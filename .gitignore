@@ -1,0 +1,28 @@
+# Build artifacts
+/target/
+**/*.rs.bk
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+
+# Profiling
+perf.data
+perf.data.old
+flamegraph.svg
+
+# Coverage
+tarpaulin-report.html
+lcov.info
+.claude/
