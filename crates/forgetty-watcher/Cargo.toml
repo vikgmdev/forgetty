@@ -1,0 +1,9 @@
+[package]
+name = "forgetty-watcher"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+forgetty-core = { path = "../forgetty-core" }
+notify = { workspace = true }

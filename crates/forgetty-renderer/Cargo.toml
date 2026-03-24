@@ -1,0 +1,12 @@
+[package]
+name = "forgetty-renderer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+forgetty-core = { path = "../forgetty-core" }
+forgetty-vt = { path = "../forgetty-vt" }
+wgpu = { workspace = true }
+glyphon = { workspace = true }
+cosmic-text = { workspace = true }

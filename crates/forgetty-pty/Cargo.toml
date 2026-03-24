@@ -1,0 +1,10 @@
+[package]
+name = "forgetty-pty"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+forgetty-core = { path = "../forgetty-core" }
+portable-pty = { workspace = true }
+tokio = { workspace = true }

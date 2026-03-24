@@ -1,0 +1,12 @@
+[package]
+name = "forgetty-workspace"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+forgetty-core = { path = "../forgetty-core" }
+forgetty-config = { path = "../forgetty-config" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }

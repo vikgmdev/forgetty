@@ -1,0 +1,12 @@
+[package]
+name = "forgetty-vt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[dependencies]
+forgetty-core = { path = "../forgetty-core" }
+
+[build-dependencies]
+cc = "1"

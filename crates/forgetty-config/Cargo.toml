@@ -1,0 +1,12 @@
+[package]
+name = "forgetty-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+forgetty-core = { path = "../forgetty-core" }
+serde = { workspace = true }
+toml = { workspace = true }
+dirs = { workspace = true }
+tracing = { workspace = true }
