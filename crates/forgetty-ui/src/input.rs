@@ -56,6 +56,7 @@ fn encode_named_key(key: NamedKey, ctrl: bool) -> Option<Vec<u8>> {
     }
 
     match key {
+        NamedKey::Space => Some(vec![b' ']),
         NamedKey::Enter => Some(vec![b'\r']),
         NamedKey::Backspace => Some(vec![0x7f]),
         NamedKey::Tab => Some(vec![b'\t']),

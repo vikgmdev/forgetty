@@ -14,11 +14,17 @@ use forgetty_vt::Terminal;
 use tracing::{debug, error, info, warn};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::ModifiersState;
 use winit::window::{Window, WindowAttributes, WindowId};
 
 use crate::input::encode_key;
+
+/// Custom user event to wake the event loop when PTY data is available.
+#[derive(Debug, Clone)]
+pub enum UserEvent {
+    PtyOutput,
+}
 
 /// The main Forgetty application.
 pub struct App {
@@ -52,9 +58,10 @@ impl App {
 
     /// Run the application. This blocks until the window is closed.
     pub fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
-        let event_loop = EventLoop::new()?;
+        let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
         event_loop.set_control_flow(ControlFlow::Wait);
 
+        let proxy = event_loop.create_proxy();
         let mut app = App::new(&config);
 
         // Spawn the PTY process before entering the event loop.
@@ -72,7 +79,7 @@ impl App {
         thread::Builder::new()
             .name("pty-reader".into())
             .spawn(move || {
-                pty_reader_thread(reader, tx);
+                pty_reader_thread(reader, tx, proxy);
             })
             .expect("failed to spawn PTY reader thread");
 
@@ -114,7 +121,14 @@ impl App {
     }
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<UserEvent> for App {
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: UserEvent) {
+        // PTY data available — request a redraw to process it
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             // Already have a window; nothing to do.
@@ -222,13 +236,6 @@ impl ApplicationHandler for App {
                         warn!("render error: {e}");
                     }
                 }
-
-                // 3. Request the next frame.
-                // If the shell has exited, we still render (to show final output)
-                // but could stop requesting redraws if desired.
-                if let Some(window) = &self.window {
-                    window.request_redraw();
-                }
             }
 
             WindowEvent::ModifiersChanged(mods) => {
@@ -239,6 +246,10 @@ impl ApplicationHandler for App {
                 if event.state == ElementState::Pressed {
                     if let Some(bytes) = encode_key(&event, self.modifiers) {
                         self.write_to_pty(&bytes);
+                        // Request redraw so the echo appears immediately
+                        if let Some(window) = &self.window {
+                            window.request_redraw();
+                        }
                     }
                 }
             }
@@ -274,7 +285,11 @@ impl ApplicationHandler for App {
 }
 
 /// Background thread that reads from the PTY and sends data to the main thread.
-fn pty_reader_thread(mut reader: Box<dyn std::io::Read + Send>, tx: mpsc::Sender<Vec<u8>>) {
+fn pty_reader_thread(
+    mut reader: Box<dyn std::io::Read + Send>,
+    tx: mpsc::Sender<Vec<u8>>,
+    proxy: EventLoopProxy<UserEvent>,
+) {
     let mut buf = [0u8; 65536];
     loop {
         match reader.read(&mut buf) {
@@ -287,6 +302,8 @@ fn pty_reader_thread(mut reader: Box<dyn std::io::Read + Send>, tx: mpsc::Sender
                     // Receiver dropped — main thread is shutting down.
                     break;
                 }
+                // Wake the event loop to process the new data
+                let _ = proxy.send_event(UserEvent::PtyOutput);
             }
             Err(e) => {
                 debug!("PTY reader error: {e}");
