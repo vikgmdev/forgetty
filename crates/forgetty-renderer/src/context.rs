@@ -47,17 +47,32 @@ impl RenderContext {
         .map_err(|e| crate::RendererError::Device(e.to_string()))?;
 
         let caps = surface.get_capabilities(&adapter);
-        let format = caps.formats.iter().find(|f| f.is_srgb()).copied().unwrap_or(caps.formats[0]);
+        // Prefer non-sRGB format so we can pass colors directly without gamma conversion.
+        // If only sRGB is available, we'll need to handle the conversion in shaders.
+        let format = caps
+            .formats
+            .iter()
+            .find(|f| !f.is_srgb())
+            .or_else(|| caps.formats.first())
+            .copied()
+            .unwrap_or(wgpu::TextureFormat::Bgra8Unorm);
+
+        // Prefer Mailbox (low-latency, no tearing) over Fifo (vsync but more latency)
+        let present_mode = if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
+            wgpu::PresentMode::Mailbox
+        } else {
+            wgpu::PresentMode::Fifo
+        };
 
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
             width,
             height,
-            present_mode: wgpu::PresentMode::Fifo,
+            present_mode,
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
-            desired_maximum_frame_latency: 2,
+            desired_maximum_frame_latency: 1,
         };
         surface.configure(&device, &surface_config);
 
