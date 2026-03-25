@@ -24,6 +24,7 @@ pub struct GlyphAtlas {
     pub cell_size: CellSize,
     font_size: f32,
     line_height: f32,
+    font_family: glyphon::Family<'static>,
 }
 
 impl GlyphAtlas {
@@ -37,10 +38,18 @@ impl GlyphAtlas {
     ) -> Self {
         let mut font_system = glyphon::FontSystem::new();
 
-        // Measure a representative character to determine cell size
-        let metrics = glyphon::Metrics::new(font_size, font_size * 1.2);
-        let cell_size = measure_cell_size(&mut font_system, font_family, metrics);
+        // Resolve the font family — always use monospace for terminal
+        let family = glyphon::Family::Monospace;
+
+        let metrics = glyphon::Metrics::new(font_size, (font_size * 1.2).ceil());
+        let cell_size = measure_cell_size(&mut font_system, family, metrics);
         let line_height = metrics.line_height;
+
+        tracing::info!(
+            "Font: family={font_family}, size={font_size}, cell={}x{}, line_height={line_height}",
+            cell_size.width,
+            cell_size.height,
+        );
 
         let cache = glyphon::Cache::new(device);
         let mut text_atlas = glyphon::TextAtlas::new(device, queue, &cache, format);
@@ -62,6 +71,7 @@ impl GlyphAtlas {
             cell_size,
             font_size,
             line_height,
+            font_family: family,
         }
     }
 
@@ -103,44 +113,37 @@ impl GlyphAtlas {
                 Some(self.line_height),
             );
 
-            // Build spans with per-character colors
-            let mut spans: Vec<(&str, glyphon::Attrs)> = Vec::new();
-            let mut char_strings: Vec<String> = Vec::new();
+            // Build rich text spans with per-character colors and monospace font
+            let char_strings: Vec<String> = row.iter().map(|c| c.character.to_string()).collect();
 
-            for cell in row.iter() {
-                let fg = if cell.attrs.inverse {
-                    color_scheme.resolve_bg(cell.attrs.bg)
-                } else {
-                    color_scheme.resolve_fg(cell.attrs.fg)
-                };
-
-                let color = glyphon::Color::rgba(fg[0], fg[1], fg[2], fg[3]);
-                char_strings.push(cell.character.to_string());
-
-                let mut attrs = glyphon::Attrs::new();
-                attrs = attrs.color(color);
-
-                if cell.attrs.bold {
-                    attrs = attrs.weight(glyphon::Weight::BOLD);
-                }
-                if cell.attrs.italic {
-                    attrs = attrs.style(glyphon::Style::Italic);
-                }
-
-                spans.push(("", attrs)); // placeholder, we'll set text below
-            }
-
-            // Build the text with attrs using set_rich_text
             let rich_text: Vec<(&str, glyphon::Attrs)> = char_strings
                 .iter()
-                .zip(spans.iter())
-                .map(|(s, (_, attrs))| (s.as_str(), *attrs))
+                .zip(row.iter())
+                .map(|(s, cell)| {
+                    let fg = if cell.attrs.inverse {
+                        color_scheme.resolve_bg(cell.attrs.bg)
+                    } else {
+                        color_scheme.resolve_fg(cell.attrs.fg)
+                    };
+
+                    let color = glyphon::Color::rgba(fg[0], fg[1], fg[2], fg[3]);
+                    let mut attrs = glyphon::Attrs::new().family(self.font_family).color(color);
+
+                    if cell.attrs.bold {
+                        attrs = attrs.weight(glyphon::Weight::BOLD);
+                    }
+                    if cell.attrs.italic {
+                        attrs = attrs.style(glyphon::Style::Italic);
+                    }
+
+                    (s.as_str(), attrs)
+                })
                 .collect();
 
             buffer.set_rich_text(
                 &mut self.font_system,
                 rich_text,
-                glyphon::Attrs::new(),
+                glyphon::Attrs::new().family(self.font_family),
                 glyphon::Shaping::Advanced,
             );
             buffer.shape_until_scroll(&mut self.font_system, false);
@@ -203,22 +206,36 @@ impl GlyphAtlas {
 /// Measure the width and height of a single monospace cell.
 fn measure_cell_size(
     font_system: &mut glyphon::FontSystem,
-    _font_family: &str,
+    family: glyphon::Family<'_>,
     metrics: glyphon::Metrics,
 ) -> CellSize {
-    // Create a buffer with a single character to measure
+    // Create a buffer with a representative string to measure average monospace width
     let mut buffer = glyphon::Buffer::new(font_system, metrics);
-    buffer.set_size(font_system, Some(1000.0), Some(metrics.line_height));
-    buffer.set_text(font_system, "M", glyphon::Attrs::new(), glyphon::Shaping::Advanced);
+    buffer.set_size(font_system, Some(10000.0), Some(metrics.line_height));
+    buffer.set_text(
+        font_system,
+        "MMMMMMMMMM",
+        glyphon::Attrs::new().family(family),
+        glyphon::Shaping::Advanced,
+    );
     buffer.shape_until_scroll(font_system, false);
 
-    // Try to get the glyph width from layout runs
-    let mut width = metrics.font_size * 0.6; // fallback
+    // Get the width from the layout run
+    let mut total_width = 0.0;
+    let mut glyph_count = 0;
     if let Some(run) = buffer.layout_runs().next() {
-        if let Some(glyph) = run.glyphs.iter().next() {
-            width = glyph.w;
+        for glyph in run.glyphs.iter() {
+            total_width += glyph.w;
+            glyph_count += 1;
         }
     }
+
+    let width = if glyph_count > 0 {
+        total_width / glyph_count as f32
+    } else {
+        // Fallback: estimate from font size
+        metrics.font_size * 0.6
+    };
 
     CellSize { width, height: metrics.line_height }
 }
