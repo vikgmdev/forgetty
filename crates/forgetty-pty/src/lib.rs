@@ -7,4 +7,5 @@
 pub mod multiplexer;
 pub mod process;
 
-// TODO: Phase 2 — re-export key types
+pub use multiplexer::{PtyId, PtyMultiplexer};
+pub use process::{PtyProcess, PtySize};
