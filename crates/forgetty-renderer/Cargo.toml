@@ -10,3 +10,8 @@ forgetty-vt = { path = "../forgetty-vt" }
 wgpu = { workspace = true }
 glyphon = { workspace = true }
 cosmic-text = { workspace = true }
+bytemuck = { workspace = true }
+tracing = { workspace = true }
+winit = { workspace = true }
+pollster = { workspace = true }
+thiserror = { workspace = true }
