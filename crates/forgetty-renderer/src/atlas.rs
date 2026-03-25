@@ -189,6 +189,168 @@ impl GlyphAtlas {
         Ok(())
     }
 
+    /// Prepare text with a vertical offset (for tab bar) and include tab title text.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_with_offset(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        screen: &Screen,
+        scroll_offset: usize,
+        viewport_size: (u32, u32),
+        color_scheme: &ColorScheme,
+        y_offset: f32,
+        tab_state: &crate::statusbar::TabBarState,
+        tab_bar_height: f32,
+    ) -> Result<(), glyphon::PrepareError> {
+        self.viewport
+            .update(queue, glyphon::Resolution { width: viewport_size.0, height: viewport_size.1 });
+
+        let usable_h = viewport_size.1 as f32 - y_offset;
+        let visible_rows = (usable_h / self.cell_size.height).ceil() as usize;
+        let metrics = glyphon::Metrics::new(self.font_size, self.line_height);
+
+        // Build terminal text buffers
+        let mut buffers: Vec<glyphon::Buffer> =
+            Vec::with_capacity(visible_rows + tab_state.tabs.len());
+
+        for vis_row in 0..visible_rows {
+            let screen_row = vis_row + scroll_offset;
+            if screen_row >= screen.rows() {
+                break;
+            }
+
+            let row = screen.row(screen_row);
+            let mut buffer = glyphon::Buffer::new(&mut self.font_system, metrics);
+            buffer.set_size(
+                &mut self.font_system,
+                Some(viewport_size.0 as f32),
+                Some(self.line_height),
+            );
+
+            let char_strings: Vec<String> = row.iter().map(|c| c.character.to_string()).collect();
+            let rich_text: Vec<(&str, glyphon::Attrs)> = char_strings
+                .iter()
+                .zip(row.iter())
+                .map(|(s, cell)| {
+                    let fg = if cell.attrs.inverse {
+                        color_scheme.resolve_bg(cell.attrs.bg)
+                    } else {
+                        color_scheme.resolve_fg(cell.attrs.fg)
+                    };
+                    let color = glyphon::Color::rgba(fg[0], fg[1], fg[2], fg[3]);
+                    let mut attrs = glyphon::Attrs::new().family(self.font_family).color(color);
+                    if cell.attrs.bold {
+                        attrs = attrs.weight(glyphon::Weight::BOLD);
+                    }
+                    if cell.attrs.italic {
+                        attrs = attrs.style(glyphon::Style::Italic);
+                    }
+                    (s.as_str(), attrs)
+                })
+                .collect();
+
+            buffer.set_rich_text(
+                &mut self.font_system,
+                rich_text,
+                glyphon::Attrs::new().family(self.font_family),
+                glyphon::Shaping::Advanced,
+            );
+            buffer.shape_until_scroll(&mut self.font_system, false);
+            buffers.push(buffer);
+        }
+
+        let terminal_buffer_count = buffers.len();
+
+        // Build tab title buffers (smaller font)
+        let tab_font_size = 11.0;
+        let tab_metrics = glyphon::Metrics::new(tab_font_size, tab_bar_height);
+        let tab_width = 140.0f32;
+        let tab_padding = 2.0;
+
+        for (i, tab) in tab_state.tabs.iter().enumerate() {
+            let mut buffer = glyphon::Buffer::new(&mut self.font_system, tab_metrics);
+            buffer.set_size(&mut self.font_system, Some(tab_width - 16.0), Some(tab_bar_height));
+
+            let is_active = i == tab_state.active_index;
+            let color = if is_active {
+                glyphon::Color::rgba(220, 220, 240, 255)
+            } else {
+                glyphon::Color::rgba(140, 140, 160, 255)
+            };
+
+            let title =
+                if tab.title.is_empty() { format!("Tab {}", i + 1) } else { tab.title.clone() };
+
+            buffer.set_text(
+                &mut self.font_system,
+                &title,
+                glyphon::Attrs::new().family(glyphon::Family::SansSerif).color(color),
+                glyphon::Shaping::Advanced,
+            );
+            buffer.shape_until_scroll(&mut self.font_system, false);
+            buffers.push(buffer);
+        }
+
+        // Build text areas
+        let mut text_areas: Vec<glyphon::TextArea<'_>> = Vec::with_capacity(buffers.len());
+
+        // Terminal text areas (offset by tab bar)
+        for (vis_row, buffer) in buffers.iter().enumerate().take(terminal_buffer_count) {
+            text_areas.push(glyphon::TextArea {
+                buffer,
+                left: 0.0,
+                top: y_offset + vis_row as f32 * self.cell_size.height,
+                scale: 1.0,
+                bounds: glyphon::TextBounds {
+                    left: 0,
+                    top: y_offset as i32,
+                    right: viewport_size.0 as i32,
+                    bottom: viewport_size.1 as i32,
+                },
+                default_color: glyphon::Color::rgba(
+                    color_scheme.foreground[0],
+                    color_scheme.foreground[1],
+                    color_scheme.foreground[2],
+                    color_scheme.foreground[3],
+                ),
+                custom_glyphs: &[],
+            });
+        }
+
+        // Tab title text areas (in the tab bar area)
+        for (i, buffer) in buffers.iter().enumerate().skip(terminal_buffer_count) {
+            let tab_idx = i - terminal_buffer_count;
+            let x = tab_padding + tab_idx as f32 * (tab_width + tab_padding) + 8.0;
+            text_areas.push(glyphon::TextArea {
+                buffer,
+                left: x,
+                top: 0.0,
+                scale: 1.0,
+                bounds: glyphon::TextBounds {
+                    left: 0,
+                    top: 0,
+                    right: viewport_size.0 as i32,
+                    bottom: tab_bar_height as i32,
+                },
+                default_color: glyphon::Color::rgba(180, 180, 200, 255),
+                custom_glyphs: &[],
+            });
+        }
+
+        self.text_renderer.prepare(
+            device,
+            queue,
+            &mut self.font_system,
+            &mut self.text_atlas,
+            &self.viewport,
+            text_areas,
+            &mut self.swash_cache,
+        )?;
+
+        Ok(())
+    }
+
     /// Render text into the render pass.
     pub fn render<'a>(
         &'a self,

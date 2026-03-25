@@ -3,9 +3,8 @@ name = "forgetty-vt"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+build = "build.rs"
 
 [dependencies]
 forgetty-core = { path = "../forgetty-core" }
-vte = "0.13"
 tracing = { workspace = true }
-unicode-width = "0.2"

@@ -149,7 +149,82 @@ impl BackgroundRenderer {
         Self { pipeline, instance_buffer, instance_count: 0, uniform_buffer, uniform_bind_group }
     }
 
+    /// Update the instance buffer with current screen background colors, with a y offset.
+    pub fn update_with_offset(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        screen: &Screen,
+        cell_size: &CellSize,
+        scroll_offset: usize,
+        viewport_size: (u32, u32),
+        color_scheme: &ColorScheme,
+        y_offset: f32,
+    ) {
+        let uniforms = Uniforms { viewport_size: [viewport_size.0 as f32, viewport_size.1 as f32] };
+        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+
+        let default_bg = color_scheme.background;
+        let usable_h = viewport_size.1 as f32 - y_offset;
+        let visible_rows = (usable_h / cell_size.height).ceil() as usize;
+        let visible_cols = screen.cols();
+
+        let mut instances = Vec::with_capacity(visible_rows * visible_cols);
+
+        for vis_row in 0..visible_rows {
+            let screen_row = vis_row + scroll_offset;
+            if screen_row >= screen.rows() {
+                break;
+            }
+
+            let row = screen.row(screen_row);
+            for (col, cell) in row.iter().enumerate().take(visible_cols) {
+                let bg = if cell.attrs.inverse {
+                    color_scheme.resolve_fg(cell.attrs.fg)
+                } else {
+                    color_scheme.resolve_bg(cell.attrs.bg)
+                };
+
+                if bg == default_bg {
+                    continue;
+                }
+
+                instances.push(BackgroundInstance {
+                    position: [
+                        col as f32 * cell_size.width,
+                        y_offset + vis_row as f32 * cell_size.height,
+                    ],
+                    size: [cell_size.width, cell_size.height],
+                    color: [
+                        bg[0] as f32 / 255.0,
+                        bg[1] as f32 / 255.0,
+                        bg[2] as f32 / 255.0,
+                        bg[3] as f32 / 255.0,
+                    ],
+                });
+            }
+        }
+
+        self.instance_count = instances.len() as u32;
+        if instances.is_empty() {
+            return;
+        }
+
+        let data = bytemuck::cast_slice(&instances);
+        let needed = data.len() as u64;
+        if needed > self.instance_buffer.size() {
+            self.instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("bg instances"),
+                size: needed,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        queue.write_buffer(&self.instance_buffer, 0, data);
+    }
+
     /// Update the instance buffer with current screen background colors.
+    #[allow(dead_code)]
     pub fn update(
         &mut self,
         device: &wgpu::Device,

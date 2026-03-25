@@ -1,0 +1,3 @@
+[submodule "crates/forgetty-vt/ghostty"]
+	path = crates/forgetty-vt/ghostty
+	url = https://github.com/ghostty-org/ghostty.git
