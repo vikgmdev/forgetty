@@ -40,7 +40,7 @@ impl From<PtySize> for portable_pty::PtySize {
 pub struct PtyProcess {
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
-    reader: Box<dyn IoRead + Send>,
+    reader: Option<Box<dyn IoRead + Send>>,
     writer: Box<dyn IoWrite + Send>,
 }
 
@@ -101,12 +101,27 @@ impl PtyProcess {
             .take_writer()
             .map_err(|e| ForgettyError::Pty(format!("failed to take PTY writer: {e}")))?;
 
-        Ok(Self { master: pair.master, child, reader, writer })
+        Ok(Self { master: pair.master, child, reader: Some(reader), writer })
     }
 
     /// Read bytes from the PTY. This is a blocking call.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `take_reader()` has been called previously.
     pub fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        self.reader.read(buf).map_err(ForgettyError::Io)
+        self.reader
+            .as_mut()
+            .expect("reader has been taken via take_reader()")
+            .read(buf)
+            .map_err(ForgettyError::Io)
+    }
+
+    /// Take the reader out of this PtyProcess for use in a separate thread.
+    ///
+    /// After calling this, `read()` will panic. Use the returned reader directly.
+    pub fn take_reader(&mut self) -> Option<Box<dyn IoRead + Send>> {
+        self.reader.take()
     }
 
     /// Write bytes to the PTY.

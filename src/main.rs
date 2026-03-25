@@ -1,6 +1,8 @@
 mod cli;
 
 use clap::Parser;
+use forgetty_config::defaults::default_config;
+use forgetty_ui::app::App;
 use tracing_subscriber::EnvFilter;
 
 fn main() {
@@ -9,7 +11,8 @@ fn main() {
     let _args = cli::Args::parse();
     tracing::info!("Starting Forgetty v{}", env!("CARGO_PKG_VERSION"));
 
-    // TODO: Phase 4 — launch the terminal application
-    println!("Forgetty — The AI-first agentic terminal");
-    println!("v{}", env!("CARGO_PKG_VERSION"));
+    if let Err(e) = App::run(default_config()) {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    }
 }
