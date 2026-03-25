@@ -7,4 +7,9 @@ license.workspace = true
 [dependencies]
 forgetty-core = { path = "../forgetty-core" }
 tokio = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

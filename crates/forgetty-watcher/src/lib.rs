@@ -6,4 +6,4 @@
 
 pub mod watcher;
 
-// TODO: Phase 5 — re-export key types once watcher is implemented
+pub use watcher::{ChangeKind, FileChange, FileWatcher};
