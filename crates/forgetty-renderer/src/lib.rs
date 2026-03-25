@@ -48,6 +48,8 @@ pub struct TerminalRenderer {
     damage: DamageTracker,
     scroll_offset: usize,
     cursor_style: CursorStyle,
+    /// Last known screen generation — skip re-preparing text if unchanged
+    last_screen_generation: u64,
 }
 
 impl TerminalRenderer {
@@ -76,7 +78,8 @@ impl TerminalRenderer {
             color_scheme,
             damage,
             scroll_offset: 0,
-            cursor_style: CursorStyle::Block,
+            cursor_style: CursorStyle::Bar,
+            last_screen_generation: 0,
         })
     }
 
@@ -84,6 +87,10 @@ impl TerminalRenderer {
     pub fn render(&mut self, terminal: &Terminal) -> Result<(), RendererError> {
         let screen = terminal.screen();
         let viewport_size = self.context.size;
+        let current_gen = screen.generation();
+
+        // Only re-prepare text and backgrounds when the screen has actually changed
+        let screen_changed = current_gen != self.last_screen_generation;
 
         // Step 1: Get surface texture
         let output = self
@@ -93,28 +100,32 @@ impl TerminalRenderer {
             .map_err(|e| RendererError::Render(e.to_string()))?;
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        // Step 2: Update background instances
-        self.background.update(
-            &self.context.device,
-            &self.context.queue,
-            screen,
-            &self.atlas.cell_size(),
-            self.scroll_offset,
-            viewport_size,
-            &self.color_scheme,
-        );
-
-        // Step 3: Prepare text
-        self.atlas
-            .prepare(
+        if screen_changed {
+            // Step 2: Update background instances
+            self.background.update(
                 &self.context.device,
                 &self.context.queue,
                 screen,
+                &self.atlas.cell_size(),
                 self.scroll_offset,
                 viewport_size,
                 &self.color_scheme,
-            )
-            .map_err(|e| RendererError::Render(format!("text prepare: {e:?}")))?;
+            );
+
+            // Step 3: Prepare text
+            self.atlas
+                .prepare(
+                    &self.context.device,
+                    &self.context.queue,
+                    screen,
+                    self.scroll_offset,
+                    viewport_size,
+                    &self.color_scheme,
+                )
+                .map_err(|e| RendererError::Render(format!("text prepare: {e:?}")))?;
+
+            self.last_screen_generation = current_gen;
+        }
 
         // Step 4: Build command buffer
         let mut encoder =
