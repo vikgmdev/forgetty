@@ -22,7 +22,7 @@ homepage = "https://forgetty.dev"
 description = "The AI-first agentic terminal emulator"
 
 [workspace.dependencies]
-wgpu = "24"
+wgpu = "23"
 winit = "0.30"
 glyphon = "0.7"
 cosmic-text = "0.12"
@@ -42,6 +42,8 @@ arboard = "3"
 uuid = { version = "1", features = ["v4", "serde"] }
 dirs = "6"
 git2 = "0.19"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.4"
 
 [package]
 name = "forgetty"
