@@ -1,6 +1,9 @@
 //! Input event processing.
 //!
 //! Translates winit keyboard events into terminal input byte sequences.
+//! Uses `event.text` for regular character input (correct with shift/caps)
+//! and `event.logical_key` for named keys (arrows, function keys, etc.)
+//! and Ctrl+key combos.
 
 use winit::event::{ElementState, KeyEvent};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
@@ -16,45 +19,50 @@ pub fn encode_key(event: &KeyEvent, modifiers: ModifiersState) -> Option<Vec<u8>
     }
 
     let ctrl = modifiers.control_key();
-    let _alt = modifiers.alt_key();
-    let _shift = modifiers.shift_key();
 
-    match &event.logical_key {
-        // Named keys
-        Key::Named(named) => encode_named_key(*named, ctrl),
-        // Character keys
-        Key::Character(c) => {
-            let ch = c.as_str();
-            if ctrl && ch.len() == 1 {
-                let byte = ch.as_bytes()[0];
-                // Ctrl+letter produces control characters \x01-\x1a
-                match byte {
-                    b'a'..=b'z' => Some(vec![byte - b'a' + 1]),
-                    b'A'..=b'Z' => Some(vec![byte - b'A' + 1]),
-                    // Ctrl+[ = ESC, Ctrl+\ = FS, Ctrl+] = GS, Ctrl+^ = RS, Ctrl+_ = US
-                    b'[' => Some(vec![0x1b]),
-                    b'\\' => Some(vec![0x1c]),
-                    b']' => Some(vec![0x1d]),
-                    b'^' => Some(vec![0x1e]),
-                    b'_' => Some(vec![0x1f]),
-                    b'@' => Some(vec![0x00]),
-                    _ => None,
+    // 1. Handle Ctrl+key combos first (these produce control characters)
+    if ctrl {
+        if let Key::Character(c) = &event.logical_key {
+            let bytes = c.as_str().as_bytes();
+            if bytes.len() == 1 {
+                let b = bytes[0].to_ascii_lowercase();
+                match b {
+                    b'a'..=b'z' => return Some(vec![b - b'a' + 1]),
+                    b'[' => return Some(vec![0x1b]),
+                    b'\\' => return Some(vec![0x1c]),
+                    b']' => return Some(vec![0x1d]),
+                    b'^' => return Some(vec![0x1e]),
+                    b'_' => return Some(vec![0x1f]),
+                    b'@' => return Some(vec![0x00]),
+                    _ => {}
                 }
-            } else {
-                Some(ch.as_bytes().to_vec())
             }
         }
-        _ => None,
+        // Ctrl+Space
+        if event.logical_key == Key::Named(NamedKey::Space) {
+            return Some(vec![0x00]);
+        }
     }
+
+    // 2. Handle named keys (arrows, function keys, Enter, etc.)
+    if let Key::Named(named) = &event.logical_key {
+        return encode_named_key(*named);
+    }
+
+    // 3. For regular text input, use event.text — this correctly handles
+    //    shift, caps lock, and dead keys on all platforms.
+    if let Some(text) = &event.text {
+        let s = text.as_str();
+        if !s.is_empty() && !ctrl {
+            return Some(s.as_bytes().to_vec());
+        }
+    }
+
+    None
 }
 
 /// Encode a named key to terminal bytes.
-fn encode_named_key(key: NamedKey, ctrl: bool) -> Option<Vec<u8>> {
-    // If ctrl is held with a named key, some have special behavior
-    if ctrl && key == NamedKey::Space {
-        return Some(vec![0x00]); // Ctrl+Space = NUL
-    }
-
+fn encode_named_key(key: NamedKey) -> Option<Vec<u8>> {
     match key {
         NamedKey::Space => Some(vec![b' ']),
         NamedKey::Enter => Some(vec![b'\r']),

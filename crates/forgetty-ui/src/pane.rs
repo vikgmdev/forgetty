@@ -11,6 +11,9 @@ use std::thread;
 use forgetty_pty::{PtyProcess, PtySize};
 use forgetty_vt::Terminal;
 use tracing::{debug, warn};
+use winit::event_loop::EventLoopProxy;
+
+use crate::app::UserEvent;
 
 /// Global counter for unique pane IDs.
 static NEXT_PANE_ID: AtomicU64 = AtomicU64::new(1);
@@ -42,11 +45,13 @@ impl Pane {
     /// Create a new pane, spawning a shell.
     ///
     /// Spawns a PTY reader thread internally that sends output via a channel.
+    /// The `proxy` is used to wake the main event loop when PTY data arrives.
     pub fn new(
         id: PaneId,
         rows: usize,
         cols: usize,
         working_dir: Option<&Path>,
+        proxy: EventLoopProxy<UserEvent>,
     ) -> Result<Self, String> {
         let terminal = Terminal::new(rows, cols);
         let size =
@@ -65,7 +70,7 @@ impl Pane {
         thread::Builder::new()
             .name(format!("pty-reader-{}", pane_id))
             .spawn(move || {
-                pane_reader_thread(reader, tx);
+                pane_reader_thread(reader, tx, proxy);
             })
             .map_err(|e| format!("failed to spawn PTY reader thread: {e}"))?;
 
@@ -136,7 +141,11 @@ impl Pane {
 }
 
 /// Background thread that reads from the PTY and sends data via the channel.
-fn pane_reader_thread(mut reader: Box<dyn std::io::Read + Send>, tx: mpsc::Sender<Vec<u8>>) {
+fn pane_reader_thread(
+    mut reader: Box<dyn std::io::Read + Send>,
+    tx: mpsc::Sender<Vec<u8>>,
+    proxy: EventLoopProxy<UserEvent>,
+) {
     let mut buf = [0u8; 65536];
     loop {
         match reader.read(&mut buf) {
@@ -148,6 +157,8 @@ fn pane_reader_thread(mut reader: Box<dyn std::io::Read + Send>, tx: mpsc::Sende
                 if tx.send(buf[..n].to_vec()).is_err() {
                     break;
                 }
+                // Wake the event loop to process the new data
+                let _ = proxy.send_event(UserEvent::PtyOutput);
             }
             Err(e) => {
                 debug!("Pane PTY reader error: {e}");

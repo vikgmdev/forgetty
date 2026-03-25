@@ -11,7 +11,7 @@ use forgetty_renderer::TerminalRenderer;
 use tracing::{debug, error, info, warn};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::ModifiersState;
 use winit::window::{Window, WindowAttributes, WindowId};
 
@@ -44,11 +44,14 @@ pub struct App {
     // Keybindings and clipboard.
     keybindings: KeyBindings,
     clipboard: Option<SmartClipboard>,
+
+    // Event loop proxy for waking the main thread from PTY reader threads.
+    proxy: EventLoopProxy<UserEvent>,
 }
 
 impl App {
     /// Create a new application instance.
-    pub fn new(config: &Config) -> Self {
+    pub fn new(config: &Config, proxy: EventLoopProxy<UserEvent>) -> Self {
         Self {
             config: config.clone(),
             window: None,
@@ -59,6 +62,7 @@ impl App {
             panes: HashMap::new(),
             keybindings: KeyBindings::default_bindings(),
             clipboard: SmartClipboard::new(),
+            proxy,
         }
     }
 
@@ -67,11 +71,12 @@ impl App {
         let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
         event_loop.set_control_flow(ControlFlow::Wait);
 
-        let mut app = App::new(&config);
+        let proxy = event_loop.create_proxy();
+        let mut app = App::new(&config, proxy);
 
         // Create the initial pane and tab.
         let pane_id = PaneId::next();
-        let pane = Pane::new(pane_id, 24, 80, None)
+        let pane = Pane::new(pane_id, 24, 80, None, app.proxy.clone())
             .map_err(|e| format!("Failed to spawn initial shell: {e}"))?;
         info!(pane_id = pane_id.0, pid = ?pane.pty.pid(), "initial shell spawned");
 
@@ -120,7 +125,7 @@ impl App {
     fn new_tab(&mut self) {
         let (rows, cols) = self.current_grid_size();
         let pane_id = PaneId::next();
-        match Pane::new(pane_id, rows, cols, None) {
+        match Pane::new(pane_id, rows, cols, None, self.proxy.clone()) {
             Ok(pane) => {
                 info!(pane_id = pane_id.0, "new pane spawned for tab");
                 self.panes.insert(pane_id, pane);
@@ -179,7 +184,7 @@ impl App {
     fn split_focused(&mut self, direction: SplitDirection) {
         let (rows, cols) = self.current_grid_size();
         let new_pane_id = PaneId::next();
-        match Pane::new(new_pane_id, rows, cols, None) {
+        match Pane::new(new_pane_id, rows, cols, None, self.proxy.clone()) {
             Ok(pane) => {
                 info!(pane_id = new_pane_id.0, "new pane spawned for split");
                 self.panes.insert(new_pane_id, pane);
