@@ -8,4 +8,6 @@ pub mod project;
 pub mod session;
 pub mod workspace;
 
-// TODO: Phase 7 — re-export key types once workspace is implemented
+pub use project::{find_project_root, project_name, ProjectType};
+pub use session::{load_session, save_session, session_path};
+pub use workspace::{PaneTreeState, TabState, Workspace, WorkspaceState};

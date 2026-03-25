@@ -7,4 +7,6 @@ pub mod image_viewer;
 pub mod markdown;
 pub mod webview;
 
-// TODO: Phase 6 — re-export key types once viewer is implemented
+pub use image_viewer::render_image;
+pub use markdown::render_markdown;
+pub use webview::{content_for_file, is_previewable, ViewerContent};
