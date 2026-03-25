@@ -12,3 +12,4 @@ forgetty-pty = { path = "../forgetty-pty" }
 forgetty-renderer = { path = "../forgetty-renderer" }
 winit = { workspace = true }
 arboard = { workspace = true }
+tracing = { workspace = true }

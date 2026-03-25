@@ -16,5 +16,3 @@ pub mod pane_tree;
 pub mod tab;
 pub mod tab_bar;
 pub mod window;
-
-// TODO: Phase 4 — re-export key types once UI is implemented

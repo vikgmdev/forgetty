@@ -1077,6 +1077,7 @@ dependencies = [
  "forgetty-pty",
  "forgetty-renderer",
  "forgetty-vt",
+ "tracing",
  "winit",
 ]
 
