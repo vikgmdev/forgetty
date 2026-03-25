@@ -7,4 +7,4 @@ license.workspace = true
 [dependencies]
 forgetty-core = { path = "../forgetty-core" }
 portable-pty = { workspace = true }
-tokio = { workspace = true }
+tracing = { workspace = true }

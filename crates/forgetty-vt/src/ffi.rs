@@ -1,12 +1,9 @@
-//! FFI bindings to the Zig-based VT parser.
+//! FFI bindings for libghostty-vt.
 //!
-//! This module will contain the raw C FFI declarations for the VT parser
-//! compiled from Zig, as well as safe Rust wrappers around them.
-
-// TODO: Phase 2 — define extern "C" function declarations for the Zig VT parser
-//
-// Expected FFI surface:
-//   - `vt_parser_new() -> *mut VtParser`
-//   - `vt_parser_feed(parser: *mut VtParser, data: *const u8, len: usize)`
-//   - `vt_parser_destroy(parser: *mut VtParser)`
-//   - Screen query functions for rows, cols, cell contents, attributes, etc.
+//! This module will contain the C FFI bindings to libghostty-vt once
+//! the library is integrated. Currently, Forgetty uses a built-in
+//! VT parser based on the `vte` crate as an interim solution.
+//!
+//! The public API in `terminal.rs` and `screen.rs` is designed to be
+//! backend-agnostic, so switching from the built-in parser to
+//! libghostty-vt will not change the API surface.
