@@ -2,6 +2,7 @@
 //!
 //! Manages the grid of cells that makes up the visible terminal display,
 //! including dirty-tracking via generation counters for efficient rendering.
+//! The cell grid is populated from the libghostty-vt render state.
 
 /// A single cell in the terminal grid.
 #[derive(Debug, Clone)]
@@ -108,6 +109,24 @@ impl Screen {
     /// Get the current generation counter.
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Replace the entire grid from an externally-built cell matrix.
+    /// Also marks all replaced rows dirty and bumps the generation.
+    pub(crate) fn replace_from_grid(&mut self, grid: Vec<Vec<Cell>>, dirty_rows: &[bool]) {
+        let new_rows = grid.len();
+        let new_cols = grid.first().map(|r| r.len()).unwrap_or(0);
+        self.cells = grid;
+        self.rows = new_rows;
+        self.cols = new_cols;
+        self.row_generations.resize(new_rows, 0);
+
+        self.generation += 1;
+        for (i, is_dirty) in dirty_rows.iter().enumerate() {
+            if *is_dirty && i < new_rows {
+                self.row_generations[i] = self.generation;
+            }
+        }
     }
 
     /// Clear the entire screen with blank cells.

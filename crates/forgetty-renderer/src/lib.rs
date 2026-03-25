@@ -1,12 +1,4 @@
 //! GPU-accelerated terminal renderer using wgpu.
-//!
-//! This crate handles all rendering for the Forgetty terminal, including:
-//! - Text glyph rasterization and atlas management via cosmic-text/glyphon
-//! - Terminal grid cell rendering via custom wgpu shaders
-//! - Cursor rendering with multiple styles (block, bar, underline)
-//! - Selection highlight overlay
-//! - Damage tracking for efficient partial redraws
-//! - Inline image rendering (iTerm2/Sixel protocols)
 
 pub mod atlas;
 pub mod color;
@@ -16,6 +8,7 @@ pub mod damage;
 pub mod grid;
 pub mod images;
 pub mod selection;
+pub mod statusbar;
 
 pub use atlas::{CellSize, GlyphAtlas};
 pub use color::ColorScheme;
@@ -23,6 +16,7 @@ pub use context::RenderContext;
 pub use cursor::{CursorRenderer, CursorStyle};
 pub use damage::DamageTracker;
 pub use grid::BackgroundRenderer;
+pub use statusbar::{StatusBar, TabBarState, TabInfo};
 
 use forgetty_vt::Terminal;
 use std::sync::Arc;
@@ -38,18 +32,22 @@ pub enum RendererError {
     Render(String),
 }
 
-/// The top-level terminal renderer that ties all rendering subsystems together.
+/// Height of the tab bar in pixels.
+const TAB_BAR_HEIGHT: f32 = 32.0;
+
+/// The top-level terminal renderer.
 pub struct TerminalRenderer {
     context: RenderContext,
     atlas: GlyphAtlas,
     background: BackgroundRenderer,
     cursor_renderer: CursorRenderer,
+    tab_bar: StatusBar,
     color_scheme: ColorScheme,
     damage: DamageTracker,
     scroll_offset: usize,
     cursor_style: CursorStyle,
-    /// Last known screen generation — skip re-preparing text if unchanged
     last_screen_generation: u64,
+    tab_state: TabBarState,
 }
 
 impl TerminalRenderer {
@@ -67,19 +65,25 @@ impl TerminalRenderer {
         let atlas = GlyphAtlas::new(device, queue, format, font_family, font_size);
         let background = BackgroundRenderer::new(device, format);
         let cursor_renderer = CursorRenderer::new(device, format);
+        let tab_bar = StatusBar::new(device, format);
         let color_scheme = ColorScheme::default();
-        let damage = DamageTracker::new(24); // sensible default
+        let damage = DamageTracker::new(24);
 
         Ok(Self {
             context,
             atlas,
             background,
             cursor_renderer,
+            tab_bar,
             color_scheme,
             damage,
             scroll_offset: 0,
             cursor_style: CursorStyle::Bar,
             last_screen_generation: 0,
+            tab_state: TabBarState {
+                tabs: vec![TabInfo { title: "shell".to_string() }],
+                active_index: 0,
+            },
         })
     }
 
@@ -88,9 +92,11 @@ impl TerminalRenderer {
         let screen = terminal.screen();
         let viewport_size = self.context.size;
         let current_gen = screen.generation();
+        // Always re-prepare until libghostty-vt dirty tracking is confirmed working
+        let screen_changed = true;
 
-        // Only re-prepare text and backgrounds when the screen has actually changed
-        let screen_changed = current_gen != self.last_screen_generation;
+        // Terminal content is offset below the tab bar
+        let terminal_y_offset = TAB_BAR_HEIGHT;
 
         // Step 1: Get surface texture
         let output = self
@@ -101,8 +107,8 @@ impl TerminalRenderer {
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         if screen_changed {
-            // Step 2: Update background instances
-            self.background.update(
+            // Step 2: Update background instances (offset by tab bar)
+            self.background.update_with_offset(
                 &self.context.device,
                 &self.context.queue,
                 screen,
@@ -110,30 +116,42 @@ impl TerminalRenderer {
                 self.scroll_offset,
                 viewport_size,
                 &self.color_scheme,
+                terminal_y_offset,
             );
 
-            // Step 3: Prepare text
+            // Step 3: Prepare terminal text (offset by tab bar)
             self.atlas
-                .prepare(
+                .prepare_with_offset(
                     &self.context.device,
                     &self.context.queue,
                     screen,
                     self.scroll_offset,
                     viewport_size,
                     &self.color_scheme,
+                    terminal_y_offset,
+                    &self.tab_state,
+                    TAB_BAR_HEIGHT,
                 )
                 .map_err(|e| RendererError::Render(format!("text prepare: {e:?}")))?;
 
             self.last_screen_generation = current_gen;
         }
 
-        // Step 4: Build command buffer
+        // Step 4: Update tab bar
+        self.tab_bar.update(
+            &self.context.queue,
+            &self.context.device,
+            viewport_size,
+            TAB_BAR_HEIGHT,
+            &self.tab_state,
+        );
+
+        // Step 5: Build command buffer
         let mut encoder =
             self.context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("forgetty render encoder"),
             });
 
-        // Clear color from the color scheme background
         let bg = &self.color_scheme.background;
         let clear_color = wgpu::Color {
             r: bg[0] as f64 / 255.0,
@@ -158,15 +176,18 @@ impl TerminalRenderer {
                 occlusion_query_set: None,
             });
 
-            // Pass 1: Backgrounds
+            // Pass 1: Tab bar background (at top)
+            self.tab_bar.render(&mut pass);
+
+            // Pass 2: Terminal cell backgrounds (below tab bar)
             self.background.render(&mut pass);
 
-            // Pass 2: Text
+            // Pass 3: All text (tab titles + terminal text)
             self.atlas
                 .render(&mut pass)
                 .map_err(|e| RendererError::Render(format!("text render: {e:?}")))?;
 
-            // Pass 3: Cursor
+            // Pass 4: Cursor (offset by tab bar)
             let (cursor_row, cursor_col) = terminal.cursor();
             self.cursor_renderer.render(
                 &mut pass,
@@ -177,14 +198,14 @@ impl TerminalRenderer {
                 self.cursor_style,
                 viewport_size,
                 self.color_scheme.cursor,
+                terminal_y_offset,
             );
         }
 
-        // Step 5: Submit and present
+        // Step 6: Submit and present
         self.context.queue.submit(std::iter::once(encoder.finish()));
         output.present();
 
-        // Step 6: Post-frame maintenance
         self.atlas.trim();
         self.damage.mark_clean(screen);
 
@@ -202,32 +223,34 @@ impl TerminalRenderer {
     pub fn grid_size(&self) -> (usize, usize) {
         let cell = self.atlas.cell_size();
         let (w, h) = self.context.size;
+        let usable_h = h as f32 - TAB_BAR_HEIGHT;
         let cols = (w as f32 / cell.width).floor() as usize;
-        let rows = (h as f32 / cell.height).floor() as usize;
+        let rows = (usable_h / cell.height).floor() as usize;
         (rows.max(1), cols.max(1))
     }
 
-    /// Set the scroll offset (number of rows scrolled back).
+    /// Update the tab bar state.
+    pub fn set_tab_info(&mut self, tabs: Vec<(String, bool)>) {
+        self.tab_state.active_index = tabs.iter().position(|(_, active)| *active).unwrap_or(0);
+        self.tab_state.tabs = tabs.into_iter().map(|(title, _)| TabInfo { title }).collect();
+    }
+
     pub fn set_scroll_offset(&mut self, offset: usize) {
         self.scroll_offset = offset;
     }
 
-    /// Update the color scheme.
     pub fn set_color_scheme(&mut self, scheme: ColorScheme) {
         self.color_scheme = scheme;
     }
 
-    /// Set the cursor style.
     pub fn set_cursor_style(&mut self, style: CursorStyle) {
         self.cursor_style = style;
     }
 
-    /// Get a reference to the render context.
     pub fn context(&self) -> &RenderContext {
         &self.context
     }
 
-    /// Get a mutable reference to the render context.
     pub fn context_mut(&mut self) -> &mut RenderContext {
         &mut self.context
     }

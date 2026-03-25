@@ -234,14 +234,9 @@ impl App {
             Action::CloseTab => self.close_active_tab(),
             Action::NextTab => self.next_tab(),
             Action::PrevTab => self.prev_tab(),
-            Action::SplitHorizontal => self.split_focused(SplitDirection::Horizontal),
-            Action::SplitVertical => self.split_focused(SplitDirection::Vertical),
+            Action::SplitDown => self.split_focused(SplitDirection::Vertical),
+            Action::SplitRight => self.split_focused(SplitDirection::Horizontal),
             Action::ClosePane => self.close_focused_pane(),
-            Action::FocusNext => {
-                if let Some(tab) = self.active_tab_mut() {
-                    tab.focus_next();
-                }
-            }
             Action::FocusUp => {
                 if let Some(tab) = self.active_tab_mut() {
                     tab.focus_direction(SplitDirection::Vertical, false);
@@ -277,10 +272,14 @@ impl App {
                     }
                 }
             }
-            Action::ScrollPageUp | Action::ScrollUp => {
+            Action::ClearScreen => {
+                // Send Ctrl+L to the PTY
+                self.write_to_focused_pty(&[0x0c]);
+            }
+            Action::ScrollPageUp => {
                 // TODO: implement scrollback navigation
             }
-            Action::ScrollPageDown | Action::ScrollDown => {
+            Action::ScrollPageDown => {
                 // TODO: implement scrollback navigation
             }
             Action::ResetScroll => {
@@ -401,8 +400,25 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
 
-                // 3. Render the focused pane of the active tab.
-                //    For the MVP, we render only the focused pane full-screen.
+                // 3. Update tab info for the status bar.
+                if let Some(renderer) = &mut self.renderer {
+                    let tab_info: Vec<(String, bool)> = self
+                        .tabs
+                        .iter()
+                        .enumerate()
+                        .map(|(i, tab)| {
+                            let title = if tab.title.is_empty() {
+                                format!("Tab {}", i + 1)
+                            } else {
+                                tab.title.clone()
+                            };
+                            (title, i == self.active_tab)
+                        })
+                        .collect();
+                    renderer.set_tab_info(tab_info);
+                }
+
+                // 4. Render the focused pane of the active tab.
                 let focused = self.focused_pane_id();
                 if let (Some(renderer), Some(pane_id)) = (&mut self.renderer, focused) {
                     if let Some(pane) = self.panes.get(&pane_id) {
