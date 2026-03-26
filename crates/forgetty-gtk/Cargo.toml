@@ -1,0 +1,12 @@
+[package]
+name = "forgetty-gtk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+forgetty-core = { path = "../forgetty-core" }
+forgetty-config = { path = "../forgetty-config" }
+gtk4 = { workspace = true }
+libadwaita = { workspace = true }
+tracing = { workspace = true }
