@@ -22,6 +22,7 @@ use gtk4::prelude::*;
 use libadwaita as adw;
 use tracing::info;
 
+use crate::clipboard;
 use crate::terminal::{self, TerminalState};
 
 /// The application ID used for D-Bus registration and desktop integration.
@@ -243,6 +244,20 @@ fn build_ui(app: &adw::Application, config: &Config) {
     }
 
     app.set_accels_for_action("win.close-pane", &["<Control><Shift>w"]);
+
+    // --- Copy selection action (Ctrl+Shift+C) ---
+    {
+        let states_copy = Rc::clone(&tab_states);
+        let focus_copy = Rc::clone(&focus_tracker);
+        let window_copy = window.clone();
+        let action = gio::SimpleAction::new("copy", None);
+        action.connect_activate(move |_action, _param| {
+            copy_selection(&states_copy, &focus_copy, &window_copy);
+        });
+        window.add_action(&action);
+    }
+
+    app.set_accels_for_action("win.copy", &["<Control><Shift>c"]);
 
     // --- Pane navigation actions (Alt+Arrow) ---
     for (name, direction) in [
@@ -785,6 +800,72 @@ fn navigate_pane(tab_view: &adw::TabView, focus_tracker: &FocusTracker, directio
 /// Check if two 1D float ranges overlap. Each range is [start, end).
 fn ranges_overlap(a_start: f32, a_end: f32, b_start: f32, b_end: f32) -> bool {
     a_start < b_end && b_start < a_end
+}
+
+// ---------------------------------------------------------------------------
+// Copy selection
+// ---------------------------------------------------------------------------
+
+/// Copy the currently selected text from the focused pane to the system clipboard.
+///
+/// Extracts text from the selection, runs it through the smart copy pipeline
+/// (strip box-drawing, trailing whitespace, normalize newlines), and places
+/// the result on the system clipboard via GDK.
+fn copy_selection(
+    tab_states: &TabStateMap,
+    focus_tracker: &FocusTracker,
+    window: &adw::ApplicationWindow,
+) {
+    let focused_name = {
+        let Ok(name) = focus_tracker.try_borrow() else {
+            return;
+        };
+        name.clone()
+    };
+
+    if focused_name.is_empty() {
+        return;
+    }
+
+    let Ok(states) = tab_states.try_borrow() else {
+        return;
+    };
+
+    let Some(state_rc) = states.get(&focused_name).cloned() else {
+        return;
+    };
+    drop(states);
+
+    let Ok(s) = state_rc.try_borrow_mut() else {
+        return;
+    };
+
+    // AC-9: Do nothing if no active selection
+    let Some(ref sel) = s.selection else {
+        return;
+    };
+
+    // Extract text from the screen at the selected cell range
+    let screen = s.terminal.screen();
+    let raw_text = sel.extract_text(screen);
+
+    if raw_text.is_empty() {
+        return;
+    }
+
+    // Run through the smart copy pipeline (AC-6, AC-7, AC-8)
+    let cleaned = clipboard::smart_copy_pipeline(&raw_text);
+
+    if cleaned.is_empty() {
+        return;
+    }
+
+    // Write to system clipboard via GDK
+    let display = gtk4::prelude::WidgetExt::display(window);
+    let gdk_clipboard = display.clipboard();
+    gdk_clipboard.set_text(&cleaned);
+
+    tracing::debug!("Copied {} chars to clipboard", cleaned.len());
 }
 
 // ---------------------------------------------------------------------------
