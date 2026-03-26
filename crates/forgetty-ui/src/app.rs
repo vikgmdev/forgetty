@@ -16,6 +16,7 @@ use winit::keyboard::ModifiersState;
 use winit::window::{Window, WindowAttributes, WindowId};
 
 use crate::clipboard::SmartClipboard;
+use crate::ghostty_input::{GhosttyInput, ScrollAction};
 use crate::input::encode_key;
 use crate::keybindings::{Action, KeyBindings};
 use crate::notifications;
@@ -45,6 +46,15 @@ pub struct App {
     keybindings: KeyBindings,
     clipboard: Option<SmartClipboard>,
 
+    // Ghostty key/mouse encoder for proper VT input encoding.
+    ghostty_input: GhosttyInput,
+
+    // Last known cursor position (for mouse events).
+    cursor_position: (f64, f64),
+
+    // Track window focus state for focus reporting.
+    window_focused: bool,
+
     // Event loop proxy for waking the main thread from PTY reader threads.
     proxy: EventLoopProxy<UserEvent>,
 }
@@ -62,6 +72,9 @@ impl App {
             panes: HashMap::new(),
             keybindings: KeyBindings::default_bindings(),
             clipboard: SmartClipboard::new(),
+            ghostty_input: GhosttyInput::new(),
+            cursor_position: (0.0, 0.0),
+            window_focused: true,
             proxy,
         }
     }
@@ -277,15 +290,42 @@ impl App {
                 self.write_to_focused_pty(&[0x0c]);
             }
             Action::ScrollPageUp => {
-                // TODO: implement scrollback navigation
+                let (rows, _cols) = self.current_grid_size();
+                let delta = -((rows.max(3) - 2) as isize);
+                if let Some(pane_id) = self.focused_pane_id() {
+                    if let Some(pane) = self.panes.get_mut(&pane_id) {
+                        pane.terminal.scroll_viewport_delta(delta);
+                    }
+                }
             }
             Action::ScrollPageDown => {
-                // TODO: implement scrollback navigation
+                let (rows, _cols) = self.current_grid_size();
+                let delta = (rows.max(3) - 2) as isize;
+                if let Some(pane_id) = self.focused_pane_id() {
+                    if let Some(pane) = self.panes.get_mut(&pane_id) {
+                        pane.terminal.scroll_viewport_delta(delta);
+                    }
+                }
             }
             Action::ResetScroll => {
-                // TODO: implement scrollback reset
+                if let Some(pane_id) = self.focused_pane_id() {
+                    if let Some(pane) = self.panes.get_mut(&pane_id) {
+                        pane.terminal.scroll_viewport_bottom();
+                    }
+                }
             }
             Action::None => {}
+        }
+    }
+
+    /// Get screen and cell sizes for mouse encoder.
+    fn get_screen_cell_sizes(&self) -> (u32, u32, u32, u32) {
+        if let Some(renderer) = &self.renderer {
+            let (screen_w, screen_h) = renderer.surface_size();
+            let (cell_w, cell_h) = renderer.cell_size();
+            (screen_w, screen_h, cell_w, cell_h)
+        } else {
+            (960, 640, 8, 16)
         }
     }
 
@@ -445,7 +485,9 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             WindowEvent::KeyboardInput { event, .. } => {
-                if event.state == ElementState::Pressed {
+                let is_press = event.state == ElementState::Pressed;
+
+                if is_press {
                     // Check keybindings BEFORE encoding for PTY.
                     let action = self.keybindings.match_key(&event, self.modifiers);
                     if action != Action::None {
@@ -455,8 +497,40 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         return;
                     }
+                }
 
-                    // No binding matched — encode and send to PTY.
+                // Use ghostty encoder for both press and release events.
+                // The encoder handles Kitty protocol release events automatically
+                // via setopt_from_terminal — if the terminal hasn't requested
+                // release events, the encoder will produce no output for them.
+                let terminal_handle = self
+                    .focused_pane_id()
+                    .and_then(|id| self.panes.get(&id))
+                    .map(|pane| pane.terminal.raw_handle());
+
+                if let Some(handle) = terminal_handle {
+                    if let Some(bytes) = self.ghostty_input.encode_key(
+                        &event,
+                        self.modifiers,
+                        handle,
+                        is_press,
+                        event.repeat,
+                    ) {
+                        self.write_to_focused_pty(&bytes);
+                        // Scroll to bottom on input (matching standard terminal behavior).
+                        if is_press {
+                            if let Some(pane_id) = self.focused_pane_id() {
+                                if let Some(pane) = self.panes.get_mut(&pane_id) {
+                                    pane.terminal.scroll_viewport_bottom();
+                                }
+                            }
+                        }
+                        if let Some(window) = &self.window {
+                            window.request_redraw();
+                        }
+                    }
+                } else if is_press {
+                    // Fallback to legacy encoder if no terminal handle available.
                     if let Some(bytes) = encode_key(&event, self.modifiers) {
                         self.write_to_focused_pty(&bytes);
                         if let Some(window) = &self.window {
@@ -466,19 +540,126 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
 
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor_position = (position.x, position.y);
+
+                let terminal_handle = self
+                    .focused_pane_id()
+                    .and_then(|id| self.panes.get(&id))
+                    .map(|pane| pane.terminal.raw_handle());
+
+                if let Some(handle) = terminal_handle {
+                    let (screen_w, screen_h, cell_w, cell_h) = self.get_screen_cell_sizes();
+                    if let Some(bytes) = self.ghostty_input.handle_mouse_move(
+                        self.cursor_position,
+                        self.modifiers,
+                        handle,
+                        (screen_w, screen_h),
+                        (cell_w, cell_h),
+                    ) {
+                        self.write_to_focused_pty(&bytes);
+                        if let Some(window) = &self.window {
+                            window.request_redraw();
+                        }
+                    }
+                }
+            }
+
+            WindowEvent::MouseInput { state, button, .. } => {
+                let pressed = state == ElementState::Pressed;
+
+                let terminal_handle = self
+                    .focused_pane_id()
+                    .and_then(|id| self.panes.get(&id))
+                    .map(|pane| pane.terminal.raw_handle());
+
+                if let Some(handle) = terminal_handle {
+                    let (screen_w, screen_h, cell_w, cell_h) = self.get_screen_cell_sizes();
+                    if let Some(bytes) = self.ghostty_input.handle_mouse_button(
+                        button,
+                        pressed,
+                        self.cursor_position,
+                        self.modifiers,
+                        handle,
+                        (screen_w, screen_h),
+                        (cell_w, cell_h),
+                    ) {
+                        self.write_to_focused_pty(&bytes);
+                        if let Some(window) = &self.window {
+                            window.request_redraw();
+                        }
+                    }
+                }
+            }
+
             WindowEvent::MouseWheel { delta, .. } => {
-                let lines = match delta {
-                    winit::event::MouseScrollDelta::LineDelta(_, y) => y as i32,
-                    winit::event::MouseScrollDelta::PixelDelta(pos) => (pos.y / 20.0) as i32,
+                let delta_lines = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, y) => y,
+                    winit::event::MouseScrollDelta::PixelDelta(pos) => (pos.y / 20.0) as f32,
                 };
 
-                if lines > 0 {
-                    for _ in 0..lines.unsigned_abs() {
-                        self.write_to_focused_pty(b"\x1b[A");
+                if delta_lines == 0.0 {
+                    return;
+                }
+
+                let terminal_handle = self
+                    .focused_pane_id()
+                    .and_then(|id| self.panes.get(&id))
+                    .map(|pane| pane.terminal.raw_handle());
+
+                let mouse_tracking = self
+                    .focused_pane_id()
+                    .and_then(|id| self.panes.get(&id))
+                    .map(|pane| pane.terminal.is_mouse_tracking())
+                    .unwrap_or(false);
+
+                if let Some(handle) = terminal_handle {
+                    let (screen_w, screen_h, cell_w, cell_h) = self.get_screen_cell_sizes();
+                    let action = self.ghostty_input.handle_scroll(
+                        delta_lines,
+                        self.modifiers,
+                        self.cursor_position,
+                        handle,
+                        mouse_tracking,
+                        (screen_w, screen_h),
+                        (cell_w, cell_h),
+                    );
+                    match action {
+                        ScrollAction::WriteBytes(bytes) => {
+                            self.write_to_focused_pty(&bytes);
+                        }
+                        ScrollAction::ScrollViewport(delta) => {
+                            if let Some(pane_id) = self.focused_pane_id() {
+                                if let Some(pane) = self.panes.get_mut(&pane_id) {
+                                    pane.terminal.scroll_viewport_delta(delta);
+                                }
+                            }
+                        }
                     }
-                } else if lines < 0 {
-                    for _ in 0..lines.unsigned_abs() {
-                        self.write_to_focused_pty(b"\x1b[B");
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                }
+            }
+
+            WindowEvent::Focused(focused) => {
+                if focused != self.window_focused {
+                    self.window_focused = focused;
+
+                    // Send focus event if the terminal has focus reporting enabled.
+                    let focus_reporting = self
+                        .focused_pane_id()
+                        .and_then(|id| self.panes.get(&id))
+                        .map(|pane| pane.terminal.is_focus_reporting())
+                        .unwrap_or(false);
+
+                    if focus_reporting {
+                        if let Some(bytes) = GhosttyInput::encode_focus(focused) {
+                            self.write_to_focused_pty(&bytes);
+                            if let Some(window) = &self.window {
+                                window.request_redraw();
+                            }
+                        }
                     }
                 }
             }

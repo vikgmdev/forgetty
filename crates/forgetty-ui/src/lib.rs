@@ -7,6 +7,7 @@
 
 pub mod app;
 pub mod clipboard;
+pub mod ghostty_input;
 pub mod input;
 pub mod keybindings;
 pub mod layout;

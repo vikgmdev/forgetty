@@ -332,6 +332,58 @@ impl Terminal {
         self.handle
     }
 
+    /// Scroll the viewport by a delta (negative = up/into history, positive = down).
+    pub fn scroll_viewport_delta(&mut self, delta: isize) {
+        let sv = ffi::GhosttyTerminalScrollViewport {
+            tag: ffi::GHOSTTY_SCROLL_VIEWPORT_DELTA,
+            value: ffi::GhosttyTerminalScrollViewportValue { delta },
+        };
+        unsafe {
+            ffi::ghostty_terminal_scroll_viewport(self.handle, sv);
+        }
+        let cache = self.cache.get_mut();
+        cache.screen_dirty = true;
+    }
+
+    /// Scroll the viewport to the bottom (active area).
+    pub fn scroll_viewport_bottom(&mut self) {
+        let sv = ffi::GhosttyTerminalScrollViewport {
+            tag: ffi::GHOSTTY_SCROLL_VIEWPORT_BOTTOM,
+            value: ffi::GhosttyTerminalScrollViewportValue { _padding: [0; 2] },
+        };
+        unsafe {
+            ffi::ghostty_terminal_scroll_viewport(self.handle, sv);
+        }
+        let cache = self.cache.get_mut();
+        cache.screen_dirty = true;
+    }
+
+    /// Check if any mouse tracking mode is active.
+    pub fn is_mouse_tracking(&self) -> bool {
+        let mut tracking: bool = false;
+        unsafe {
+            ffi::ghostty_terminal_get(
+                self.handle,
+                ffi::GHOSTTY_TERMINAL_DATA_MOUSE_TRACKING,
+                &mut tracking as *mut bool as *mut c_void,
+            );
+        }
+        tracking
+    }
+
+    /// Check if focus reporting mode (DECSET 1004) is active.
+    pub fn is_focus_reporting(&self) -> bool {
+        let mut enabled: bool = false;
+        unsafe {
+            ffi::ghostty_terminal_mode_get(
+                self.handle,
+                ffi::GHOSTTY_MODE_FOCUS_EVENT,
+                &mut enabled,
+            );
+        }
+        enabled
+    }
+
     /// Get scrollback lines.
     ///
     /// Scrollback is currently not implemented via the render state API.
