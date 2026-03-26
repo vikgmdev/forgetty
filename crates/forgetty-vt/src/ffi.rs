@@ -206,8 +206,10 @@ pub const GHOSTTY_RENDER_STATE_ROW_OPTION_DIRTY: i32 = 0;
 // Row cells data types
 pub const GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW: i32 = 1;
 pub const GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_STYLE: i32 = 2;
-pub const GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_FG_COLOR: i32 = 6;
+pub const GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_LEN: i32 = 3;
+pub const GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_BUF: i32 = 4;
 pub const GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_BG_COLOR: i32 = 5;
+pub const GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_FG_COLOR: i32 = 6;
 
 // Point types
 #[repr(C)]
@@ -247,6 +249,30 @@ pub struct GhosttyGridRef {
 }
 
 impl GhosttyGridRef {
+    pub fn init_sized() -> Self {
+        let mut s: Self = unsafe { std::mem::zeroed() };
+        s.size = std::mem::size_of::<Self>();
+        s
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Render state colors (sized-struct pattern)
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct GhosttyRenderStateColors {
+    pub size: usize,
+    pub background: GhosttyColorRgb,
+    pub foreground: GhosttyColorRgb,
+    pub cursor: GhosttyColorRgb,
+    pub cursor_has_value: bool,
+    pub palette: [GhosttyColorRgb; 256],
+}
+
+impl GhosttyRenderStateColors {
+    /// Create a zeroed colors struct with the `size` field set.
     pub fn init_sized() -> Self {
         let mut s: Self = unsafe { std::mem::zeroed() };
         s.size = std::mem::size_of::<Self>();
@@ -391,4 +417,10 @@ extern "C" {
     ) -> GhosttyResult;
 
     pub fn ghostty_render_state_row_cells_free(cells: GhosttyRenderStateRowCells);
+
+    // Render state colors
+    pub fn ghostty_render_state_colors_get(
+        state: GhosttyRenderState,
+        out_colors: *mut GhosttyRenderStateColors,
+    ) -> GhosttyResult;
 }

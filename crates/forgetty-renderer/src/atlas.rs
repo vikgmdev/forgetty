@@ -114,7 +114,7 @@ impl GlyphAtlas {
             );
 
             // Build rich text spans with per-character colors and monospace font
-            let char_strings: Vec<String> = row.iter().map(|c| c.character.to_string()).collect();
+            let char_strings: Vec<String> = row.iter().map(|c| c.grapheme.clone()).collect();
 
             let rich_text: Vec<(&str, glyphon::Attrs)> = char_strings
                 .iter()
@@ -228,7 +228,7 @@ impl GlyphAtlas {
                 Some(self.line_height),
             );
 
-            let char_strings: Vec<String> = row.iter().map(|c| c.character.to_string()).collect();
+            let char_strings: Vec<String> = row.iter().map(|c| c.grapheme.clone()).collect();
             let rich_text: Vec<(&str, glyphon::Attrs)> = char_strings
                 .iter()
                 .zip(row.iter())

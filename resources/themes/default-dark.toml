@@ -2,7 +2,7 @@
 foreground = "#cdd6f4"
 background = "#1e1e2e"
 cursor = "#f5e0dc"
-selection = "#45475a"
+selection = "#585b70"
 
 [colors.ansi]
 black = "#45475a"
@@ -22,4 +22,4 @@ yellow = "#f9e2af"
 blue = "#89b4fa"
 magenta = "#f5c2e7"
 cyan = "#94e2d5"
-white = "#a6adc8"
+white = "#cdd6f4"

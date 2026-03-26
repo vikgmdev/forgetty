@@ -1054,6 +1054,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "cosmic-text",
+ "forgetty-config",
  "forgetty-core",
  "forgetty-vt",
  "glyphon",

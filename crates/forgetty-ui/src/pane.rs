@@ -89,9 +89,11 @@ impl Pane {
 
     /// Drain PTY output and feed to terminal.
     pub fn drain_output(&mut self) {
+        let mut had_output = false;
         loop {
             match self.pty_rx.try_recv() {
                 Ok(data) => {
+                    had_output = true;
                     self.terminal.feed(&data);
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
@@ -110,6 +112,39 @@ impl Pane {
         if !t.is_empty() {
             self.title = t.to_string();
         }
+
+        // Refresh cwd from /proc/{pid}/cwd when we received output.
+        if had_output {
+            if let Some(pid) = self.pty.pid() {
+                let proc_path = format!("/proc/{}/cwd", pid);
+                if let Ok(target) = std::fs::read_link(&proc_path) {
+                    let new_cwd = target.to_string_lossy().to_string();
+                    if new_cwd != self.cwd {
+                        self.cwd = new_cwd;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Return a display-friendly title for this pane.
+    ///
+    /// Priority: basename of cwd > OSC title (if meaningful) > "shell".
+    pub fn display_title(&self) -> String {
+        // Always prefer the actual cwd (from /proc) — it's a clean path.
+        if !self.cwd.is_empty() {
+            return std::path::Path::new(&self.cwd)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| self.cwd.clone());
+        }
+
+        // Fall back to OSC title if cwd is not available.
+        if !self.title.is_empty() && self.title != "shell" {
+            return self.title.clone();
+        }
+
+        "shell".to_string()
     }
 
     /// Write bytes to PTY.

@@ -7,13 +7,13 @@
 /// A single cell in the terminal grid.
 #[derive(Debug, Clone)]
 pub struct Cell {
-    pub character: char,
+    pub grapheme: String,
     pub attrs: CellAttributes,
 }
 
 impl Default for Cell {
     fn default() -> Self {
-        Self { character: ' ', attrs: CellAttributes::default() }
+        Self { grapheme: " ".to_string(), attrs: CellAttributes::default() }
     }
 }
 
@@ -31,14 +31,15 @@ pub struct CellAttributes {
 }
 
 /// A color value for terminal cells.
+///
+/// All palette lookups are resolved by libghostty-vt before reaching Rust.
+/// Only `Default` (use theme color) and `Rgb` (pre-resolved) remain.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum Color {
     /// Use the terminal's default foreground or background color.
     #[default]
     Default,
-    /// A color from the 256-color palette (0-255).
-    Indexed(u8),
-    /// A 24-bit truecolor value.
+    /// A 24-bit truecolor value (pre-resolved from palette by libghostty-vt).
     Rgb(u8, u8, u8),
 }
 

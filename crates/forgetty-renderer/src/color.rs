@@ -1,8 +1,11 @@
 //! Color conversion and management utilities.
 //!
 //! Handles conversion between the various color representations used
-//! throughout the terminal (ANSI indices, RGB, theme colors) and the
-//! GPU-friendly formats needed by the renderer.
+//! throughout the terminal (RGB, theme colors) and the GPU-friendly
+//! formats needed by the renderer.
+//!
+//! All palette lookups are now resolved by libghostty-vt before reaching
+//! the renderer. The `Color` enum only has `Default` and `Rgb` variants.
 
 use forgetty_vt::Color;
 
@@ -16,85 +19,76 @@ pub struct ColorScheme {
     pub cursor: [u8; 4],
     /// Selection highlight color.
     pub selection: [u8; 4],
-    /// The 16 standard ANSI colors.
+    /// The 16 standard ANSI colors (kept for theme UI, not for palette resolution).
     pub ansi: [[u8; 4]; 16],
 }
 
 impl Default for ColorScheme {
-    /// Catppuccin Mocha-inspired defaults.
+    /// Default color scheme aligned with `Theme::default()` (Catppuccin Mocha).
     fn default() -> Self {
         Self {
-            foreground: [205, 214, 244, 255], // #CDD6F4
-            background: [30, 30, 46, 255],    // #1E1E2E
-            cursor: [245, 224, 220, 255],     // #F5E0DC
-            selection: [88, 91, 112, 128],    // #585B70 with alpha
+            foreground: [205, 214, 244, 255], // #cdd6f4
+            background: [30, 30, 46, 255],    // #1e1e2e
+            cursor: [245, 224, 220, 255],     // #f5e0dc
+            selection: [88, 91, 112, 128],    // #585b70 with alpha
             ansi: [
-                [69, 71, 90, 255],    // 0  black   #45475A
-                [243, 139, 168, 255], // 1  red     #F38BA8
-                [166, 227, 161, 255], // 2  green   #A6E3A1
-                [249, 226, 175, 255], // 3  yellow  #F9E2AF
-                [137, 180, 250, 255], // 4  blue    #89B4FA
-                [245, 194, 231, 255], // 5  magenta #F5C2E7
-                [148, 226, 213, 255], // 6  cyan    #94E2D5
-                [186, 194, 222, 255], // 7  white   #BAC2DE
-                [88, 91, 112, 255],   // 8  bright black   #585B70
-                [243, 139, 168, 255], // 9  bright red     #F38BA8
-                [166, 227, 161, 255], // 10 bright green   #A6E3A1
-                [249, 226, 175, 255], // 11 bright yellow  #F9E2AF
-                [137, 180, 250, 255], // 12 bright blue    #89B4FA
-                [245, 194, 231, 255], // 13 bright magenta #F5C2E7
-                [148, 226, 213, 255], // 14 bright cyan    #94E2D5
-                [205, 214, 244, 255], // 15 bright white   #CDD6F4
+                [69, 71, 90, 255],    // 0  black   #45475a
+                [243, 139, 168, 255], // 1  red     #f38ba8
+                [166, 227, 161, 255], // 2  green   #a6e3a1
+                [249, 226, 175, 255], // 3  yellow  #f9e2af
+                [137, 180, 250, 255], // 4  blue    #89b4fa
+                [245, 194, 231, 255], // 5  magenta #f5c2e7
+                [148, 226, 213, 255], // 6  cyan    #94e2d5
+                [186, 194, 222, 255], // 7  white   #bac2de
+                [88, 91, 112, 255],   // 8  bright black   #585b70
+                [243, 139, 168, 255], // 9  bright red     #f38ba8
+                [166, 227, 161, 255], // 10 bright green   #a6e3a1
+                [249, 226, 175, 255], // 11 bright yellow  #f9e2af
+                [137, 180, 250, 255], // 12 bright blue    #89b4fa
+                [245, 194, 231, 255], // 13 bright magenta #f5c2e7
+                [148, 226, 213, 255], // 14 bright cyan    #94e2d5
+                [205, 214, 244, 255], // 15 bright white   #cdd6f4
             ],
         }
     }
 }
 
 impl ColorScheme {
+    /// Build a `ColorScheme` from a config `Theme`.
+    pub fn from_theme(theme: &forgetty_config::theme::Theme) -> Self {
+        let to_rgba = |c: forgetty_core::Rgba| -> [u8; 4] { [c.r, c.g, c.b, c.a] };
+        let mut ansi = [[0u8; 4]; 16];
+        for (i, color) in theme.ansi_colors.iter().enumerate() {
+            ansi[i] = to_rgba(*color);
+        }
+        Self {
+            foreground: to_rgba(theme.foreground),
+            background: to_rgba(theme.background),
+            cursor: to_rgba(theme.cursor),
+            selection: to_rgba(theme.selection),
+            ansi,
+        }
+    }
+
     /// Resolve a terminal Color to an RGBA foreground color.
+    ///
+    /// Colors are pre-resolved by libghostty-vt, so this only handles
+    /// `Default` (use theme foreground) and `Rgb` (use directly).
     pub fn resolve_fg(&self, color: Color) -> [u8; 4] {
         match color {
             Color::Default => self.foreground,
-            Color::Indexed(idx) => self.resolve_indexed(idx),
             Color::Rgb(r, g, b) => [r, g, b, 255],
         }
     }
 
     /// Resolve a terminal Color to an RGBA background color.
+    ///
+    /// Colors are pre-resolved by libghostty-vt, so this only handles
+    /// `Default` (use theme background) and `Rgb` (use directly).
     pub fn resolve_bg(&self, color: Color) -> [u8; 4] {
         match color {
             Color::Default => self.background,
-            Color::Indexed(idx) => self.resolve_indexed(idx),
             Color::Rgb(r, g, b) => [r, g, b, 255],
-        }
-    }
-
-    /// Resolve a 256-color palette index to RGBA.
-    fn resolve_indexed(&self, idx: u8) -> [u8; 4] {
-        match idx {
-            // Standard 16 ANSI colors
-            0..=15 => self.ansi[idx as usize],
-            // 6x6x6 color cube (indices 16-231)
-            16..=231 => {
-                let idx = idx - 16;
-                let r = idx / 36;
-                let g = (idx % 36) / 6;
-                let b = idx % 6;
-                // Map each component: 0 -> 0, 1 -> 95, 2 -> 135, 3 -> 175, 4 -> 215, 5 -> 255
-                let to_val = |c: u8| -> u8 {
-                    if c == 0 {
-                        0
-                    } else {
-                        55 + c * 40
-                    }
-                };
-                [to_val(r), to_val(g), to_val(b), 255]
-            }
-            // Grayscale ramp (indices 232-255)
-            232..=255 => {
-                let level = 8 + (idx - 232) * 10;
-                [level, level, level, 255]
-            }
         }
     }
 }
@@ -122,38 +116,8 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_fg_indexed_ansi() {
+    fn test_resolve_bg_rgb() {
         let scheme = ColorScheme::default();
-        // Index 1 = red
-        assert_eq!(scheme.resolve_fg(Color::Indexed(1)), [243, 139, 168, 255]);
-        // Index 0 = black
-        assert_eq!(scheme.resolve_fg(Color::Indexed(0)), [69, 71, 90, 255]);
-    }
-
-    #[test]
-    fn test_resolve_indexed_color_cube() {
-        let scheme = ColorScheme::default();
-        // Index 16 = rgb(0,0,0) in cube
-        assert_eq!(scheme.resolve_fg(Color::Indexed(16)), [0, 0, 0, 255]);
-        // Index 21 = rgb(0,0,255)
-        assert_eq!(scheme.resolve_fg(Color::Indexed(21)), [0, 0, 255, 255]);
-        // Index 196 = rgb(255,0,0)
-        assert_eq!(scheme.resolve_fg(Color::Indexed(196)), [255, 0, 0, 255]);
-    }
-
-    #[test]
-    fn test_resolve_indexed_grayscale() {
-        let scheme = ColorScheme::default();
-        // Index 232 = darkest gray
-        assert_eq!(scheme.resolve_fg(Color::Indexed(232)), [8, 8, 8, 255]);
-        // Index 255 = lightest gray
-        assert_eq!(scheme.resolve_fg(Color::Indexed(255)), [238, 238, 238, 255]);
-    }
-
-    #[test]
-    fn test_resolve_bg_indexed() {
-        let scheme = ColorScheme::default();
-        // bg resolution uses the same indexed palette
-        assert_eq!(scheme.resolve_bg(Color::Indexed(4)), [137, 180, 250, 255]);
+        assert_eq!(scheme.resolve_bg(Color::Rgb(100, 200, 50)), [100, 200, 50, 255]);
     }
 }

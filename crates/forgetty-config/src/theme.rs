@@ -43,41 +43,41 @@ impl Default for Theme {
 }
 
 fn default_foreground() -> Rgba {
-    Rgba::rgb(204, 204, 204)
+    Rgba::rgb(205, 214, 244) // Catppuccin Mocha #cdd6f4
 }
 
 fn default_background() -> Rgba {
-    Rgba::rgb(24, 24, 24)
+    Rgba::rgb(30, 30, 46) // Catppuccin Mocha #1e1e2e
 }
 
 fn default_cursor_color() -> Rgba {
-    Rgba::rgb(255, 255, 255)
+    Rgba::rgb(245, 224, 220) // Catppuccin Mocha #f5e0dc
 }
 
 fn default_selection_color() -> Rgba {
-    Rgba::new(100, 100, 180, 128)
+    Rgba::new(88, 91, 112, 128) // Catppuccin Mocha #585b70 with alpha
 }
 
-/// Returns the default ANSI 16-color palette (roughly xterm-256color defaults).
+/// Returns the default ANSI 16-color palette (Catppuccin Mocha).
 fn default_ansi_colors() -> [Rgba; 16] {
     [
         // Normal colors (0-7)
-        Rgba::rgb(0, 0, 0),       // Black
-        Rgba::rgb(205, 49, 49),   // Red
-        Rgba::rgb(13, 188, 121),  // Green
-        Rgba::rgb(229, 229, 16),  // Yellow
-        Rgba::rgb(36, 114, 200),  // Blue
-        Rgba::rgb(188, 63, 188),  // Magenta
-        Rgba::rgb(17, 168, 205),  // Cyan
-        Rgba::rgb(204, 204, 204), // White
+        Rgba::rgb(69, 71, 90),    // Black   #45475a
+        Rgba::rgb(243, 139, 168), // Red     #f38ba8
+        Rgba::rgb(166, 227, 161), // Green   #a6e3a1
+        Rgba::rgb(249, 226, 175), // Yellow  #f9e2af
+        Rgba::rgb(137, 180, 250), // Blue    #89b4fa
+        Rgba::rgb(245, 194, 231), // Magenta #f5c2e7
+        Rgba::rgb(148, 226, 213), // Cyan    #94e2d5
+        Rgba::rgb(186, 194, 222), // White   #bac2de
         // Bright colors (8-15)
-        Rgba::rgb(102, 102, 102), // Bright Black
-        Rgba::rgb(241, 76, 76),   // Bright Red
-        Rgba::rgb(35, 209, 139),  // Bright Green
-        Rgba::rgb(245, 245, 67),  // Bright Yellow
-        Rgba::rgb(59, 142, 234),  // Bright Blue
-        Rgba::rgb(214, 112, 214), // Bright Magenta
-        Rgba::rgb(41, 184, 219),  // Bright Cyan
-        Rgba::rgb(242, 242, 242), // Bright White
+        Rgba::rgb(88, 91, 112),   // Bright Black   #585b70
+        Rgba::rgb(243, 139, 168), // Bright Red     #f38ba8
+        Rgba::rgb(166, 227, 161), // Bright Green   #a6e3a1
+        Rgba::rgb(249, 226, 175), // Bright Yellow  #f9e2af
+        Rgba::rgb(137, 180, 250), // Bright Blue    #89b4fa
+        Rgba::rgb(245, 194, 231), // Bright Magenta #f5c2e7
+        Rgba::rgb(148, 226, 213), // Bright Cyan    #94e2d5
+        Rgba::rgb(205, 214, 244), // Bright White   #cdd6f4
     ]
 }

@@ -35,8 +35,6 @@ struct Cache {
     scrollback: Vec<Vec<Cell>>,
     /// Whether the screen cache needs rebuilding.
     screen_dirty: bool,
-    /// Whether the scrollback cache needs rebuilding.
-    scrollback_dirty: bool,
 }
 
 /// A virtual terminal that processes VT escape sequences and maintains screen state.
@@ -105,7 +103,6 @@ impl Terminal {
                 title_buf: String::new(),
                 scrollback: Vec::new(),
                 screen_dirty: true,
-                scrollback_dirty: true,
             }),
             callback_state,
             rows,
@@ -121,39 +118,51 @@ impl Terminal {
         unsafe {
             ffi::ghostty_terminal_vt_write(self.handle, bytes.as_ptr(), bytes.len());
         }
-        // Mark caches as dirty
+        // Mark cache as dirty
         let cache = self.cache.get_mut();
         cache.screen_dirty = true;
-        cache.scrollback_dirty = true;
     }
 
     /// Get the current screen state.
     ///
-    /// Lazily updates the render state from the terminal and rebuilds the
-    /// cached cell grid for any dirty rows.
+    /// Always snapshots the render state from the terminal (like Ghostling
+    /// line 1272: `ghostty_render_state_update` every frame). Then rebuilds
+    /// the cached cell grid if the render state reports changes.
     pub fn screen(&self) -> &Screen {
         // Safety: Terminal is !Sync so no concurrent access is possible.
         let cache = unsafe { &mut *self.cache.get() };
-        if cache.screen_dirty {
-            self.sync_screen(cache);
-            cache.screen_dirty = false;
-        }
+        // Always snapshot — this is cheap and must happen every frame
+        // (Ghostling calls render_state_update unconditionally each frame)
+        self.sync_screen(cache);
+        cache.screen_dirty = false;
         &cache.screen
     }
 
-    /// Get cursor position as (row, col).
+    /// Get cursor position as (row, col) from the render state viewport cursor.
     pub fn cursor(&self) -> (usize, usize) {
+        let mut has_value: bool = false;
+        unsafe {
+            ffi::ghostty_render_state_get(
+                self.render_state,
+                ffi::GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_HAS_VALUE,
+                &mut has_value as *mut bool as *mut c_void,
+            );
+        }
+        if !has_value {
+            return (0, 0);
+        }
+
         let mut x: u16 = 0;
         let mut y: u16 = 0;
         unsafe {
-            ffi::ghostty_terminal_get(
-                self.handle,
-                ffi::GHOSTTY_TERMINAL_DATA_CURSOR_Y,
+            ffi::ghostty_render_state_get(
+                self.render_state,
+                ffi::GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_Y,
                 &mut y as *mut u16 as *mut c_void,
             );
-            ffi::ghostty_terminal_get(
-                self.handle,
-                ffi::GHOSTTY_TERMINAL_DATA_CURSOR_X,
+            ffi::ghostty_render_state_get(
+                self.render_state,
+                ffi::GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_X,
                 &mut x as *mut u16 as *mut c_void,
             );
         }
@@ -164,13 +173,27 @@ impl Terminal {
     pub fn cursor_visible(&self) -> bool {
         let mut visible: bool = true;
         unsafe {
-            ffi::ghostty_terminal_get(
-                self.handle,
-                ffi::GHOSTTY_TERMINAL_DATA_CURSOR_VISIBLE,
+            ffi::ghostty_render_state_get(
+                self.render_state,
+                ffi::GHOSTTY_RENDER_STATE_DATA_CURSOR_VISIBLE,
                 &mut visible as *mut bool as *mut c_void,
             );
         }
-        visible
+
+        if !visible {
+            return false;
+        }
+
+        // Also check if cursor is in the viewport
+        let mut has_value: bool = false;
+        unsafe {
+            ffi::ghostty_render_state_get(
+                self.render_state,
+                ffi::GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_HAS_VALUE,
+                &mut has_value as *mut bool as *mut c_void,
+            );
+        }
+        has_value
     }
 
     /// Resize the terminal to new dimensions.
@@ -189,7 +212,6 @@ impl Terminal {
         let cache = self.cache.get_mut();
         cache.screen.resize(rows, cols);
         cache.screen_dirty = true;
-        cache.scrollback_dirty = true;
     }
 
     /// Get the terminal title (set via OSC).
@@ -219,13 +241,11 @@ impl Terminal {
     }
 
     /// Get scrollback lines.
+    ///
+    /// Scrollback is currently not implemented via the render state API.
+    /// It will be re-implemented using the viewport scroll API in a future change.
     pub fn scrollback(&self) -> &[Vec<Cell>] {
-        // Safety: Terminal is !Sync so no concurrent access is possible.
-        let cache = unsafe { &mut *self.cache.get() };
-        if cache.scrollback_dirty {
-            self.rebuild_scrollback_cache(cache);
-            cache.scrollback_dirty = false;
-        }
+        let cache = unsafe { &*self.cache.get() };
         &cache.scrollback
     }
 
@@ -247,6 +267,9 @@ impl Terminal {
     // -----------------------------------------------------------------------
 
     /// Synchronize the cached Screen from the libghostty-vt render state.
+    ///
+    /// This follows the exact same API call sequence as Ghostling's
+    /// `render_terminal()` (main.c lines 647-833).
     ///
     /// # Safety
     /// Caller must ensure exclusive access to `cache` (which is guaranteed
@@ -276,6 +299,14 @@ impl Terminal {
             return;
         }
 
+        // 1. Get colors from render state (matches Ghostling line 657-659)
+        let mut colors = ffi::GhosttyRenderStateColors::init_sized();
+        let rc = unsafe { ffi::ghostty_render_state_colors_get(self.render_state, &mut colors) };
+        if rc != ffi::GHOSTTY_SUCCESS {
+            tracing::warn!("ghostty_render_state_colors_get failed: {rc}");
+            return;
+        }
+
         // Get dimensions from render state
         let mut rs_cols: u16 = 0;
         let mut rs_rows: u16 = 0;
@@ -295,67 +326,114 @@ impl Terminal {
         let num_rows = rs_rows as usize;
         let num_cols = rs_cols as usize;
 
-        // Populate the row iterator from the render state
+        // 2. Populate the row iterator from the render state (matches Ghostling line 662-663)
+        //
+        // IMPORTANT: pass a pointer TO the handle (`&mut self.row_iter`), not the handle
+        // itself. The C API dereferences `out` to obtain the pre-allocated iterator handle,
+        // then writes row data through it. Passing the handle value directly corrupts
+        // the iterator's internal memory and causes intermittent segfaults.
+        let mut row_iter = self.row_iter;
         unsafe {
             ffi::ghostty_render_state_get(
                 self.render_state,
                 ffi::GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR,
-                self.row_iter as *mut c_void,
+                &mut row_iter as *mut ffi::GhosttyRenderStateRowIterator as *mut c_void,
             );
         }
 
-        // Build the cell grid
+        // 3. Build the cell grid by iterating rows (matches Ghostling line 670)
         let mut grid: Vec<Vec<Cell>> = Vec::with_capacity(num_rows);
         let mut dirty_rows: Vec<bool> = Vec::with_capacity(num_rows);
 
         while unsafe { ffi::ghostty_render_state_row_iterator_next(self.row_iter) } {
-            // Check row dirty state
-            let mut row_dirty: bool = false;
-            unsafe {
-                ffi::ghostty_render_state_row_get(
-                    self.row_iter,
-                    ffi::GHOSTTY_RENDER_STATE_ROW_DATA_DIRTY,
-                    &mut row_dirty as *mut bool as *mut c_void,
-                );
-            }
-            dirty_rows.push(row_dirty);
-
-            // Populate cell iterator
+            // Get cells for this row (matches Ghostling line 672-673)
+            //
+            // Same pointer-to-handle pattern as row_iterator above: pass
+            // `&mut row_cells` so the C code can dereference to get the handle.
+            let mut row_cells = self.row_cells;
             unsafe {
                 ffi::ghostty_render_state_row_get(
                     self.row_iter,
                     ffi::GHOSTTY_RENDER_STATE_ROW_DATA_CELLS,
-                    self.row_cells as *mut c_void,
+                    &mut row_cells as *mut ffi::GhosttyRenderStateRowCells as *mut c_void,
                 );
             }
 
             let mut row_cells_vec: Vec<Cell> = Vec::with_capacity(num_cols);
 
+            // 4. Iterate cells (matches Ghostling line 678)
             while unsafe { ffi::ghostty_render_state_row_cells_next(self.row_cells) } {
-                // Get raw cell
-                let mut raw_cell: ffi::GhosttyCell = 0;
+                // 5. Get grapheme length (matches Ghostling line 680-682)
+                let mut grapheme_len: u32 = 0;
                 unsafe {
                     ffi::ghostty_render_state_row_cells_get(
                         self.row_cells,
-                        ffi::GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW,
-                        &mut raw_cell as *mut ffi::GhosttyCell as *mut c_void,
+                        ffi::GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_LEN,
+                        &mut grapheme_len as *mut u32 as *mut c_void,
                     );
                 }
 
-                // Get codepoint
-                let mut codepoint: u32 = 0;
+                if grapheme_len == 0 {
+                    // Empty cell — check for BG color (matches Ghostling line 684-698)
+                    let mut bg_rgb = ffi::GhosttyColorRgb::default();
+                    let has_bg = unsafe {
+                        ffi::ghostty_render_state_row_cells_get(
+                            self.row_cells,
+                            ffi::GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_BG_COLOR,
+                            &mut bg_rgb as *mut ffi::GhosttyColorRgb as *mut c_void,
+                        )
+                    } == ffi::GHOSTTY_SUCCESS;
+
+                    let bg = if has_bg {
+                        Color::Rgb(bg_rgb.r, bg_rgb.g, bg_rgb.b)
+                    } else {
+                        Color::Default
+                    };
+
+                    row_cells_vec.push(Cell {
+                        grapheme: " ".to_string(),
+                        attrs: CellAttributes { bg, ..CellAttributes::default() },
+                    });
+                    continue;
+                }
+
+                // 6. Get grapheme codepoints (matches Ghostling line 702-705)
+                let mut codepoints = [0u32; 16];
+                let len = (grapheme_len as usize).min(16);
                 unsafe {
-                    ffi::ghostty_cell_get(
-                        raw_cell,
-                        ffi::GHOSTTY_CELL_DATA_CODEPOINT,
-                        &mut codepoint as *mut u32 as *mut c_void,
+                    ffi::ghostty_render_state_row_cells_get(
+                        self.row_cells,
+                        ffi::GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_BUF,
+                        codepoints.as_mut_ptr() as *mut c_void,
                     );
                 }
 
-                let character =
-                    if codepoint == 0 { ' ' } else { char::from_u32(codepoint).unwrap_or(' ') };
+                // Convert codepoints to String
+                let grapheme: String =
+                    codepoints[..len].iter().filter_map(|&cp| char::from_u32(cp)).collect();
+                let grapheme = if grapheme.is_empty() { " ".to_string() } else { grapheme };
 
-                // Get style
+                // 7. Get resolved FG color (matches Ghostling line 723-725)
+                let mut fg_rgb = colors.foreground;
+                unsafe {
+                    ffi::ghostty_render_state_row_cells_get(
+                        self.row_cells,
+                        ffi::GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_FG_COLOR,
+                        &mut fg_rgb as *mut ffi::GhosttyColorRgb as *mut c_void,
+                    );
+                }
+
+                // 8. Get resolved BG color (matches Ghostling line 727-729)
+                let mut bg_rgb = colors.background;
+                let has_bg = unsafe {
+                    ffi::ghostty_render_state_row_cells_get(
+                        self.row_cells,
+                        ffi::GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_BG_COLOR,
+                        &mut bg_rgb as *mut ffi::GhosttyColorRgb as *mut c_void,
+                    )
+                } == ffi::GHOSTTY_SUCCESS;
+
+                // 9. Get style for boolean flags (matches Ghostling line 733-735)
                 let mut style = ffi::GhosttyStyle::init_sized();
                 unsafe {
                     ffi::ghostty_render_state_row_cells_get(
@@ -365,18 +443,29 @@ impl Terminal {
                     );
                 }
 
+                // 10. Handle inverse by swapping fg/bg (matches Ghostling line 738-743)
+                let (final_fg, final_bg, final_has_bg) =
+                    if style.inverse { (bg_rgb, fg_rgb, true) } else { (fg_rgb, bg_rgb, has_bg) };
+
+                let fg = Color::Rgb(final_fg.r, final_fg.g, final_fg.b);
+                let bg = if final_has_bg {
+                    Color::Rgb(final_bg.r, final_bg.g, final_bg.b)
+                } else {
+                    Color::Default
+                };
+
                 let attrs = CellAttributes {
-                    fg: style_color_to_color(&style.fg_color),
-                    bg: style_color_to_color(&style.bg_color),
+                    fg,
+                    bg,
                     bold: style.bold,
                     italic: style.italic,
                     underline: style.underline != 0,
                     strikethrough: style.strikethrough,
-                    inverse: style.inverse,
+                    inverse: false, // Already handled above via color swap
                     dim: style.faint,
                 };
 
-                row_cells_vec.push(Cell { character, attrs });
+                row_cells_vec.push(Cell { grapheme, attrs });
             }
 
             // Pad row to expected width if needed
@@ -386,6 +475,18 @@ impl Terminal {
             row_cells_vec.truncate(num_cols);
 
             grid.push(row_cells_vec);
+
+            // 11. Clear per-row dirty flag immediately (matches Ghostling line 770-772)
+            let clean: bool = false;
+            unsafe {
+                ffi::ghostty_render_state_row_set(
+                    self.row_iter,
+                    ffi::GHOSTTY_RENDER_STATE_ROW_OPTION_DIRTY,
+                    &clean as *const bool as *const c_void,
+                );
+            }
+
+            dirty_rows.push(true);
         }
 
         // Pad to expected number of rows
@@ -396,21 +497,10 @@ impl Terminal {
         grid.truncate(num_rows);
         dirty_rows.truncate(num_rows);
 
-        // Fallback: if render state row iteration produced no content,
-        // read directly from the terminal via grid_ref.
-        let has_content =
-            grid.iter().any(|row| row.iter().any(|c| c.character != ' ' && c.character != '\0'));
-
-        if !has_content && num_rows > 0 && num_cols > 0 {
-            tracing::debug!("render state yielded no content, falling back to grid_ref");
-            grid = self.read_grid_via_grid_ref(num_rows, num_cols);
-            dirty_rows = vec![true; grid.len()];
-        }
-
         // Replace grid in screen
         cache.screen.replace_from_grid(grid, &dirty_rows);
 
-        // Reset render state dirty flag so we don't re-process
+        // 12. Clear global dirty flag (matches Ghostling line 830-832)
         let clean = ffi::GHOSTTY_RENDER_STATE_DIRTY_FALSE;
         unsafe {
             ffi::ghostty_render_state_set(
@@ -419,191 +509,6 @@ impl Terminal {
                 &clean as *const i32 as *const c_void,
             );
         }
-
-        // Also reset per-row dirty flags
-        unsafe {
-            ffi::ghostty_render_state_get(
-                self.render_state,
-                ffi::GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR,
-                self.row_iter as *mut c_void,
-            );
-            let false_val: bool = false;
-            while ffi::ghostty_render_state_row_iterator_next(self.row_iter) {
-                ffi::ghostty_render_state_row_set(
-                    self.row_iter,
-                    ffi::GHOSTTY_RENDER_STATE_ROW_OPTION_DIRTY,
-                    &false_val as *const bool as *const c_void,
-                );
-            }
-        }
-    }
-
-    /// Read the terminal grid directly via grid_ref (fallback when render state is empty).
-    fn read_grid_via_grid_ref(&self, num_rows: usize, num_cols: usize) -> Vec<Vec<Cell>> {
-        let mut grid = Vec::with_capacity(num_rows);
-
-        for row in 0..num_rows {
-            let mut row_cells = Vec::with_capacity(num_cols);
-            for col in 0..num_cols {
-                let mut grid_ref = ffi::GhosttyGridRef {
-                    size: std::mem::size_of::<ffi::GhosttyGridRef>(),
-                    node: std::ptr::null_mut(),
-                    x: col as u16,
-                    y: row as u16,
-                };
-
-                let point = ffi::GhosttyPoint {
-                    tag: ffi::GHOSTTY_POINT_TAG_ACTIVE,
-                    value: ffi::GhosttyPointValue {
-                        coordinate: ffi::GhosttyPointCoordinate { x: col as u16, y: row as u32 },
-                    },
-                };
-
-                let rc =
-                    unsafe { ffi::ghostty_terminal_grid_ref(self.handle, point, &mut grid_ref) };
-
-                if rc != ffi::GHOSTTY_SUCCESS {
-                    row_cells.push(Cell::default());
-                    continue;
-                }
-
-                // Get codepoint
-                let mut raw_cell: ffi::GhosttyCell = 0;
-                let rc = unsafe { ffi::ghostty_grid_ref_cell(&grid_ref, &mut raw_cell) };
-                if rc != ffi::GHOSTTY_SUCCESS {
-                    row_cells.push(Cell::default());
-                    continue;
-                }
-
-                let mut codepoint: u32 = 0;
-                unsafe {
-                    ffi::ghostty_cell_get(
-                        raw_cell,
-                        ffi::GHOSTTY_CELL_DATA_CODEPOINT,
-                        &mut codepoint as *mut u32 as *mut c_void,
-                    );
-                }
-
-                let character =
-                    if codepoint == 0 { ' ' } else { char::from_u32(codepoint).unwrap_or(' ') };
-
-                // Get style
-                let mut style = ffi::GhosttyStyle::init_sized();
-                let rc = unsafe { ffi::ghostty_grid_ref_style(&grid_ref, &mut style) };
-                let attrs = if rc == ffi::GHOSTTY_SUCCESS {
-                    CellAttributes {
-                        fg: style_color_to_color(&style.fg_color),
-                        bg: style_color_to_color(&style.bg_color),
-                        bold: style.bold,
-                        italic: style.italic,
-                        underline: style.underline != 0,
-                        strikethrough: style.strikethrough,
-                        inverse: style.inverse,
-                        dim: style.faint,
-                    }
-                } else {
-                    CellAttributes::default()
-                };
-
-                row_cells.push(Cell { character, attrs });
-            }
-            grid.push(row_cells);
-        }
-
-        grid
-    }
-
-    /// Rebuild the scrollback cache by reading history lines via grid_ref.
-    fn rebuild_scrollback_cache(&self, cache: &mut Cache) {
-        let mut scrollback_rows: usize = 0;
-        unsafe {
-            ffi::ghostty_terminal_get(
-                self.handle,
-                ffi::GHOSTTY_TERMINAL_DATA_SCROLLBACK_ROWS,
-                &mut scrollback_rows as *mut usize as *mut c_void,
-            );
-        }
-
-        if scrollback_rows == 0 {
-            cache.scrollback.clear();
-            return;
-        }
-
-        // Get terminal cols
-        let mut t_cols: u16 = 0;
-        unsafe {
-            ffi::ghostty_terminal_get(
-                self.handle,
-                ffi::GHOSTTY_TERMINAL_DATA_COLS,
-                &mut t_cols as *mut u16 as *mut c_void,
-            );
-        }
-        let cols = t_cols as usize;
-
-        let mut new_scrollback = Vec::with_capacity(scrollback_rows);
-
-        for y in 0..scrollback_rows {
-            let mut row_cells = Vec::with_capacity(cols);
-
-            for x in 0..cols {
-                let point = ffi::GhosttyPoint {
-                    tag: ffi::GHOSTTY_POINT_TAG_HISTORY,
-                    value: ffi::GhosttyPointValue {
-                        coordinate: ffi::GhosttyPointCoordinate { x: x as u16, y: y as u32 },
-                    },
-                };
-
-                let mut grid_ref = ffi::GhosttyGridRef::init_sized();
-                let rc =
-                    unsafe { ffi::ghostty_terminal_grid_ref(self.handle, point, &mut grid_ref) };
-
-                if rc != ffi::GHOSTTY_SUCCESS {
-                    row_cells.push(Cell::default());
-                    continue;
-                }
-
-                // Get graphemes
-                let mut buf = [0u32; 16];
-                let mut out_len: usize = 0;
-                let rc = unsafe {
-                    ffi::ghostty_grid_ref_graphemes(
-                        &grid_ref,
-                        buf.as_mut_ptr(),
-                        buf.len(),
-                        &mut out_len,
-                    )
-                };
-
-                let character = if rc == ffi::GHOSTTY_SUCCESS && out_len > 0 {
-                    char::from_u32(buf[0]).unwrap_or(' ')
-                } else {
-                    ' '
-                };
-
-                // Get style
-                let mut style = ffi::GhosttyStyle::init_sized();
-                unsafe {
-                    ffi::ghostty_grid_ref_style(&grid_ref, &mut style);
-                }
-
-                let attrs = CellAttributes {
-                    fg: style_color_to_color(&style.fg_color),
-                    bg: style_color_to_color(&style.bg_color),
-                    bold: style.bold,
-                    italic: style.italic,
-                    underline: style.underline != 0,
-                    strikethrough: style.strikethrough,
-                    inverse: style.inverse,
-                    dim: style.faint,
-                };
-
-                row_cells.push(Cell { character, attrs });
-            }
-
-            new_scrollback.push(row_cells);
-        }
-
-        cache.scrollback = new_scrollback;
     }
 }
 
@@ -614,21 +519,6 @@ impl Drop for Terminal {
             ffi::ghostty_render_state_row_iterator_free(self.row_iter);
             ffi::ghostty_render_state_free(self.render_state);
             ffi::ghostty_terminal_free(self.handle);
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Color conversion
-// ---------------------------------------------------------------------------
-
-fn style_color_to_color(sc: &ffi::GhosttyStyleColor) -> Color {
-    match sc.tag {
-        ffi::GhosttyStyleColorTag::None => Color::Default,
-        ffi::GhosttyStyleColorTag::Palette => Color::Indexed(unsafe { sc.value.palette }),
-        ffi::GhosttyStyleColorTag::Rgb => {
-            let rgb = unsafe { sc.value.rgb };
-            Color::Rgb(rgb.r, rgb.g, rgb.b)
         }
     }
 }
