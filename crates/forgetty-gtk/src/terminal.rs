@@ -17,7 +17,7 @@ use gtk4::pango;
 use gtk4::prelude::*;
 use gtk4::{glib, DrawingArea};
 
-use crate::input::GhosttyInput;
+use crate::input::{GhosttyInput, ScrollAction};
 use crate::pty_bridge;
 
 /// Shared terminal state accessible from multiple GTK callbacks.
@@ -137,8 +137,17 @@ pub fn create_terminal(
         let state = Rc::clone(&state);
         let da = drawing_area.clone();
         glib::timeout_add_local(Duration::from_millis(8), move || {
-            let had_data = state.borrow_mut().drain_pty_output();
+            let Ok(mut s) = state.try_borrow_mut() else {
+                // Another callback holds the borrow -- skip this tick.
+                // The PTY data will be picked up on the next 8ms cycle.
+                return glib::ControlFlow::Continue;
+            };
+            let had_data = s.drain_pty_output();
             if had_data {
+                // Scroll to bottom on new output so the user doesn't miss
+                // anything after browsing scrollback (AC-9).
+                s.terminal.scroll_viewport_bottom();
+                drop(s);
                 da.queue_draw();
             }
             glib::ControlFlow::Continue
@@ -154,7 +163,10 @@ pub fn create_terminal(
             let state = Rc::clone(&state);
             let da_for_key = drawing_area.clone();
             key_controller.connect_key_pressed(move |_controller, keyval, keycode, modifier| {
-                let mut s = state.borrow_mut();
+                let Ok(mut s) = state.try_borrow_mut() else {
+                    // Borrow held elsewhere -- drop this key event.
+                    return glib::Propagation::Proceed;
+                };
                 let terminal_handle = s.terminal.raw_handle();
                 if let Some(bytes) =
                     s.input.encode_key_press(keyval, keycode, modifier, terminal_handle)
@@ -174,7 +186,10 @@ pub fn create_terminal(
             let state = Rc::clone(&state);
             let da_for_release = drawing_area.clone();
             key_controller.connect_key_released(move |_controller, keyval, keycode, modifier| {
-                let mut s = state.borrow_mut();
+                let Ok(mut s) = state.try_borrow_mut() else {
+                    // Borrow held elsewhere -- drop this release event.
+                    return;
+                };
                 let terminal_handle = s.terminal.raw_handle();
                 if let Some(bytes) =
                     s.input.encode_key_release(keyval, keycode, modifier, terminal_handle)
@@ -199,7 +214,9 @@ pub fn create_terminal(
             let state = Rc::clone(&state);
             let da_focus = drawing_area.clone();
             focus_controller.connect_enter(move |_controller| {
-                let mut s = state.borrow_mut();
+                let Ok(mut s) = state.try_borrow_mut() else {
+                    return;
+                };
                 if s.terminal.is_focus_reporting() {
                     if let Some(bytes) = GhosttyInput::encode_focus(true) {
                         if let Err(e) = s.pty.write(&bytes) {
@@ -216,7 +233,9 @@ pub fn create_terminal(
             let state = Rc::clone(&state);
             let da_focus = drawing_area.clone();
             focus_controller.connect_leave(move |_controller| {
-                let mut s = state.borrow_mut();
+                let Ok(mut s) = state.try_borrow_mut() else {
+                    return;
+                };
                 if s.terminal.is_focus_reporting() {
                     if let Some(bytes) = GhosttyInput::encode_focus(false) {
                         if let Err(e) = s.pty.write(&bytes) {
@@ -231,6 +250,179 @@ pub fn create_terminal(
         drawing_area.add_controller(focus_controller);
     }
 
+    // --- Mouse click controller (GestureClick for button press/release) ---
+    {
+        let gesture = gtk4::GestureClick::new();
+        // Respond to all buttons (default is button 1 only).
+        gesture.set_button(0);
+
+        // Button pressed
+        {
+            let state = Rc::clone(&state);
+            let da_click = drawing_area.clone();
+            gesture.connect_pressed(move |gesture, _n_press, x, y| {
+                let button = gesture.current_button();
+                let modifier = gesture.current_event_state();
+                let Ok(mut s) = state.try_borrow_mut() else {
+                    // Borrow held elsewhere -- drop this click event.
+                    return;
+                };
+
+                let terminal_handle = s.terminal.raw_handle();
+                let screen_size =
+                    ((s.cols as f64 * s.cell_width) as u32, (s.rows as f64 * s.cell_height) as u32);
+                let cell_size = (s.cell_width as u32, s.cell_height as u32);
+
+                if let Some(bytes) = s.input.encode_mouse_button(
+                    button,
+                    true,
+                    (x, y),
+                    modifier,
+                    terminal_handle,
+                    screen_size,
+                    cell_size,
+                ) {
+                    if let Err(e) = s.pty.write(&bytes) {
+                        tracing::warn!("Failed to write mouse press to PTY: {e}");
+                    }
+                    da_click.queue_draw();
+                }
+            });
+        }
+
+        // Button released
+        {
+            let state = Rc::clone(&state);
+            let da_release = drawing_area.clone();
+            gesture.connect_released(move |gesture, _n_press, x, y| {
+                let button = gesture.current_button();
+                let modifier = gesture.current_event_state();
+                let Ok(mut s) = state.try_borrow_mut() else {
+                    // Borrow held elsewhere -- drop this release event.
+                    return;
+                };
+
+                let terminal_handle = s.terminal.raw_handle();
+                let screen_size =
+                    ((s.cols as f64 * s.cell_width) as u32, (s.rows as f64 * s.cell_height) as u32);
+                let cell_size = (s.cell_width as u32, s.cell_height as u32);
+
+                if let Some(bytes) = s.input.encode_mouse_button(
+                    button,
+                    false,
+                    (x, y),
+                    modifier,
+                    terminal_handle,
+                    screen_size,
+                    cell_size,
+                ) {
+                    if let Err(e) = s.pty.write(&bytes) {
+                        tracing::warn!("Failed to write mouse release to PTY: {e}");
+                    }
+                    da_release.queue_draw();
+                }
+            });
+        }
+
+        drawing_area.add_controller(gesture);
+    }
+
+    // --- Mouse motion controller ---
+    {
+        let motion_controller = gtk4::EventControllerMotion::new();
+
+        {
+            let state = Rc::clone(&state);
+            let da_motion = drawing_area.clone();
+            motion_controller.connect_motion(move |controller, x, y| {
+                let modifier = controller.current_event_state();
+                let Ok(mut s) = state.try_borrow_mut() else {
+                    // Borrow held elsewhere -- drop this motion event.
+                    return;
+                };
+
+                let terminal_handle = s.terminal.raw_handle();
+                let screen_size =
+                    ((s.cols as f64 * s.cell_width) as u32, (s.rows as f64 * s.cell_height) as u32);
+                let cell_size = (s.cell_width as u32, s.cell_height as u32);
+
+                if let Some(bytes) = s.input.encode_mouse_motion(
+                    (x, y),
+                    modifier,
+                    terminal_handle,
+                    screen_size,
+                    cell_size,
+                ) {
+                    if let Err(e) = s.pty.write(&bytes) {
+                        tracing::warn!("Failed to write mouse motion to PTY: {e}");
+                    }
+                    da_motion.queue_draw();
+                }
+            });
+        }
+
+        drawing_area.add_controller(motion_controller);
+    }
+
+    // --- Scroll controller ---
+    {
+        let scroll_controller = gtk4::EventControllerScroll::new(
+            gtk4::EventControllerScrollFlags::VERTICAL | gtk4::EventControllerScrollFlags::DISCRETE,
+        );
+
+        {
+            let state = Rc::clone(&state);
+            let da_scroll = drawing_area.clone();
+            scroll_controller.connect_scroll(move |controller, _dx, dy| {
+                let modifier = controller.current_event_state();
+                let Ok(mut s) = state.try_borrow_mut() else {
+                    // Borrow held elsewhere -- drop this scroll event.
+                    return glib::Propagation::Proceed;
+                };
+
+                let terminal_handle = s.terminal.raw_handle();
+                let mouse_tracking = s.terminal.is_mouse_tracking();
+                let screen_size =
+                    ((s.cols as f64 * s.cell_width) as u32, (s.rows as f64 * s.cell_height) as u32);
+                let cell_size = (s.cell_width as u32, s.cell_height as u32);
+
+                // Get mouse position from the last event on the controller.
+                // EventControllerScroll doesn't directly provide position, so we
+                // use (0,0) as fallback -- the scroll button/position is rarely
+                // critical for applications, and the cell is determined by the
+                // encoder's last known position.
+                let position = (0.0, 0.0);
+
+                let action = s.input.encode_scroll(
+                    dy,
+                    position,
+                    modifier,
+                    terminal_handle,
+                    mouse_tracking,
+                    screen_size,
+                    cell_size,
+                );
+
+                match action {
+                    ScrollAction::WriteBytes(bytes) => {
+                        if let Err(e) = s.pty.write(&bytes) {
+                            tracing::warn!("Failed to write scroll to PTY: {e}");
+                        }
+                    }
+                    ScrollAction::ScrollViewport(delta) => {
+                        s.terminal.scroll_viewport_delta(delta);
+                    }
+                }
+
+                drop(s);
+                da_scroll.queue_draw();
+                glib::Propagation::Stop
+            });
+        }
+
+        drawing_area.add_controller(scroll_controller);
+    }
+
     // --- Resize handler ---
     {
         let state = Rc::clone(&state);
@@ -240,10 +432,13 @@ pub fn create_terminal(
                 return;
             }
 
-            let (cw, ch) = {
-                let s = state.borrow();
-                (s.cell_width, s.cell_height)
+            let Ok(s) = state.try_borrow() else {
+                // Borrow held elsewhere -- skip this resize; the next
+                // resize or draw will recalculate.
+                return;
             };
+            let (cw, ch) = (s.cell_width, s.cell_height);
+            drop(s);
 
             if cw < 1.0 || ch < 1.0 {
                 return;
@@ -252,7 +447,9 @@ pub fn create_terminal(
             let new_cols = ((width as f64) / cw).max(1.0) as usize;
             let new_rows = ((height as f64) / ch).max(1.0) as usize;
 
-            let mut s = state.borrow_mut();
+            let Ok(mut s) = state.try_borrow_mut() else {
+                return;
+            };
             if new_cols != s.cols || new_rows != s.rows {
                 s.cols = new_cols;
                 s.rows = new_rows;
@@ -296,7 +493,11 @@ fn draw_terminal(
     config: &Config,
     cell_measured: &Rc<RefCell<bool>>,
 ) {
-    let mut s = state.borrow_mut();
+    let Ok(mut s) = state.try_borrow_mut() else {
+        // Another callback holds the borrow -- skip this frame.
+        // The next queue_draw() will catch up.
+        return;
+    };
 
     // Clone theme colors up front to avoid borrow conflicts
     let bg_color = s.config.theme.background;

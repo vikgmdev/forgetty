@@ -1,4 +1,4 @@
-//! Keyboard input encoding via the ghostty key encoder API.
+//! Keyboard and mouse input encoding via the ghostty key/mouse encoder APIs.
 //!
 //! Replaces the minimal hand-rolled key-to-byte-sequence table with the full
 //! ghostty key encoder pipeline. This gives us automatic support for:
@@ -7,32 +7,49 @@
 //! - Key release events
 //! - Modifier side bits, CapsLock/NumLock reporting
 //! - Numpad disambiguation
+//! - All mouse tracking modes and formats (X10, SGR, URxvt, SGR-Pixels)
 //!
 //! Adapted from `crates/forgetty-ui/src/ghostty_input.rs` (winit backend) to
-//! work with GTK4/GDK key events.
+//! work with GTK4/GDK key events and mouse event controllers.
 
 use std::collections::HashSet;
+use std::os::raw::c_void;
 
 use forgetty_vt::ffi;
 use gtk4::gdk;
 
-/// Wraps the ghostty key encoder and key event handles, providing a safe(ish)
-/// interface for encoding GDK key events into PTY bytes.
+/// Result of encoding a scroll wheel event.
+pub enum ScrollAction {
+    /// Write these bytes to the PTY (mouse tracking is active).
+    WriteBytes(Vec<u8>),
+    /// Scroll the viewport by this many rows (no mouse tracking).
+    ScrollViewport(isize),
+}
+
+/// Wraps the ghostty key encoder, key event, mouse encoder, and mouse event
+/// handles, providing a safe(ish) interface for encoding GDK key and mouse
+/// events into PTY bytes.
 pub struct GhosttyInput {
     key_encoder: ffi::GhosttyKeyEncoder,
     key_event: ffi::GhosttyKeyEvent,
+    mouse_encoder: ffi::GhosttyMouseEncoder,
+    mouse_event: ffi::GhosttyMouseEvent,
     /// Track currently-pressed hardware keycodes to detect repeats.
     /// GTK4's `key-pressed` fires for both initial press and repeat with no
     /// built-in flag to distinguish them. If the same keycode fires again
     /// without a release in between, we treat it as a repeat.
     pressed_keys: HashSet<u32>,
+    /// Track last known cursor position for mouse motion dedup.
+    last_cursor_pos: (f64, f64),
+    /// Track which mouse buttons are currently held (bitmask).
+    buttons_held: u8,
 }
 
 // Safety: The FFI handles are exclusively owned and not shared.
 unsafe impl Send for GhosttyInput {}
 
 impl GhosttyInput {
-    /// Create a new GhosttyInput with key encoder and key event handles allocated.
+    /// Create a new GhosttyInput with all encoder/event handles allocated.
     pub fn new() -> Self {
         let mut key_encoder: ffi::GhosttyKeyEncoder = std::ptr::null_mut();
         let rc = unsafe { ffi::ghostty_key_encoder_new(std::ptr::null(), &mut key_encoder) };
@@ -42,7 +59,23 @@ impl GhosttyInput {
         let rc = unsafe { ffi::ghostty_key_event_new(std::ptr::null(), &mut key_event) };
         assert_eq!(rc, ffi::GHOSTTY_SUCCESS, "ghostty_key_event_new failed: {rc}");
 
-        Self { key_encoder, key_event, pressed_keys: HashSet::new() }
+        let mut mouse_encoder: ffi::GhosttyMouseEncoder = std::ptr::null_mut();
+        let rc = unsafe { ffi::ghostty_mouse_encoder_new(std::ptr::null(), &mut mouse_encoder) };
+        assert_eq!(rc, ffi::GHOSTTY_SUCCESS, "ghostty_mouse_encoder_new failed: {rc}");
+
+        let mut mouse_event: ffi::GhosttyMouseEvent = std::ptr::null_mut();
+        let rc = unsafe { ffi::ghostty_mouse_event_new(std::ptr::null(), &mut mouse_event) };
+        assert_eq!(rc, ffi::GHOSTTY_SUCCESS, "ghostty_mouse_event_new failed: {rc}");
+
+        Self {
+            key_encoder,
+            key_event,
+            mouse_encoder,
+            mouse_event,
+            pressed_keys: HashSet::new(),
+            last_cursor_pos: (0.0, 0.0),
+            buttons_held: 0,
+        }
     }
 
     /// Encode a key-pressed event into PTY bytes.
@@ -109,7 +142,192 @@ impl GhosttyInput {
     }
 
     // -----------------------------------------------------------------------
-    // Private
+    // Mouse input encoding
+    // -----------------------------------------------------------------------
+
+    /// Encode a mouse button press or release event.
+    ///
+    /// `gdk_button` is the GDK button number (1=left, 2=middle, 3=right).
+    /// `pressed` is true for press, false for release.
+    /// `position` is the (x, y) pixel position within the widget.
+    /// `modifier` is the GDK modifier state at the time of the event.
+    ///
+    /// Returns bytes to write to the PTY, or None if the encoder produces
+    /// no output (e.g. no mouse tracking mode active).
+    pub fn encode_mouse_button(
+        &mut self,
+        gdk_button: u32,
+        pressed: bool,
+        position: (f64, f64),
+        modifier: gdk::ModifierType,
+        terminal: ffi::GhosttyTerminal,
+        screen_size: (u32, u32),
+        cell_size: (u32, u32),
+    ) -> Option<Vec<u8>> {
+        let gbtn = gdk_button_to_ghostty(gdk_button);
+        if gbtn == ffi::GHOSTTY_MOUSE_BUTTON_UNKNOWN {
+            return None;
+        }
+
+        // Track button state.
+        if pressed {
+            self.buttons_held |= 1 << gbtn;
+        } else {
+            self.buttons_held &= !(1 << gbtn);
+        }
+
+        self.sync_mouse_encoder(terminal, screen_size, cell_size);
+
+        let mods = gdk_mods_to_ghostty(modifier, 0);
+        let action = if pressed {
+            ffi::GHOSTTY_MOUSE_ACTION_PRESS
+        } else {
+            ffi::GHOSTTY_MOUSE_ACTION_RELEASE
+        };
+
+        unsafe {
+            ffi::ghostty_mouse_event_set_action(self.mouse_event, action);
+            ffi::ghostty_mouse_event_set_button(self.mouse_event, gbtn);
+            ffi::ghostty_mouse_event_set_mods(self.mouse_event, mods);
+            ffi::ghostty_mouse_event_set_position(
+                self.mouse_event,
+                ffi::GhosttyMousePosition { x: position.0 as f32, y: position.1 as f32 },
+            );
+        }
+
+        self.mouse_encode()
+    }
+
+    /// Encode a mouse motion event.
+    ///
+    /// `position` is the (x, y) pixel position within the widget.
+    /// Returns bytes to write to the PTY, or None if the encoder produces
+    /// no output or if the position hasn't changed enough (dedup threshold 0.5px).
+    pub fn encode_mouse_motion(
+        &mut self,
+        position: (f64, f64),
+        modifier: gdk::ModifierType,
+        terminal: ffi::GhosttyTerminal,
+        screen_size: (u32, u32),
+        cell_size: (u32, u32),
+    ) -> Option<Vec<u8>> {
+        // Only send if position actually changed (0.5px threshold, same as winit backend).
+        if (position.0 - self.last_cursor_pos.0).abs() < 0.5
+            && (position.1 - self.last_cursor_pos.1).abs() < 0.5
+        {
+            return None;
+        }
+        self.last_cursor_pos = position;
+
+        self.sync_mouse_encoder(terminal, screen_size, cell_size);
+
+        let mods = gdk_mods_to_ghostty(modifier, 0);
+        unsafe {
+            ffi::ghostty_mouse_event_set_action(self.mouse_event, ffi::GHOSTTY_MOUSE_ACTION_MOTION);
+            ffi::ghostty_mouse_event_set_mods(self.mouse_event, mods);
+            ffi::ghostty_mouse_event_set_position(
+                self.mouse_event,
+                ffi::GhosttyMousePosition { x: position.0 as f32, y: position.1 as f32 },
+            );
+        }
+
+        // Set button or clear based on what's held.
+        if self.buttons_held != 0 {
+            // Find the first held button.
+            for i in 1..=7 {
+                if self.buttons_held & (1 << i) != 0 {
+                    unsafe { ffi::ghostty_mouse_event_set_button(self.mouse_event, i) };
+                    break;
+                }
+            }
+        } else {
+            unsafe { ffi::ghostty_mouse_event_clear_button(self.mouse_event) };
+        }
+
+        self.mouse_encode()
+    }
+
+    /// Encode a scroll wheel event. Returns a `ScrollAction` indicating what to do.
+    ///
+    /// `dy` follows GTK convention: negative = scroll up (into history),
+    /// positive = scroll down (toward bottom).
+    ///
+    /// When mouse tracking is active, the scroll is forwarded to the application
+    /// as button 4 (up) / button 5 (down) press+release. When not active, the
+    /// caller should scroll the viewport by the returned delta.
+    pub fn encode_scroll(
+        &mut self,
+        dy: f64,
+        position: (f64, f64),
+        modifier: gdk::ModifierType,
+        terminal: ffi::GhosttyTerminal,
+        mouse_tracking: bool,
+        screen_size: (u32, u32),
+        cell_size: (u32, u32),
+    ) -> ScrollAction {
+        if mouse_tracking {
+            // Forward to application via mouse encoder as button 4/5 press+release.
+            self.sync_mouse_encoder(terminal, screen_size, cell_size);
+
+            let mods = gdk_mods_to_ghostty(modifier, 0);
+            // GTK: negative dy = scroll up, positive dy = scroll down.
+            // Terminal: button 4 = scroll up, button 5 = scroll down.
+            let scroll_btn = if dy < 0.0 {
+                ffi::GHOSTTY_MOUSE_BUTTON_FOUR // scroll up
+            } else {
+                ffi::GHOSTTY_MOUSE_BUTTON_FIVE // scroll down
+            };
+
+            unsafe {
+                ffi::ghostty_mouse_event_set_mods(self.mouse_event, mods);
+                ffi::ghostty_mouse_event_set_position(
+                    self.mouse_event,
+                    ffi::GhosttyMousePosition { x: position.0 as f32, y: position.1 as f32 },
+                );
+                ffi::ghostty_mouse_event_set_button(self.mouse_event, scroll_btn);
+            }
+
+            let mut result = Vec::new();
+
+            // Press
+            unsafe {
+                ffi::ghostty_mouse_event_set_action(
+                    self.mouse_event,
+                    ffi::GHOSTTY_MOUSE_ACTION_PRESS,
+                );
+            }
+            if let Some(bytes) = self.mouse_encode() {
+                result.extend_from_slice(&bytes);
+            }
+
+            // Release
+            unsafe {
+                ffi::ghostty_mouse_event_set_action(
+                    self.mouse_event,
+                    ffi::GHOSTTY_MOUSE_ACTION_RELEASE,
+                );
+            }
+            if let Some(bytes) = self.mouse_encode() {
+                result.extend_from_slice(&bytes);
+            }
+
+            if result.is_empty() {
+                // Encoder produced nothing; fall through to viewport scroll.
+                let rows = if dy < 0.0 { -3 } else { 3 };
+                ScrollAction::ScrollViewport(rows)
+            } else {
+                ScrollAction::WriteBytes(result)
+            }
+        } else {
+            // Scroll the viewport. 3 rows per tick, matching Ghostling.
+            // Negative dy = scroll up = negative delta (into history).
+            let rows = if dy < 0.0 { -3 } else { 3 };
+            ScrollAction::ScrollViewport(rows)
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Private helpers (keyboard)
     // -----------------------------------------------------------------------
 
     fn encode_key_inner(
@@ -224,11 +442,86 @@ impl GhosttyInput {
 
         None
     }
+
+    // -----------------------------------------------------------------------
+    // Private helpers (mouse)
+    // -----------------------------------------------------------------------
+
+    /// Sync mouse encoder options from the terminal and current dimensions.
+    fn sync_mouse_encoder(
+        &self,
+        terminal: ffi::GhosttyTerminal,
+        screen_size: (u32, u32),
+        cell_size: (u32, u32),
+    ) {
+        unsafe {
+            ffi::ghostty_mouse_encoder_setopt_from_terminal(self.mouse_encoder, terminal);
+        }
+
+        let enc_size = ffi::GhosttyMouseEncoderSize {
+            size: std::mem::size_of::<ffi::GhosttyMouseEncoderSize>(),
+            screen_width: screen_size.0,
+            screen_height: screen_size.1,
+            cell_width: cell_size.0,
+            cell_height: cell_size.1,
+            padding_top: 0,
+            padding_bottom: 0,
+            padding_right: 0,
+            padding_left: 0,
+        };
+        unsafe {
+            ffi::ghostty_mouse_encoder_setopt(
+                self.mouse_encoder,
+                ffi::GHOSTTY_MOUSE_ENCODER_OPT_SIZE,
+                &enc_size as *const ffi::GhosttyMouseEncoderSize as *const c_void,
+            );
+        }
+
+        let any_pressed = self.buttons_held != 0;
+        unsafe {
+            ffi::ghostty_mouse_encoder_setopt(
+                self.mouse_encoder,
+                ffi::GHOSTTY_MOUSE_ENCODER_OPT_ANY_BUTTON_PRESSED,
+                &any_pressed as *const bool as *const c_void,
+            );
+        }
+
+        let track_cell = true;
+        unsafe {
+            ffi::ghostty_mouse_encoder_setopt(
+                self.mouse_encoder,
+                ffi::GHOSTTY_MOUSE_ENCODER_OPT_TRACK_LAST_CELL,
+                &track_cell as *const bool as *const c_void,
+            );
+        }
+    }
+
+    /// Encode the current mouse event via the ghostty mouse encoder.
+    fn mouse_encode(&self) -> Option<Vec<u8>> {
+        let mut buf = [0u8; 128];
+        let mut written: usize = 0;
+        let rc = unsafe {
+            ffi::ghostty_mouse_encoder_encode(
+                self.mouse_encoder,
+                self.mouse_event,
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut written,
+            )
+        };
+        if rc == ffi::GHOSTTY_SUCCESS && written > 0 {
+            Some(buf[..written].to_vec())
+        } else {
+            None
+        }
+    }
 }
 
 impl Drop for GhosttyInput {
     fn drop(&mut self) {
         unsafe {
+            ffi::ghostty_mouse_event_free(self.mouse_event);
+            ffi::ghostty_mouse_encoder_free(self.mouse_encoder);
             ffi::ghostty_key_event_free(self.key_event);
             ffi::ghostty_key_encoder_free(self.key_encoder);
         }
@@ -743,4 +1036,32 @@ fn unshifted_codepoint(keyval: gdk::Key) -> u32 {
     }
 
     0
+}
+
+// ---------------------------------------------------------------------------
+// GDK mouse button -> GhosttyMouseButton mapping
+// ---------------------------------------------------------------------------
+
+/// Map a GDK mouse button number to a GhosttyMouseButton constant.
+///
+/// GDK button numbering: 1=left, 2=middle, 3=right, 4+=extra.
+/// Ghostty button numbering: 1=left, 2=right, 3=middle, 4+=extra.
+///
+/// Note: GDK swaps middle and right compared to Ghostty, so we must swap
+/// buttons 2 and 3 in the mapping.
+fn gdk_button_to_ghostty(button: u32) -> i32 {
+    match button {
+        1 => ffi::GHOSTTY_MOUSE_BUTTON_LEFT,   // GDK 1 = left
+        2 => ffi::GHOSTTY_MOUSE_BUTTON_MIDDLE, // GDK 2 = middle
+        3 => ffi::GHOSTTY_MOUSE_BUTTON_RIGHT,  // GDK 3 = right
+        4 => ffi::GHOSTTY_MOUSE_BUTTON_FOUR,
+        5 => ffi::GHOSTTY_MOUSE_BUTTON_FIVE,
+        6 => ffi::GHOSTTY_MOUSE_BUTTON_SIX,
+        7 => ffi::GHOSTTY_MOUSE_BUTTON_SEVEN,
+        8 => ffi::GHOSTTY_MOUSE_BUTTON_EIGHT,
+        9 => ffi::GHOSTTY_MOUSE_BUTTON_NINE,
+        10 => ffi::GHOSTTY_MOUSE_BUTTON_TEN,
+        11 => ffi::GHOSTTY_MOUSE_BUTTON_ELEVEN,
+        _ => ffi::GHOSTTY_MOUSE_BUTTON_UNKNOWN,
+    }
 }
