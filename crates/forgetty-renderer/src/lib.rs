@@ -247,6 +247,17 @@ impl TerminalRenderer {
         self.cursor_style = style;
     }
 
+    /// Get the surface/screen size in pixels.
+    pub fn surface_size(&self) -> (u32, u32) {
+        self.context.size
+    }
+
+    /// Get the cell size in integer pixels (for mouse encoder).
+    pub fn cell_size(&self) -> (u32, u32) {
+        let cs = self.atlas.cell_size();
+        (cs.width.ceil() as u32, cs.height.ceil() as u32)
+    }
+
     pub fn context(&self) -> &RenderContext {
         &self.context
     }

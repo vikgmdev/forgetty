@@ -340,6 +340,327 @@ pub const GHOSTTY_DA_FEATURE_ANSI_COLOR: u16 = 22;
 pub const GHOSTTY_DA_DEVICE_TYPE_VT220: u16 = 1;
 
 // ---------------------------------------------------------------------------
+// Key encoder types
+// ---------------------------------------------------------------------------
+
+/// Opaque key encoder handle.
+#[repr(C)]
+pub struct GhosttyKeyEncoderOpaque {
+    _private: [u8; 0],
+}
+pub type GhosttyKeyEncoder = *mut GhosttyKeyEncoderOpaque;
+
+/// Opaque key event handle.
+#[repr(C)]
+pub struct GhosttyKeyEventOpaque {
+    _private: [u8; 0],
+}
+pub type GhosttyKeyEvent = *mut GhosttyKeyEventOpaque;
+
+/// Modifier bitmask type.
+pub type GhosttyMods = u16;
+
+pub const GHOSTTY_MODS_SHIFT: GhosttyMods = 1 << 0;
+pub const GHOSTTY_MODS_CTRL: GhosttyMods = 1 << 1;
+pub const GHOSTTY_MODS_ALT: GhosttyMods = 1 << 2;
+pub const GHOSTTY_MODS_SUPER: GhosttyMods = 1 << 3;
+
+/// Key action constants.
+pub const GHOSTTY_KEY_ACTION_RELEASE: i32 = 0;
+pub const GHOSTTY_KEY_ACTION_PRESS: i32 = 1;
+pub const GHOSTTY_KEY_ACTION_REPEAT: i32 = 2;
+
+// GhosttyKey enum values — must match ghostty/vt/key/event.h exactly.
+// The C enum is sequential starting from 0.
+pub const GHOSTTY_KEY_UNIDENTIFIED: i32 = 0;
+// Writing System Keys (W3C 3.1.1)
+pub const GHOSTTY_KEY_BACKQUOTE: i32 = 1;
+pub const GHOSTTY_KEY_BACKSLASH: i32 = 2;
+pub const GHOSTTY_KEY_BRACKET_LEFT: i32 = 3;
+pub const GHOSTTY_KEY_BRACKET_RIGHT: i32 = 4;
+pub const GHOSTTY_KEY_COMMA: i32 = 5;
+pub const GHOSTTY_KEY_DIGIT_0: i32 = 6;
+pub const GHOSTTY_KEY_DIGIT_1: i32 = 7;
+pub const GHOSTTY_KEY_DIGIT_2: i32 = 8;
+pub const GHOSTTY_KEY_DIGIT_3: i32 = 9;
+pub const GHOSTTY_KEY_DIGIT_4: i32 = 10;
+pub const GHOSTTY_KEY_DIGIT_5: i32 = 11;
+pub const GHOSTTY_KEY_DIGIT_6: i32 = 12;
+pub const GHOSTTY_KEY_DIGIT_7: i32 = 13;
+pub const GHOSTTY_KEY_DIGIT_8: i32 = 14;
+pub const GHOSTTY_KEY_DIGIT_9: i32 = 15;
+pub const GHOSTTY_KEY_EQUAL: i32 = 16;
+pub const GHOSTTY_KEY_INTL_BACKSLASH: i32 = 17;
+pub const GHOSTTY_KEY_INTL_RO: i32 = 18;
+pub const GHOSTTY_KEY_INTL_YEN: i32 = 19;
+pub const GHOSTTY_KEY_A: i32 = 20;
+pub const GHOSTTY_KEY_B: i32 = 21;
+pub const GHOSTTY_KEY_C: i32 = 22;
+pub const GHOSTTY_KEY_D: i32 = 23;
+pub const GHOSTTY_KEY_E: i32 = 24;
+pub const GHOSTTY_KEY_F: i32 = 25;
+pub const GHOSTTY_KEY_G: i32 = 26;
+pub const GHOSTTY_KEY_H: i32 = 27;
+pub const GHOSTTY_KEY_I: i32 = 28;
+pub const GHOSTTY_KEY_J: i32 = 29;
+pub const GHOSTTY_KEY_K: i32 = 30;
+pub const GHOSTTY_KEY_L: i32 = 31;
+pub const GHOSTTY_KEY_M: i32 = 32;
+pub const GHOSTTY_KEY_N: i32 = 33;
+pub const GHOSTTY_KEY_O: i32 = 34;
+pub const GHOSTTY_KEY_P: i32 = 35;
+pub const GHOSTTY_KEY_Q: i32 = 36;
+pub const GHOSTTY_KEY_R: i32 = 37;
+pub const GHOSTTY_KEY_S: i32 = 38;
+pub const GHOSTTY_KEY_T: i32 = 39;
+pub const GHOSTTY_KEY_U: i32 = 40;
+pub const GHOSTTY_KEY_V: i32 = 41;
+pub const GHOSTTY_KEY_W: i32 = 42;
+pub const GHOSTTY_KEY_X: i32 = 43;
+pub const GHOSTTY_KEY_Y: i32 = 44;
+pub const GHOSTTY_KEY_Z: i32 = 45;
+pub const GHOSTTY_KEY_MINUS: i32 = 46;
+pub const GHOSTTY_KEY_PERIOD: i32 = 47;
+pub const GHOSTTY_KEY_QUOTE: i32 = 48;
+pub const GHOSTTY_KEY_SEMICOLON: i32 = 49;
+pub const GHOSTTY_KEY_SLASH: i32 = 50;
+// Functional Keys (W3C 3.1.2)
+pub const GHOSTTY_KEY_ALT_LEFT: i32 = 51;
+pub const GHOSTTY_KEY_ALT_RIGHT: i32 = 52;
+pub const GHOSTTY_KEY_BACKSPACE: i32 = 53;
+pub const GHOSTTY_KEY_CAPS_LOCK: i32 = 54;
+pub const GHOSTTY_KEY_CONTEXT_MENU: i32 = 55;
+pub const GHOSTTY_KEY_CONTROL_LEFT: i32 = 56;
+pub const GHOSTTY_KEY_CONTROL_RIGHT: i32 = 57;
+pub const GHOSTTY_KEY_ENTER: i32 = 58;
+pub const GHOSTTY_KEY_META_LEFT: i32 = 59;
+pub const GHOSTTY_KEY_META_RIGHT: i32 = 60;
+pub const GHOSTTY_KEY_SHIFT_LEFT: i32 = 61;
+pub const GHOSTTY_KEY_SHIFT_RIGHT: i32 = 62;
+pub const GHOSTTY_KEY_SPACE: i32 = 63;
+pub const GHOSTTY_KEY_TAB: i32 = 64;
+pub const GHOSTTY_KEY_CONVERT: i32 = 65;
+pub const GHOSTTY_KEY_KANA_MODE: i32 = 66;
+pub const GHOSTTY_KEY_NON_CONVERT: i32 = 67;
+// Control Pad (W3C 3.2)
+pub const GHOSTTY_KEY_DELETE: i32 = 68;
+pub const GHOSTTY_KEY_END: i32 = 69;
+pub const GHOSTTY_KEY_HELP: i32 = 70;
+pub const GHOSTTY_KEY_HOME: i32 = 71;
+pub const GHOSTTY_KEY_INSERT: i32 = 72;
+pub const GHOSTTY_KEY_PAGE_DOWN: i32 = 73;
+pub const GHOSTTY_KEY_PAGE_UP: i32 = 74;
+// Arrow Pad (W3C 3.3)
+pub const GHOSTTY_KEY_ARROW_DOWN: i32 = 75;
+pub const GHOSTTY_KEY_ARROW_LEFT: i32 = 76;
+pub const GHOSTTY_KEY_ARROW_RIGHT: i32 = 77;
+pub const GHOSTTY_KEY_ARROW_UP: i32 = 78;
+// Numpad (W3C 3.4)
+pub const GHOSTTY_KEY_NUM_LOCK: i32 = 79;
+pub const GHOSTTY_KEY_NUMPAD_0: i32 = 80;
+pub const GHOSTTY_KEY_NUMPAD_1: i32 = 81;
+pub const GHOSTTY_KEY_NUMPAD_2: i32 = 82;
+pub const GHOSTTY_KEY_NUMPAD_3: i32 = 83;
+pub const GHOSTTY_KEY_NUMPAD_4: i32 = 84;
+pub const GHOSTTY_KEY_NUMPAD_5: i32 = 85;
+pub const GHOSTTY_KEY_NUMPAD_6: i32 = 86;
+pub const GHOSTTY_KEY_NUMPAD_7: i32 = 87;
+pub const GHOSTTY_KEY_NUMPAD_8: i32 = 88;
+pub const GHOSTTY_KEY_NUMPAD_9: i32 = 89;
+pub const GHOSTTY_KEY_NUMPAD_ADD: i32 = 90;
+pub const GHOSTTY_KEY_NUMPAD_BACKSPACE: i32 = 91;
+pub const GHOSTTY_KEY_NUMPAD_CLEAR: i32 = 92;
+pub const GHOSTTY_KEY_NUMPAD_CLEAR_ENTRY: i32 = 93;
+pub const GHOSTTY_KEY_NUMPAD_COMMA: i32 = 94;
+pub const GHOSTTY_KEY_NUMPAD_DECIMAL: i32 = 95;
+pub const GHOSTTY_KEY_NUMPAD_DIVIDE: i32 = 96;
+pub const GHOSTTY_KEY_NUMPAD_ENTER: i32 = 97;
+pub const GHOSTTY_KEY_NUMPAD_EQUAL: i32 = 98;
+pub const GHOSTTY_KEY_NUMPAD_MEMORY_ADD: i32 = 99;
+pub const GHOSTTY_KEY_NUMPAD_MEMORY_CLEAR: i32 = 100;
+pub const GHOSTTY_KEY_NUMPAD_MEMORY_RECALL: i32 = 101;
+pub const GHOSTTY_KEY_NUMPAD_MEMORY_STORE: i32 = 102;
+pub const GHOSTTY_KEY_NUMPAD_MEMORY_SUBTRACT: i32 = 103;
+pub const GHOSTTY_KEY_NUMPAD_MULTIPLY: i32 = 104;
+pub const GHOSTTY_KEY_NUMPAD_PAREN_LEFT: i32 = 105;
+pub const GHOSTTY_KEY_NUMPAD_PAREN_RIGHT: i32 = 106;
+pub const GHOSTTY_KEY_NUMPAD_SUBTRACT: i32 = 107;
+pub const GHOSTTY_KEY_NUMPAD_SEPARATOR: i32 = 108;
+pub const GHOSTTY_KEY_NUMPAD_UP: i32 = 109;
+pub const GHOSTTY_KEY_NUMPAD_DOWN: i32 = 110;
+pub const GHOSTTY_KEY_NUMPAD_RIGHT: i32 = 111;
+pub const GHOSTTY_KEY_NUMPAD_LEFT: i32 = 112;
+pub const GHOSTTY_KEY_NUMPAD_BEGIN: i32 = 113;
+pub const GHOSTTY_KEY_NUMPAD_HOME: i32 = 114;
+pub const GHOSTTY_KEY_NUMPAD_END: i32 = 115;
+pub const GHOSTTY_KEY_NUMPAD_INSERT: i32 = 116;
+pub const GHOSTTY_KEY_NUMPAD_DELETE: i32 = 117;
+pub const GHOSTTY_KEY_NUMPAD_PAGE_UP: i32 = 118;
+pub const GHOSTTY_KEY_NUMPAD_PAGE_DOWN: i32 = 119;
+// Function Section (W3C 3.5)
+pub const GHOSTTY_KEY_ESCAPE: i32 = 120;
+pub const GHOSTTY_KEY_F1: i32 = 121;
+pub const GHOSTTY_KEY_F2: i32 = 122;
+pub const GHOSTTY_KEY_F3: i32 = 123;
+pub const GHOSTTY_KEY_F4: i32 = 124;
+pub const GHOSTTY_KEY_F5: i32 = 125;
+pub const GHOSTTY_KEY_F6: i32 = 126;
+pub const GHOSTTY_KEY_F7: i32 = 127;
+pub const GHOSTTY_KEY_F8: i32 = 128;
+pub const GHOSTTY_KEY_F9: i32 = 129;
+pub const GHOSTTY_KEY_F10: i32 = 130;
+pub const GHOSTTY_KEY_F11: i32 = 131;
+pub const GHOSTTY_KEY_F12: i32 = 132;
+pub const GHOSTTY_KEY_F13: i32 = 133;
+pub const GHOSTTY_KEY_F14: i32 = 134;
+pub const GHOSTTY_KEY_F15: i32 = 135;
+pub const GHOSTTY_KEY_F16: i32 = 136;
+pub const GHOSTTY_KEY_F17: i32 = 137;
+pub const GHOSTTY_KEY_F18: i32 = 138;
+pub const GHOSTTY_KEY_F19: i32 = 139;
+pub const GHOSTTY_KEY_F20: i32 = 140;
+pub const GHOSTTY_KEY_F21: i32 = 141;
+pub const GHOSTTY_KEY_F22: i32 = 142;
+pub const GHOSTTY_KEY_F23: i32 = 143;
+pub const GHOSTTY_KEY_F24: i32 = 144;
+pub const GHOSTTY_KEY_F25: i32 = 145;
+pub const GHOSTTY_KEY_FN: i32 = 146;
+pub const GHOSTTY_KEY_FN_LOCK: i32 = 147;
+pub const GHOSTTY_KEY_PRINT_SCREEN: i32 = 148;
+pub const GHOSTTY_KEY_SCROLL_LOCK: i32 = 149;
+pub const GHOSTTY_KEY_PAUSE: i32 = 150;
+
+// ---------------------------------------------------------------------------
+// Mouse encoder types
+// ---------------------------------------------------------------------------
+
+/// Opaque mouse encoder handle.
+#[repr(C)]
+pub struct GhosttyMouseEncoderOpaque {
+    _private: [u8; 0],
+}
+pub type GhosttyMouseEncoder = *mut GhosttyMouseEncoderOpaque;
+
+/// Opaque mouse event handle.
+#[repr(C)]
+pub struct GhosttyMouseEventOpaque {
+    _private: [u8; 0],
+}
+pub type GhosttyMouseEvent = *mut GhosttyMouseEventOpaque;
+
+/// Mouse action constants.
+pub const GHOSTTY_MOUSE_ACTION_PRESS: i32 = 0;
+pub const GHOSTTY_MOUSE_ACTION_RELEASE: i32 = 1;
+pub const GHOSTTY_MOUSE_ACTION_MOTION: i32 = 2;
+
+/// Mouse button constants.
+pub const GHOSTTY_MOUSE_BUTTON_UNKNOWN: i32 = 0;
+pub const GHOSTTY_MOUSE_BUTTON_LEFT: i32 = 1;
+pub const GHOSTTY_MOUSE_BUTTON_RIGHT: i32 = 2;
+pub const GHOSTTY_MOUSE_BUTTON_MIDDLE: i32 = 3;
+pub const GHOSTTY_MOUSE_BUTTON_FOUR: i32 = 4;
+pub const GHOSTTY_MOUSE_BUTTON_FIVE: i32 = 5;
+pub const GHOSTTY_MOUSE_BUTTON_SIX: i32 = 6;
+pub const GHOSTTY_MOUSE_BUTTON_SEVEN: i32 = 7;
+pub const GHOSTTY_MOUSE_BUTTON_EIGHT: i32 = 8;
+pub const GHOSTTY_MOUSE_BUTTON_NINE: i32 = 9;
+pub const GHOSTTY_MOUSE_BUTTON_TEN: i32 = 10;
+pub const GHOSTTY_MOUSE_BUTTON_ELEVEN: i32 = 11;
+
+/// Mouse position (surface-space pixels).
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct GhosttyMousePosition {
+    pub x: f32,
+    pub y: f32,
+}
+
+/// Mouse encoder size context.
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct GhosttyMouseEncoderSize {
+    pub size: usize,
+    pub screen_width: u32,
+    pub screen_height: u32,
+    pub cell_width: u32,
+    pub cell_height: u32,
+    pub padding_top: u32,
+    pub padding_bottom: u32,
+    pub padding_right: u32,
+    pub padding_left: u32,
+}
+
+impl GhosttyMouseEncoderSize {
+    pub fn init_sized() -> Self {
+        let mut s: Self = unsafe { std::mem::zeroed() };
+        s.size = std::mem::size_of::<Self>();
+        s
+    }
+}
+
+/// Mouse encoder option constants.
+pub const GHOSTTY_MOUSE_ENCODER_OPT_EVENT: i32 = 0;
+pub const GHOSTTY_MOUSE_ENCODER_OPT_FORMAT: i32 = 1;
+pub const GHOSTTY_MOUSE_ENCODER_OPT_SIZE: i32 = 2;
+pub const GHOSTTY_MOUSE_ENCODER_OPT_ANY_BUTTON_PRESSED: i32 = 3;
+pub const GHOSTTY_MOUSE_ENCODER_OPT_TRACK_LAST_CELL: i32 = 4;
+
+// ---------------------------------------------------------------------------
+// Terminal scroll viewport types
+// ---------------------------------------------------------------------------
+
+/// Scroll viewport tag.
+pub const GHOSTTY_SCROLL_VIEWPORT_TOP: i32 = 0;
+pub const GHOSTTY_SCROLL_VIEWPORT_BOTTOM: i32 = 1;
+pub const GHOSTTY_SCROLL_VIEWPORT_DELTA: i32 = 2;
+
+/// Scroll viewport value union.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub union GhosttyTerminalScrollViewportValue {
+    pub delta: isize,
+    pub _padding: [u64; 2],
+}
+
+/// Scroll viewport tagged union.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct GhosttyTerminalScrollViewport {
+    pub tag: i32,
+    pub value: GhosttyTerminalScrollViewportValue,
+}
+
+// ---------------------------------------------------------------------------
+// Mode types
+// ---------------------------------------------------------------------------
+
+/// Packed 16-bit terminal mode (matches GhosttyMode from modes.h).
+pub type GhosttyMode = u16;
+
+/// Construct a GhosttyMode from a mode value and ANSI flag.
+/// Matches the inline `ghostty_mode_new()` from modes.h.
+pub const fn ghostty_mode_new(value: u16, ansi: bool) -> GhosttyMode {
+    (value & 0x7FFF) | ((ansi as u16) << 15)
+}
+
+// Key mode constants used for queries.
+pub const GHOSTTY_MODE_FOCUS_EVENT: GhosttyMode = ghostty_mode_new(1004, false);
+pub const GHOSTTY_MODE_NORMAL_MOUSE: GhosttyMode = ghostty_mode_new(1000, false);
+pub const GHOSTTY_MODE_BUTTON_MOUSE: GhosttyMode = ghostty_mode_new(1002, false);
+pub const GHOSTTY_MODE_ANY_MOUSE: GhosttyMode = ghostty_mode_new(1003, false);
+pub const GHOSTTY_MODE_X10_MOUSE: GhosttyMode = ghostty_mode_new(9, false);
+
+// ---------------------------------------------------------------------------
+// Focus types
+// ---------------------------------------------------------------------------
+
+pub const GHOSTTY_FOCUS_GAINED: i32 = 0;
+pub const GHOSTTY_FOCUS_LOST: i32 = 1;
+
+// Terminal data for mouse tracking query.
+pub const GHOSTTY_TERMINAL_DATA_MOUSE_TRACKING: i32 = 11;
+
+// ---------------------------------------------------------------------------
 // Callback types for terminal effects
 // ---------------------------------------------------------------------------
 
@@ -503,5 +824,144 @@ extern "C" {
     pub fn ghostty_render_state_colors_get(
         state: GhosttyRenderState,
         out_colors: *mut GhosttyRenderStateColors,
+    ) -> GhosttyResult;
+
+    // -----------------------------------------------------------------------
+    // Key encoder
+    // -----------------------------------------------------------------------
+
+    pub fn ghostty_key_encoder_new(
+        allocator: *const c_void,
+        encoder: *mut GhosttyKeyEncoder,
+    ) -> GhosttyResult;
+
+    pub fn ghostty_key_encoder_free(encoder: GhosttyKeyEncoder);
+
+    pub fn ghostty_key_encoder_setopt(
+        encoder: GhosttyKeyEncoder,
+        option: i32,
+        value: *const c_void,
+    );
+
+    pub fn ghostty_key_encoder_setopt_from_terminal(
+        encoder: GhosttyKeyEncoder,
+        terminal: GhosttyTerminal,
+    );
+
+    pub fn ghostty_key_encoder_encode(
+        encoder: GhosttyKeyEncoder,
+        event: GhosttyKeyEvent,
+        out_buf: *mut u8,
+        out_buf_size: usize,
+        out_len: *mut usize,
+    ) -> GhosttyResult;
+
+    // Key event
+    pub fn ghostty_key_event_new(
+        allocator: *const c_void,
+        event: *mut GhosttyKeyEvent,
+    ) -> GhosttyResult;
+
+    pub fn ghostty_key_event_free(event: GhosttyKeyEvent);
+
+    pub fn ghostty_key_event_set_action(event: GhosttyKeyEvent, action: i32);
+
+    pub fn ghostty_key_event_set_key(event: GhosttyKeyEvent, key: i32);
+
+    pub fn ghostty_key_event_set_mods(event: GhosttyKeyEvent, mods: GhosttyMods);
+
+    pub fn ghostty_key_event_set_consumed_mods(event: GhosttyKeyEvent, consumed_mods: GhosttyMods);
+
+    pub fn ghostty_key_event_set_composing(event: GhosttyKeyEvent, composing: bool);
+
+    pub fn ghostty_key_event_set_utf8(event: GhosttyKeyEvent, utf8: *const u8, len: usize);
+
+    pub fn ghostty_key_event_set_unshifted_codepoint(event: GhosttyKeyEvent, codepoint: u32);
+
+    // -----------------------------------------------------------------------
+    // Mouse encoder
+    // -----------------------------------------------------------------------
+
+    pub fn ghostty_mouse_encoder_new(
+        allocator: *const c_void,
+        encoder: *mut GhosttyMouseEncoder,
+    ) -> GhosttyResult;
+
+    pub fn ghostty_mouse_encoder_free(encoder: GhosttyMouseEncoder);
+
+    pub fn ghostty_mouse_encoder_setopt(
+        encoder: GhosttyMouseEncoder,
+        option: i32,
+        value: *const c_void,
+    );
+
+    pub fn ghostty_mouse_encoder_setopt_from_terminal(
+        encoder: GhosttyMouseEncoder,
+        terminal: GhosttyTerminal,
+    );
+
+    pub fn ghostty_mouse_encoder_encode(
+        encoder: GhosttyMouseEncoder,
+        event: GhosttyMouseEvent,
+        out_buf: *mut u8,
+        out_buf_size: usize,
+        out_len: *mut usize,
+    ) -> GhosttyResult;
+
+    pub fn ghostty_mouse_encoder_reset(encoder: GhosttyMouseEncoder);
+
+    // Mouse event
+    pub fn ghostty_mouse_event_new(
+        allocator: *const c_void,
+        event: *mut GhosttyMouseEvent,
+    ) -> GhosttyResult;
+
+    pub fn ghostty_mouse_event_free(event: GhosttyMouseEvent);
+
+    pub fn ghostty_mouse_event_set_action(event: GhosttyMouseEvent, action: i32);
+
+    pub fn ghostty_mouse_event_set_button(event: GhosttyMouseEvent, button: i32);
+
+    pub fn ghostty_mouse_event_clear_button(event: GhosttyMouseEvent);
+
+    pub fn ghostty_mouse_event_set_mods(event: GhosttyMouseEvent, mods: GhosttyMods);
+
+    pub fn ghostty_mouse_event_set_position(
+        event: GhosttyMouseEvent,
+        position: GhosttyMousePosition,
+    );
+
+    // -----------------------------------------------------------------------
+    // Terminal control (scroll, reset, modes)
+    // -----------------------------------------------------------------------
+
+    pub fn ghostty_terminal_scroll_viewport(
+        terminal: GhosttyTerminal,
+        behavior: GhosttyTerminalScrollViewport,
+    );
+
+    pub fn ghostty_terminal_reset(terminal: GhosttyTerminal);
+
+    pub fn ghostty_terminal_mode_get(
+        terminal: GhosttyTerminal,
+        mode: GhosttyMode,
+        out_value: *mut bool,
+    ) -> GhosttyResult;
+
+    pub fn ghostty_terminal_mode_set(
+        terminal: GhosttyTerminal,
+        mode: GhosttyMode,
+        value: bool,
+    ) -> GhosttyResult;
+
+    // -----------------------------------------------------------------------
+    // Focus encoding
+    // -----------------------------------------------------------------------
+
+    pub fn ghostty_focus_encode(
+        event: i32,
+        buf: *mut u8,
+        buf_len: usize,
+        out_written: *mut usize,
     ) -> GhosttyResult;
 }
