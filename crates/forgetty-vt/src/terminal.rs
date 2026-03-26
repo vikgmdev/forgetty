@@ -25,6 +25,15 @@ pub enum TerminalEvent {
 /// Per-terminal userdata carried through C callbacks.
 struct CallbackState {
     events: Vec<TerminalEvent>,
+    /// Accumulator for write-PTY data. The WRITE_PTY callback appends here
+    /// during `ghostty_terminal_vt_write()`, and the caller drains it after
+    /// `feed()` returns. This avoids reentrancy issues.
+    write_pty_buf: Vec<Vec<u8>>,
+    /// Terminal dimensions for the SIZE callback.
+    cols: u16,
+    rows: u16,
+    cell_width: u32,
+    cell_height: u32,
 }
 
 /// Interior-mutable cache that allows `screen()`, `title()`, and `scrollback()`
@@ -85,13 +94,78 @@ impl Terminal {
             unsafe { ffi::ghostty_render_state_row_cells_new(std::ptr::null(), &mut row_cells) };
         assert_eq!(rc, ffi::GHOSTTY_SUCCESS, "row_cells_new failed: {rc}");
 
-        let callback_state = Box::new(CallbackState { events: Vec::new() });
+        let callback_state = Box::new(CallbackState {
+            events: Vec::new(),
+            write_pty_buf: Vec::new(),
+            cols: cols as u16,
+            rows: rows as u16,
+            cell_width: 8,
+            cell_height: 16,
+        });
 
-        // NOTE: Callbacks are disabled for now. Registering them caused a
-        // segfault, likely due to FFI calling convention mismatches. The
-        // terminal works fine without callbacks — we just poll for title
-        // changes manually. TODO: investigate the correct way to pass
-        // function pointers via ghostty_terminal_set().
+        // Register userdata FIRST — all callbacks receive this pointer.
+        // We pass a raw pointer to the Box's heap allocation.
+        let userdata_ptr = &*callback_state as *const CallbackState as *const c_void;
+        unsafe {
+            ffi::ghostty_terminal_set(handle, ffi::GHOSTTY_TERMINAL_OPT_USERDATA, userdata_ptr);
+        }
+
+        // Register WRITE_PTY callback — the function pointer IS the value,
+        // not a pointer-to-function-pointer. This matches Ghostling line 1080:
+        //   ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_WRITE_PTY,
+        //       (const void *)effect_write_pty);
+        unsafe {
+            ffi::ghostty_terminal_set(
+                handle,
+                ffi::GHOSTTY_TERMINAL_OPT_WRITE_PTY,
+                write_pty_callback as *const c_void,
+            );
+        }
+
+        // Register SIZE callback for XTWINOPS queries.
+        unsafe {
+            ffi::ghostty_terminal_set(
+                handle,
+                ffi::GHOSTTY_TERMINAL_OPT_SIZE,
+                size_callback as *const c_void,
+            );
+        }
+
+        // Register DEVICE_ATTRIBUTES callback for DA1/DA2/DA3 queries.
+        unsafe {
+            ffi::ghostty_terminal_set(
+                handle,
+                ffi::GHOSTTY_TERMINAL_OPT_DEVICE_ATTRIBUTES,
+                device_attributes_callback as *const c_void,
+            );
+        }
+
+        // Register XTVERSION callback.
+        unsafe {
+            ffi::ghostty_terminal_set(
+                handle,
+                ffi::GHOSTTY_TERMINAL_OPT_XTVERSION,
+                xtversion_callback as *const c_void,
+            );
+        }
+
+        // Register TITLE_CHANGED callback.
+        unsafe {
+            ffi::ghostty_terminal_set(
+                handle,
+                ffi::GHOSTTY_TERMINAL_OPT_TITLE_CHANGED,
+                title_changed_callback as *const c_void,
+            );
+        }
+
+        // Register BELL callback.
+        unsafe {
+            ffi::ghostty_terminal_set(
+                handle,
+                ffi::GHOSTTY_TERMINAL_OPT_BELL,
+                bell_callback as *const c_void,
+            );
+        }
 
         Terminal {
             handle,
@@ -200,13 +274,16 @@ impl Terminal {
     pub fn resize(&mut self, rows: usize, cols: usize) {
         self.rows = rows;
         self.cols = cols;
+        // Keep callback state in sync for the SIZE callback.
+        self.callback_state.cols = cols as u16;
+        self.callback_state.rows = rows as u16;
         unsafe {
             ffi::ghostty_terminal_resize(
                 self.handle,
                 cols as u16,
                 rows as u16,
-                8,  // default cell width
-                16, // default cell height
+                self.callback_state.cell_width,
+                self.callback_state.cell_height,
             );
         }
         let cache = self.cache.get_mut();
@@ -238,6 +315,21 @@ impl Terminal {
     /// Drain pending events.
     pub fn drain_events(&mut self) -> Vec<TerminalEvent> {
         std::mem::take(&mut self.callback_state.events)
+    }
+
+    /// Drain accumulated write-PTY data.
+    ///
+    /// Returns all data chunks that the terminal's WRITE_PTY callback
+    /// accumulated during the last `feed()` call. Each chunk is a
+    /// response that should be written to the PTY (e.g., DA responses,
+    /// mode queries).
+    pub fn drain_write_pty(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.callback_state.write_pty_buf)
+    }
+
+    /// Get the raw terminal handle for use with other FFI calls.
+    pub fn raw_handle(&self) -> ffi::GhosttyTerminal {
+        self.handle
     }
 
     /// Get scrollback lines.
@@ -525,14 +617,99 @@ impl Drop for Terminal {
 
 // ---------------------------------------------------------------------------
 // C callbacks
+//
+// CRITICAL: Function pointers are registered by casting them directly to
+// *const c_void — NOT by passing &fn_ptr. This matches Ghostling line 1080:
+//   ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_WRITE_PTY,
+//       (const void *)effect_write_pty);
 // ---------------------------------------------------------------------------
 
+/// WRITE_PTY callback — accumulates response data during feed().
+/// Must NOT write to PTY directly (reentrancy). Instead appends to
+/// the CallbackState buffer which the caller drains after feed() returns.
+unsafe extern "C" fn write_pty_callback(
+    _terminal: ffi::GhosttyTerminal,
+    userdata: *mut c_void,
+    data: *const u8,
+    len: usize,
+) {
+    if userdata.is_null() || data.is_null() || len == 0 {
+        return;
+    }
+    let state = unsafe { &mut *(userdata as *mut CallbackState) };
+    let slice = unsafe { std::slice::from_raw_parts(data, len) };
+    state.write_pty_buf.push(slice.to_vec());
+}
+
+/// SIZE callback — responds to XTWINOPS size queries (CSI 14/16/18 t).
+unsafe extern "C" fn size_callback(
+    _terminal: ffi::GhosttyTerminal,
+    userdata: *mut c_void,
+    out_size: *mut ffi::GhosttySizeReportSize,
+) -> bool {
+    if userdata.is_null() || out_size.is_null() {
+        return false;
+    }
+    let state = unsafe { &*(userdata as *const CallbackState) };
+    unsafe {
+        (*out_size).rows = state.rows;
+        (*out_size).columns = state.cols;
+        (*out_size).cell_width = state.cell_width;
+        (*out_size).cell_height = state.cell_height;
+    }
+    true
+}
+
+/// DEVICE_ATTRIBUTES callback — responds to DA1/DA2/DA3 queries.
+/// Reports VT220-level conformance matching Ghostling's implementation.
+unsafe extern "C" fn device_attributes_callback(
+    _terminal: ffi::GhosttyTerminal,
+    _userdata: *mut c_void,
+    out_attrs: *mut ffi::GhosttyDeviceAttributes,
+) -> bool {
+    if out_attrs.is_null() {
+        return false;
+    }
+    unsafe {
+        // DA1: VT220 with common features.
+        (*out_attrs).primary.conformance_level = ffi::GHOSTTY_DA_CONFORMANCE_VT220;
+        (*out_attrs).primary.features[0] = ffi::GHOSTTY_DA_FEATURE_COLUMNS_132;
+        (*out_attrs).primary.features[1] = ffi::GHOSTTY_DA_FEATURE_SELECTIVE_ERASE;
+        (*out_attrs).primary.features[2] = ffi::GHOSTTY_DA_FEATURE_ANSI_COLOR;
+        (*out_attrs).primary.num_features = 3;
+
+        // DA2: VT220-type, version 1, no ROM cartridge.
+        (*out_attrs).secondary.device_type = ffi::GHOSTTY_DA_DEVICE_TYPE_VT220;
+        (*out_attrs).secondary.firmware_version = 1;
+        (*out_attrs).secondary.rom_cartridge = 0;
+
+        // DA3: arbitrary unit id.
+        (*out_attrs).tertiary.unit_id = 0;
+    }
+    true
+}
+
+/// XTVERSION callback — returns "forgetty" as the terminal name.
+unsafe extern "C" fn xtversion_callback(
+    _terminal: ffi::GhosttyTerminal,
+    _userdata: *mut c_void,
+) -> ffi::GhosttyString {
+    static VERSION: &[u8] = b"forgetty";
+    ffi::GhosttyString { ptr: VERSION.as_ptr(), len: VERSION.len() }
+}
+
 unsafe extern "C" fn bell_callback(_terminal: ffi::GhosttyTerminal, userdata: *mut c_void) {
+    if userdata.is_null() {
+        return;
+    }
     let state = unsafe { &mut *(userdata as *mut CallbackState) };
     state.events.push(TerminalEvent::Bell);
 }
 
 unsafe extern "C" fn title_changed_callback(terminal: ffi::GhosttyTerminal, userdata: *mut c_void) {
+    if userdata.is_null() {
+        return;
+    }
     let state = unsafe { &mut *(userdata as *mut CallbackState) };
 
     // Read the title from the terminal

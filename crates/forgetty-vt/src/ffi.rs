@@ -155,8 +155,12 @@ pub const GHOSTTY_TERMINAL_DATA_SCROLLBACK_ROWS: i32 = 15;
 
 // Terminal options
 pub const GHOSTTY_TERMINAL_OPT_USERDATA: i32 = 0;
+pub const GHOSTTY_TERMINAL_OPT_WRITE_PTY: i32 = 1;
 pub const GHOSTTY_TERMINAL_OPT_BELL: i32 = 2;
+pub const GHOSTTY_TERMINAL_OPT_XTVERSION: i32 = 4;
 pub const GHOSTTY_TERMINAL_OPT_TITLE_CHANGED: i32 = 5;
+pub const GHOSTTY_TERMINAL_OPT_SIZE: i32 = 6;
+pub const GHOSTTY_TERMINAL_OPT_DEVICE_ATTRIBUTES: i32 = 8;
 
 // Cell data types
 pub type GhosttyCell = u64;
@@ -281,8 +285,85 @@ impl GhosttyRenderStateColors {
 }
 
 // ---------------------------------------------------------------------------
+// Device attributes types (for DA1/DA2/DA3 callbacks)
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct GhosttyDeviceAttributesPrimary {
+    pub conformance_level: u16,
+    pub features: [u16; 64],
+    pub num_features: usize,
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct GhosttyDeviceAttributesSecondary {
+    pub device_type: u16,
+    pub firmware_version: u16,
+    pub rom_cartridge: u16,
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct GhosttyDeviceAttributesTertiary {
+    pub unit_id: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct GhosttyDeviceAttributes {
+    pub primary: GhosttyDeviceAttributesPrimary,
+    pub secondary: GhosttyDeviceAttributesSecondary,
+    pub tertiary: GhosttyDeviceAttributesTertiary,
+}
+
+// Size report types (for SIZE callback)
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct GhosttySizeReportSize {
+    pub rows: u16,
+    pub columns: u16,
+    pub cell_width: u32,
+    pub cell_height: u32,
+}
+
+// DA conformance levels
+pub const GHOSTTY_DA_CONFORMANCE_VT220: u16 = 62;
+
+// DA feature codes
+pub const GHOSTTY_DA_FEATURE_COLUMNS_132: u16 = 1;
+pub const GHOSTTY_DA_FEATURE_SELECTIVE_ERASE: u16 = 6;
+pub const GHOSTTY_DA_FEATURE_ANSI_COLOR: u16 = 22;
+
+// DA2 device types
+pub const GHOSTTY_DA_DEVICE_TYPE_VT220: u16 = 1;
+
+// ---------------------------------------------------------------------------
 // Callback types for terminal effects
 // ---------------------------------------------------------------------------
+
+pub type GhosttyTerminalWritePtyFn = unsafe extern "C" fn(
+    terminal: GhosttyTerminal,
+    userdata: *mut c_void,
+    data: *const u8,
+    len: usize,
+);
+
+pub type GhosttyTerminalSizeFn = unsafe extern "C" fn(
+    terminal: GhosttyTerminal,
+    userdata: *mut c_void,
+    out_size: *mut GhosttySizeReportSize,
+) -> bool;
+
+pub type GhosttyTerminalDeviceAttributesFn = unsafe extern "C" fn(
+    terminal: GhosttyTerminal,
+    userdata: *mut c_void,
+    out_attrs: *mut GhosttyDeviceAttributes,
+) -> bool;
+
+pub type GhosttyTerminalXtversionFn =
+    unsafe extern "C" fn(terminal: GhosttyTerminal, userdata: *mut c_void) -> GhosttyString;
 
 pub type GhosttyTerminalBellFn =
     Option<unsafe extern "C" fn(terminal: GhosttyTerminal, userdata: *mut c_void)>;
