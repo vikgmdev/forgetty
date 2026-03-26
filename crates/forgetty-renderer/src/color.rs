@@ -28,7 +28,7 @@ impl Default for ColorScheme {
     fn default() -> Self {
         Self {
             foreground: [205, 214, 244, 255], // #cdd6f4
-            background: [30, 30, 46, 255],    // #1e1e2e
+            background: [40, 40, 40, 255],    // #282828
             cursor: [245, 224, 220, 255],     // #f5e0dc
             selection: [88, 91, 112, 128],    // #585b70 with alpha
             ansi: [
@@ -106,7 +106,7 @@ mod tests {
     #[test]
     fn test_resolve_bg_default() {
         let scheme = ColorScheme::default();
-        assert_eq!(scheme.resolve_bg(Color::Default), [30, 30, 46, 255]);
+        assert_eq!(scheme.resolve_bg(Color::Default), [40, 40, 40, 255]);
     }
 
     #[test]

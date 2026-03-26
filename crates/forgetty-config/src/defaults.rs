@@ -10,14 +10,14 @@ use std::collections::HashMap;
 /// Returns the default Forgetty configuration.
 ///
 /// Uses sensible defaults suitable for most systems:
-/// - monospace font at 14pt
+/// - monospace font at 16pt
 /// - dark theme
 /// - 10,000 scrollback lines
 /// - block cursor
 pub fn default_config() -> Config {
     Config {
         font_family: "monospace".to_string(),
-        font_size: 14.0,
+        font_size: 16.0,
         theme: Theme::default(),
         shell: None,
         scrollback_lines: 10_000,

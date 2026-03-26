@@ -1,6 +1,6 @@
 [colors]
 foreground = "#cdd6f4"
-background = "#1e1e2e"
+background = "#282828"
 cursor = "#f5e0dc"
 selection = "#585b70"
 

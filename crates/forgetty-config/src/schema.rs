@@ -66,7 +66,7 @@ fn default_font_family() -> String {
 }
 
 fn default_font_size() -> f32 {
-    14.0
+    16.0
 }
 
 fn default_scrollback_lines() -> usize {
