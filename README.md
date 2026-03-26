@@ -171,37 +171,50 @@ Forgetty is organized as a Cargo workspace with the following crates:
 See [docs/architecture.md](docs/architecture.md) for the full architecture
 overview and data flow diagrams.
 
-## Why Not Fork Ghostty?
+## Why Forgetty Exists
 
-Ghostty is an excellent terminal — so why build Forgetty instead of forking it?
+Simple terminals are for the old days. When you spend your day working with
+AI coding agents, managing multiple workspaces across projects, and switching
+between local and remote sessions — you need a terminal built for that workflow.
 
-**We use Ghostty's brain, not its body.** Forgetty uses
-[libghostty-vt](https://github.com/ghostty-org/ghostty) for terminal emulation
-(the same SIMD-optimized VT parser that powers Ghostty), but replaces the
-rendering layer with [wgpu](https://wgpu.rs/) for true cross-platform support.
+Ghostty and cmux are the closest to what we want, but:
+- **Ghostty** is a standalone terminal focused on native macOS/Linux rendering
+  quality. No AI-native features, no cloud sync, no built-in workspace management.
+- **cmux** is macOS-only (Swift + AppKit). Brilliant for Mac users, but if you
+  work on Linux or Windows with WSL, you're out of luck.
+- **Windows Terminal** has great WSL support but zero AI awareness.
+- **Every other terminal** treats AI agents as just another CLI process.
 
-| | Ghostty | Forgetty |
-|---|---|---|
-| **Terminal engine** | libghostty (Zig) | libghostty-vt (same engine) |
-| **GPU rendering** | Metal (macOS) + OpenGL (Linux) | wgpu → Vulkan, Metal, DX12, OpenGL, WebGPU |
-| **Shader language** | MSL + GLSL (separate per platform) | WGSL (one language, compiled for all) |
-| **Font rendering** | CoreText (macOS) + FreeType (Linux) | cosmic-text + glyphon (Rust, all platforms) |
-| **Windows** | Limited (OpenGL, no font discovery) | Full (DX12/Vulkan, native fonts) |
-| **Android** | No | Yes (Vulkan/GLES) |
-| **Browser** | Stubbed WebGL | WebGPU (all major browsers) |
-| **UI framework** | GTK (Linux) + AppKit (macOS) | wgpu custom (one codebase) |
-| **Language** | Zig | Rust |
-| **License** | MIT | MIT |
+Forgetty fills the gap: **an AI-first terminal for Linux, Windows (WSL),
+Android, and Web** — where nobody else is building.
 
-**Ghostty's renderer is platform-specific by design** — Metal shaders don't run
-on Linux, GLSL doesn't run on macOS. Each platform has a separate renderer
-codebase. wgpu solves this: one WGSL shader compiles to Metal, HLSL, GLSL, and
-SPIR-V automatically via [Naga](https://github.com/gfx-rs/naga).
+## Forgetty vs Ghostty: Technical Comparison
 
-**The result:** Forgetty gets Ghostty's battle-tested terminal emulation
-(including Kitty protocol, SIMD parsing, Unicode support) with a renderer that
-runs on every platform from a single codebase. We build AI-first UI features
-(workspaces, agent notifications, smart clipboard, sync) on top.
+We use Ghostty's brain (libghostty-vt), not its body (renderer). Same SIMD-optimized
+VT parser, different rendering architecture optimized for cross-platform reach.
+
+| | Ghostty | Forgetty | Who wins |
+|---|---|---|---|
+| **Terminal engine** | libghostty | libghostty-vt (same) | Tie |
+| **macOS rendering** | Metal (native, hand-tuned) | wgpu → Metal (thin abstraction) | Ghostty |
+| **macOS text** | CoreText (pixel-perfect native) | cosmic-text (good, not native) | Ghostty |
+| **Linux rendering** | OpenGL 4.3 (dated, GTK threading issues) | wgpu → Vulkan (modern) | **Forgetty** |
+| **Windows** | OpenGL, no font discovery | DX12/Vulkan, full support | **Forgetty** |
+| **Android** | None | Vulkan/GLES | **Forgetty** |
+| **Browser** | 3-line WebGL stub | WebGPU (all major browsers) | **Forgetty** |
+| **VT correctness** | Identical | Identical | Tie |
+| **AI agent UX** | None | Notification rings, smart copy, viewer, hooks | **Forgetty** |
+| **Workspace mgmt** | None (build your own) | Built-in tabs, splits, session persistence | **Forgetty** |
+| **Cloud sync** | None | Planned (premium SaaS) | **Forgetty** |
+| **Socket API** | None | JSON-RPC for automation | **Forgetty** |
+| **Input handling** | Native (Cocoa/GTK) | winit (good, fewer edge cases) | Ghostty |
+| **Reliability** | Years of production use | Days (AI-accelerated development) | Ghostty |
+| **Shader code** | MSL + GLSL (2 codebases) | WGSL (1 codebase, auto-compiled) | **Forgetty** |
+
+**Our bet:** Platform reach + AI-native UX beats native polish on one platform.
+If you need the best macOS terminal, use Ghostty or cmux. If you need one
+terminal that works across Linux, Windows WSL, Android, and eventually the web —
+with AI agents as first-class citizens — that's Forgetty.
 
 See [docs/adr/004-wgpu-vs-ghostty-renderer.md](docs/adr/004-wgpu-vs-ghostty-renderer.md)
 for the full architectural decision record.
