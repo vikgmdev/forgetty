@@ -133,10 +133,17 @@ pub fn create_terminal(
     }
 
     // --- Poll PTY data with a GLib timeout (8ms ~ 120Hz) ---
+    // Uses a weak reference to the DrawingArea so the timer stops automatically
+    // when the tab is closed and the widget is destroyed.
     {
         let state = Rc::clone(&state);
-        let da = drawing_area.clone();
+        let da_weak = drawing_area.downgrade();
         glib::timeout_add_local(Duration::from_millis(8), move || {
+            // Stop the timer if the DrawingArea has been destroyed (tab closed)
+            let Some(da) = da_weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+
             let Ok(mut s) = state.try_borrow_mut() else {
                 // Another callback holds the borrow -- skip this tick.
                 // The PTY data will be picked up on the next 8ms cycle.
