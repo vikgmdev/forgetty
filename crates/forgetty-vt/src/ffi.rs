@@ -367,6 +367,13 @@ pub const GHOSTTY_MODS_SUPER: GhosttyMods = 1 << 3;
 pub const GHOSTTY_MODS_CAPS_LOCK: GhosttyMods = 1 << 4;
 pub const GHOSTTY_MODS_NUM_LOCK: GhosttyMods = 1 << 5;
 
+// Modifier side bits — set when the right-hand modifier is pressed.
+// Matches ghostty/vt/key/event.h exactly.
+pub const GHOSTTY_MODS_SHIFT_SIDE: GhosttyMods = 1 << 6;
+pub const GHOSTTY_MODS_CTRL_SIDE: GhosttyMods = 1 << 7;
+pub const GHOSTTY_MODS_ALT_SIDE: GhosttyMods = 1 << 8;
+pub const GHOSTTY_MODS_SUPER_SIDE: GhosttyMods = 1 << 9;
+
 /// Key action constants.
 pub const GHOSTTY_KEY_ACTION_RELEASE: i32 = 0;
 pub const GHOSTTY_KEY_ACTION_PRESS: i32 = 1;

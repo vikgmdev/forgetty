@@ -17,6 +17,7 @@ use gtk4::pango;
 use gtk4::prelude::*;
 use gtk4::{glib, DrawingArea};
 
+use crate::input::GhosttyInput;
 use crate::pty_bridge;
 
 /// Shared terminal state accessible from multiple GTK callbacks.
@@ -26,6 +27,7 @@ pub struct TerminalState {
     pub terminal: forgetty_vt::Terminal,
     pub pty: forgetty_pty::PtyProcess,
     pub pty_rx: mpsc::Receiver<Vec<u8>>,
+    pub input: GhosttyInput,
     pub config: Config,
     pub cell_width: f64,
     pub cell_height: f64,
@@ -96,10 +98,13 @@ pub fn create_terminal(
     // Create terminal VT state
     let terminal = forgetty_vt::Terminal::new(initial_rows, initial_cols);
 
+    let input = GhosttyInput::new();
+
     let state = Rc::new(RefCell::new(TerminalState {
         terminal,
         pty,
         pty_rx,
+        input,
         config: config.clone(),
         cell_width: 8.0,
         cell_height: 16.0,
@@ -140,23 +145,90 @@ pub fn create_terminal(
         });
     }
 
-    // --- Keyboard input ---
+    // --- Keyboard input (via ghostty key encoder) ---
     {
-        let state = Rc::clone(&state);
-        let da_for_key = drawing_area.clone();
         let key_controller = gtk4::EventControllerKey::new();
-        key_controller.connect_key_pressed(move |_controller, keyval, _keycode, modifier| {
-            if let Some(bytes) = crate::input::key_to_pty_bytes(keyval, modifier) {
+
+        // key-pressed handler (fires for both initial press and repeat)
+        {
+            let state = Rc::clone(&state);
+            let da_for_key = drawing_area.clone();
+            key_controller.connect_key_pressed(move |_controller, keyval, keycode, modifier| {
                 let mut s = state.borrow_mut();
-                if let Err(e) = s.pty.write(&bytes) {
-                    tracing::warn!("Failed to write to PTY: {e}");
+                let terminal_handle = s.terminal.raw_handle();
+                if let Some(bytes) =
+                    s.input.encode_key_press(keyval, keycode, modifier, terminal_handle)
+                {
+                    if let Err(e) = s.pty.write(&bytes) {
+                        tracing::warn!("Failed to write to PTY: {e}");
+                    }
+                    da_for_key.queue_draw();
+                    return glib::Propagation::Stop;
                 }
-                da_for_key.queue_draw();
-                return glib::Propagation::Stop;
-            }
-            glib::Propagation::Proceed
-        });
+                glib::Propagation::Proceed
+            });
+        }
+
+        // key-released handler (needed for Kitty keyboard protocol release events)
+        {
+            let state = Rc::clone(&state);
+            let da_for_release = drawing_area.clone();
+            key_controller.connect_key_released(move |_controller, keyval, keycode, modifier| {
+                let mut s = state.borrow_mut();
+                let terminal_handle = s.terminal.raw_handle();
+                if let Some(bytes) =
+                    s.input.encode_key_release(keyval, keycode, modifier, terminal_handle)
+                {
+                    if let Err(e) = s.pty.write(&bytes) {
+                        tracing::warn!("Failed to write to PTY: {e}");
+                    }
+                    da_for_release.queue_draw();
+                }
+            });
+        }
+
         drawing_area.add_controller(key_controller);
+    }
+
+    // --- Focus controller (for DECSET 1004 focus reporting) ---
+    {
+        let focus_controller = gtk4::EventControllerFocus::new();
+
+        // Focus gained
+        {
+            let state = Rc::clone(&state);
+            let da_focus = drawing_area.clone();
+            focus_controller.connect_enter(move |_controller| {
+                let mut s = state.borrow_mut();
+                if s.terminal.is_focus_reporting() {
+                    if let Some(bytes) = GhosttyInput::encode_focus(true) {
+                        if let Err(e) = s.pty.write(&bytes) {
+                            tracing::warn!("Failed to write focus-in to PTY: {e}");
+                        }
+                        da_focus.queue_draw();
+                    }
+                }
+            });
+        }
+
+        // Focus lost
+        {
+            let state = Rc::clone(&state);
+            let da_focus = drawing_area.clone();
+            focus_controller.connect_leave(move |_controller| {
+                let mut s = state.borrow_mut();
+                if s.terminal.is_focus_reporting() {
+                    if let Some(bytes) = GhosttyInput::encode_focus(false) {
+                        if let Err(e) = s.pty.write(&bytes) {
+                            tracing::warn!("Failed to write focus-out to PTY: {e}");
+                        }
+                        da_focus.queue_draw();
+                    }
+                }
+            });
+        }
+
+        drawing_area.add_controller(focus_controller);
     }
 
     // --- Resize handler ---
