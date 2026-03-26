@@ -1078,8 +1078,11 @@ version = "0.1.0"
 dependencies = [
  "forgetty-config",
  "forgetty-core",
+ "forgetty-pty",
+ "forgetty-vt",
  "gtk4",
  "libadwaita",
+ "pangocairo",
  "tracing",
 ]
 
@@ -3150,6 +3153,32 @@ dependencies = [
  "glib-sys 0.20.10",
  "gobject-sys 0.20.10",
  "libc",
+ "system-deps 7.0.7",
+]
+
+[[package]]
+name = "pangocairo"
+version = "0.20.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "58890dc451db9964ac2d8874f903a4370a4b3932aa5281ff0c8d9810937ad84f"
+dependencies = [
+ "cairo-rs 0.20.12",
+ "glib 0.20.12",
+ "libc",
+ "pango 0.20.12",
+ "pangocairo-sys",
+]
+
+[[package]]
+name = "pangocairo-sys"
+version = "0.20.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b9952903f88aa93e2927e7bca2d1ebae64fc26545a9280b4ce6bddeda26b5c42"
+dependencies = [
+ "cairo-sys-rs 0.20.10",
+ "glib-sys 0.20.10",
+ "libc",
+ "pango-sys 0.20.10",
  "system-deps 7.0.7",
 ]
 

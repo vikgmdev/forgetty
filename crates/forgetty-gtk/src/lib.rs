@@ -6,3 +6,6 @@
 //! Rust core crates.
 
 pub mod app;
+pub mod input;
+pub mod pty_bridge;
+pub mod terminal;
