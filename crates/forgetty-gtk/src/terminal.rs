@@ -13,6 +13,7 @@ use forgetty_config::{Config, CursorStyle};
 use forgetty_core::Rgba;
 use forgetty_vt::screen::Color;
 use gtk4::cairo;
+use gtk4::gdk;
 use gtk4::pango;
 use gtk4::prelude::*;
 use gtk4::{glib, DrawingArea};
@@ -170,6 +171,13 @@ pub fn create_terminal(
             let state = Rc::clone(&state);
             let da_for_key = drawing_area.clone();
             key_controller.connect_key_pressed(move |_controller, keyval, keycode, modifier| {
+                // Let app-level shortcuts pass through to GTK accelerators.
+                // Without this, the ghostty encoder would consume Alt+Shift+= etc.
+                // and return Stop, preventing the accelerator from firing.
+                if is_app_shortcut(keyval, modifier) {
+                    return glib::Propagation::Proceed;
+                }
+
                 let Ok(mut s) = state.try_borrow_mut() else {
                     // Borrow held elsewhere -- drop this key event.
                     return glib::Propagation::Proceed;
@@ -268,6 +276,9 @@ pub fn create_terminal(
             let state = Rc::clone(&state);
             let da_click = drawing_area.clone();
             gesture.connect_pressed(move |gesture, _n_press, x, y| {
+                // Clicking on a pane should focus it (for split pane navigation).
+                da_click.grab_focus();
+
                 let button = gesture.current_button();
                 let modifier = gesture.current_event_state();
                 let Ok(mut s) = state.try_borrow_mut() else {
@@ -490,6 +501,44 @@ fn color_to_rgb(color: &Color, default: &Rgba) -> (f64, f64, f64) {
     }
 }
 
+/// Check if a key combination is an app-level shortcut that should NOT be
+/// consumed by the terminal's key encoder. These shortcuts must propagate
+/// to GTK accelerators (defined in app.rs) instead.
+fn is_app_shortcut(keyval: gdk::Key, modifier: gdk::ModifierType) -> bool {
+    // Mask to only the modifier bits we care about (ignore NumLock, etc.)
+    let mods = modifier
+        & (gdk::ModifierType::CONTROL_MASK
+            | gdk::ModifierType::SHIFT_MASK
+            | gdk::ModifierType::ALT_MASK);
+
+    let alt_shift = gdk::ModifierType::ALT_MASK | gdk::ModifierType::SHIFT_MASK;
+    let ctrl_shift = gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK;
+
+    // Split right: Alt+Shift+= (may arrive as keyval `equal` or `plus`)
+    if mods == alt_shift && (keyval == gdk::Key::equal || keyval == gdk::Key::plus) {
+        return true;
+    }
+    // Split down: Alt+Shift+- (may arrive as keyval `minus` or `underscore`)
+    if mods == alt_shift && (keyval == gdk::Key::minus || keyval == gdk::Key::underscore) {
+        return true;
+    }
+    // Close pane: Ctrl+Shift+W
+    if mods == ctrl_shift && (keyval == gdk::Key::w || keyval == gdk::Key::W) {
+        return true;
+    }
+    // Pane navigation: Alt+Arrow
+    if mods == gdk::ModifierType::ALT_MASK
+        && (keyval == gdk::Key::Left
+            || keyval == gdk::Key::Right
+            || keyval == gdk::Key::Up
+            || keyval == gdk::Key::Down)
+    {
+        return true;
+    }
+
+    false
+}
+
 /// The main draw function called by GTK on every frame.
 fn draw_terminal(
     da: &DrawingArea,
@@ -681,5 +730,13 @@ fn draw_terminal(
                 ctx.stroke().ok();
             }
         }
+    }
+
+    // 5. Draw focus indicator border (drawn last so it's on top of everything)
+    if da.has_focus() {
+        ctx.set_source_rgb(0.31, 0.60, 0.84); // #4F99D7 — accent blue
+        ctx.set_line_width(2.0);
+        ctx.rectangle(1.0, 1.0, (width - 2) as f64, (height - 2) as f64);
+        ctx.stroke().ok();
     }
 }
