@@ -22,10 +22,12 @@ const DEFAULT_HEIGHT: i32 = 640;
 /// This function blocks until the window is closed. It initialises libadwaita,
 /// creates the main application window with CSD header bar, and enters the
 /// GTK main loop.
-pub fn run(_config: Config) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let app = adw::Application::builder().application_id(APP_ID).build();
 
-    app.connect_activate(build_ui);
+    app.connect_activate(move |app| {
+        build_ui(app, &config);
+    });
 
     // GTK expects argv-style arguments; pass empty since clap already parsed.
     let exit_code = app.run_with_args::<&str>(&[]);
@@ -37,8 +39,8 @@ pub fn run(_config: Config) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Build the main application window.
-fn build_ui(app: &adw::Application) {
+/// Build the main application window with a live terminal.
+fn build_ui(app: &adw::Application, config: &Config) {
     info!("Building Forgetty GTK4 window");
 
     let header = adw::HeaderBar::new();
@@ -46,13 +48,42 @@ fn build_ui(app: &adw::Application) {
     let content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     content.append(&header);
 
-    let window = adw::ApplicationWindow::builder()
-        .application(app)
-        .title("Forgetty")
-        .default_width(DEFAULT_WIDTH)
-        .default_height(DEFAULT_HEIGHT)
-        .content(&content)
-        .build();
+    // Create the terminal widget and wire up PTY I/O
+    match crate::terminal::create_terminal(config) {
+        Ok((drawing_area, _state)) => {
+            content.append(&drawing_area);
 
-    window.present();
+            let window = adw::ApplicationWindow::builder()
+                .application(app)
+                .title("Forgetty")
+                .default_width(DEFAULT_WIDTH)
+                .default_height(DEFAULT_HEIGHT)
+                .content(&content)
+                .build();
+
+            window.present();
+
+            // Grab focus on the drawing area so key events are delivered
+            drawing_area.grab_focus();
+        }
+        Err(e) => {
+            tracing::error!("Failed to create terminal: {e}");
+
+            // Fall back to an empty window with an error label
+            let label = gtk4::Label::new(Some(&format!("Failed to create terminal: {e}")));
+            label.set_hexpand(true);
+            label.set_vexpand(true);
+            content.append(&label);
+
+            let window = adw::ApplicationWindow::builder()
+                .application(app)
+                .title("Forgetty")
+                .default_width(DEFAULT_WIDTH)
+                .default_height(DEFAULT_HEIGHT)
+                .content(&content)
+                .build();
+
+            window.present();
+        }
+    }
 }
