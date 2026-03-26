@@ -263,7 +263,7 @@ impl GlyphAtlas {
         let terminal_buffer_count = buffers.len();
 
         // Build tab title buffers (smaller font)
-        let tab_font_size = 11.0;
+        let tab_font_size = 13.0;
         let tab_metrics = glyphon::Metrics::new(tab_font_size, tab_bar_height);
         let tab_width = 140.0f32;
         let tab_padding = 2.0;
@@ -274,9 +274,9 @@ impl GlyphAtlas {
 
             let is_active = i == tab_state.active_index;
             let color = if is_active {
-                glyphon::Color::rgba(220, 220, 240, 255)
+                glyphon::Color::rgba(224, 224, 224, 255)
             } else {
-                glyphon::Color::rgba(140, 140, 160, 255)
+                glyphon::Color::rgba(128, 128, 128, 255)
             };
 
             let title =
@@ -285,12 +285,26 @@ impl GlyphAtlas {
             buffer.set_text(
                 &mut self.font_system,
                 &title,
-                glyphon::Attrs::new().family(glyphon::Family::SansSerif).color(color),
+                glyphon::Attrs::new().family(glyphon::Family::Monospace).color(color),
                 glyphon::Shaping::Advanced,
             );
             buffer.shape_until_scroll(&mut self.font_system, false);
             buffers.push(buffer);
         }
+
+        // Window title "Forgetty" centered in the tab bar
+        let mut title_buffer = glyphon::Buffer::new(&mut self.font_system, tab_metrics);
+        title_buffer.set_size(&mut self.font_system, Some(200.0), Some(tab_bar_height));
+        title_buffer.set_text(
+            &mut self.font_system,
+            "Forgetty",
+            glyphon::Attrs::new()
+                .family(glyphon::Family::SansSerif)
+                .color(glyphon::Color::rgba(160, 160, 160, 255)),
+            glyphon::Shaping::Advanced,
+        );
+        title_buffer.shape_until_scroll(&mut self.font_system, false);
+        buffers.push(title_buffer);
 
         // Build text areas
         let mut text_areas: Vec<glyphon::TextArea<'_>> = Vec::with_capacity(buffers.len());
@@ -318,8 +332,12 @@ impl GlyphAtlas {
             });
         }
 
-        // Tab title text areas (in the tab bar area)
+        // Tab title text areas (in the tab bar area) — excludes last buffer (window title)
+        let title_buffer_index = buffers.len() - 1;
         for (i, buffer) in buffers.iter().enumerate().skip(terminal_buffer_count) {
+            if i == title_buffer_index {
+                break;
+            }
             let tab_idx = i - terminal_buffer_count;
             let x = tab_padding + tab_idx as f32 * (tab_width + tab_padding) + 8.0;
             text_areas.push(glyphon::TextArea {
@@ -337,6 +355,22 @@ impl GlyphAtlas {
                 custom_glyphs: &[],
             });
         }
+
+        // Centered "Forgetty" window title
+        text_areas.push(glyphon::TextArea {
+            buffer: &buffers[title_buffer_index],
+            left: (viewport_size.0 as f32 - 200.0) / 2.0,
+            top: 0.0,
+            scale: 1.0,
+            bounds: glyphon::TextBounds {
+                left: 0,
+                top: 0,
+                right: viewport_size.0 as i32,
+                bottom: tab_bar_height as i32,
+            },
+            default_color: glyphon::Color::rgba(160, 160, 160, 255),
+            custom_glyphs: &[],
+        });
 
         self.text_renderer.prepare(
             device,

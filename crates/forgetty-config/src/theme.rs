@@ -47,7 +47,7 @@ fn default_foreground() -> Rgba {
 }
 
 fn default_background() -> Rgba {
-    Rgba::rgb(30, 30, 46) // Catppuccin Mocha #1e1e2e
+    Rgba::rgb(40, 40, 40) // Neutral dark #282828
 }
 
 fn default_cursor_color() -> Rgba {

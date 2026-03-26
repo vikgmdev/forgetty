@@ -33,7 +33,7 @@ pub enum RendererError {
 }
 
 /// Height of the tab bar in pixels.
-const TAB_BAR_HEIGHT: f32 = 32.0;
+const TAB_BAR_HEIGHT: f32 = 36.0;
 
 /// The top-level terminal renderer.
 pub struct TerminalRenderer {

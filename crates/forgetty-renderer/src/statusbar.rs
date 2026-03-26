@@ -168,14 +168,14 @@ impl StatusBar {
         instances.push(BarInstance {
             position: [0.0, 0.0],
             size: [vw, bar_height],
-            color: [0.08, 0.08, 0.11, 1.0], // Very dark background #141419
+            color: [0.18, 0.18, 0.18, 1.0], // Neutral dark background #2d2d2d
         });
 
         // Bottom separator line (1px)
         instances.push(BarInstance {
             position: [0.0, bar_height - 1.0],
             size: [vw, 1.0],
-            color: [0.20, 0.20, 0.28, 1.0], // Subtle border #333348
+            color: [0.24, 0.24, 0.24, 1.0], // Subtle border #3d3d3d
         });
 
         // Tab buttons
@@ -199,9 +199,9 @@ impl StatusBar {
             }
 
             let color = if is_active {
-                [0.16, 0.16, 0.22, 1.0] // Active tab: slightly lighter #28283a
+                [0.12, 0.12, 0.12, 1.0] // Active tab: darker #1e1e1e
             } else {
-                [0.10, 0.10, 0.14, 1.0] // Inactive tab: darker #1a1a24
+                [0.18, 0.18, 0.18, 1.0] // Inactive tab: same as bar bg #2d2d2d
             };
 
             instances.push(BarInstance {
