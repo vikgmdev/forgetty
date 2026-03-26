@@ -329,7 +329,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
         };
 
-        let renderer = match TerminalRenderer::new(
+        let mut renderer = match TerminalRenderer::new(
             window.clone(),
             &self.config.font_family,
             self.config.font_size,
@@ -341,6 +341,10 @@ impl ApplicationHandler<UserEvent> for App {
                 return;
             }
         };
+
+        // Apply the config theme to the renderer's color scheme.
+        let scheme = forgetty_renderer::ColorScheme::from_theme(&self.config.theme);
+        renderer.set_color_scheme(scheme);
 
         // Calculate grid size and resize all panes.
         let (rows, cols) = renderer.grid_size();
@@ -407,11 +411,12 @@ impl ApplicationHandler<UserEvent> for App {
                         .iter()
                         .enumerate()
                         .map(|(i, tab)| {
-                            let title = if tab.title.is_empty() {
-                                format!("Tab {}", i + 1)
-                            } else {
-                                tab.title.clone()
-                            };
+                            // Use the focused pane's display_title for the tab label.
+                            let title = self
+                                .panes
+                                .get(&tab.focused_pane)
+                                .map(|pane| pane.display_title())
+                                .unwrap_or_else(|| format!("Tab {}", i + 1));
                             (title, i == self.active_tab)
                         })
                         .collect();

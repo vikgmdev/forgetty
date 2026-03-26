@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+forgetty-config = { path = "../forgetty-config" }
 forgetty-core = { path = "../forgetty-core" }
 forgetty-vt = { path = "../forgetty-vt" }
 wgpu = { workspace = true }
