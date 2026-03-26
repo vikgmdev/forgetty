@@ -364,6 +364,8 @@ pub const GHOSTTY_MODS_SHIFT: GhosttyMods = 1 << 0;
 pub const GHOSTTY_MODS_CTRL: GhosttyMods = 1 << 1;
 pub const GHOSTTY_MODS_ALT: GhosttyMods = 1 << 2;
 pub const GHOSTTY_MODS_SUPER: GhosttyMods = 1 << 3;
+pub const GHOSTTY_MODS_CAPS_LOCK: GhosttyMods = 1 << 4;
+pub const GHOSTTY_MODS_NUM_LOCK: GhosttyMods = 1 << 5;
 
 /// Key action constants.
 pub const GHOSTTY_KEY_ACTION_RELEASE: i32 = 0;
@@ -529,6 +531,32 @@ pub const GHOSTTY_KEY_FN_LOCK: i32 = 147;
 pub const GHOSTTY_KEY_PRINT_SCREEN: i32 = 148;
 pub const GHOSTTY_KEY_SCROLL_LOCK: i32 = 149;
 pub const GHOSTTY_KEY_PAUSE: i32 = 150;
+// Media & Browser Keys (W3C 3.6)
+pub const GHOSTTY_KEY_BROWSER_BACK: i32 = 151;
+pub const GHOSTTY_KEY_BROWSER_FAVORITES: i32 = 152;
+pub const GHOSTTY_KEY_BROWSER_FORWARD: i32 = 153;
+pub const GHOSTTY_KEY_BROWSER_HOME: i32 = 154;
+pub const GHOSTTY_KEY_BROWSER_REFRESH: i32 = 155;
+pub const GHOSTTY_KEY_BROWSER_SEARCH: i32 = 156;
+pub const GHOSTTY_KEY_BROWSER_STOP: i32 = 157;
+pub const GHOSTTY_KEY_EJECT: i32 = 158;
+pub const GHOSTTY_KEY_LAUNCH_APP_1: i32 = 159;
+pub const GHOSTTY_KEY_LAUNCH_APP_2: i32 = 160;
+pub const GHOSTTY_KEY_LAUNCH_MAIL: i32 = 161;
+pub const GHOSTTY_KEY_MEDIA_PLAY_PAUSE: i32 = 162;
+pub const GHOSTTY_KEY_MEDIA_SELECT: i32 = 163;
+pub const GHOSTTY_KEY_MEDIA_STOP: i32 = 164;
+pub const GHOSTTY_KEY_MEDIA_TRACK_NEXT: i32 = 165;
+pub const GHOSTTY_KEY_MEDIA_TRACK_PREVIOUS: i32 = 166;
+pub const GHOSTTY_KEY_POWER: i32 = 167;
+pub const GHOSTTY_KEY_SLEEP: i32 = 168;
+pub const GHOSTTY_KEY_AUDIO_VOLUME_DOWN: i32 = 169;
+pub const GHOSTTY_KEY_AUDIO_VOLUME_MUTE: i32 = 170;
+pub const GHOSTTY_KEY_AUDIO_VOLUME_UP: i32 = 171;
+pub const GHOSTTY_KEY_WAKE_UP: i32 = 172;
+pub const GHOSTTY_KEY_COPY: i32 = 173;
+pub const GHOSTTY_KEY_CUT: i32 = 174;
+pub const GHOSTTY_KEY_PASTE: i32 = 175;
 
 // ---------------------------------------------------------------------------
 // Mouse encoder types

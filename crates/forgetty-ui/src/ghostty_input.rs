@@ -11,7 +11,7 @@ use std::os::raw::c_void;
 
 use forgetty_vt::ffi;
 use winit::event::KeyEvent;
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 
 /// Result of encoding a scroll wheel event.
 pub enum ScrollAction {
@@ -84,8 +84,9 @@ impl GhosttyInput {
             ffi::ghostty_key_encoder_setopt_from_terminal(self.key_encoder, terminal);
         }
 
-        // Map winit key to ghostty key.
-        let gkey = winit_key_to_ghostty(&event.logical_key);
+        // Map winit key to ghostty key, then refine via physical key for numpad.
+        let mut gkey = winit_key_to_ghostty(&event.logical_key);
+        gkey = refine_key_with_physical(gkey, &event.physical_key);
 
         // Determine action.
         let action = if !is_press {
@@ -192,6 +193,7 @@ impl GhosttyInput {
         terminal: ffi::GhosttyTerminal,
         screen_size: (u32, u32),
         cell_size: (u32, u32),
+        padding_top: u32,
     ) -> Option<Vec<u8>> {
         let gbtn = winit_mouse_button_to_ghostty(button);
         if gbtn == ffi::GHOSTTY_MOUSE_BUTTON_UNKNOWN {
@@ -205,7 +207,7 @@ impl GhosttyInput {
             self.buttons_held &= !(1 << gbtn);
         }
 
-        self.sync_mouse_encoder(terminal, screen_size, cell_size);
+        self.sync_mouse_encoder(terminal, screen_size, cell_size, padding_top);
 
         let mods = winit_mods_to_ghostty(modifiers);
         let action = if pressed {
@@ -235,6 +237,7 @@ impl GhosttyInput {
         terminal: ffi::GhosttyTerminal,
         screen_size: (u32, u32),
         cell_size: (u32, u32),
+        padding_top: u32,
     ) -> Option<Vec<u8>> {
         // Only send if position actually changed.
         if (position.0 - self.last_cursor_pos.0).abs() < 0.5
@@ -244,7 +247,7 @@ impl GhosttyInput {
         }
         self.last_cursor_pos = position;
 
-        self.sync_mouse_encoder(terminal, screen_size, cell_size);
+        self.sync_mouse_encoder(terminal, screen_size, cell_size, padding_top);
 
         let mods = winit_mods_to_ghostty(modifiers);
         unsafe {
@@ -282,10 +285,11 @@ impl GhosttyInput {
         mouse_tracking: bool,
         screen_size: (u32, u32),
         cell_size: (u32, u32),
+        padding_top: u32,
     ) -> ScrollAction {
         if mouse_tracking {
             // Forward to application via mouse encoder as button 4/5 press+release.
-            self.sync_mouse_encoder(terminal, screen_size, cell_size);
+            self.sync_mouse_encoder(terminal, screen_size, cell_size, padding_top);
 
             let mods = winit_mods_to_ghostty(modifiers);
             let scroll_btn = if delta_lines > 0.0 {
@@ -364,6 +368,7 @@ impl GhosttyInput {
         terminal: ffi::GhosttyTerminal,
         screen_size: (u32, u32),
         cell_size: (u32, u32),
+        padding_top: u32,
     ) {
         unsafe {
             ffi::ghostty_mouse_encoder_setopt_from_terminal(self.mouse_encoder, terminal);
@@ -375,7 +380,7 @@ impl GhosttyInput {
             screen_height: screen_size.1,
             cell_width: cell_size.0,
             cell_height: cell_size.1,
-            padding_top: 0,
+            padding_top,
             padding_bottom: 0,
             padding_right: 0,
             padding_left: 0,
@@ -552,11 +557,86 @@ fn winit_named_key_to_ghostty(key: NamedKey) -> i32 {
         NamedKey::F23 => ffi::GHOSTTY_KEY_F23,
         NamedKey::F24 => ffi::GHOSTTY_KEY_F24,
         NamedKey::F25 => ffi::GHOSTTY_KEY_F25,
+        // Modifier keys (default to left variant; physical key can refine later)
+        NamedKey::Shift => ffi::GHOSTTY_KEY_SHIFT_LEFT,
+        NamedKey::Control => ffi::GHOSTTY_KEY_CONTROL_LEFT,
+        NamedKey::Alt => ffi::GHOSTTY_KEY_ALT_LEFT,
+        NamedKey::Super => ffi::GHOSTTY_KEY_META_LEFT,
+        // Media keys
+        NamedKey::MediaPlayPause => ffi::GHOSTTY_KEY_MEDIA_PLAY_PAUSE,
+        NamedKey::MediaStop => ffi::GHOSTTY_KEY_MEDIA_STOP,
+        NamedKey::MediaTrackNext => ffi::GHOSTTY_KEY_MEDIA_TRACK_NEXT,
+        NamedKey::MediaTrackPrevious => ffi::GHOSTTY_KEY_MEDIA_TRACK_PREVIOUS,
+        // NamedKey::MediaSelect not available in winit 0.30
+        NamedKey::AudioVolumeDown => ffi::GHOSTTY_KEY_AUDIO_VOLUME_DOWN,
+        NamedKey::AudioVolumeMute => ffi::GHOSTTY_KEY_AUDIO_VOLUME_MUTE,
+        NamedKey::AudioVolumeUp => ffi::GHOSTTY_KEY_AUDIO_VOLUME_UP,
+        // Browser keys
+        NamedKey::BrowserBack => ffi::GHOSTTY_KEY_BROWSER_BACK,
+        NamedKey::BrowserFavorites => ffi::GHOSTTY_KEY_BROWSER_FAVORITES,
+        NamedKey::BrowserForward => ffi::GHOSTTY_KEY_BROWSER_FORWARD,
+        NamedKey::BrowserHome => ffi::GHOSTTY_KEY_BROWSER_HOME,
+        NamedKey::BrowserRefresh => ffi::GHOSTTY_KEY_BROWSER_REFRESH,
+        NamedKey::BrowserSearch => ffi::GHOSTTY_KEY_BROWSER_SEARCH,
+        NamedKey::BrowserStop => ffi::GHOSTTY_KEY_BROWSER_STOP,
+        // Launch / power keys
+        NamedKey::Eject => ffi::GHOSTTY_KEY_EJECT,
+        NamedKey::LaunchApplication1 => ffi::GHOSTTY_KEY_LAUNCH_APP_1,
+        NamedKey::LaunchApplication2 => ffi::GHOSTTY_KEY_LAUNCH_APP_2,
+        NamedKey::LaunchMail => ffi::GHOSTTY_KEY_LAUNCH_MAIL,
+        NamedKey::Power => ffi::GHOSTTY_KEY_POWER,
+        // NamedKey::Sleep not available in winit 0.30
+        NamedKey::WakeUp => ffi::GHOSTTY_KEY_WAKE_UP,
+        // Clipboard keys
+        NamedKey::Copy => ffi::GHOSTTY_KEY_COPY,
+        NamedKey::Cut => ffi::GHOSTTY_KEY_CUT,
+        NamedKey::Paste => ffi::GHOSTTY_KEY_PASTE,
         _ => ffi::GHOSTTY_KEY_UNIDENTIFIED,
     }
 }
 
+/// Refine a GhosttyKey using the physical key, primarily for numpad keys.
+///
+/// Winit delivers numpad digit presses as `Key::Character("0")` etc., which
+/// maps to GHOSTTY_KEY_DIGIT_*. When the physical key is a numpad key we
+/// override to the correct GHOSTTY_KEY_NUMPAD_* constant. This also handles
+/// modifier keys that need left/right disambiguation.
+fn refine_key_with_physical(gkey: i32, physical: &PhysicalKey) -> i32 {
+    match physical {
+        PhysicalKey::Code(code) => match code {
+            KeyCode::Numpad0 => ffi::GHOSTTY_KEY_NUMPAD_0,
+            KeyCode::Numpad1 => ffi::GHOSTTY_KEY_NUMPAD_1,
+            KeyCode::Numpad2 => ffi::GHOSTTY_KEY_NUMPAD_2,
+            KeyCode::Numpad3 => ffi::GHOSTTY_KEY_NUMPAD_3,
+            KeyCode::Numpad4 => ffi::GHOSTTY_KEY_NUMPAD_4,
+            KeyCode::Numpad5 => ffi::GHOSTTY_KEY_NUMPAD_5,
+            KeyCode::Numpad6 => ffi::GHOSTTY_KEY_NUMPAD_6,
+            KeyCode::Numpad7 => ffi::GHOSTTY_KEY_NUMPAD_7,
+            KeyCode::Numpad8 => ffi::GHOSTTY_KEY_NUMPAD_8,
+            KeyCode::Numpad9 => ffi::GHOSTTY_KEY_NUMPAD_9,
+            KeyCode::NumpadAdd => ffi::GHOSTTY_KEY_NUMPAD_ADD,
+            KeyCode::NumpadSubtract => ffi::GHOSTTY_KEY_NUMPAD_SUBTRACT,
+            KeyCode::NumpadMultiply => ffi::GHOSTTY_KEY_NUMPAD_MULTIPLY,
+            KeyCode::NumpadDivide => ffi::GHOSTTY_KEY_NUMPAD_DIVIDE,
+            KeyCode::NumpadDecimal => ffi::GHOSTTY_KEY_NUMPAD_DECIMAL,
+            KeyCode::NumpadEnter => ffi::GHOSTTY_KEY_NUMPAD_ENTER,
+            KeyCode::NumpadEqual => ffi::GHOSTTY_KEY_NUMPAD_EQUAL,
+            // Disambiguate left/right modifier keys.
+            KeyCode::ShiftRight => ffi::GHOSTTY_KEY_SHIFT_RIGHT,
+            KeyCode::ControlRight => ffi::GHOSTTY_KEY_CONTROL_RIGHT,
+            KeyCode::AltRight => ffi::GHOSTTY_KEY_ALT_RIGHT,
+            KeyCode::SuperRight => ffi::GHOSTTY_KEY_META_RIGHT,
+            _ => gkey,
+        },
+        _ => gkey,
+    }
+}
+
 /// Map winit modifiers to GhosttyMods bitmask.
+///
+/// NOTE: Winit 0.30's `ModifiersState` does not expose CapsLock or NumLock
+/// state. Those bits (GHOSTTY_MODS_CAPS_LOCK / GHOSTTY_MODS_NUM_LOCK) will
+/// remain unset until winit adds support or we query X11/Wayland directly.
 fn winit_mods_to_ghostty(mods: ModifiersState) -> ffi::GhosttyMods {
     let mut result: ffi::GhosttyMods = 0;
     if mods.shift_key() {
@@ -571,6 +651,8 @@ fn winit_mods_to_ghostty(mods: ModifiersState) -> ffi::GhosttyMods {
     if mods.super_key() {
         result |= ffi::GHOSTTY_MODS_SUPER;
     }
+    // CapsLock and NumLock: not exposed by winit 0.30 ModifiersState.
+    // TODO: query platform-specific lock key state when winit adds support.
     result
 }
 

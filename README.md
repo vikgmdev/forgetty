@@ -171,6 +171,41 @@ Forgetty is organized as a Cargo workspace with the following crates:
 See [docs/architecture.md](docs/architecture.md) for the full architecture
 overview and data flow diagrams.
 
+## Why Not Fork Ghostty?
+
+Ghostty is an excellent terminal — so why build Forgetty instead of forking it?
+
+**We use Ghostty's brain, not its body.** Forgetty uses
+[libghostty-vt](https://github.com/ghostty-org/ghostty) for terminal emulation
+(the same SIMD-optimized VT parser that powers Ghostty), but replaces the
+rendering layer with [wgpu](https://wgpu.rs/) for true cross-platform support.
+
+| | Ghostty | Forgetty |
+|---|---|---|
+| **Terminal engine** | libghostty (Zig) | libghostty-vt (same engine) |
+| **GPU rendering** | Metal (macOS) + OpenGL (Linux) | wgpu → Vulkan, Metal, DX12, OpenGL, WebGPU |
+| **Shader language** | MSL + GLSL (separate per platform) | WGSL (one language, compiled for all) |
+| **Font rendering** | CoreText (macOS) + FreeType (Linux) | cosmic-text + glyphon (Rust, all platforms) |
+| **Windows** | Limited (OpenGL, no font discovery) | Full (DX12/Vulkan, native fonts) |
+| **Android** | No | Yes (Vulkan/GLES) |
+| **Browser** | Stubbed WebGL | WebGPU (all major browsers) |
+| **UI framework** | GTK (Linux) + AppKit (macOS) | wgpu custom (one codebase) |
+| **Language** | Zig | Rust |
+| **License** | MIT | MIT |
+
+**Ghostty's renderer is platform-specific by design** — Metal shaders don't run
+on Linux, GLSL doesn't run on macOS. Each platform has a separate renderer
+codebase. wgpu solves this: one WGSL shader compiles to Metal, HLSL, GLSL, and
+SPIR-V automatically via [Naga](https://github.com/gfx-rs/naga).
+
+**The result:** Forgetty gets Ghostty's battle-tested terminal emulation
+(including Kitty protocol, SIMD parsing, Unicode support) with a renderer that
+runs on every platform from a single codebase. We build AI-first UI features
+(workspaces, agent notifications, smart clipboard, sync) on top.
+
+See [docs/adr/004-wgpu-vs-ghostty-renderer.md](docs/adr/004-wgpu-vs-ghostty-renderer.md)
+for the full architectural decision record.
+
 ## Contributing
 
 Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) to

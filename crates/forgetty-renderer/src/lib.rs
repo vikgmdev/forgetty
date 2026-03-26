@@ -258,6 +258,11 @@ impl TerminalRenderer {
         (cs.width.ceil() as u32, cs.height.ceil() as u32)
     }
 
+    /// Get the tab bar height in pixels (used as padding_top for mouse encoding).
+    pub fn tab_bar_height(&self) -> u32 {
+        TAB_BAR_HEIGHT as u32
+    }
+
     pub fn context(&self) -> &RenderContext {
         &self.context
     }

@@ -318,14 +318,15 @@ impl App {
         }
     }
 
-    /// Get screen and cell sizes for mouse encoder.
-    fn get_screen_cell_sizes(&self) -> (u32, u32, u32, u32) {
+    /// Get screen size, cell size, and tab bar height for mouse encoder.
+    fn get_screen_cell_sizes(&self) -> (u32, u32, u32, u32, u32) {
         if let Some(renderer) = &self.renderer {
             let (screen_w, screen_h) = renderer.surface_size();
             let (cell_w, cell_h) = renderer.cell_size();
-            (screen_w, screen_h, cell_w, cell_h)
+            let tab_bar_h = renderer.tab_bar_height();
+            (screen_w, screen_h, cell_w, cell_h, tab_bar_h)
         } else {
-            (960, 640, 8, 16)
+            (960, 640, 8, 16, 36)
         }
     }
 
@@ -549,13 +550,15 @@ impl ApplicationHandler<UserEvent> for App {
                     .map(|pane| pane.terminal.raw_handle());
 
                 if let Some(handle) = terminal_handle {
-                    let (screen_w, screen_h, cell_w, cell_h) = self.get_screen_cell_sizes();
+                    let (screen_w, screen_h, cell_w, cell_h, tab_bar_h) =
+                        self.get_screen_cell_sizes();
                     if let Some(bytes) = self.ghostty_input.handle_mouse_move(
                         self.cursor_position,
                         self.modifiers,
                         handle,
                         (screen_w, screen_h),
                         (cell_w, cell_h),
+                        tab_bar_h,
                     ) {
                         self.write_to_focused_pty(&bytes);
                         if let Some(window) = &self.window {
@@ -574,7 +577,8 @@ impl ApplicationHandler<UserEvent> for App {
                     .map(|pane| pane.terminal.raw_handle());
 
                 if let Some(handle) = terminal_handle {
-                    let (screen_w, screen_h, cell_w, cell_h) = self.get_screen_cell_sizes();
+                    let (screen_w, screen_h, cell_w, cell_h, tab_bar_h) =
+                        self.get_screen_cell_sizes();
                     if let Some(bytes) = self.ghostty_input.handle_mouse_button(
                         button,
                         pressed,
@@ -583,6 +587,7 @@ impl ApplicationHandler<UserEvent> for App {
                         handle,
                         (screen_w, screen_h),
                         (cell_w, cell_h),
+                        tab_bar_h,
                     ) {
                         self.write_to_focused_pty(&bytes);
                         if let Some(window) = &self.window {
@@ -614,7 +619,8 @@ impl ApplicationHandler<UserEvent> for App {
                     .unwrap_or(false);
 
                 if let Some(handle) = terminal_handle {
-                    let (screen_w, screen_h, cell_w, cell_h) = self.get_screen_cell_sizes();
+                    let (screen_w, screen_h, cell_w, cell_h, tab_bar_h) =
+                        self.get_screen_cell_sizes();
                     let action = self.ghostty_input.handle_scroll(
                         delta_lines,
                         self.modifiers,
@@ -623,6 +629,7 @@ impl ApplicationHandler<UserEvent> for App {
                         mouse_tracking,
                         (screen_w, screen_h),
                         (cell_w, cell_h),
+                        tab_bar_h,
                     );
                     match action {
                         ScrollAction::WriteBytes(bytes) => {
