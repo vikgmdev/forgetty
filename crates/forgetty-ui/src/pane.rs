@@ -95,6 +95,17 @@ impl Pane {
                 Ok(data) => {
                     had_output = true;
                     self.terminal.feed(&data);
+
+                    // After each feed(), drain any write-PTY responses
+                    // (DA responses, mode queries, etc.) and send them
+                    // back to the PTY. This is the accumulator pattern:
+                    // the callback appends during feed(), we drain here.
+                    let responses = self.terminal.drain_write_pty();
+                    for chunk in responses {
+                        if let Err(e) = self.pty.write(&chunk) {
+                            warn!(pane_id = self.id.0, "failed to write PTY response: {e}");
+                        }
+                    }
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
