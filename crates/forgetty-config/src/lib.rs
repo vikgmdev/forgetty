@@ -9,5 +9,5 @@ pub mod schema;
 pub mod theme;
 
 pub use loader::load_config;
-pub use schema::{Config, CursorStyle};
+pub use schema::{BellMode, Config, CursorStyle};
 pub use theme::Theme;
