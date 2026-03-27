@@ -61,6 +61,15 @@ impl Default for SearchState {
     }
 }
 
+/// A URL detected under the mouse cursor, with its screen position.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HoverUrl {
+    url: String,
+    screen_row: usize,
+    col_start: usize,
+    col_end: usize, // exclusive
+}
+
 /// Shared terminal state accessible from multiple GTK callbacks.
 ///
 /// All access happens on the GTK main thread via `Rc<RefCell<>>`.
@@ -100,6 +109,10 @@ pub struct TerminalState {
     pub font_size: f32,
     /// The configured default font size, for Ctrl+0 reset.
     pub default_font_size: f32,
+    /// Currently hovered URL (if any) for underline rendering and Ctrl+Click.
+    hover_url: Option<HoverUrl>,
+    /// Last cell checked for hover URL (row, col). Avoids re-scanning the same cell on sub-pixel motion.
+    last_hover_cell: (usize, usize),
 }
 
 impl TerminalState {
@@ -194,6 +207,8 @@ pub fn create_terminal(
         search: SearchState::default(),
         font_size: config.font_size,
         default_font_size: config.font_size,
+        hover_url: None,
+        last_hover_cell: (usize::MAX, usize::MAX),
     }));
 
     // Create DrawingArea
@@ -202,6 +217,7 @@ pub fn create_terminal(
     drawing_area.set_vexpand(true);
     drawing_area.set_focusable(true);
     drawing_area.set_can_focus(true);
+    drawing_area.set_cursor_from_name(Some("text"));
 
     // Track whether cell dimensions have been measured from an actual Pango context
     let cell_measured = Rc::new(RefCell::new(false));
@@ -429,7 +445,8 @@ pub fn create_terminal(
                     let (screen_row, col) =
                         pixel_to_cell(x, y, s.cell_width, s.cell_height, s.cols, s.rows);
                     let screen = s.terminal.screen();
-                    let url = detect_url_at(screen, screen_row, col);
+                    let hover = detect_url_at(screen, screen_row, col);
+                    let url_str = hover.map(|h| h.url);
                     let has_selection = s.selection.is_some();
                     drop(s);
 
@@ -437,7 +454,7 @@ pub fn create_terminal(
                     if let Some(popover) = find_context_popover(&da_click) {
                         // Build button box fresh (handles dynamic URL + copy sensitivity)
                         let menu_box =
-                            build_context_menu_box(&popover, url.as_deref(), has_selection);
+                            build_context_menu_box(&popover, url_str.as_deref(), has_selection);
                         popover.set_child(Some(&menu_box));
                         popover
                             .set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
@@ -445,6 +462,31 @@ pub fn create_terminal(
                     }
 
                     return;
+                }
+
+                // --- Ctrl+Click to open URL (AC-7, AC-8) ---
+                // Intercept before selection logic. Only when mouse tracking is
+                // NOT active (AC-18) and Ctrl is held without Shift.
+                if button == 1
+                    && modifier.contains(gdk::ModifierType::CONTROL_MASK)
+                    && !modifier.contains(gdk::ModifierType::SHIFT_MASK)
+                {
+                    let Ok(s) = state.try_borrow() else {
+                        return;
+                    };
+                    let mouse_tracking = s.terminal.is_mouse_tracking();
+                    if !mouse_tracking {
+                        let (screen_row, col) =
+                            pixel_to_cell(x, y, s.cell_width, s.cell_height, s.cols, s.rows);
+                        let screen = s.terminal.screen();
+                        let hover = detect_url_at(screen, screen_row, col);
+                        drop(s);
+                        if let Some(hu) = hover {
+                            crate::app::open_url_in_browser(&hu.url);
+                            return;
+                        }
+                    }
+                    // If mouse tracking is active or no URL found, fall through
                 }
 
                 let Ok(mut s) = state.try_borrow_mut() else {
@@ -718,6 +760,45 @@ pub fn create_terminal(
                     }
                     da_motion.queue_draw();
                 }
+
+                // --- Hover URL detection (AC-1, AC-2, AC-3) ---
+                let (screen_row, col) =
+                    pixel_to_cell(x, y, s.cell_width, s.cell_height, s.cols, s.rows);
+                if s.last_hover_cell == (screen_row, col) {
+                    return;
+                }
+                s.last_hover_cell = (screen_row, col);
+                let screen = s.terminal.screen();
+                let new_hover = detect_url_at(screen, screen_row, col);
+                let changed = s.hover_url != new_hover;
+                if changed {
+                    let want_pointer = new_hover.is_some();
+                    s.hover_url = new_hover;
+                    drop(s);
+                    if want_pointer {
+                        da_motion.set_cursor_from_name(Some("pointer"));
+                    } else {
+                        da_motion.set_cursor_from_name(Some("text"));
+                    }
+                    da_motion.queue_draw();
+                }
+            });
+        }
+
+        // Clear hover state when the mouse leaves the DrawingArea (AC-3, AC-19)
+        {
+            let state = Rc::clone(&state);
+            let da_leave = drawing_area.clone();
+            motion_controller.connect_leave(move |_controller| {
+                let Ok(mut s) = state.try_borrow_mut() else {
+                    return;
+                };
+                if s.hover_url.is_some() {
+                    s.hover_url = None;
+                    drop(s);
+                    da_leave.set_cursor_from_name(Some("text"));
+                    da_leave.queue_draw();
+                }
             });
         }
 
@@ -776,7 +857,12 @@ pub fn create_terminal(
                     }
                 }
 
+                // Clear stale hover state after scroll (content under cursor shifted)
+                s.hover_url = None;
+                s.last_hover_cell = (usize::MAX, usize::MAX);
+
                 drop(s);
+                da_scroll.set_cursor_from_name(Some("text"));
                 da_scroll.queue_draw();
                 glib::Propagation::Stop
             });
@@ -1232,8 +1318,9 @@ fn make_menu_button(
 /// Detect a URL at the given cell position by scanning the row text.
 ///
 /// Looks for `http://` or `https://` URLs in the row containing the click.
-/// If the clicked column falls within a URL match, returns that URL.
-fn detect_url_at(screen: &forgetty_vt::Screen, screen_row: usize, col: usize) -> Option<String> {
+/// If the clicked column falls within a URL match, returns a `HoverUrl`
+/// with the URL string and its column span.
+fn detect_url_at(screen: &forgetty_vt::Screen, screen_row: usize, col: usize) -> Option<HoverUrl> {
     if screen_row >= screen.rows() {
         return None;
     }
@@ -1288,14 +1375,18 @@ fn detect_url_at(screen: &forgetty_vt::Screen, screen_row: usize, col: usize) ->
 
         let url = &line[abs_pos..end];
 
-        // Check if the clicked column falls within this URL
         // Find the column range that corresponds to [abs_pos..end)
         let url_col_start =
             col_to_byte_start.iter().position(|&b| b >= abs_pos).unwrap_or(num_cols);
         let url_col_end = col_to_byte_start.iter().position(|&b| b >= end).unwrap_or(num_cols);
 
         if col >= url_col_start && col < url_col_end {
-            return Some(url.to_string());
+            return Some(HoverUrl {
+                url: url.to_string(),
+                screen_row,
+                col_start: url_col_start,
+                col_end: url_col_end,
+            });
         }
 
         search_start = end;
@@ -1832,6 +1923,9 @@ fn draw_terminal(
     // Clone selection state for rendering
     let selection = s.selection.clone();
 
+    // Clone hover URL state for rendering
+    let hover_url = s.hover_url.clone();
+
     // Filter all_matches to the current viewport for drawing.
     // The full scrollback scan (all_matches) is done once when the query
     // changes.  Here we just recompute the viewport-relative subset so
@@ -1963,6 +2057,31 @@ fn draw_terminal(
                 ctx.set_line_width(1.0);
                 ctx.move_to(x, y + cell_h / 2.0);
                 ctx.line_to(x + cell_w, y + cell_h / 2.0);
+                ctx.stroke().ok();
+            }
+        }
+    }
+
+    // 3b. Draw hover URL underline (AC-1, AC-5, AC-6)
+    if let Some(ref hu) = hover_url {
+        if hu.screen_row < num_rows {
+            let y = hu.screen_row as f64 * cell_h;
+            let cells = screen.row(hu.screen_row);
+            for col in hu.col_start..hu.col_end.min(num_cols) {
+                // Skip cells that already have SGR underline (AC-6)
+                if col < cells.len() && cells[col].attrs.underline {
+                    continue;
+                }
+                let (fr, fg_g, fb) = if col < cells.len() {
+                    color_to_rgb(&cells[col].attrs.fg, &fg_color)
+                } else {
+                    color_to_rgb(&Color::Default, &fg_color)
+                };
+                ctx.set_source_rgb(fr, fg_g, fb);
+                ctx.set_line_width(1.0);
+                let x = col as f64 * cell_w;
+                ctx.move_to(x, y + cell_h - 1.0);
+                ctx.line_to(x + cell_w, y + cell_h - 1.0);
                 ctx.stroke().ok();
             }
         }
