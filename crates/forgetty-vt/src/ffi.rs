@@ -143,6 +143,19 @@ pub struct GhosttyTerminalOptions {
     pub max_scrollback: usize,
 }
 
+/// Scrollbar state returned by `GHOSTTY_TERMINAL_DATA_SCROLLBAR`.
+/// Matches the C struct `GhosttyTerminalScrollbar` from terminal.h.
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct GhosttyTerminalScrollbar {
+    /// Total size of the scrollable area in rows.
+    pub total: u64,
+    /// Offset into the total area that the viewport is at.
+    pub offset: u64,
+    /// Length of the visible area in rows.
+    pub len: u64,
+}
+
 // Terminal data types
 pub const GHOSTTY_TERMINAL_DATA_COLS: i32 = 1;
 pub const GHOSTTY_TERMINAL_DATA_ROWS: i32 = 2;
@@ -150,6 +163,7 @@ pub const GHOSTTY_TERMINAL_DATA_CURSOR_X: i32 = 3;
 pub const GHOSTTY_TERMINAL_DATA_CURSOR_Y: i32 = 4;
 pub const GHOSTTY_TERMINAL_DATA_CURSOR_VISIBLE: i32 = 7;
 pub const GHOSTTY_TERMINAL_DATA_TITLE: i32 = 12;
+pub const GHOSTTY_TERMINAL_DATA_SCROLLBAR: i32 = 9;
 pub const GHOSTTY_TERMINAL_DATA_TOTAL_ROWS: i32 = 14;
 pub const GHOSTTY_TERMINAL_DATA_SCROLLBACK_ROWS: i32 = 15;
 

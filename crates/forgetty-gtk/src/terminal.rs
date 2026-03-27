@@ -1,8 +1,10 @@
 //! Terminal grid rendering with Pango + Cairo.
 //!
-//! Provides `create_terminal()` which returns a `gtk::DrawingArea`
-//! that renders the terminal grid from `forgetty_vt::Terminal`'s screen state
-//! using Cairo for drawing and Pango for text layout.
+//! Provides `create_terminal()` which returns a `(gtk::Box, DrawingArea, State)`
+//! triple: the Box contains the DrawingArea (terminal grid) and a vertical
+//! gtk::Scrollbar on the right edge. The DrawingArea renders the terminal grid
+//! from `forgetty_vt::Terminal`'s screen state using Cairo for drawing and
+//! Pango for text layout.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -48,6 +50,10 @@ pub struct TerminalState {
     /// Shell redraws on SIGWINCH, which would otherwise clear the selection.
     /// Each resize resets this to a grace period; decremented each tick.
     pub suppress_selection_clear_ticks: u8,
+    /// Guard flag: true while we are programmatically updating the scrollbar
+    /// adjustment, to suppress the `value-changed` signal handler and prevent
+    /// a feedback loop (terminal -> adjustment -> scroll -> terminal -> ...).
+    pub updating_scrollbar: bool,
 }
 
 impl TerminalState {
@@ -94,14 +100,18 @@ fn font_description(config: &Config) -> pango::FontDescription {
     desc
 }
 
-/// Create the terminal `DrawingArea` and wire up PTY I/O, rendering, input,
-/// and resize handling.
+/// Create the terminal widget and wire up PTY I/O, rendering, input,
+/// scrollbar, and resize handling.
 ///
-/// Returns `(drawing_area, state)` where `state` is the shared `TerminalState`
-/// wrapped in `Rc<RefCell<>>`.
+/// Returns `(hbox, drawing_area, state)` where:
+/// - `hbox` is a horizontal `gtk::Box` containing the DrawingArea and a
+///   vertical scrollbar on the right edge.
+/// - `drawing_area` is the inner `DrawingArea` (needed for `grab_focus()`,
+///   widget naming, and focus tracking).
+/// - `state` is the shared `TerminalState` wrapped in `Rc<RefCell<>>`.
 pub fn create_terminal(
     config: &Config,
-) -> Result<(DrawingArea, Rc<RefCell<TerminalState>>), String> {
+) -> Result<(gtk4::Box, DrawingArea, Rc<RefCell<TerminalState>>), String> {
     let initial_rows: usize = 24;
     let initial_cols: usize = 80;
 
@@ -130,6 +140,7 @@ pub fn create_terminal(
         word_anchor: None,
         drag_origin: None,
         suppress_selection_clear_ticks: 0,
+        updating_scrollbar: false,
     }));
 
     // Create DrawingArea
@@ -169,11 +180,21 @@ pub fn create_terminal(
                 // The PTY data will be picked up on the next 8ms cycle.
                 return glib::ControlFlow::Continue;
             };
+
+            // Check if viewport is at the bottom BEFORE draining new data.
+            // If the user has manually scrolled up, we should NOT force them
+            // back to the bottom when new output arrives.
+            let (total, offset, len) = s.terminal.scrollbar_state();
+            let was_at_bottom = total <= len || offset + len >= total;
+
             let had_data = s.drain_pty_output();
             if had_data {
-                // Scroll to bottom on new output so the user doesn't miss
-                // anything after browsing scrollback (AC-9).
-                s.terminal.scroll_viewport_bottom();
+                // Only auto-scroll to bottom when the user was already at
+                // the bottom. This lets users browse scrollback history
+                // during rapid continuous output (e.g., `while true; do date; done`).
+                if was_at_bottom {
+                    s.terminal.scroll_viewport_bottom();
+                }
 
                 // Clear selection on new output to avoid stale highlights
                 // pointing to cells that no longer contain the selected text (AC-17).
@@ -342,8 +363,15 @@ pub fn create_terminal(
 
                 if button == 1 && use_selection {
                     // Handle text selection instead of forwarding to app
-                    let (row, col) =
+                    let (screen_row, col) =
                         pixel_to_cell(x, y, s.cell_width, s.cell_height, s.cols, s.rows);
+
+                    // Convert screen-relative row to absolute scrollback row.
+                    // scrollbar_state().1 (offset) is the viewport position from
+                    // the top of total scrollback.  Screen row 0 = scrollback
+                    // row `offset`.
+                    let (_, vp_offset, _) = s.terminal.scrollbar_state();
+                    let abs_row = screen_row + vp_offset as usize;
 
                     match n_press {
                         1 => {
@@ -353,14 +381,17 @@ pub fn create_terminal(
                             s.selection = None; // clear any previous selection (AC-3)
                             s.selecting = true;
                             s.word_anchor = None;
-                            s.drag_origin = Some((row, col));
+                            s.drag_origin = Some((abs_row, col));
                         }
                         2 => {
                             // Double-click: select word under cursor.
+                            // Word boundaries are found on the viewport screen (screen_row),
+                            // but stored as absolute coordinates.
                             let screen = s.terminal.screen();
-                            let (word_start, word_end) = find_word_boundaries(screen, row, col);
-                            let mut sel = Selection::new(row, word_start, SelectionMode::Word);
-                            sel.update(row, word_end);
+                            let (word_start, word_end) =
+                                find_word_boundaries(screen, screen_row, col);
+                            let mut sel = Selection::new(abs_row, word_start, SelectionMode::Word);
+                            sel.update(abs_row, word_end);
                             s.selection = Some(sel);
                             s.selecting = true;
                             s.word_anchor = Some((word_start, word_end));
@@ -368,9 +399,9 @@ pub fn create_terminal(
                         3 => {
                             // Triple-click: select entire line.
                             let screen = s.terminal.screen();
-                            let last_col = last_non_whitespace_col(screen, row);
-                            let mut sel = Selection::new(row, 0, SelectionMode::Line);
-                            sel.update(row, last_col);
+                            let last_col = last_non_whitespace_col(screen, screen_row);
+                            let mut sel = Selection::new(abs_row, 0, SelectionMode::Line);
+                            sel.update(abs_row, last_col);
                             s.selection = Some(sel);
                             s.selecting = false; // Line selection is immediate
                             s.word_anchor = None;
@@ -480,11 +511,16 @@ pub fn create_terminal(
 
                 // If we are actively dragging a selection, update the endpoint
                 if s.selecting {
-                    let (row, col) =
+                    let (screen_row, col) =
                         pixel_to_cell(x, y, s.cell_width, s.cell_height, s.cols, s.rows);
+
+                    // Convert screen row to absolute scrollback row
+                    let (_, vp_offset, _) = s.terminal.scrollbar_state();
+                    let abs_row = screen_row + vp_offset as usize;
 
                     // Deferred creation: if no Selection exists yet (single-click
                     // path), create it now that actual drag motion is detected.
+                    // drag_origin already stores absolute rows.
                     if s.selection.is_none() {
                         if let Some((origin_row, origin_col)) = s.drag_origin.take() {
                             s.selection =
@@ -497,10 +533,12 @@ pub fn create_terminal(
                     let word_anchor = s.word_anchor;
                     let anchor_row = s.selection.as_ref().map(|sel| sel.start.0);
 
-                    // For word mode, compute word boundaries before mutably borrowing selection
+                    // For word mode, compute word boundaries using screen-relative row
+                    // (since find_word_boundaries works on the viewport screen), but
+                    // store the result as absolute rows.
                     let word_bounds = if sel_mode == Some(SelectionMode::Word) {
                         let screen = s.terminal.screen();
-                        Some(find_word_boundaries(screen, row, col))
+                        Some(find_word_boundaries(screen, screen_row, col))
                     } else {
                         None
                     };
@@ -514,24 +552,24 @@ pub fn create_terminal(
                                 if let (Some((anchor_start, anchor_end)), Some(a_row)) =
                                     (word_anchor, anchor_row)
                                 {
-                                    if row < a_row
-                                        || (row == a_row && drag_word_start < anchor_start)
+                                    if abs_row < a_row
+                                        || (abs_row == a_row && drag_word_start < anchor_start)
                                     {
                                         // Dragging before the anchor word
                                         sel.start = (a_row, anchor_end);
-                                        sel.end = (row, drag_word_start);
+                                        sel.end = (abs_row, drag_word_start);
                                     } else {
                                         // Dragging after the anchor word
                                         sel.start = (a_row, anchor_start);
-                                        sel.end = (row, drag_word_end);
+                                        sel.end = (abs_row, drag_word_end);
                                     }
                                 } else {
-                                    sel.update(row, drag_word_end);
+                                    sel.update(abs_row, drag_word_end);
                                 }
                             }
                             _ => {
                                 // Normal mode: character-by-character
-                                sel.update(row, col);
+                                sel.update(abs_row, col);
                             }
                         }
                     }
@@ -673,7 +711,86 @@ pub fn create_terminal(
         });
     }
 
-    Ok((drawing_area, state))
+    // --- Scrollbar (GTK native vertical scrollbar + Adjustment) ---
+    let adjustment = gtk4::Adjustment::new(
+        0.0,  // value (current position)
+        0.0,  // lower bound
+        0.0,  // upper bound (total rows -- updated per frame)
+        1.0,  // step increment (1 row)
+        24.0, // page increment (visible rows, updated per frame)
+        24.0, // page size (visible rows, updated per frame)
+    );
+    let scrollbar = gtk4::Scrollbar::new(gtk4::Orientation::Vertical, Some(&adjustment));
+    scrollbar.set_visible(false); // hidden until there is scrollback
+
+    // Wire adjustment value-changed -> scroll the terminal viewport
+    {
+        let state = Rc::clone(&state);
+        let da_scroll = drawing_area.clone();
+        adjustment.connect_value_changed(move |adj| {
+            let Ok(mut s) = state.try_borrow_mut() else {
+                return;
+            };
+            // Skip if we are programmatically updating the adjustment
+            if s.updating_scrollbar {
+                return;
+            }
+            let new_offset = adj.value() as i64;
+            let (_total, current_offset, _len) = s.terminal.scrollbar_state();
+            let delta = new_offset - current_offset as i64;
+            if delta != 0 {
+                s.terminal.scroll_viewport_delta(delta as isize);
+                drop(s);
+                da_scroll.queue_draw();
+            }
+        });
+    }
+
+    // --- Scrollbar update timer (syncs terminal state -> adjustment) ---
+    // Runs alongside the existing 8ms PTY poll timer. We piggyback on a
+    // separate 16ms timer (~60Hz) to avoid querying scrollbar_state() too
+    // frequently (the ghostty docs note it can be expensive).
+    {
+        let state = Rc::clone(&state);
+        let adj = adjustment.clone();
+        let sb_widget = scrollbar.clone();
+        let da_weak = drawing_area.downgrade();
+        glib::timeout_add_local(Duration::from_millis(16), move || {
+            let Some(_da) = da_weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            let Ok(mut s) = state.try_borrow_mut() else {
+                return glib::ControlFlow::Continue;
+            };
+            let (total, offset, len) = s.terminal.scrollbar_state();
+
+            // Update scrollbar visibility: hide when no scrollback
+            let has_scrollback = total > len;
+            sb_widget.set_visible(has_scrollback);
+
+            if has_scrollback {
+                // Set guard to prevent feedback loop
+                s.updating_scrollbar = true;
+                adj.set_lower(0.0);
+                adj.set_upper(total as f64);
+                adj.set_page_size(len as f64);
+                adj.set_page_increment(len as f64);
+                adj.set_value(offset as f64);
+                s.updating_scrollbar = false;
+            }
+
+            glib::ControlFlow::Continue
+        });
+    }
+
+    // Package DrawingArea + Scrollbar into a horizontal Box
+    let hbox = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    hbox.set_hexpand(true);
+    hbox.set_vexpand(true);
+    hbox.append(&drawing_area);
+    hbox.append(&scrollbar);
+
+    Ok((hbox, drawing_area, state))
 }
 
 /// Helper: convert a `Color` to `(r, g, b)` f64 values (0.0..1.0), using
@@ -836,6 +953,12 @@ fn draw_terminal(
 
     // Clone selection state for rendering
     let selection = s.selection.clone();
+
+    // Query viewport offset for converting absolute selection rows to screen rows.
+    // Selection coordinates are stored as absolute scrollback positions; we need
+    // the viewport offset to map them back to screen-space for drawing.
+    let (_, viewport_offset, _) = s.terminal.scrollbar_state();
+    let viewport_offset = viewport_offset as usize;
 
     // Build font description
     let font_desc = font_description(config);
@@ -1009,6 +1132,10 @@ fn draw_terminal(
     }
 
     // 5. Draw selection overlay (semi-transparent, preserves underlying text)
+    //
+    // Selection coordinates are stored as ABSOLUTE scrollback rows.
+    // We convert them to screen-relative rows by subtracting viewport_offset.
+    // Only draw the portion of the selection that overlaps the current viewport.
     if let Some(ref sel) = selection {
         ctx.set_source_rgba(
             selection_color.r as f64 / 255.0,
@@ -1017,18 +1144,28 @@ fn draw_terminal(
             selection_color.a as f64 / 255.0,
         );
 
-        // Optimize: only iterate rows in the selection range
+        // Determine the absolute row range of the selection
         let ((sr, _), (er, _)) = sel.ordered();
-        let start_row = sr.min(num_rows);
-        let end_row = er.min(num_rows.saturating_sub(1));
 
-        for row in start_row..=end_row {
-            for col in 0..num_cols {
-                if sel.contains(row, col) {
-                    let sx = col as f64 * cell_w;
-                    let sy = row as f64 * cell_h;
-                    ctx.rectangle(sx, sy, cell_w, cell_h);
-                    ctx.fill().ok();
+        // Viewport shows absolute rows [viewport_offset .. viewport_offset + num_rows - 1].
+        // Clamp the selection range to the visible viewport.
+        let vp_start = viewport_offset;
+        let vp_end = viewport_offset + num_rows.saturating_sub(1);
+
+        // Skip rendering entirely if selection is outside the viewport
+        if er >= vp_start && sr <= vp_end {
+            let abs_start = sr.max(vp_start);
+            let abs_end = er.min(vp_end);
+
+            for abs_row in abs_start..=abs_end {
+                let screen_row = abs_row - viewport_offset;
+                for col in 0..num_cols {
+                    if sel.contains(abs_row, col) {
+                        let sx = col as f64 * cell_w;
+                        let sy = screen_row as f64 * cell_h;
+                        ctx.rectangle(sx, sy, cell_w, cell_h);
+                        ctx.fill().ok();
+                    }
                 }
             }
         }
