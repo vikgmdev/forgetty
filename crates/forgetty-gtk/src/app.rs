@@ -259,6 +259,19 @@ fn build_ui(app: &adw::Application, config: &Config) {
 
     app.set_accels_for_action("win.copy", &["<Control><Shift>c"]);
 
+    // --- Search in terminal action (Ctrl+Shift+F) ---
+    {
+        let states_search = Rc::clone(&tab_states);
+        let focus_search = Rc::clone(&focus_tracker);
+        let action = gio::SimpleAction::new("search", None);
+        action.connect_activate(move |_action, _param| {
+            toggle_search_on_focused_pane(&states_search, &focus_search);
+        });
+        window.add_action(&action);
+    }
+
+    app.set_accels_for_action("win.search", &["<Control><Shift>f"]);
+
     // --- Pane navigation actions (Alt+Arrow) ---
     for (name, direction) in [
         ("focus-pane-left", Direction::Left),
@@ -322,7 +335,7 @@ fn add_new_tab(
     focus_tracker: &FocusTracker,
 ) {
     match terminal::create_terminal(config) {
-        Ok((hbox, drawing_area, state)) => {
+        Ok((pane_vbox, drawing_area, state)) => {
             // Assign a unique widget name for registry lookup
             let pane_id = next_pane_id();
             drawing_area.set_widget_name(&pane_id);
@@ -337,7 +350,7 @@ fn add_new_tab(
             let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
             container.set_hexpand(true);
             container.set_vexpand(true);
-            container.append(&hbox);
+            container.append(&pane_vbox);
 
             // Append the page to the TabView
             let page = tab_view.append(&container);
@@ -432,7 +445,7 @@ fn split_pane(
     };
 
     // Create the new terminal pane
-    let (new_hbox, new_da, new_state) = match terminal::create_terminal(config) {
+    let (new_pane_vbox, new_da, new_state) = match terminal::create_terminal(config) {
         Ok(triple) => triple,
         Err(e) => {
             tracing::error!("Failed to create terminal for split: {e}");
@@ -455,26 +468,27 @@ fn split_pane(
     paned.set_hexpand(true);
     paned.set_vexpand(true);
 
-    // The DrawingArea lives inside an hbox (with the scrollbar).
-    // We need to operate on the hbox for tree manipulation.
+    // The DrawingArea lives inside: DA -> hbox(DA+scrollbar) -> vbox(SearchBar+hbox).
+    // We need to operate on the vbox for tree manipulation (the pane unit).
     let focused_hbox: gtk4::Widget =
         focused_da.parent().expect("focused DA should have a parent hbox");
+    let focused_vbox: gtk4::Widget = focused_hbox.parent().expect("hbox should have a parent vbox");
 
-    // Determine where the hbox sits in the widget tree.
+    // Determine where the vbox sits in the widget tree.
     // Detect the slot BEFORE removing the child.
-    let is_direct_child = root_content == focused_hbox;
-    let parent = focused_hbox.parent();
+    let is_direct_child = root_content == focused_vbox;
+    let parent = focused_vbox.parent();
     let parent_slot = parent.as_ref().and_then(|p| {
-        p.downcast_ref::<gtk4::Paned>().map(|pp| detect_paned_slot(pp, &focused_hbox))
+        p.downcast_ref::<gtk4::Paned>().map(|pp| detect_paned_slot(pp, &focused_vbox))
     });
 
-    // Remove the hbox from its current parent.
+    // Remove the vbox from its current parent.
     // IMPORTANT: For Paned parents, we MUST use set_start/end_child(None)
     // instead of unparent(). Direct unparent() doesn't clear the Paned's
     // internal child pointer, so a later set_start/end_child() would
     // double-unparent the widget from its new location.
     if is_direct_child {
-        focused_hbox.unparent();
+        focused_vbox.unparent();
     } else if let Some(ref parent_widget) = parent {
         if let Some(parent_paned) = parent_widget.downcast_ref::<gtk4::Paned>() {
             match parent_slot.unwrap_or(PanedSlot::End) {
@@ -482,13 +496,13 @@ fn split_pane(
                 PanedSlot::End => parent_paned.set_end_child(gtk4::Widget::NONE),
             }
         } else {
-            focused_hbox.unparent();
+            focused_vbox.unparent();
         }
     }
 
-    // Set up the Paned children: original hbox on start, new hbox on end
-    paned.set_start_child(Some(&focused_hbox));
-    paned.set_end_child(Some(&new_hbox));
+    // Set up the Paned children: original vbox on start, new vbox on end
+    paned.set_start_child(Some(&focused_vbox));
+    paned.set_end_child(Some(&new_pane_vbox));
 
     if is_direct_child {
         // The hbox was the sole content of the pane container.
@@ -603,12 +617,15 @@ fn close_focused_pane(
         return;
     }
 
-    // The DrawingArea lives inside an hbox (with the scrollbar).
-    // Navigate: DrawingArea -> hbox -> parent Paned.
+    // The DrawingArea lives inside: DA -> hbox -> vbox.
+    // Navigate: DrawingArea -> hbox -> vbox -> parent Paned.
     let Some(hbox_widget) = focused_da.parent() else {
         return;
     };
-    let Some(parent_widget) = hbox_widget.parent() else {
+    let Some(vbox_widget) = hbox_widget.parent() else {
+        return;
+    };
+    let Some(parent_widget) = vbox_widget.parent() else {
         return;
     };
 
@@ -617,7 +634,7 @@ fn close_focused_pane(
     };
 
     // Determine the sibling (the other child of the parent Paned)
-    let slot = detect_paned_slot(parent_paned, &hbox_widget);
+    let slot = detect_paned_slot(parent_paned, &vbox_widget);
     let sibling = match slot {
         PanedSlot::Start => parent_paned.end_child(),
         PanedSlot::End => parent_paned.start_child(),
@@ -812,6 +829,79 @@ fn ranges_overlap(a_start: f32, a_end: f32, b_start: f32, b_end: f32) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Search in terminal
+// ---------------------------------------------------------------------------
+
+/// Toggle the search bar on the currently focused pane.
+///
+/// Looks up the focused DrawingArea from the focus tracker, retrieves its
+/// TerminalState, and delegates to `terminal::toggle_search()`.
+fn toggle_search_on_focused_pane(tab_states: &TabStateMap, focus_tracker: &FocusTracker) {
+    let focused_name = {
+        let Ok(name) = focus_tracker.try_borrow() else {
+            return;
+        };
+        name.clone()
+    };
+
+    if focused_name.is_empty() {
+        return;
+    }
+
+    let Ok(states) = tab_states.try_borrow() else {
+        return;
+    };
+
+    let Some(state_rc) = states.get(&focused_name).cloned() else {
+        return;
+    };
+    drop(states);
+
+    // Find the DrawingArea widget by its name to pass to toggle_search.
+    // Walk up from a known widget -- we need the DA itself.
+    // Since we have the state, we can use the GLib/GTK widget registry indirectly:
+    // look for a DrawingArea with the focused_name in any visible window.
+    // A simpler approach: iterate the focused window's widget tree.
+    // But the easiest path: the DrawingArea is registered via widget_name.
+    // GTK doesn't provide a global "find by name" API, so we walk the tree.
+    let app =
+        gtk4::gio::Application::default().and_then(|a| a.downcast::<gtk4::Application>().ok());
+    let Some(app) = app else {
+        return;
+    };
+    let Some(window) = app.active_window() else {
+        return;
+    };
+    let Some(da) = find_drawing_area_by_name(&window, &focused_name) else {
+        return;
+    };
+
+    terminal::toggle_search(&da, &state_rc);
+}
+
+/// Recursively find a DrawingArea with the given widget name.
+fn find_drawing_area_by_name(
+    widget: &impl IsA<gtk4::Widget>,
+    name: &str,
+) -> Option<gtk4::DrawingArea> {
+    let widget_ref = widget.upcast_ref::<gtk4::Widget>();
+    if let Some(da) = widget_ref.downcast_ref::<gtk4::DrawingArea>() {
+        if da.widget_name().as_str() == name {
+            return Some(da.clone());
+        }
+    }
+    // Walk children
+    let mut child = widget_ref.first_child();
+    while let Some(c) = child {
+        if let Some(found) = find_drawing_area_by_name(&c, name) {
+            return Some(found);
+        }
+        child = c.next_sibling();
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
 // Copy selection
 // ---------------------------------------------------------------------------
 
@@ -892,10 +982,16 @@ fn copy_selection(
 
             let (col_start, col_end) = match sel_mode {
                 forgetty_vt::selection::SelectionMode::Line => (0, num_cols.saturating_sub(1)),
-                forgetty_vt::selection::SelectionMode::Block => (sc.min(ec), sc.max(ec).min(num_cols.saturating_sub(1))),
+                forgetty_vt::selection::SelectionMode::Block => {
+                    (sc.min(ec), sc.max(ec).min(num_cols.saturating_sub(1)))
+                }
                 _ => {
                     let cs = if abs_row == sr { sc } else { 0 };
-                    let ce = if abs_row == er { ec.min(num_cols.saturating_sub(1)) } else { num_cols.saturating_sub(1) };
+                    let ce = if abs_row == er {
+                        ec.min(num_cols.saturating_sub(1))
+                    } else {
+                        num_cols.saturating_sub(1)
+                    };
                     (cs, ce)
                 }
             };
