@@ -20,6 +20,9 @@ pub enum CursorStyle {
     Bar,
     /// A horizontal underline cursor.
     Underline,
+    /// An unfilled (hollow) block cursor outline.
+    #[serde(alias = "block_hollow")]
+    BlockHollow,
 }
 
 /// The top-level Forgetty configuration.

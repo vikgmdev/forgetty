@@ -270,6 +270,61 @@ impl Terminal {
         has_value
     }
 
+    /// Get the cursor visual style from the render state.
+    ///
+    /// Returns the raw enum int: BAR=0, BLOCK=1, UNDERLINE=2, BLOCK_HOLLOW=3.
+    pub fn cursor_visual_style(&self) -> i32 {
+        let mut style: i32 = ffi::GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK;
+        unsafe {
+            ffi::ghostty_render_state_get(
+                self.render_state,
+                ffi::GHOSTTY_RENDER_STATE_DATA_CURSOR_VISUAL_STYLE,
+                &mut style as *mut i32 as *mut c_void,
+            );
+        }
+        style
+    }
+
+    /// Is the cursor in blinking mode according to the render state?
+    pub fn cursor_blinking(&self) -> bool {
+        let mut blinking: bool = false;
+        unsafe {
+            ffi::ghostty_render_state_get(
+                self.render_state,
+                ffi::GHOSTTY_RENDER_STATE_DATA_CURSOR_BLINKING,
+                &mut blinking as *mut bool as *mut c_void,
+            );
+        }
+        blinking
+    }
+
+    /// Get the terminal-provided cursor color (via OSC 12), if set.
+    ///
+    /// Returns `Some((r, g, b))` when the terminal has an explicit cursor color,
+    /// `None` when the theme default should be used.
+    pub fn cursor_color(&self) -> Option<(u8, u8, u8)> {
+        let mut has_value: bool = false;
+        unsafe {
+            ffi::ghostty_render_state_get(
+                self.render_state,
+                ffi::GHOSTTY_RENDER_STATE_DATA_COLOR_CURSOR_HAS_VALUE,
+                &mut has_value as *mut bool as *mut c_void,
+            );
+        }
+        if !has_value {
+            return None;
+        }
+        let mut rgb = ffi::GhosttyColorRgb::default();
+        unsafe {
+            ffi::ghostty_render_state_get(
+                self.render_state,
+                ffi::GHOSTTY_RENDER_STATE_DATA_COLOR_CURSOR,
+                &mut rgb as *mut ffi::GhosttyColorRgb as *mut c_void,
+            );
+        }
+        Some((rgb.r, rgb.g, rgb.b))
+    }
+
     /// Resize the terminal to new dimensions.
     pub fn resize(&mut self, rows: usize, cols: usize) {
         self.rows = rows;
@@ -356,6 +411,19 @@ impl Terminal {
         }
         let cache = self.cache.get_mut();
         cache.screen_dirty = true;
+    }
+
+    /// Returns true if the terminal is on the alternate screen (e.g., vim, htop).
+    pub fn is_alternate_screen(&self) -> bool {
+        let mut screen: i32 = 0;
+        unsafe {
+            ffi::ghostty_terminal_get(
+                self.handle,
+                ffi::GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN,
+                &mut screen as *mut i32 as *mut c_void,
+            );
+        }
+        screen == 1 // GHOSTTY_TERMINAL_SCREEN_ALTERNATE
     }
 
     /// Check if any mouse tracking mode is active.
