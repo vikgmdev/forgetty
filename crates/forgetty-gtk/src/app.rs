@@ -272,6 +272,44 @@ fn build_ui(app: &adw::Application, config: &Config) {
 
     app.set_accels_for_action("win.search", &["<Control><Shift>f"]);
 
+    // --- Paste action (Ctrl+Shift+V) ---
+    {
+        let states_paste = Rc::clone(&tab_states);
+        let focus_paste = Rc::clone(&focus_tracker);
+        let window_paste = window.clone();
+        let action = gio::SimpleAction::new("paste", None);
+        action.connect_activate(move |_action, _param| {
+            paste_clipboard(&states_paste, &focus_paste, &window_paste);
+        });
+        window.add_action(&action);
+    }
+
+    app.set_accels_for_action("win.paste", &["<Control><Shift>v"]);
+
+    // --- Select All action (context menu only, no accelerator) ---
+    {
+        let states_sel = Rc::clone(&tab_states);
+        let focus_sel = Rc::clone(&focus_tracker);
+        let action = gio::SimpleAction::new("select-all", None);
+        action.connect_activate(move |_action, _param| {
+            select_all_on_focused_pane(&states_sel, &focus_sel);
+        });
+        window.add_action(&action);
+    }
+
+    // --- Open URL action (context menu only, receives URL as string parameter) ---
+    {
+        let action = gio::SimpleAction::new("open-url", Some(glib::VariantTy::STRING));
+        action.connect_activate(move |_action, param| {
+            if let Some(url) = param.and_then(|v| v.get::<String>()) {
+                if !url.is_empty() {
+                    open_url_in_browser(&url);
+                }
+            }
+        });
+        window.add_action(&action);
+    }
+
     // --- Pane navigation actions (Alt+Arrow) ---
     for (name, direction) in [
         ("focus-pane-left", Direction::Left),
@@ -1253,4 +1291,135 @@ fn compute_display_title(state: &TerminalState) -> String {
     }
 
     "shell".to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Paste from clipboard
+// ---------------------------------------------------------------------------
+
+/// Paste the system clipboard text into the focused pane's PTY.
+///
+/// Reads the clipboard text asynchronously via `gdk::Clipboard::read_text_async()`,
+/// then writes the text bytes to the PTY. The `TerminalState` borrow is NOT held
+/// across the async boundary -- only acquired in the callback.
+fn paste_clipboard(
+    tab_states: &TabStateMap,
+    focus_tracker: &FocusTracker,
+    window: &adw::ApplicationWindow,
+) {
+    let focused_name = {
+        let Ok(name) = focus_tracker.try_borrow() else {
+            return;
+        };
+        name.clone()
+    };
+
+    if focused_name.is_empty() {
+        return;
+    }
+
+    let Ok(states) = tab_states.try_borrow() else {
+        return;
+    };
+
+    let Some(state_rc) = states.get(&focused_name).cloned() else {
+        return;
+    };
+    drop(states);
+
+    // Read clipboard text asynchronously
+    let display = gtk4::prelude::WidgetExt::display(window);
+    let clipboard = display.clipboard();
+
+    // Clone state_rc for the async callback
+    let state_for_cb = Rc::clone(&state_rc);
+    clipboard.read_text_async(gio::Cancellable::NONE, move |result| {
+        let text = match result {
+            Ok(Some(text)) => text.to_string(),
+            Ok(None) => return, // clipboard empty (AC-11)
+            Err(e) => {
+                tracing::debug!("Clipboard read failed: {e}");
+                return;
+            }
+        };
+
+        if text.is_empty() {
+            return;
+        }
+
+        // Write the pasted text to the PTY
+        let Ok(mut s) = state_for_cb.try_borrow_mut() else {
+            return;
+        };
+
+        if let Err(e) = s.pty.write(text.as_bytes()) {
+            tracing::warn!("Failed to write paste to PTY: {e}");
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Select All
+// ---------------------------------------------------------------------------
+
+/// Select all visible text in the focused pane.
+///
+/// Delegates to `terminal::select_all_visible()` after looking up the focused
+/// DrawingArea and its TerminalState.
+fn select_all_on_focused_pane(tab_states: &TabStateMap, focus_tracker: &FocusTracker) {
+    let focused_name = {
+        let Ok(name) = focus_tracker.try_borrow() else {
+            return;
+        };
+        name.clone()
+    };
+
+    if focused_name.is_empty() {
+        return;
+    }
+
+    let Ok(states) = tab_states.try_borrow() else {
+        return;
+    };
+
+    let Some(state_rc) = states.get(&focused_name).cloned() else {
+        return;
+    };
+    drop(states);
+
+    // Find the DrawingArea widget to trigger a redraw
+    let app =
+        gtk4::gio::Application::default().and_then(|a| a.downcast::<gtk4::Application>().ok());
+    let Some(app) = app else {
+        return;
+    };
+    let Some(window) = app.active_window() else {
+        return;
+    };
+    let Some(da) = find_drawing_area_by_name(&window, &focused_name) else {
+        return;
+    };
+
+    terminal::select_all_visible(&da, &state_rc);
+}
+
+// ---------------------------------------------------------------------------
+// Open URL in browser
+// ---------------------------------------------------------------------------
+
+/// Open a URL in the user's default browser.
+///
+/// Uses `gtk::UriLauncher` (GTK 4.10+) for GNOME-native URL handling.
+fn open_url_in_browser(url: &str) {
+    let launcher = gtk4::UriLauncher::new(url);
+
+    let app =
+        gtk4::gio::Application::default().and_then(|a| a.downcast::<gtk4::Application>().ok());
+    let window = app.and_then(|a| a.active_window());
+
+    launcher.launch(window.as_ref(), gio::Cancellable::NONE, |result| {
+        if let Err(e) = result {
+            tracing::warn!("Failed to open URL: {e}");
+        }
+    });
 }

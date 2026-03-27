@@ -396,6 +396,38 @@ pub fn create_terminal(
 
                 let button = gesture.current_button();
                 let modifier = gesture.current_event_state();
+
+                // --- Right-click context menu (AC-1, AC-9, AC-22) ---
+                // Button 3 always opens the context menu, even when mouse
+                // tracking is active (matches Ghostty behavior).
+                // IMPORTANT: do NOT clear the selection on right-click (AC-9).
+                if button == 3 {
+                    let Ok(s) = state.try_borrow() else {
+                        return;
+                    };
+
+                    // Detect URL at the click position for conditional menu item
+                    let (screen_row, col) =
+                        pixel_to_cell(x, y, s.cell_width, s.cell_height, s.cols, s.rows);
+                    let screen = s.terminal.screen();
+                    let url = detect_url_at(screen, screen_row, col);
+                    let has_selection = s.selection.is_some();
+                    drop(s);
+
+                    // Find the Popover attached to this DrawingArea
+                    if let Some(popover) = find_context_popover(&da_click) {
+                        // Build button box fresh (handles dynamic URL + copy sensitivity)
+                        let menu_box =
+                            build_context_menu_box(&popover, url.as_deref(), has_selection);
+                        popover.set_child(Some(&menu_box));
+                        popover
+                            .set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+                        popover.popup();
+                    }
+
+                    return;
+                }
+
                 let Ok(mut s) = state.try_borrow_mut() else {
                     // Borrow held elsewhere -- drop this click event.
                     return;
@@ -987,6 +1019,16 @@ pub fn create_terminal(
     // find the SearchBar by walking the widget tree.
     search_bar.set_widget_name("forgetty-search-bar");
 
+    // --- Context menu (right-click Popover with manual buttons) ---
+    // Use a plain Popover (not PopoverMenu) to avoid GTK4's internal
+    // ScrolledWindow that constrains height and adds a scrollbar.
+    let context_popover = gtk4::Popover::new();
+    context_popover.set_parent(&drawing_area);
+    context_popover.set_has_arrow(false);
+    context_popover.set_halign(gtk4::Align::Start);
+    context_popover.add_css_class("menu");
+    context_popover.set_widget_name("forgetty-context-menu");
+
     Ok((vbox, drawing_area, state))
 }
 
@@ -1035,6 +1077,10 @@ fn is_app_shortcut(keyval: gdk::Key, modifier: gdk::ModifierType) -> bool {
     if mods == ctrl_shift && (keyval == gdk::Key::f || keyval == gdk::Key::F) {
         return true;
     }
+    // Paste: Ctrl+Shift+V
+    if mods == ctrl_shift && (keyval == gdk::Key::v || keyval == gdk::Key::V) {
+        return true;
+    }
     // Pane navigation: Alt+Arrow
     if mods == gdk::ModifierType::ALT_MASK
         && (keyval == gdk::Key::Left
@@ -1046,6 +1092,231 @@ fn is_app_shortcut(keyval: gdk::Key, modifier: gdk::ModifierType) -> bool {
     }
 
     false
+}
+
+/// Build the context menu as a vertical `gtk4::Box` with button items.
+///
+/// Uses a plain Box (not gio::Menu / PopoverMenu) to avoid GTK4's internal
+/// ScrolledWindow that constrains height and adds unwanted scrollbars.
+///
+/// Items:
+/// 1. Copy (sensitive only when text is selected), Paste
+/// 2. Separator
+/// 3. Select All, Search
+/// 4. (Optional) Separator + Open URL
+///
+/// Each button activates the corresponding `win.*` action and closes the popover.
+fn build_context_menu_box(
+    popover: &gtk4::Popover,
+    url: Option<&str>,
+    has_selection: bool,
+) -> gtk4::Box {
+    let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+
+    // --- Copy ---
+    let copy_btn = make_menu_button("Copy", Some("Shift+Ctrl+C"), "win.copy", None, popover);
+    copy_btn.set_sensitive(has_selection);
+    vbox.append(&copy_btn);
+
+    // --- Paste ---
+    let paste_btn = make_menu_button("Paste", Some("Shift+Ctrl+V"), "win.paste", None, popover);
+    vbox.append(&paste_btn);
+
+    // --- Separator ---
+    let sep1 = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+    vbox.append(&sep1);
+
+    // --- Select All ---
+    let select_all_btn = make_menu_button("Select All", None, "win.select-all", None, popover);
+    vbox.append(&select_all_btn);
+
+    // --- Search ---
+    let search_btn = make_menu_button("Search", Some("Shift+Ctrl+F"), "win.search", None, popover);
+    vbox.append(&search_btn);
+
+    // --- Open URL (conditional) ---
+    if let Some(url_str) = url {
+        let sep2 = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+        vbox.append(&sep2);
+
+        let label = format!("Open {}", url_str);
+        let url_btn =
+            make_menu_button(&label, None, "win.open-url", Some(&url_str.to_variant()), popover);
+        vbox.append(&url_btn);
+    }
+
+    vbox
+}
+
+/// Create a single flat button for the context menu.
+///
+/// The button contains a horizontal box with the label on the left and an
+/// optional dimmed shortcut hint on the right. Clicking the button activates
+/// the given action on the window and closes the popover.
+fn make_menu_button(
+    label_text: &str,
+    shortcut: Option<&str>,
+    action_name: &str,
+    action_target: Option<&glib::Variant>,
+    popover: &gtk4::Popover,
+) -> gtk4::Button {
+    let hbox = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
+
+    let label = gtk4::Label::new(Some(label_text));
+    label.set_halign(gtk4::Align::Start);
+    label.set_hexpand(true);
+    hbox.append(&label);
+
+    if let Some(hint) = shortcut {
+        let hint_label = gtk4::Label::new(Some(hint));
+        hint_label.set_halign(gtk4::Align::End);
+        hint_label.add_css_class("dim-label");
+        hbox.append(&hint_label);
+    }
+
+    let btn = gtk4::Button::new();
+    btn.set_child(Some(&hbox));
+    btn.set_has_frame(false);
+    btn.add_css_class("flat");
+
+    // On click: activate the action, then close the popover.
+    let action_name = action_name.to_string();
+    let action_target = action_target.cloned();
+    let popover = popover.clone();
+    btn.connect_clicked(move |widget| {
+        widget.activate_action(&action_name, action_target.as_ref()).ok();
+        popover.popdown();
+    });
+
+    btn
+}
+
+/// Detect a URL at the given cell position by scanning the row text.
+///
+/// Looks for `http://` or `https://` URLs in the row containing the click.
+/// If the clicked column falls within a URL match, returns that URL.
+fn detect_url_at(screen: &forgetty_vt::Screen, screen_row: usize, col: usize) -> Option<String> {
+    if screen_row >= screen.rows() {
+        return None;
+    }
+
+    let cells = screen.row(screen_row);
+    let num_cols = screen.cols().min(cells.len());
+
+    // Build the line text and track byte-to-col and col-to-byte mappings
+    let mut line = String::new();
+    let mut col_to_byte_start: Vec<usize> = Vec::with_capacity(num_cols);
+    for c in 0..num_cols {
+        col_to_byte_start.push(line.len());
+        let g = &cells[c].grapheme;
+        if g.is_empty() {
+            line.push(' ');
+        } else {
+            line.push_str(g);
+        }
+    }
+
+    // URL-breaking characters (stop the URL match when encountered)
+    let url_break_chars: &[char] =
+        &[' ', '\t', '"', '\'', '<', '>', '{', '}', '|', '\\', '^', '`', '[', ']'];
+
+    // Scan for URLs in the line
+    let mut search_start = 0;
+    while let Some(pos) = line[search_start..].find("http") {
+        let abs_pos = search_start + pos;
+
+        // Check for http:// or https://
+        let rest = &line[abs_pos..];
+        let scheme_ok = rest.starts_with("https://") || rest.starts_with("http://");
+        if !scheme_ok {
+            search_start = abs_pos + 1;
+            continue;
+        }
+
+        // Find the end of the URL (stop at whitespace or URL-breaking chars)
+        let url_end =
+            abs_pos + rest.find(|c: char| url_break_chars.contains(&c)).unwrap_or(rest.len());
+
+        // Strip trailing punctuation that is unlikely part of the URL
+        let mut end = url_end;
+        while end > abs_pos {
+            let last_char = line.as_bytes()[end - 1];
+            if matches!(last_char, b'.' | b',' | b';' | b':' | b')' | b']') {
+                end -= 1;
+            } else {
+                break;
+            }
+        }
+
+        let url = &line[abs_pos..end];
+
+        // Check if the clicked column falls within this URL
+        // Find the column range that corresponds to [abs_pos..end)
+        let url_col_start =
+            col_to_byte_start.iter().position(|&b| b >= abs_pos).unwrap_or(num_cols);
+        let url_col_end = col_to_byte_start.iter().position(|&b| b >= end).unwrap_or(num_cols);
+
+        if col >= url_col_start && col < url_col_end {
+            return Some(url.to_string());
+        }
+
+        search_start = end;
+    }
+
+    None
+}
+
+/// Find the context Popover attached to a DrawingArea.
+///
+/// Searches the DrawingArea's children for a Popover with the expected
+/// widget name.
+fn find_context_popover(da: &DrawingArea) -> Option<gtk4::Popover> {
+    // Popover set_parent attaches it as a child widget
+    let mut child = da.first_child();
+    while let Some(c) = child {
+        if let Some(popover) = c.downcast_ref::<gtk4::Popover>() {
+            if popover.widget_name().as_str() == "forgetty-context-menu" {
+                return Some(popover.clone());
+            }
+        }
+        child = c.next_sibling();
+    }
+    None
+}
+
+/// Select all visible text in the viewport (for the "Select All" context menu action).
+///
+/// Creates a selection covering row 0 to `rows-1` in the current viewport,
+/// using absolute row coordinates for proper integration with the selection system.
+pub fn select_all_visible(da: &DrawingArea, state: &Rc<RefCell<TerminalState>>) {
+    let Ok(mut s) = state.try_borrow_mut() else {
+        return;
+    };
+
+    let rows = s.rows;
+    let cols = s.cols;
+    let vp_offset = s.viewport_offset as usize;
+
+    if rows == 0 || cols == 0 {
+        return;
+    }
+
+    // Find the last non-whitespace column on the last row for a clean selection
+    let screen = s.terminal.screen();
+    let last_row = rows.saturating_sub(1);
+    let last_col = last_non_whitespace_col(screen, last_row).max(cols.saturating_sub(1));
+
+    let abs_start = vp_offset;
+    let abs_end = vp_offset + last_row;
+
+    let mut sel = Selection::new(abs_start, 0, SelectionMode::Normal);
+    sel.update(abs_end, last_col);
+    s.selection = Some(sel);
+    s.selecting = false;
+    s.word_anchor = None;
+
+    drop(s);
+    da.queue_draw();
 }
 
 /// Toggle the search bar for a pane identified by its TerminalState.
