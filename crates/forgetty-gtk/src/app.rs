@@ -855,34 +855,69 @@ fn copy_selection(
     };
 
     // Selection coordinates are stored as absolute scrollback rows.
-    // The screen() viewport only shows a window of rows starting at the
-    // current viewport offset.  To extract text from the selection, we
-    // temporarily scroll the viewport so the selection start is visible,
-    // extract, then restore the original viewport position.
+    // The screen() viewport only shows `rows` visible lines at a time.
+    // For selections spanning more than one viewport, we must scroll
+    // page by page, extracting each viewport's contribution.
     let sel_clone = sel.clone();
+    let ((sr, sc), (er, ec)) = sel_clone.ordered();
+    let sel_mode = sel_clone.mode;
     let (_, orig_offset, _) = s.terminal.scrollbar_state();
-    let sel_start_row = sel_clone.ordered().0 .0;
-    let delta = sel_start_row as isize - orig_offset as isize;
-    if delta != 0 {
-        s.terminal.scroll_viewport_delta(delta);
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut cursor = sr; // absolute row we need to read next
+
+    while cursor <= er {
+        // Scroll viewport so `cursor` is at the top
+        let (_, cur_off, _) = s.terminal.scrollbar_state();
+        let delta = cursor as isize - cur_off as isize;
+        if delta != 0 {
+            s.terminal.scroll_viewport_delta(delta);
+        }
+
+        let (_, vp_off, vp_len) = s.terminal.scrollbar_state();
+        let vp_off = vp_off as usize;
+        let vp_len = vp_len as usize;
+        let screen = s.terminal.screen();
+        let num_screen_rows = screen.rows();
+        let num_cols = screen.cols();
+
+        // Read rows from this viewport that fall within the selection
+        let page_end = er.min(vp_off + vp_len.saturating_sub(1));
+        for abs_row in cursor..=page_end {
+            let screen_row = abs_row.saturating_sub(vp_off);
+            if screen_row >= num_screen_rows {
+                break;
+            }
+            let cells = screen.row(screen_row);
+
+            let (col_start, col_end) = match sel_mode {
+                forgetty_vt::selection::SelectionMode::Line => (0, num_cols.saturating_sub(1)),
+                forgetty_vt::selection::SelectionMode::Block => (sc.min(ec), sc.max(ec).min(num_cols.saturating_sub(1))),
+                _ => {
+                    let cs = if abs_row == sr { sc } else { 0 };
+                    let ce = if abs_row == er { ec.min(num_cols.saturating_sub(1)) } else { num_cols.saturating_sub(1) };
+                    (cs, ce)
+                }
+            };
+
+            let mut line = String::new();
+            for col in col_start..=col_end.min(cells.len().saturating_sub(1)) {
+                line.push_str(&cells[col].grapheme);
+            }
+            lines.push(line);
+        }
+
+        cursor = page_end + 1;
     }
 
-    // Now the viewport starts at the selection's first row.
-    // Convert absolute selection rows to viewport-relative for extract_text().
-    let (_, vp_offset, _) = s.terminal.scrollbar_state();
-    let vp_offset = vp_offset as usize;
-    let mut viewport_sel = sel_clone.clone();
-    viewport_sel.start.0 = sel_clone.start.0.saturating_sub(vp_offset);
-    viewport_sel.end.0 = sel_clone.end.0.saturating_sub(vp_offset);
-
-    // Extract text from the screen at the selected cell range
-    let screen = s.terminal.screen();
-    let raw_text = viewport_sel.extract_text(screen);
-
-    // Restore the original viewport position
-    if delta != 0 {
-        s.terminal.scroll_viewport_delta(-delta);
+    // Restore original viewport position
+    let (_, cur_off, _) = s.terminal.scrollbar_state();
+    let restore = orig_offset as isize - cur_off as isize;
+    if restore != 0 {
+        s.terminal.scroll_viewport_delta(restore);
     }
+
+    let raw_text = lines.join("\n");
 
     if raw_text.is_empty() {
         return;
