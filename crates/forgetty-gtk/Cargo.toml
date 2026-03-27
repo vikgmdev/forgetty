@@ -9,6 +9,7 @@ forgetty-core = { path = "../forgetty-core" }
 forgetty-config = { path = "../forgetty-config" }
 forgetty-vt = { path = "../forgetty-vt" }
 forgetty-pty = { path = "../forgetty-pty" }
+forgetty-watcher = { path = "../forgetty-watcher" }
 gtk4 = { workspace = true }
 libadwaita = { workspace = true }
 pangocairo = "0.20"
