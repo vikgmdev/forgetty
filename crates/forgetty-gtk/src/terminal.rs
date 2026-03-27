@@ -1308,6 +1308,16 @@ fn is_app_shortcut(keyval: gdk::Key, modifier: gdk::ModifierType) -> bool {
         return true;
     }
 
+    // Shortcuts window: F1 (no modifiers)
+    if mods.is_empty() && keyval == gdk::Key::F1 {
+        return true;
+    }
+    // Shortcuts window: Ctrl+? (Ctrl+Shift+/ on US keyboards)
+    // GTK may report keyval as `question` or `slash` with SHIFT modifier.
+    if mods == ctrl_shift && (keyval == gdk::Key::question || keyval == gdk::Key::slash) {
+        return true;
+    }
+
     false
 }
 

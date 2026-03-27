@@ -45,7 +45,7 @@ dirs = "6"
 git2 = "0.19"
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.4"
-gtk4 = { version = "0.9", features = ["v4_12"] }
+gtk4 = { version = "0.9", features = ["v4_14"] }
 libadwaita = { version = "0.7", features = ["v1_4"] }
 
 [package]

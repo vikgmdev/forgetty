@@ -103,6 +103,18 @@ fn build_ui(app: &adw::Application, config: &Config) {
 
     let header = adw::HeaderBar::new();
 
+    // --- Hamburger menu button ---
+    // Standard GNOME pattern: gio::Menu model + gtk::MenuButton.
+    let menu = gio::Menu::new();
+    menu.append(Some("Keyboard Shortcuts"), Some("win.show-shortcuts"));
+    menu.append(Some("About Forgetty"), Some("win.show-about"));
+
+    let menu_button = gtk4::MenuButton::new();
+    menu_button.set_icon_name("open-menu-symbolic");
+    menu_button.set_menu_model(Some(&menu));
+    menu_button.set_tooltip_text(Some("Menu"));
+    header.pack_end(&menu_button);
+
     let tab_view = adw::TabView::new();
     tab_view.set_vexpand(true);
 
@@ -377,6 +389,41 @@ fn build_ui(app: &adw::Application, config: &Config) {
     }
 
     app.set_accels_for_action("win.zoom-reset", &["<Control>0"]);
+
+    // --- Show shortcuts window action (F1 / Ctrl+?) ---
+    {
+        let window_shortcuts = window.clone();
+        let action = gio::SimpleAction::new("show-shortcuts", None);
+        action.connect_activate(move |_action, _param| {
+            let shortcuts_window = build_shortcuts_window();
+            shortcuts_window.set_transient_for(Some(&window_shortcuts));
+            shortcuts_window.present();
+        });
+        window.add_action(&action);
+    }
+
+    app.set_accels_for_action(
+        "win.show-shortcuts",
+        &["F1", "<Control>question", "<Control><Shift>slash"],
+    );
+
+    // --- Show about dialog action ---
+    {
+        let window_about = window.clone();
+        let action = gio::SimpleAction::new("show-about", None);
+        action.connect_activate(move |_action, _param| {
+            let about = adw::AboutWindow::builder()
+                .application_name("Forgetty")
+                .version(env!("CARGO_PKG_VERSION"))
+                .comments("A workspace-aware terminal emulator")
+                .license_type(gtk4::License::MitX11)
+                .transient_for(&window_about)
+                .modal(true)
+                .build();
+            about.present();
+        });
+        window.add_action(&action);
+    }
 
     // --- "+" button click ---
     {
@@ -1601,4 +1648,88 @@ pub(crate) fn open_url_in_browser(url: &str) {
             tracing::warn!("Failed to open URL: {e}");
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// Shortcuts window
+// ---------------------------------------------------------------------------
+
+/// Build a `gtk::ShortcutsWindow` listing all keybindings organized by category.
+///
+/// Uses `ShortcutsSection` > `ShortcutsGroup` > `ShortcutsShortcut` hierarchy.
+/// Accelerator strings use GTK notation so GTK renders proper key cap icons.
+fn build_shortcuts_window() -> gtk4::ShortcutsWindow {
+    let section =
+        gtk4::ShortcutsSection::builder().section_name("shortcuts").title("Shortcuts").build();
+    // GTK requires max_height to properly show all groups.
+    section.set_max_height(12);
+
+    // --- Tabs ---
+    let tabs_group = shortcut_group("Tabs");
+    tabs_group.add_shortcut(&shortcut("<Control><Shift>t", "New Tab"));
+    tabs_group.add_shortcut(&shortcut("<Control><Shift>w", "Close Pane / Tab"));
+    section.add_group(&tabs_group);
+
+    // --- Panes ---
+    let panes_group = shortcut_group("Panes");
+    panes_group.add_shortcut(&shortcut("<Alt><Shift>equal", "Split Right"));
+    panes_group.add_shortcut(&shortcut("<Alt><Shift>minus", "Split Down"));
+    panes_group.add_shortcut(&shortcut("<Alt>Left", "Focus Pane Left"));
+    panes_group.add_shortcut(&shortcut("<Alt>Right", "Focus Pane Right"));
+    panes_group.add_shortcut(&shortcut("<Alt>Up", "Focus Pane Up"));
+    panes_group.add_shortcut(&shortcut("<Alt>Down", "Focus Pane Down"));
+    section.add_group(&panes_group);
+
+    // --- Clipboard ---
+    let clipboard_group = shortcut_group("Clipboard");
+    clipboard_group.add_shortcut(&shortcut("<Control><Shift>c", "Copy Selection"));
+    clipboard_group.add_shortcut(&shortcut("<Control><Shift>v", "Paste"));
+    section.add_group(&clipboard_group);
+
+    // --- Search ---
+    let search_group = shortcut_group("Search");
+    search_group.add_shortcut(&shortcut("<Control><Shift>f", "Find in Terminal"));
+    search_group.add_shortcut(&shortcut("Return", "Next Match (in search bar)"));
+    search_group.add_shortcut(&shortcut("<Shift>Return", "Previous Match (in search bar)"));
+    search_group.add_shortcut(&shortcut("Escape", "Close Search"));
+    section.add_group(&search_group);
+
+    // --- Zoom ---
+    let zoom_group = shortcut_group("Zoom");
+    zoom_group.add_shortcut(&shortcut("<Control>equal", "Zoom In"));
+    zoom_group.add_shortcut(&shortcut("<Control>minus", "Zoom Out"));
+    zoom_group.add_shortcut(&shortcut("<Control>0", "Reset Zoom"));
+    section.add_group(&zoom_group);
+
+    // --- Navigation ---
+    let nav_group = shortcut_group("Navigation");
+    nav_group.add_shortcut(
+        &gtk4::ShortcutsShortcut::builder()
+            .title("Open URL")
+            .subtitle("Ctrl+Click on a highlighted URL")
+            .shortcut_type(gtk4::ShortcutType::Accelerator)
+            .accelerator("")
+            .build(),
+    );
+    section.add_group(&nav_group);
+
+    // --- Help ---
+    let help_group = shortcut_group("Help");
+    help_group.add_shortcut(&shortcut("F1", "Keyboard Shortcuts"));
+    section.add_group(&help_group);
+
+    let window = gtk4::ShortcutsWindow::builder().modal(true).build();
+    window.add_section(&section);
+
+    window
+}
+
+/// Create a `ShortcutsGroup` with the given title.
+fn shortcut_group(title: &str) -> gtk4::ShortcutsGroup {
+    gtk4::ShortcutsGroup::builder().title(title).build()
+}
+
+/// Create a single `ShortcutsShortcut` with an accelerator string and title.
+fn shortcut(accel: &str, title: &str) -> gtk4::ShortcutsShortcut {
+    gtk4::ShortcutsShortcut::builder().accelerator(accel).title(title).build()
 }
