@@ -184,6 +184,19 @@ impl Terminal {
         }
     }
 
+    /// Perform a full terminal reset (RIS).
+    ///
+    /// Resets all SGR attributes, clears the screen and scrollback, restores
+    /// default cursor style, and resets all terminal modes.  This is the
+    /// proper API-level reset — prefer it over feeding `ESC c` bytes.
+    pub fn reset(&mut self) {
+        unsafe {
+            ffi::ghostty_terminal_reset(self.handle);
+        }
+        let cache = self.cache.get_mut();
+        cache.screen_dirty = true;
+    }
+
     /// Feed raw bytes from the PTY into the terminal parser.
     pub fn feed(&mut self, bytes: &[u8]) {
         if bytes.is_empty() {

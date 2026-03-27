@@ -11,7 +11,7 @@
 //! during split/close operations without removing and re-inserting the TabPage.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -21,6 +21,7 @@ use gtk4::gio;
 use gtk4::glib;
 use gtk4::prelude::*;
 use libadwaita as adw;
+use libadwaita::prelude::*;
 use tracing::info;
 
 use crate::clipboard;
@@ -58,6 +59,13 @@ type TabStateMap = Rc<RefCell<HashMap<String, Rc<RefCell<TerminalState>>>>>;
 /// Updated on focus-enter events from each pane's EventControllerFocus.
 /// Read by split/close/navigate actions to determine the target pane.
 type FocusTracker = Rc<RefCell<String>>;
+
+/// Tracks which tab pages (by page pointer hash) have user-set custom titles.
+///
+/// When a page key is present in this set, the title polling timer skips
+/// overwriting that page's title, allowing the user-provided title to stick.
+/// Removing the key (or setting an empty title) re-enables automatic CWD polling.
+type CustomTitles = Rc<RefCell<HashSet<String>>>;
 
 /// Run the GTK4/libadwaita application.
 ///
@@ -108,9 +116,72 @@ fn build_ui(app: &adw::Application, config: &Config) {
 
     // --- Hamburger menu button ---
     // Standard GNOME pattern: gio::Menu model + gtk::MenuButton.
+    // Full menu structure matching Ghostty's discoverability.
     let menu = gio::Menu::new();
-    menu.append(Some("Keyboard Shortcuts"), Some("win.show-shortcuts"));
-    menu.append(Some("About Forgetty"), Some("win.show-about"));
+
+    // Section 1 -- Clipboard
+    let clipboard_section = gio::Menu::new();
+    let copy_item = gio::MenuItem::new(Some("Copy"), Some("win.copy"));
+    copy_item.set_attribute_value("accel", Some(&"<Control><Shift>c".to_variant()));
+    clipboard_section.append_item(&copy_item);
+    let paste_item = gio::MenuItem::new(Some("Paste"), Some("win.paste"));
+    paste_item.set_attribute_value("accel", Some(&"<Control><Shift>v".to_variant()));
+    clipboard_section.append_item(&paste_item);
+    menu.append_section(None, &clipboard_section);
+
+    // Section 2 -- Window & Tab management
+    let window_tab_section = gio::Menu::new();
+    window_tab_section.append(Some("New Window"), Some("win.new-window"));
+    window_tab_section.append(Some("Close Window"), Some("win.close-window"));
+    window_tab_section.append(Some("Change Tab Title\u{2026}"), Some("win.change-tab-title"));
+    let new_tab_menu_item = gio::MenuItem::new(Some("New Tab"), Some("win.new-tab"));
+    new_tab_menu_item.set_attribute_value("accel", Some(&"<Control><Shift>t".to_variant()));
+    window_tab_section.append_item(&new_tab_menu_item);
+    let close_tab_item = gio::MenuItem::new(Some("Close Tab"), Some("win.close-tab"));
+    close_tab_item.set_attribute_value("accel", Some(&"<Control><Shift>w".to_variant()));
+    window_tab_section.append_item(&close_tab_item);
+    menu.append_section(None, &window_tab_section);
+
+    // Section 3 -- Split submenu
+    let split_section = gio::Menu::new();
+    let split_submenu = gio::Menu::new();
+    split_submenu.append(Some("Up"), Some("win.split-up"));
+    let split_down_item = gio::MenuItem::new(Some("Down"), Some("win.split-down"));
+    split_down_item.set_attribute_value("accel", Some(&"<Alt><Shift>minus".to_variant()));
+    split_submenu.append_item(&split_down_item);
+    split_submenu.append(Some("Left"), Some("win.split-left"));
+    let split_right_item = gio::MenuItem::new(Some("Right"), Some("win.split-right"));
+    split_right_item.set_attribute_value("accel", Some(&"<Alt><Shift>equal".to_variant()));
+    split_submenu.append_item(&split_right_item);
+    split_section.append_submenu(Some("Split"), &split_submenu);
+    menu.append_section(None, &split_section);
+
+    // Section 4 -- Terminal operations
+    let terminal_section = gio::Menu::new();
+    terminal_section.append(Some("Clear"), Some("win.clear"));
+    terminal_section.append(Some("Reset"), Some("win.reset"));
+    menu.append_section(None, &terminal_section);
+
+    // Section 5 -- Configuration & Help
+    let config_help_section = gio::Menu::new();
+    let cmd_palette_item = gio::MenuItem::new(Some("Command Palette"), Some("win.command-palette"));
+    cmd_palette_item.set_attribute_value("accel", Some(&"<Control><Shift>p".to_variant()));
+    config_help_section.append_item(&cmd_palette_item);
+    config_help_section.append(Some("Terminal Inspector"), Some("win.terminal-inspector"));
+    config_help_section.append(Some("Open Configuration"), Some("win.open-config"));
+    config_help_section.append(Some("Reload Configuration"), Some("win.reload-config"));
+    let shortcuts_item = gio::MenuItem::new(Some("Keyboard Shortcuts"), Some("win.show-shortcuts"));
+    shortcuts_item.set_attribute_value("accel", Some(&"F1".to_variant()));
+    config_help_section.append_item(&shortcuts_item);
+    config_help_section.append(Some("About Forgetty"), Some("win.show-about"));
+    menu.append_section(None, &config_help_section);
+
+    // Section 6 -- Application
+    let app_section = gio::Menu::new();
+    let quit_item = gio::MenuItem::new(Some("Quit"), Some("app.quit"));
+    quit_item.set_attribute_value("accel", Some(&"<Control><Shift>q".to_variant()));
+    app_section.append_item(&quit_item);
+    menu.append_section(None, &app_section);
 
     let menu_button = gtk4::MenuButton::new();
     menu_button.set_icon_name("open-menu-symbolic");
@@ -178,6 +249,9 @@ fn build_ui(app: &adw::Application, config: &Config) {
     // Focus tracker -- widget name of the currently focused DrawingArea
     let focus_tracker: FocusTracker = Rc::new(RefCell::new(String::new()));
 
+    // Custom title tracker -- pages with user-set titles (skip CWD polling)
+    let custom_titles: CustomTitles = Rc::new(RefCell::new(HashSet::new()));
+
     // Shared config -- updated on hot reload, read by new tab/split creation.
     // All action closures that create terminals capture a clone of this Rc.
     let shared_config: SharedConfig = Rc::new(RefCell::new(config.clone()));
@@ -234,13 +308,14 @@ fn build_ui(app: &adw::Application, config: &Config) {
         let tv_action = tab_view.clone();
         let states_action = Rc::clone(&tab_states);
         let focus_action = Rc::clone(&focus_tracker);
+        let ct_action = Rc::clone(&custom_titles);
         let win_action = window.clone();
         let action = gio::SimpleAction::new("new-tab", None);
         action.connect_activate(move |_action, _param| {
             let Ok(cfg) = config_action.try_borrow() else {
                 return;
             };
-            add_new_tab(&tv_action, &cfg, &states_action, &focus_action, &win_action);
+            add_new_tab(&tv_action, &cfg, &states_action, &focus_action, &ct_action, &win_action);
         });
         window.add_action(&action);
     }
@@ -253,6 +328,7 @@ fn build_ui(app: &adw::Application, config: &Config) {
         let tv_split = tab_view.clone();
         let states_split = Rc::clone(&tab_states);
         let focus_split = Rc::clone(&focus_tracker);
+        let ct_split = Rc::clone(&custom_titles);
         let action = gio::SimpleAction::new("split-right", None);
         action.connect_activate(move |_action, _param| {
             let Ok(cfg) = config_split.try_borrow() else {
@@ -263,6 +339,7 @@ fn build_ui(app: &adw::Application, config: &Config) {
                 &cfg,
                 &states_split,
                 &focus_split,
+                &ct_split,
                 gtk4::Orientation::Horizontal,
                 false,
             );
@@ -278,6 +355,7 @@ fn build_ui(app: &adw::Application, config: &Config) {
         let tv_split = tab_view.clone();
         let states_split = Rc::clone(&tab_states);
         let focus_split = Rc::clone(&focus_tracker);
+        let ct_split = Rc::clone(&custom_titles);
         let action = gio::SimpleAction::new("split-down", None);
         action.connect_activate(move |_action, _param| {
             let Ok(cfg) = config_split.try_borrow() else {
@@ -288,6 +366,7 @@ fn build_ui(app: &adw::Application, config: &Config) {
                 &cfg,
                 &states_split,
                 &focus_split,
+                &ct_split,
                 gtk4::Orientation::Vertical,
                 false,
             );
@@ -303,6 +382,7 @@ fn build_ui(app: &adw::Application, config: &Config) {
         let tv_split = tab_view.clone();
         let states_split = Rc::clone(&tab_states);
         let focus_split = Rc::clone(&focus_tracker);
+        let ct_split = Rc::clone(&custom_titles);
         let action = gio::SimpleAction::new("split-left", None);
         action.connect_activate(move |_action, _param| {
             let Ok(cfg) = config_split.try_borrow() else {
@@ -313,6 +393,7 @@ fn build_ui(app: &adw::Application, config: &Config) {
                 &cfg,
                 &states_split,
                 &focus_split,
+                &ct_split,
                 gtk4::Orientation::Horizontal,
                 true,
             );
@@ -326,6 +407,7 @@ fn build_ui(app: &adw::Application, config: &Config) {
         let tv_split = tab_view.clone();
         let states_split = Rc::clone(&tab_states);
         let focus_split = Rc::clone(&focus_tracker);
+        let ct_split = Rc::clone(&custom_titles);
         let action = gio::SimpleAction::new("split-up", None);
         action.connect_activate(move |_action, _param| {
             let Ok(cfg) = config_split.try_borrow() else {
@@ -336,6 +418,7 @@ fn build_ui(app: &adw::Application, config: &Config) {
                 &cfg,
                 &states_split,
                 &focus_split,
+                &ct_split,
                 gtk4::Orientation::Vertical,
                 true,
             );
@@ -518,8 +601,142 @@ fn build_ui(app: &adw::Application, config: &Config) {
         window.add_action(&action);
     }
 
+    // --- New Window action (menu only, no accelerator) ---
+    {
+        let action = gio::SimpleAction::new("new-window", None);
+        action.connect_activate(move |_action, _param| {
+            if let Ok(exe) = std::env::current_exe() {
+                if let Err(e) = std::process::Command::new(exe).spawn() {
+                    tracing::warn!("Failed to spawn new window: {e}");
+                }
+            }
+        });
+        window.add_action(&action);
+    }
+
+    // --- Close Window action (menu only, no accelerator) ---
+    {
+        let win_close = window.clone();
+        let action = gio::SimpleAction::new("close-window", None);
+        action.connect_activate(move |_action, _param| {
+            win_close.close();
+        });
+        window.add_action(&action);
+    }
+
+    // --- Close Tab action (menu only) ---
+    {
+        let tv_close_tab = tab_view.clone();
+        let states_close_tab = Rc::clone(&tab_states);
+        let window_close_tab = window.clone();
+        let action = gio::SimpleAction::new("close-tab", None);
+        action.connect_activate(move |_action, _param| {
+            let Some(page) = tv_close_tab.selected_page() else {
+                return;
+            };
+            let container = page.child();
+            kill_all_panes_in_subtree(&container, &states_close_tab);
+
+            if tv_close_tab.n_pages() <= 1 {
+                window_close_tab.close();
+            } else {
+                tv_close_tab.close_page(&page);
+            }
+        });
+        window.add_action(&action);
+    }
+
+    // --- Change Tab Title action (menu only) ---
+    {
+        let tv_title = tab_view.clone();
+        let ct_title = Rc::clone(&custom_titles);
+        let win_title = window.clone();
+        let action = gio::SimpleAction::new("change-tab-title", None);
+        action.connect_activate(move |_action, _param| {
+            let Some(page) = tv_title.selected_page() else {
+                return;
+            };
+            show_change_tab_title_dialog(&win_title, &page, &ct_title);
+        });
+        window.add_action(&action);
+    }
+
+    // --- Clear terminal action (menu only) ---
+    // Write Ctrl+L (form feed) to the PTY so the shell clears the screen AND
+    // redraws the prompt — identical to pressing Ctrl+L interactively.
+    {
+        let states_clear = Rc::clone(&tab_states);
+        let focus_clear = Rc::clone(&focus_tracker);
+        let action = gio::SimpleAction::new("clear", None);
+        action.connect_activate(move |_action, _param| {
+            write_to_focused_pty(&states_clear, &focus_clear, b"\x0c");
+        });
+        window.add_action(&action);
+    }
+
+    // --- Reset terminal action (menu only) ---
+    // Use the proper ghostty_terminal_reset() API to perform a full RIS, then
+    // Ctrl+L to PTY so the shell redraws its prompt in default colors.
+    {
+        let states_reset = Rc::clone(&tab_states);
+        let focus_reset = Rc::clone(&focus_tracker);
+        let action = gio::SimpleAction::new("reset", None);
+        action.connect_activate(move |_action, _param| {
+            reset_focused_pane(&states_reset, &focus_reset);
+            write_to_focused_pty(&states_reset, &focus_reset, b"\x0c");
+        });
+        window.add_action(&action);
+    }
+
+    // --- Open Configuration action (menu only) ---
+    {
+        let action = gio::SimpleAction::new("open-config", None);
+        action.connect_activate(move |_action, _param| {
+            open_config_file();
+        });
+        window.add_action(&action);
+    }
+
+    // --- Reload Configuration action (menu only) ---
+    {
+        let shared_cfg_reload = Rc::clone(&shared_config);
+        let states_reload_action = Rc::clone(&tab_states);
+        let win_reload = window.clone();
+        let action = gio::SimpleAction::new("reload-config", None);
+        action.connect_activate(move |_action, _param| {
+            reload_config(&shared_cfg_reload, &states_reload_action, &win_reload);
+        });
+        window.add_action(&action);
+    }
+
+    // --- Quit action (Ctrl+Shift+Q) ---
+    {
+        let app_quit = app.clone();
+        let action = gio::SimpleAction::new("quit", None);
+        action.connect_activate(move |_action, _param| {
+            app_quit.quit();
+        });
+        app.add_action(&action);
+    }
+
+    app.set_accels_for_action("app.quit", &["<Control><Shift>q"]);
+
+    // --- Command Palette placeholder (greyed out) ---
+    {
+        let action = gio::SimpleAction::new("command-palette", None);
+        action.set_enabled(false);
+        window.add_action(&action);
+    }
+
+    // --- Terminal Inspector placeholder (greyed out) ---
+    {
+        let action = gio::SimpleAction::new("terminal-inspector", None);
+        action.set_enabled(false);
+        window.add_action(&action);
+    }
+
     // --- Create the first tab ---
-    add_new_tab(&tab_view, config, &tab_states, &focus_tracker, &window);
+    add_new_tab(&tab_view, config, &tab_states, &focus_tracker, &custom_titles, &window);
 
     window.present();
 
@@ -604,6 +821,7 @@ fn add_new_tab(
     config: &Config,
     tab_states: &TabStateMap,
     focus_tracker: &FocusTracker,
+    custom_titles: &CustomTitles,
     window: &adw::ApplicationWindow,
 ) {
     match terminal::create_terminal(config) {
@@ -616,7 +834,7 @@ fn add_new_tab(
             tab_states.borrow_mut().insert(pane_id, Rc::clone(&state));
 
             // Wire up focus tracking on this pane
-            wire_focus_tracking(&drawing_area, focus_tracker, tab_view, tab_states);
+            wire_focus_tracking(&drawing_area, focus_tracker, tab_view, tab_states, custom_titles);
 
             // Wrap in a pane container Box (allows swapping root widget later)
             let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
@@ -642,7 +860,14 @@ fn add_new_tab(
 
             // --- Title polling timer ---
             // Periodically update the tab title from the focused pane's CWD.
-            register_title_timer(&page, tab_view, tab_states, focus_tracker, &window);
+            register_title_timer(
+                &page,
+                tab_view,
+                tab_states,
+                focus_tracker,
+                custom_titles,
+                &window,
+            );
         }
         Err(e) => {
             tracing::error!("Failed to create terminal for new tab: {e}");
@@ -694,6 +919,7 @@ fn split_pane(
     config: &Config,
     tab_states: &TabStateMap,
     focus_tracker: &FocusTracker,
+    custom_titles: &CustomTitles,
     orientation: gtk4::Orientation,
     before: bool,
 ) {
@@ -740,7 +966,7 @@ fn split_pane(
     let new_pane_id = next_pane_id();
     new_da.set_widget_name(&new_pane_id);
     tab_states.borrow_mut().insert(new_pane_id, new_state);
-    wire_focus_tracking(&new_da, focus_tracker, tab_view, tab_states);
+    wire_focus_tracking(&new_da, focus_tracker, tab_view, tab_states, custom_titles);
 
     // Create the Paned container
     let paned = gtk4::Paned::new(orientation);
@@ -1468,6 +1694,7 @@ fn wire_focus_tracking(
     focus_tracker: &FocusTracker,
     tab_view: &adw::TabView,
     tab_states: &TabStateMap,
+    custom_titles: &CustomTitles,
 ) {
     let focus_controller = gtk4::EventControllerFocus::new();
 
@@ -1477,6 +1704,7 @@ fn wire_focus_tracking(
         let da = drawing_area.clone();
         let tv = tab_view.clone();
         let states = Rc::clone(tab_states);
+        let ct = Rc::clone(custom_titles);
         focus_controller.connect_enter(move |_controller| {
             let pane_name = da.widget_name().to_string();
             if let Ok(mut name) = tracker.try_borrow_mut() {
@@ -1485,13 +1713,20 @@ fn wire_focus_tracking(
             // Redraw to show the focus indicator
             da.queue_draw();
             // Update tab title immediately from this pane's CWD
+            // (skip if user has set a custom title for this page)
             if let Some(page) = tv.selected_page() {
-                if let Ok(map) = states.try_borrow() {
-                    if let Some(state_rc) = map.get(&pane_name) {
-                        if let Ok(s) = state_rc.try_borrow() {
-                            let title = compute_display_title(&s);
-                            if page.title().as_str() != title {
-                                page.set_title(&title);
+                let has_custom_title = ct
+                    .try_borrow()
+                    .map(|ct| ct.contains(&page_identity_key(&page)))
+                    .unwrap_or(false);
+                if !has_custom_title {
+                    if let Ok(map) = states.try_borrow() {
+                        if let Some(state_rc) = map.get(&pane_name) {
+                            if let Ok(s) = state_rc.try_borrow() {
+                                let title = compute_display_title(&s);
+                                if page.title().as_str() != title {
+                                    page.set_title(&title);
+                                }
                             }
                         }
                     }
@@ -1525,13 +1760,16 @@ fn register_title_timer(
     tab_view: &adw::TabView,
     tab_states: &TabStateMap,
     focus_tracker: &FocusTracker,
+    custom_titles: &CustomTitles,
     window: &adw::ApplicationWindow,
 ) {
     let page_weak = page.downgrade();
     let tab_states_title = Rc::clone(tab_states);
     let focus_title = Rc::clone(focus_tracker);
+    let custom_titles_timer = Rc::clone(custom_titles);
     let tv_weak = tab_view.downgrade();
     let win_weak = window.downgrade();
+    let page_key = page_identity_key(page);
 
     glib::timeout_add_local(Duration::from_millis(TITLE_POLL_MS), move || {
         let Some(page) = page_weak.upgrade() else {
@@ -1546,6 +1784,34 @@ fn register_title_timer(
 
         if !is_selected {
             return glib::ControlFlow::Continue;
+        }
+
+        // Skip CWD polling if user has set a custom title for this page
+        if let Ok(ct) = custom_titles_timer.try_borrow() {
+            if ct.contains(&page_key) {
+                // Still update the window title bar from CWD, but leave tab title alone
+                let focused_name = {
+                    let Ok(name) = focus_title.try_borrow() else {
+                        return glib::ControlFlow::Continue;
+                    };
+                    name.clone()
+                };
+                let Ok(states) = tab_states_title.try_borrow() else {
+                    return glib::ControlFlow::Continue;
+                };
+                if let Some(state_rc) = states.get(&focused_name).cloned() {
+                    drop(states);
+                    if let Ok(s) = state_rc.try_borrow() {
+                        if let Some(win) = win_weak.upgrade() {
+                            let win_title = compute_window_title(&s);
+                            if win.title().map(|t| t.as_str() != win_title).unwrap_or(true) {
+                                win.set_title(Some(&win_title));
+                            }
+                        }
+                    }
+                }
+                return glib::ControlFlow::Continue;
+            }
         }
 
         // Read the focused pane's state for the title
@@ -1838,6 +2104,12 @@ fn build_shortcuts_window() -> gtk4::ShortcutsWindow {
     zoom_group.add_shortcut(&shortcut("<Control>0", "Reset Zoom"));
     section.add_group(&zoom_group);
 
+    // --- Terminal ---
+    let terminal_group = shortcut_group("Terminal");
+    terminal_group.add_shortcut(&shortcut_no_accel("Clear", "Via hamburger menu"));
+    terminal_group.add_shortcut(&shortcut_no_accel("Reset", "Via hamburger menu"));
+    section.add_group(&terminal_group);
+
     // --- Navigation ---
     let nav_group = shortcut_group("Navigation");
     nav_group.add_shortcut(
@@ -1853,6 +2125,7 @@ fn build_shortcuts_window() -> gtk4::ShortcutsWindow {
     // --- Help ---
     let help_group = shortcut_group("Help");
     help_group.add_shortcut(&shortcut("F1", "Keyboard Shortcuts"));
+    help_group.add_shortcut(&shortcut("<Control><Shift>q", "Quit"));
     section.add_group(&help_group);
 
     let window = gtk4::ShortcutsWindow::builder().modal(true).build();
@@ -1881,4 +2154,297 @@ fn shortcut_no_accel(title: &str, subtitle: &str) -> gtk4::ShortcutsShortcut {
         .shortcut_type(gtk4::ShortcutType::Accelerator)
         .accelerator("")
         .build()
+}
+
+// ---------------------------------------------------------------------------
+// Clear / Reset terminal
+// ---------------------------------------------------------------------------
+
+/// Perform a full terminal reset (RIS) on the focused pane via the
+/// `ghostty_terminal_reset()` API, then queue a redraw.
+fn reset_focused_pane(
+    tab_states: &TabStateMap,
+    focus_tracker: &FocusTracker,
+) {
+    let focused_name = {
+        let Ok(name) = focus_tracker.try_borrow() else {
+            return;
+        };
+        name.clone()
+    };
+
+    if focused_name.is_empty() {
+        return;
+    }
+
+    let Ok(states) = tab_states.try_borrow() else {
+        return;
+    };
+
+    let Some(state_rc) = states.get(&focused_name).cloned() else {
+        return;
+    };
+    drop(states);
+
+    let Ok(mut s) = state_rc.try_borrow_mut() else {
+        return;
+    };
+
+    s.terminal.reset();
+
+    let app =
+        gtk4::gio::Application::default().and_then(|a| a.downcast::<gtk4::Application>().ok());
+    if let Some(app) = app {
+        if let Some(window) = app.active_window() {
+            if let Some(da) = find_drawing_area_by_name(&window, &focused_name) {
+                da.queue_draw();
+            }
+        }
+    }
+}
+
+/// Feed an escape sequence to the focused pane's VT terminal.
+///
+/// Used by the Clear menu action. The bytes are fed directly into
+/// the VT parser (same path as PTY data), then the pane is redrawn.
+fn feed_escape_to_focused_pane(
+    tab_states: &TabStateMap,
+    focus_tracker: &FocusTracker,
+    escape_bytes: &[u8],
+) {
+    let focused_name = {
+        let Ok(name) = focus_tracker.try_borrow() else {
+            return;
+        };
+        name.clone()
+    };
+
+    if focused_name.is_empty() {
+        return;
+    }
+
+    let Ok(states) = tab_states.try_borrow() else {
+        return;
+    };
+
+    let Some(state_rc) = states.get(&focused_name).cloned() else {
+        return;
+    };
+    drop(states);
+
+    let Ok(mut s) = state_rc.try_borrow_mut() else {
+        return;
+    };
+
+    s.terminal.feed(escape_bytes);
+
+    // Queue a redraw on the DrawingArea
+    let app =
+        gtk4::gio::Application::default().and_then(|a| a.downcast::<gtk4::Application>().ok());
+    if let Some(app) = app {
+        if let Some(window) = app.active_window() {
+            if let Some(da) = find_drawing_area_by_name(&window, &focused_name) {
+                da.queue_draw();
+            }
+        }
+    }
+}
+
+/// Write raw bytes to the focused pane's PTY (shell stdin).
+///
+/// Used by Clear (sends Ctrl+L so the shell redraws the prompt) and Reset
+/// (sends a newline after the VT-level RIS to trigger a fresh prompt).
+fn write_to_focused_pty(
+    tab_states: &TabStateMap,
+    focus_tracker: &FocusTracker,
+    bytes: &[u8],
+) {
+    let focused_name = {
+        let Ok(name) = focus_tracker.try_borrow() else {
+            return;
+        };
+        name.clone()
+    };
+
+    if focused_name.is_empty() {
+        return;
+    }
+
+    let Ok(states) = tab_states.try_borrow() else {
+        return;
+    };
+
+    let Some(state_rc) = states.get(&focused_name).cloned() else {
+        return;
+    };
+    drop(states);
+
+    let Ok(mut s) = state_rc.try_borrow_mut() else {
+        return;
+    };
+
+    if let Err(e) = s.pty.write(bytes) {
+        tracing::warn!("Failed to write to PTY: {e}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Change Tab Title dialog
+// ---------------------------------------------------------------------------
+
+/// Generate a stable identity key for a tab page.
+///
+/// Uses the widget name of the page's container Box, which is unique per page.
+/// This avoids pointer-based hashing which is fragile across GObject lifecycles.
+fn page_identity_key(page: &adw::TabPage) -> String {
+    // Use the page's child widget (the pane container Box) as the key source.
+    // Each container is unique since add_new_tab creates a fresh Box per tab.
+    let child = page.child();
+    format!("page-{:p}", child.as_ptr())
+}
+
+/// Show the "Change Tab Title" dialog.
+///
+/// Presents an `adw::MessageDialog` with a text entry. On confirm, sets the
+/// tab title and marks the page as having a custom title to suppress CWD polling.
+/// An empty string clears the custom title, re-enabling automatic CWD polling.
+#[allow(deprecated)]
+fn show_change_tab_title_dialog(
+    window: &adw::ApplicationWindow,
+    page: &adw::TabPage,
+    custom_titles: &CustomTitles,
+) {
+    let dialog = adw::MessageDialog::new(
+        Some(window),
+        Some("Change Tab Title"),
+        Some("Enter a new title for this tab, or leave empty to restore automatic title."),
+    );
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("apply", "Apply");
+    dialog.set_response_appearance("apply", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("apply"));
+    dialog.set_close_response("cancel");
+
+    // Add a text entry as the extra child
+    let entry = gtk4::Entry::new();
+    entry.set_placeholder_text(Some("Tab title"));
+    // Pre-fill with current title
+    let current_title = page.title();
+    entry.set_text(&current_title);
+    entry.select_region(0, -1);
+    dialog.set_extra_child(Some(&entry));
+
+    // Allow Enter in the entry to trigger the "apply" response
+    let dialog_for_enter = dialog.clone();
+    entry.connect_activate(move |_entry| {
+        dialog_for_enter.response("apply");
+    });
+
+    let page_clone = page.clone();
+    let ct = Rc::clone(custom_titles);
+    dialog.connect_response(None, move |_dialog, response| {
+        if response != "apply" {
+            return;
+        }
+        let new_title = entry.text().to_string();
+        let page_key = page_identity_key(&page_clone);
+
+        if new_title.is_empty() {
+            // Empty title: revert to automatic CWD-based title
+            if let Ok(mut ct) = ct.try_borrow_mut() {
+                ct.remove(&page_key);
+            }
+        } else {
+            // Set the custom title and mark the page
+            page_clone.set_title(&new_title);
+            if let Ok(mut ct) = ct.try_borrow_mut() {
+                ct.insert(page_key);
+            }
+        }
+    });
+
+    dialog.present();
+}
+
+// ---------------------------------------------------------------------------
+// Open / Reload configuration
+// ---------------------------------------------------------------------------
+
+/// Open the configuration file in the user's default text editor.
+///
+/// Creates `~/.config/forgetty/config.toml` with default content if it does
+/// not exist, then opens it via `xdg-open`.
+fn open_config_file() {
+    let config_dir = forgetty_core::platform::config_dir();
+    let config_path = config_dir.join("config.toml");
+
+    // Create directory and default config if missing
+    if !config_path.exists() {
+        if let Err(e) = std::fs::create_dir_all(&config_dir) {
+            tracing::warn!("Failed to create config directory: {e}");
+            return;
+        }
+        let default_content = concat!(
+            "# Forgetty configuration\n",
+            "# See https://forgetty.dev/docs/config for all options.\n",
+            "\n",
+            "# font_family = \"JetBrains Mono\"\n",
+            "# font_size = 13.0\n",
+            "# shell = \"/bin/zsh\"\n",
+        );
+        if let Err(e) = std::fs::write(&config_path, default_content) {
+            tracing::warn!("Failed to write default config: {e}");
+            return;
+        }
+        info!("Created default config at {}", config_path.display());
+    }
+
+    // Open in default editor via xdg-open
+    if let Err(e) = std::process::Command::new("xdg-open").arg(&config_path).spawn() {
+        tracing::warn!("Failed to open config file with xdg-open: {e}");
+    }
+}
+
+/// Reload configuration from disk and apply to all existing panes.
+///
+/// This is the same logic used by the config watcher timer, extracted so that
+/// the "Reload Configuration" menu action can trigger an immediate reload.
+fn reload_config(
+    shared_config: &SharedConfig,
+    tab_states: &TabStateMap,
+    window: &adw::ApplicationWindow,
+) {
+    let new_config = match load_config(None) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            tracing::warn!("Config reload failed: {e}");
+            return;
+        }
+    };
+
+    info!("Config reloaded via menu action");
+
+    // Update the shared config so new tabs/splits use the new values.
+    if let Ok(mut cfg) = shared_config.try_borrow_mut() {
+        *cfg = new_config.clone();
+    }
+
+    // Apply changes to every existing pane.
+    let Ok(states) = tab_states.try_borrow() else {
+        return;
+    };
+
+    let state_entries: Vec<_> =
+        states.iter().map(|(name, rc)| (name.clone(), Rc::clone(rc))).collect();
+    drop(states);
+
+    for (pane_name, state_rc) in &state_entries {
+        let Ok(mut s) = state_rc.try_borrow_mut() else {
+            continue;
+        };
+        let Some(da) = find_drawing_area_by_name(window, pane_name) else {
+            continue;
+        };
+        terminal::apply_config_change(&mut s, &new_config, &da);
+    }
 }
