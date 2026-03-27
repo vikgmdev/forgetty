@@ -54,6 +54,9 @@ pub struct TerminalState {
     /// adjustment, to suppress the `value-changed` signal handler and prevent
     /// a feedback loop (terminal -> adjustment -> scroll -> terminal -> ...).
     pub updating_scrollbar: bool,
+    /// Cached viewport offset from the 16ms scrollbar timer.
+    /// Used by mouse handlers to avoid expensive FFI calls on every event.
+    pub viewport_offset: u64,
 }
 
 impl TerminalState {
@@ -141,6 +144,7 @@ pub fn create_terminal(
         drag_origin: None,
         suppress_selection_clear_ticks: 0,
         updating_scrollbar: false,
+        viewport_offset: 0,
     }));
 
     // Create DrawingArea
@@ -185,6 +189,7 @@ pub fn create_terminal(
             // If the user has manually scrolled up, we should NOT force them
             // back to the bottom when new output arrives.
             let (total, offset, len) = s.terminal.scrollbar_state();
+            s.viewport_offset = offset; // keep cache fresh
             let was_at_bottom = total <= len || offset + len >= total;
 
             let had_data = s.drain_pty_output();
@@ -194,6 +199,8 @@ pub fn create_terminal(
                 // during rapid continuous output (e.g., `while true; do date; done`).
                 if was_at_bottom {
                     s.terminal.scroll_viewport_bottom();
+                    let (_, off, _) = s.terminal.scrollbar_state();
+                    s.viewport_offset = off;
                 }
 
                 // Clear selection on new output to avoid stale highlights
@@ -366,15 +373,24 @@ pub fn create_terminal(
                     let (screen_row, col) =
                         pixel_to_cell(x, y, s.cell_width, s.cell_height, s.cols, s.rows);
 
-                    // Convert screen-relative row to absolute scrollback row.
-                    // scrollbar_state().1 (offset) is the viewport position from
-                    // the top of total scrollback.  Screen row 0 = scrollback
-                    // row `offset`.
-                    let (_, vp_offset, _) = s.terminal.scrollbar_state();
+                    // Use cached viewport offset (updated by 16ms timer) to
+                    // avoid expensive FFI calls on every mouse event.
+                    let vp_offset = s.viewport_offset;
                     let abs_row = screen_row + vp_offset as usize;
 
                     match n_press {
                         1 => {
+                            // Shift+Click extends existing selection to clicked position
+                            if shift_held {
+                                if let Some(ref mut sel) = s.selection {
+                                    sel.update(abs_row, col);
+                                    s.selecting = false;
+                                    drop(s);
+                                    da_click.queue_draw();
+                                    return;
+                                }
+                            }
+
                             // Single click: defer selection creation until motion is
                             // detected.  This avoids a visible flicker where the
                             // selection overlay renders for one frame on a plain click.
@@ -511,11 +527,25 @@ pub fn create_terminal(
 
                 // If we are actively dragging a selection, update the endpoint
                 if s.selecting {
+                    // Auto-scroll when dragging past viewport edges
+                    let viewport_height = s.rows as f64 * s.cell_height;
+                    if y < 0.0 {
+                        // Dragging above the top edge — scroll up
+                        s.terminal.scroll_viewport_delta(-3);
+                        let (_, off, _) = s.terminal.scrollbar_state();
+                        s.viewport_offset = off;
+                    } else if y > viewport_height {
+                        // Dragging below the bottom edge — scroll down
+                        s.terminal.scroll_viewport_delta(3);
+                        let (_, off, _) = s.terminal.scrollbar_state();
+                        s.viewport_offset = off;
+                    }
+
                     let (screen_row, col) =
                         pixel_to_cell(x, y, s.cell_width, s.cell_height, s.cols, s.rows);
 
-                    // Convert screen row to absolute scrollback row
-                    let (_, vp_offset, _) = s.terminal.scrollbar_state();
+                    // Use cached viewport offset (updated by 16ms timer)
+                    let vp_offset = s.viewport_offset;
                     let abs_row = screen_row + vp_offset as usize;
 
                     // Deferred creation: if no Selection exists yet (single-click
@@ -650,6 +680,8 @@ pub fn create_terminal(
                     }
                     ScrollAction::ScrollViewport(delta) => {
                         s.terminal.scroll_viewport_delta(delta);
+                        let (_, off, _) = s.terminal.scrollbar_state();
+                        s.viewport_offset = off;
                     }
                 }
 
@@ -693,6 +725,10 @@ pub fn create_terminal(
                 s.cols = new_cols;
                 s.rows = new_rows;
                 s.terminal.resize(new_rows, new_cols);
+                // Refresh cached viewport offset immediately so the draw
+                // callback uses the correct value (avoids 1-row selection drift).
+                let (_, off, _) = s.terminal.scrollbar_state();
+                s.viewport_offset = off;
                 // Shell will redraw on SIGWINCH — suppress selection clearing
                 // so the selection survives the resize (AC-16).
                 // 12 ticks × 8ms = ~100ms grace period covers drag-resize bursts.
@@ -740,6 +776,7 @@ pub fn create_terminal(
             let delta = new_offset - current_offset as i64;
             if delta != 0 {
                 s.terminal.scroll_viewport_delta(delta as isize);
+                s.viewport_offset = new_offset as u64;
                 drop(s);
                 da_scroll.queue_draw();
             }
@@ -763,6 +800,9 @@ pub fn create_terminal(
                 return glib::ControlFlow::Continue;
             };
             let (total, offset, len) = s.terminal.scrollbar_state();
+
+            // Cache viewport offset for mouse handlers (avoids FFI calls per event)
+            s.viewport_offset = offset;
 
             // Update scrollbar visibility: hide when no scrollback
             let has_scrollback = total > len;
@@ -957,8 +997,7 @@ fn draw_terminal(
     // Query viewport offset for converting absolute selection rows to screen rows.
     // Selection coordinates are stored as absolute scrollback positions; we need
     // the viewport offset to map them back to screen-space for drawing.
-    let (_, viewport_offset, _) = s.terminal.scrollbar_state();
-    let viewport_offset = viewport_offset as usize;
+    let viewport_offset = s.viewport_offset as usize;
 
     // Build font description
     let font_desc = font_description(config);
@@ -1171,11 +1210,11 @@ fn draw_terminal(
         }
     }
 
-    // 6. Draw focus indicator border (drawn last so it's on top of everything)
-    if da.has_focus() {
-        ctx.set_source_rgb(0.31, 0.60, 0.84); // #4F99D7 — accent blue
-        ctx.set_line_width(2.0);
-        ctx.rectangle(1.0, 1.0, (width - 2) as f64, (height - 2) as f64);
-        ctx.stroke().ok();
+    // 6. Dim unfocused panes with a semi-transparent overlay (Ghostty style).
+    // Focused pane renders at full brightness; unfocused panes get a dark wash.
+    if !da.has_focus() {
+        ctx.set_source_rgba(0.0, 0.0, 0.0, 0.12);
+        ctx.rectangle(0.0, 0.0, width as f64, height as f64);
+        ctx.fill().ok();
     }
 }
