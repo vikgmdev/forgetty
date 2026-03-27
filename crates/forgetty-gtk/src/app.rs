@@ -331,6 +331,45 @@ fn build_ui(app: &adw::Application, config: &Config) {
     app.set_accels_for_action("win.focus-pane-up", &["<Alt>Up"]);
     app.set_accels_for_action("win.focus-pane-down", &["<Alt>Down"]);
 
+    // --- Zoom in action (Ctrl+= / Ctrl++) ---
+    {
+        let states_zoom = Rc::clone(&tab_states);
+        let focus_zoom = Rc::clone(&focus_tracker);
+        let action = gio::SimpleAction::new("zoom-in", None);
+        action.connect_activate(move |_action, _param| {
+            zoom_focused_pane(&states_zoom, &focus_zoom, ZoomDirection::In);
+        });
+        window.add_action(&action);
+    }
+
+    app.set_accels_for_action("win.zoom-in", &["<Control>equal", "<Control>plus"]);
+
+    // --- Zoom out action (Ctrl+-) ---
+    {
+        let states_zoom = Rc::clone(&tab_states);
+        let focus_zoom = Rc::clone(&focus_tracker);
+        let action = gio::SimpleAction::new("zoom-out", None);
+        action.connect_activate(move |_action, _param| {
+            zoom_focused_pane(&states_zoom, &focus_zoom, ZoomDirection::Out);
+        });
+        window.add_action(&action);
+    }
+
+    app.set_accels_for_action("win.zoom-out", &["<Control>minus"]);
+
+    // --- Zoom reset action (Ctrl+0) ---
+    {
+        let states_zoom = Rc::clone(&tab_states);
+        let focus_zoom = Rc::clone(&focus_tracker);
+        let action = gio::SimpleAction::new("zoom-reset", None);
+        action.connect_activate(move |_action, _param| {
+            zoom_focused_pane(&states_zoom, &focus_zoom, ZoomDirection::Reset);
+        });
+        window.add_action(&action);
+    }
+
+    app.set_accels_for_action("win.zoom-reset", &["<Control>0"]);
+
     // --- "+" button click ---
     {
         let config_btn = config.clone();
@@ -915,6 +954,78 @@ fn toggle_search_on_focused_pane(tab_states: &TabStateMap, focus_tracker: &Focus
     };
 
     terminal::toggle_search(&da, &state_rc);
+}
+
+/// Direction for font zoom actions.
+#[derive(Clone, Copy)]
+enum ZoomDirection {
+    In,
+    Out,
+    Reset,
+}
+
+/// Minimum font size (points) -- below this, text is unreadable.
+const FONT_SIZE_MIN: f32 = 6.0;
+/// Maximum font size (points) -- above this, a single cell fills the window.
+const FONT_SIZE_MAX: f32 = 72.0;
+
+/// Apply a zoom action (in/out/reset) to the currently focused pane.
+fn zoom_focused_pane(
+    tab_states: &TabStateMap,
+    focus_tracker: &FocusTracker,
+    direction: ZoomDirection,
+) {
+    let focused_name = {
+        let Ok(name) = focus_tracker.try_borrow() else {
+            return;
+        };
+        name.clone()
+    };
+
+    if focused_name.is_empty() {
+        return;
+    }
+
+    let Ok(states) = tab_states.try_borrow() else {
+        return;
+    };
+
+    let Some(state_rc) = states.get(&focused_name).cloned() else {
+        return;
+    };
+    drop(states);
+
+    // Find the DrawingArea widget by name (needed for pango context + dimensions)
+    let app =
+        gtk4::gio::Application::default().and_then(|a| a.downcast::<gtk4::Application>().ok());
+    let Some(app) = app else {
+        return;
+    };
+    let Some(window) = app.active_window() else {
+        return;
+    };
+    let Some(da) = find_drawing_area_by_name(&window, &focused_name) else {
+        return;
+    };
+
+    let Ok(mut s) = state_rc.try_borrow_mut() else {
+        return;
+    };
+
+    let new_size = match direction {
+        ZoomDirection::In => (s.font_size + 1.0).min(FONT_SIZE_MAX),
+        ZoomDirection::Out => (s.font_size - 1.0).max(FONT_SIZE_MIN),
+        ZoomDirection::Reset => s.default_font_size,
+    };
+
+    if (new_size - s.font_size).abs() < f32::EPSILON {
+        return; // No change needed
+    }
+
+    s.font_size = new_size;
+    terminal::apply_font_zoom(&mut s, &da);
+    drop(s);
+    da.queue_draw();
 }
 
 /// Recursively find a DrawingArea with the given widget name.
