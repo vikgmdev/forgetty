@@ -393,6 +393,23 @@ impl Terminal {
         &cache.scrollback
     }
 
+    /// Query the scrollbar state: (total, offset, len).
+    ///
+    /// - `total`: total scrollable rows (scrollback + visible).
+    /// - `offset`: viewport offset from top.
+    /// - `len`: visible rows (page size).
+    pub fn scrollbar_state(&self) -> (u64, u64, u64) {
+        let mut sb = ffi::GhosttyTerminalScrollbar { total: 0, offset: 0, len: 0 };
+        unsafe {
+            ffi::ghostty_terminal_get(
+                self.handle,
+                ffi::GHOSTTY_TERMINAL_DATA_SCROLLBAR,
+                &mut sb as *mut ffi::GhosttyTerminalScrollbar as *mut c_void,
+            );
+        }
+        (sb.total, sb.offset, sb.len)
+    }
+
     /// Total lines: scrollback + visible rows.
     pub fn total_lines(&self) -> usize {
         let mut total: usize = 0;

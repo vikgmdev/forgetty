@@ -322,7 +322,7 @@ fn add_new_tab(
     focus_tracker: &FocusTracker,
 ) {
     match terminal::create_terminal(config) {
-        Ok((drawing_area, state)) => {
+        Ok((hbox, drawing_area, state)) => {
             // Assign a unique widget name for registry lookup
             let pane_id = next_pane_id();
             drawing_area.set_widget_name(&pane_id);
@@ -337,7 +337,7 @@ fn add_new_tab(
             let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
             container.set_hexpand(true);
             container.set_vexpand(true);
-            container.append(&drawing_area);
+            container.append(&hbox);
 
             // Append the page to the TabView
             let page = tab_view.append(&container);
@@ -432,8 +432,8 @@ fn split_pane(
     };
 
     // Create the new terminal pane
-    let (new_da, new_state) = match terminal::create_terminal(config) {
-        Ok(pair) => pair,
+    let (new_hbox, new_da, new_state) = match terminal::create_terminal(config) {
+        Ok(triple) => triple,
         Err(e) => {
             tracing::error!("Failed to create terminal for split: {e}");
             return;
@@ -455,21 +455,26 @@ fn split_pane(
     paned.set_hexpand(true);
     paned.set_vexpand(true);
 
-    // Determine where the focused DA sits in the widget tree.
-    // Detect the slot BEFORE removing the child.
-    let is_direct_child = root_content == focused_da;
-    let parent = focused_da.parent();
-    let parent_slot = parent
-        .as_ref()
-        .and_then(|p| p.downcast_ref::<gtk4::Paned>().map(|pp| detect_paned_slot(pp, &focused_da)));
+    // The DrawingArea lives inside an hbox (with the scrollbar).
+    // We need to operate on the hbox for tree manipulation.
+    let focused_hbox: gtk4::Widget =
+        focused_da.parent().expect("focused DA should have a parent hbox");
 
-    // Remove the focused DA from its current parent.
+    // Determine where the hbox sits in the widget tree.
+    // Detect the slot BEFORE removing the child.
+    let is_direct_child = root_content == focused_hbox;
+    let parent = focused_hbox.parent();
+    let parent_slot = parent.as_ref().and_then(|p| {
+        p.downcast_ref::<gtk4::Paned>().map(|pp| detect_paned_slot(pp, &focused_hbox))
+    });
+
+    // Remove the hbox from its current parent.
     // IMPORTANT: For Paned parents, we MUST use set_start/end_child(None)
     // instead of unparent(). Direct unparent() doesn't clear the Paned's
     // internal child pointer, so a later set_start/end_child() would
     // double-unparent the widget from its new location.
     if is_direct_child {
-        focused_da.unparent();
+        focused_hbox.unparent();
     } else if let Some(ref parent_widget) = parent {
         if let Some(parent_paned) = parent_widget.downcast_ref::<gtk4::Paned>() {
             match parent_slot.unwrap_or(PanedSlot::End) {
@@ -477,21 +482,21 @@ fn split_pane(
                 PanedSlot::End => parent_paned.set_end_child(gtk4::Widget::NONE),
             }
         } else {
-            focused_da.unparent();
+            focused_hbox.unparent();
         }
     }
 
-    // Set up the Paned children: original on start, new on end
-    paned.set_start_child(Some(&focused_da));
-    paned.set_end_child(Some(&new_da));
+    // Set up the Paned children: original hbox on start, new hbox on end
+    paned.set_start_child(Some(&focused_hbox));
+    paned.set_end_child(Some(&new_hbox));
 
     if is_direct_child {
-        // The focused DA was the sole content of the pane container.
+        // The hbox was the sole content of the pane container.
         // Replace it with the new Paned.
         set_container_content(&container, &paned);
     } else if let Some(parent_widget) = parent {
-        // The focused DA was inside a nested Paned.
-        // Insert the new Paned in the same slot that the focused DA occupied.
+        // The hbox was inside a nested Paned.
+        // Insert the new Paned in the same slot that the hbox occupied.
         if let Some(parent_paned) = parent_widget.downcast_ref::<gtk4::Paned>() {
             match parent_slot.unwrap_or(PanedSlot::End) {
                 PanedSlot::Start => parent_paned.set_start_child(Some(&paned)),
@@ -525,9 +530,9 @@ fn split_pane(
 ///
 /// Must be called BEFORE unparenting the child, since unparenting clears
 /// the parent's child reference.
-fn detect_paned_slot(parent_paned: &gtk4::Paned, child: &gtk4::DrawingArea) -> PanedSlot {
+fn detect_paned_slot(parent_paned: &gtk4::Paned, child: &impl IsA<gtk4::Widget>) -> PanedSlot {
     if let Some(start) = parent_paned.start_child() {
-        if start == *child {
+        if start == *child.upcast_ref::<gtk4::Widget>() {
             return PanedSlot::Start;
         }
     }
@@ -598,8 +603,12 @@ fn close_focused_pane(
         return;
     }
 
-    // Find the parent Paned
-    let Some(parent_widget) = focused_da.parent() else {
+    // The DrawingArea lives inside an hbox (with the scrollbar).
+    // Navigate: DrawingArea -> hbox -> parent Paned.
+    let Some(hbox_widget) = focused_da.parent() else {
+        return;
+    };
+    let Some(parent_widget) = hbox_widget.parent() else {
         return;
     };
 
@@ -608,7 +617,7 @@ fn close_focused_pane(
     };
 
     // Determine the sibling (the other child of the parent Paned)
-    let slot = detect_paned_slot(parent_paned, &focused_da);
+    let slot = detect_paned_slot(parent_paned, &hbox_widget);
     let sibling = match slot {
         PanedSlot::Start => parent_paned.end_child(),
         PanedSlot::End => parent_paned.start_child(),
@@ -836,7 +845,7 @@ fn copy_selection(
     };
     drop(states);
 
-    let Ok(s) = state_rc.try_borrow_mut() else {
+    let Ok(mut s) = state_rc.try_borrow_mut() else {
         return;
     };
 
@@ -845,9 +854,35 @@ fn copy_selection(
         return;
     };
 
+    // Selection coordinates are stored as absolute scrollback rows.
+    // The screen() viewport only shows a window of rows starting at the
+    // current viewport offset.  To extract text from the selection, we
+    // temporarily scroll the viewport so the selection start is visible,
+    // extract, then restore the original viewport position.
+    let sel_clone = sel.clone();
+    let (_, orig_offset, _) = s.terminal.scrollbar_state();
+    let sel_start_row = sel_clone.ordered().0 .0;
+    let delta = sel_start_row as isize - orig_offset as isize;
+    if delta != 0 {
+        s.terminal.scroll_viewport_delta(delta);
+    }
+
+    // Now the viewport starts at the selection's first row.
+    // Convert absolute selection rows to viewport-relative for extract_text().
+    let (_, vp_offset, _) = s.terminal.scrollbar_state();
+    let vp_offset = vp_offset as usize;
+    let mut viewport_sel = sel_clone.clone();
+    viewport_sel.start.0 = sel_clone.start.0.saturating_sub(vp_offset);
+    viewport_sel.end.0 = sel_clone.end.0.saturating_sub(vp_offset);
+
     // Extract text from the screen at the selected cell range
     let screen = s.terminal.screen();
-    let raw_text = sel.extract_text(screen);
+    let raw_text = viewport_sel.extract_text(screen);
+
+    // Restore the original viewport position
+    if delta != 0 {
+        s.terminal.scroll_viewport_delta(-delta);
+    }
 
     if raw_text.is_empty() {
         return;
