@@ -15,7 +15,8 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
 
-use forgetty_config::Config;
+use forgetty_config::{load_config, Config};
+use forgetty_watcher::ConfigWatcher;
 use gtk4::gio;
 use gtk4::glib;
 use gtk4::prelude::*;
@@ -24,6 +25,12 @@ use tracing::info;
 
 use crate::clipboard;
 use crate::terminal::{self, TerminalState};
+
+/// Shared config state, updated on hot reload and read by new tab/split creation.
+type SharedConfig = Rc<RefCell<Config>>;
+
+/// Interval for polling config file changes (milliseconds).
+const CONFIG_POLL_MS: u64 = 500;
 
 /// The application ID used for D-Bus registration and desktop integration.
 const APP_ID: &str = "dev.forgetty.Forgetty";
@@ -127,6 +134,10 @@ fn build_ui(app: &adw::Application, config: &Config) {
     // Focus tracker -- widget name of the currently focused DrawingArea
     let focus_tracker: FocusTracker = Rc::new(RefCell::new(String::new()));
 
+    // Shared config -- updated on hot reload, read by new tab/split creation.
+    // All action closures that create terminals capture a clone of this Rc.
+    let shared_config: SharedConfig = Rc::new(RefCell::new(config.clone()));
+
     // --- Tab close handling ---
     // When a tab's close button is clicked, kill ALL PTYs in the tab's
     // widget tree (may contain nested Paned widgets with multiple panes).
@@ -175,13 +186,16 @@ fn build_ui(app: &adw::Application, config: &Config) {
 
     // --- New tab action (Ctrl+Shift+T) ---
     {
-        let config_action = config.clone();
+        let config_action = Rc::clone(&shared_config);
         let tv_action = tab_view.clone();
         let states_action = Rc::clone(&tab_states);
         let focus_action = Rc::clone(&focus_tracker);
         let action = gio::SimpleAction::new("new-tab", None);
         action.connect_activate(move |_action, _param| {
-            add_new_tab(&tv_action, &config_action, &states_action, &focus_action);
+            let Ok(cfg) = config_action.try_borrow() else {
+                return;
+            };
+            add_new_tab(&tv_action, &cfg, &states_action, &focus_action);
         });
         window.add_action(&action);
     }
@@ -190,19 +204,16 @@ fn build_ui(app: &adw::Application, config: &Config) {
 
     // --- Split right action (Alt+Shift+=) ---
     {
-        let config_split = config.clone();
+        let config_split = Rc::clone(&shared_config);
         let tv_split = tab_view.clone();
         let states_split = Rc::clone(&tab_states);
         let focus_split = Rc::clone(&focus_tracker);
         let action = gio::SimpleAction::new("split-right", None);
         action.connect_activate(move |_action, _param| {
-            split_pane(
-                &tv_split,
-                &config_split,
-                &states_split,
-                &focus_split,
-                gtk4::Orientation::Horizontal,
-            );
+            let Ok(cfg) = config_split.try_borrow() else {
+                return;
+            };
+            split_pane(&tv_split, &cfg, &states_split, &focus_split, gtk4::Orientation::Horizontal);
         });
         window.add_action(&action);
     }
@@ -211,19 +222,16 @@ fn build_ui(app: &adw::Application, config: &Config) {
 
     // --- Split down action (Alt+Shift+-) ---
     {
-        let config_split = config.clone();
+        let config_split = Rc::clone(&shared_config);
         let tv_split = tab_view.clone();
         let states_split = Rc::clone(&tab_states);
         let focus_split = Rc::clone(&focus_tracker);
         let action = gio::SimpleAction::new("split-down", None);
         action.connect_activate(move |_action, _param| {
-            split_pane(
-                &tv_split,
-                &config_split,
-                &states_split,
-                &focus_split,
-                gtk4::Orientation::Vertical,
-            );
+            let Ok(cfg) = config_split.try_borrow() else {
+                return;
+            };
+            split_pane(&tv_split, &cfg, &states_split, &focus_split, gtk4::Orientation::Vertical);
         });
         window.add_action(&action);
     }
@@ -372,12 +380,15 @@ fn build_ui(app: &adw::Application, config: &Config) {
 
     // --- "+" button click ---
     {
-        let config_btn = config.clone();
+        let config_btn = Rc::clone(&shared_config);
         let tv_btn = tab_view.clone();
         let states_btn = Rc::clone(&tab_states);
         let focus_btn = Rc::clone(&focus_tracker);
         new_tab_button.connect_clicked(move |_btn| {
-            add_new_tab(&tv_btn, &config_btn, &states_btn, &focus_btn);
+            let Ok(cfg) = config_btn.try_borrow() else {
+                return;
+            };
+            add_new_tab(&tv_btn, &cfg, &states_btn, &focus_btn);
         });
     }
 
@@ -393,6 +404,63 @@ fn build_ui(app: &adw::Application, config: &Config) {
         if let Some(da) = leaves.first() {
             da.grab_focus();
         }
+    }
+
+    // --- Config hot reload timer ---
+    // Polls the config watcher every 500ms. On change, reloads config.toml
+    // and applies diffs (font, theme, bell) to all existing panes.
+    if let Some(mut config_watcher) = ConfigWatcher::new() {
+        let shared_cfg = Rc::clone(&shared_config);
+        let states_reload = Rc::clone(&tab_states);
+        let window_weak = window.downgrade();
+
+        glib::timeout_add_local(Duration::from_millis(CONFIG_POLL_MS), move || {
+            // Stop the timer if the window has been destroyed.
+            let Some(win) = window_weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+
+            if !config_watcher.poll() {
+                return glib::ControlFlow::Continue;
+            }
+
+            // Config file changed -- attempt to reload.
+            let new_config = match load_config(None) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    tracing::warn!("Config reload failed, keeping previous config: {e}");
+                    return glib::ControlFlow::Continue;
+                }
+            };
+
+            info!("Config reloaded successfully");
+
+            // Update the shared config so new tabs/splits use the new values.
+            if let Ok(mut cfg) = shared_cfg.try_borrow_mut() {
+                *cfg = new_config.clone();
+            }
+
+            // Apply changes to every existing pane.
+            let Ok(states) = states_reload.try_borrow() else {
+                return glib::ControlFlow::Continue;
+            };
+
+            let state_entries: Vec<_> =
+                states.iter().map(|(name, rc)| (name.clone(), Rc::clone(rc))).collect();
+            drop(states);
+
+            for (pane_name, state_rc) in &state_entries {
+                let Ok(mut s) = state_rc.try_borrow_mut() else {
+                    continue;
+                };
+                let Some(da) = find_drawing_area_by_name(&win, pane_name) else {
+                    continue;
+                };
+                terminal::apply_config_change(&mut s, &new_config, &da);
+            }
+
+            glib::ControlFlow::Continue
+        });
     }
 }
 

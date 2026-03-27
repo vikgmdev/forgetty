@@ -6,4 +6,4 @@
 
 pub mod watcher;
 
-pub use watcher::{ChangeKind, FileChange, FileWatcher};
+pub use watcher::{ChangeKind, ConfigWatcher, FileChange, FileWatcher};

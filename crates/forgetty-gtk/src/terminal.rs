@@ -1637,6 +1637,43 @@ pub fn apply_font_zoom(state: &mut TerminalState, da: &DrawingArea) {
     }
 }
 
+/// Apply a config change to a live terminal pane.
+///
+/// Compares the new config against the pane's current config and applies
+/// any differences:
+/// - **Font family/size:** Updates font metrics, cell dimensions, grid size,
+///   and PTY dimensions (programs see SIGWINCH). Resets the zoom delta.
+/// - **Theme colors:** Updates the theme so the next `draw_terminal()` frame
+///   uses the new colors.
+/// - **Bell mode:** Updates the bell mode for immediate effect on next BEL.
+///
+/// Follows the same pattern as `apply_font_zoom()` for font changes.
+pub fn apply_config_change(state: &mut TerminalState, new_config: &Config, da: &DrawingArea) {
+    let font_changed = state.config.font_family != new_config.font_family
+        || (state.config.font_size - new_config.font_size).abs() > f32::EPSILON;
+
+    // Always update theme -- it's cheap and the next draw picks it up.
+    state.config.theme = new_config.theme.clone();
+
+    // Update bell mode -- takes effect on next BEL event.
+    state.config.bell_mode = new_config.bell_mode;
+
+    // Update font family (needed even if size didn't change, for font_description_with_size).
+    state.config.font_family = new_config.font_family.clone();
+
+    if font_changed {
+        // Reset zoom: the user explicitly changed their config, so the zoom
+        // delta is cleared. Ctrl+0 now resets to the new config value.
+        state.config.font_size = new_config.font_size;
+        state.font_size = new_config.font_size;
+        state.default_font_size = new_config.font_size;
+
+        apply_font_zoom(state, da);
+    }
+
+    da.queue_draw();
+}
+
 /// Characters that act as word delimiters for double-click word selection.
 const WORD_DELIMITERS: &[char] =
     &[' ', '\t', '"', '\'', '`', '(', ')', '[', ']', '{', '}', '<', '>', ',', ';', '|', ':'];
