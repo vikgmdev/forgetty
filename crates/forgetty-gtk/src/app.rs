@@ -1521,7 +1521,7 @@ fn select_all_on_focused_pane(tab_states: &TabStateMap, focus_tracker: &FocusTra
 /// Open a URL in the user's default browser.
 ///
 /// Uses `gtk::UriLauncher` (GTK 4.10+) for GNOME-native URL handling.
-fn open_url_in_browser(url: &str) {
+pub(crate) fn open_url_in_browser(url: &str) {
     let launcher = gtk4::UriLauncher::new(url);
 
     let app =
