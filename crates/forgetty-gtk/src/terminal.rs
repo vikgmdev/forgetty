@@ -24,6 +24,43 @@ use gtk4::{glib, DrawingArea};
 use crate::input::{GhosttyInput, ScrollAction};
 use crate::pty_bridge;
 
+/// Search state for in-terminal text search (Ctrl+Shift+F).
+///
+/// Tracks the current query, all match positions across the entire scrollback,
+/// and the index of the currently focused match for navigation.
+#[derive(Debug, Clone)]
+pub struct SearchState {
+    /// Whether search mode is active (search bar visible).
+    pub active: bool,
+    /// The current search query (lowercased for case-insensitive matching).
+    pub query: String,
+    /// ALL matches across the entire scrollback: (absolute_row, start_col, match_len).
+    /// Sorted by absolute_row ascending (natural order from scanning top to bottom).
+    pub all_matches: Vec<(usize, usize, usize)>,
+    /// Viewport-relative matches for drawing: (screen_row, start_col, match_len).
+    /// Recomputed each frame from `all_matches` by filtering to the visible window.
+    pub matches: Vec<(usize, usize, usize)>,
+    /// Index into `all_matches` for the currently focused match.
+    pub current_index: usize,
+    /// Index within `matches` (viewport-relative) that corresponds to the
+    /// currently focused match (`current_index` in `all_matches`), or `None`
+    /// if the focused match is not in the current viewport.
+    pub current_viewport_index: Option<usize>,
+}
+
+impl Default for SearchState {
+    fn default() -> Self {
+        Self {
+            active: false,
+            query: String::new(),
+            all_matches: Vec::new(),
+            matches: Vec::new(),
+            current_index: 0,
+            current_viewport_index: None,
+        }
+    }
+}
+
 /// Shared terminal state accessible from multiple GTK callbacks.
 ///
 /// All access happens on the GTK main thread via `Rc<RefCell<>>`.
@@ -57,6 +94,8 @@ pub struct TerminalState {
     /// Cached viewport offset from the 16ms scrollbar timer.
     /// Used by mouse handlers to avoid expensive FFI calls on every event.
     pub viewport_offset: u64,
+    /// In-terminal search state (Ctrl+Shift+F).
+    pub search: SearchState,
 }
 
 impl TerminalState {
@@ -145,6 +184,7 @@ pub fn create_terminal(
         suppress_selection_clear_ticks: 0,
         updating_scrollbar: false,
         viewport_offset: 0,
+        search: SearchState::default(),
     }));
 
     // Create DrawingArea
@@ -830,7 +870,124 @@ pub fn create_terminal(
     hbox.append(&drawing_area);
     hbox.append(&scrollbar);
 
-    Ok((hbox, drawing_area, state))
+    // --- Search bar (Ctrl+Shift+F) ---
+    // A gtk::SearchBar containing a gtk::SearchEntry, placed above the terminal
+    // content in a vertical container. Hidden by default; revealed on action.
+    let search_entry = gtk4::SearchEntry::new();
+    search_entry.set_hexpand(true);
+    search_entry.set_placeholder_text(Some("Search..."));
+
+    let match_label = gtk4::Label::new(Some(""));
+    match_label.add_css_class("dim-label");
+
+    let search_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+    search_box.append(&search_entry);
+    search_box.append(&match_label);
+    search_box.set_margin_start(6);
+    search_box.set_margin_end(6);
+
+    let search_bar = gtk4::SearchBar::new();
+    search_bar.set_child(Some(&search_box));
+    search_bar.connect_entry(&search_entry);
+    search_bar.set_show_close_button(false);
+    // SearchBar starts hidden (search_mode = false)
+    search_bar.set_search_mode(false);
+
+    // --- Wire search-changed signal (recompute matches as user types) ---
+    {
+        let state = Rc::clone(&state);
+        let da_search = drawing_area.clone();
+        let ml = match_label.clone();
+        search_entry.connect_search_changed(move |entry| {
+            let query = entry.text().to_string();
+            let Ok(mut s) = state.try_borrow_mut() else {
+                return;
+            };
+            s.search.query = query.to_lowercase();
+            recompute_all_search_matches(&mut s);
+            update_match_label(&s.search, &ml);
+            drop(s);
+            da_search.queue_draw();
+        });
+    }
+
+    // --- Wire Enter (activate) for next-match navigation ---
+    {
+        let state = Rc::clone(&state);
+        let da_nav = drawing_area.clone();
+        let ml = match_label.clone();
+        search_entry.connect_activate(move |_entry| {
+            let Ok(mut s) = state.try_borrow_mut() else {
+                return;
+            };
+            if s.search.query.is_empty() {
+                return;
+            }
+            navigate_search_forward(&mut s);
+            update_match_label(&s.search, &ml);
+            drop(s);
+            da_nav.queue_draw();
+        });
+    }
+
+    // --- Wire Shift+Enter for previous-match and Escape for close ---
+    {
+        let key_controller = gtk4::EventControllerKey::new();
+        let state = Rc::clone(&state);
+        let da_key = drawing_area.clone();
+        let ml = match_label.clone();
+        let sb = search_bar.clone();
+        key_controller.connect_key_pressed(move |_ctrl, keyval, _keycode, modifier| {
+            // Shift+Enter: navigate to previous match
+            if keyval == gdk::Key::Return && modifier.contains(gdk::ModifierType::SHIFT_MASK) {
+                let Ok(mut s) = state.try_borrow_mut() else {
+                    return glib::Propagation::Stop;
+                };
+                if s.search.query.is_empty() {
+                    return glib::Propagation::Stop;
+                }
+                navigate_search_backward(&mut s);
+                update_match_label(&s.search, &ml);
+                drop(s);
+                da_key.queue_draw();
+                return glib::Propagation::Stop;
+            }
+
+            // Escape: close search bar, clear highlights, return focus to terminal
+            if keyval == gdk::Key::Escape {
+                let Ok(mut s) = state.try_borrow_mut() else {
+                    return glib::Propagation::Stop;
+                };
+                s.search.active = false;
+                s.search.query.clear();
+                s.search.all_matches.clear();
+                s.search.matches.clear();
+                s.search.current_index = 0;
+                drop(s);
+                sb.set_search_mode(false);
+                da_key.grab_focus();
+                da_key.queue_draw();
+                return glib::Propagation::Stop;
+            }
+
+            glib::Propagation::Proceed
+        });
+        search_entry.add_controller(key_controller);
+    }
+
+    // --- Vertical container: SearchBar on top, HBox (DrawingArea + Scrollbar) below ---
+    let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    vbox.set_hexpand(true);
+    vbox.set_vexpand(true);
+    vbox.append(&search_bar);
+    vbox.append(&hbox);
+
+    // Store search bar reference for the win.search action to toggle
+    // We use widget name as a lookup key -- the action in app.rs will
+    // find the SearchBar by walking the widget tree.
+    search_bar.set_widget_name("forgetty-search-bar");
+
+    Ok((vbox, drawing_area, state))
 }
 
 /// Helper: convert a `Color` to `(r, g, b)` f64 values (0.0..1.0), using
@@ -874,6 +1031,10 @@ fn is_app_shortcut(keyval: gdk::Key, modifier: gdk::ModifierType) -> bool {
     if mods == ctrl_shift && (keyval == gdk::Key::c || keyval == gdk::Key::C) {
         return true;
     }
+    // Search in terminal: Ctrl+Shift+F
+    if mods == ctrl_shift && (keyval == gdk::Key::f || keyval == gdk::Key::F) {
+        return true;
+    }
     // Pane navigation: Alt+Arrow
     if mods == gdk::ModifierType::ALT_MASK
         && (keyval == gdk::Key::Left
@@ -885,6 +1046,64 @@ fn is_app_shortcut(keyval: gdk::Key, modifier: gdk::ModifierType) -> bool {
     }
 
     false
+}
+
+/// Toggle the search bar for a pane identified by its TerminalState.
+///
+/// Called from app.rs when the `win.search` action fires (Ctrl+Shift+F).
+/// Finds the SearchBar in the widget tree above the DrawingArea and toggles
+/// search mode. When opening, focuses the SearchEntry. When closing, clears
+/// state and returns focus to the DrawingArea.
+pub fn toggle_search(da: &DrawingArea, state: &Rc<RefCell<TerminalState>>) {
+    // Walk up from DrawingArea -> hbox -> vbox to find the SearchBar
+    let Some(hbox_widget) = da.parent() else {
+        return;
+    };
+    let Some(vbox_widget) = hbox_widget.parent() else {
+        return;
+    };
+    let Some(vbox) = vbox_widget.downcast_ref::<gtk4::Box>() else {
+        return;
+    };
+
+    // The SearchBar is the first child of the vbox
+    let Some(first_child) = vbox.first_child() else {
+        return;
+    };
+    let Some(search_bar) = first_child.downcast_ref::<gtk4::SearchBar>() else {
+        return;
+    };
+
+    let is_active = search_bar.is_search_mode();
+
+    if is_active {
+        // Close search
+        if let Ok(mut s) = state.try_borrow_mut() {
+            s.search.active = false;
+            s.search.query.clear();
+            s.search.all_matches.clear();
+            s.search.matches.clear();
+            s.search.current_index = 0;
+        }
+        search_bar.set_search_mode(false);
+        da.grab_focus();
+        da.queue_draw();
+    } else {
+        // Open search
+        if let Ok(mut s) = state.try_borrow_mut() {
+            s.search.active = true;
+        }
+        search_bar.set_search_mode(true);
+        // Find the SearchEntry inside the SearchBar and focus it
+        if let Some(sb_child) = search_bar.child() {
+            if let Some(sb_box) = sb_child.downcast_ref::<gtk4::Box>() {
+                if let Some(entry_widget) = sb_box.first_child() {
+                    entry_widget.grab_focus();
+                }
+            }
+        }
+        da.queue_draw();
+    }
 }
 
 /// Characters that act as word delimiters for double-click word selection.
@@ -968,6 +1187,277 @@ fn last_non_whitespace_col(screen: &forgetty_vt::Screen, row: usize) -> usize {
     last
 }
 
+/// Scan a single viewport page and collect matches with the given row offset.
+///
+/// Reads the current screen (after caller has scrolled to the desired position
+/// and ensured `screen()` is up-to-date) and appends `(abs_row, start_col, match_len)`
+/// to `out` for every case-insensitive occurrence of `query`.
+fn collect_matches_from_viewport(
+    screen: &forgetty_vt::screen::Screen,
+    query: &str,
+    row_offset: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut Vec<(usize, usize, usize)>,
+) {
+    let num_rows = screen.rows().min(rows);
+    let num_cols = screen.cols().min(cols);
+
+    for row in 0..num_rows {
+        let cells = screen.row(row);
+        // Build the lowercased line string and a mapping from byte offset
+        // in the lowercased string to column index.
+        let mut line_lower = String::new();
+        let mut byte_to_col: Vec<usize> = Vec::new();
+        for col in 0..num_cols.min(cells.len()) {
+            let g = &cells[col].grapheme;
+            let start_byte = line_lower.len();
+            if g.is_empty() {
+                line_lower.push(' ');
+            } else {
+                for ch in g.chars() {
+                    for lc in ch.to_lowercase() {
+                        line_lower.push(lc);
+                    }
+                }
+            }
+            for _ in start_byte..line_lower.len() {
+                byte_to_col.push(col);
+            }
+        }
+
+        let mut search_start = 0;
+        while let Some(byte_pos) = line_lower[search_start..].find(query) {
+            let abs_byte_pos = search_start + byte_pos;
+            let end_byte_pos = abs_byte_pos + query.len();
+
+            if abs_byte_pos < byte_to_col.len() && end_byte_pos > 0 {
+                let start_col = byte_to_col[abs_byte_pos];
+                let end_col = if end_byte_pos <= byte_to_col.len() {
+                    byte_to_col[end_byte_pos.saturating_sub(1)]
+                } else {
+                    byte_to_col[byte_to_col.len() - 1]
+                };
+                let match_len = end_col - start_col + 1;
+                let abs_row = row_offset + row;
+                out.push((abs_row, start_col, match_len));
+            }
+
+            search_start = abs_byte_pos + 1;
+            if search_start >= line_lower.len() {
+                break;
+            }
+        }
+    }
+}
+
+/// Scan the entire scrollback and visible area to find ALL matches.
+///
+/// Temporarily scrolls the viewport page-by-page from the top of scrollback
+/// to the bottom, collecting matches with absolute row positions, then restores
+/// the viewport to the original offset. The result is stored in
+/// `s.search.all_matches` sorted by absolute row (natural scan order).
+fn recompute_all_search_matches(s: &mut TerminalState) {
+    s.search.all_matches.clear();
+    s.search.matches.clear();
+
+    if s.search.query.is_empty() {
+        s.search.current_index = 0;
+        return;
+    }
+
+    let query = s.search.query.clone();
+    let rows = s.rows;
+    let cols = s.cols;
+
+    // Save the current viewport offset so we can restore it after scanning.
+    let (total, original_offset, len) = s.terminal.scrollbar_state();
+    if total == 0 || len == 0 {
+        return;
+    }
+
+    let page_size = len as usize;
+    let max_offset = if total > len { (total - len) as usize } else { 0 };
+
+    // Scroll to the very top of scrollback.
+    if original_offset > 0 {
+        s.terminal.scroll_viewport_delta(-(original_offset as isize));
+    }
+
+    let mut all = Vec::new();
+    let mut current_offset: usize = 0;
+
+    loop {
+        // Read screen at the current position.
+        let screen = s.terminal.screen();
+        collect_matches_from_viewport(screen, &query, current_offset, rows, cols, &mut all);
+
+        // Are we at the bottom?
+        if current_offset >= max_offset {
+            break;
+        }
+
+        // Advance by one page (but don't overshoot past the bottom).
+        let remaining = max_offset - current_offset;
+        let step = page_size.min(remaining);
+        if step == 0 {
+            break;
+        }
+        s.terminal.scroll_viewport_delta(step as isize);
+        let (_, new_off, _) = s.terminal.scrollbar_state();
+        current_offset = new_off as usize;
+    }
+
+    // Deduplicate: since pages can overlap (page_size > step at the end),
+    // the same absolute row may be scanned twice. Remove duplicates while
+    // preserving sort order.
+    all.sort_by_key(|&(abs_row, col, _)| (abs_row, col));
+    all.dedup();
+
+    // Restore the original viewport offset.
+    let (_, after_offset, _) = s.terminal.scrollbar_state();
+    let restore_delta = original_offset as isize - after_offset as isize;
+    if restore_delta != 0 {
+        s.terminal.scroll_viewport_delta(restore_delta);
+    }
+    let (_, off, _) = s.terminal.scrollbar_state();
+    s.viewport_offset = off;
+
+    s.search.all_matches = all;
+
+    // Clamp current_index to valid range.
+    if s.search.all_matches.is_empty() {
+        s.search.current_index = 0;
+    } else if s.search.current_index >= s.search.all_matches.len() {
+        s.search.current_index = 0;
+    }
+
+    // Compute the viewport-relative matches for drawing.
+    filter_viewport_matches(s);
+}
+
+/// Filter `all_matches` to the current viewport, producing `matches`
+/// with screen-relative row coordinates for the drawing pass.
+/// Also computes `current_viewport_index` so the drawing pass can
+/// identify which viewport match (if any) is the focused one.
+fn filter_viewport_matches(s: &mut TerminalState) {
+    s.search.matches.clear();
+    s.search.current_viewport_index = None;
+
+    let (_, offset, len) = s.terminal.scrollbar_state();
+    let vp_start = offset as usize;
+    let vp_end = vp_start + len as usize; // exclusive
+
+    // The currently focused match in all_matches (for comparison).
+    let current_abs = if !s.search.all_matches.is_empty()
+        && s.search.current_index < s.search.all_matches.len()
+    {
+        Some(s.search.all_matches[s.search.current_index])
+    } else {
+        None
+    };
+
+    for (global_idx, &(abs_row, col, match_len)) in s.search.all_matches.iter().enumerate() {
+        if abs_row >= vp_start && abs_row < vp_end {
+            let screen_row = abs_row - vp_start;
+            let vp_idx = s.search.matches.len();
+            s.search.matches.push((screen_row, col, match_len));
+
+            // Check if this global match is the focused one.
+            if global_idx == s.search.current_index {
+                if let Some(cur) = current_abs {
+                    if cur == (abs_row, col, match_len) {
+                        s.search.current_viewport_index = Some(vp_idx);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Update the match count label text (e.g., "3 of 15" or "0 of 0").
+///
+/// Uses `all_matches` for the total count so the label reflects every match
+/// across the entire scrollback, not just the visible viewport.
+fn update_match_label(search: &SearchState, label: &gtk4::Label) {
+    if search.query.is_empty() || search.all_matches.is_empty() {
+        label.set_text("0 of 0");
+    } else {
+        label.set_text(&format!("{} of {}", search.current_index + 1, search.all_matches.len()));
+    }
+}
+
+/// Scroll the viewport so the currently focused search match is visible.
+///
+/// Reads the absolute row from `all_matches[current_index]` and scrolls the
+/// viewport so that row is roughly at 1/3 from the top of the screen.
+fn scroll_to_current_match(s: &mut TerminalState) {
+    if s.search.all_matches.is_empty() {
+        return;
+    }
+
+    let (abs_row, _, _) = s.search.all_matches[s.search.current_index];
+
+    // Get current viewport state.
+    let (total, offset, len) = s.terminal.scrollbar_state();
+    let viewport_rows = len as usize;
+
+    // Target: place the match row at roughly 1/3 from the top.
+    let target_offset = if abs_row > viewport_rows / 3 { abs_row - viewport_rows / 3 } else { 0 };
+
+    // Clamp to valid range.
+    let max_offset = if total > len { (total - len) as usize } else { 0 };
+    let target_offset = target_offset.min(max_offset);
+
+    let delta = target_offset as isize - offset as isize;
+    if delta != 0 {
+        s.terminal.scroll_viewport_delta(delta);
+        let (_, off, _) = s.terminal.scrollbar_state();
+        s.viewport_offset = off;
+    }
+
+    // Refresh viewport-relative matches after scrolling.
+    filter_viewport_matches(s);
+}
+
+/// Navigate to the next search match (Enter in search bar).
+///
+/// Advances `current_index` in `all_matches` (wrapping around to the first
+/// match at the end) and scrolls the viewport to show it.
+fn navigate_search_forward(s: &mut TerminalState) {
+    if s.search.query.is_empty() || s.search.all_matches.is_empty() {
+        return;
+    }
+
+    // Advance index, wrapping around.
+    if s.search.current_index + 1 < s.search.all_matches.len() {
+        s.search.current_index += 1;
+    } else {
+        s.search.current_index = 0; // wrap to first match
+    }
+
+    scroll_to_current_match(s);
+}
+
+/// Navigate to the previous search match (Shift+Enter in search bar).
+///
+/// Decrements `current_index` in `all_matches` (wrapping around to the last
+/// match at the beginning) and scrolls the viewport to show it.
+fn navigate_search_backward(s: &mut TerminalState) {
+    if s.search.query.is_empty() || s.search.all_matches.is_empty() {
+        return;
+    }
+
+    // Decrement index, wrapping around.
+    if s.search.current_index > 0 {
+        s.search.current_index -= 1;
+    } else {
+        s.search.current_index = s.search.all_matches.len() - 1; // wrap to last match
+    }
+
+    scroll_to_current_match(s);
+}
+
 /// The main draw function called by GTK on every frame.
 fn draw_terminal(
     da: &DrawingArea,
@@ -989,10 +1479,22 @@ fn draw_terminal(
     let fg_color = s.config.theme.foreground;
     let cursor_color = s.config.theme.cursor;
     let selection_color = s.config.theme.selection;
+    let search_match_color = s.config.theme.search_match;
+    let search_current_color = s.config.theme.search_current;
     let cursor_style = s.config.cursor_style;
 
     // Clone selection state for rendering
     let selection = s.selection.clone();
+
+    // Filter all_matches to the current viewport for drawing.
+    // The full scrollback scan (all_matches) is done once when the query
+    // changes.  Here we just recompute the viewport-relative subset so
+    // highlights track scrolling, new PTY output, etc.
+    if s.search.active && !s.search.query.is_empty() {
+        filter_viewport_matches(&mut s);
+    }
+    // Clone search state for rendering
+    let search = s.search.clone();
 
     // Query viewport offset for converting absolute selection rows to screen rows.
     // Selection coordinates are stored as absolute scrollback positions; we need
@@ -1210,7 +1712,33 @@ fn draw_terminal(
         }
     }
 
-    // 6. Dim unfocused panes with a semi-transparent overlay (Ghostty style).
+    // 6. Draw search match highlights (between selection and dim overlays).
+    //
+    // Non-focused matches get a warm amber overlay; the currently focused match
+    // gets a brighter orange overlay so the user can distinguish it.
+    if search.active && !search.matches.is_empty() {
+        for (idx, &(match_row, match_col, match_len)) in search.matches.iter().enumerate() {
+            let is_current = search.current_viewport_index == Some(idx);
+            let color = if is_current { &search_current_color } else { &search_match_color };
+            ctx.set_source_rgba(
+                color.r as f64 / 255.0,
+                color.g as f64 / 255.0,
+                color.b as f64 / 255.0,
+                color.a as f64 / 255.0,
+            );
+
+            for c in match_col..match_col + match_len {
+                if match_row < num_rows && c < num_cols {
+                    let sx = c as f64 * cell_w;
+                    let sy = match_row as f64 * cell_h;
+                    ctx.rectangle(sx, sy, cell_w, cell_h);
+                    ctx.fill().ok();
+                }
+            }
+        }
+    }
+
+    // 7. Dim unfocused panes with a semi-transparent overlay (Ghostty style).
     // Focused pane renders at full brightness; unfocused panes get a dark wash.
     if !da.has_focus() {
         ctx.set_source_rgba(0.0, 0.0, 0.0, 0.12);
