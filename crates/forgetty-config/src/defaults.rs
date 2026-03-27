@@ -3,7 +3,7 @@
 //! Provides a sensible default configuration for users who have not yet
 //! created a configuration file.
 
-use crate::schema::{Config, CursorStyle};
+use crate::schema::{BellMode, Config, CursorStyle};
 use crate::theme::Theme;
 use std::collections::HashMap;
 
@@ -22,6 +22,7 @@ pub fn default_config() -> Config {
         shell: None,
         scrollback_lines: 10_000,
         cursor_style: CursorStyle::Block,
+        bell_mode: BellMode::Visual,
         keybindings: HashMap::new(),
     }
 }

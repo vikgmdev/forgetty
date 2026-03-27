@@ -11,10 +11,11 @@ use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use forgetty_config::{Config, CursorStyle};
+use forgetty_config::{BellMode, Config, CursorStyle};
 use forgetty_core::Rgba;
 use forgetty_vt::screen::Color;
 use forgetty_vt::selection::{Selection, SelectionMode};
+use forgetty_vt::TerminalEvent;
 use gtk4::cairo;
 use gtk4::gdk;
 use gtk4::pango;
@@ -120,6 +121,12 @@ pub struct TerminalState {
     /// Whether the terminal was on the alternate screen last tick.
     /// Used to detect alt→primary transitions and restore blink default.
     pub was_alternate_screen: bool,
+    /// Deadline for the visual bell flash overlay. While `Instant::now()` is
+    /// before this deadline, `draw_terminal()` paints a semi-transparent white
+    /// overlay over the pane.
+    pub bell_flash_until: Option<Instant>,
+    /// Timestamp of the last bell response, for rate limiting (200ms cooldown).
+    pub last_bell: Instant,
 }
 
 impl TerminalState {
@@ -225,6 +232,8 @@ pub fn create_terminal(
         cursor_blink_visible: true,
         last_blink_toggle: Instant::now(),
         was_alternate_screen: false,
+        bell_flash_until: None,
+        last_bell: Instant::now() - Duration::from_secs(1),
     }));
 
     // Create DrawingArea
@@ -283,6 +292,34 @@ pub fn create_terminal(
             }
             s.was_alternate_screen = is_alt;
 
+            // Drain terminal events (bell, title changes) so they don't
+            // accumulate unboundedly in the event buffer.
+            let events = s.terminal.drain_events();
+            for event in events {
+                if let TerminalEvent::Bell = event {
+                    let now = Instant::now();
+                    // Rate limit: suppress bells within 200ms of the last one.
+                    if now.duration_since(s.last_bell) < Duration::from_millis(200) {
+                        continue;
+                    }
+                    s.last_bell = now;
+
+                    match s.config.bell_mode {
+                        BellMode::Visual => {
+                            s.bell_flash_until = Some(Instant::now() + Duration::from_millis(150));
+                        }
+                        BellMode::Audio => {
+                            da.error_bell();
+                        }
+                        BellMode::Both => {
+                            s.bell_flash_until = Some(Instant::now() + Duration::from_millis(150));
+                            da.error_bell();
+                        }
+                        BellMode::None => {}
+                    }
+                }
+            }
+
             if had_data {
                 // Only auto-scroll to bottom when the user was already at
                 // the bottom. This lets users browse scrollback history
@@ -330,9 +367,17 @@ pub fn create_terminal(
                 // Toggle blink phase every 600ms when the terminal requests blinking.
                 // Only trigger a redraw when the phase actually changes.
                 let now = Instant::now();
-                if now.duration_since(s.last_blink_toggle) >= Duration::from_millis(600) {
-                    s.cursor_blink_visible = !s.cursor_blink_visible;
-                    s.last_blink_toggle = now;
+                let needs_redraw =
+                    if now.duration_since(s.last_blink_toggle) >= Duration::from_millis(600) {
+                        s.cursor_blink_visible = !s.cursor_blink_visible;
+                        s.last_blink_toggle = now;
+                        true
+                    } else {
+                        false
+                    };
+                // Also redraw while the bell flash overlay is active.
+                let bell_active = s.bell_flash_until.is_some();
+                if needs_redraw || bell_active {
                     drop(s);
                     da.queue_draw();
                 }
@@ -2296,5 +2341,18 @@ fn draw_terminal(
         ctx.set_source_rgba(0.0, 0.0, 0.0, 0.12);
         ctx.rectangle(0.0, 0.0, width as f64, height as f64);
         ctx.fill().ok();
+    }
+
+    // 8. Visual bell flash overlay.
+    // While the bell flash deadline is in the future, paint a semi-transparent
+    // white wash over the pane. Once the deadline passes, clear the field.
+    if let Some(deadline) = s.bell_flash_until {
+        if Instant::now() < deadline {
+            ctx.set_source_rgba(1.0, 1.0, 1.0, 0.15);
+            ctx.rectangle(0.0, 0.0, width as f64, height as f64);
+            ctx.fill().ok();
+        } else {
+            s.bell_flash_until = None;
+        }
     }
 }

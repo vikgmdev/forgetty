@@ -8,6 +8,22 @@ use std::collections::HashMap;
 
 use crate::theme::Theme;
 
+/// The bell mode — how the terminal responds to BEL (0x07).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[derive(Default)]
+pub enum BellMode {
+    /// A brief visual flash overlay on the terminal pane.
+    #[default]
+    Visual,
+    /// An audible system beep.
+    Audio,
+    /// Both visual flash and audio beep.
+    Both,
+    /// Bell is silently ignored.
+    None,
+}
+
 /// The cursor rendering style.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -52,6 +68,10 @@ pub struct Config {
     /// The cursor style.
     #[serde(default)]
     pub cursor_style: CursorStyle,
+
+    /// The bell mode (visual, audio, both, or none).
+    #[serde(default)]
+    pub bell_mode: BellMode,
 
     /// Custom keybindings mapping action names to key combinations.
     #[serde(default)]
