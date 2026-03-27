@@ -42,7 +42,8 @@ const DEFAULT_WIDTH: i32 = 960;
 const DEFAULT_HEIGHT: i32 = 640;
 
 /// Interval for polling CWD / OSC title changes (milliseconds).
-const TITLE_POLL_MS: u64 = 1500;
+/// Kept low (100ms) so `cd` updates feel instant — readlink on /proc is ~1μs.
+const TITLE_POLL_MS: u64 = 100;
 
 /// Lookup table mapping each pane's DrawingArea widget name to its TerminalState.
 ///
@@ -94,8 +95,10 @@ fn build_ui(app: &adw::Application, config: &Config) {
     // --- Widget hierarchy ---
     // adw::ApplicationWindow
     //   content: gtk::Box (vertical)
-    //     [0] adw::HeaderBar
-    //     [1] adw::TabBar (linked to tab_view)
+    //     [0] adw::HeaderBar (centered title from window title "Forgetty")
+    //           pack_start: dropdown MenuButton (New Tab / Split actions)
+    //           pack_end: hamburger MenuButton
+    //     [1] adw::TabBar (autohide=true, hidden when 1 tab, shown for 2+)
     //     [2] adw::TabView (holds pane containers as pages)
     //
     // Each tab page child is a gtk::Box (the "pane container"), which holds
@@ -115,17 +118,46 @@ fn build_ui(app: &adw::Application, config: &Config) {
     menu_button.set_tooltip_text(Some("Menu"));
     header.pack_end(&menu_button);
 
+    // --- New tab button (direct click to create tab, like Ghostty) ---
+    let new_tab_button = gtk4::Button::from_icon_name("tab-new-symbolic");
+    new_tab_button.set_tooltip_text(Some("New Tab"));
+    new_tab_button.set_action_name(Some("win.new-tab"));
+    header.pack_start(&new_tab_button);
+
+    // --- Dropdown menu button (split actions + new tab) ---
+    let dropdown_menu = gio::Menu::new();
+    let new_tab_item = gio::MenuItem::new(Some("New Tab"), Some("win.new-tab"));
+    new_tab_item.set_attribute_value("accel", Some(&"<Control><Shift>t".to_variant()));
+    dropdown_menu.append_item(&new_tab_item);
+
+    let split_section = gio::Menu::new();
+    split_section.append(Some("Split Up"), Some("win.split-up"));
+    let sd = gio::MenuItem::new(Some("Split Down"), Some("win.split-down"));
+    sd.set_attribute_value("accel", Some(&"<Alt><Shift>minus".to_variant()));
+    split_section.append_item(&sd);
+    split_section.append(Some("Split Left"), Some("win.split-left"));
+    let sr = gio::MenuItem::new(Some("Split Right"), Some("win.split-right"));
+    sr.set_attribute_value("accel", Some(&"<Alt><Shift>equal".to_variant()));
+    split_section.append_item(&sr);
+    dropdown_menu.append_section(None, &split_section);
+
+    let dropdown_button = gtk4::MenuButton::new();
+    dropdown_button.set_icon_name("pan-down-symbolic");
+    dropdown_button.set_menu_model(Some(&dropdown_menu));
+    dropdown_button.set_tooltip_text(Some("Tab and Split Actions"));
+    header.pack_start(&dropdown_button);
+
     let tab_view = adw::TabView::new();
     tab_view.set_vexpand(true);
 
     let tab_bar = adw::TabBar::new();
     tab_bar.set_view(Some(&tab_view));
-    tab_bar.set_autohide(false);
+    tab_bar.set_autohide(true);
+    tab_bar.set_hexpand(true);
 
-    // "+" button for creating new tabs via mouse
-    let new_tab_button = gtk4::Button::from_icon_name("tab-new-symbolic");
-    new_tab_button.set_tooltip_text(Some("New Tab (Ctrl+Shift+T)"));
-    tab_bar.set_end_action_widget(Some(&new_tab_button));
+    // The header bar keeps its default title ("Forgetty" from the window title).
+    // The tab bar lives as a separate row below the header, auto-hidden when
+    // only one tab exists (matching Ghostty's two-row layout for 2+ tabs).
 
     let content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     content.append(&header);
@@ -202,12 +234,13 @@ fn build_ui(app: &adw::Application, config: &Config) {
         let tv_action = tab_view.clone();
         let states_action = Rc::clone(&tab_states);
         let focus_action = Rc::clone(&focus_tracker);
+        let win_action = window.clone();
         let action = gio::SimpleAction::new("new-tab", None);
         action.connect_activate(move |_action, _param| {
             let Ok(cfg) = config_action.try_borrow() else {
                 return;
             };
-            add_new_tab(&tv_action, &cfg, &states_action, &focus_action);
+            add_new_tab(&tv_action, &cfg, &states_action, &focus_action, &win_action);
         });
         window.add_action(&action);
     }
@@ -225,7 +258,14 @@ fn build_ui(app: &adw::Application, config: &Config) {
             let Ok(cfg) = config_split.try_borrow() else {
                 return;
             };
-            split_pane(&tv_split, &cfg, &states_split, &focus_split, gtk4::Orientation::Horizontal);
+            split_pane(
+                &tv_split,
+                &cfg,
+                &states_split,
+                &focus_split,
+                gtk4::Orientation::Horizontal,
+                false,
+            );
         });
         window.add_action(&action);
     }
@@ -243,12 +283,65 @@ fn build_ui(app: &adw::Application, config: &Config) {
             let Ok(cfg) = config_split.try_borrow() else {
                 return;
             };
-            split_pane(&tv_split, &cfg, &states_split, &focus_split, gtk4::Orientation::Vertical);
+            split_pane(
+                &tv_split,
+                &cfg,
+                &states_split,
+                &focus_split,
+                gtk4::Orientation::Vertical,
+                false,
+            );
         });
         window.add_action(&action);
     }
 
     app.set_accels_for_action("win.split-down", &["<Alt><Shift>minus", "<Alt>underscore"]);
+
+    // --- Split left action (dropdown menu only, no default accelerator) ---
+    {
+        let config_split = Rc::clone(&shared_config);
+        let tv_split = tab_view.clone();
+        let states_split = Rc::clone(&tab_states);
+        let focus_split = Rc::clone(&focus_tracker);
+        let action = gio::SimpleAction::new("split-left", None);
+        action.connect_activate(move |_action, _param| {
+            let Ok(cfg) = config_split.try_borrow() else {
+                return;
+            };
+            split_pane(
+                &tv_split,
+                &cfg,
+                &states_split,
+                &focus_split,
+                gtk4::Orientation::Horizontal,
+                true,
+            );
+        });
+        window.add_action(&action);
+    }
+
+    // --- Split up action (dropdown menu only, no default accelerator) ---
+    {
+        let config_split = Rc::clone(&shared_config);
+        let tv_split = tab_view.clone();
+        let states_split = Rc::clone(&tab_states);
+        let focus_split = Rc::clone(&focus_tracker);
+        let action = gio::SimpleAction::new("split-up", None);
+        action.connect_activate(move |_action, _param| {
+            let Ok(cfg) = config_split.try_borrow() else {
+                return;
+            };
+            split_pane(
+                &tv_split,
+                &cfg,
+                &states_split,
+                &focus_split,
+                gtk4::Orientation::Vertical,
+                true,
+            );
+        });
+        window.add_action(&action);
+    }
 
     // --- Close pane action (Ctrl+Shift+W) ---
     {
@@ -425,22 +518,8 @@ fn build_ui(app: &adw::Application, config: &Config) {
         window.add_action(&action);
     }
 
-    // --- "+" button click ---
-    {
-        let config_btn = Rc::clone(&shared_config);
-        let tv_btn = tab_view.clone();
-        let states_btn = Rc::clone(&tab_states);
-        let focus_btn = Rc::clone(&focus_tracker);
-        new_tab_button.connect_clicked(move |_btn| {
-            let Ok(cfg) = config_btn.try_borrow() else {
-                return;
-            };
-            add_new_tab(&tv_btn, &cfg, &states_btn, &focus_btn);
-        });
-    }
-
     // --- Create the first tab ---
-    add_new_tab(&tab_view, config, &tab_states, &focus_tracker);
+    add_new_tab(&tab_view, config, &tab_states, &focus_tracker, &window);
 
     window.present();
 
@@ -525,6 +604,7 @@ fn add_new_tab(
     config: &Config,
     tab_states: &TabStateMap,
     focus_tracker: &FocusTracker,
+    window: &adw::ApplicationWindow,
 ) {
     match terminal::create_terminal(config) {
         Ok((pane_vbox, drawing_area, state)) => {
@@ -554,9 +634,15 @@ fn add_new_tab(
             // Grab focus so keyboard input goes to this terminal
             drawing_area.grab_focus();
 
+            // --- Set initial window title immediately ---
+            if let Ok(s) = state.try_borrow() {
+                window.set_title(Some(&compute_window_title(&s)));
+                page.set_title(&compute_display_title(&s));
+            }
+
             // --- Title polling timer ---
             // Periodically update the tab title from the focused pane's CWD.
-            register_title_timer(&page, tab_view, tab_states, focus_tracker);
+            register_title_timer(&page, tab_view, tab_states, focus_tracker, &window);
         }
         Err(e) => {
             tracing::error!("Failed to create terminal for new tab: {e}");
@@ -598,12 +684,18 @@ fn set_container_content(container: &gtk4::Box, new_content: &impl IsA<gtk4::Wid
 ///
 /// Replaces the focused DrawingArea with a gtk::Paned containing the original
 /// pane and a newly created terminal pane.
+///
+/// When `before` is false (split-right, split-down): existing pane goes in
+/// start_child, new pane in end_child.
+/// When `before` is true (split-left, split-up): new pane goes in start_child,
+/// existing pane in end_child.
 fn split_pane(
     tab_view: &adw::TabView,
     config: &Config,
     tab_states: &TabStateMap,
     focus_tracker: &FocusTracker,
     orientation: gtk4::Orientation,
+    before: bool,
 ) {
     // Find the currently focused DrawingArea
     let focused_name = {
@@ -692,9 +784,16 @@ fn split_pane(
         }
     }
 
-    // Set up the Paned children: original vbox on start, new vbox on end
-    paned.set_start_child(Some(&focused_vbox));
-    paned.set_end_child(Some(&new_pane_vbox));
+    // Set up the Paned children.
+    // When `before` is true (split-left/split-up), the new pane goes in
+    // start_child so it appears before (left of / above) the existing pane.
+    if before {
+        paned.set_start_child(Some(&new_pane_vbox));
+        paned.set_end_child(Some(&focused_vbox));
+    } else {
+        paned.set_start_child(Some(&focused_vbox));
+        paned.set_end_child(Some(&new_pane_vbox));
+    }
 
     if is_direct_child {
         // The hbox was the sole content of the pane container.
@@ -1426,11 +1525,13 @@ fn register_title_timer(
     tab_view: &adw::TabView,
     tab_states: &TabStateMap,
     focus_tracker: &FocusTracker,
+    window: &adw::ApplicationWindow,
 ) {
     let page_weak = page.downgrade();
     let tab_states_title = Rc::clone(tab_states);
     let focus_title = Rc::clone(focus_tracker);
     let tv_weak = tab_view.downgrade();
+    let win_weak = window.downgrade();
 
     glib::timeout_add_local(Duration::from_millis(TITLE_POLL_MS), move || {
         let Some(page) = page_weak.upgrade() else {
@@ -1484,6 +1585,13 @@ fn register_title_timer(
             if current_title.as_str() != title {
                 page.set_title(&title);
             }
+            // Update window title bar with user@host:cwd for the focused pane
+            if let Some(win) = win_weak.upgrade() {
+                let win_title = compute_window_title(&s);
+                if win.title().map(|t| t.as_str() != win_title).unwrap_or(true) {
+                    win.set_title(Some(&win_title));
+                }
+            }
         }
 
         glib::ControlFlow::Continue
@@ -1517,6 +1625,33 @@ fn compute_display_title(state: &TerminalState) -> String {
     }
 
     "shell".to_string()
+}
+
+/// Compute the window title bar string: `user@hostname:cwd`.
+///
+/// Mirrors Ghostty's title format shown in the CSD header bar.
+fn compute_window_title(state: &TerminalState) -> String {
+    let user = std::env::var("USER").unwrap_or_default();
+    let hostname = glib::host_name().to_string();
+    // Strip domain from hostname (e.g. "totemlabs-lap.local" → "totemlabs-lap")
+    let short_host = hostname.split('.').next().unwrap_or(&hostname);
+
+    if let Some(pid) = state.pty.pid() {
+        let proc_path = format!("/proc/{}/cwd", pid);
+        if let Ok(target) = std::fs::read_link(&proc_path) {
+            let cwd = target.to_string_lossy().to_string();
+            // Replace /home/user with ~
+            let home = std::env::var("HOME").unwrap_or_default();
+            let display_cwd = if !home.is_empty() && cwd.starts_with(&home) {
+                format!("~{}", &cwd[home.len()..])
+            } else {
+                cwd
+            };
+            return format!("{}@{}:{}", user, short_host, display_cwd);
+        }
+    }
+
+    format!("{}@{}", user, short_host)
 }
 
 // ---------------------------------------------------------------------------
@@ -1674,6 +1809,8 @@ fn build_shortcuts_window() -> gtk4::ShortcutsWindow {
     let panes_group = shortcut_group("Panes");
     panes_group.add_shortcut(&shortcut("<Alt><Shift>equal", "Split Right"));
     panes_group.add_shortcut(&shortcut("<Alt><Shift>minus", "Split Down"));
+    panes_group.add_shortcut(&shortcut_no_accel("Split Left", "Via dropdown menu"));
+    panes_group.add_shortcut(&shortcut_no_accel("Split Up", "Via dropdown menu"));
     panes_group.add_shortcut(&shortcut("<Alt>Left", "Focus Pane Left"));
     panes_group.add_shortcut(&shortcut("<Alt>Right", "Focus Pane Right"));
     panes_group.add_shortcut(&shortcut("<Alt>Up", "Focus Pane Up"));
@@ -1732,4 +1869,16 @@ fn shortcut_group(title: &str) -> gtk4::ShortcutsGroup {
 /// Create a single `ShortcutsShortcut` with an accelerator string and title.
 fn shortcut(accel: &str, title: &str) -> gtk4::ShortcutsShortcut {
     gtk4::ShortcutsShortcut::builder().accelerator(accel).title(title).build()
+}
+
+/// Create a `ShortcutsShortcut` without a keyboard accelerator.
+///
+/// Used for actions only accessible via the dropdown menu (Split Left, Split Up).
+fn shortcut_no_accel(title: &str, subtitle: &str) -> gtk4::ShortcutsShortcut {
+    gtk4::ShortcutsShortcut::builder()
+        .title(title)
+        .subtitle(subtitle)
+        .shortcut_type(gtk4::ShortcutType::Accelerator)
+        .accelerator("")
+        .build()
 }
