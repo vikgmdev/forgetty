@@ -96,6 +96,10 @@ pub struct TerminalState {
     pub viewport_offset: u64,
     /// In-terminal search state (Ctrl+Shift+F).
     pub search: SearchState,
+    /// Current font size in points (may differ from config default after zoom).
+    pub font_size: f32,
+    /// The configured default font size, for Ctrl+0 reset.
+    pub default_font_size: f32,
 }
 
 impl TerminalState {
@@ -134,11 +138,14 @@ fn measure_cell(pango_ctx: &pango::Context, font_desc: &pango::FontDescription) 
     (w as f64, h as f64)
 }
 
-/// Build a `pango::FontDescription` from the config.
-fn font_description(config: &Config) -> pango::FontDescription {
+/// Build a `pango::FontDescription` from the config with an explicit size.
+///
+/// Used by `draw_terminal()` and `apply_font_zoom()` so the font size
+/// reflects the current zoom level rather than the static config default.
+fn font_description_with_size(config: &Config, size: f32) -> pango::FontDescription {
     let mut desc = pango::FontDescription::new();
     desc.set_family(&config.font_family);
-    desc.set_size((config.font_size as i32) * pango::SCALE);
+    desc.set_size((size as i32) * pango::SCALE);
     desc
 }
 
@@ -185,6 +192,8 @@ pub fn create_terminal(
         updating_scrollbar: false,
         viewport_offset: 0,
         search: SearchState::default(),
+        font_size: config.font_size,
+        default_font_size: config.font_size,
     }));
 
     // Create DrawingArea
@@ -200,10 +209,9 @@ pub fn create_terminal(
     // --- Draw callback ---
     {
         let state = Rc::clone(&state);
-        let config = config.clone();
         let cell_measured = Rc::clone(&cell_measured);
         drawing_area.set_draw_func(move |da, ctx, width, height| {
-            draw_terminal(da, ctx, width, height, &state, &config, &cell_measured);
+            draw_terminal(da, ctx, width, height, &state, &cell_measured);
         });
     }
 
@@ -1102,6 +1110,25 @@ fn is_app_shortcut(keyval: gdk::Key, modifier: gdk::ModifierType) -> bool {
         return true;
     }
 
+    // Zoom in: Ctrl+= or Ctrl++ (Ctrl+Shift+=)
+    if mods == gdk::ModifierType::CONTROL_MASK
+        && (keyval == gdk::Key::equal || keyval == gdk::Key::plus)
+    {
+        return true;
+    }
+    // Ctrl+Shift+= also arrives with SHIFT set; match that too
+    if mods == ctrl_shift && (keyval == gdk::Key::equal || keyval == gdk::Key::plus) {
+        return true;
+    }
+    // Zoom out: Ctrl+-
+    if mods == gdk::ModifierType::CONTROL_MASK && keyval == gdk::Key::minus {
+        return true;
+    }
+    // Zoom reset: Ctrl+0
+    if mods == gdk::ModifierType::CONTROL_MASK && keyval == gdk::Key::_0 {
+        return true;
+    }
+
     false
 }
 
@@ -1385,6 +1412,44 @@ pub fn toggle_search(da: &DrawingArea, state: &Rc<RefCell<TerminalState>>) {
             }
         }
         da.queue_draw();
+    }
+}
+
+/// Recalculate cell dimensions and grid size after a font size change.
+///
+/// Called after modifying `state.font_size`. Measures the new cell size
+/// via Pango, updates `cell_width`/`cell_height`, recalculates
+/// cols/rows from the current widget pixel size, and resizes both the
+/// VT terminal and the PTY.
+pub fn apply_font_zoom(state: &mut TerminalState, da: &DrawingArea) {
+    let font_desc = font_description_with_size(&state.config, state.font_size);
+    let pango_ctx = da.pango_context();
+    let (cw, ch) = measure_cell(&pango_ctx, &font_desc);
+    if cw < 1.0 || ch < 1.0 {
+        return;
+    }
+    state.cell_width = cw;
+    state.cell_height = ch;
+
+    let width = da.width();
+    let height = da.height();
+    let new_cols = ((width as f64) / cw).max(1.0) as usize;
+    let new_rows = ((height as f64) / ch).max(1.0) as usize;
+
+    state.cols = new_cols;
+    state.rows = new_rows;
+    state.terminal.resize(new_rows, new_cols);
+    state.suppress_selection_clear_ticks = 12;
+    let _ = state.pty.resize(forgetty_pty::PtySize {
+        rows: new_rows as u16,
+        cols: new_cols as u16,
+        pixel_width: width as u16,
+        pixel_height: height as u16,
+    });
+
+    // Recompute search highlights so they render at the new cell dimensions.
+    if !state.search.query.is_empty() {
+        recompute_all_search_matches(state);
     }
 }
 
@@ -1747,7 +1812,6 @@ fn draw_terminal(
     width: i32,
     height: i32,
     state: &Rc<RefCell<TerminalState>>,
-    config: &Config,
     cell_measured: &Rc<RefCell<bool>>,
 ) {
     let Ok(mut s) = state.try_borrow_mut() else {
@@ -1783,8 +1847,8 @@ fn draw_terminal(
     // the viewport offset to map them back to screen-space for drawing.
     let viewport_offset = s.viewport_offset as usize;
 
-    // Build font description
-    let font_desc = font_description(config);
+    // Build font description using the current zoom level
+    let font_desc = font_description_with_size(&s.config, s.font_size);
 
     // Measure cell dimensions from the actual Pango context if not yet done
     if !*cell_measured.borrow() {
