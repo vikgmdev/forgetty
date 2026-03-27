@@ -255,6 +255,17 @@ pub fn create_terminal(
                     s.word_anchor = None;
                 }
 
+                // Invalidate stale search matches when terminal content changes.
+                // Match positions are stored as absolute rows which become wrong
+                // after Ctrl+L (clear) or any output that shifts scrollback.
+                // Without this, ghost highlight rectangles persist over empty cells.
+                if s.search.active && !s.search.all_matches.is_empty() {
+                    s.search.all_matches.clear();
+                    s.search.matches.clear();
+                    s.search.current_index = 0;
+                    s.search.current_viewport_index = None;
+                }
+
                 drop(s);
                 da.queue_draw();
             }
