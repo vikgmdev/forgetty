@@ -9,7 +9,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use forgetty_config::{Config, CursorStyle};
 use forgetty_core::Rgba;
@@ -113,6 +113,13 @@ pub struct TerminalState {
     hover_url: Option<HoverUrl>,
     /// Last cell checked for hover URL (row, col). Avoids re-scanning the same cell on sub-pixel motion.
     last_hover_cell: (usize, usize),
+    /// Current blink phase: true = cursor drawn, false = cursor hidden.
+    pub cursor_blink_visible: bool,
+    /// Timestamp of the last blink phase toggle (or last keypress).
+    pub last_blink_toggle: Instant,
+    /// Whether the terminal was on the alternate screen last tick.
+    /// Used to detect alt→primary transitions and restore blink default.
+    pub was_alternate_screen: bool,
 }
 
 impl TerminalState {
@@ -183,7 +190,13 @@ pub fn create_terminal(
         pty_bridge::spawn_pty_bridge(initial_rows as u16, initial_cols as u16, shell)?;
 
     // Create terminal VT state
-    let terminal = forgetty_vt::Terminal::new(initial_rows, initial_cols);
+    let mut terminal = forgetty_vt::Terminal::new(initial_rows, initial_cols);
+
+    // Set default cursor to "blinking block" (DECSCUSR 1) so that
+    // cursor_blinking() returns true before the shell sends any DECSCUSR.
+    // Without this, the render state defaults cursor_blinking to false and
+    // the cursor wouldn't blink until an app explicitly requests it.
+    terminal.feed(b"\x1b[1 q");
 
     let input = GhosttyInput::new();
 
@@ -209,6 +222,9 @@ pub fn create_terminal(
         default_font_size: config.font_size,
         hover_url: None,
         last_hover_cell: (usize::MAX, usize::MAX),
+        cursor_blink_visible: true,
+        last_blink_toggle: Instant::now(),
+        was_alternate_screen: false,
     }));
 
     // Create DrawingArea
@@ -257,6 +273,16 @@ pub fn create_terminal(
             let was_at_bottom = total <= len || offset + len >= total;
 
             let had_data = s.drain_pty_output();
+
+            // Detect alternate screen → primary screen transitions (e.g., htop exit).
+            // Re-feed DECSCUSR 1 (blinking block) to restore our blink default,
+            // since the alternate screen exit may reset cursor_blinking to false.
+            let is_alt = s.terminal.is_alternate_screen();
+            if s.was_alternate_screen && !is_alt {
+                s.terminal.feed(b"\x1b[1 q");
+            }
+            s.was_alternate_screen = is_alt;
+
             if had_data {
                 // Only auto-scroll to bottom when the user was already at
                 // the bottom. This lets users browse scrollback history
@@ -290,8 +316,26 @@ pub fn create_terminal(
                     s.search.current_viewport_index = None;
                 }
 
+                // Advance blink phase if needed (data path already triggers redraw)
+                let now = Instant::now();
+                if now.duration_since(s.last_blink_toggle) >= Duration::from_millis(600) {
+                    s.cursor_blink_visible = !s.cursor_blink_visible;
+                    s.last_blink_toggle = now;
+                }
+
                 drop(s);
                 da.queue_draw();
+            } else {
+                // No PTY data this tick — check cursor blink timer.
+                // Toggle blink phase every 600ms when the terminal requests blinking.
+                // Only trigger a redraw when the phase actually changes.
+                let now = Instant::now();
+                if now.duration_since(s.last_blink_toggle) >= Duration::from_millis(600) {
+                    s.cursor_blink_visible = !s.cursor_blink_visible;
+                    s.last_blink_toggle = now;
+                    drop(s);
+                    da.queue_draw();
+                }
             }
             glib::ControlFlow::Continue
         });
@@ -339,6 +383,10 @@ pub fn create_terminal(
                     if let Err(e) = s.pty.write(&bytes) {
                         tracing::warn!("Failed to write to PTY: {e}");
                     }
+                    // Reset cursor blink on keypress: make cursor solid and
+                    // restart the blink countdown (AC-2).
+                    s.cursor_blink_visible = true;
+                    s.last_blink_toggle = Instant::now();
                     da_for_key.queue_draw();
                     return glib::Propagation::Stop;
                 }
@@ -1914,11 +1962,33 @@ fn draw_terminal(
     // Clone theme colors up front to avoid borrow conflicts
     let bg_color = s.config.theme.background;
     let fg_color = s.config.theme.foreground;
-    let cursor_color = s.config.theme.cursor;
+    let theme_cursor_color = s.config.theme.cursor;
     let selection_color = s.config.theme.selection;
     let search_match_color = s.config.theme.search_match;
     let search_current_color = s.config.theme.search_current;
-    let cursor_style = s.config.cursor_style;
+
+    // Read cursor visual style from the render state (DECSCUSR).
+    // Map the FFI enum int to CursorStyle; unknown values default to Block.
+    let cursor_style = match s.terminal.cursor_visual_style() {
+        0 => CursorStyle::Bar,         // BAR
+        1 => CursorStyle::Block,       // BLOCK
+        2 => CursorStyle::Underline,   // UNDERLINE
+        3 => CursorStyle::BlockHollow, // BLOCK_HOLLOW
+        _ => CursorStyle::Block,       // fallback for unknown values
+    };
+
+    // Blink logic: cursor_blinking() defaults to true (we feed DECSCUSR 1
+    // at terminal creation). Apps can disable via steady DECSCUSR (2/4/6).
+    // Unfocused panes hide the cursor entirely (see draw_cursor below).
+    let cursor_blinking = s.terminal.cursor_blinking();
+    let pane_has_focus = da.has_focus();
+    let cursor_blink_visible = s.cursor_blink_visible;
+
+    // Prefer terminal-provided cursor color (OSC 12) over theme default.
+    let cursor_color = match s.terminal.cursor_color() {
+        Some((r, g, b)) => Rgba { r, g, b, a: 255 },
+        None => theme_cursor_color,
+    };
 
     // Clone selection state for rendering
     let selection = s.selection.clone();
@@ -2088,7 +2158,18 @@ fn draw_terminal(
     }
 
     // 4. Draw cursor
-    if cursor_visible && cursor_row < num_rows && cursor_col < num_cols {
+    //
+    // Skip drawing when:
+    //   - pane is unfocused (hide cursor entirely in inactive panes)
+    //   - cursor is hidden by the terminal (DECTCEM off)
+    //   - cursor is in the blink "off" phase and the terminal requests blinking
+    let draw_cursor = pane_has_focus
+        && cursor_visible
+        && cursor_row < num_rows
+        && cursor_col < num_cols
+        && (!cursor_blinking || cursor_blink_visible);
+
+    if draw_cursor {
         let cx = cursor_col as f64 * cell_w;
         let cy = cursor_row as f64 * cell_h;
 
@@ -2132,6 +2213,12 @@ fn draw_terminal(
                 ctx.set_line_width(2.0);
                 ctx.move_to(cx, cy + cell_h - 1.0);
                 ctx.line_to(cx + cell_w, cy + cell_h - 1.0);
+                ctx.stroke().ok();
+            }
+            CursorStyle::BlockHollow => {
+                // Outline only — no fill, character remains in normal color
+                ctx.set_line_width(1.0);
+                ctx.rectangle(cx + 0.5, cy + 0.5, cell_w - 1.0, cell_h - 1.0);
                 ctx.stroke().ok();
             }
         }
