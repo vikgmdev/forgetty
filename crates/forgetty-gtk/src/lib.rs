@@ -8,5 +8,6 @@
 pub mod app;
 pub mod clipboard;
 pub mod input;
+pub mod preferences;
 pub mod pty_bridge;
 pub mod terminal;

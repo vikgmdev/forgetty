@@ -76,6 +76,106 @@ fn default_search_current_color() -> Rgba {
     Rgba::new(250, 179, 135, 160) // Brighter orange, more opaque (Catppuccin Peach)
 }
 
+// ---------------------------------------------------------------------------
+// Theme file parsing — matches the `[colors]` / `[colors.ansi]` / `[colors.bright]` format
+// ---------------------------------------------------------------------------
+
+/// Named ANSI colors (indices 0-7).
+#[derive(Debug, Clone, Deserialize)]
+struct AnsiColors {
+    black: Rgba,
+    red: Rgba,
+    green: Rgba,
+    yellow: Rgba,
+    blue: Rgba,
+    magenta: Rgba,
+    cyan: Rgba,
+    white: Rgba,
+}
+
+/// Named bright colors (indices 8-15).
+#[derive(Debug, Clone, Deserialize)]
+struct BrightColors {
+    black: Rgba,
+    red: Rgba,
+    green: Rgba,
+    yellow: Rgba,
+    blue: Rgba,
+    magenta: Rgba,
+    cyan: Rgba,
+    white: Rgba,
+}
+
+/// The `[colors]` table in a theme TOML file.
+#[derive(Debug, Clone, Deserialize)]
+struct ThemeColors {
+    foreground: Rgba,
+    background: Rgba,
+    cursor: Option<Rgba>,
+    selection: Option<Rgba>,
+    ansi: Option<AnsiColors>,
+    bright: Option<BrightColors>,
+}
+
+/// Top-level structure of a `.toml` theme file.
+#[derive(Debug, Clone, Deserialize)]
+struct ThemeFile {
+    colors: ThemeColors,
+}
+
+impl ThemeFile {
+    fn into_theme(self) -> Theme {
+        let c = self.colors;
+
+        let default = default_ansi_colors();
+
+        let ansi_normal: [Rgba; 8] = match c.ansi {
+            Some(a) => [a.black, a.red, a.green, a.yellow, a.blue, a.magenta, a.cyan, a.white],
+            None => [
+                default[0], default[1], default[2], default[3], default[4], default[5], default[6],
+                default[7],
+            ],
+        };
+
+        let ansi_bright: [Rgba; 8] = match c.bright {
+            Some(b) => [b.black, b.red, b.green, b.yellow, b.blue, b.magenta, b.cyan, b.white],
+            None => [
+                default[8],
+                default[9],
+                default[10],
+                default[11],
+                default[12],
+                default[13],
+                default[14],
+                default[15],
+            ],
+        };
+
+        let mut ansi_colors = [Rgba::rgb(0, 0, 0); 16];
+        ansi_colors[..8].copy_from_slice(&ansi_normal);
+        ansi_colors[8..].copy_from_slice(&ansi_bright);
+
+        Theme {
+            ansi_colors,
+            foreground: c.foreground,
+            background: c.background,
+            cursor: c.cursor.unwrap_or_else(default_cursor_color),
+            selection: c.selection.unwrap_or_else(default_selection_color),
+            search_match: default_search_match_color(),
+            search_current: default_search_current_color(),
+        }
+    }
+}
+
+/// Parse a theme from a `.toml` file's contents (the `[colors]` file format).
+///
+/// This is the public entry point used by the preferences UI and anywhere else
+/// that needs to load bundled or user-provided theme files.
+pub fn parse_theme_file(contents: &str) -> Result<Theme, toml::de::Error> {
+    let tf: ThemeFile = toml::from_str(contents)?;
+    Ok(tf.into_theme())
+}
+
 /// Returns the default ANSI 16-color palette (Catppuccin Mocha).
 fn default_ansi_colors() -> [Rgba; 16] {
     [

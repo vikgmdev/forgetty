@@ -1084,6 +1084,7 @@ dependencies = [
  "gtk4",
  "libadwaita",
  "pangocairo",
+ "toml 0.8.2",
  "tracing",
 ]
 

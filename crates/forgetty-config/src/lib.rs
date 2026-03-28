@@ -8,6 +8,6 @@ pub mod loader;
 pub mod schema;
 pub mod theme;
 
-pub use loader::load_config;
+pub use loader::{load_config, save_config};
 pub use schema::{BellMode, Config, CursorStyle};
-pub use theme::Theme;
+pub use theme::{parse_theme_file, Theme};

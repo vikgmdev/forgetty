@@ -1308,6 +1308,11 @@ fn is_app_shortcut(keyval: gdk::Key, modifier: gdk::ModifierType) -> bool {
         return true;
     }
 
+    // Appearance sidebar: Ctrl+,
+    if mods == gdk::ModifierType::CONTROL_MASK && keyval == gdk::Key::comma {
+        return true;
+    }
+
     // Shortcuts window: F1 (no modifiers)
     if mods.is_empty() && keyval == gdk::Key::F1 {
         return true;

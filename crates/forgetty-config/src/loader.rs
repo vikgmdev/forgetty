@@ -1,7 +1,8 @@
-//! Configuration file loading and parsing.
+//! Configuration file loading, parsing, and saving.
 //!
 //! Handles locating the configuration file on disk, reading it,
-//! and deserializing it into a `Config` struct.
+//! deserializing it into a `Config` struct, and writing updated
+//! configuration back to disk.
 
 use std::path::Path;
 
@@ -45,4 +46,31 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
 
     tracing::info!("Loaded config from {}", config_path.display());
     Ok(config)
+}
+
+/// Saves the configuration to `~/.config/forgetty/config.toml`.
+///
+/// Creates the config directory if it does not exist. Uses an atomic
+/// write pattern (write to temp file, then rename) to prevent partial
+/// writes from confusing the `ConfigWatcher`.
+pub fn save_config(config: &Config) -> Result<()> {
+    let config_dir = forgetty_core::platform::config_dir();
+    let config_path = config_dir.join("config.toml");
+
+    // Ensure the config directory exists.
+    if !config_dir.exists() {
+        std::fs::create_dir_all(&config_dir)?;
+    }
+
+    let toml_string = toml::to_string_pretty(config).map_err(|e| {
+        forgetty_core::ForgettyError::Config(format!("Failed to serialize config: {}", e))
+    })?;
+
+    // Atomic write: write to a temp file in the same directory, then rename.
+    let tmp_path = config_dir.join("config.toml.tmp");
+    std::fs::write(&tmp_path, &toml_string)?;
+    std::fs::rename(&tmp_path, &config_path)?;
+
+    tracing::info!("Saved config to {}", config_path.display());
+    Ok(())
 }
