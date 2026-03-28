@@ -1,0 +1,27 @@
+name = "Belafonte Night"
+
+[colors]
+foreground = "#968c83"
+background = "#20111b"
+cursor = "#968c83"
+selection = "#45373c"
+
+[colors.ansi]
+black = "#20111b"
+red = "#be100e"
+green = "#858162"
+yellow = "#eaa549"
+blue = "#426a79"
+magenta = "#97522c"
+cyan = "#989a9c"
+white = "#968c83"
+
+[colors.bright]
+black = "#5e5252"
+red = "#be100e"
+green = "#858162"
+yellow = "#eaa549"
+blue = "#426a79"
+magenta = "#97522c"
+cyan = "#989a9c"
+white = "#d5ccba"

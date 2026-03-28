@@ -1,0 +1,27 @@
+name = "IC Orange PPL"
+
+[colors]
+foreground = "#ffcb83"
+background = "#262626"
+cursor = "#fc531d"
+selection = "#c14020"
+
+[colors.ansi]
+black = "#000000"
+red = "#c13900"
+green = "#a4a900"
+yellow = "#caaf00"
+blue = "#bd6d00"
+magenta = "#fc5e00"
+cyan = "#f79500"
+white = "#ffc88a"
+
+[colors.bright]
+black = "#6a4f2a"
+red = "#ff8c68"
+green = "#f6ff40"
+yellow = "#ffe36e"
+blue = "#ffbe55"
+magenta = "#fc874f"
+cyan = "#c69752"
+white = "#fafaff"

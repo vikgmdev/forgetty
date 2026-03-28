@@ -1,0 +1,27 @@
+name = "Blazer"
+
+[colors]
+foreground = "#d9e6f2"
+background = "#0d1926"
+cursor = "#d9e6f2"
+selection = "#c1ddff"
+
+[colors.ansi]
+black = "#000000"
+red = "#b87a7a"
+green = "#7ab87a"
+yellow = "#b8b87a"
+blue = "#7a7ab8"
+magenta = "#b87ab8"
+cyan = "#7ab8b8"
+white = "#d9d9d9"
+
+[colors.bright]
+black = "#262626"
+red = "#dbbdbd"
+green = "#bddbbd"
+yellow = "#dbdbbd"
+blue = "#bdbddb"
+magenta = "#dbbddb"
+cyan = "#bddbdb"
+white = "#ffffff"

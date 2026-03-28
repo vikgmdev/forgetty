@@ -1,0 +1,27 @@
+name = "Wombat"
+
+[colors]
+foreground = "#dedacf"
+background = "#171717"
+cursor = "#bbbbbb"
+selection = "#453b39"
+
+[colors.ansi]
+black = "#000000"
+red = "#ff615a"
+green = "#b1e969"
+yellow = "#ebd99c"
+blue = "#5da9f6"
+magenta = "#e86aff"
+cyan = "#82fff7"
+white = "#dedacf"
+
+[colors.bright]
+black = "#313131"
+red = "#f58c80"
+green = "#ddf88f"
+yellow = "#eee5b2"
+blue = "#a5c7ff"
+magenta = "#ddaaff"
+cyan = "#b7fff9"
+white = "#ffffff"

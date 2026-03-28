@@ -1,0 +1,27 @@
+name = "Popping And Locking"
+
+[colors]
+foreground = "#ebdbb2"
+background = "#181921"
+cursor = "#c7c7c7"
+selection = "#ebdbb2"
+
+[colors.ansi]
+black = "#1d2021"
+red = "#cc241d"
+green = "#98971a"
+yellow = "#d79921"
+blue = "#458588"
+magenta = "#b16286"
+cyan = "#689d6a"
+white = "#a89984"
+
+[colors.bright]
+black = "#928374"
+red = "#f42c3e"
+green = "#b8bb26"
+yellow = "#fabd2f"
+blue = "#99c6ca"
+magenta = "#d3869b"
+cyan = "#7ec16e"
+white = "#ebdbb2"

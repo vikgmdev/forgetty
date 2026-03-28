@@ -1,0 +1,27 @@
+name = "Tomorrow Night Eighties"
+
+[colors]
+foreground = "#cccccc"
+background = "#2d2d2d"
+cursor = "#cccccc"
+selection = "#515151"
+
+[colors.ansi]
+black = "#000000"
+red = "#f2777a"
+green = "#99cc99"
+yellow = "#ffcc66"
+blue = "#6699cc"
+magenta = "#cc99cc"
+cyan = "#66cccc"
+white = "#ffffff"
+
+[colors.bright]
+black = "#000000"
+red = "#f2777a"
+green = "#99cc99"
+yellow = "#ffcc66"
+blue = "#6699cc"
+magenta = "#cc99cc"
+cyan = "#66cccc"
+white = "#ffffff"

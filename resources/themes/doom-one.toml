@@ -1,0 +1,27 @@
+name = "Doom One"
+
+[colors]
+foreground = "#bbc2cf"
+background = "#282c34"
+cursor = "#51afef"
+selection = "#42444b"
+
+[colors.ansi]
+black = "#000000"
+red = "#ff6c6b"
+green = "#98be65"
+yellow = "#ecbe7b"
+blue = "#a9a1e1"
+magenta = "#c678dd"
+cyan = "#51afef"
+white = "#bbc2cf"
+
+[colors.bright]
+black = "#000000"
+red = "#ff6655"
+green = "#99bb66"
+yellow = "#ecbe7b"
+blue = "#a9a1e1"
+magenta = "#c678dd"
+cyan = "#51afef"
+white = "#bfbfbf"

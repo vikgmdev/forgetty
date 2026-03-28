@@ -1,0 +1,27 @@
+name = "Matte Black"
+
+[colors]
+foreground = "#bebebe"
+background = "#121212"
+cursor = "#eaeaea"
+selection = "#333333"
+
+[colors.ansi]
+black = "#333333"
+red = "#d35f5f"
+green = "#ffc107"
+yellow = "#b91c1c"
+blue = "#e68e0d"
+magenta = "#d35f5f"
+cyan = "#bebebe"
+white = "#bebebe"
+
+[colors.bright]
+black = "#8a8a8d"
+red = "#891c1c"
+green = "#ffc107"
+yellow = "#b90a0a"
+blue = "#f59e0b"
+magenta = "#b91c1c"
+cyan = "#eaeaea"
+white = "#ffffff"

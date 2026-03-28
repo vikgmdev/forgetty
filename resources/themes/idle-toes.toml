@@ -1,0 +1,27 @@
+name = "Idle Toes"
+
+[colors]
+foreground = "#ffffff"
+background = "#323232"
+cursor = "#d6d6d6"
+selection = "#5b5b5b"
+
+[colors.ansi]
+black = "#323232"
+red = "#d25252"
+green = "#7fe173"
+yellow = "#ffc66d"
+blue = "#4099ff"
+magenta = "#f680ff"
+cyan = "#bed6ff"
+white = "#eeeeec"
+
+[colors.bright]
+black = "#535353"
+red = "#f07070"
+green = "#9dff91"
+yellow = "#ffe48b"
+blue = "#5eb7f7"
+magenta = "#ff9dff"
+cyan = "#dcf4ff"
+white = "#ffffff"

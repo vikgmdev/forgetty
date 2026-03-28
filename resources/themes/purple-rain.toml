@@ -1,0 +1,27 @@
+name = "Purple Rain"
+
+[colors]
+foreground = "#fffbf6"
+background = "#21084a"
+cursor = "#ff271d"
+selection = "#287691"
+
+[colors.ansi]
+black = "#000000"
+red = "#ff260e"
+green = "#9be205"
+yellow = "#ffc400"
+blue = "#00a2fa"
+magenta = "#815bb5"
+cyan = "#00deef"
+white = "#ffffff"
+
+[colors.bright]
+black = "#565656"
+red = "#ff4250"
+green = "#b8e36e"
+yellow = "#ffd852"
+blue = "#00a6ff"
+magenta = "#ac7bf0"
+cyan = "#74fdf3"
+white = "#ffffff"

@@ -1,0 +1,27 @@
+name = "Crayon Pony Fish"
+
+[colors]
+foreground = "#68525a"
+background = "#150707"
+cursor = "#68525a"
+selection = "#2b1b1d"
+
+[colors.ansi]
+black = "#2b1b1d"
+red = "#91002b"
+green = "#579524"
+yellow = "#ab311b"
+blue = "#8c87b0"
+magenta = "#692f50"
+cyan = "#e8a866"
+white = "#68525a"
+
+[colors.bright]
+black = "#3d2b2e"
+red = "#c5255d"
+green = "#8dff57"
+yellow = "#c8381d"
+blue = "#cfc9ff"
+magenta = "#fc6cba"
+cyan = "#ffceaf"
+white = "#b0949d"

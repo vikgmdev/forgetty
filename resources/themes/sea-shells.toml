@@ -1,0 +1,27 @@
+name = "Sea Shells"
+
+[colors]
+foreground = "#deb88d"
+background = "#09141b"
+cursor = "#fca02f"
+selection = "#1e4962"
+
+[colors.ansi]
+black = "#17384c"
+red = "#d15123"
+green = "#027c9b"
+yellow = "#fca02f"
+blue = "#1e4950"
+magenta = "#68d4f1"
+cyan = "#50a3b5"
+white = "#deb88d"
+
+[colors.bright]
+black = "#434b53"
+red = "#d48678"
+green = "#628d98"
+yellow = "#fdd39f"
+blue = "#1bbcdd"
+magenta = "#bbe3ee"
+cyan = "#87acb4"
+white = "#fee4ce"

@@ -1,0 +1,27 @@
+name = "Man Page"
+
+[colors]
+foreground = "#000000"
+background = "#fef49c"
+cursor = "#7f7f7f"
+selection = "#a4c9cd"
+
+[colors.ansi]
+black = "#000000"
+red = "#cc0000"
+green = "#00a600"
+yellow = "#999900"
+blue = "#0000b2"
+magenta = "#b200b2"
+cyan = "#00a6b2"
+white = "#cccccc"
+
+[colors.bright]
+black = "#666666"
+red = "#e50000"
+green = "#00d900"
+yellow = "#e5e500"
+blue = "#0000ff"
+magenta = "#e500e5"
+cyan = "#00e5e5"
+white = "#e5e5e5"

@@ -1,0 +1,27 @@
+name = "Xcode Light hc"
+
+[colors]
+foreground = "#000000"
+background = "#ffffff"
+cursor = "#000000"
+selection = "#b4d8fd"
+
+[colors.ansi]
+black = "#b4d8fd"
+red = "#ad1805"
+green = "#355d61"
+yellow = "#78492a"
+blue = "#0058a1"
+magenta = "#9c2191"
+cyan = "#703daa"
+white = "#000000"
+
+[colors.bright]
+black = "#8a99a6"
+red = "#ad1805"
+green = "#174145"
+yellow = "#78492a"
+blue = "#003f73"
+magenta = "#9c2191"
+cyan = "#441ea1"
+white = "#000000"

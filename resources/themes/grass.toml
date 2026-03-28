@@ -1,0 +1,27 @@
+name = "Grass"
+
+[colors]
+foreground = "#fff0a5"
+background = "#13773d"
+cursor = "#8c2800"
+selection = "#b64926"
+
+[colors.ansi]
+black = "#000000"
+red = "#bb0000"
+green = "#00bb00"
+yellow = "#e7b000"
+blue = "#0000a3"
+magenta = "#950062"
+cyan = "#00bbbb"
+white = "#bbbbbb"
+
+[colors.bright]
+black = "#555555"
+red = "#bb0000"
+green = "#00bb00"
+yellow = "#e7b000"
+blue = "#0000bb"
+magenta = "#ff55ff"
+cyan = "#55ffff"
+white = "#ffffff"

@@ -1,0 +1,27 @@
+name = "urban"
+
+[colors]
+foreground = "#bca89c"
+background = "#302e38"
+cursor = "#bca89c"
+selection = "#bca89c"
+
+[colors.ansi]
+black = "#32303a"
+red = "#7e444f"
+green = "#7a9256"
+yellow = "#a78560"
+blue = "#5f5770"
+magenta = "#704156"
+cyan = "#534856"
+white = "#bca89c"
+
+[colors.bright]
+black = "#4e4b57"
+red = "#7e444f"
+green = "#7a9256"
+yellow = "#a78560"
+blue = "#5f5770"
+magenta = "#704156"
+cyan = "#534856"
+white = "#bca89c"

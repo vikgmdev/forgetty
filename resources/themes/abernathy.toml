@@ -1,0 +1,27 @@
+name = "Abernathy"
+
+[colors]
+foreground = "#eeeeec"
+background = "#111416"
+cursor = "#bbbbbb"
+selection = "#eeeeec"
+
+[colors.ansi]
+black = "#000000"
+red = "#cd0000"
+green = "#00cd00"
+yellow = "#cdcd00"
+blue = "#1093f5"
+magenta = "#cd00cd"
+cyan = "#00cdcd"
+white = "#faebd7"
+
+[colors.bright]
+black = "#404040"
+red = "#ff0000"
+green = "#00ff00"
+yellow = "#ffff00"
+blue = "#11b5f6"
+magenta = "#ff00ff"
+cyan = "#00ffff"
+white = "#ffffff"

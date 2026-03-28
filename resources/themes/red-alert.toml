@@ -1,0 +1,27 @@
+name = "Red Alert"
+
+[colors]
+foreground = "#ffffff"
+background = "#762423"
+cursor = "#ffffff"
+selection = "#073642"
+
+[colors.ansi]
+black = "#000000"
+red = "#d62e4e"
+green = "#71be6b"
+yellow = "#beb86b"
+blue = "#489bee"
+magenta = "#e979d7"
+cyan = "#6bbeb8"
+white = "#d6d6d6"
+
+[colors.bright]
+black = "#262626"
+red = "#e02553"
+green = "#aff08c"
+yellow = "#dfddb7"
+blue = "#65aaf1"
+magenta = "#ddb7df"
+cyan = "#b7dfdd"
+white = "#ffffff"

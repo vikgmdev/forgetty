@@ -1,0 +1,27 @@
+name = "Oceanic Next"
+
+[colors]
+foreground = "#c1c5cd"
+background = "#1b2b34"
+cursor = "#c1c5cd"
+selection = "#515b65"
+
+[colors.ansi]
+black = "#1b2b34"
+red = "#db686b"
+green = "#a2c699"
+yellow = "#f2ca73"
+blue = "#7198c8"
+magenta = "#bd96c2"
+cyan = "#74b1b2"
+white = "#ffffff"
+
+[colors.bright]
+black = "#68737d"
+red = "#db686b"
+green = "#a2c699"
+yellow = "#f2ca73"
+blue = "#7198c8"
+magenta = "#bd96c2"
+cyan = "#74b1b2"
+white = "#ffffff"

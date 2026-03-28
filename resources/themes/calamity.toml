@@ -1,0 +1,27 @@
+name = "Calamity"
+
+[colors]
+foreground = "#d5ced9"
+background = "#2f2833"
+cursor = "#d5ced9"
+selection = "#7e6c88"
+
+[colors.ansi]
+black = "#2f2833"
+red = "#fc644d"
+green = "#a5f69c"
+yellow = "#e9d7a5"
+blue = "#3b79c7"
+magenta = "#f92672"
+cyan = "#74d3de"
+white = "#d5ced9"
+
+[colors.bright]
+black = "#7e6c88"
+red = "#fc644d"
+green = "#a5f69c"
+yellow = "#e9d7a5"
+blue = "#3b79c7"
+magenta = "#f92672"
+cyan = "#74d3de"
+white = "#ffffff"

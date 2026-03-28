@@ -1,0 +1,27 @@
+name = "Phala Green Dark"
+
+[colors]
+foreground = "#cdfa50"
+background = "#000000"
+cursor = "#cdfa50"
+selection = "#1c4611"
+
+[colors.ansi]
+black = "#000000"
+red = "#9d2814"
+green = "#4aae31"
+yellow = "#a9a733"
+blue = "#0c23b8"
+magenta = "#b23bba"
+cyan = "#4bb1bd"
+white = "#cbcbcb"
+
+[colors.bright]
+black = "#797979"
+red = "#da3b20"
+green = "#5dd83f"
+yellow = "#e9e74a"
+blue = "#1432f5"
+magenta = "#da4be3"
+cyan = "#64e5e8"
+white = "#eaeaea"

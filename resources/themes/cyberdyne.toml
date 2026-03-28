@@ -1,0 +1,27 @@
+name = "Cyberdyne"
+
+[colors]
+foreground = "#00ff92"
+background = "#151144"
+cursor = "#00ff9c"
+selection = "#454d96"
+
+[colors.ansi]
+black = "#080808"
+red = "#ff8373"
+green = "#00c172"
+yellow = "#d2a700"
+blue = "#0071cf"
+magenta = "#ff90fe"
+cyan = "#6bffdd"
+white = "#f1f1f1"
+
+[colors.bright]
+black = "#2e2e2e"
+red = "#ffc4be"
+green = "#d6fcba"
+yellow = "#fffed5"
+blue = "#c2e3ff"
+magenta = "#ffb2fe"
+cyan = "#e6e7fe"
+white = "#ffffff"

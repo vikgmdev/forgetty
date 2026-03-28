@@ -1,0 +1,27 @@
+name = "Scarlet Protocol"
+
+[colors]
+foreground = "#e41951"
+background = "#1c153d"
+cursor = "#76ff9f"
+selection = "#c1deff"
+
+[colors.ansi]
+black = "#101116"
+red = "#ff0051"
+green = "#00dc84"
+yellow = "#faf945"
+blue = "#0271b6"
+magenta = "#ca30c7"
+cyan = "#00c5c7"
+white = "#c7c7c7"
+
+[colors.bright]
+black = "#686868"
+red = "#ff6e67"
+green = "#5ffa68"
+yellow = "#fffc67"
+blue = "#6871ff"
+magenta = "#bd35ec"
+cyan = "#60fdff"
+white = "#ffffff"

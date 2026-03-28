@@ -1,0 +1,27 @@
+name = "Sublette"
+
+[colors]
+foreground = "#ccced0"
+background = "#202535"
+cursor = "#ccced0"
+selection = "#ccced0"
+
+[colors.ansi]
+black = "#253045"
+red = "#ee5577"
+green = "#55ee77"
+yellow = "#ffdd88"
+blue = "#5588ff"
+magenta = "#ff77cc"
+cyan = "#44eeee"
+white = "#f5f5da"
+
+[colors.bright]
+black = "#405570"
+red = "#ee6655"
+green = "#99ee77"
+yellow = "#ffff77"
+blue = "#77bbff"
+magenta = "#aa88ff"
+cyan = "#55ffbb"
+white = "#ffffee"

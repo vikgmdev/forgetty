@@ -1,0 +1,27 @@
+name = "Ultra Violent"
+
+[colors]
+foreground = "#c1c1c1"
+background = "#242728"
+cursor = "#c1c1c1"
+selection = "#574c49"
+
+[colors.ansi]
+black = "#242728"
+red = "#ff0090"
+green = "#b6ff00"
+yellow = "#fff727"
+blue = "#47e0fb"
+magenta = "#d731ff"
+cyan = "#0effbb"
+white = "#e1e1e1"
+
+[colors.bright]
+black = "#636667"
+red = "#fb58b4"
+green = "#deff8c"
+yellow = "#ebe087"
+blue = "#7fecff"
+magenta = "#e681ff"
+cyan = "#69fcd3"
+white = "#f9f9f5"

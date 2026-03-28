@@ -1,0 +1,27 @@
+name = "Bluloco Dark"
+
+[colors]
+foreground = "#b9c0cb"
+background = "#282c34"
+cursor = "#ffcc00"
+selection = "#b9c0ca"
+
+[colors.ansi]
+black = "#41444d"
+red = "#fc2f52"
+green = "#25a45c"
+yellow = "#ff936a"
+blue = "#3476ff"
+magenta = "#7a82da"
+cyan = "#4483aa"
+white = "#cdd4e0"
+
+[colors.bright]
+black = "#8f9aae"
+red = "#ff6480"
+green = "#3fc56b"
+yellow = "#f9c859"
+blue = "#10b1fe"
+magenta = "#ff78f8"
+cyan = "#5fb9bc"
+white = "#ffffff"

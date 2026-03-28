@@ -1,0 +1,27 @@
+name = "Raycast Light"
+
+[colors]
+foreground = "#000000"
+background = "#ffffff"
+cursor = "#000000"
+selection = "#e5e5e5"
+
+[colors.ansi]
+black = "#000000"
+red = "#b12424"
+green = "#006b4f"
+yellow = "#f8a300"
+blue = "#138af2"
+magenta = "#9a1b6e"
+cyan = "#3eb8bf"
+white = "#ffffff"
+
+[colors.bright]
+black = "#000000"
+red = "#b12424"
+green = "#006b4f"
+yellow = "#f8a300"
+blue = "#138af2"
+magenta = "#9a1b6e"
+cyan = "#3eb8bf"
+white = "#ffffff"

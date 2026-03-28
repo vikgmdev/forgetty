@@ -1,0 +1,27 @@
+name = "Django"
+
+[colors]
+foreground = "#f8f8f8"
+background = "#0b2f20"
+cursor = "#336442"
+selection = "#245032"
+
+[colors.ansi]
+black = "#000000"
+red = "#fd6209"
+green = "#41a83e"
+yellow = "#ffe862"
+blue = "#245032"
+magenta = "#f8f8f8"
+cyan = "#9df39f"
+white = "#ffffff"
+
+[colors.bright]
+black = "#323232"
+red = "#ff943b"
+green = "#73da70"
+yellow = "#ffff94"
+blue = "#568264"
+magenta = "#ffffff"
+cyan = "#cfffd1"
+white = "#ffffff"

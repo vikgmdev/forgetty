@@ -1,0 +1,27 @@
+name = "Solarized Osaka Night"
+
+[colors]
+foreground = "#c2caf1"
+background = "#1a1b25"
+cursor = "#c2caf1"
+selection = "#2a3454"
+
+[colors.ansi]
+black = "#15161d"
+red = "#e77d8f"
+green = "#a8cd76"
+yellow = "#d8b172"
+blue = "#82a1f1"
+magenta = "#b69bf1"
+cyan = "#90cdfa"
+white = "#aab1d3"
+
+[colors.bright]
+black = "#424866"
+red = "#e77d8f"
+green = "#a8cd76"
+yellow = "#d8b172"
+blue = "#82a1f1"
+magenta = "#b69bf1"
+cyan = "#90cdfa"
+white = "#c2caf1"

@@ -1,0 +1,27 @@
+name = "N0Tch2K"
+
+[colors]
+foreground = "#a0a0a0"
+background = "#222222"
+cursor = "#aa9175"
+selection = "#4d4d4d"
+
+[colors.ansi]
+black = "#383838"
+red = "#a95551"
+green = "#666666"
+yellow = "#a98051"
+blue = "#657d3e"
+magenta = "#767676"
+cyan = "#c9c9c9"
+white = "#d0b8a3"
+
+[colors.bright]
+black = "#474747"
+red = "#a97775"
+green = "#8c8c8c"
+yellow = "#a99175"
+blue = "#98bd5e"
+magenta = "#a3a3a3"
+cyan = "#dcdcdc"
+white = "#d8c8bb"

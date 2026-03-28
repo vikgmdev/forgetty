@@ -1,0 +1,27 @@
+name = "branch"
+
+[colors]
+foreground = "#cdc1ac"
+background = "#30231b"
+cursor = "#cdc1ac"
+selection = "#cdc1ac"
+
+[colors.ansi]
+black = "#32251d"
+red = "#b55c38"
+green = "#99a667"
+yellow = "#ca9d64"
+blue = "#528c8b"
+magenta = "#ba8161"
+cyan = "#6f9990"
+white = "#cdc1ac"
+
+[colors.bright]
+black = "#544a46"
+red = "#b55c38"
+green = "#99a667"
+yellow = "#ca9d64"
+blue = "#528c8b"
+magenta = "#ba8161"
+cyan = "#6f9990"
+white = "#cdc1ac"

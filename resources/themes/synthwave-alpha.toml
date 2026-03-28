@@ -1,0 +1,27 @@
+name = "Synthwave Alpha"
+
+[colors]
+foreground = "#f2f2e3"
+background = "#241b30"
+cursor = "#f2f2e3"
+selection = "#6e29ad"
+
+[colors.ansi]
+black = "#241b30"
+red = "#e60a70"
+green = "#00986c"
+yellow = "#adad3e"
+blue = "#6e29ad"
+magenta = "#b300ad"
+cyan = "#00b0b1"
+white = "#b9b1bc"
+
+[colors.bright]
+black = "#7f7094"
+red = "#e60a70"
+green = "#0ae4a4"
+yellow = "#f9f972"
+blue = "#aa54f9"
+magenta = "#ff00f6"
+cyan = "#00fbfd"
+white = "#f2f2e3"

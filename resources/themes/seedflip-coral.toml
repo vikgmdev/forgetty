@@ -1,0 +1,27 @@
+name = "SeedFlip Coral"
+
+[colors]
+foreground = "#1d1d1d"
+background = "#ffffff"
+cursor = "#f24e1e"
+selection = "#f5f5f5"
+
+[colors.ansi]
+black = "#d9d9d9"
+red = "#bd0f0f"
+green = "#0fbd49"
+yellow = "#bda00f"
+blue = "#0f58bd"
+magenta = "#bd0fbd"
+cyan = "#0fbdbd"
+white = "#101010"
+
+[colors.bright]
+black = "#b3b3b3"
+red = "#ee2b2b"
+green = "#12d452"
+yellow = "#e1c01e"
+blue = "#2b7cee"
+magenta = "#ee2bee"
+cyan = "#12d4d4"
+white = "#1d1d1d"

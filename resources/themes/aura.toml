@@ -1,0 +1,27 @@
+name = "Aura"
+
+[colors]
+foreground = "#edecee"
+background = "#15141b"
+cursor = "#a277ff"
+selection = "#a277ff"
+
+[colors.ansi]
+black = "#110f18"
+red = "#ff6767"
+green = "#61ffca"
+yellow = "#ffca85"
+blue = "#a277ff"
+magenta = "#a277ff"
+cyan = "#61ffca"
+white = "#edecee"
+
+[colors.bright]
+black = "#4d4d4d"
+red = "#ffca85"
+green = "#a277ff"
+yellow = "#ffca85"
+blue = "#a277ff"
+magenta = "#a277ff"
+cyan = "#61ffca"
+white = "#edecee"

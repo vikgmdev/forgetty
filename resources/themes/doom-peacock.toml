@@ -1,0 +1,27 @@
+name = "Doom Peacock"
+
+[colors]
+foreground = "#ede0ce"
+background = "#2b2a27"
+cursor = "#9c9c9d"
+selection = "#a60033"
+
+[colors.ansi]
+black = "#1c1f24"
+red = "#cb4b16"
+green = "#26a6a6"
+yellow = "#bcd42a"
+blue = "#2a6cc6"
+magenta = "#a9a1e1"
+cyan = "#5699af"
+white = "#ede0ce"
+
+[colors.bright]
+black = "#2b2a27"
+red = "#ff5d38"
+green = "#98be65"
+yellow = "#e6f972"
+blue = "#51afef"
+magenta = "#c678dd"
+cyan = "#46d9ff"
+white = "#dfdfdf"

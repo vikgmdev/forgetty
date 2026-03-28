@@ -1,0 +1,27 @@
+name = "Aizen Light"
+
+[colors]
+foreground = "#4a4d66"
+background = "#f0f2f6"
+cursor = "#fc6008"
+selection = "#bdc2cc"
+
+[colors.ansi]
+black = "#f0f2f6"
+red = "#d00c36"
+green = "#3e9e28"
+yellow = "#dd8c1a"
+blue = "#1c64f2"
+magenta = "#8636ec"
+cyan = "#159096"
+white = "#4a4d66"
+
+[colors.bright]
+black = "#adb2bc"
+red = "#d00c36"
+green = "#3e9e28"
+yellow = "#dd8c1a"
+blue = "#1c64f2"
+magenta = "#8636ec"
+cyan = "#159096"
+white = "#4a4d66"

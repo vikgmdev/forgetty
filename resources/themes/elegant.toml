@@ -1,0 +1,27 @@
+name = "Elegant"
+
+[colors]
+foreground = "#cfd2d6"
+background = "#292b31"
+cursor = "#55bbf9"
+selection = "#d5d5d5"
+
+[colors.ansi]
+black = "#0c1221"
+red = "#ea335b"
+green = "#95ca9a"
+yellow = "#f7cd94"
+blue = "#93aadd"
+magenta = "#bf94e5"
+cyan = "#8ccaec"
+white = "#ffffff"
+
+[colors.bright]
+black = "#575656"
+red = "#ea335b"
+green = "#95ca9a"
+yellow = "#f7cd94"
+blue = "#93aadd"
+magenta = "#bf94e5"
+cyan = "#5faae9"
+white = "#ffffff"

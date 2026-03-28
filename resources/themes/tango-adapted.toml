@@ -1,0 +1,27 @@
+name = "Tango Adapted"
+
+[colors]
+foreground = "#000000"
+background = "#ffffff"
+cursor = "#000000"
+selection = "#c1deff"
+
+[colors.ansi]
+black = "#000000"
+red = "#ff0000"
+green = "#59d600"
+yellow = "#f0cb00"
+blue = "#00a2ff"
+magenta = "#c17ecc"
+cyan = "#00d0d6"
+white = "#e6ebe1"
+
+[colors.bright]
+black = "#8f928b"
+red = "#ff0013"
+green = "#93ff00"
+yellow = "#fff121"
+blue = "#88c9ff"
+magenta = "#e9a7e1"
+cyan = "#00feff"
+white = "#f6f6f4"

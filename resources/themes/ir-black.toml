@@ -1,0 +1,27 @@
+name = "IR Black"
+
+[colors]
+foreground = "#f1f1f1"
+background = "#000000"
+cursor = "#808080"
+selection = "#b5d5ff"
+
+[colors.ansi]
+black = "#4f4f4f"
+red = "#fa6c60"
+green = "#a8ff60"
+yellow = "#fffeb7"
+blue = "#96cafe"
+magenta = "#fa73fd"
+cyan = "#c6c5fe"
+white = "#efedef"
+
+[colors.bright]
+black = "#7b7b7b"
+red = "#fcb6b0"
+green = "#cfffab"
+yellow = "#ffffcc"
+blue = "#b5dcff"
+magenta = "#fb9cfe"
+cyan = "#e0e0fe"
+white = "#ffffff"

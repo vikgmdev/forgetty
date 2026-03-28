@@ -1,0 +1,27 @@
+name = "HaX0R Blue"
+
+[colors]
+foreground = "#11b7ff"
+background = "#010515"
+cursor = "#10b6ff"
+selection = "#c1e4ff"
+
+[colors.ansi]
+black = "#010921"
+red = "#10b6ff"
+green = "#10b6ff"
+yellow = "#10b6ff"
+blue = "#10b6ff"
+magenta = "#10b6ff"
+cyan = "#10b6ff"
+white = "#fafafa"
+
+[colors.bright]
+black = "#080117"
+red = "#00b3f7"
+green = "#00b3f7"
+yellow = "#00b3f7"
+blue = "#00b3f7"
+magenta = "#00b3f7"
+cyan = "#00b3f7"
+white = "#fefefe"

@@ -1,0 +1,27 @@
+name = "Mona Lisa"
+
+[colors]
+foreground = "#f7d66a"
+background = "#120b0d"
+cursor = "#c46c32"
+selection = "#f7d66a"
+
+[colors.ansi]
+black = "#351b0e"
+red = "#9b291c"
+green = "#636232"
+yellow = "#c36e28"
+blue = "#515c5d"
+magenta = "#9b1d29"
+cyan = "#588056"
+white = "#f7d75c"
+
+[colors.bright]
+black = "#874228"
+red = "#ff4331"
+green = "#b4b264"
+yellow = "#ff9566"
+blue = "#9eb2b4"
+magenta = "#ff5b6a"
+cyan = "#8acd8f"
+white = "#ffe598"

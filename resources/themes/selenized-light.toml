@@ -1,0 +1,27 @@
+name = "Selenized Light"
+
+[colors]
+foreground = "#53676d"
+background = "#fbf3db"
+cursor = "#53676d"
+selection = "#ece3cc"
+
+[colors.ansi]
+black = "#ece3cc"
+red = "#d2212d"
+green = "#489100"
+yellow = "#ad8900"
+blue = "#0072d4"
+magenta = "#ca4898"
+cyan = "#009c8f"
+white = "#53676d"
+
+[colors.bright]
+black = "#909995"
+red = "#cc1729"
+green = "#428b00"
+yellow = "#a78300"
+blue = "#006dce"
+magenta = "#c44392"
+cyan = "#00978a"
+white = "#3a4d53"

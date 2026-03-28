@@ -1,0 +1,27 @@
+name = "Material Darker"
+
+[colors]
+foreground = "#eeffff"
+background = "#212121"
+cursor = "#ffffff"
+selection = "#eeffff"
+
+[colors.ansi]
+black = "#000000"
+red = "#ff5370"
+green = "#c3e88d"
+yellow = "#ffcb6b"
+blue = "#82aaff"
+magenta = "#c792ea"
+cyan = "#89ddff"
+white = "#ffffff"
+
+[colors.bright]
+black = "#545454"
+red = "#ff5370"
+green = "#c3e88d"
+yellow = "#ffcb6b"
+blue = "#82aaff"
+magenta = "#c792ea"
+cyan = "#89ddff"
+white = "#ffffff"

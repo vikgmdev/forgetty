@@ -1,0 +1,27 @@
+name = "Monokai Pro"
+
+[colors]
+foreground = "#fcfcfa"
+background = "#2d2a2e"
+cursor = "#c1c0c0"
+selection = "#5b595c"
+
+[colors.ansi]
+black = "#2d2a2e"
+red = "#ff6188"
+green = "#a9dc76"
+yellow = "#ffd866"
+blue = "#fc9867"
+magenta = "#ab9df2"
+cyan = "#78dce8"
+white = "#fcfcfa"
+
+[colors.bright]
+black = "#727072"
+red = "#ff6188"
+green = "#a9dc76"
+yellow = "#ffd866"
+blue = "#fc9867"
+magenta = "#ab9df2"
+cyan = "#78dce8"
+white = "#fcfcfa"

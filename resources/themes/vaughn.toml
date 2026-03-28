@@ -1,0 +1,27 @@
+name = "Vaughn"
+
+[colors]
+foreground = "#dcdccc"
+background = "#25234f"
+cursor = "#ff5555"
+selection = "#b5d5ff"
+
+[colors.ansi]
+black = "#25234f"
+red = "#705050"
+green = "#60b48a"
+yellow = "#dfaf8f"
+blue = "#5555ff"
+magenta = "#f08cc3"
+cyan = "#8cd0d3"
+white = "#709080"
+
+[colors.bright]
+black = "#709080"
+red = "#dca3a3"
+green = "#60b48a"
+yellow = "#f0dfaf"
+blue = "#5555ff"
+magenta = "#ec93d3"
+cyan = "#93e0e3"
+white = "#ffffff"

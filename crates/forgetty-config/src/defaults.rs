@@ -4,7 +4,6 @@
 //! created a configuration file.
 
 use crate::schema::{BellMode, Config, CursorStyle};
-use crate::theme::Theme;
 use std::collections::HashMap;
 
 /// Returns the default Forgetty configuration.
@@ -15,10 +14,12 @@ use std::collections::HashMap;
 /// - 10,000 scrollback lines
 /// - block cursor
 pub fn default_config() -> Config {
+    let theme = crate::theme::load_theme_by_name("0x96f").unwrap_or_default();
     Config {
         font_family: "monospace".to_string(),
         font_size: 12.0,
-        theme: Theme::default(),
+        theme,
+        theme_name: Some("0x96f".to_string()),
         shell: None,
         scrollback_lines: 10_000,
         cursor_style: CursorStyle::Block,

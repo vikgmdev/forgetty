@@ -1,0 +1,27 @@
+name = "Electron Highlighter"
+
+[colors]
+foreground = "#a8b5d1"
+background = "#24283b"
+cursor = "#a8b5d1"
+selection = "#283457"
+
+[colors.ansi]
+black = "#15161e"
+red = "#f7768e"
+green = "#58ffc7"
+yellow = "#ffd9af"
+blue = "#82aaff"
+magenta = "#d2a6ef"
+cyan = "#57f9ff"
+white = "#7c8eac"
+
+[colors.bright]
+black = "#506686"
+red = "#f7768e"
+green = "#58ffc7"
+yellow = "#ffd9af"
+blue = "#82aaff"
+magenta = "#d2a6ef"
+cyan = "#57f9ff"
+white = "#c5cee0"

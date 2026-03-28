@@ -1,0 +1,27 @@
+name = "Snazzy"
+
+[colors]
+foreground = "#ebece6"
+background = "#1e1f29"
+cursor = "#e4e4e4"
+selection = "#81aec6"
+
+[colors.ansi]
+black = "#000000"
+red = "#fc4346"
+green = "#50fb7c"
+yellow = "#f0fb8c"
+blue = "#49baff"
+magenta = "#fc4cb4"
+cyan = "#8be9fe"
+white = "#ededec"
+
+[colors.bright]
+black = "#555555"
+red = "#fc4346"
+green = "#50fb7c"
+yellow = "#f0fb8c"
+blue = "#49baff"
+magenta = "#fc4cb4"
+cyan = "#8be9fe"
+white = "#ededec"

@@ -1,0 +1,27 @@
+name = "Retro Legends"
+
+[colors]
+foreground = "#45eb45"
+background = "#0d0d0d"
+cursor = "#45eb45"
+selection = "#336633"
+
+[colors.ansi]
+black = "#262626"
+red = "#de5454"
+green = "#45eb45"
+yellow = "#f7bf2b"
+blue = "#4066f2"
+magenta = "#bf4cf2"
+cyan = "#40d9e6"
+white = "#bfe6bf"
+
+[colors.bright]
+black = "#4c594c"
+red = "#ff6666"
+green = "#59ff59"
+yellow = "#ffd933"
+blue = "#4c80ff"
+magenta = "#e666ff"
+cyan = "#59e6ff"
+white = "#f2fff2"

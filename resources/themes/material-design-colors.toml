@@ -1,0 +1,27 @@
+name = "Material Design Colors"
+
+[colors]
+foreground = "#e7ebed"
+background = "#1d262a"
+cursor = "#eaeaea"
+selection = "#4e6a78"
+
+[colors.ansi]
+black = "#435b67"
+red = "#fc3841"
+green = "#5cf19e"
+yellow = "#fed032"
+blue = "#37b6ff"
+magenta = "#fc226e"
+cyan = "#59ffd1"
+white = "#ffffff"
+
+[colors.bright]
+black = "#a1b0b8"
+red = "#fc746d"
+green = "#adf7be"
+yellow = "#fee16c"
+blue = "#70cfff"
+magenta = "#fc669b"
+cyan = "#9affe6"
+white = "#ffffff"

@@ -1,0 +1,27 @@
+name = "Thayer Bright"
+
+[colors]
+foreground = "#f8f8f8"
+background = "#1b1d1e"
+cursor = "#fc971f"
+selection = "#4d4d4d"
+
+[colors.ansi]
+black = "#1b1d1e"
+red = "#f92672"
+green = "#4df840"
+yellow = "#f4fd22"
+blue = "#2757d6"
+magenta = "#8c54fe"
+cyan = "#38c8b5"
+white = "#ccccc6"
+
+[colors.bright]
+black = "#505354"
+red = "#ff5995"
+green = "#b6e354"
+yellow = "#feed6c"
+blue = "#3f78ff"
+magenta = "#9e6ffe"
+cyan = "#23cfd5"
+white = "#f8f8f2"

@@ -1,0 +1,27 @@
+name = "Framer"
+
+[colors]
+foreground = "#777777"
+background = "#111111"
+cursor = "#fcdc08"
+selection = "#666666"
+
+[colors.ansi]
+black = "#141414"
+red = "#ff5555"
+green = "#98ec65"
+yellow = "#ffcc33"
+blue = "#00aaff"
+magenta = "#aa88ff"
+cyan = "#88ddff"
+white = "#cccccc"
+
+[colors.bright]
+black = "#414141"
+red = "#ff8888"
+green = "#b6f292"
+yellow = "#ffd966"
+blue = "#33bbff"
+magenta = "#cebbff"
+cyan = "#bbecff"
+white = "#ffffff"

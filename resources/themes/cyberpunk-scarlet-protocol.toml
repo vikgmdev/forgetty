@@ -1,0 +1,27 @@
+name = "Cyberpunk Scarlet Protocol"
+
+[colors]
+foreground = "#d13554"
+background = "#101116"
+cursor = "#9bfca8"
+selection = "#c7ddfc"
+
+[colors.ansi]
+black = "#101116"
+red = "#ea3356"
+green = "#64d98c"
+yellow = "#faf968"
+blue = "#306fb1"
+magenta = "#ba3ec1"
+cyan = "#59c2c6"
+white = "#c7c7c7"
+
+[colors.bright]
+black = "#686868"
+red = "#ed776d"
+green = "#8df77a"
+yellow = "#fefc7f"
+blue = "#6a71f6"
+magenta = "#ae40e4"
+cyan = "#8efafd"
+white = "#ffffff"

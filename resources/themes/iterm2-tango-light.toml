@@ -1,0 +1,27 @@
+name = "iTerm2 Tango Light"
+
+[colors]
+foreground = "#000000"
+background = "#ffffff"
+cursor = "#000000"
+selection = "#c1deff"
+
+[colors.ansi]
+black = "#000000"
+red = "#d81e00"
+green = "#5ea702"
+yellow = "#cfae00"
+blue = "#427ab3"
+magenta = "#89658e"
+cyan = "#00a7aa"
+white = "#dbded8"
+
+[colors.bright]
+black = "#686a66"
+red = "#f54235"
+green = "#99e343"
+yellow = "#fdeb61"
+blue = "#84b0d8"
+magenta = "#bc94b7"
+cyan = "#37e6e8"
+white = "#f1f1f0"

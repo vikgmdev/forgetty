@@ -1,0 +1,27 @@
+name = "Spacegray"
+
+[colors]
+foreground = "#b3b8c3"
+background = "#20242d"
+cursor = "#b3b8c3"
+selection = "#16181e"
+
+[colors.ansi]
+black = "#000000"
+red = "#b04b57"
+green = "#87b379"
+yellow = "#e5c179"
+blue = "#7d8fa4"
+magenta = "#a47996"
+cyan = "#85a7a5"
+white = "#b3b8c3"
+
+[colors.bright]
+black = "#000000"
+red = "#b04b57"
+green = "#87b379"
+yellow = "#e5c179"
+blue = "#7d8fa4"
+magenta = "#a47996"
+cyan = "#85a7a5"
+white = "#ffffff"

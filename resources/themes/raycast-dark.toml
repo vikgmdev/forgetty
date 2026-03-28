@@ -1,0 +1,27 @@
+name = "Raycast Dark"
+
+[colors]
+foreground = "#ffffff"
+background = "#1a1a1a"
+cursor = "#cccccc"
+selection = "#333333"
+
+[colors.ansi]
+black = "#000000"
+red = "#ff5360"
+green = "#59d499"
+yellow = "#ffc531"
+blue = "#56c2ff"
+magenta = "#cf2f98"
+cyan = "#52eee5"
+white = "#ffffff"
+
+[colors.bright]
+black = "#000000"
+red = "#ff6363"
+green = "#59d499"
+yellow = "#ffc531"
+blue = "#56c2ff"
+magenta = "#cf2f98"
+cyan = "#52eee5"
+white = "#ffffff"

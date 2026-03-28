@@ -1,0 +1,27 @@
+name = "Black Metal (Burzum)"
+
+[colors]
+foreground = "#c1c1c1"
+background = "#000000"
+cursor = "#c1c1c1"
+selection = "#c1c1c1"
+
+[colors.ansi]
+black = "#000000"
+red = "#5f8787"
+green = "#ddeecc"
+yellow = "#99bbaa"
+blue = "#888888"
+magenta = "#999999"
+cyan = "#aaaaaa"
+white = "#c1c1c1"
+
+[colors.bright]
+black = "#404040"
+red = "#5f8787"
+green = "#ddeecc"
+yellow = "#99bbaa"
+blue = "#888888"
+magenta = "#999999"
+cyan = "#aaaaaa"
+white = "#c1c1c1"

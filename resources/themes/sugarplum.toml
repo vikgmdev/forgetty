@@ -1,0 +1,27 @@
+name = "Sugarplum"
+
+[colors]
+foreground = "#db7ddd"
+background = "#111147"
+cursor = "#53b397"
+selection = "#5ca8dc"
+
+[colors.ansi]
+black = "#111147"
+red = "#5ca8dc"
+green = "#53b397"
+yellow = "#249a84"
+blue = "#db7ddd"
+magenta = "#d0beee"
+cyan = "#f9f3f9"
+white = "#a175d4"
+
+[colors.bright]
+black = "#111147"
+red = "#5cb5dc"
+green = "#52deb5"
+yellow = "#01f5c7"
+blue = "#fa5dfd"
+magenta = "#c6a5fd"
+cyan = "#ffffff"
+white = "#b577fd"

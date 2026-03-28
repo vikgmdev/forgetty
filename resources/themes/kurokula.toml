@@ -1,0 +1,27 @@
+name = "Kurokula"
+
+[colors]
+foreground = "#ddd0c4"
+background = "#141515"
+cursor = "#702420"
+selection = "#515151"
+
+[colors.ansi]
+black = "#333333"
+red = "#b66056"
+green = "#85b1a9"
+yellow = "#dbbb43"
+blue = "#6890d7"
+magenta = "#887aa3"
+cyan = "#837369"
+white = "#ddd0c4"
+
+[colors.bright]
+black = "#515151"
+red = "#ffc663"
+green = "#c1ffae"
+yellow = "#fff700"
+blue = "#a1d9ff"
+magenta = "#a994ff"
+cyan = "#f9cfb9"
+white = "#ffffff"

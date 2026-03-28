@@ -1,0 +1,27 @@
+name = "Pro Light"
+
+[colors]
+foreground = "#191919"
+background = "#ffffff"
+cursor = "#4d4d4d"
+selection = "#c1ddff"
+
+[colors.ansi]
+black = "#000000"
+red = "#e5492b"
+green = "#50d148"
+yellow = "#c6c440"
+blue = "#3b75ff"
+magenta = "#ed66e8"
+cyan = "#4ed2de"
+white = "#dcdcdc"
+
+[colors.bright]
+black = "#9f9f9f"
+red = "#ff6640"
+green = "#61ef57"
+yellow = "#f2f156"
+blue = "#0082ff"
+magenta = "#ff7eff"
+cyan = "#61f7f8"
+white = "#f2f2f2"

@@ -1,0 +1,27 @@
+name = "Wez"
+
+[colors]
+foreground = "#b3b3b3"
+background = "#000000"
+cursor = "#53ae71"
+selection = "#4d52f8"
+
+[colors.ansi]
+black = "#000000"
+red = "#cc5555"
+green = "#55cc55"
+yellow = "#cdcd55"
+blue = "#5555cc"
+magenta = "#cc55cc"
+cyan = "#7acaca"
+white = "#cccccc"
+
+[colors.bright]
+black = "#555555"
+red = "#ff5555"
+green = "#55ff55"
+yellow = "#ffff55"
+blue = "#5555ff"
+magenta = "#ff55ff"
+cyan = "#55ffff"
+white = "#ffffff"

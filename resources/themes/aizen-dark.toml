@@ -1,0 +1,27 @@
+name = "Aizen Dark"
+
+[colors]
+foreground = "#d0d6f0"
+background = "#1a1a1a"
+cursor = "#f8b080"
+selection = "#333333"
+
+[colors.ansi]
+black = "#1a1a1a"
+red = "#f08898"
+green = "#a4e09c"
+yellow = "#f5dea4"
+blue = "#84b4f8"
+magenta = "#c8a2f4"
+cyan = "#90dcd0"
+white = "#d0d6f0"
+
+[colors.bright]
+black = "#444444"
+red = "#f08898"
+green = "#a4e09c"
+yellow = "#f5dea4"
+blue = "#84b4f8"
+magenta = "#c8a2f4"
+cyan = "#90dcd0"
+white = "#ffffff"

@@ -1,0 +1,27 @@
+name = "Symfonic"
+
+[colors]
+foreground = "#ffffff"
+background = "#000000"
+cursor = "#dc322f"
+selection = "#073642"
+
+[colors.ansi]
+black = "#000000"
+red = "#dc322f"
+green = "#56db3a"
+yellow = "#ff8400"
+blue = "#0084d4"
+magenta = "#b729d9"
+cyan = "#ccccff"
+white = "#ffffff"
+
+[colors.bright]
+black = "#1b1d21"
+red = "#dc322f"
+green = "#56db3a"
+yellow = "#ff8400"
+blue = "#0084d4"
+magenta = "#b729d9"
+cyan = "#ccccff"
+white = "#ffffff"

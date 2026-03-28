@@ -1,0 +1,27 @@
+name = "SeedFlip Inkwell"
+
+[colors]
+foreground = "#e8e4df"
+background = "#0a0a0a"
+cursor = "#c8b8a0"
+selection = "#141414"
+
+[colors.ansi]
+black = "#050505"
+red = "#cc6666"
+green = "#66cc88"
+yellow = "#ccbb66"
+blue = "#6690cc"
+magenta = "#cc66cc"
+cyan = "#66cccc"
+white = "#f3f1ee"
+
+[colors.bright]
+black = "#3d3d3d"
+red = "#df9f9f"
+green = "#9fdfb5"
+yellow = "#dfd49f"
+blue = "#9fbadf"
+magenta = "#df9fdf"
+cyan = "#9fdfdf"
+white = "#ffffff"

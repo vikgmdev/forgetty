@@ -1,0 +1,27 @@
+name = "SeedFlip Wavelength"
+
+[colors]
+foreground = "#e6edf3"
+background = "#0d1117"
+cursor = "#238636"
+selection = "#161b22"
+
+[colors.ansi]
+black = "#090c10"
+red = "#d55d5d"
+green = "#5dd585"
+yellow = "#d5c15d"
+blue = "#5d8fd5"
+magenta = "#d55dd5"
+cyan = "#5dd5d5"
+white = "#f7f9fb"
+
+[colors.bright]
+black = "#364255"
+red = "#e59a9a"
+green = "#9ae5b3"
+yellow = "#e5d89a"
+blue = "#9ab9e5"
+magenta = "#e59ae5"
+cyan = "#9ae5e5"
+white = "#ffffff"

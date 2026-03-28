@@ -1,0 +1,27 @@
+name = "Embark"
+
+[colors]
+foreground = "#eeffff"
+background = "#1e1c31"
+cursor = "#a1efd3"
+selection = "#fbfcfc"
+
+[colors.ansi]
+black = "#1e1c31"
+red = "#f0719b"
+green = "#a1efd3"
+yellow = "#ffe9aa"
+blue = "#57c7ff"
+magenta = "#c792ea"
+cyan = "#87dfeb"
+white = "#f8f8f2"
+
+[colors.bright]
+black = "#585273"
+red = "#f02e6e"
+green = "#2ce592"
+yellow = "#ffb378"
+blue = "#1da0e2"
+magenta = "#a742ea"
+cyan = "#63f2f1"
+white = "#a6b3cc"

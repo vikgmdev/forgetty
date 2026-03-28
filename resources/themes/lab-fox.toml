@@ -1,0 +1,27 @@
+name = "Lab Fox"
+
+[colors]
+foreground = "#ffffff"
+background = "#2e2e2e"
+cursor = "#7f7f7f"
+selection = "#cb392e"
+
+[colors.ansi]
+black = "#2e2e2e"
+red = "#fc6d26"
+green = "#3eb383"
+yellow = "#fca121"
+blue = "#db3b21"
+magenta = "#380d75"
+cyan = "#6e49cb"
+white = "#ffffff"
+
+[colors.bright]
+black = "#464646"
+red = "#ff6517"
+green = "#53eaa8"
+yellow = "#fca013"
+blue = "#db501f"
+magenta = "#441090"
+cyan = "#7d53e7"
+white = "#ffffff"

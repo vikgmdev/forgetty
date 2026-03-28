@@ -1,0 +1,27 @@
+name = "Blue Dolphin"
+
+[colors]
+foreground = "#c5f2ff"
+background = "#006984"
+cursor = "#ffcc00"
+selection = "#2baeca"
+
+[colors.ansi]
+black = "#292d3e"
+red = "#ff8288"
+green = "#b4e88d"
+yellow = "#f4d69f"
+blue = "#82aaff"
+magenta = "#e9c1ff"
+cyan = "#89ebff"
+white = "#d0d0d0"
+
+[colors.bright]
+black = "#434758"
+red = "#ff8b92"
+green = "#ddffa7"
+yellow = "#ffe585"
+blue = "#9cc4ff"
+magenta = "#ddb0f6"
+cyan = "#a3f7ff"
+white = "#ffffff"

@@ -1,0 +1,27 @@
+name = "Rapture"
+
+[colors]
+foreground = "#c0c9e5"
+background = "#111e2a"
+cursor = "#ffffff"
+selection = "#304b66"
+
+[colors.ansi]
+black = "#000000"
+red = "#fc644d"
+green = "#7afde1"
+yellow = "#fff09b"
+blue = "#6c9bf5"
+magenta = "#ff4fa1"
+cyan = "#64e0ff"
+white = "#c0c9e5"
+
+[colors.bright]
+black = "#304b66"
+red = "#fc644d"
+green = "#7afde1"
+yellow = "#fff09b"
+blue = "#6c9bf5"
+magenta = "#ff4fa1"
+cyan = "#64e0ff"
+white = "#ffffff"

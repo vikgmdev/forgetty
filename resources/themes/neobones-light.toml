@@ -1,0 +1,27 @@
+name = "Neobones Light"
+
+[colors]
+foreground = "#202e18"
+background = "#e5ede6"
+cursor = "#202e18"
+selection = "#ade48c"
+
+[colors.ansi]
+black = "#e5ede6"
+red = "#a8334c"
+green = "#567a30"
+yellow = "#944927"
+blue = "#286486"
+magenta = "#88507d"
+cyan = "#3b8992"
+white = "#202e18"
+
+[colors.bright]
+black = "#b3c6b6"
+red = "#94253e"
+green = "#3f5a22"
+yellow = "#803d1c"
+blue = "#1d5573"
+magenta = "#7b3b70"
+cyan = "#2b747c"
+white = "#415934"

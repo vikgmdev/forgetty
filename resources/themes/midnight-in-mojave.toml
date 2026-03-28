@@ -1,0 +1,27 @@
+name = "Midnight In Mojave"
+
+[colors]
+foreground = "#ffffff"
+background = "#1e1e1e"
+cursor = "#32d74b"
+selection = "#4a504d"
+
+[colors.ansi]
+black = "#1e1e1e"
+red = "#ff453a"
+green = "#32d74b"
+yellow = "#ffd60a"
+blue = "#0a84ff"
+magenta = "#bf5af2"
+cyan = "#5ac8fa"
+white = "#ffffff"
+
+[colors.bright]
+black = "#1e1e1e"
+red = "#ff453a"
+green = "#32d74b"
+yellow = "#ffd60a"
+blue = "#0a84ff"
+magenta = "#bf5af2"
+cyan = "#5ac8fa"
+white = "#ffffff"
