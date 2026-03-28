@@ -241,10 +241,15 @@ fn build_ui(app: &adw::Application, config: &Config) {
     main_area.set_vexpand(true);
     main_area.append(&tab_view);
 
+    // Wrap main_area in an Overlay so the command palette can float on top.
+    let main_overlay = gtk4::Overlay::new();
+    main_overlay.set_child(Some(&main_area));
+    main_overlay.set_vexpand(true);
+
     let content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     content.append(&header);
     content.append(&tab_bar);
-    content.append(&main_area);
+    content.append(&main_overlay);
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
@@ -271,6 +276,46 @@ fn build_ui(app: &adw::Application, config: &Config) {
     let appearance_revealer =
         preferences::build_appearance_sidebar(&shared_config, &tab_states, &window);
     main_area.append(&appearance_revealer);
+
+    // --- Command palette overlay (built after focus_tracker is ready) ---
+    let command_palette = build_command_palette(&window, &focus_tracker);
+    main_overlay.add_overlay(&command_palette);
+
+    // Click-outside-to-close: a GestureClick on the overlay detects clicks
+    // that land outside the palette card and closes it.
+    {
+        let palette_ref = command_palette.clone();
+        let ft_click = Rc::clone(&focus_tracker);
+        let click_gesture = gtk4::GestureClick::new();
+        click_gesture.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        click_gesture.connect_pressed(move |gesture, _n_press, x, y| {
+            if !palette_ref.is_visible() {
+                gesture.set_state(gtk4::EventSequenceState::None);
+                return;
+            }
+            // Check if the click is inside the palette widget bounds
+            let Some(parent) = palette_ref.parent() else {
+                gesture.set_state(gtk4::EventSequenceState::None);
+                return;
+            };
+            let Some(bounds) = palette_ref.compute_bounds(&parent) else {
+                gesture.set_state(gtk4::EventSequenceState::None);
+                return;
+            };
+            let inside = x >= bounds.x() as f64
+                && x <= (bounds.x() + bounds.width()) as f64
+                && y >= bounds.y() as f64
+                && y <= (bounds.y() + bounds.height()) as f64;
+
+            if !inside {
+                close_command_palette(&palette_ref, &ft_click);
+                gesture.set_state(gtk4::EventSequenceState::Claimed);
+            } else {
+                gesture.set_state(gtk4::EventSequenceState::None);
+            }
+        });
+        main_overlay.add_controller(click_gesture);
+    }
 
     // --- Tab close handling ---
     // When a tab's close button is clicked, kill ALL PTYs in the tab's
@@ -750,12 +795,19 @@ fn build_ui(app: &adw::Application, config: &Config) {
 
     app.set_accels_for_action("app.quit", &["<Control><Shift>q"]);
 
-    // --- Command Palette placeholder (greyed out) ---
+    // --- Command Palette action (Ctrl+Shift+P) ---
     {
+        let palette_ref = command_palette.clone();
+        let ft_palette = Rc::clone(&focus_tracker);
+        let win_ref = window.clone();
         let action = gio::SimpleAction::new("command-palette", None);
-        action.set_enabled(false);
+        action.connect_activate(move |_action, _param| {
+            toggle_command_palette(&palette_ref, &ft_palette, &win_ref);
+        });
         window.add_action(&action);
     }
+
+    app.set_accels_for_action("win.command-palette", &["<Control><Shift>p"]);
 
     // --- Terminal Inspector placeholder (greyed out) ---
     {
@@ -2468,5 +2520,496 @@ fn reload_config(
             continue;
         };
         terminal::apply_config_change(&mut s, &new_config, &da);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Command Palette
+// ---------------------------------------------------------------------------
+
+/// A single entry in the command palette registry.
+struct CommandEntry {
+    display_name: &'static str,
+    action_name: &'static str,
+    shortcut_label: &'static str,
+}
+
+/// The static list of commands shown in the command palette.
+///
+/// Order matches the hamburger menu grouping for discoverability.
+/// Commands with parameters (e.g., open-url) and disabled placeholders
+/// (terminal-inspector) are excluded.
+fn command_registry() -> &'static [CommandEntry] {
+    static COMMANDS: &[CommandEntry] = &[
+        CommandEntry {
+            display_name: "Copy",
+            action_name: "win.copy",
+            shortcut_label: "Ctrl+Shift+C",
+        },
+        CommandEntry {
+            display_name: "Paste",
+            action_name: "win.paste",
+            shortcut_label: "Ctrl+Shift+V",
+        },
+        CommandEntry {
+            display_name: "New Window",
+            action_name: "win.new-window",
+            shortcut_label: "",
+        },
+        CommandEntry {
+            display_name: "Close Window",
+            action_name: "win.close-window",
+            shortcut_label: "",
+        },
+        CommandEntry {
+            display_name: "New Tab",
+            action_name: "win.new-tab",
+            shortcut_label: "Ctrl+Shift+T",
+        },
+        CommandEntry {
+            display_name: "Close Tab",
+            action_name: "win.close-tab",
+            shortcut_label: "",
+        },
+        CommandEntry {
+            display_name: "Close Pane",
+            action_name: "win.close-pane",
+            shortcut_label: "Ctrl+Shift+W",
+        },
+        CommandEntry {
+            display_name: "Change Tab Title",
+            action_name: "win.change-tab-title",
+            shortcut_label: "",
+        },
+        CommandEntry { display_name: "Split Up", action_name: "win.split-up", shortcut_label: "" },
+        CommandEntry {
+            display_name: "Split Down",
+            action_name: "win.split-down",
+            shortcut_label: "Alt+Shift+\u{2212}",
+        },
+        CommandEntry {
+            display_name: "Split Left",
+            action_name: "win.split-left",
+            shortcut_label: "",
+        },
+        CommandEntry {
+            display_name: "Split Right",
+            action_name: "win.split-right",
+            shortcut_label: "Alt+Shift+=",
+        },
+        CommandEntry {
+            display_name: "Focus Pane Left",
+            action_name: "win.focus-pane-left",
+            shortcut_label: "Alt+Left",
+        },
+        CommandEntry {
+            display_name: "Focus Pane Right",
+            action_name: "win.focus-pane-right",
+            shortcut_label: "Alt+Right",
+        },
+        CommandEntry {
+            display_name: "Focus Pane Up",
+            action_name: "win.focus-pane-up",
+            shortcut_label: "Alt+Up",
+        },
+        CommandEntry {
+            display_name: "Focus Pane Down",
+            action_name: "win.focus-pane-down",
+            shortcut_label: "Alt+Down",
+        },
+        CommandEntry {
+            display_name: "Find in Terminal",
+            action_name: "win.search",
+            shortcut_label: "Ctrl+Shift+F",
+        },
+        CommandEntry {
+            display_name: "Zoom In",
+            action_name: "win.zoom-in",
+            shortcut_label: "Ctrl+=",
+        },
+        CommandEntry {
+            display_name: "Zoom Out",
+            action_name: "win.zoom-out",
+            shortcut_label: "Ctrl+\u{2212}",
+        },
+        CommandEntry {
+            display_name: "Reset Zoom",
+            action_name: "win.zoom-reset",
+            shortcut_label: "Ctrl+0",
+        },
+        CommandEntry { display_name: "Clear", action_name: "win.clear", shortcut_label: "" },
+        CommandEntry { display_name: "Reset", action_name: "win.reset", shortcut_label: "" },
+        CommandEntry {
+            display_name: "Open Configuration",
+            action_name: "win.open-config",
+            shortcut_label: "",
+        },
+        CommandEntry {
+            display_name: "Reload Configuration",
+            action_name: "win.reload-config",
+            shortcut_label: "",
+        },
+        CommandEntry {
+            display_name: "Appearance",
+            action_name: "win.appearance",
+            shortcut_label: "Ctrl+,",
+        },
+        CommandEntry {
+            display_name: "Keyboard Shortcuts",
+            action_name: "win.show-shortcuts",
+            shortcut_label: "F1",
+        },
+        CommandEntry {
+            display_name: "About Forgetty",
+            action_name: "win.show-about",
+            shortcut_label: "",
+        },
+        CommandEntry {
+            display_name: "Quit",
+            action_name: "app.quit",
+            shortcut_label: "Ctrl+Shift+Q",
+        },
+    ];
+    COMMANDS
+}
+
+/// Build the command palette overlay widget.
+///
+/// Returns the outer container (a `gtk4::Box` used as the overlay child)
+/// and internal widgets needed for wiring up actions.
+///
+/// The palette is a centered card with a SearchEntry at the top and a
+/// scrollable ListBox below it. It starts hidden; the caller adds it
+/// as an overlay child on the `main_overlay` and toggles visibility.
+fn build_command_palette(
+    window: &adw::ApplicationWindow,
+    focus_tracker: &FocusTracker,
+) -> gtk4::Box {
+    let registry = command_registry();
+
+    // --- Outer alignment container ---
+    // This Box fills the entire overlay area. We use alignment to center the
+    // palette card horizontally at the top third of the window.
+    let outer = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    outer.set_halign(gtk4::Align::Center);
+    outer.set_valign(gtk4::Align::Start);
+    outer.set_margin_top(60);
+    outer.set_hexpand(true);
+    outer.set_vexpand(true);
+    // Request ~55% of default window width; actual width adapts via CSS/hexpand.
+    outer.set_width_request((DEFAULT_WIDTH as f64 * 0.55) as i32);
+    outer.set_visible(false);
+    outer.set_can_focus(false);
+    // Give it a card-like look
+    outer.add_css_class("card");
+    outer.add_css_class("command-palette");
+
+    // --- Search entry ---
+    let search_entry = gtk4::SearchEntry::new();
+    search_entry.set_placeholder_text(Some("Type a command\u{2026}"));
+    search_entry.set_hexpand(true);
+    search_entry.set_focusable(true);
+    search_entry.set_can_focus(true);
+    search_entry.set_margin_start(8);
+    search_entry.set_margin_end(8);
+    search_entry.set_margin_top(8);
+    search_entry.set_margin_bottom(4);
+    outer.append(&search_entry);
+
+    let separator = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+    outer.append(&separator);
+
+    // --- Scrollable command list ---
+    let list_box = gtk4::ListBox::new();
+    list_box.set_selection_mode(gtk4::SelectionMode::Single);
+    list_box.add_css_class("navigation-sidebar");
+
+    // Populate with all commands
+    for entry in registry {
+        let row = build_palette_row(entry);
+        list_box.append(&row);
+    }
+
+    let scrolled = gtk4::ScrolledWindow::new();
+    scrolled.set_child(Some(&list_box));
+    scrolled.set_vexpand(true);
+    scrolled.set_propagate_natural_height(true);
+    scrolled.set_max_content_height(400);
+    scrolled.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
+    outer.append(&scrolled);
+
+    // Select the first row by default
+    if let Some(first_row) = list_box.row_at_index(0) {
+        list_box.select_row(Some(&first_row));
+    }
+
+    // --- Filtering logic ---
+    // On search-changed, show/hide rows based on substring match and
+    // auto-select the first visible row.
+    {
+        let lb = list_box.clone();
+        search_entry.connect_search_changed(move |entry| {
+            let query = entry.text().to_string().to_lowercase();
+            let registry = command_registry();
+            let mut first_visible: Option<gtk4::ListBoxRow> = None;
+
+            for (i, cmd) in registry.iter().enumerate() {
+                let Some(row) = lb.row_at_index(i as i32) else {
+                    continue;
+                };
+                let visible = query.is_empty() || cmd.display_name.to_lowercase().contains(&query);
+                row.set_visible(visible);
+                if visible && first_visible.is_none() {
+                    first_visible = Some(row);
+                }
+            }
+
+            // Auto-select first visible row
+            if let Some(row) = first_visible {
+                lb.select_row(Some(&row));
+                // Scroll to make the selected row visible
+                row.grab_focus();
+                // Return focus to search entry after scroll adjustment
+                entry.grab_focus();
+            } else {
+                lb.select_row(gtk4::ListBoxRow::NONE);
+            }
+        });
+    }
+
+    // --- Keyboard navigation ---
+    // Up/Down arrows move selection; Enter executes; Escape closes.
+    {
+        let lb = list_box.clone();
+        let outer_ref = outer.clone();
+        let win = window.clone();
+        let ft = Rc::clone(focus_tracker);
+        let key_controller = gtk4::EventControllerKey::new();
+        key_controller.connect_key_pressed(move |_ctrl, key, _code, _mods| {
+            match key {
+                gtk4::gdk::Key::Escape => {
+                    close_command_palette(&outer_ref, &ft);
+                    glib::Propagation::Stop
+                }
+                gtk4::gdk::Key::Return | gtk4::gdk::Key::KP_Enter => {
+                    if let Some(row) = lb.selected_row() {
+                        let index = row.index();
+                        let registry = command_registry();
+                        if let Some(cmd) = registry.get(index as usize) {
+                            let action_name = cmd.action_name.to_string();
+                            close_command_palette(&outer_ref, &ft);
+                            // Defer action dispatch so the palette is fully hidden
+                            // before any dialog opens (e.g. "Change Tab Title").
+                            let win_deferred = win.clone();
+                            glib::idle_add_local_once(move || {
+                                let _ = gtk4::prelude::WidgetExt::activate_action(
+                                    &win_deferred,
+                                    &action_name,
+                                    None,
+                                );
+                            });
+                        }
+                    }
+                    glib::Propagation::Stop
+                }
+                gtk4::gdk::Key::Down => {
+                    move_palette_selection(&lb, true);
+                    glib::Propagation::Stop
+                }
+                gtk4::gdk::Key::Up => {
+                    move_palette_selection(&lb, false);
+                    glib::Propagation::Stop
+                }
+                _ => glib::Propagation::Proceed,
+            }
+        });
+        search_entry.add_controller(key_controller);
+    }
+
+    // --- Row activation (Enter or click on a row) ---
+    {
+        let outer_ref = outer.clone();
+        let win = window.clone();
+        let ft = Rc::clone(focus_tracker);
+        list_box.connect_row_activated(move |_lb, row| {
+            let index = row.index();
+            let registry = command_registry();
+            if let Some(cmd) = registry.get(index as usize) {
+                let action_name = cmd.action_name.to_string();
+                close_command_palette(&outer_ref, &ft);
+                // Defer action dispatch so the palette is fully hidden
+                // before any dialog opens (e.g. "Change Tab Title").
+                let win_deferred = win.clone();
+                glib::idle_add_local_once(move || {
+                    let _ = gtk4::prelude::WidgetExt::activate_action(
+                        &win_deferred,
+                        &action_name,
+                        None,
+                    );
+                });
+            }
+        });
+    }
+
+    outer
+}
+
+/// Build a single row for the command palette list.
+///
+/// Each row is a horizontal Box with the command name on the left and
+/// the shortcut label (if any) on the right in a muted style.
+fn build_palette_row(entry: &CommandEntry) -> gtk4::ListBoxRow {
+    let hbox = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
+    hbox.set_margin_start(12);
+    hbox.set_margin_end(12);
+    hbox.set_margin_top(6);
+    hbox.set_margin_bottom(6);
+
+    let name_label = gtk4::Label::new(Some(entry.display_name));
+    name_label.set_halign(gtk4::Align::Start);
+    name_label.set_hexpand(true);
+    hbox.append(&name_label);
+
+    if !entry.shortcut_label.is_empty() {
+        let shortcut_label = gtk4::Label::new(Some(entry.shortcut_label));
+        shortcut_label.set_halign(gtk4::Align::End);
+        shortcut_label.add_css_class("dim-label");
+        hbox.append(&shortcut_label);
+    }
+
+    let row = gtk4::ListBoxRow::new();
+    row.set_child(Some(&hbox));
+    row
+}
+
+/// Move the palette selection up or down with wrapping.
+///
+/// Skips hidden (filtered-out) rows to navigate only visible entries.
+fn move_palette_selection(list_box: &gtk4::ListBox, forward: bool) {
+    let current_index = list_box.selected_row().map(|r| r.index()).unwrap_or(-1);
+
+    // Collect indices of visible rows
+    let mut visible_indices: Vec<i32> = Vec::new();
+    let mut i = 0;
+    while let Some(row) = list_box.row_at_index(i) {
+        if row.is_visible() {
+            visible_indices.push(i);
+        }
+        i += 1;
+    }
+
+    if visible_indices.is_empty() {
+        return;
+    }
+
+    // Find current position in the visible list
+    let current_pos = visible_indices.iter().position(|&idx| idx == current_index);
+    let next_pos = match current_pos {
+        Some(pos) => {
+            if forward {
+                (pos + 1) % visible_indices.len()
+            } else if pos == 0 {
+                visible_indices.len() - 1
+            } else {
+                pos - 1
+            }
+        }
+        // No current selection: pick the first or last visible row
+        None => {
+            if forward {
+                0
+            } else {
+                visible_indices.len() - 1
+            }
+        }
+    };
+
+    let target_index = visible_indices[next_pos];
+    if let Some(row) = list_box.row_at_index(target_index) {
+        list_box.select_row(Some(&row));
+    }
+}
+
+/// Close the command palette and restore focus to the previously focused pane.
+fn close_command_palette(palette: &gtk4::Box, focus_tracker: &FocusTracker) {
+    palette.set_visible(false);
+
+    // Restore focus to the DrawingArea that was focused before the palette opened
+    let focused_name = {
+        let Ok(name) = focus_tracker.try_borrow() else {
+            return;
+        };
+        name.clone()
+    };
+
+    if focused_name.is_empty() {
+        return;
+    }
+
+    let app =
+        gtk4::gio::Application::default().and_then(|a| a.downcast::<gtk4::Application>().ok());
+    let Some(app) = app else {
+        return;
+    };
+    let Some(window) = app.active_window() else {
+        return;
+    };
+
+    if let Some(da) = find_drawing_area_by_name(&window, &focused_name) {
+        da.grab_focus();
+    }
+}
+
+/// Open the command palette: show it, clear previous query, focus the search entry.
+///
+/// Resets all row visibility and selects the first row so the palette always
+/// opens in a clean state.
+fn open_command_palette(palette: &gtk4::Box, window: &adw::ApplicationWindow) {
+    palette.set_visible(true);
+
+    // Find the SearchEntry (first child) and clear + focus it
+    let search_entry = palette.first_child().and_then(|w| w.downcast::<gtk4::SearchEntry>().ok());
+    if let Some(ref entry) = search_entry {
+        entry.set_text("");
+    }
+
+    // Find the ListBox (inside ScrolledWindow, third child: entry, separator, scrolled)
+    // and ensure all rows are visible + first is selected.
+    let mut child = palette.first_child();
+    while let Some(c) = child {
+        if let Some(scrolled) = c.downcast_ref::<gtk4::ScrolledWindow>() {
+            if let Some(lb) = scrolled.child().and_then(|w| w.downcast::<gtk4::ListBox>().ok()) {
+                let mut i = 0;
+                while let Some(row) = lb.row_at_index(i) {
+                    row.set_visible(true);
+                    i += 1;
+                }
+                if let Some(first) = lb.row_at_index(0) {
+                    lb.select_row(Some(&first));
+                }
+            }
+            break;
+        }
+        child = c.next_sibling();
+    }
+
+    // Use the window's set_focus() to directly assign keyboard focus to the
+    // search entry. This works reliably even before the widget is fully mapped,
+    // unlike grab_focus() which silently fails on unrealized widgets.
+    if let Some(entry) = search_entry {
+        gtk4::prelude::GtkWindowExt::set_focus(window, Some(&entry));
+    }
+}
+
+/// Toggle the command palette open/closed.
+fn toggle_command_palette(
+    palette: &gtk4::Box,
+    focus_tracker: &FocusTracker,
+    window: &adw::ApplicationWindow,
+) {
+    if palette.is_visible() {
+        close_command_palette(palette, focus_tracker);
+    } else {
+        open_command_palette(palette, window);
     }
 }

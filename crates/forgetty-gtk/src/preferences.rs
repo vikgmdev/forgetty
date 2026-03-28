@@ -20,7 +20,6 @@ type SharedConfig = Rc<RefCell<Config>>;
 /// Pane state map, matching the type alias in `app.rs`.
 type TabStateMap = Rc<RefCell<HashMap<String, Rc<RefCell<TerminalState>>>>>;
 
-
 /// Build the Appearance sidebar as a `gtk4::Revealer`.
 ///
 /// The revealer uses `SlideLeft` transition and starts hidden. The caller
@@ -91,8 +90,7 @@ pub fn build_appearance_sidebar(
     content_box.set_vexpand(true);
 
     // --- Theme dropdown section ---
-    let theme_section =
-        build_theme_section(&current_config, shared_config, tab_states, window);
+    let theme_section = build_theme_section(&current_config, shared_config, tab_states, window);
     content_box.append(&theme_section);
 
     // --- Font Family section ---
@@ -161,10 +159,7 @@ fn build_theme_section(
 
     // Pre-select the current theme.
     let current_name = config.theme_name.as_deref().unwrap_or("0x96f");
-    let selected_idx = theme_names
-        .iter()
-        .position(|n| n == current_name)
-        .unwrap_or(0) as u32;
+    let selected_idx = theme_names.iter().position(|n| n == current_name).unwrap_or(0) as u32;
     dropdown.set_selected(selected_idx);
 
     let theme_count = theme_names.len() as u32;
