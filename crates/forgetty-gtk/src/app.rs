@@ -25,6 +25,7 @@ use libadwaita::prelude::*;
 use tracing::info;
 
 use crate::clipboard;
+use crate::preferences;
 use crate::terminal::{self, TerminalState};
 
 /// Shared config state, updated on hot reload and read by new tab/split creation.
@@ -170,6 +171,9 @@ fn build_ui(app: &adw::Application, config: &Config) {
     config_help_section.append(Some("Terminal Inspector"), Some("win.terminal-inspector"));
     config_help_section.append(Some("Open Configuration"), Some("win.open-config"));
     config_help_section.append(Some("Reload Configuration"), Some("win.reload-config"));
+    let appearance_item = gio::MenuItem::new(Some("Appearance"), Some("win.appearance"));
+    appearance_item.set_attribute_value("accel", Some(&"<Control>comma".to_variant()));
+    config_help_section.append_item(&appearance_item);
     let shortcuts_item = gio::MenuItem::new(Some("Keyboard Shortcuts"), Some("win.show-shortcuts"));
     shortcuts_item.set_attribute_value("accel", Some(&"F1".to_variant()));
     config_help_section.append_item(&shortcuts_item);
@@ -220,6 +224,7 @@ fn build_ui(app: &adw::Application, config: &Config) {
 
     let tab_view = adw::TabView::new();
     tab_view.set_vexpand(true);
+    tab_view.set_hexpand(true);
 
     let tab_bar = adw::TabBar::new();
     tab_bar.set_view(Some(&tab_view));
@@ -230,10 +235,16 @@ fn build_ui(app: &adw::Application, config: &Config) {
     // The tab bar lives as a separate row below the header, auto-hidden when
     // only one tab exists (matching Ghostty's two-row layout for 2+ tabs).
 
+    // Wrap TabView in a horizontal Box with an Appearance sidebar Revealer.
+    // The sidebar slides in from the right when the user clicks "Appearance".
+    let main_area = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    main_area.set_vexpand(true);
+    main_area.append(&tab_view);
+
     let content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     content.append(&header);
     content.append(&tab_bar);
-    content.append(&tab_view);
+    content.append(&main_area);
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
@@ -255,6 +266,11 @@ fn build_ui(app: &adw::Application, config: &Config) {
     // Shared config -- updated on hot reload, read by new tab/split creation.
     // All action closures that create terminals capture a clone of this Rc.
     let shared_config: SharedConfig = Rc::new(RefCell::new(config.clone()));
+
+    // --- Appearance sidebar (right panel, built after shared state is ready) ---
+    let appearance_revealer =
+        preferences::build_appearance_sidebar(&shared_config, &tab_states, &window);
+    main_area.append(&appearance_revealer);
 
     // --- Tab close handling ---
     // When a tab's close button is clicked, kill ALL PTYs in the tab's
@@ -707,6 +723,19 @@ fn build_ui(app: &adw::Application, config: &Config) {
             reload_config(&shared_cfg_reload, &states_reload_action, &win_reload);
         });
         window.add_action(&action);
+    }
+
+    // --- Appearance sidebar toggle action (Ctrl+, or menu) ---
+    {
+        let revealer = appearance_revealer.clone();
+        let action = gio::SimpleAction::new("appearance", None);
+        action.connect_activate(move |_action, _param| {
+            let showing = revealer.reveals_child();
+            revealer.set_visible(!showing);
+            revealer.set_reveal_child(!showing);
+        });
+        window.add_action(&action);
+        app.set_accels_for_action("win.appearance", &["<Control>comma"]);
     }
 
     // --- Quit action (Ctrl+Shift+Q) ---
@@ -2162,10 +2191,7 @@ fn shortcut_no_accel(title: &str, subtitle: &str) -> gtk4::ShortcutsShortcut {
 
 /// Perform a full terminal reset (RIS) on the focused pane via the
 /// `ghostty_terminal_reset()` API, then queue a redraw.
-fn reset_focused_pane(
-    tab_states: &TabStateMap,
-    focus_tracker: &FocusTracker,
-) {
+fn reset_focused_pane(tab_states: &TabStateMap, focus_tracker: &FocusTracker) {
     let focused_name = {
         let Ok(name) = focus_tracker.try_borrow() else {
             return;
@@ -2254,11 +2280,7 @@ fn feed_escape_to_focused_pane(
 ///
 /// Used by Clear (sends Ctrl+L so the shell redraws the prompt) and Reset
 /// (sends a newline after the VT-level RIS to trigger a fresh prompt).
-fn write_to_focused_pty(
-    tab_states: &TabStateMap,
-    focus_tracker: &FocusTracker,
-    bytes: &[u8],
-) {
+fn write_to_focused_pty(tab_states: &TabStateMap, focus_tracker: &FocusTracker, bytes: &[u8]) {
     let focused_name = {
         let Ok(name) = focus_tracker.try_borrow() else {
             return;
