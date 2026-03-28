@@ -1,0 +1,27 @@
+name = "Wild Cherry"
+
+[colors]
+foreground = "#dafaff"
+background = "#1f1726"
+cursor = "#dd00ff"
+selection = "#002831"
+
+[colors.ansi]
+black = "#000507"
+red = "#d94085"
+green = "#2ab250"
+yellow = "#ffd16f"
+blue = "#883cdc"
+magenta = "#ececec"
+cyan = "#c1b8b7"
+white = "#fff8de"
+
+[colors.bright]
+black = "#009cc9"
+red = "#da6bac"
+green = "#f4dca5"
+yellow = "#eac066"
+blue = "#308cba"
+magenta = "#ae636b"
+cyan = "#ff919d"
+white = "#e4838d"

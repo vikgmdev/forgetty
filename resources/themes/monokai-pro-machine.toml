@@ -1,0 +1,27 @@
+name = "Monokai Pro Machine"
+
+[colors]
+foreground = "#f2fffc"
+background = "#273136"
+cursor = "#b8c4c3"
+selection = "#545f62"
+
+[colors.ansi]
+black = "#273136"
+red = "#ff6d7e"
+green = "#a2e57b"
+yellow = "#ffed72"
+blue = "#ffb270"
+magenta = "#baa0f8"
+cyan = "#7cd5f1"
+white = "#f2fffc"
+
+[colors.bright]
+black = "#6b7678"
+red = "#ff6d7e"
+green = "#a2e57b"
+yellow = "#ffed72"
+blue = "#ffb270"
+magenta = "#baa0f8"
+cyan = "#7cd5f1"
+white = "#f2fffc"

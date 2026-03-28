@@ -1,0 +1,27 @@
+name = "Sunset Drive"
+
+[colors]
+foreground = "#ededfd"
+background = "#0f0f19"
+cursor = "#ededfd"
+selection = "#202034"
+
+[colors.ansi]
+black = "#0a0a12"
+red = "#ff3366"
+green = "#00f59b"
+yellow = "#ffea00"
+blue = "#33a1ff"
+magenta = "#ff66f6"
+cyan = "#3cffed"
+white = "#ededfe"
+
+[colors.bright]
+black = "#181824"
+red = "#ff9a8f"
+green = "#57f8bd"
+yellow = "#ffff80"
+blue = "#5a9eff"
+magenta = "#ff99ff"
+cyan = "#80ffff"
+white = "#f8f8ff"

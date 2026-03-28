@@ -1,0 +1,27 @@
+name = "Cobalt Next Dark"
+
+[colors]
+foreground = "#d8dee9"
+background = "#0f1c23"
+cursor = "#fac863"
+selection = "#5fb3b3"
+
+[colors.ansi]
+black = "#282f36"
+red = "#e6576a"
+green = "#99c794"
+yellow = "#fac863"
+blue = "#5a9bcf"
+magenta = "#c5a5c5"
+cyan = "#5fb3b3"
+white = "#d8dee9"
+
+[colors.bright]
+black = "#65737e"
+red = "#d6838c"
+green = "#c1dcbe"
+yellow = "#ffde9b"
+blue = "#8abee7"
+magenta = "#edcded"
+cyan = "#9be2e2"
+white = "#ffffff"

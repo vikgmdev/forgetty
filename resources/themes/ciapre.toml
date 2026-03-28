@@ -1,0 +1,27 @@
+name = "Ciapre"
+
+[colors]
+foreground = "#aea47a"
+background = "#191c27"
+cursor = "#92805b"
+selection = "#172539"
+
+[colors.ansi]
+black = "#181818"
+red = "#810009"
+green = "#48513b"
+yellow = "#cc8b3f"
+blue = "#576d8c"
+magenta = "#724d7c"
+cyan = "#5c4f4b"
+white = "#aea47f"
+
+[colors.bright]
+black = "#555555"
+red = "#ac3835"
+green = "#a6a75d"
+yellow = "#dcdf7c"
+blue = "#3097c6"
+magenta = "#d33061"
+cyan = "#f3dbb2"
+white = "#f4f4f4"

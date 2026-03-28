@@ -1,0 +1,27 @@
+name = "Hot Dog Stand"
+
+[colors]
+foreground = "#ffffff"
+background = "#ea3323"
+cursor = "#ffff54"
+selection = "#ffff54"
+
+[colors.ansi]
+black = "#000000"
+red = "#ffff54"
+green = "#ffff54"
+yellow = "#ffff54"
+blue = "#000000"
+magenta = "#ffff54"
+cyan = "#ffffff"
+white = "#c6c6c6"
+
+[colors.bright]
+black = "#000000"
+red = "#ffff54"
+green = "#ffff54"
+yellow = "#ffff54"
+blue = "#000000"
+magenta = "#ffff54"
+cyan = "#ffffff"
+white = "#c6c6c6"

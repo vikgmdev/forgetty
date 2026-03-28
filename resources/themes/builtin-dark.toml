@@ -1,0 +1,27 @@
+name = "Builtin Dark"
+
+[colors]
+foreground = "#bbbbbb"
+background = "#000000"
+cursor = "#bbbbbb"
+selection = "#b5d5ff"
+
+[colors.ansi]
+black = "#000000"
+red = "#bb0000"
+green = "#00bb00"
+yellow = "#bbbb00"
+blue = "#0000bb"
+magenta = "#bb00bb"
+cyan = "#00bbbb"
+white = "#bbbbbb"
+
+[colors.bright]
+black = "#555555"
+red = "#ff5555"
+green = "#55ff55"
+yellow = "#ffff55"
+blue = "#5555ff"
+magenta = "#ff55ff"
+cyan = "#55ffff"
+white = "#ffffff"

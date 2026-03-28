@@ -1,0 +1,27 @@
+name = "Monospace Dark"
+
+[colors]
+foreground = "#a4afbd"
+background = "#10151d"
+cursor = "#c8aaff"
+selection = "#264dcb"
+
+[colors.ansi]
+black = "#738295"
+red = "#f76769"
+green = "#17b877"
+yellow = "#ffa23e"
+blue = "#708fff"
+magenta = "#a87ffb"
+cyan = "#25a6e9"
+white = "#a4afbd"
+
+[colors.bright]
+black = "#8b98a9"
+red = "#fc8f8e"
+green = "#66ce98"
+yellow = "#ffc26e"
+blue = "#a2b6ff"
+magenta = "#c8aaff"
+cyan = "#71c2ee"
+white = "#fafbfe"

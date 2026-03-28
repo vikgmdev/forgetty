@@ -1,0 +1,27 @@
+name = "novmbr"
+
+[colors]
+foreground = "#c4b9ad"
+background = "#231d1a"
+cursor = "#c4b9ad"
+selection = "#c4b9ad"
+
+[colors.ansi]
+black = "#282a2e"
+red = "#97673d"
+green = "#a0ac68"
+yellow = "#c6a869"
+blue = "#457b7b"
+magenta = "#ae8b72"
+cyan = "#5e867f"
+white = "#c4b9ad"
+
+[colors.bright]
+black = "#4e423b"
+red = "#97673d"
+green = "#a0ac68"
+yellow = "#c6a869"
+blue = "#457b7b"
+magenta = "#ae8b72"
+cyan = "#5e867f"
+white = "#c4b9ad"

@@ -1,0 +1,27 @@
+name = "Xcode Dark hc"
+
+[colors]
+foreground = "#ffffff"
+background = "#1f1f24"
+cursor = "#ffffff"
+selection = "#43454b"
+
+[colors.ansi]
+black = "#43454b"
+red = "#ff8a7a"
+green = "#83c9bc"
+yellow = "#d9c668"
+blue = "#4ec4e6"
+magenta = "#ff85b8"
+cyan = "#cda1ff"
+white = "#ffffff"
+
+[colors.bright]
+black = "#838991"
+red = "#ff8a7a"
+green = "#b1faeb"
+yellow = "#ffa14f"
+blue = "#6bdfff"
+magenta = "#ff85b8"
+cyan = "#e5cfff"
+white = "#ffffff"

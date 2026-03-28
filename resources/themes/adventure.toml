@@ -1,0 +1,27 @@
+name = "Adventure"
+
+[colors]
+foreground = "#feffff"
+background = "#040404"
+cursor = "#feffff"
+selection = "#606060"
+
+[colors.ansi]
+black = "#040404"
+red = "#d84a33"
+green = "#5da602"
+yellow = "#eebb6e"
+blue = "#417ab3"
+magenta = "#e5c499"
+cyan = "#bdcfe5"
+white = "#dbded8"
+
+[colors.bright]
+black = "#685656"
+red = "#d76b42"
+green = "#99b52c"
+yellow = "#ffb670"
+blue = "#97d7ef"
+magenta = "#aa7900"
+cyan = "#bdcfe5"
+white = "#e4d5c7"

@@ -1,0 +1,27 @@
+name = "Ghostty Default Style Dark"
+
+[colors]
+foreground = "#ffffff"
+background = "#292c33"
+cursor = "#ffffff"
+selection = "#ffffff"
+
+[colors.ansi]
+black = "#1d1f21"
+red = "#bf6b69"
+green = "#b7bd73"
+yellow = "#e9c880"
+blue = "#88a1bb"
+magenta = "#ad95b8"
+cyan = "#95bdb7"
+white = "#c5c8c6"
+
+[colors.bright]
+black = "#666666"
+red = "#c55757"
+green = "#bcc95f"
+yellow = "#e1c65e"
+blue = "#83a5d6"
+magenta = "#bc99d4"
+cyan = "#83beb1"
+white = "#eaeaea"

@@ -1,0 +1,27 @@
+name = "Cutie Pro"
+
+[colors]
+foreground = "#d5d0c9"
+background = "#181818"
+cursor = "#efc4cd"
+selection = "#363636"
+
+[colors.ansi]
+black = "#000000"
+red = "#f56e7f"
+green = "#bec975"
+yellow = "#f58669"
+blue = "#42d9c5"
+magenta = "#d286b7"
+cyan = "#37cb8a"
+white = "#d5c3c3"
+
+[colors.bright]
+black = "#88847f"
+red = "#e5a1a3"
+green = "#e8d6a7"
+yellow = "#f1bb79"
+blue = "#80c5de"
+magenta = "#b294bb"
+cyan = "#9dccbb"
+white = "#ffffff"

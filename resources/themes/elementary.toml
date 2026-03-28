@@ -1,0 +1,27 @@
+name = "Elementary"
+
+[colors]
+foreground = "#efefef"
+background = "#181818"
+cursor = "#bbbbbb"
+selection = "#b5d5ff"
+
+[colors.ansi]
+black = "#242424"
+red = "#d71c15"
+green = "#5aa513"
+yellow = "#fdb40c"
+blue = "#063b8c"
+magenta = "#e40038"
+cyan = "#2595e1"
+white = "#efefef"
+
+[colors.bright]
+black = "#4b4b4b"
+red = "#fc1c18"
+green = "#6bc219"
+yellow = "#fec80e"
+blue = "#0955ff"
+magenta = "#fb0050"
+cyan = "#3ea8fc"
+white = "#8c00ec"

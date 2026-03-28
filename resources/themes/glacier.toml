@@ -1,0 +1,27 @@
+name = "Glacier"
+
+[colors]
+foreground = "#ffffff"
+background = "#0c1115"
+cursor = "#6c6c6c"
+selection = "#bd2523"
+
+[colors.ansi]
+black = "#2e343c"
+red = "#bd0f2f"
+green = "#35a770"
+yellow = "#fb9435"
+blue = "#1f5872"
+magenta = "#bd2523"
+cyan = "#778397"
+white = "#ffffff"
+
+[colors.bright]
+black = "#404a55"
+red = "#bd0f2f"
+green = "#49e998"
+yellow = "#fddf6e"
+blue = "#2a8bc1"
+magenta = "#ea4727"
+cyan = "#a0b6d3"
+white = "#ffffff"

@@ -1,0 +1,27 @@
+name = "CLRS"
+
+[colors]
+foreground = "#262626"
+background = "#ffffff"
+cursor = "#6fd3fc"
+selection = "#6fd3fc"
+
+[colors.ansi]
+black = "#000000"
+red = "#f8282a"
+green = "#328a5d"
+yellow = "#fa701d"
+blue = "#135cd0"
+magenta = "#9f00bd"
+cyan = "#33c3c1"
+white = "#b3b3b3"
+
+[colors.bright]
+black = "#555753"
+red = "#fb0416"
+green = "#2cc631"
+yellow = "#fdd727"
+blue = "#1670ff"
+magenta = "#e900b0"
+cyan = "#3ad5ce"
+white = "#eeeeec"

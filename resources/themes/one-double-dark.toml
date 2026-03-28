@@ -1,0 +1,27 @@
+name = "One Double Dark"
+
+[colors]
+foreground = "#dcdfe4"
+background = "#292c33"
+cursor = "#f1e1dd"
+selection = "#595b6e"
+
+[colors.ansi]
+black = "#3e4451"
+red = "#e06c75"
+green = "#98c379"
+yellow = "#e5c07b"
+blue = "#61afef"
+magenta = "#c678dd"
+cyan = "#56b6c2"
+white = "#dcdfe4"
+
+[colors.bright]
+black = "#545d6d"
+red = "#fd807f"
+green = "#96d58b"
+yellow = "#edc273"
+blue = "#84c8ff"
+magenta = "#ee82ee"
+cyan = "#3ae1f7"
+white = "#f7f9fc"

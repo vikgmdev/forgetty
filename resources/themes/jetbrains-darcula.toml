@@ -1,0 +1,27 @@
+name = "JetBrains Darcula"
+
+[colors]
+foreground = "#adadad"
+background = "#202020"
+cursor = "#ffffff"
+selection = "#1a3272"
+
+[colors.ansi]
+black = "#000000"
+red = "#fa5355"
+green = "#126e00"
+yellow = "#c2c300"
+blue = "#4581eb"
+magenta = "#fa54ff"
+cyan = "#33c2c1"
+white = "#adadad"
+
+[colors.bright]
+black = "#555555"
+red = "#fb7172"
+green = "#67ff4f"
+yellow = "#ffff00"
+blue = "#6d9df1"
+magenta = "#fb82ff"
+cyan = "#60d3d1"
+white = "#eeeeee"

@@ -1,0 +1,27 @@
+name = "Rebecca"
+
+[colors]
+foreground = "#e8e6ed"
+background = "#292a44"
+cursor = "#b89bf9"
+selection = "#663399"
+
+[colors.ansi]
+black = "#12131e"
+red = "#dd7755"
+green = "#04dbb5"
+yellow = "#f2e7b7"
+blue = "#7aa5ff"
+magenta = "#bf9cf9"
+cyan = "#56d3c2"
+white = "#e4e3e9"
+
+[colors.bright]
+black = "#666699"
+red = "#ff92cd"
+green = "#01eac0"
+yellow = "#fffca8"
+blue = "#69c0fa"
+magenta = "#c17ff8"
+cyan = "#8bfde1"
+white = "#f4f2f9"

@@ -1,0 +1,27 @@
+name = "Adwaita"
+
+[colors]
+foreground = "#000000"
+background = "#ffffff"
+cursor = "#000000"
+selection = "#c0bfbc"
+
+[colors.ansi]
+black = "#241f31"
+red = "#c01c28"
+green = "#2ec27e"
+yellow = "#e8b504"
+blue = "#1e78e4"
+magenta = "#9841bb"
+cyan = "#0ab9dc"
+white = "#c0bfbc"
+
+[colors.bright]
+black = "#5e5c64"
+red = "#ed333b"
+green = "#4ad67c"
+yellow = "#d2be36"
+blue = "#51a1ff"
+magenta = "#c061cb"
+cyan = "#4fd2fd"
+white = "#f6f5f4"

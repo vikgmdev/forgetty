@@ -1,0 +1,27 @@
+name = "Monokai Pro Octagon"
+
+[colors]
+foreground = "#eaf2f1"
+background = "#282a3a"
+cursor = "#b2b9bd"
+selection = "#535763"
+
+[colors.ansi]
+black = "#282a3a"
+red = "#ff657a"
+green = "#bad761"
+yellow = "#ffd76d"
+blue = "#ff9b5e"
+magenta = "#c39ac9"
+cyan = "#9cd1bb"
+white = "#eaf2f1"
+
+[colors.bright]
+black = "#696d77"
+red = "#ff657a"
+green = "#bad761"
+yellow = "#ffd76d"
+blue = "#ff9b5e"
+magenta = "#c39ac9"
+cyan = "#9cd1bb"
+white = "#eaf2f1"

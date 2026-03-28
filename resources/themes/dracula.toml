@@ -1,0 +1,27 @@
+name = "Dracula+"
+
+[colors]
+foreground = "#f8f8f2"
+background = "#212121"
+cursor = "#eceff4"
+selection = "#f8f8f2"
+
+[colors.ansi]
+black = "#21222c"
+red = "#ff5555"
+green = "#50fa7b"
+yellow = "#ffcb6b"
+blue = "#82aaff"
+magenta = "#c792ea"
+cyan = "#8be9fd"
+white = "#f8f8f2"
+
+[colors.bright]
+black = "#545454"
+red = "#ff6e6e"
+green = "#69ff94"
+yellow = "#ffcb6b"
+blue = "#d6acff"
+magenta = "#ff92df"
+cyan = "#a4ffff"
+white = "#f8f8f2"

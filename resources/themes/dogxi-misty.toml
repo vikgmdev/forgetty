@@ -1,0 +1,27 @@
+name = "Dogxi Misty"
+
+[colors]
+foreground = "#eff0eb"
+background = "#282a35"
+cursor = "#eaeaea"
+selection = "#9bbace"
+
+[colors.ansi]
+black = "#000000"
+red = "#ec675e"
+green = "#a6e173"
+yellow = "#e6bf7b"
+blue = "#aceafb"
+magenta = "#ed73be"
+cyan = "#82dbeb"
+white = "#f1f1f0"
+
+[colors.bright]
+black = "#686868"
+red = "#ec675e"
+green = "#a6e173"
+yellow = "#e8c88a"
+blue = "#aceafb"
+magenta = "#ed73be"
+cyan = "#9cdeee"
+white = "#f1f1f0"

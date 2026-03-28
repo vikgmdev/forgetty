@@ -1,0 +1,27 @@
+name = "Idea"
+
+[colors]
+foreground = "#adadad"
+background = "#202020"
+cursor = "#bbbbbb"
+selection = "#44475a"
+
+[colors.ansi]
+black = "#adadad"
+red = "#fc5256"
+green = "#98b61c"
+yellow = "#ccb444"
+blue = "#437ee7"
+magenta = "#9d74b0"
+cyan = "#248887"
+white = "#181818"
+
+[colors.bright]
+black = "#ffffff"
+red = "#fc7072"
+green = "#98b61c"
+yellow = "#ffff0b"
+blue = "#6c9ced"
+magenta = "#fc7eff"
+cyan = "#248887"
+white = "#181818"

@@ -1,0 +1,27 @@
+name = "Rippedcasts"
+
+[colors]
+foreground = "#ffffff"
+background = "#2b2b2b"
+cursor = "#7f7f7f"
+selection = "#5a647e"
+
+[colors.ansi]
+black = "#000000"
+red = "#cdaf95"
+green = "#a8ff60"
+yellow = "#bfbb1f"
+blue = "#75a5b0"
+magenta = "#ff73fd"
+cyan = "#5a647e"
+white = "#bfbfbf"
+
+[colors.bright]
+black = "#666666"
+red = "#eecbad"
+green = "#bcee68"
+yellow = "#e5e500"
+blue = "#86bdc9"
+magenta = "#e500e5"
+cyan = "#8c9bc4"
+white = "#e5e5e5"

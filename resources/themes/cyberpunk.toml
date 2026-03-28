@@ -1,0 +1,27 @@
+name = "Cyberpunk"
+
+[colors]
+foreground = "#e5e5e5"
+background = "#332a57"
+cursor = "#21f6bc"
+selection = "#c1deff"
+
+[colors.ansi]
+black = "#000000"
+red = "#ff7092"
+green = "#00fbac"
+yellow = "#fffa6a"
+blue = "#00bfff"
+magenta = "#df95ff"
+cyan = "#86cbfe"
+white = "#ffffff"
+
+[colors.bright]
+black = "#000000"
+red = "#ff8aa4"
+green = "#21f6bc"
+yellow = "#fff787"
+blue = "#1bccfd"
+magenta = "#e6aefe"
+cyan = "#99d6fc"
+white = "#ffffff"

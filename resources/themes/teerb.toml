@@ -1,0 +1,27 @@
+name = "Teerb"
+
+[colors]
+foreground = "#d0d0d0"
+background = "#262626"
+cursor = "#e4c9af"
+selection = "#4d4d4d"
+
+[colors.ansi]
+black = "#1c1c1c"
+red = "#d68686"
+green = "#aed686"
+yellow = "#d7af87"
+blue = "#86aed6"
+magenta = "#d6aed6"
+cyan = "#8adbb4"
+white = "#d0d0d0"
+
+[colors.bright]
+black = "#1c1c1c"
+red = "#d68686"
+green = "#aed686"
+yellow = "#e4c9af"
+blue = "#86aed6"
+magenta = "#d6aed6"
+cyan = "#b1e7dd"
+white = "#efefef"

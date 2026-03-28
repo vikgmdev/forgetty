@@ -1,0 +1,27 @@
+name = "Dot Gov"
+
+[colors]
+foreground = "#ebebeb"
+background = "#262c35"
+cursor = "#d9002f"
+selection = "#1a4080"
+
+[colors.ansi]
+black = "#191919"
+red = "#bf091d"
+green = "#3d9751"
+yellow = "#f6bb34"
+blue = "#17b2e0"
+magenta = "#7830b0"
+cyan = "#8bd2ed"
+white = "#ffffff"
+
+[colors.bright]
+black = "#191919"
+red = "#bf091d"
+green = "#3d9751"
+yellow = "#f6bb34"
+blue = "#17b2e0"
+magenta = "#7830b0"
+cyan = "#8bd2ed"
+white = "#ffffff"

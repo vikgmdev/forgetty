@@ -1,0 +1,27 @@
+name = "Xcode WWDC"
+
+[colors]
+foreground = "#e7e8eb"
+background = "#292c36"
+cursor = "#e7e8eb"
+selection = "#494d5c"
+
+[colors.ansi]
+black = "#494d5c"
+red = "#bb383a"
+green = "#94c66e"
+yellow = "#d28e5d"
+blue = "#8884c5"
+magenta = "#b73999"
+cyan = "#00aba4"
+white = "#e7e8eb"
+
+[colors.bright]
+black = "#7f869e"
+red = "#bb383a"
+green = "#94c66e"
+yellow = "#d28e5d"
+blue = "#8884c5"
+magenta = "#b73999"
+cyan = "#00aba4"
+white = "#e7e8eb"

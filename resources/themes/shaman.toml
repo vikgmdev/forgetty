@@ -1,0 +1,27 @@
+name = "Shaman"
+
+[colors]
+foreground = "#405555"
+background = "#001015"
+cursor = "#4afcd6"
+selection = "#415555"
+
+[colors.ansi]
+black = "#012026"
+red = "#b2302d"
+green = "#00a941"
+yellow = "#5e8baa"
+blue = "#449a86"
+magenta = "#00599d"
+cyan = "#5d7e19"
+white = "#405555"
+
+[colors.bright]
+black = "#384451"
+red = "#ff4242"
+green = "#2aea5e"
+yellow = "#8ed4fd"
+blue = "#61d5ba"
+magenta = "#1298ff"
+cyan = "#98d028"
+white = "#58fbd6"

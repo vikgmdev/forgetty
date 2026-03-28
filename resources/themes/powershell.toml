@@ -1,0 +1,27 @@
+name = "Powershell"
+
+[colors]
+foreground = "#f6f6f7"
+background = "#052454"
+cursor = "#f6f6f7"
+selection = "#f6f6f7"
+
+[colors.ansi]
+black = "#000000"
+red = "#981a22"
+green = "#098003"
+yellow = "#c4a000"
+blue = "#4140c3"
+magenta = "#d33682"
+cyan = "#0e807f"
+white = "#7f7c7f"
+
+[colors.bright]
+black = "#808080"
+red = "#ef2929"
+green = "#1cfe3c"
+yellow = "#fefe45"
+blue = "#268ad2"
+magenta = "#fe13fa"
+cyan = "#29fffe"
+white = "#c2c1c3"

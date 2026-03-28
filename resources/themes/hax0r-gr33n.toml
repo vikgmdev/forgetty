@@ -1,0 +1,27 @@
+name = "HaX0R Gr33N"
+
+[colors]
+foreground = "#16b10e"
+background = "#020f01"
+cursor = "#15d00d"
+selection = "#d4ffc1"
+
+[colors.ansi]
+black = "#001f0b"
+red = "#15d00d"
+green = "#15d00d"
+yellow = "#15d00d"
+blue = "#15d00d"
+magenta = "#15d00d"
+cyan = "#15d00d"
+white = "#fafafa"
+
+[colors.bright]
+black = "#001510"
+red = "#19e20e"
+green = "#19e20e"
+yellow = "#19e20e"
+blue = "#19e20e"
+magenta = "#19e20e"
+cyan = "#19e20e"
+white = "#fefefe"

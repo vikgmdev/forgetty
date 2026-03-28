@@ -1,0 +1,27 @@
+name = "Sakura"
+
+[colors]
+foreground = "#dd7bdc"
+background = "#18131e"
+cursor = "#ff65fd"
+selection = "#c05cbf"
+
+[colors.ansi]
+black = "#000000"
+red = "#d52370"
+green = "#41af1a"
+yellow = "#bc7053"
+blue = "#6964ab"
+magenta = "#c71fbf"
+cyan = "#939393"
+white = "#998eac"
+
+[colors.bright]
+black = "#786d69"
+red = "#f41d99"
+green = "#22e529"
+yellow = "#f59574"
+blue = "#9892f1"
+magenta = "#e90cdd"
+cyan = "#eeeeee"
+white = "#cbb6ff"

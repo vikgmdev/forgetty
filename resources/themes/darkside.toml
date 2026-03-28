@@ -1,0 +1,27 @@
+name = "Darkside"
+
+[colors]
+foreground = "#bababa"
+background = "#222324"
+cursor = "#bbbbbb"
+selection = "#303333"
+
+[colors.ansi]
+black = "#000000"
+red = "#e8341c"
+green = "#68c256"
+yellow = "#f2d42c"
+blue = "#1c98e8"
+magenta = "#8e69c9"
+cyan = "#1c98e8"
+white = "#bababa"
+
+[colors.bright]
+black = "#000000"
+red = "#e05a4f"
+green = "#77b869"
+yellow = "#efd64b"
+blue = "#387cd3"
+magenta = "#957bbe"
+cyan = "#3d97e2"
+white = "#bababa"

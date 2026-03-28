@@ -1,0 +1,27 @@
+name = "Misterioso"
+
+[colors]
+foreground = "#e1e1e0"
+background = "#2d3743"
+cursor = "#000000"
+selection = "#2d37ff"
+
+[colors.ansi]
+black = "#000000"
+red = "#ff4242"
+green = "#74af68"
+yellow = "#ffad29"
+blue = "#338f86"
+magenta = "#9414e6"
+cyan = "#23d7d7"
+white = "#e1e1e0"
+
+[colors.bright]
+black = "#555555"
+red = "#ff3242"
+green = "#74cd68"
+yellow = "#ffb929"
+blue = "#23d7d7"
+magenta = "#ff37ff"
+cyan = "#00ede1"
+white = "#ffffff"

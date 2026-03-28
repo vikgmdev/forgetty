@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""Convert iTerm2-Color-Schemes .itermcolors XML (plist) to Forgetty TOML theme files.
+
+Usage:
+    python3 scripts/convert-iterm-themes.py /path/to/iTerm2-Color-Schemes/schemes
+
+Outputs:
+    resources/themes/*.toml           -- One TOML file per theme
+    crates/forgetty-config/src/bundled_themes.rs  -- include_str!() registry
+
+The generated files are committed to git. This script is a maintenance tool,
+NOT a build dependency.
+"""
+
+import os
+import plistlib
+import re
+import sys
+from pathlib import Path
+
+# Resolve project root (parent of scripts/)
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+THEMES_DIR = PROJECT_ROOT / "resources" / "themes"
+BUNDLED_RS = PROJECT_ROOT / "crates" / "forgetty-config" / "src" / "bundled_themes.rs"
+
+
+def plist_color_to_hex(color_dict: dict) -> str:
+    """Convert an iTerm2 plist color dict to a '#rrggbb' hex string."""
+    r = color_dict.get("Red Component", 0.0)
+    g = color_dict.get("Green Component", 0.0)
+    b = color_dict.get("Blue Component", 0.0)
+    # Clamp to [0, 1] and convert to 8-bit
+    ri = max(0, min(255, int(round(r * 255))))
+    gi = max(0, min(255, int(round(g * 255))))
+    bi = max(0, min(255, int(round(b * 255))))
+    return f"#{ri:02x}{gi:02x}{bi:02x}"
+
+
+def slugify(name: str) -> str:
+    """Convert a display name to a filesystem-safe slug.
+
+    Preserves case but replaces non-alphanumeric chars (except hyphens) with hyphens.
+    Collapses consecutive hyphens. Strips leading/trailing hyphens.
+    """
+    slug = re.sub(r"[^a-zA-Z0-9\-]", "-", name)
+    slug = re.sub(r"-+", "-", slug)
+    slug = slug.strip("-")
+    return slug.lower()
+
+
+def convert_scheme(plist_path: Path) -> tuple[str, str, str] | None:
+    """Convert a single .itermcolors file to a Forgetty TOML string.
+
+    Returns (display_name, slug, toml_content) or None on failure.
+    """
+    display_name = plist_path.stem
+    slug = slugify(display_name)
+
+    try:
+        with open(plist_path, "rb") as f:
+            plist = plistlib.load(f)
+    except Exception as e:
+        print(f"  SKIP {display_name}: {e}", file=sys.stderr)
+        return None
+
+    def get_color(key: str, fallback: str = "#000000") -> str:
+        d = plist.get(key)
+        if d is None:
+            return fallback
+        return plist_color_to_hex(d)
+
+    fg = get_color("Foreground Color", "#c0c0c0")
+    bg = get_color("Background Color", "#1e1e1e")
+    cursor = get_color("Cursor Color", fg)
+    selection = get_color("Selection Color", "#44475a")
+
+    # ANSI 0-7 (normal), 8-15 (bright)
+    ansi_names = ["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"]
+    ansi = {}
+    bright = {}
+    for i, name in enumerate(ansi_names):
+        ansi[name] = get_color(f"Ansi {i} Color")
+        bright[name] = get_color(f"Ansi {i + 8} Color")
+
+    lines = [
+        f'name = "{display_name}"',
+        "",
+        "[colors]",
+        f'foreground = "{fg}"',
+        f'background = "{bg}"',
+        f'cursor = "{cursor}"',
+        f'selection = "{selection}"',
+        "",
+        "[colors.ansi]",
+    ]
+    for name in ansi_names:
+        lines.append(f'{name} = "{ansi[name]}"')
+    lines.append("")
+    lines.append("[colors.bright]")
+    for name in ansi_names:
+        lines.append(f'{name} = "{bright[name]}"')
+    lines.append("")
+
+    return (display_name, slug, "\n".join(lines))
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python3 convert-iterm-themes.py /path/to/iTerm2-Color-Schemes/schemes")
+        sys.exit(1)
+
+    schemes_dir = Path(sys.argv[1])
+    if not schemes_dir.is_dir():
+        print(f"Error: {schemes_dir} is not a directory", file=sys.stderr)
+        sys.exit(1)
+
+    # Ensure output dirs exist
+    THEMES_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Remove old generated themes (keep default-dark.toml)
+    for f in THEMES_DIR.glob("*.toml"):
+        if f.name != "default-dark.toml":
+            f.unlink()
+
+    itermcolors = sorted(schemes_dir.glob("*.itermcolors"))
+    print(f"Found {len(itermcolors)} .itermcolors files")
+
+    entries = []  # (display_name, slug) for bundled_themes.rs
+    converted = 0
+    skipped = 0
+
+    for path in itermcolors:
+        result = convert_scheme(path)
+        if result is None:
+            skipped += 1
+            continue
+
+        display_name, slug, toml_content = result
+        out_path = THEMES_DIR / f"{slug}.toml"
+
+        # Handle slug collisions by appending a suffix
+        if out_path.exists():
+            i = 2
+            while out_path.exists():
+                out_path = THEMES_DIR / f"{slug}-{i}.toml"
+                i += 1
+
+        out_path.write_text(toml_content)
+        entries.append((display_name, out_path.name))
+        converted += 1
+
+    # Sort entries alphabetically by display name
+    entries.sort(key=lambda e: e[0].lower())
+
+    # Generate bundled_themes.rs
+    rs_lines = [
+        "//! Auto-generated bundled theme registry.",
+        "//!",
+        "//! Generated by `scripts/convert-iterm-themes.py`. Do NOT edit manually.",
+        "//! Re-run the script to regenerate after updating iTerm2-Color-Schemes.",
+        "",
+        "/// Bundled themes: (display_name, toml_content) pairs.",
+        "pub static BUNDLED_THEMES: &[(&str, &str)] = &[",
+    ]
+    for display_name, filename in entries:
+        # Escape any backslashes or quotes in display name
+        escaped = display_name.replace("\\", "\\\\").replace('"', '\\"')
+        rs_lines.append(
+            f'    ("{escaped}", include_str!("../../../resources/themes/{filename}")),'
+        )
+    rs_lines.append("];")
+    rs_lines.append("")
+
+    BUNDLED_RS.write_text("\n".join(rs_lines))
+
+    print(f"Converted: {converted}, Skipped: {skipped}")
+    print(f"TOML files: {THEMES_DIR}")
+    print(f"Rust registry: {BUNDLED_RS}")
+
+
+if __name__ == "__main__":
+    main()

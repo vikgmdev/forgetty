@@ -1,0 +1,27 @@
+name = "traffic"
+
+[colors]
+foreground = "#cbbaaa"
+background = "#282c30"
+cursor = "#cbbaaa"
+selection = "#cbbaaa"
+
+[colors.ansi]
+black = "#292d31"
+red = "#8a5249"
+green = "#667269"
+yellow = "#c1a088"
+blue = "#535e66"
+magenta = "#6e605e"
+cyan = "#606e7c"
+white = "#cbbaaa"
+
+[colors.bright]
+black = "#434a50"
+red = "#8a5249"
+green = "#667270"
+yellow = "#c1a088"
+blue = "#535e66"
+magenta = "#6e605e"
+cyan = "#606e7c"
+white = "#dacfc3"

@@ -1,0 +1,27 @@
+name = "Mathias"
+
+[colors]
+foreground = "#bbbbbb"
+background = "#000000"
+cursor = "#bbbbbb"
+selection = "#555555"
+
+[colors.ansi]
+black = "#000000"
+red = "#e52222"
+green = "#a6e32d"
+yellow = "#fc951e"
+blue = "#c48dff"
+magenta = "#fa2573"
+cyan = "#67d9f0"
+white = "#f2f2f2"
+
+[colors.bright]
+black = "#555555"
+red = "#ff5555"
+green = "#55ff55"
+yellow = "#ffff55"
+blue = "#5555ff"
+magenta = "#ff55ff"
+cyan = "#55ffff"
+white = "#ffffff"

@@ -1,0 +1,27 @@
+name = "Starlight"
+
+[colors]
+foreground = "#ffffff"
+background = "#242424"
+cursor = "#ffffff"
+selection = "#ffffff"
+
+[colors.ansi]
+black = "#242424"
+red = "#e2425d"
+green = "#66b238"
+yellow = "#dec541"
+blue = "#54aad0"
+magenta = "#e8b2f8"
+cyan = "#5abf9b"
+white = "#e6e6e6"
+
+[colors.bright]
+black = "#616161"
+red = "#ec5b58"
+green = "#6bd162"
+yellow = "#e9e85c"
+blue = "#78c3f3"
+magenta = "#f2afee"
+cyan = "#6adcc5"
+white = "#ffffff"

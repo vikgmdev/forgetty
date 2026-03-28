@@ -1,0 +1,27 @@
+name = "Alabaster"
+
+[colors]
+foreground = "#000000"
+background = "#f7f7f7"
+cursor = "#007acc"
+selection = "#bfdbfe"
+
+[colors.ansi]
+black = "#000000"
+red = "#aa3731"
+green = "#448c27"
+yellow = "#cb9000"
+blue = "#325cc0"
+magenta = "#7a3e9d"
+cyan = "#0083b2"
+white = "#f7f7f7"
+
+[colors.bright]
+black = "#777777"
+red = "#f05050"
+green = "#60cb00"
+yellow = "#ffbc5d"
+blue = "#007acc"
+magenta = "#e64ce6"
+cyan = "#00aacb"
+white = "#f7f7f7"

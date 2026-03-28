@@ -1,0 +1,27 @@
+name = "Havn Daggry"
+
+[colors]
+foreground = "#3e4a77"
+background = "#f8f9fb"
+cursor = "#386a51"
+selection = "#d4e8de"
+
+[colors.ansi]
+black = "#212840"
+red = "#8f564b"
+green = "#5c705b"
+yellow = "#b36f00"
+blue = "#40567a"
+magenta = "#775d93"
+cyan = "#8a5a7e"
+white = "#d7dbea"
+
+[colors.bright]
+black = "#212840"
+red = "#bd533e"
+green = "#79957b"
+yellow = "#f3b550"
+blue = "#6988bc"
+magenta = "#7b7393"
+cyan = "#a4879c"
+white = "#d7dbea"

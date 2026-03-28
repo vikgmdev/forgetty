@@ -1,0 +1,27 @@
+name = "iTerm2 Pastel Dark Background"
+
+[colors]
+foreground = "#c7c7c7"
+background = "#000000"
+cursor = "#ffb473"
+selection = "#454d96"
+
+[colors.ansi]
+black = "#626262"
+red = "#ff8373"
+green = "#b4fb73"
+yellow = "#fffdc3"
+blue = "#a5d5fe"
+magenta = "#ff90fe"
+cyan = "#d1d1fe"
+white = "#f1f1f1"
+
+[colors.bright]
+black = "#8f8f8f"
+red = "#ffc4be"
+green = "#d6fcba"
+yellow = "#fffed5"
+blue = "#c2e3ff"
+magenta = "#ffb2fe"
+cyan = "#e6e6fe"
+white = "#ffffff"

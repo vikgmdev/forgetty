@@ -1,0 +1,27 @@
+name = "IRIX Terminal"
+
+[colors]
+foreground = "#f2f2f2"
+background = "#000043"
+cursor = "#c7c7c7"
+selection = "#c2deff"
+
+[colors.ansi]
+black = "#1a1919"
+red = "#ff2b1e"
+green = "#57ff3d"
+yellow = "#ffff44"
+blue = "#0004ff"
+magenta = "#ff2cff"
+cyan = "#56ffff"
+white = "#ffffff"
+
+[colors.bright]
+black = "#ffff44"
+red = "#ffff44"
+green = "#ffff44"
+yellow = "#fffc72"
+blue = "#ffff44"
+magenta = "#ffff44"
+cyan = "#ffff44"
+white = "#ffff44"

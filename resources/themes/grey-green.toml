@@ -1,0 +1,27 @@
+name = "Grey Green"
+
+[colors]
+foreground = "#ffffff"
+background = "#002a1a"
+cursor = "#fff400"
+selection = "#517e50"
+
+[colors.ansi]
+black = "#000000"
+red = "#fe1414"
+green = "#74ff00"
+yellow = "#f1ff01"
+blue = "#00deff"
+magenta = "#ff00f0"
+cyan = "#00ffbc"
+white = "#ffffff"
+
+[colors.bright]
+black = "#666666"
+red = "#ff3939"
+green = "#00ff44"
+yellow = "#ffd100"
+blue = "#00afff"
+magenta = "#ff008a"
+cyan = "#00ffd3"
+white = "#f5ecec"

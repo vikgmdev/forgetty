@@ -1,0 +1,27 @@
+name = "Blue Berry Pie"
+
+[colors]
+foreground = "#babab9"
+background = "#1c0c28"
+cursor = "#fcfad6"
+selection = "#606060"
+
+[colors.ansi]
+black = "#0a4c62"
+red = "#99246e"
+green = "#5cb1b3"
+yellow = "#eab9a8"
+blue = "#90a5bd"
+magenta = "#9d54a7"
+cyan = "#7e83cc"
+white = "#f0e8d6"
+
+[colors.bright]
+black = "#201637"
+red = "#c87272"
+green = "#0a6c7e"
+yellow = "#7a3188"
+blue = "#39173d"
+magenta = "#bc94b7"
+cyan = "#5e6071"
+white = "#0a6c7e"

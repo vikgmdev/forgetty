@@ -1,0 +1,27 @@
+name = "Matrix"
+
+[colors]
+foreground = "#426644"
+background = "#0f191c"
+cursor = "#384545"
+selection = "#18282e"
+
+[colors.ansi]
+black = "#0f191c"
+red = "#23755a"
+green = "#82d967"
+yellow = "#ffd700"
+blue = "#3f5242"
+magenta = "#409931"
+cyan = "#50b45a"
+white = "#507350"
+
+[colors.bright]
+black = "#688060"
+red = "#2fc079"
+green = "#90d762"
+yellow = "#faff00"
+blue = "#4f7e7e"
+magenta = "#11ff25"
+cyan = "#c1ff8a"
+white = "#678c61"

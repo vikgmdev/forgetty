@@ -1,0 +1,27 @@
+name = "Darkermatrix"
+
+[colors]
+foreground = "#28380d"
+background = "#070c0e"
+cursor = "#373a26"
+selection = "#0f191c"
+
+[colors.ansi]
+black = "#091013"
+red = "#002e18"
+green = "#6fa64c"
+yellow = "#595900"
+blue = "#00cb6b"
+magenta = "#412a4d"
+cyan = "#125459"
+white = "#002e19"
+
+[colors.bright]
+black = "#333333"
+red = "#00381d"
+green = "#90d762"
+yellow = "#e2e500"
+blue = "#00ff87"
+magenta = "#412a4d"
+cyan = "#176c73"
+white = "#00381e"

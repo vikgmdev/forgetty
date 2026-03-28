@@ -1,0 +1,27 @@
+name = "Ardoise"
+
+[colors]
+foreground = "#eaeaea"
+background = "#1e1e1e"
+cursor = "#f7f7f7"
+selection = "#46515e"
+
+[colors.ansi]
+black = "#2c2c2c"
+red = "#d3322d"
+green = "#588b35"
+yellow = "#fca93a"
+blue = "#2465c2"
+magenta = "#7332b4"
+cyan = "#64e1b8"
+white = "#f7f7f7"
+
+[colors.bright]
+black = "#535353"
+red = "#fa5852"
+green = "#8dc252"
+yellow = "#ffea51"
+blue = "#6ab5f8"
+magenta = "#be68ca"
+cyan = "#89ffdb"
+white = "#fefefe"

@@ -1,0 +1,27 @@
+name = "Nocturnal Winter"
+
+[colors]
+foreground = "#e6e5e5"
+background = "#0d0d17"
+cursor = "#e6e5e5"
+selection = "#adbdd0"
+
+[colors.ansi]
+black = "#4d4d4d"
+red = "#f12d52"
+green = "#09cd7e"
+yellow = "#f5f17a"
+blue = "#3182e0"
+magenta = "#ff2b6d"
+cyan = "#09c87a"
+white = "#fcfcfc"
+
+[colors.bright]
+black = "#808080"
+red = "#f16d86"
+green = "#0ae78d"
+yellow = "#fffc67"
+blue = "#6096ff"
+magenta = "#ff78a2"
+cyan = "#0ae78d"
+white = "#ffffff"

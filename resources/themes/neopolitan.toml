@@ -1,0 +1,27 @@
+name = "Neopolitan"
+
+[colors]
+foreground = "#ffffff"
+background = "#271f19"
+cursor = "#ffffff"
+selection = "#253b76"
+
+[colors.ansi]
+black = "#000000"
+red = "#800000"
+green = "#61ce3c"
+yellow = "#fbde2d"
+blue = "#253b76"
+magenta = "#ff0080"
+cyan = "#8da6ce"
+white = "#f8f8f8"
+
+[colors.bright]
+black = "#000000"
+red = "#800000"
+green = "#61ce3c"
+yellow = "#fbde2d"
+blue = "#253b76"
+magenta = "#ff0080"
+cyan = "#8da6ce"
+white = "#f8f8f8"

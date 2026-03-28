@@ -1,0 +1,27 @@
+name = "IBM 5153 CGA (Black)"
+
+[colors]
+foreground = "#c4c4c4"
+background = "#000000"
+cursor = "#c4c4c4"
+selection = "#c4c4c4"
+
+[colors.ansi]
+black = "#000000"
+red = "#c40000"
+green = "#00c400"
+yellow = "#c47e00"
+blue = "#0000c4"
+magenta = "#c400c4"
+cyan = "#00c4c4"
+white = "#c4c4c4"
+
+[colors.bright]
+black = "#4e4e4e"
+red = "#dc4e4e"
+green = "#4edc4e"
+yellow = "#f3f34e"
+blue = "#4e4edc"
+magenta = "#f34ef3"
+cyan = "#4ef3f3"
+white = "#ffffff"

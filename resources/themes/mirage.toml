@@ -1,0 +1,27 @@
+name = "Mirage"
+
+[colors]
+foreground = "#a6b2c0"
+background = "#1b2738"
+cursor = "#ddb3ff"
+selection = "#273951"
+
+[colors.ansi]
+black = "#011627"
+red = "#ff9999"
+green = "#85cc95"
+yellow = "#ffd700"
+blue = "#7fb5ff"
+magenta = "#ddb3ff"
+cyan = "#21c7a8"
+white = "#ffffff"
+
+[colors.bright]
+black = "#575656"
+red = "#ff9999"
+green = "#85cc95"
+yellow = "#ffd700"
+blue = "#7fb5ff"
+magenta = "#ddb3ff"
+cyan = "#85cc95"
+white = "#ffffff"

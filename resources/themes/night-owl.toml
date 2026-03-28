@@ -1,0 +1,27 @@
+name = "Night Owl"
+
+[colors]
+foreground = "#d6deeb"
+background = "#011627"
+cursor = "#7e57c2"
+selection = "#5f7e97"
+
+[colors.ansi]
+black = "#011627"
+red = "#ef5350"
+green = "#22da6e"
+yellow = "#addb67"
+blue = "#82aaff"
+magenta = "#c792ea"
+cyan = "#21c7a8"
+white = "#ffffff"
+
+[colors.bright]
+black = "#575656"
+red = "#ef5350"
+green = "#22da6e"
+yellow = "#ffeb95"
+blue = "#82aaff"
+magenta = "#c792ea"
+cyan = "#7fdbca"
+white = "#ffffff"

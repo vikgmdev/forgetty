@@ -1,0 +1,27 @@
+name = "Light Owl"
+
+[colors]
+foreground = "#403f53"
+background = "#fbfbfb"
+cursor = "#403f53"
+selection = "#e0e0e0"
+
+[colors.ansi]
+black = "#403f53"
+red = "#de3d3b"
+green = "#08916a"
+yellow = "#e0af02"
+blue = "#288ed7"
+magenta = "#d6438a"
+cyan = "#2aa298"
+white = "#f0f0f0"
+
+[colors.bright]
+black = "#989fb1"
+red = "#de3d3b"
+green = "#08916a"
+yellow = "#daaa01"
+blue = "#288ed7"
+magenta = "#d6438a"
+cyan = "#2aa298"
+white = "#f0f0f0"

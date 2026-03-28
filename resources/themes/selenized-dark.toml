@@ -1,0 +1,27 @@
+name = "Selenized Dark"
+
+[colors]
+foreground = "#adbcbc"
+background = "#103c48"
+cursor = "#adbcbc"
+selection = "#184956"
+
+[colors.ansi]
+black = "#184956"
+red = "#fa5750"
+green = "#75b938"
+yellow = "#dbb32d"
+blue = "#4695f7"
+magenta = "#f275be"
+cyan = "#41c7b9"
+white = "#adbcbc"
+
+[colors.bright]
+black = "#72898f"
+red = "#ff665c"
+green = "#84c747"
+yellow = "#ebc13d"
+blue = "#58a3ff"
+magenta = "#ff84cd"
+cyan = "#53d6c7"
+white = "#cad8d9"

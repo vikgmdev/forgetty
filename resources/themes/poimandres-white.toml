@@ -1,0 +1,27 @@
+name = "Poimandres White"
+
+[colors]
+foreground = "#969cbd"
+background = "#fefeff"
+cursor = "#969cbd"
+selection = "#969cbd"
+
+[colors.ansi]
+black = "#fefeff"
+red = "#ff2090"
+green = "#01dab2"
+yellow = "#e5ba4e"
+blue = "#8abacd"
+magenta = "#eb8394"
+cyan = "#8abacd"
+white = "#000000"
+
+[colors.bright]
+black = "#969cbd"
+red = "#ff2090"
+green = "#01dab2"
+yellow = "#e5ba4e"
+blue = "#0ebfff"
+magenta = "#eb8394"
+cyan = "#0ebfff"
+white = "#000000"

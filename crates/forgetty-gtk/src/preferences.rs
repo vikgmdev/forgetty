@@ -1,15 +1,14 @@
 //! Appearance sidebar for live visual configuration editing.
 //!
 //! Provides an in-window sidebar (right-panel) with Theme, Font Family, and
-//! Font Size dropdowns. Every change is applied IMMEDIATELY to all terminal
-//! panes via `apply_config_change()`, then persisted to disk in the background.
+//! Font Size dropdowns. All changes apply immediately with live preview and
+//! are saved to disk.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::rc::Rc;
 
-use forgetty_config::{parse_theme_file, save_config, Config, Theme};
+use forgetty_config::{load_theme_by_name, load_theme_catalog, save_config, Config};
 use gtk4::prelude::*;
 use libadwaita as adw;
 
@@ -21,15 +20,17 @@ type SharedConfig = Rc<RefCell<Config>>;
 /// Pane state map, matching the type alias in `app.rs`.
 type TabStateMap = Rc<RefCell<HashMap<String, Rc<RefCell<TerminalState>>>>>;
 
+
 /// Build the Appearance sidebar as a `gtk4::Revealer`.
 ///
 /// The revealer uses `SlideLeft` transition and starts hidden. The caller
 /// places it in the layout and connects a menu action to toggle visibility.
 ///
-/// Each dropdown's change handler:
-/// 1. Mutates `SharedConfig` directly.
-/// 2. Calls `apply_config_change()` on every pane for instant visual update.
-/// 3. Fires `save_config()` in the background to persist to disk.
+/// The theme browser supports:
+/// - Arrow key navigation with live preview on every selection change.
+/// - Enter to confirm (save to config.toml).
+/// - Escape to revert to the original theme.
+/// - Close sidebar (X button or toggle) also reverts if no Enter was pressed.
 pub fn build_appearance_sidebar(
     shared_config: &SharedConfig,
     tab_states: &TabStateMap,
@@ -69,12 +70,6 @@ pub fn build_appearance_sidebar(
     let close_button = gtk4::Button::from_icon_name("window-close-symbolic");
     close_button.add_css_class("flat");
     close_button.set_tooltip_text(Some("Close (Ctrl+,)"));
-    {
-        let rev = revealer.clone();
-        close_button.connect_clicked(move |_| {
-            rev.set_reveal_child(false);
-        });
-    }
     title_bar.append(&close_button);
 
     sidebar_box.append(&title_bar);
@@ -91,32 +86,40 @@ pub fn build_appearance_sidebar(
         cfg.clone()
     };
 
-    // --- Theme section ---
-    let theme_section = build_theme_section(&current_config, shared_config, tab_states, window);
-    sidebar_box.append(&theme_section);
+    // --- Scrollable content area (holds all sections) ---
+    let content_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    content_box.set_vexpand(true);
+
+    // --- Theme dropdown section ---
+    let theme_section =
+        build_theme_section(&current_config, shared_config, tab_states, window);
+    content_box.append(&theme_section);
 
     // --- Font Family section ---
     let font_family_section =
         build_font_family_section(&current_config, shared_config, tab_states, window);
-    sidebar_box.append(&font_family_section);
+    content_box.append(&font_family_section);
 
     // --- Font Size section ---
     let font_size_section =
         build_font_size_section(&current_config, shared_config, tab_states, window);
-    sidebar_box.append(&font_size_section);
+    content_box.append(&font_size_section);
 
-    // Close sidebar on Escape when it has focus.
+    // Wrap content in a ScrolledWindow for long option lists.
+    let scrolled_sidebar = gtk4::ScrolledWindow::new();
+    scrolled_sidebar.set_child(Some(&content_box));
+    scrolled_sidebar.set_vexpand(true);
+    scrolled_sidebar.set_propagate_natural_height(true);
+    scrolled_sidebar.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
+    sidebar_box.append(&scrolled_sidebar);
+
+    // --- Close button handler ---
     {
         let rev = revealer.clone();
-        let key_controller = gtk4::EventControllerKey::new();
-        key_controller.connect_key_pressed(move |_ctrl, key, _code, _mods| {
-            if key == gtk4::gdk::Key::Escape {
-                rev.set_reveal_child(false);
-                return gtk4::glib::Propagation::Stop;
-            }
-            gtk4::glib::Propagation::Proceed
+        close_button.connect_clicked(move |_| {
+            rev.set_reveal_child(false);
+            rev.set_visible(false);
         });
-        sidebar_box.add_controller(key_controller);
     }
 
     revealer.set_child(Some(&sidebar_box));
@@ -124,10 +127,10 @@ pub fn build_appearance_sidebar(
 }
 
 // ---------------------------------------------------------------------------
-// Theme section
+// Theme dropdown section
 // ---------------------------------------------------------------------------
 
-/// Build the Theme dropdown section.
+/// Build the Theme dropdown section (same pattern as Font Family).
 fn build_theme_section(
     config: &Config,
     shared_config: &SharedConfig,
@@ -139,45 +142,13 @@ fn build_theme_section(
     let label = make_section_label("Theme");
     section.append(&label);
 
-    // Scan for custom theme files.
-    let themes_dir = forgetty_core::platform::config_dir().join("themes");
-    let mut theme_entries: Vec<(String, Option<PathBuf>)> = vec![];
-    theme_entries.push(("Default Dark".to_string(), None));
-
-    if themes_dir.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(&themes_dir) {
-            let mut custom: Vec<(String, PathBuf)> = entries
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().extension().is_some_and(|ext| ext == "toml"))
-                .filter_map(|e| {
-                    let path = e.path();
-                    let stem = path.file_stem()?.to_string_lossy().to_string();
-                    // Validate the theme parses before adding it.
-                    match std::fs::read_to_string(&path) {
-                        Ok(contents) => match parse_theme_file(&contents) {
-                            Ok(_) => Some((stem, path)),
-                            Err(e) => {
-                                tracing::warn!("Skipping malformed theme {}: {e}", path.display());
-                                None
-                            }
-                        },
-                        Err(e) => {
-                            tracing::warn!("Skipping unreadable theme {}: {e}", path.display());
-                            None
-                        }
-                    }
-                })
-                .collect();
-            custom.sort_by(|a, b| a.0.cmp(&b.0));
-            for (name, path) in custom {
-                theme_entries.push((name, Some(path)));
-            }
-        }
-    }
+    // Load the full theme catalog (bundled + custom).
+    let catalog = load_theme_catalog();
+    let theme_names: Vec<String> = catalog.iter().map(|e| e.name.clone()).collect();
 
     // Build StringList model.
     let string_list = gtk4::StringList::new(&[]);
-    for (name, _) in &theme_entries {
+    for name in &theme_names {
         string_list.append(name);
     }
 
@@ -185,47 +156,44 @@ fn build_theme_section(
     dropdown.set_margin_start(12);
     dropdown.set_margin_end(12);
 
+    // Enable search for 400+ themes.
+    dropdown.set_enable_search(true);
+
     // Pre-select the current theme.
-    let selected_idx = find_current_theme_index(config, &theme_entries);
+    let current_name = config.theme_name.as_deref().unwrap_or("0x96f");
+    let selected_idx = theme_names
+        .iter()
+        .position(|n| n == current_name)
+        .unwrap_or(0) as u32;
     dropdown.set_selected(selected_idx);
 
-    let theme_count = theme_entries.len() as u32;
+    let theme_count = theme_names.len() as u32;
 
-    // Connect change handler.
+    // Connect change handler — immediate apply + save (same as font dropdowns).
     {
         let shared = Rc::clone(shared_config);
         let states = Rc::clone(tab_states);
         let win = window.clone();
-        let entries = theme_entries;
+        let names = theme_names;
         dropdown.connect_selected_notify(move |dd| {
             let idx = dd.selected() as usize;
-            if idx >= entries.len() {
+            if idx >= names.len() {
                 return;
             }
-
-            let new_theme = match &entries[idx].1 {
-                None => Theme::default(),
-                Some(p) => {
-                    match std::fs::read_to_string(p)
-                        .map_err(|e| e.to_string())
-                        .and_then(|s| parse_theme_file(&s).map_err(|e| e.to_string()))
-                    {
-                        Ok(theme) => theme,
-                        Err(e) => {
-                            tracing::warn!("Failed to parse theme {}: {e}", p.display());
-                            return;
-                        }
-                    }
-                }
-            };
+            let theme_name = &names[idx];
+            let new_theme = load_theme_by_name(theme_name).unwrap_or_default();
 
             // 1. Update SharedConfig
             let new_config = {
                 let Ok(cfg) = shared.try_borrow() else {
                     return;
                 };
+                if cfg.theme_name.as_deref() == Some(theme_name.as_str()) {
+                    return;
+                }
                 let mut updated = cfg.clone();
                 updated.theme = new_theme;
+                updated.theme_name = Some(theme_name.clone());
                 updated
             };
             if let Ok(mut cfg) = shared.try_borrow_mut() {
@@ -461,37 +429,6 @@ fn find_closest_size_index(current_size: f32) -> u32 {
         }
     }
     best_idx
-}
-
-/// Find the index of the currently active theme in the theme entries list.
-///
-/// Compares the current config theme against the default and each custom file.
-/// Falls back to 0 (Default Dark) if no match is found.
-fn find_current_theme_index(config: &Config, entries: &[(String, Option<PathBuf>)]) -> u32 {
-    let default_theme = Theme::default();
-    if theme_matches(&config.theme, &default_theme) {
-        return 0;
-    }
-
-    // Check custom themes by parsing each file.
-    for (idx, (_, path)) in entries.iter().enumerate() {
-        if let Some(p) = path {
-            if let Ok(contents) = std::fs::read_to_string(p) {
-                if let Ok(theme) = parse_theme_file(&contents) {
-                    if theme_matches(&config.theme, &theme) {
-                        return idx as u32;
-                    }
-                }
-            }
-        }
-    }
-
-    0
-}
-
-/// Rough equality check for two themes (compare foreground, background, and cursor).
-fn theme_matches(a: &Theme, b: &Theme) -> bool {
-    a.foreground == b.foreground && a.background == b.background && a.cursor == b.cursor
 }
 
 /// Recursively find a DrawingArea with the given widget name.

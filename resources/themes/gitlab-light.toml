@@ -1,0 +1,27 @@
+name = "GitLab Light"
+
+[colors]
+foreground = "#303030"
+background = "#fafaff"
+cursor = "#303030"
+selection = "#ad95e9"
+
+[colors.ansi]
+black = "#303030"
+red = "#a31700"
+green = "#0a7f3d"
+yellow = "#af551d"
+blue = "#006cd8"
+magenta = "#583cac"
+cyan = "#00798a"
+white = "#303030"
+
+[colors.bright]
+black = "#303030"
+red = "#a31700"
+green = "#0a7f3d"
+yellow = "#af551d"
+blue = "#006cd8"
+magenta = "#583cac"
+cyan = "#00798a"
+white = "#303030"

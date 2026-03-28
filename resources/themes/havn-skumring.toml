@@ -1,0 +1,27 @@
+name = "Havn Skumring"
+
+[colors]
+foreground = "#d7dbea"
+background = "#121521"
+cursor = "#40786f"
+selection = "#34504b"
+
+[colors.ansi]
+black = "#262c45"
+red = "#d96048"
+green = "#7cab7f"
+yellow = "#eeb64e"
+blue = "#5d6bef"
+magenta = "#7a729a"
+cyan = "#ca8cbe"
+white = "#dde0ed"
+
+[colors.bright]
+black = "#212840"
+red = "#c47768"
+green = "#8f9d90"
+yellow = "#e4c693"
+blue = "#5d85c6"
+magenta = "#967de7"
+cyan = "#c57eb3"
+white = "#fdf6e3"

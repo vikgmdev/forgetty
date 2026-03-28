@@ -1,0 +1,27 @@
+name = "Dalton Dark"
+
+[colors]
+foreground = "#c8c9cc"
+background = "#1b1b1b"
+cursor = "#9a9a9a"
+selection = "#c8c9cc"
+
+[colors.ansi]
+black = "#282828"
+red = "#d85050"
+green = "#5b914e"
+yellow = "#c4c40c"
+blue = "#7aa2f7"
+magenta = "#a050d0"
+cyan = "#56717f"
+white = "#b8b8b8"
+
+[colors.bright]
+black = "#494949"
+red = "#f07068"
+green = "#88b97d"
+yellow = "#eded02"
+blue = "#97b1f1"
+magenta = "#c070f0"
+cyan = "#6691a7"
+white = "#d8d8d8"

@@ -1,0 +1,27 @@
+name = "Poimandres"
+
+[colors]
+foreground = "#a6accd"
+background = "#1a1e28"
+cursor = "#ffffff"
+selection = "#a6accd"
+
+[colors.ansi]
+black = "#1a1e28"
+red = "#d0679d"
+green = "#5de4c7"
+yellow = "#fffac2"
+blue = "#89ddff"
+magenta = "#fcc5e9"
+cyan = "#add7ff"
+white = "#ffffff"
+
+[colors.bright]
+black = "#a6accd"
+red = "#d0679d"
+green = "#5de4c7"
+yellow = "#fffac2"
+blue = "#add7ff"
+magenta = "#fae4fc"
+cyan = "#89ddff"
+white = "#ffffff"

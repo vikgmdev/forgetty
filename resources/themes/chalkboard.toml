@@ -1,0 +1,27 @@
+name = "Chalkboard"
+
+[colors]
+foreground = "#d9e6f2"
+background = "#29262f"
+cursor = "#d9e6f2"
+selection = "#073642"
+
+[colors.ansi]
+black = "#000000"
+red = "#c37372"
+green = "#72c373"
+yellow = "#c2c372"
+blue = "#7372c3"
+magenta = "#c372c2"
+cyan = "#72c2c3"
+white = "#d9d9d9"
+
+[colors.bright]
+black = "#323232"
+red = "#dbaaaa"
+green = "#aadbaa"
+yellow = "#dadbaa"
+blue = "#aaaadb"
+magenta = "#dbaada"
+cyan = "#aadadb"
+white = "#ffffff"

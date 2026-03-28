@@ -1,0 +1,27 @@
+name = "Apple System Colors Light"
+
+[colors]
+foreground = "#000000"
+background = "#feffff"
+cursor = "#98989d"
+selection = "#b4d7ff"
+
+[colors.ansi]
+black = "#1a1a1a"
+red = "#bc4437"
+green = "#51a148"
+yellow = "#c7ad3a"
+blue = "#2e68c5"
+magenta = "#8c4bb8"
+cyan = "#5e9cbe"
+white = "#98989d"
+
+[colors.bright]
+black = "#464646"
+red = "#eb5545"
+green = "#6bd45f"
+yellow = "#f8d84a"
+blue = "#3b82f7"
+magenta = "#b260ea"
+cyan = "#8dd3fb"
+white = "#ffffff"

@@ -1,0 +1,27 @@
+name = "Fahrenheit"
+
+[colors]
+foreground = "#ffffce"
+background = "#000000"
+cursor = "#bbbbbb"
+selection = "#4e739f"
+
+[colors.ansi]
+black = "#1d1d1d"
+red = "#cda074"
+green = "#9e744d"
+yellow = "#fecf75"
+blue = "#720102"
+magenta = "#734c4d"
+cyan = "#979797"
+white = "#ffffce"
+
+[colors.bright]
+black = "#000000"
+red = "#fecea0"
+green = "#cc734d"
+yellow = "#fd9f4d"
+blue = "#cb4a05"
+magenta = "#4e739f"
+cyan = "#fed04d"
+white = "#ffffff"

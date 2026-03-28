@@ -1,0 +1,27 @@
+name = "Obsidian"
+
+[colors]
+foreground = "#cdcdcd"
+background = "#283033"
+cursor = "#c0cad0"
+selection = "#3e4c4f"
+
+[colors.ansi]
+black = "#000000"
+red = "#a60001"
+green = "#00bb00"
+yellow = "#fecd22"
+blue = "#3a9bdb"
+magenta = "#bb00bb"
+cyan = "#00bbbb"
+white = "#bbbbbb"
+
+[colors.bright]
+black = "#555555"
+red = "#ff0003"
+green = "#93c863"
+yellow = "#fef874"
+blue = "#a1d7ff"
+magenta = "#ff55ff"
+cyan = "#55ffff"
+white = "#ffffff"

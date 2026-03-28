@@ -1,0 +1,27 @@
+name = "GitLab Dark"
+
+[colors]
+foreground = "#ffffff"
+background = "#28262b"
+cursor = "#ffffff"
+selection = "#ad95e9"
+
+[colors.ansi]
+black = "#000000"
+red = "#f57f6c"
+green = "#52b87a"
+yellow = "#d99530"
+blue = "#7fb6ed"
+magenta = "#f88aaf"
+cyan = "#32c5d2"
+white = "#ffffff"
+
+[colors.bright]
+black = "#666666"
+red = "#fcb5aa"
+green = "#91d4a8"
+yellow = "#e9be74"
+blue = "#498dd1"
+magenta = "#fcacc5"
+cyan = "#5edee3"
+white = "#ffffff"

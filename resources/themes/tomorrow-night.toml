@@ -1,0 +1,27 @@
+name = "Tomorrow Night"
+
+[colors]
+foreground = "#c5c8c6"
+background = "#1d1f21"
+cursor = "#c5c8c6"
+selection = "#373b41"
+
+[colors.ansi]
+black = "#000000"
+red = "#cc6666"
+green = "#b5bd68"
+yellow = "#f0c674"
+blue = "#81a2be"
+magenta = "#b294bb"
+cyan = "#8abeb7"
+white = "#ffffff"
+
+[colors.bright]
+black = "#000000"
+red = "#cc6666"
+green = "#b5bd68"
+yellow = "#f0c674"
+blue = "#81a2be"
+magenta = "#b294bb"
+cyan = "#8abeb7"
+white = "#ffffff"

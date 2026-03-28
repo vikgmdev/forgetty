@@ -1,0 +1,27 @@
+name = "Piatto Light"
+
+[colors]
+foreground = "#414141"
+background = "#ffffff"
+cursor = "#5e77c8"
+selection = "#706b4e"
+
+[colors.ansi]
+black = "#414141"
+red = "#b23771"
+green = "#66781e"
+yellow = "#cd6f34"
+blue = "#3c5ea8"
+magenta = "#a454b2"
+cyan = "#66781e"
+white = "#ffffff"
+
+[colors.bright]
+black = "#3f3f3f"
+red = "#db3365"
+green = "#829429"
+yellow = "#cd6f34"
+blue = "#3c5ea8"
+magenta = "#a454b2"
+cyan = "#829429"
+white = "#f2f2f2"

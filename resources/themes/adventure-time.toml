@@ -1,0 +1,27 @@
+name = "Adventure Time"
+
+[colors]
+foreground = "#f8dcc0"
+background = "#1f1d45"
+cursor = "#efbf38"
+selection = "#706b4e"
+
+[colors.ansi]
+black = "#050404"
+red = "#bd0013"
+green = "#4ab118"
+yellow = "#e7741e"
+blue = "#0f4ac6"
+magenta = "#665993"
+cyan = "#70a598"
+white = "#f8dcc0"
+
+[colors.bright]
+black = "#4e7cbf"
+red = "#fc5f5a"
+green = "#9eff6e"
+yellow = "#efc11a"
+blue = "#1997c6"
+magenta = "#9b5953"
+cyan = "#c8faf4"
+white = "#f6f5fb"

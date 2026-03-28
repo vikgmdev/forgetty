@@ -1,0 +1,27 @@
+name = "Builtin Pastel Dark"
+
+[colors]
+foreground = "#bbbbbb"
+background = "#000000"
+cursor = "#ffa560"
+selection = "#363983"
+
+[colors.ansi]
+black = "#4f4f4f"
+red = "#ff6c60"
+green = "#a8ff60"
+yellow = "#ffffb6"
+blue = "#96cbfe"
+magenta = "#ff73fd"
+cyan = "#c6c5fe"
+white = "#eeeeee"
+
+[colors.bright]
+black = "#7c7c7c"
+red = "#ffb6b0"
+green = "#ceffac"
+yellow = "#ffffcc"
+blue = "#b5dcff"
+magenta = "#ff9cfe"
+cyan = "#dfdffe"
+white = "#ffffff"

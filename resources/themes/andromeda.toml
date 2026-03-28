@@ -1,0 +1,27 @@
+name = "Andromeda"
+
+[colors]
+foreground = "#e5e5e5"
+background = "#262a33"
+cursor = "#f8f8f0"
+selection = "#5a5c62"
+
+[colors.ansi]
+black = "#000000"
+red = "#cd3131"
+green = "#05bc79"
+yellow = "#e5e512"
+blue = "#2472c8"
+magenta = "#bc3fbc"
+cyan = "#0fa8cd"
+white = "#e5e5e5"
+
+[colors.bright]
+black = "#666666"
+red = "#cd3131"
+green = "#05bc79"
+yellow = "#e5e512"
+blue = "#2472c8"
+magenta = "#bc3fbc"
+cyan = "#0fa8cd"
+white = "#e5e5e5"

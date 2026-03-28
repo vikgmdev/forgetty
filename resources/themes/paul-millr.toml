@@ -1,0 +1,27 @@
+name = "Paul Millr"
+
+[colors]
+foreground = "#f2f2f2"
+background = "#000000"
+cursor = "#4d4d4d"
+selection = "#414141"
+
+[colors.ansi]
+black = "#2a2a2a"
+red = "#ff0000"
+green = "#79ff0f"
+yellow = "#e7bf00"
+blue = "#396bd7"
+magenta = "#b449be"
+cyan = "#66ccff"
+white = "#bbbbbb"
+
+[colors.bright]
+black = "#666666"
+red = "#ff0080"
+green = "#66ff66"
+yellow = "#f3d64e"
+blue = "#709aed"
+magenta = "#db67e6"
+cyan = "#7adff2"
+white = "#ffffff"

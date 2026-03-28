@@ -1,0 +1,27 @@
+name = "Spacegray Bright"
+
+[colors]
+foreground = "#f3f3f3"
+background = "#2a2e3a"
+cursor = "#c6c6c6"
+selection = "#cacaca"
+
+[colors.ansi]
+black = "#080808"
+red = "#bc5553"
+green = "#a0b56c"
+yellow = "#f6c987"
+blue = "#7baec1"
+magenta = "#b98aae"
+cyan = "#85c9b8"
+white = "#d8d8d8"
+
+[colors.bright]
+black = "#626262"
+red = "#bc5553"
+green = "#a0b56c"
+yellow = "#f6c987"
+blue = "#7baec1"
+magenta = "#b98aae"
+cyan = "#85c9b8"
+white = "#f7f7f7"

@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use crate::theme::Theme;
 
-/// The bell mode — how the terminal responds to BEL (0x07).
+/// The bell mode -- how the terminal responds to BEL (0x07).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 #[derive(Default)]
@@ -42,45 +42,174 @@ pub enum CursorStyle {
 }
 
 /// The top-level Forgetty configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Supports two theme formats for backward compatibility:
+/// - **New format:** `theme = "Theme Name"` (a string referencing a named theme)
+/// - **Old format:** `[theme]` inline table with full color values
+///
+/// On load, `theme_name` is resolved to a `Theme` struct. On save, only
+/// `theme_name` is written (not inline colors), keeping `config.toml` clean.
+#[derive(Debug, Clone)]
 pub struct Config {
     /// The font family name (e.g., "JetBrains Mono").
-    #[serde(default = "default_font_family")]
     pub font_family: String,
 
     /// The font size in points.
-    #[serde(default = "default_font_size")]
     pub font_size: f32,
 
-    /// The color theme.
-    #[serde(default)]
+    /// The resolved color theme (not serialized directly).
     pub theme: Theme,
+
+    /// The theme name for config persistence (e.g., "Dracula", "Default Dark").
+    /// When `Some`, this is what gets written to `config.toml`.
+    /// When `None`, the inline `[theme]` format was used (legacy).
+    pub theme_name: Option<String>,
 
     /// The shell command to launch (e.g., "/bin/zsh").
     /// If `None`, the user's default shell is used.
-    #[serde(default)]
     pub shell: Option<String>,
 
     /// Maximum number of scrollback lines to retain.
-    #[serde(default = "default_scrollback_lines")]
     pub scrollback_lines: usize,
 
     /// The cursor style.
-    #[serde(default)]
     pub cursor_style: CursorStyle,
 
     /// The bell mode (visual, audio, both, or none).
-    #[serde(default)]
     pub bell_mode: BellMode,
 
     /// Custom keybindings mapping action names to key combinations.
-    #[serde(default)]
     pub keybindings: HashMap<String, String>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         crate::defaults::default_config()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Custom Serialize: writes `theme = "name"` when theme_name is set,
+// otherwise falls back to inline `[theme]` table.
+// ---------------------------------------------------------------------------
+
+impl Serialize for Config {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+
+        // Count fields: font_family, font_size, theme/theme_name, shell?,
+        // scrollback_lines, cursor_style, bell_mode, keybindings?
+        let mut len = 5; // font_family, font_size, theme, scrollback_lines, cursor_style, bell_mode
+        len += 1; // bell_mode
+        if self.shell.is_some() {
+            len += 1;
+        }
+        if !self.keybindings.is_empty() {
+            len += 1;
+        }
+
+        let mut map = serializer.serialize_map(Some(len))?;
+
+        map.serialize_entry("font_family", &self.font_family)?;
+        map.serialize_entry("font_size", &self.font_size)?;
+
+        // Write theme_name as `theme = "Name"` or fall back to inline theme.
+        if let Some(ref name) = self.theme_name {
+            map.serialize_entry("theme", name)?;
+        } else {
+            map.serialize_entry("theme", &self.theme)?;
+        }
+
+        if let Some(ref shell) = self.shell {
+            map.serialize_entry("shell", shell)?;
+        }
+
+        map.serialize_entry("scrollback_lines", &self.scrollback_lines)?;
+        map.serialize_entry("cursor_style", &self.cursor_style)?;
+        map.serialize_entry("bell_mode", &self.bell_mode)?;
+
+        if !self.keybindings.is_empty() {
+            map.serialize_entry("keybindings", &self.keybindings)?;
+        }
+
+        map.end()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Custom Deserialize: accepts both `theme = "Name"` and `[theme]` inline table.
+// ---------------------------------------------------------------------------
+
+impl<'de> Deserialize<'de> for Config {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        /// Raw intermediate representation that handles both theme formats.
+        #[derive(Deserialize)]
+        struct RawConfig {
+            #[serde(default = "default_font_family")]
+            font_family: String,
+
+            #[serde(default = "default_font_size")]
+            font_size: f32,
+
+            /// Accepts either a string ("Dracula") or an inline theme table.
+            #[serde(default)]
+            theme: Option<toml::Value>,
+
+            #[serde(default)]
+            shell: Option<String>,
+
+            #[serde(default = "default_scrollback_lines")]
+            scrollback_lines: usize,
+
+            #[serde(default)]
+            cursor_style: CursorStyle,
+
+            #[serde(default)]
+            bell_mode: BellMode,
+
+            #[serde(default)]
+            keybindings: HashMap<String, String>,
+        }
+
+        let raw = RawConfig::deserialize(deserializer)?;
+
+        let (theme, theme_name) = match raw.theme {
+            Some(toml::Value::String(name)) => {
+                // New format: theme = "Name"
+                let resolved = crate::theme::load_theme_by_name(&name).unwrap_or_else(|| {
+                    tracing::warn!("Theme '{name}' not found, falling back to default");
+                    Theme::default()
+                });
+                (resolved, Some(name))
+            }
+            Some(table @ toml::Value::Table(_)) => {
+                // Old format: [theme] inline table
+                let theme: Theme = table.try_into().unwrap_or_else(|e| {
+                    tracing::warn!("Failed to parse inline theme: {e}, using default");
+                    Theme::default()
+                });
+                (theme, None)
+            }
+            _ => (Theme::default(), None),
+        };
+
+        Ok(Config {
+            font_family: raw.font_family,
+            font_size: raw.font_size,
+            theme,
+            theme_name,
+            shell: raw.shell,
+            scrollback_lines: raw.scrollback_lines,
+            cursor_style: raw.cursor_style,
+            bell_mode: raw.bell_mode,
+            keybindings: raw.keybindings,
+        })
     }
 }
 

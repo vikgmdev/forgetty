@@ -1,0 +1,27 @@
+name = "Onenord Light"
+
+[colors]
+foreground = "#2e3440"
+background = "#f7f8fa"
+cursor = "#3879c5"
+selection = "#eaebed"
+
+[colors.ansi]
+black = "#2e3440"
+red = "#cb4f53"
+green = "#48a53d"
+yellow = "#ee5e25"
+blue = "#3879c5"
+magenta = "#9f4aca"
+cyan = "#3ea1ad"
+white = "#e5e9f0"
+
+[colors.bright]
+black = "#646a76"
+red = "#d16366"
+green = "#5f9e9d"
+yellow = "#ba793e"
+blue = "#1b40a6"
+magenta = "#9665af"
+cyan = "#8fbcbb"
+white = "#eceff4"

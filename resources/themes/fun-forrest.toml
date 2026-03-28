@@ -1,0 +1,27 @@
+name = "Fun Forrest"
+
+[colors]
+foreground = "#dec165"
+background = "#251200"
+cursor = "#e5591c"
+selection = "#e5591c"
+
+[colors.ansi]
+black = "#000000"
+red = "#d6262b"
+green = "#919c00"
+yellow = "#be8a13"
+blue = "#4699a3"
+magenta = "#8d4331"
+cyan = "#da8213"
+white = "#ddc265"
+
+[colors.bright]
+black = "#7f6a55"
+red = "#e55a1c"
+green = "#bfc65a"
+yellow = "#ffcb1b"
+blue = "#7cc9cf"
+magenta = "#d26349"
+cyan = "#e6a96b"
+white = "#ffeaa3"
