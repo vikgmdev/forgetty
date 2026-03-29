@@ -15,6 +15,8 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::Duration;
 
+use std::path::PathBuf;
+
 use forgetty_config::{load_config, Config};
 use forgetty_watcher::ConfigWatcher;
 use gtk4::gio;
@@ -47,6 +49,14 @@ const DEFAULT_HEIGHT: i32 = 640;
 /// Kept low (100ms) so `cd` updates feel instant — readlink on /proc is ~1μs.
 const TITLE_POLL_MS: u64 = 100;
 
+// POSIX signal numbers — stable constants, avoids adding a `libc` dependency.
+/// Hangup (terminal closed, session leader death).
+const SIGHUP: i32 = 1;
+/// Interrupt (Ctrl+C from controlling terminal).
+const SIGINT: i32 = 2;
+/// Termination request (default `kill` signal).
+const SIGTERM: i32 = 15;
+
 /// Lookup table mapping each pane's DrawingArea widget name to its TerminalState.
 ///
 /// This is NOT shared mutable terminal state -- it is a simple registry so that
@@ -68,19 +78,37 @@ type FocusTracker = Rc<RefCell<String>>;
 /// Removing the key (or setting an empty title) re-enables automatic CWD polling.
 type CustomTitles = Rc<RefCell<HashSet<String>>>;
 
+/// CLI-derived launch parameters for this specific invocation.
+///
+/// Re-exported from the binary crate. These are runtime overrides, NOT
+/// persistent config. They affect only the initial pane.
+#[derive(Debug, Clone, Default)]
+pub struct LaunchOptions {
+    /// Working directory for the initial pane.
+    pub working_directory: Option<PathBuf>,
+
+    /// Command + args for the initial pane (overrides config shell).
+    pub command: Option<Vec<String>>,
+
+    /// WM_CLASS override for the GTK application ID.
+    pub class: Option<String>,
+}
+
 /// Run the GTK4/libadwaita application.
 ///
 /// This function blocks until the window is closed. It initialises libadwaita,
 /// creates the main application window with CSD header bar, and enters the
 /// GTK main loop.
-pub fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run(config: Config, launch: LaunchOptions) -> Result<(), Box<dyn std::error::Error>> {
+    let app_id = launch.class.as_deref().unwrap_or(APP_ID);
+
     let app = adw::Application::builder()
-        .application_id(APP_ID)
+        .application_id(app_id)
         .flags(gio::ApplicationFlags::NON_UNIQUE)
         .build();
 
     app.connect_activate(move |app| {
-        build_ui(app, &config);
+        build_ui(app, &config, &launch);
     });
 
     // GTK expects argv-style arguments; pass empty since clap already parsed.
@@ -101,7 +129,7 @@ fn next_pane_id() -> String {
 }
 
 /// Build the main application window with tab bar and initial terminal tab.
-fn build_ui(app: &adw::Application, config: &Config) {
+fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
     info!("Building Forgetty GTK4 window");
 
     // --- Widget hierarchy ---
@@ -379,7 +407,16 @@ fn build_ui(app: &adw::Application, config: &Config) {
             let Ok(cfg) = config_action.try_borrow() else {
                 return;
             };
-            add_new_tab(&tv_action, &cfg, &states_action, &focus_action, &ct_action, &win_action);
+            add_new_tab(
+                &tv_action,
+                &cfg,
+                &states_action,
+                &focus_action,
+                &ct_action,
+                &win_action,
+                None,
+                None,
+            );
         });
         window.add_action(&action);
     }
@@ -797,8 +834,10 @@ fn build_ui(app: &adw::Application, config: &Config) {
     // --- Quit action (Ctrl+Shift+Q) ---
     {
         let app_quit = app.clone();
+        let tab_states_quit = Rc::clone(&tab_states);
         let action = gio::SimpleAction::new("quit", None);
         action.connect_activate(move |_action, _param| {
+            kill_all_ptys(&tab_states_quit, "Quit action");
             app_quit.quit();
         });
         app.add_action(&action);
@@ -828,7 +867,49 @@ fn build_ui(app: &adw::Application, config: &Config) {
     }
 
     // --- Create the first tab ---
-    add_new_tab(&tab_view, config, &tab_states, &focus_tracker, &custom_titles, &window);
+    // CLI launch options (working_directory, command) apply only to the initial pane.
+    add_new_tab(
+        &tab_view,
+        config,
+        &tab_states,
+        &focus_tracker,
+        &custom_titles,
+        &window,
+        launch.working_directory.as_deref(),
+        launch.command.as_deref(),
+    );
+
+    // --- Window close request handler ---
+    // Fires when the user clicks the CSD X button, when window.close() is
+    // called programmatically, or when the window manager requests a close.
+    // Runs BEFORE the window is destroyed, so all state is still accessible.
+    {
+        let tab_states_close = Rc::clone(&tab_states);
+        window.connect_close_request(move |_win| {
+            kill_all_ptys(&tab_states_close, "Window close request");
+            glib::Propagation::Proceed
+        });
+    }
+
+    // --- Unix signal handlers (SIGTERM, SIGHUP, SIGINT) ---
+    // Registered via glib::unix_signal_add_local which dispatches signals as
+    // GLib source callbacks on the main thread, avoiding async-signal-safety
+    // issues. Must be registered before window.present() so signals arriving
+    // immediately after startup are caught.
+    {
+        let signals: &[(i32, &str)] =
+            &[(SIGTERM, "SIGTERM"), (SIGHUP, "SIGHUP"), (SIGINT, "SIGINT")];
+        for &(signum, name) in signals {
+            let tab_states_signal = Rc::clone(&tab_states);
+            let app_signal = app.clone();
+            glib::unix_signal_add_local(signum, move || {
+                tracing::info!("Received {name} (signal {signum}), initiating clean shutdown");
+                kill_all_ptys(&tab_states_signal, name);
+                app_signal.quit();
+                glib::ControlFlow::Break
+            });
+        }
+    }
 
     window.present();
 
@@ -932,9 +1013,11 @@ fn add_new_tab(
     focus_tracker: &FocusTracker,
     custom_titles: &CustomTitles,
     window: &adw::ApplicationWindow,
+    working_dir: Option<&std::path::Path>,
+    command: Option<&[String]>,
 ) {
     let on_exit = make_on_exit_callback(tab_view, tab_states, window);
-    match terminal::create_terminal(config, Some(on_exit)) {
+    match terminal::create_terminal(config, Some(on_exit), working_dir, command) {
         Ok((pane_vbox, drawing_area, state)) => {
             // Assign a unique widget name for registry lookup
             let pane_id = next_pane_id();
@@ -1065,16 +1148,16 @@ fn split_pane(
         return;
     };
 
-    // Create the new terminal pane
+    // Create the new terminal pane (splits always get default shell + default CWD)
     let on_exit = make_on_exit_callback(tab_view, tab_states, window);
-    let (new_pane_vbox, new_da, new_state) = match terminal::create_terminal(config, Some(on_exit))
-    {
-        Ok(triple) => triple,
-        Err(e) => {
-            tracing::error!("Failed to create terminal for split: {e}");
-            return;
-        }
-    };
+    let (new_pane_vbox, new_da, new_state) =
+        match terminal::create_terminal(config, Some(on_exit), None, None) {
+            Ok(triple) => triple,
+            Err(e) => {
+                tracing::error!("Failed to create terminal for split: {e}");
+                return;
+            }
+        };
 
     let new_pane_id = next_pane_id();
     new_da.set_widget_name(&new_pane_id);
@@ -1833,6 +1916,30 @@ fn kill_pane(pane_id: &str, tab_states: &TabStateMap) {
         }
     }
     tab_states.borrow_mut().remove(pane_id);
+}
+
+/// Kill every PTY process tracked in the state registry.
+///
+/// This is the centralized shutdown path, called by signal handlers,
+/// `connect_close_request`, and the Quit action. It iterates the data
+/// structure directly (not the widget tree), so it works even after GTK
+/// widgets have been destroyed.
+fn kill_all_ptys(tab_states: &TabStateMap, reason: &str) {
+    let Ok(states) = tab_states.try_borrow() else {
+        tracing::warn!("kill_all_ptys: could not borrow tab_states (already borrowed)");
+        return;
+    };
+    let count = states.len();
+    if count > 0 {
+        tracing::info!("{reason}: killing {count} PTY process(es)");
+    }
+    for (pane_id, state_rc) in states.iter() {
+        if let Ok(mut s) = state_rc.try_borrow_mut() {
+            if let Err(e) = s.pty.kill() {
+                tracing::warn!("Failed to kill PTY for pane {pane_id}: {e}");
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

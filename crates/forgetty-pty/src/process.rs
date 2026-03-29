@@ -79,6 +79,9 @@ impl PtyProcess {
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
         cmd.env("TERM_PROGRAM", "forgetty");
+        // Version derived from workspace Cargo.toml at compile time.
+        // If forgetty-pty ever gets its own version, this will diverge from the binary version.
+        cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
 
         if let Some(dir) = working_dir {
             cmd.cwd(dir);
@@ -159,6 +162,18 @@ impl PtyProcess {
     /// Kill the child process.
     pub fn kill(&mut self) -> Result<()> {
         self.child.kill().map_err(|e| ForgettyError::Pty(format!("failed to kill child: {e}")))
+    }
+}
+
+impl Drop for PtyProcess {
+    fn drop(&mut self) {
+        if self.is_alive() {
+            if let Err(e) = self.child.kill() {
+                // Best effort -- the process may have already exited between
+                // the is_alive() check and the kill() call.
+                debug!("PtyProcess::drop: kill failed: {e}");
+            }
+        }
     }
 }
 
@@ -258,6 +273,42 @@ mod tests {
         // Spawn returns a mutable proc but resize takes &self, so we need to
         // drop cleanly.
         drop(proc);
+    }
+
+    #[test]
+    fn test_env_vars_set() {
+        let cmd = vec!["env".to_string()];
+        let mut proc =
+            PtyProcess::spawn(default_size(), None, Some(&cmd)).expect("failed to spawn");
+
+        let mut output = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            match proc.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => output.extend_from_slice(&buf[..n]),
+                Err(_) => break,
+            }
+        }
+
+        let output_str = String::from_utf8_lossy(&output);
+        assert!(
+            output_str.contains("TERM=xterm-256color"),
+            "expected TERM=xterm-256color in env output, got: {output_str}"
+        );
+        assert!(
+            output_str.contains("COLORTERM=truecolor"),
+            "expected COLORTERM=truecolor in env output, got: {output_str}"
+        );
+        assert!(
+            output_str.contains("TERM_PROGRAM=forgetty"),
+            "expected TERM_PROGRAM=forgetty in env output, got: {output_str}"
+        );
+        let expected_version = format!("TERM_PROGRAM_VERSION={}", env!("CARGO_PKG_VERSION"));
+        assert!(
+            output_str.contains(&expected_version),
+            "expected {expected_version} in env output, got: {output_str}"
+        );
     }
 
     #[test]
