@@ -1,0 +1,22 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Forgetty
+GenericName=Terminal Emulator
+Comment=The AI-first agentic terminal emulator
+TryExec=forgetty
+Exec=forgetty
+Icon=dev.forgetty.Forgetty
+Categories=System;TerminalEmulator;
+Keywords=terminal;tty;pty;shell;console;command;
+StartupNotify=true
+StartupWMClass=dev.forgetty.Forgetty
+Terminal=false
+Actions=new-window;
+X-TerminalArgExec=-e
+X-TerminalArgDir=--working-directory=
+X-TerminalArgAppId=--class=
+
+[Desktop Action new-window]
+Name=New Window
+Exec=forgetty

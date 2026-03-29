@@ -6,6 +6,7 @@
 //! redraws.
 
 use std::io::Read as IoRead;
+use std::path::Path;
 use std::sync::mpsc;
 use std::thread;
 
@@ -17,18 +18,29 @@ use tracing::{debug, warn};
 /// Returns `(pty, receiver)` where:
 /// - `pty` is the `PtyProcess` (used for writing and resizing on the main thread)
 /// - `receiver` is an mpsc receiver that delivers `Vec<u8>` chunks of PTY output
+///
+/// `working_dir` overrides the initial CWD for the spawned process.
+/// `command` overrides the shell with an explicit command + args.
+/// When both are `None`, the default shell starts in the default directory.
 pub fn spawn_pty_bridge(
     rows: u16,
     cols: u16,
     shell: Option<&str>,
+    working_dir: Option<&Path>,
+    command: Option<&[String]>,
 ) -> Result<(PtyProcess, mpsc::Receiver<Vec<u8>>), String> {
     let size = PtySize { rows, cols, pixel_width: 0, pixel_height: 0 };
 
-    let command: Option<Vec<String>> = shell.map(|s| vec![s.to_string()]);
-    let command_ref: Option<&[String]> = command.as_deref();
+    // CLI -e command takes priority over config shell.
+    let shell_command: Option<Vec<String>> = if command.is_some() {
+        None // will use `command` directly below
+    } else {
+        shell.map(|s| vec![s.to_string()])
+    };
+    let effective_command: Option<&[String]> = command.or_else(|| shell_command.as_deref());
 
-    let mut pty =
-        PtyProcess::spawn(size, None, command_ref).map_err(|e| format!("spawn PTY: {e}"))?;
+    let mut pty = PtyProcess::spawn(size, working_dir, effective_command)
+        .map_err(|e| format!("spawn PTY: {e}"))?;
 
     let reader = pty
         .take_reader()

@@ -7,6 +7,7 @@
 //! Pango for text layout.
 
 use std::cell::RefCell;
+use std::path::Path;
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -212,17 +213,27 @@ fn font_description_with_size(config: &Config, size: f32) -> pango::FontDescript
 /// `on_exit` is an optional callback invoked (once) when the PTY channel
 /// disconnects (shell exited). The callback receives the DrawingArea's
 /// widget name so the caller can close the correct pane.
+///
+/// `working_dir` and `command` are CLI launch overrides for the initial pane.
+/// Pass `None` for both when creating tabs/splits (they use defaults).
 pub fn create_terminal(
     config: &Config,
     on_exit: Option<Rc<dyn Fn(String)>>,
+    working_dir: Option<&Path>,
+    command: Option<&[String]>,
 ) -> Result<(gtk4::Box, DrawingArea, Rc<RefCell<TerminalState>>), String> {
     let initial_rows: usize = 24;
     let initial_cols: usize = 80;
 
     // Spawn PTY bridge
     let shell = config.shell.as_deref();
-    let (pty, pty_rx) =
-        pty_bridge::spawn_pty_bridge(initial_rows as u16, initial_cols as u16, shell)?;
+    let (pty, pty_rx) = pty_bridge::spawn_pty_bridge(
+        initial_rows as u16,
+        initial_cols as u16,
+        shell,
+        working_dir,
+        command,
+    )?;
 
     // Create terminal VT state
     let mut terminal = forgetty_vt::Terminal::new(initial_rows, initial_cols);
