@@ -129,11 +129,22 @@ pub struct TerminalState {
     pub last_bell: Instant,
 }
 
+/// Result of draining the PTY output channel.
+#[derive(Debug, Clone, Copy)]
+pub struct DrainResult {
+    /// Whether any data was fed to the VT parser this tick.
+    pub had_data: bool,
+    /// Whether the PTY reader thread has exited (channel disconnected).
+    pub pty_exited: bool,
+}
+
 impl TerminalState {
     /// Drain all pending PTY output from the channel and feed it to the
-    /// terminal VT parser. Returns true if any data was processed.
-    fn drain_pty_output(&mut self) -> bool {
+    /// terminal VT parser. Returns a `DrainResult` indicating whether data
+    /// was processed and whether the PTY channel has disconnected.
+    fn drain_pty_output(&mut self) -> DrainResult {
         let mut had_data = false;
+        let mut disconnected = false;
         loop {
             match self.pty_rx.try_recv() {
                 Ok(data) => {
@@ -148,11 +159,23 @@ impl TerminalState {
                         }
                     }
                 }
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => break,
+                Err(mpsc::TryRecvError::Empty) => {
+                    // Channel is empty but the child process may have been
+                    // killed externally. In that case orphan children can
+                    // keep the PTY slave fd open, so the reader thread never
+                    // gets EOF.  Detect this by checking the child status.
+                    if !self.pty.is_alive() {
+                        disconnected = true;
+                    }
+                    break;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
             }
         }
-        had_data
+        DrainResult { had_data, pty_exited: disconnected }
     }
 }
 
@@ -185,8 +208,13 @@ fn font_description_with_size(config: &Config, size: f32) -> pango::FontDescript
 /// - `drawing_area` is the inner `DrawingArea` (needed for `grab_focus()`,
 ///   widget naming, and focus tracking).
 /// - `state` is the shared `TerminalState` wrapped in `Rc<RefCell<>>`.
+///
+/// `on_exit` is an optional callback invoked (once) when the PTY channel
+/// disconnects (shell exited). The callback receives the DrawingArea's
+/// widget name so the caller can close the correct pane.
 pub fn create_terminal(
     config: &Config,
+    on_exit: Option<Rc<dyn Fn(String)>>,
 ) -> Result<(gtk4::Box, DrawingArea, Rc<RefCell<TerminalState>>), String> {
     let initial_rows: usize = 24;
     let initial_cols: usize = 80;
@@ -262,6 +290,8 @@ pub fn create_terminal(
     {
         let state = Rc::clone(&state);
         let da_weak = drawing_area.downgrade();
+        // Wrap on_exit in Rc so it can be moved into the closure and called once.
+        let on_exit = on_exit.map(|cb| Rc::new(std::cell::Cell::new(Some(cb))));
         glib::timeout_add_local(Duration::from_millis(8), move || {
             // Stop the timer if the DrawingArea has been destroyed (tab closed)
             let Some(da) = da_weak.upgrade() else {
@@ -281,7 +311,7 @@ pub fn create_terminal(
             s.viewport_offset = offset; // keep cache fresh
             let was_at_bottom = total <= len || offset + len >= total;
 
-            let had_data = s.drain_pty_output();
+            let DrainResult { had_data, pty_exited } = s.drain_pty_output();
 
             // Detect alternate screen → primary screen transitions (e.g., htop exit).
             // Re-feed DECSCUSR 1 (blinking block) to restore our blink default,
@@ -382,6 +412,23 @@ pub fn create_terminal(
                     da.queue_draw();
                 }
             }
+
+            // PTY channel disconnected -- shell process has exited.
+            // Schedule the pane close asynchronously via idle callback to avoid
+            // reentrancy issues with the timer that detected the exit.
+            if pty_exited {
+                tracing::debug!("PTY exited for pane {:?}, scheduling close", da.widget_name());
+                if let Some(ref exit_cell) = on_exit {
+                    if let Some(cb) = exit_cell.take() {
+                        let pane_name = da.widget_name().to_string();
+                        glib::idle_add_local_once(move || {
+                            cb(pane_name);
+                        });
+                    }
+                }
+                return glib::ControlFlow::Break;
+            }
+
             glib::ControlFlow::Continue
         });
     }
