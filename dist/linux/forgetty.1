@@ -1,0 +1,91 @@
+.\" forgetty.1 — man page for Forgetty terminal emulator
+.TH FORGETTY 1 "March 2026" "forgetty 0.1.0" "User Commands"
+.SH NAME
+forgetty \- the AI\-first agentic terminal emulator
+.SH SYNOPSIS
+.B forgetty
+.RB [ \-\-config\-file
+.IR path ]
+.RB [ \-\-working\-directory
+.IR path ]
+.RB [ \-\-class
+.IR name ]
+.RB [ \-e
+.IR command
+.RI [ args... ]]
+.br
+.B forgetty \-\-version
+.br
+.B forgetty \-\-help
+.SH DESCRIPTION
+.B Forgetty
+is a workspace\-aware terminal emulator where your AI agents, tabs,
+splits, and sessions persist across reboots and sync across devices.
+Built on GTK4/libadwaita with the Ghostty VT engine for high\-performance
+terminal rendering.
+.SH OPTIONS
+.TP
+.BI \-\-config\-file " path"
+Path to configuration file. If not specified, the default configuration
+is used.
+.TP
+.BI \-\-working\-directory " path"
+Set the initial working directory for the shell session.
+.TP
+.BI \-\-class " name"
+Set the window class (WM_CLASS) for window manager rules. Useful for
+per\-window configuration in tiling window managers.
+.TP
+.BI \-e " command " "\fR[\fIargs...\fR]"
+Execute a command instead of the default shell. All arguments after
+.B \-e
+are passed to the command. Flags like
+.B \-\-working\-directory
+must come before
+.BR \-e .
+.TP
+.B \-\-version
+Print the version number and exit.
+.TP
+.B \-\-help
+Print usage information and exit.
+.SH ENVIRONMENT
+.TP
+.B SHELL
+The default shell to launch if no
+.B \-e
+flag is given. Falls back to
+.B /bin/bash
+if not set.
+.TP
+.B TERM
+Set by Forgetty to advertise terminal capabilities.
+.TP
+.B FORGETTY_CONFIG
+If set, used as the default configuration file path.
+.SH FILES
+.TP
+.I ~/.config/forgetty/config.toml
+User configuration file.
+.TP
+.I /usr/lib/libghostty\-vt.so.0
+Shared Ghostty VT library used for terminal emulation.
+.TP
+.I /usr/share/applications/dev.forgetty.Forgetty.desktop
+Desktop entry for GNOME and other desktop environments.
+.SH AUTHORS
+Vick <vick@totemlabs.dev>
+.PP
+Forgetty is developed by TotemLabsForge LLC.
+.SH SEE ALSO
+.BR ghostty (1),
+.BR bash (1),
+.BR zsh (1)
+.PP
+Project homepage:
+.UR https://forgetty.dev
+.UE
+.PP
+Source code:
+.UR https://github.com/totem\-labs\-forge/forgetty
+.UE
