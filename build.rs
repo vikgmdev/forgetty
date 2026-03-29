@@ -14,7 +14,11 @@ fn main() {
     // $ORIGIN/lib  — cargo run: binary at target/release/, .so at target/release/lib/
     println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/lib");
 
-    // $ORIGIN/../lib — DEB: binary at /usr/bin/, .so at /usr/lib/
+    // $ORIGIN/../lib/forgetty — DEB: binary at /usr/bin/, .so at /usr/lib/forgetty/
+    // Private directory avoids file conflict with ghostty package at /usr/lib/
+    println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../lib/forgetty");
+
+    // $ORIGIN/../lib — fallback for standard /usr/lib/ layout
     println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../lib");
 
     // $ORIGIN — flat deployment: binary and .so in same directory

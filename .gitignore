@@ -29,3 +29,6 @@ lcov.info
 
 # Ghostty build artifacts
 crates/forgetty-vt/ghostty-out/
+
+# Package artifacts
+*.deb
