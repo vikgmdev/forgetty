@@ -35,15 +35,22 @@ fi
 SO_NAME="libghostty-vt.so.0.1.0"
 SO_DIR=""
 
-# Try the cargo build output directory first (newest match)
-for candidate in $(ls -dt "$SCRIPT_DIR"/target/release/build/forgetty-vt-*/out/ghostty-install/lib/ 2>/dev/null); do
-    if [ -f "$candidate/$SO_NAME" ]; then
-        SO_DIR="$candidate"
-        break
-    fi
-done
+# 1. Canonical location: target/release/lib/ (post-build copy from T-023)
+if [ -f "$SCRIPT_DIR/target/release/lib/$SO_NAME" ]; then
+    SO_DIR="$SCRIPT_DIR/target/release/lib"
+fi
 
-# Fallback: check crates/forgetty-vt/ghostty-out/lib/
+# 2. Fallback: deep build output directory (newest match)
+if [ -z "$SO_DIR" ]; then
+    for candidate in $(ls -dt "$SCRIPT_DIR"/target/release/build/forgetty-vt-*/out/ghostty-install/lib/ 2>/dev/null); do
+        if [ -f "$candidate/$SO_NAME" ]; then
+            SO_DIR="$candidate"
+            break
+        fi
+    done
+fi
+
+# 3. Fallback: check crates/forgetty-vt/ghostty-out/lib/
 if [ -z "$SO_DIR" ] && [ -f "$SCRIPT_DIR/crates/forgetty-vt/ghostty-out/lib/$SO_NAME" ]; then
     SO_DIR="$SCRIPT_DIR/crates/forgetty-vt/ghostty-out/lib"
 fi
