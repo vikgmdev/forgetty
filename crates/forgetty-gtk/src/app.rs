@@ -74,7 +74,10 @@ type CustomTitles = Rc<RefCell<HashSet<String>>>;
 /// creates the main application window with CSD header bar, and enters the
 /// GTK main loop.
 pub fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
-    let app = adw::Application::builder().application_id(APP_ID).build();
+    let app = adw::Application::builder()
+        .application_id(APP_ID)
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
 
     app.connect_activate(move |app| {
         build_ui(app, &config);
@@ -390,6 +393,7 @@ fn build_ui(app: &adw::Application, config: &Config) {
         let states_split = Rc::clone(&tab_states);
         let focus_split = Rc::clone(&focus_tracker);
         let ct_split = Rc::clone(&custom_titles);
+        let win_split = window.clone();
         let action = gio::SimpleAction::new("split-right", None);
         action.connect_activate(move |_action, _param| {
             let Ok(cfg) = config_split.try_borrow() else {
@@ -403,6 +407,7 @@ fn build_ui(app: &adw::Application, config: &Config) {
                 &ct_split,
                 gtk4::Orientation::Horizontal,
                 false,
+                &win_split,
             );
         });
         window.add_action(&action);
@@ -417,6 +422,7 @@ fn build_ui(app: &adw::Application, config: &Config) {
         let states_split = Rc::clone(&tab_states);
         let focus_split = Rc::clone(&focus_tracker);
         let ct_split = Rc::clone(&custom_titles);
+        let win_split = window.clone();
         let action = gio::SimpleAction::new("split-down", None);
         action.connect_activate(move |_action, _param| {
             let Ok(cfg) = config_split.try_borrow() else {
@@ -430,6 +436,7 @@ fn build_ui(app: &adw::Application, config: &Config) {
                 &ct_split,
                 gtk4::Orientation::Vertical,
                 false,
+                &win_split,
             );
         });
         window.add_action(&action);
@@ -444,6 +451,7 @@ fn build_ui(app: &adw::Application, config: &Config) {
         let states_split = Rc::clone(&tab_states);
         let focus_split = Rc::clone(&focus_tracker);
         let ct_split = Rc::clone(&custom_titles);
+        let win_split = window.clone();
         let action = gio::SimpleAction::new("split-left", None);
         action.connect_activate(move |_action, _param| {
             let Ok(cfg) = config_split.try_borrow() else {
@@ -457,6 +465,7 @@ fn build_ui(app: &adw::Application, config: &Config) {
                 &ct_split,
                 gtk4::Orientation::Horizontal,
                 true,
+                &win_split,
             );
         });
         window.add_action(&action);
@@ -469,6 +478,7 @@ fn build_ui(app: &adw::Application, config: &Config) {
         let states_split = Rc::clone(&tab_states);
         let focus_split = Rc::clone(&focus_tracker);
         let ct_split = Rc::clone(&custom_titles);
+        let win_split = window.clone();
         let action = gio::SimpleAction::new("split-up", None);
         action.connect_activate(move |_action, _param| {
             let Ok(cfg) = config_split.try_borrow() else {
@@ -482,6 +492,7 @@ fn build_ui(app: &adw::Application, config: &Config) {
                 &ct_split,
                 gtk4::Orientation::Vertical,
                 true,
+                &win_split,
             );
         });
         window.add_action(&action);
@@ -897,6 +908,23 @@ fn build_ui(app: &adw::Application, config: &Config) {
 /// Creates a new DrawingArea + TerminalState pair via `create_terminal()`,
 /// wraps it in a pane container Box, appends a page to the TabView, sets up
 /// title polling, and selects the new tab.
+/// Build an `on_exit` callback for a terminal pane.
+///
+/// When the PTY channel disconnects (shell exits), this callback fires on the
+/// GTK main thread and calls `close_pane_by_name()` to remove the pane.
+fn make_on_exit_callback(
+    tab_view: &adw::TabView,
+    tab_states: &TabStateMap,
+    window: &adw::ApplicationWindow,
+) -> Rc<dyn Fn(String)> {
+    let tv = tab_view.clone();
+    let states = Rc::clone(tab_states);
+    let win = window.clone();
+    Rc::new(move |pane_name: String| {
+        close_pane_by_name(&pane_name, &tv, &states, &win);
+    })
+}
+
 fn add_new_tab(
     tab_view: &adw::TabView,
     config: &Config,
@@ -905,7 +933,8 @@ fn add_new_tab(
     custom_titles: &CustomTitles,
     window: &adw::ApplicationWindow,
 ) {
-    match terminal::create_terminal(config) {
+    let on_exit = make_on_exit_callback(tab_view, tab_states, window);
+    match terminal::create_terminal(config, Some(on_exit)) {
         Ok((pane_vbox, drawing_area, state)) => {
             // Assign a unique widget name for registry lookup
             let pane_id = next_pane_id();
@@ -1003,6 +1032,7 @@ fn split_pane(
     custom_titles: &CustomTitles,
     orientation: gtk4::Orientation,
     before: bool,
+    window: &adw::ApplicationWindow,
 ) {
     // Find the currently focused DrawingArea
     let focused_name = {
@@ -1036,7 +1066,9 @@ fn split_pane(
     };
 
     // Create the new terminal pane
-    let (new_pane_vbox, new_da, new_state) = match terminal::create_terminal(config) {
+    let on_exit = make_on_exit_callback(tab_view, tab_states, window);
+    let (new_pane_vbox, new_da, new_state) = match terminal::create_terminal(config, Some(on_exit))
+    {
         Ok(triple) => triple,
         Err(e) => {
             tracing::error!("Failed to create terminal for split: {e}");
@@ -1164,8 +1196,7 @@ enum PanedSlot {
 
 /// Close the currently focused pane.
 ///
-/// If the pane is the only one in the tab, close the tab.
-/// If the tab is the only tab, close the window.
+/// Delegates to `close_pane_by_name()` with the focused pane's widget name.
 fn close_focused_pane(
     tab_view: &adw::TabView,
     tab_states: &TabStateMap,
@@ -1183,9 +1214,51 @@ fn close_focused_pane(
         return;
     }
 
-    let Some(page) = tab_view.selected_page() else {
+    close_pane_by_name(&focused_name, tab_view, tab_states, window);
+}
+
+/// Close a specific pane identified by its DrawingArea widget name.
+///
+/// If the pane is the only one in its tab, the tab is closed.
+/// If the tab is the only tab, the window (and application) closes.
+/// If the pane is part of a split, the sibling expands and receives focus.
+///
+/// This function is idempotent -- if the pane has already been removed from
+/// the registry or the widget is already destroyed, it silently no-ops.
+fn close_pane_by_name(
+    pane_name: &str,
+    tab_view: &adw::TabView,
+    tab_states: &TabStateMap,
+    window: &adw::ApplicationWindow,
+) {
+    // Idempotency guard: if the pane is already gone from the registry,
+    // it was already closed (e.g., by a concurrent manual Ctrl+Shift+W).
+    {
+        let Ok(states) = tab_states.try_borrow() else {
+            return;
+        };
+        if !states.contains_key(pane_name) {
+            return;
+        }
+    }
+
+    // Find which tab page contains this pane by searching all pages.
+    let mut target_page: Option<adw::TabPage> = None;
+    for i in 0..tab_view.n_pages() {
+        let page = tab_view.nth_page(i);
+        let page_child = page.child();
+        let leaves = collect_leaf_drawing_areas(&page_child);
+        if leaves.iter().any(|da| da.widget_name().as_str() == pane_name) {
+            target_page = Some(page);
+            break;
+        }
+    }
+
+    let Some(page) = target_page else {
+        // Pane widget not found in any tab -- already removed.
         return;
     };
+
     let Some(container) = pane_container(&page) else {
         return;
     };
@@ -1195,17 +1268,17 @@ fn close_focused_pane(
 
     let leaves = collect_leaf_drawing_areas(&root_content);
 
-    // Find the focused DrawingArea
-    let focused_da = leaves.iter().find(|da| da.widget_name().as_str() == focused_name);
+    // Find the target DrawingArea
+    let target_da = leaves.iter().find(|da| da.widget_name().as_str() == pane_name);
 
-    let Some(focused_da) = focused_da.cloned() else {
+    let Some(target_da) = target_da.cloned() else {
         return;
     };
 
     // If this is the only pane in the tab, close the tab
     if leaves.len() <= 1 {
         // Kill the PTY
-        kill_pane(&focused_name, tab_states);
+        kill_pane(pane_name, tab_states);
 
         if tab_view.n_pages() <= 1 {
             window.close();
@@ -1217,7 +1290,7 @@ fn close_focused_pane(
 
     // The DrawingArea lives inside: DA -> hbox -> vbox.
     // Navigate: DrawingArea -> hbox -> vbox -> parent Paned.
-    let Some(hbox_widget) = focused_da.parent() else {
+    let Some(hbox_widget) = target_da.parent() else {
         return;
     };
     let Some(vbox_widget) = hbox_widget.parent() else {
@@ -1248,7 +1321,7 @@ fn close_focused_pane(
     parent_paned.set_end_child(gtk4::Widget::NONE);
 
     // Kill the closed pane's PTY and remove from registry
-    kill_pane(&focused_name, tab_states);
+    kill_pane(pane_name, tab_states);
 
     // Replace the Paned with the surviving sibling.
     // Check if the Paned was the direct content of the pane container.
