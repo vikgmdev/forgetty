@@ -1,248 +1,199 @@
 # Contributing to Forgetty
 
-Thank you for your interest in contributing to Forgetty! This guide will help
-you get started, whether you're reporting a bug, suggesting a feature, or
-submitting code.
+Thanks for your interest in contributing! This guide gets you from clone to running the terminal, and helps you make your first contribution.
 
-## Table of Contents
-
-- [Code of Conduct](#code-of-conduct)
-- [Reporting Bugs](#reporting-bugs)
-- [Suggesting Features](#suggesting-features)
-- [Development Setup](#development-setup)
-- [Code Style](#code-style)
-- [Commit Messages](#commit-messages)
-- [Pull Request Process](#pull-request-process)
-- [License](#license)
-
-## Code of Conduct
-
-This project follows the [Contributor Covenant Code of Conduct](CODE_OF_CONDUCT.md).
-By participating, you agree to uphold this code. Please report unacceptable
-behavior to conduct@totemlabsforge.com.
-
-## Reporting Bugs
-
-Found a bug? We'd like to fix it. Please
-[open an issue](https://github.com/totem-labs-forge/forgetty/issues/new?template=bug_report.md)
-using the bug report template.
-
-A good bug report includes:
-
-1. **A clear title** that summarizes the problem.
-2. **Steps to reproduce** the issue, as minimal as possible.
-3. **Expected behavior** — what you thought would happen.
-4. **Actual behavior** — what actually happened, including any error output.
-5. **Environment details** — OS, Forgetty version (`forgetty --version`),
-   terminal info, GPU driver version if rendering-related.
-
-If you can include a short screen recording or screenshot, even better.
-
-## Suggesting Features
-
-Feature ideas are welcome. Please
-[open an issue](https://github.com/totem-labs-forge/forgetty/issues/new?template=feature_request.md)
-using the feature request template.
-
-When proposing a feature:
-
-- Explain the problem it solves or the use case it enables.
-- Describe the behavior you'd like to see.
-- Note any alternatives you've considered.
-- If the feature is large, consider opening a discussion first.
-
-## Development Setup
+## Building from source
 
 ### Prerequisites
 
-| Tool   | Version | Notes                                    |
-|--------|---------|------------------------------------------|
-| Rust   | 1.85+   | Install via [rustup](https://rustup.rs/) |
-| Zig    | 0.13+   | Required for building libghostty-vt      |
-| Git    | 2.x     | With submodule support                   |
+| Tool | Version | Install |
+|------|---------|---------|
+| **Rust** | stable | [rustup.rs](https://rustup.rs/) |
+| **Zig** | 0.15+ | [ziglang.org/download](https://ziglang.org/download/) — builds libghostty-vt |
+| **GTK4 + libadwaita** | 4.9+ | See below |
 
-**Linux additional packages:**
+Install GTK4 development libraries:
 
 ```sh
 # Debian/Ubuntu
-sudo apt install libx11-dev libxkbcommon-dev libwayland-dev libfontconfig-dev
+sudo apt install libgtk-4-dev libadwaita-1-dev
 
 # Fedora
-sudo dnf install libX11-devel libxkbcommon-devel wayland-devel fontconfig-devel
+sudo dnf install gtk4-devel libadwaita-devel
 
 # Arch
-sudo pacman -S libx11 libxkbcommon wayland fontconfig
+sudo pacman -S gtk4 libadwaita
 ```
 
-### Building
+### Clone and build
 
 ```sh
-# Clone the repository with submodules
 git clone --recursive https://github.com/totem-labs-forge/forgetty.git
 cd forgetty
-
-# Build in debug mode (faster compilation)
-cargo build
-
-# Build in release mode (optimized)
 cargo build --release
-
-# Run the application
-cargo run
 ```
 
-### Running Tests
+The `--recursive` flag is required — libghostty-vt is a git submodule under `crates/forgetty-vt/ghostty/`. If you cloned without it:
 
 ```sh
-# Run all tests
+git submodule update --init --recursive
+```
+
+First build takes a few minutes because Zig compiles libghostty-vt from source. Subsequent builds are fast.
+
+### Run
+
+```sh
+cargo run --release
+```
+
+Or with flags:
+
+```sh
+cargo run --release -- --working-directory ~/projects -e htop
+```
+
+## Project structure
+
+Forgetty is a Cargo workspace with 11 crates. The design principle is **thin native shell + thick shared core** — the GTK4 shell is ~7,400 lines, but ~70% of the code is platform-independent Rust that will be shared across future platform targets.
+
+```
+forgetty/
+├── src/                    # Binary entry point (main.rs, cli.rs)
+├── crates/
+│   ├── forgetty-core/      # Shared types, errors, coordinate types
+│   ├── forgetty-vt/        # libghostty-vt FFI — VT parsing, screen state
+│   │   └── ghostty/        # Git submodule (Ghostty source for Zig build)
+│   ├── forgetty-pty/       # PTY spawn/lifecycle, I/O multiplexing
+│   ├── forgetty-config/    # TOML config, 486 bundled themes, defaults
+│   ├── forgetty-gtk/       # GTK4 platform shell — rendering, input, UI
+│   ├── forgetty-watcher/   # Filesystem watcher for config hot reload
+│   ├── forgetty-workspace/ # Session save/restore, workspace persistence
+│   ├── forgetty-socket/    # JSON-RPC 2.0 over Unix socket
+│   ├── forgetty-viewer/    # Embedded content viewer (markdown, images)
+│   └── forgetty-renderer/  # Legacy wgpu renderer (inactive, pre-GTK4)
+├── resources/themes/       # 486 bundled theme TOML files
+├── assets/icons/           # App icon (SVG)
+├── dist/linux/             # Desktop entry, man page, DEB build script
+├── scripts/                # convert-iterm-themes.py (theme maintenance)
+├── tests/
+│   ├── stress/             # 25-scenario stress test suite
+│   ├── integration/        # Integration tests
+│   └── fixtures/           # Test fixtures
+└── docs/
+    ├── harness/            # internal docs
+    └── launch/             # Launch prep (README, social, docs)
+```
+
+### Key crates
+
+**`forgetty-gtk`** — Where most UI work happens. `app.rs` is the GTK4 application (tabs, splits, menus, shortcuts), `terminal.rs` handles per-pane rendering and state, `input.rs` maps GDK events to ghostty key/mouse encoders, `clipboard.rs` has the smart copy pipeline.
+
+**`forgetty-vt`** — Safe Rust wrappers around libghostty-vt's C API. If you're adding a new terminal capability, this is where the FFI binding goes. Read `` → "FFI Pattern" before touching this crate — there are hard-won rules from weeks of debugging.
+
+**`forgetty-config`** — Config loading, theme system, and the bundled theme registry. Note: `bundled_themes.rs` is auto-generated by `scripts/convert-iterm-themes.py` — don't edit it by hand.
+
+**`forgetty-pty`** — PTY management. Spawns the user's shell, handles resize, I/O channels.
+
+### Crates you probably won't touch
+
+- `forgetty-renderer` — legacy wgpu rendering path, not used in GTK4 builds
+- `forgetty-ui` — legacy winit UI layer, not used in GTK4 builds
+
+## Running checks
+
+```sh
+# Compile check (fast feedback)
+cargo check --workspace
+
+# Lint — must pass clean
+cargo clippy --workspace -- -D warnings
+
+# Run tests
 cargo test --workspace
 
-# Run tests for a specific crate
-cargo test -p forgetty-render
-
-# Run tests with output
-cargo test --workspace -- --nocapture
+# Full release build
+cargo build --release
 ```
 
-### Useful Commands
+Always run `cargo clippy` and `cargo test` before submitting a PR.
 
-```sh
-# Check formatting
-cargo fmt --all -- --check
+## How we develop
 
-# Run clippy lints
-cargo clippy --workspace --all-targets -- -D warnings
+Forgetty uses a **** where every feature goes through three phases:
 
-# Run cargo-deny checks (license, advisories, duplicates)
-cargo deny check
+1. **Plan** — Write a spec with acceptance criteria (what does "done" look like?)
+2. **Build** — Implement, commit, verify no regressions
+3. **QA** — Test every acceptance criterion, score, write a report
 
-# Generate documentation
-cargo doc --workspace --no-deps --open
-```
+ The current backlog lives in ``.
 
-## Code Style
+You don't need to follow the full harness for small fixes. But for new features, writing clear acceptance criteria before you start coding will save time and make review faster.
 
-We use `rustfmt` and `clippy` to maintain consistent code style. CI will reject
-PRs that don't pass both.
+## Pull request guidelines
 
-### General guidelines
+- **One feature or fix per PR.** Small, focused PRs get reviewed faster.
+- **Describe what changed and why.** For bug fixes, include how to reproduce.
+- **Run checks locally** before pushing: `cargo clippy --workspace && cargo test --workspace`
+- **Test manually** — launch Forgetty and verify your change works. For UI changes, test with splits, multiple tabs, and at least one theme switch.
+- **Don't break existing features.** If your change touches input handling, test that vim, htop, and basic shell usage still work.
+- **Match existing patterns.** The codebase uses `Rc<RefCell<>>` for shared state, `try_borrow_mut()` instead of `borrow_mut()` to avoid panics, and GTK4 actions for keyboard shortcuts.
 
-- **Format your code** with `cargo fmt --all` before committing.
-- **Fix all clippy warnings** — run `cargo clippy --workspace --all-targets -- -D warnings`.
-- **Write documentation** for all public items. Use `///` doc comments with
-  examples where appropriate.
-- **Keep functions focused.** If a function is doing too many things, break it
-  up.
-- **Prefer explicit error handling** over `.unwrap()` in library code. Binary
-  crate entry points and tests may use `.unwrap()` or `?` as appropriate.
-- **Use `thiserror`** for defining error types in library crates.
-- **Name things clearly.** A longer, descriptive name is better than a short,
-  ambiguous one.
-
-See [docs/contributing/code-style.md](docs/contributing/code-style.md) for the
-full code style guide.
-
-## Commit Messages
-
-We follow [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/).
-
-### Format
+### Branch naming
 
 ```
-<type>(<scope>): <description>
-
-[optional body]
-
-[optional footer(s)]
+feat/quake-mode
+fix/search-highlight-zoom
+docs/config-reference
 ```
 
-### Types
+### Commit messages
 
-| Type       | Description                                  |
-|------------|----------------------------------------------|
-| `feat`     | A new feature                                |
-| `fix`      | A bug fix                                    |
-| `docs`     | Documentation only changes                   |
-| `style`    | Formatting, missing semicolons, etc.         |
-| `refactor` | Code change that neither fixes nor adds      |
-| `perf`     | Performance improvement                      |
-| `test`     | Adding or updating tests                     |
-| `build`    | Build system or external dependency changes  |
-| `ci`       | CI configuration changes                     |
-| `chore`    | Other changes that don't modify src or tests |
-
-### Scope
-
-Use the crate name without the `forgetty-` prefix when the change is
-crate-specific:
+Use conventional prefixes:
 
 ```
-feat(render): add subpixel glyph positioning
-fix(pty): handle SIGWINCH on FreeBSD
-docs(socket): document workspace.list RPC method
+feat: add quake/dropdown mode with global hotkey
+fix: search highlights misaligned after font zoom
+perf: reduce allocation in screen sync hot path
+docs: add configuration reference
+test: stress test for concurrent splits
 ```
 
-### Examples
+## Good first issues
 
-```
-feat(ui): add vertical tab bar with git branch display
+Concrete, scoped tasks suitable for a first contribution:
 
-Add a vertical tab bar that shows the git branch, working directory,
-and running command for each session. The tab bar auto-hides when
-only one tab is open.
+1. **Shift+Click to extend selection** — Currently Shift+Click clears the selection instead of extending it to the click position. The selection code is in `crates/forgetty-gtk/src/terminal.rs`. Look at how double-click-drag extends by word — similar logic, but from the existing selection anchor to the clicked cell.
 
-Closes #42
-```
+2. **Auto-scroll during drag selection** — When drag-selecting text and the mouse moves past the top or bottom edge of the viewport, the terminal should auto-scroll. The drag handling is in `terminal.rs`.
 
-```
-fix(vt): correct wide character cursor positioning
+3. **Tab reordering via drag-and-drop** — `adw::TabBar` supports drag-to-reorder natively, but it needs to be wired up so the underlying `TabStateMap` stays in sync.
 
-Wide characters (CJK, emoji) were causing the cursor to be positioned
-one cell too far to the right. This aligns cursor tracking with the
-actual cell width reported by libghostty-vt.
-```
+4. **Custom cursor color in config** — Add a `cursor_color` key to `config.toml` that overrides the theme cursor color. Parsing in `forgetty-config`, rendering in `forgetty-gtk/src/terminal.rs`.
 
-## Pull Request Process
+5. **Man page improvements** — The man page at `dist/linux/forgetty.1` could cover more CLI flags, environment variables, and config options.
 
-1. **Fork and branch.** Create a feature branch from `main`:
-   ```sh
-   git checkout -b feat/my-feature main
-   ```
+Look for issues labeled `good first issue` on GitHub for the latest list.
 
-2. **Make your changes.** Keep the scope focused — one feature or fix per PR.
+## Reporting bugs
 
-3. **Write tests.** New features should include tests. Bug fixes should include
-   a regression test when feasible.
+Open a GitHub issue with:
 
-4. **Ensure CI passes locally:**
-   ```sh
-   cargo fmt --all -- --check
-   cargo clippy --workspace --all-targets -- -D warnings
-   cargo test --workspace
-   ```
+- Forgetty version (`forgetty --version`)
+- Linux distribution and version
+- Display server (Wayland or X11): `echo $XDG_SESSION_TYPE`
+- Steps to reproduce
+- Expected vs actual behavior
+- Terminal output or screenshots if relevant
 
-5. **Push and open a PR.** Fill out the PR template completely. Link any related
-   issues.
+## Code of conduct
 
-6. **Respond to review feedback.** We aim to review PRs within a few days.
-   Please be responsive to comments — we'll work with you to get the PR merged.
-
-### What we look for in review
-
-- **Correctness** — Does it do what it claims?
-- **Tests** — Are edge cases covered?
-- **Documentation** — Are public APIs documented?
-- **Performance** — Are there obvious performance pitfalls?
-- **Style** — Does it follow the project's conventions?
-
-### After merge
-
-Your contribution will be included in the next release and credited in the
-changelog. Thank you!
+Be kind, be constructive, be welcoming. We're building this in the open and want contributions from everyone. Harassment, discrimination, and personal attacks have no place here.
 
 ## License
 
-By contributing to Forgetty, you agree that your contributions will be licensed
-under the [MIT License](LICENSE). This is the same license that covers the
-project, so your contributions are available under the same terms as the rest of
-the codebase.
+By contributing to Forgetty, you agree that your contributions will be licensed under the [MIT License](LICENSE), the same license that covers the project.
+
+## Questions?
+
+Open a GitHub Discussion or file an issue. Happy to help you find the right place to start.
