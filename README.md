@@ -1,141 +1,208 @@
-# Forgetty
+<p align="center">
+  <img src="assets/icons/dev.forgetty.Forgetty.svg" width="120" alt="Forgetty icon">
+</p>
 
-**The AI-first agentic terminal emulator.**
+<h1 align="center">Forgetty</h1>
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![CI](https://github.com/totem-labs-forge/forgetty/actions/workflows/ci.yml/badge.svg)](https://github.com/totem-labs-forge/forgetty/actions/workflows/ci.yml)
-[![crates.io](https://img.shields.io/crates/v/forgetty.svg)](https://crates.io/crates/forgetty)
+<p align="center">
+  <b>A modern terminal emulator for Linux with workspaces, session persistence, and native rendering quality.</b>
+</p>
 
-Forgetty is a cross-platform, GPU-accelerated terminal emulator built on
-[libghostty-vt](https://github.com/ghostty-org/ghostty), designed from the
-ground up for AI coding agents and workspace management. It treats AI agents as
-first-class citizens — surfacing notifications when they need your attention,
-managing multi-session workspaces, and exposing a scriptable JSON-RPC API so
-external tools can drive the terminal programmatically.
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
+  <img src="https://img.shields.io/badge/platform-Linux-informational" alt="Linux">
+  <img src="https://img.shields.io/badge/status-beta-orange" alt="Beta">
+  <img src="https://img.shields.io/badge/built%20with-Claude%20Code-blueviolet" alt="Built with Claude Code">
+</p>
 
-<!-- TODO: Add screenshot -->
+<p align="center">
+  [SCREENSHOT: Forgetty with multiple tabs, split panes, Catppuccin Mocha theme, showing code + terminal output]
+</p>
+
+Forgetty is a terminal emulator for Linux built on
+[Ghostty](https://ghostty.org/)'s VT engine ([libghostty-vt](https://github.com/ghostty-org/ghostty))
+and native GTK4 rendering. It matches Ghostty's text quality pixel-for-pixel,
+then adds what's missing from every Linux terminal: workspaces that persist
+across reboots, session restore, a live theme browser with 486 themes, and
+AI-native integrations for developers who work with coding agents daily.
 
 ---
 
 ## Features
 
-- **GPU-accelerated rendering** — wgpu-powered renderer with libghostty-vt for
-  terminal emulation. Smooth scrolling, ligature support, and sub-pixel
-  positioning on all platforms.
+### Native rendering quality
 
-- **AI agent-aware** — Notification rings alert you when a background agent
-  needs attention. Never miss a prompt or error from your AI assistant again.
+GTK4 + Pango/FreeType — the same text rendering stack as Ghostty on Linux.
+Subpixel antialiasing, Fontconfig font discovery, full IME support. Powered by
+libghostty-vt: SIMD-optimized VT parsing, Kitty keyboard protocol, Unicode
+grapheme clustering, text reflow. No compromises on terminal correctness.
 
-- **Smart copy/paste** — Automatically strips box-drawing characters, ANSI
-  escapes, and trailing whitespace when you copy from the terminal. Paste what
-  you actually want.
+[SCREENSHOT: Side-by-side Forgetty vs Ghostty rendering the same content — identical text quality]
 
-- **Vertical tabs** — Tabs live on the side, showing the git branch, working
-  directory, and running command for each session at a glance.
+### Tabs and split panes
 
-- **Split panes** — Horizontal and vertical splits with keyboard-driven
-  navigation. Resize with the mouse or keybindings.
+Tabs with CWD-based titles that update automatically. Horizontal and vertical
+splits with independent shells. Navigate panes with `Alt+Arrow`. Each pane has
+its own scrollback, search state, zoom level, and cursor.
 
-- **Embedded markdown/image viewer** — Preview markdown files and images
-  inline, with a file watcher that auto-refreshes on save.
+[SCREENSHOT: Split panes with different content in each, tab bar visible]
 
-- **Workspace management** — Group tabs into workspaces. Session restore brings
-  back your full layout — splits, working directories, and scroll position —
-  after a restart.
+### 486 color themes with live preview
 
-- **Scriptable JSON-RPC socket API** — Automate the terminal from scripts,
-  editors, or AI agents. Create tabs, send input, read output, manage
-  workspaces — all over a Unix domain socket.
+Browse and switch themes from the appearance sidebar (`Ctrl+,`). All 485 themes
+from [iTerm2-Color-Schemes](https://github.com/mbadolato/iTerm2-Color-Schemes)
+are bundled, plus you can drop your own into `~/.config/forgetty/themes/`. Arrow
+keys cycle through themes with live preview on your actual terminal content —
+Enter to keep, Escape to revert.
 
-- **Cross-platform** — Linux, macOS, and Windows. Android support is on the
-  roadmap.
+[SCREENSHOT: Theme browser sidebar open, showing color swatches and live preview]
 
-## Installation
+### Session persistence
 
-### Pre-built binaries
+Close your laptop, reopen it, and everything is exactly where you left it —
+tabs, splits, working directories, scroll position. Auto-saves in the
+background. You never lose your terminal layout again.
 
-Download the latest release for your platform from
-[GitHub Releases](https://github.com/totem-labs-forge/forgetty/releases).
+### Workspaces
 
-### Homebrew (macOS / Linux)
+Named workspaces for different projects. Each workspace has its own set of tabs,
+splits, and layout. Switch between them instantly. Workspaces persist across
+restarts just like sessions.
+
+### Search across scrollback
+
+`Ctrl+Shift+F` opens per-pane search. All matches highlighted with an "N of M"
+count. Enter/Shift+Enter navigate forward and backward with wrap-around.
+Viewport auto-scrolls to center each match.
+
+[SCREENSHOT: Search bar with "N of M" match count, highlighted matches in terminal]
+
+### AI-native integrations
+
+For developers working with AI coding agents daily:
+
+- **Agent notifications** — colored ring on pane border, badge on the tab, and
+  desktop notification when a background agent needs attention. No more hunting
+  through tabs.
+- **Smart clipboard** — strips box-drawing characters, trailing whitespace, and
+  normalizes line endings automatically. Copy from Claude Code or any TUI app
+  and paste clean text.
+- **Embedded markdown/image viewer** — preview markdown files and images inline,
+  with a file watcher that auto-refreshes on save.
+- **Screenshot paste** — paste clipboard images directly into the terminal for
+  AI agents that accept them.
+- **Socket API** — JSON-RPC over Unix socket. Automate Forgetty from scripts,
+  editors, or AI agents — create tabs, send input, read output, manage
+  workspaces programmatically.
+
+### Everything else
+
+- **URL detection** — hover highlights URLs, `Ctrl+Click` opens in browser
+- **Font zoom** — `Ctrl+=`/`Ctrl+-` per pane, grid reflows correctly
+- **Cursor styles** — block, bar, underline, hollow block; blink; respects DECSCUSR
+- **Bell modes** — visual flash, audio beep, both, or none
+- **Config hot reload** — edit `config.toml`, changes apply instantly to all panes
+- **Right-click context menu** — copy, paste, select all, search, open URL
+- **Command palette** — `Ctrl+Shift+P` for quick access to all actions
+- **Multi-instance** — each `forgetty` invocation is a fully independent window
+- **Desktop integration** — `.desktop` entry, SVG icon, GNOME Activities search
+- **CLI flags** — `--working-directory`, `-e` (execute command), `--class`, `--config-file`
+
+## Forgetty vs the rest
+
+| | Ghostty | Warp | Terminator | GNOME Terminal | Forgetty |
+|---|---|---|---|---|---|
+| **Rendering** | Pango/FreeType | GPU | VTE | VTE | Pango/FreeType |
+| **VT engine** | libghostty | Custom | VTE | VTE | libghostty-vt |
+| **Tabs + splits** | Yes | Yes | Yes | Tabs only | Yes |
+| **Session persistence** | No | Partial | No | No | **Full** |
+| **Workspaces** | No | No | Layouts (manual) | No | **Yes** |
+| **Themes** | ~20 | Limited | ~10 | ~10 | **486 + live preview** |
+| **Agent notifications** | No | No | No | No | **Yes** |
+| **Smart copy** | No | Some | No | No | **Yes** |
+| **Socket API** | No | No | D-Bus (limited) | No | **JSON-RPC** |
+| **Config hot reload** | Yes | N/A | Partial | No | **Yes** |
+| **Open source** | Yes | No | Yes | Yes | **Yes (MIT)** |
+
+## Install
+
+### DEB package (Ubuntu/Debian)
 
 ```sh
-brew install totem-labs-forge/tap/forgetty
+# Download from GitHub Releases
+sudo dpkg -i forgetty_0.1.0_amd64.deb
 ```
 
-### AUR (Arch Linux)
+### Install script (any Linux)
 
 ```sh
-yay -S forgetty
+git clone https://github.com/totem-labs-forge/forgetty.git
+cd forgetty
+cargo build --release
+./install.sh
 ```
 
-### Cargo
+Installs binary to `/usr/local/bin/`, shared library to `/usr/local/lib/`,
+desktop entry and icon to `~/.local/share/`. Uninstall with `./uninstall.sh`.
 
-```sh
-cargo install forgetty
+## Keyboard shortcuts
+
+| Action | Shortcut |
+|--------|----------|
+| New tab | `Ctrl+Shift+T` |
+| Close pane/tab | `Ctrl+Shift+W` |
+| Split right | `Alt+Shift+=` |
+| Split down | `Alt+Shift+-` |
+| Navigate panes | `Alt+Arrow` |
+| Copy | `Ctrl+Shift+C` |
+| Paste | `Ctrl+Shift+V` |
+| Search | `Ctrl+Shift+F` |
+| Zoom in / out / reset | `Ctrl+=` / `Ctrl+-` / `Ctrl+0` |
+| Appearance sidebar | `Ctrl+,` |
+| Command palette | `Ctrl+Shift+P` |
+| Keyboard shortcuts | `F1` |
+| Quit | `Ctrl+Shift+Q` |
+
+## Configuration
+
+Forgetty is configured via `~/.config/forgetty/config.toml`. The config file is
+created automatically on first launch with sensible defaults. Changes apply
+instantly (hot reload).
+
+```toml
+font_family = "JetBrains Mono"
+font_size = 13.0
+theme = "Catppuccin Mocha"
+scrollback_lines = 10000
+cursor_style = "block"      # block | bar | underline | block_hollow
+bell_mode = "visual"         # visual | audio | both | none
+# shell = "/bin/zsh"         # default: your login shell
 ```
 
-> **Note:** Building from source requires a [Zig](https://ziglang.org/)
-> compiler (0.13+) because libghostty-vt is built with Zig. See
-> [Building from Source](#building-from-source) for details.
-
-## Quick Start
-
-```sh
-# Launch Forgetty
-forgetty
-
-# Open a new tab
-Ctrl+Shift+T
-
-# Split the current pane vertically
-Ctrl+Shift+D
-
-# Split the current pane horizontally
-Ctrl+Shift+E
-
-# Navigate between panes
-Ctrl+Shift+Arrow
-
-# Open the command palette
-Ctrl+Shift+P
-```
-
-Configuration lives in `~/.config/forgetty/config.toml`. Forgetty creates a
-default config on first launch. See the [configuration docs](docs/configuration.md)
-for the full reference.
+Or use the appearance sidebar (`Ctrl+,`) to change theme, font, and size with live preview.
 
 ## Building from Source
 
 ### Prerequisites
 
-| Tool   | Minimum version | Notes                              |
-|--------|-----------------|------------------------------------|
-| Rust   | 1.85+           | Install via [rustup](https://rustup.rs/) |
-| Zig    | 0.13+           | Required for libghostty-vt         |
-| Git    | 2.x             | With submodule support             |
+| Tool | Version | Notes |
+|------|---------|-------|
+| Rust | stable | Install via [rustup.rs](https://rustup.rs/) |
+| Zig | 0.15+ | Builds libghostty-vt ([download](https://ziglang.org/download/)) |
+| GTK4 | 4.14+ | `sudo apt install libgtk-4-dev libadwaita-1-dev` |
 
-Platform-specific dependencies:
-
-- **Linux:** `libx11-dev`, `libxkbcommon-dev`, `libwayland-dev`, `libfontconfig-dev`
-- **macOS:** Xcode command-line tools
-- **Windows:** Visual Studio Build Tools 2022
+> **Tip:** If Zig isn't on your `$PATH`, set `ZIG_PATH` to its location.
 
 ### Build
 
 ```sh
-# Clone with submodules (libghostty-vt is a git submodule)
-git clone --recursive https://github.com/totem-labs-forge/forgetty.git
+git clone https://github.com/totem-labs-forge/forgetty.git
 cd forgetty
-
-# Build in release mode
 cargo build --release
-
-# Run
-cargo run
+cargo run --release
 ```
 
-The release binary is written to `target/release/forgetty`.
+The release binary is at `target/release/forgetty`.
 
 ### Running tests
 
@@ -143,100 +210,73 @@ The release binary is written to `target/release/forgetty`.
 cargo test --workspace
 ```
 
-## Configuration
-
-Forgetty is configured via `~/.config/forgetty/config.toml`. The config file is
-created automatically on first launch with sensible defaults.
-
-See [docs/configuration.md](docs/configuration.md) for the full configuration
-reference.
-
 ## Architecture
 
-Forgetty is organized as a Cargo workspace with the following crates:
+```
+┌──────────────────────────────────────────────────────┐
+│  Platform Shell (THIN — native per platform)          │
+│  Linux:   GTK4 + libadwaita (gtk4-rs)    ← current   │
+│  Windows: winit + DirectWrite            ← planned    │
+│  Android: Jetpack Compose + Rust JNI     ← planned    │
+├──────────────────────────────────────────────────────┤
+│  Shared Rust Core (THICK — platform-independent)      │
+│  forgetty-vt        libghostty-vt FFI bindings        │
+│  forgetty-pty       PTY management (portable-pty)     │
+│  forgetty-config    Config, 486 themes, defaults      │
+│  forgetty-core      Shared types, errors              │
+│  forgetty-workspace Session + workspace persistence   │
+│  forgetty-watcher   Config file hot reload            │
+│  forgetty-socket    JSON-RPC API                      │
+│  forgetty-clipboard Smart copy pipeline               │
+├──────────────────────────────────────────────────────┤
+│  libghostty-vt.so (Zig, C API — Ghostty project)     │
+│  SIMD VT parser, Kitty protocol, Unicode graphemes,   │
+│  scrollback, text reflow — proven by millions of users │
+└──────────────────────────────────────────────────────┘
+```
 
-| Crate              | Purpose                                      |
-|--------------------|----------------------------------------------|
-| `forgetty`         | Binary entry point, CLI, and app orchestration |
-| `forgetty-config`  | Configuration loading, validation, and defaults |
-| `forgetty-vt`      | Zig build + Rust FFI bindings for libghostty-vt |
-| `forgetty-pty`     | PTY abstraction (Unix + ConPTY)              |
-| `forgetty-render`  | wgpu renderer, glyph rasterization, shaders  |
-| `forgetty-ui`      | Window management, tabs, splits, input handling |
-| `forgetty-workspace` | Workspace and session persistence           |
-| `forgetty-socket`  | JSON-RPC Unix domain socket server           |
-| `forgetty-notify`  | Agent notification detection and rendering   |
-| `forgetty-common`  | Shared types, error handling, logging         |
+**Design principle:** thin native shell per platform (~1,300 lines), thick
+shared Rust core (~10,000+ lines, ~70% of code). When we add Windows or
+Android, we write a new thin shell — the core stays the same.
 
-See [docs/architecture.md](docs/architecture.md) for the full architecture
-overview and data flow diagrams.
+## Roadmap
 
-## Why Forgetty Exists
+**Next:** Windows + WSL support, Android companion app, cross-device sync,
+web version. See [docs/lead/ROADMAP.md](docs/lead/ROADMAP.md) for the full plan.
 
-Simple terminals are for the old days. When you spend your day working with
-AI coding agents, managing multiple workspaces across projects, and switching
-between local and remote sessions — you need a terminal built for that workflow.
+## How it was built
 
-Ghostty and cmux are the closest to what we want, but:
-- **Ghostty** is a standalone terminal focused on native macOS/Linux rendering
-  quality. No AI-native features, no cloud sync, no built-in workspace management.
-- **cmux** is macOS-only (Swift + AppKit). Brilliant for Mac users, but if you
-  work on Linux or Windows with WSL, you're out of luck.
-- **Windows Terminal** has great WSL support but zero AI awareness.
-- **Every other terminal** treats AI agents as just another CLI process.
+Forgetty was built with [Claude Code](https://claude.ai/claude-code) using a
+structured 3-phase harness methodology:
 
-Forgetty fills the gap: **an AI-first terminal for Linux, Windows (WSL),
-Android, and Web** — where nobody else is building.
+1. **Plan** — agent writes a spec with acceptance criteria
+2. **Build** — agent implements, commits, verifies no crashes
+3. **QA** — agent tests every acceptance criterion, scores, writes a report
 
-## Forgetty vs Ghostty: Technical Comparison
-
-We use Ghostty's brain (libghostty-vt), not its body (renderer). Same SIMD-optimized
-VT parser, different rendering architecture optimized for cross-platform reach.
-
-| | Ghostty | Forgetty | Who wins |
-|---|---|---|---|
-| **Terminal engine** | libghostty | libghostty-vt (same) | Tie |
-| **macOS rendering** | Metal (native, hand-tuned) | wgpu → Metal (thin abstraction) | Ghostty |
-| **macOS text** | CoreText (pixel-perfect native) | cosmic-text (good, not native) | Ghostty |
-| **Linux rendering** | OpenGL 4.3 (dated, GTK threading issues) | wgpu → Vulkan (modern) | **Forgetty** |
-| **Windows** | OpenGL, no font discovery | DX12/Vulkan, full support | **Forgetty** |
-| **Android** | None | Vulkan/GLES | **Forgetty** |
-| **Browser** | 3-line WebGL stub | WebGPU (all major browsers) | **Forgetty** |
-| **VT correctness** | Identical | Identical | Tie |
-| **AI agent UX** | None | Notification rings, smart copy, viewer, hooks | **Forgetty** |
-| **Workspace mgmt** | None (build your own) | Built-in tabs, splits, session persistence | **Forgetty** |
-| **Cloud sync** | None | Planned (premium SaaS) | **Forgetty** |
-| **Socket API** | None | JSON-RPC for automation | **Forgetty** |
-| **Input handling** | Native (Cocoa/GTK) | winit (good, fewer edge cases) | Ghostty |
-| **Reliability** | Years of production use | Days (AI-accelerated development) | Ghostty |
-| **Shader code** | MSL + GLSL (2 codebases) | WGSL (1 codebase, auto-compiled) | **Forgetty** |
-
-**Our bet:** Platform reach + AI-native UX beats native polish on one platform.
-If you need the best macOS terminal, use Ghostty or cmux. If you need one
-terminal that works across Linux, Windows WSL, Android, and eventually the web —
-with AI agents as first-class citizens — that's Forgetty.
-
-See [docs/adr/004-wgpu-vs-ghostty-renderer.md](docs/adr/004-wgpu-vs-ghostty-renderer.md)
-for the full architectural decision record.
+The architecture decision to use GTK4 instead of wgpu came from learning (the
+hard way) that GPU-rendered text can never match native Linux quality — no
+subpixel antialiasing, no Fontconfig, no IME. Pivoting to GTK4 + Pango gave us
+rendering identical to Ghostty on day one.
 
 ## Contributing
 
-Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) to
-get started. Whether it's a bug report, feature request, documentation
-improvement, or code change — we appreciate your help.
+Contributions welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for build
+instructions, code style, and the crate map.
 
 ## License
 
-Forgetty is licensed under the [MIT License](LICENSE).
+[MIT](LICENSE) &copy; 2026 TotemLabsForge, LLC
 
 ## Acknowledgments
 
-Forgetty stands on the shoulders of excellent open-source work:
-
-- **[Ghostty](https://ghostty.org/)** by Mitchell Hashimoto — libghostty-vt
-  provides the terminal emulation core. Ghostty's correctness and performance
-  set a high bar that we're grateful to build upon.
-- **[wgpu](https://wgpu.rs/)** — Cross-platform GPU abstraction that makes
-  rendering work everywhere.
-- **The Rust community** — For the tooling, crates, and ecosystem that make
-  projects like this possible.
+- **[Ghostty](https://ghostty.org/)** by [Mitchell Hashimoto](https://github.com/mitchellh)
+  — libghostty-vt provides the terminal emulation engine. Ghostty's VT
+  correctness and SIMD-optimized parsing are what make Forgetty possible.
+- **[iTerm2-Color-Schemes](https://github.com/mbadolato/iTerm2-Color-Schemes)**
+  — 485 of our 486 bundled themes come from this collection.
+- **[Claude Code](https://claude.ai/claude-code)** by
+  [Anthropic](https://anthropic.com) — the AI coding agent that built Forgetty.
+- **GTK4, libadwaita, Pango, FreeType** — the GNOME platform that gives
+  Forgetty its native rendering quality.
+- **The Rust ecosystem** — gtk4-rs, portable-pty, serde, toml, clap, and the
+  many crates Forgetty depends on.

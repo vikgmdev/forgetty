@@ -1,212 +1,219 @@
 # Configuration Reference
 
-Forgetty is configured via a TOML file located at:
+Forgetty is configured via a TOML file at `~/.config/forgetty/config.toml`. The file is created automatically on first launch with sensible defaults.
+
+**Hot reload:** Forgetty watches the config file and applies changes instantly to all panes. No restart needed. If you save a malformed config, the previous working config is preserved.
+
+You can also edit font, theme, and size visually using the appearance sidebar (`Ctrl+,`).
+
+## Config file location
 
 | Platform | Path |
 |----------|------|
-| Linux    | `~/.config/forgetty/config.toml` |
-| macOS    | `~/Library/Application Support/forgetty/config.toml` |
-| Windows  | `%APPDATA%\forgetty\config.toml` |
+| Linux | `$XDG_CONFIG_HOME/forgetty/config.toml` (default: `~/.config/forgetty/config.toml`) |
 
-A default configuration file is created automatically on first launch. Changes
-are applied live -- Forgetty watches the config file and reloads on save.
+Override with `--config-file <PATH>` on the command line.
 
-## Full Schema
+## Full example
 
 ```toml
-# ~/.config/forgetty/config.toml
+font_family = "JetBrains Mono"
+font_size = 14.0
+theme = "Catppuccin Mocha"
+shell = "/bin/zsh"
+scrollback_lines = 10000
+cursor_style = "block"
+bell_mode = "visual"
+```
 
-# ──────────────────────────────────────────────
-# Font
-# ──────────────────────────────────────────────
+All fields are optional. Omitted fields use defaults.
 
-[font]
-# Font family for regular text. Forgetty uses the system font fallback
-# chain for missing glyphs.
-family = "JetBrains Mono"
+## Fields
 
-# Font size in points.
-size = 13.0
+### `font_family`
 
-# Line height as a multiplier of the font's default line height.
-# 1.0 = default, 1.2 = 20% extra spacing.
-line_height = 1.0
+**Type:** String
+**Default:** `"monospace"`
 
-# Enable font ligatures (e.g., -> becomes an arrow in supported fonts).
-ligatures = true
+Font family name for terminal text. Uses Fontconfig for font discovery — any font installed on your system works. Monospace fonts are recommended.
 
-# ──────────────────────────────────────────────
-# Window
-# ──────────────────────────────────────────────
+```toml
+font_family = "JetBrains Mono"
+font_family = "Fira Code"
+font_family = "monospace"       # system default monospace
+```
 
-[window]
-# Initial window width and height in pixels.
-width = 1200
-height = 800
+### `font_size`
 
-# Window opacity (0.0 = fully transparent, 1.0 = fully opaque).
-# Requires a compositor that supports transparency.
-opacity = 1.0
+**Type:** Float
+**Default:** `12.0`
 
-# Window padding in pixels (space between the terminal grid and window edge).
-padding = 8
+Font size in points. Runtime zoom (`Ctrl+=`/`Ctrl+-`) adjusts this per-pane without changing the config.
 
-# Enable window decorations (title bar, borders).
-# Set to false for a borderless window.
-decorations = true
+```toml
+font_size = 14.0
+```
 
-# ──────────────────────────────────────────────
-# Theme
-# ──────────────────────────────────────────────
+Minimum: 6.0. Maximum: 72.0.
 
-[theme]
-# Name of the built-in theme to use, or a path to a custom theme TOML file.
-# Built-in themes: "default-dark", "default-light"
-name = "default-dark"
+### `theme`
 
-# ──────────────────────────────────────────────
-# Cursor
-# ──────────────────────────────────────────────
+**Type:** String
+**Default:** `"0x96f"`
 
-[cursor]
-# Cursor style: "block", "beam", or "underline".
-style = "block"
+Name of the color theme. Forgetty ships with 486 built-in themes (all from [iTerm2-Color-Schemes](https://github.com/mbadolato/iTerm2-Color-Schemes) plus a default dark theme).
 
-# Whether the cursor blinks.
-blink = true
+```toml
+theme = "Catppuccin Mocha"
+theme = "Dracula"
+theme = "Solarized Dark"
+theme = "Tokyo Night"
+theme = "Nord"
+theme = "Gruvbox Dark"
+```
 
-# Blink interval in milliseconds.
-blink_interval = 500
+Browse all themes interactively with the appearance sidebar (`Ctrl+,`). Arrow keys preview themes live — Enter to apply, Escape to revert.
 
-# ──────────────────────────────────────────────
-# Scrollback
-# ──────────────────────────────────────────────
+**Custom themes:** Drop a `.toml` file in `~/.config/forgetty/themes/` and reference it by name. Custom themes override bundled themes with the same name.
 
-[scrollback]
-# Maximum number of lines to keep in the scrollback buffer.
-lines = 10000
+**Theme aliases:** Common aliases are built in — "Solarized Dark" maps to "Solarized Dark - Patched", "Tokyo Night" maps to "tokyonight", etc.
 
-# ──────────────────────────────────────────────
-# Shell
-# ──────────────────────────────────────────────
+### `shell`
 
-[shell]
-# Path to the shell executable. If empty, Forgetty uses the system
-# default ($SHELL on Unix, %COMSPEC% on Windows).
-program = ""
+**Type:** String (optional)
+**Default:** not set (auto-detect)
 
-# Additional arguments passed to the shell.
-args = []
+Shell to launch in new terminals. When not set, Forgetty uses the `$SHELL` environment variable, falls back to `/etc/passwd`, then `/bin/sh`.
 
-# Working directory for new tabs. If empty, uses the current
-# working directory of the focused pane (or $HOME for the first tab).
-working_directory = ""
+```toml
+shell = "/bin/zsh"
+shell = "/usr/bin/fish"
+```
 
-# ──────────────────────────────────────────────
-# Tabs
-# ──────────────────────────────────────────────
+### `scrollback_lines`
 
-[tabs]
-# Tab bar position: "left" (vertical) or "top" (horizontal).
-position = "left"
+**Type:** Integer
+**Default:** `10000`
 
-# Width of the vertical tab bar in pixels (only used when position = "left").
-width = 200
+Maximum number of lines retained in the scrollback buffer per pane.
 
-# Show the git branch in the tab title.
-show_git_branch = true
+```toml
+scrollback_lines = 50000
+scrollback_lines = 0            # disable scrollback
+```
 
-# Show the current working directory in the tab title.
-show_cwd = true
+### `cursor_style`
 
-# Show the running command in the tab title.
-show_command = true
+**Type:** Enum
+**Default:** `"block"`
 
-# ──────────────────────────────────────────────
-# Keybindings
-# ──────────────────────────────────────────────
+Cursor shape. Applications can override this via DECSCUSR escape sequences (e.g., vim uses bar cursor in insert mode).
 
-# Keybindings are defined as key = action pairs. Modifier keys are
-# joined with "+". Examples: "ctrl+shift+t", "cmd+d", "alt+1".
+| Value | Description |
+|-------|-------------|
+| `"block"` | Filled block cursor |
+| `"bar"` | Thin vertical bar |
+| `"underline"` | Horizontal underline |
+| `"block_hollow"` | Unfilled block outline |
 
+```toml
+cursor_style = "bar"
+```
+
+### `bell_mode`
+
+**Type:** Enum
+**Default:** `"visual"`
+
+How the terminal responds to the BEL character (0x07).
+
+| Value | Description |
+|-------|-------------|
+| `"visual"` | Brief white flash overlay on the pane |
+| `"audio"` | System beep via the desktop |
+| `"both"` | Flash and beep |
+| `"none"` | Ignore bells silently |
+
+```toml
+bell_mode = "none"
+```
+
+### `keybindings`
+
+**Type:** Map of action name to key combination
+**Default:** empty (uses built-in defaults)
+
+Custom keybindings using GTK4 accelerator format.
+
+```toml
 [keybindings]
-new_tab = "ctrl+shift+t"
-close_tab = "ctrl+shift+w"
-next_tab = "ctrl+tab"
-prev_tab = "ctrl+shift+tab"
-split_vertical = "ctrl+shift+d"
-split_horizontal = "ctrl+shift+e"
-close_pane = "ctrl+shift+x"
-focus_up = "ctrl+shift+up"
-focus_down = "ctrl+shift+down"
-focus_left = "ctrl+shift+left"
-focus_right = "ctrl+shift+right"
-copy = "ctrl+shift+c"
-paste = "ctrl+shift+v"
-command_palette = "ctrl+shift+p"
-zoom_in = "ctrl+="
-zoom_out = "ctrl+-"
-zoom_reset = "ctrl+0"
-
-# ──────────────────────────────────────────────
-# Notifications
-# ──────────────────────────────────────────────
-
-[notifications]
-# Enable AI agent attention notifications. When a background pane's
-# output matches a notification pattern, the pane's tab shows a
-# notification ring.
-enabled = true
-
-# Patterns that trigger a notification (regex). Applied to each
-# new line of terminal output.
-patterns = [
-  "\\? ",           # Interactive prompt (y/n)
-  "error\\[",       # Rust compiler error
-  "Error:",         # General error
-  "FAILED",         # Test failure
-  "Press .* to continue",
-]
-
-# ──────────────────────────────────────────────
-# Socket API
-# ──────────────────────────────────────────────
-
-[socket]
-# Enable the JSON-RPC socket API.
-enabled = true
-
-# Path to the Unix domain socket. Use "auto" to place it in the
-# XDG runtime directory (Linux) or a temporary directory.
-path = "auto"
-
-# ──────────────────────────────────────────────
-# Workspace
-# ──────────────────────────────────────────────
-
-[workspace]
-# Automatically save and restore sessions on restart.
-auto_restore = true
-
-# Directory where workspace session files are stored.
-# Default: platform config directory / "sessions"
-session_dir = ""
+# Not yet applied at runtime — planned for the keybindings editor (T-037).
+# Default shortcuts are listed in the README and viewable via F1 in-app.
 ```
 
-## Theme Files
+## Custom theme format
 
-Theme files follow the same format as `resources/themes/default-dark.toml`.
-Place custom themes anywhere on disk and reference them by path:
+Create a `.toml` file in `~/.config/forgetty/themes/`:
 
 ```toml
-[theme]
-name = "/home/user/.config/forgetty/themes/my-theme.toml"
+name = "My Theme"
+
+[colors]
+foreground = "#cdd6f4"
+background = "#1e1e2e"
+cursor = "#f5e0dc"
+selection = "#585b70"
+
+[colors.ansi]
+black = "#45475a"
+red = "#f38ba8"
+green = "#a6e3a1"
+yellow = "#f9e2af"
+blue = "#89b4fa"
+magenta = "#f5c2e7"
+cyan = "#94e2d5"
+white = "#bac2de"
+
+[colors.bright]
+black = "#585b70"
+red = "#f38ba8"
+green = "#a6e3a1"
+yellow = "#f9e2af"
+blue = "#89b4fa"
+magenta = "#f5c2e7"
+cyan = "#94e2d5"
+white = "#cdd6f4"
 ```
 
-## Environment Variables
+All color values are `#rrggbb` hex strings. The `cursor` and `selection` fields are optional — they fall back to theme defaults if omitted.
 
-| Variable | Description |
-|----------|-------------|
-| `FORGETTY_CONFIG` | Override the config file path |
-| `FORGETTY_LOG` | Set the log level (`trace`, `debug`, `info`, `warn`, `error`) |
-| `FORGETTY_SOCKET` | Override the socket path |
+## Environment variables
+
+Forgetty sets these on every spawned shell:
+
+| Variable | Value | Notes |
+|----------|-------|-------|
+| `TERM` | `xterm-256color` | Terminal type for 256-color support |
+| `COLORTERM` | `truecolor` | Indicates 24-bit true color support |
+| `TERM_PROGRAM` | `forgetty` | Terminal program identifier |
+| `TERM_PROGRAM_VERSION` | `0.1.0` | Version from build time |
+
+## CLI flags
+
+```
+forgetty [OPTIONS]
+
+Options:
+  --working-directory <PATH>   Start in this directory
+  -e, --execute <CMD> [ARGS]   Run a command instead of default shell
+  --config-file <PATH>         Use alternate config file
+  --class <CLASS>              Set WM_CLASS for window manager rules
+  -V, --version                Show version
+  -h, --help                   Show help
+```
+
+Flags like `--working-directory` and `--config-file` must come before `-e`:
+
+```sh
+forgetty --working-directory ~/projects -e nvim server.log
+```
