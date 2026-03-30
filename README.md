@@ -242,16 +242,9 @@ Android, we write a new thin shell — the core stays the same.
 ## Roadmap
 
 **Next:** Windows + WSL support, Android companion app, cross-device sync,
-web version. See [docs/lead/ROADMAP.md](docs/lead/ROADMAP.md) for the full plan.
+web version. See the roadmap in [CONTRIBUTING.md](CONTRIBUTING.md) for the full plan.
 
-## How it was built
-
-Forgetty was built with [Claude Code](https://claude.ai/claude-code) using a
-structured 3-phase harness methodology:
-
-1. **Plan** — agent writes a spec with acceptance criteria
-2. **Build** — agent implements, commits, verifies no crashes
-3. **QA** — agent tests every acceptance criterion, scores, writes a report
+## Architecture
 
 The architecture decision to use GTK4 instead of wgpu came from learning (the
 hard way) that GPU-rendered text can never match native Linux quality — no
