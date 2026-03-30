@@ -18,10 +18,11 @@ A clear description of the bug.
 ## Actual Behavior
 
 ## Environment
-- OS:
-- Forgetty version:
-- Terminal:
+- Forgetty version (`forgetty --version`):
+- Linux distribution and version:
+- Display server (Wayland or X11): `echo $XDG_SESSION_TYPE`
 - Shell:
+- Desktop environment:
 
 ## Screenshots
-If applicable, add screenshots.
+If applicable, add screenshots or terminal output.
