@@ -140,15 +140,24 @@ pub struct DrainResult {
 }
 
 impl TerminalState {
-    /// Drain all pending PTY output from the channel and feed it to the
-    /// terminal VT parser. Returns a `DrainResult` indicating whether data
-    /// was processed and whether the PTY channel has disconnected.
+    /// Drain pending PTY output from the channel and feed it to the
+    /// terminal VT parser.  Caps the amount of data processed per tick
+    /// to `MAX_DRAIN_BYTES` so the GTK main thread stays responsive for
+    /// input events — especially when multiple panes stream output
+    /// concurrently.  Any remaining data stays in the channel and will
+    /// be picked up on the next 8ms cycle.
     fn drain_pty_output(&mut self) -> DrainResult {
+        const MAX_DRAIN_BYTES: usize = 128 * 1024; // 128 KB per tick
         let mut had_data = false;
         let mut disconnected = false;
+        let mut bytes_drained: usize = 0;
         loop {
+            if bytes_drained >= MAX_DRAIN_BYTES {
+                break; // yield back to the GTK main loop
+            }
             match self.pty_rx.try_recv() {
                 Ok(data) => {
+                    bytes_drained += data.len();
                     had_data = true;
                     self.terminal.feed(&data);
 
@@ -2218,6 +2227,20 @@ fn draw_terminal(
     let num_cols = screen.cols().min(s.cols);
 
     // 3. Draw cells
+    //
+    // Reuse a single Pango layout and pre-built font variants to avoid
+    // allocating a new layout + cloning fonts for every cell.  With an
+    // 80×24 grid that is ~1,920 cells per frame — per pane.  Concurrent
+    // panes multiply this, so reuse is critical for responsiveness.
+    let layout = pango::Layout::new(&pango_ctx);
+    let mut font_bold = font_desc.clone();
+    font_bold.set_weight(pango::Weight::Bold);
+    let mut font_italic = font_desc.clone();
+    font_italic.set_style(pango::Style::Italic);
+    let mut font_bold_italic = font_desc.clone();
+    font_bold_italic.set_weight(pango::Weight::Bold);
+    font_bold_italic.set_style(pango::Style::Italic);
+
     for row in 0..num_rows {
         let y = row as f64 * cell_h;
         let cells = screen.row(row);
@@ -2251,18 +2274,15 @@ fn draw_terminal(
 
             ctx.set_source_rgb(fr, fg_g, fb);
 
-            // Create Pango layout for this cell's text
-            let layout = pango::Layout::new(&pango_ctx);
-            let mut cell_font = font_desc.clone();
+            // Pick the pre-built font variant for this cell
+            let cell_font = match (cell.attrs.bold, cell.attrs.italic) {
+                (true, true) => &font_bold_italic,
+                (true, false) => &font_bold,
+                (false, true) => &font_italic,
+                (false, false) => &font_desc,
+            };
 
-            if cell.attrs.bold {
-                cell_font.set_weight(pango::Weight::Bold);
-            }
-            if cell.attrs.italic {
-                cell_font.set_style(pango::Style::Italic);
-            }
-
-            layout.set_font_description(Some(&cell_font));
+            layout.set_font_description(Some(cell_font));
             layout.set_text(grapheme);
 
             // Render text
