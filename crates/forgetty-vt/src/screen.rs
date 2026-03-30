@@ -17,6 +17,34 @@ impl Default for Cell {
     }
 }
 
+impl Cell {
+    /// Update this cell's grapheme in-place, reusing the existing `String`
+    /// heap allocation when the new value fits within the current capacity.
+    /// Returns `true` if the grapheme actually changed.
+    #[inline]
+    pub fn update_grapheme(&mut self, new_grapheme: &str) -> bool {
+        if self.grapheme == new_grapheme {
+            return false;
+        }
+        self.grapheme.clear();
+        self.grapheme.push_str(new_grapheme);
+        true
+    }
+
+    /// Update this cell in-place from new grapheme + attrs, reusing the
+    /// existing `String` allocation when possible. Returns `true` if
+    /// anything changed.
+    #[inline]
+    pub fn update_in_place(&mut self, new_grapheme: &str, new_attrs: CellAttributes) -> bool {
+        let grapheme_changed = self.update_grapheme(new_grapheme);
+        let attrs_changed = self.attrs != new_attrs;
+        if attrs_changed {
+            self.attrs = new_attrs;
+        }
+        grapheme_changed || attrs_changed
+    }
+}
+
 /// Visual attributes for a terminal cell.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CellAttributes {
@@ -114,6 +142,7 @@ impl Screen {
 
     /// Replace the entire grid from an externally-built cell matrix.
     /// Also marks all replaced rows dirty and bumps the generation.
+    #[allow(dead_code)]
     pub(crate) fn replace_from_grid(&mut self, grid: Vec<Vec<Cell>>, dirty_rows: &[bool]) {
         let new_rows = grid.len();
         let new_cols = grid.first().map(|r| r.len()).unwrap_or(0);
@@ -128,6 +157,70 @@ impl Screen {
                 self.row_generations[i] = self.generation;
             }
         }
+    }
+
+    /// Update a cell in-place, reusing existing heap allocations.
+    /// Only bumps the row generation if the cell actually changed.
+    #[inline]
+    pub(crate) fn update_cell_in_place(
+        &mut self,
+        row: usize,
+        col: usize,
+        grapheme: &str,
+        attrs: CellAttributes,
+    ) -> bool {
+        let changed = self.cells[row][col].update_in_place(grapheme, attrs);
+        if changed {
+            self.generation += 1;
+            self.row_generations[row] = self.generation;
+        }
+        changed
+    }
+
+    /// Ensure the grid has exactly `rows` x `cols` dimensions.
+    /// Reuses existing row/cell allocations where possible.
+    pub(crate) fn ensure_capacity(&mut self, rows: usize, cols: usize) {
+        // Adjust column count in existing rows
+        for row in &mut self.cells {
+            if row.len() < cols {
+                row.reserve(cols - row.len());
+                while row.len() < cols {
+                    row.push(Cell::default());
+                }
+            } else if row.len() > cols {
+                row.truncate(cols);
+            }
+        }
+        // Adjust row count
+        if self.cells.len() < rows {
+            self.cells.reserve(rows - self.cells.len());
+            while self.cells.len() < rows {
+                let mut new_row = Vec::with_capacity(cols);
+                new_row.resize_with(cols, Cell::default);
+                self.cells.push(new_row);
+            }
+        } else if self.cells.len() > rows {
+            self.cells.truncate(rows);
+        }
+        self.row_generations.resize(rows, 0);
+        self.rows = rows;
+        self.cols = cols;
+    }
+
+    /// Get mutable access to a cell (for direct in-place updates).
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn cell_mut(&mut self, row: usize, col: usize) -> &mut Cell {
+        &mut self.cells[row][col]
+    }
+
+    /// Mark a specific row dirty (bump generation) without changing cell contents.
+    /// Used when the caller knows a row changed but already updated cells directly.
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn mark_row_dirty(&mut self, row: usize) {
+        self.generation += 1;
+        self.row_generations[row] = self.generation;
     }
 
     /// Clear the entire screen with blank cells.

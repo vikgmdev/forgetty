@@ -15,3 +15,6 @@ libadwaita = { workspace = true }
 pangocairo = "0.20"
 toml = { workspace = true }
 tracing = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

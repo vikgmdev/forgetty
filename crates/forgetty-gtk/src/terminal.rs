@@ -128,6 +128,13 @@ pub struct TerminalState {
     pub bell_flash_until: Option<Instant>,
     /// Timestamp of the last bell response, for rate limiting (200ms cooldown).
     pub last_bell: Instant,
+    /// Timestamp of the last PTY data received. Used to detect idle periods
+    /// for calling `malloc_trim(0)` to return freed memory to the OS (T-028).
+    pub last_pty_data: Instant,
+    /// Whether `malloc_trim` has already been called for the current idle
+    /// period. Reset to `false` when new PTY data arrives. Prevents calling
+    /// `malloc_trim` repeatedly during sustained idle periods.
+    pub malloc_trimmed: bool,
 }
 
 /// Result of draining the PTY output channel.
@@ -282,6 +289,8 @@ pub fn create_terminal(
         was_alternate_screen: false,
         bell_flash_until: None,
         last_bell: Instant::now() - Duration::from_secs(1),
+        last_pty_data: Instant::now(),
+        malloc_trimmed: false,
     }));
 
     // Create DrawingArea
@@ -371,6 +380,10 @@ pub fn create_terminal(
             }
 
             if had_data {
+                // Track when we last received PTY data for idle detection (T-028).
+                s.last_pty_data = Instant::now();
+                s.malloc_trimmed = false;
+
                 // Only auto-scroll to bottom when the user was already at
                 // the bottom. This lets users browse scrollback history
                 // during rapid continuous output (e.g., `while true; do date; done`).
@@ -425,6 +438,26 @@ pub fn create_terminal(
                     } else {
                         false
                     };
+
+                // T-028: After 5 seconds of no PTY data, call malloc_trim(0) to
+                // return freed heap pages to the OS. The glibc allocator retains
+                // freed memory by default, which causes the 39% post-settle RSS
+                // bloat found in T-027 benchmarking. This is called once per idle
+                // transition, not repeatedly.
+                #[cfg(target_os = "linux")]
+                if !s.malloc_trimmed
+                    && now.duration_since(s.last_pty_data) >= Duration::from_secs(5)
+                {
+                    s.malloc_trimmed = true;
+                    // Safety: malloc_trim is thread-safe and returns 1 if memory
+                    // was actually released, 0 otherwise. Called on the GTK main
+                    // thread during a confirmed idle period.
+                    unsafe {
+                        libc::malloc_trim(0);
+                    }
+                    tracing::debug!("malloc_trim(0) called after 5s idle");
+                }
+
                 // Also redraw while the bell flash overlay is active.
                 let bell_active = s.bell_flash_until.is_some();
                 if needs_redraw || bell_active {
