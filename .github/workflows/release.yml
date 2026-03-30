@@ -8,44 +8,64 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  build-linux:
     name: Build (${{ matrix.target }})
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     strategy:
       matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-          - target: x86_64-apple-darwin
-            os: macos-latest
-          - target: aarch64-apple-darwin
-            os: macos-latest
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
+        target:
+          - x86_64-unknown-linux-gnu
+          # - aarch64-unknown-linux-gnu  # Enable when cross-compilation is tested
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.0
+
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
-      - name: Upload artifact
+
+      - name: Build DEB package
+        run: bash dist/linux/build-deb.sh
+
+      - name: Package tarball
+        run: |
+          mkdir -p forgetty-${{ matrix.target }}/{bin,lib}
+          cp target/${{ matrix.target }}/release/forgetty forgetty-${{ matrix.target }}/bin/
+          cp target/release/lib/libghostty-vt.so.0* forgetty-${{ matrix.target }}/lib/ 2>/dev/null || true
+          tar czf forgetty-${{ matrix.target }}.tar.gz forgetty-${{ matrix.target }}/
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: forgetty-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/forgetty*
+          path: |
+            forgetty-${{ matrix.target }}.tar.gz
+            forgetty_*.deb
 
   release:
-    needs: build
+    needs: build-linux
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: forgetty-*/forgetty*
+          files: |
+            forgetty-*/*.tar.gz
+            forgetty-*/*.deb
           generate_release_notes: true
