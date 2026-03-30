@@ -17,7 +17,7 @@ jobs:
           - x86_64-unknown-linux-gnu
           # - aarch64-unknown-linux-gnu  # Enable when cross-compilation is tested
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
 
