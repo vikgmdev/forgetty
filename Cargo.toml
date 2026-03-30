@@ -25,7 +25,7 @@ description = "The AI-first agentic terminal emulator"
 [workspace.dependencies]
 wgpu = "23"
 winit = "0.30"
-glyphon = "0.7"
+glyphon = "0.10"
 cosmic-text = "0.12"
 wry = "0.48"
 pulldown-cmark = "0.12"
