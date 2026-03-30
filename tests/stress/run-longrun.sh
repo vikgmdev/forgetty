@@ -397,13 +397,13 @@ echo "Test ended:    $(date +%Y-%m-%dT%H:%M:%S)"
 echo "Samples:       $SAMPLE_COUNT"
 echo "" | tee -a "$SUMMARY_FILE"
 
-MAX_RSS_MB=$((MAX_RSS_SEEN / 1024))
+PEAK_RSS_MB=$((MAX_RSS_SEEN / 1024))
 
 # AC-07: RSS stays under 500 MB
-if [[ $MAX_RSS_MB -le $MAX_RSS_MB ]]; then
-    check "AC-07a (max RSS)" "PASS" "peak ${MAX_RSS_MB}MB <= ${MAX_RSS_MB}MB limit"
+if [[ $PEAK_RSS_MB -le $MAX_RSS_MB ]]; then
+    check "AC-07a (max RSS)" "PASS" "peak ${PEAK_RSS_MB}MB <= ${MAX_RSS_MB}MB limit"
 else
-    check "AC-07a (max RSS)" "FAIL" "peak ${MAX_RSS_MB}MB > ${MAX_RSS_MB}MB limit"
+    check "AC-07a (max RSS)" "FAIL" "peak ${PEAK_RSS_MB}MB > ${MAX_RSS_MB}MB limit"
 fi
 
 # AC-07: Final RSS within 120% of initial (skip if warm-up not reached)
@@ -419,6 +419,52 @@ if [[ "$WARMUP_DONE" == "true" ]] && [[ $INITIAL_RSS_KB -gt 0 ]]; then
     fi
 else
     check "AC-07b (RSS growth)" "PASS" "warm-up period not reached; skipped"
+fi
+
+# AC-08: Idle CPU under 0.5% and idle RSS within 105% of initial
+# Parse the TSV log for idle-phase samples (skip the header line)
+IDLE_CPU_SUM=0
+IDLE_CPU_COUNT=0
+IDLE_RSS_FIRST=0
+IDLE_RSS_LAST=0
+while IFS=$'\t' read -r _ts _elapsed _rss_kb _rss_mb cpu_pct _fd _child phase; do
+    if [[ "$phase" == "idle" ]]; then
+        IDLE_CPU_COUNT=$((IDLE_CPU_COUNT + 1))
+        IDLE_CPU_SUM=$(awk "BEGIN {printf \"%.2f\", $IDLE_CPU_SUM + $cpu_pct}")
+        if [[ $IDLE_RSS_FIRST -eq 0 ]]; then
+            IDLE_RSS_FIRST=$_rss_kb
+        fi
+        IDLE_RSS_LAST=$_rss_kb
+    fi
+done < <(tail -n +2 "$LOG_FILE")
+
+if [[ $IDLE_CPU_COUNT -gt 0 ]]; then
+    IDLE_CPU_AVG=$(awk "BEGIN {printf \"%.2f\", $IDLE_CPU_SUM / $IDLE_CPU_COUNT}")
+    # Check average idle CPU is under MAX_IDLE_CPU (0.5%)
+    IDLE_CPU_OK=$(awk "BEGIN {print ($IDLE_CPU_AVG <= $MAX_IDLE_CPU) ? 1 : 0}")
+    if [[ "$IDLE_CPU_OK" -eq 1 ]]; then
+        check "AC-08a (idle CPU)" "PASS" "avg ${IDLE_CPU_AVG}% <= ${MAX_IDLE_CPU}% limit (${IDLE_CPU_COUNT} idle samples)"
+    else
+        check "AC-08a (idle CPU)" "FAIL" "avg ${IDLE_CPU_AVG}% > ${MAX_IDLE_CPU}% limit (${IDLE_CPU_COUNT} idle samples)"
+    fi
+
+    # Check idle RSS: final idle RSS within 105% of first idle RSS
+    if [[ $IDLE_RSS_FIRST -gt 0 ]]; then
+        IDLE_RSS_LIMIT=$(awk "BEGIN {printf \"%d\", $IDLE_RSS_FIRST * $RSS_IDLE_THRESHOLD}")
+        IDLE_RSS_FIRST_MB=$((IDLE_RSS_FIRST / 1024))
+        IDLE_RSS_LAST_MB=$((IDLE_RSS_LAST / 1024))
+        IDLE_RSS_LIMIT_MB=$((IDLE_RSS_LIMIT / 1024))
+        if [[ $IDLE_RSS_LAST -le $IDLE_RSS_LIMIT ]]; then
+            check "AC-08b (idle RSS)" "PASS" "final ${IDLE_RSS_LAST_MB}MB <= ${IDLE_RSS_LIMIT_MB}MB (105% of ${IDLE_RSS_FIRST_MB}MB initial)"
+        else
+            check "AC-08b (idle RSS)" "FAIL" "final ${IDLE_RSS_LAST_MB}MB > ${IDLE_RSS_LIMIT_MB}MB (105% of ${IDLE_RSS_FIRST_MB}MB initial)"
+        fi
+    else
+        check "AC-08b (idle RSS)" "PASS" "no idle RSS data; skipped"
+    fi
+else
+    check "AC-08a (idle CPU)" "PASS" "no idle samples recorded; skipped"
+    check "AC-08b (idle RSS)" "PASS" "no idle samples recorded; skipped"
 fi
 
 # AC-09: fd count stable
