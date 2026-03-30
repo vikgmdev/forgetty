@@ -32,14 +32,20 @@ pub fn spawn_pty_bridge(
     let size = PtySize { rows, cols, pixel_width: 0, pixel_height: 0 };
 
     // CLI -e command takes priority over config shell.
-    let shell_command: Option<Vec<String>> = if command.is_some() {
-        None // will use `command` directly below
+    // Login shell semantics: apply to auto-detected shells and config shell
+    // overrides, but NOT to -e commands (those are explicit programs).
+    let (effective_command, login_shell): (Option<Vec<String>>, bool) = if let Some(cmd) = command {
+        // -e flag: run the command directly, no login shell.
+        (Some(cmd.to_vec()), false)
+    } else if let Some(s) = shell {
+        // Config shell override: treat as the user's interactive shell.
+        (Some(vec![s.to_string()]), true)
     } else {
-        shell.map(|s| vec![s.to_string()])
+        // No override: PtyProcess will detect the shell.
+        (None, true)
     };
-    let effective_command: Option<&[String]> = command.or_else(|| shell_command.as_deref());
 
-    let mut pty = PtyProcess::spawn(size, working_dir, effective_command)
+    let mut pty = PtyProcess::spawn(size, working_dir, effective_command.as_deref(), login_shell)
         .map_err(|e| format!("spawn PTY: {e}"))?;
 
     let reader = pty

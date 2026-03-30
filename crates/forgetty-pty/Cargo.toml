@@ -8,3 +8,6 @@ license.workspace = true
 forgetty-core = { path = "../forgetty-core" }
 portable-pty = { workspace = true }
 tracing = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

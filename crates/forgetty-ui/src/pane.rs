@@ -58,7 +58,7 @@ impl Pane {
             PtySize { rows: rows as u16, cols: cols as u16, pixel_width: 0, pixel_height: 0 };
 
         let mut pty =
-            PtyProcess::spawn(size, working_dir, None).map_err(|e| format!("spawn: {e}"))?;
+            PtyProcess::spawn(size, working_dir, None, true).map_err(|e| format!("spawn: {e}"))?;
 
         let reader = pty
             .take_reader()
