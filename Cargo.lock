@@ -1083,6 +1083,7 @@ dependencies = [
  "forgetty-watcher",
  "gtk4",
  "libadwaita",
+ "libc",
  "pangocairo",
  "toml 0.8.2",
  "tracing",

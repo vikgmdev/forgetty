@@ -513,6 +513,15 @@ impl Terminal {
     /// This follows the exact same API call sequence as Ghostling's
     /// `render_terminal()` (main.c lines 647-833).
     ///
+    /// **Memory optimization (T-028):** Instead of allocating a new
+    /// `Vec<Vec<Cell>>` grid every dirty frame, updates the existing
+    /// `Screen` cells in-place via `update_cell_in_place()`. This reuses
+    /// existing `String` heap allocations when graphemes haven't changed,
+    /// eliminating hundreds of thousands of short-lived allocations per
+    /// second during high-throughput output. The glibc allocator retains
+    /// freed virtual memory rather than returning it to the OS, so reducing
+    /// allocation churn directly reduces the post-settle RSS bloat.
+    ///
     /// # Safety
     /// Caller must ensure exclusive access to `cache` (which is guaranteed
     /// because Terminal is !Sync).
@@ -568,6 +577,10 @@ impl Terminal {
         let num_rows = rs_rows as usize;
         let num_cols = rs_cols as usize;
 
+        // Ensure the cached screen has the right dimensions (reuses
+        // existing row/cell allocations where possible).
+        cache.screen.ensure_capacity(num_rows, num_cols);
+
         // 2. Populate the row iterator from the render state (matches Ghostling line 662-663)
         //
         // IMPORTANT: pass a pointer TO the handle (`&mut self.row_iter`), not the handle
@@ -583,11 +596,22 @@ impl Terminal {
             );
         }
 
-        // 3. Build the cell grid by iterating rows (matches Ghostling line 670)
-        let mut grid: Vec<Vec<Cell>> = Vec::with_capacity(num_rows);
-        let mut dirty_rows: Vec<bool> = Vec::with_capacity(num_rows);
+        // 3. Iterate rows in-place (matches Ghostling line 670)
+        //
+        // Instead of building a new Vec<Vec<Cell>> and calling replace_from_grid(),
+        // we write directly into the existing Screen cells via update_cell_in_place().
+        // This eliminates per-frame grid allocation and reuses String heap buffers.
+        let mut row_idx: usize = 0;
+
+        // Reusable buffer for building grapheme strings from codepoints.
+        // Avoids allocating a temporary String on every non-empty cell.
+        let mut grapheme_buf = String::with_capacity(16);
 
         while unsafe { ffi::ghostty_render_state_row_iterator_next(self.row_iter) } {
+            if row_idx >= num_rows {
+                break;
+            }
+
             // Get cells for this row (matches Ghostling line 672-673)
             //
             // Same pointer-to-handle pattern as row_iterator above: pass
@@ -601,10 +625,14 @@ impl Terminal {
                 );
             }
 
-            let mut row_cells_vec: Vec<Cell> = Vec::with_capacity(num_cols);
+            let mut col_idx: usize = 0;
 
             // 4. Iterate cells (matches Ghostling line 678)
             while unsafe { ffi::ghostty_render_state_row_cells_next(self.row_cells) } {
+                if col_idx >= num_cols {
+                    break;
+                }
+
                 // 5. Get grapheme length (matches Ghostling line 680-682)
                 let mut grapheme_len: u32 = 0;
                 unsafe {
@@ -632,10 +660,9 @@ impl Terminal {
                         Color::Default
                     };
 
-                    row_cells_vec.push(Cell {
-                        grapheme: " ".to_string(),
-                        attrs: CellAttributes { bg, ..CellAttributes::default() },
-                    });
+                    let attrs = CellAttributes { bg, ..CellAttributes::default() };
+                    cache.screen.update_cell_in_place(row_idx, col_idx, " ", attrs);
+                    col_idx += 1;
                     continue;
                 }
 
@@ -650,10 +677,14 @@ impl Terminal {
                     );
                 }
 
-                // Convert codepoints to String
-                let grapheme: String =
-                    codepoints[..len].iter().filter_map(|&cp| char::from_u32(cp)).collect();
-                let grapheme = if grapheme.is_empty() { " ".to_string() } else { grapheme };
+                // Convert codepoints to grapheme string, reusing buffer
+                grapheme_buf.clear();
+                for &cp in &codepoints[..len] {
+                    if let Some(ch) = char::from_u32(cp) {
+                        grapheme_buf.push(ch);
+                    }
+                }
+                let grapheme_str = if grapheme_buf.is_empty() { " " } else { &grapheme_buf };
 
                 // 7. Get resolved FG color (matches Ghostling line 723-725)
                 let mut fg_rgb = colors.foreground;
@@ -707,16 +738,15 @@ impl Terminal {
                     dim: style.faint,
                 };
 
-                row_cells_vec.push(Cell { grapheme, attrs });
+                cache.screen.update_cell_in_place(row_idx, col_idx, grapheme_str, attrs);
+                col_idx += 1;
             }
 
-            // Pad row to expected width if needed
-            while row_cells_vec.len() < num_cols {
-                row_cells_vec.push(Cell::default());
+            // Pad remaining columns with defaults (reusing existing cells)
+            while col_idx < num_cols {
+                cache.screen.update_cell_in_place(row_idx, col_idx, " ", CellAttributes::default());
+                col_idx += 1;
             }
-            row_cells_vec.truncate(num_cols);
-
-            grid.push(row_cells_vec);
 
             // 11. Clear per-row dirty flag immediately (matches Ghostling line 770-772)
             let clean: bool = false;
@@ -728,19 +758,16 @@ impl Terminal {
                 );
             }
 
-            dirty_rows.push(true);
+            row_idx += 1;
         }
 
-        // Pad to expected number of rows
-        while grid.len() < num_rows {
-            grid.push((0..num_cols).map(|_| Cell::default()).collect());
-            dirty_rows.push(true);
+        // Pad remaining rows with defaults (reusing existing cells)
+        while row_idx < num_rows {
+            for col in 0..num_cols {
+                cache.screen.update_cell_in_place(row_idx, col, " ", CellAttributes::default());
+            }
+            row_idx += 1;
         }
-        grid.truncate(num_rows);
-        dirty_rows.truncate(num_rows);
-
-        // Replace grid in screen
-        cache.screen.replace_from_grid(grid, &dirty_rows);
 
         // 12. Clear global dirty flag (matches Ghostling line 830-832)
         let clean = ffi::GHOSTTY_RENDER_STATE_DIRTY_FALSE;
