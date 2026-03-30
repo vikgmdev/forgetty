@@ -28,7 +28,7 @@ winit = "0.30"
 glyphon = "0.7"
 cosmic-text = "0.12"
 wry = "0.48"
-pulldown-cmark = "0.12"
+pulldown-cmark = "0.13"
 notify = "7"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
