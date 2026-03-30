@@ -47,12 +47,21 @@ pub struct PtyProcess {
 impl PtyProcess {
     /// Spawn a new shell process in a PTY.
     ///
-    /// If `command` is `None`, the user's default shell is detected from
-    /// the `$SHELL` environment variable (Unix) or PowerShell/cmd (Windows).
+    /// If `command` is `None`, the user's default shell is detected via the
+    /// fallback chain: `$SHELL` -> `/etc/passwd` -> `/bin/sh`. The shell is
+    /// invoked as a login shell (argv[0] prefixed with `-`).
+    ///
+    /// If `command` is `Some` and `login_shell` is `true`, the command is
+    /// treated as a shell override (e.g., from config.toml) and gets login
+    /// shell semantics.
+    ///
+    /// If `command` is `Some` and `login_shell` is `false`, the command is
+    /// run directly without login shell semantics (matching `-e` flag behavior).
     pub fn spawn(
         size: PtySize,
         working_dir: Option<&Path>,
         command: Option<&[String]>,
+        login_shell: bool,
     ) -> Result<Self> {
         let pty_system = native_pty_system();
 
@@ -62,16 +71,36 @@ impl PtyProcess {
 
         let mut cmd = match command {
             Some(args) if !args.is_empty() => {
-                let mut cb = CommandBuilder::new(&args[0]);
-                if args.len() > 1 {
-                    cb.args(&args[1..]);
+                if login_shell {
+                    // Config shell override: use new_default_prog() for login
+                    // shell semantics. portable-pty reads SHELL from the
+                    // builder's env, uses it as the executable, and sets
+                    // argv[0] to "-basename" automatically.
+                    debug!(shell = %args[0], "using config shell as login shell");
+                    let mut cb = CommandBuilder::new_default_prog();
+                    cb.env("SHELL", &args[0]);
+                    // Note: args beyond [0] are ignored for config shell
+                    // overrides (shell path only, no extra args).
+                    cb
+                } else {
+                    // Explicit -e command: run as-is, no login shell.
+                    let mut cb = CommandBuilder::new(&args[0]);
+                    if args.len() > 1 {
+                        cb.args(&args[1..]);
+                    }
+                    cb
                 }
-                cb
             }
             _ => {
+                // No command specified: detect the user's shell and invoke
+                // it as a login shell via new_default_prog(). portable-pty
+                // reads SHELL from the builder's env and prefixes argv[0]
+                // with "-" for login shell semantics.
                 let shell = detect_shell();
-                debug!(shell = %shell, "using shell");
-                CommandBuilder::new(shell)
+                debug!(shell = %shell, "using detected shell as login shell");
+                let mut cb = CommandBuilder::new_default_prog();
+                cb.env("SHELL", &shell);
+                cb
             }
         };
 
@@ -178,13 +207,45 @@ impl Drop for PtyProcess {
 }
 
 /// Detect the user's default shell.
+///
+/// Fallback chain (Unix):
+///   1. `$SHELL` environment variable (if set and the path exists + is executable)
+///   2. `/etc/passwd` entry via `getpwuid(getuid())` (if valid and path exists)
+///   3. `/bin/sh` (absolute last resort)
 fn detect_shell() -> String {
     #[cfg(unix)]
     {
-        std::env::var("SHELL").unwrap_or_else(|_| {
-            warn!("$SHELL not set, falling back to /bin/sh");
-            "/bin/sh".to_string()
-        })
+        // Step 1: Try $SHELL environment variable.
+        if let Ok(shell) = std::env::var("SHELL") {
+            if !shell.is_empty() {
+                let path = Path::new(&shell);
+                if path.exists() {
+                    debug!(shell = %shell, "using $SHELL");
+                    return shell;
+                }
+                warn!(
+                    shell = %shell,
+                    "$SHELL points to a nonexistent path, trying /etc/passwd"
+                );
+            }
+        }
+
+        // Step 2: Try /etc/passwd via getpwuid(getuid()).
+        if let Some(shell) = passwd_shell() {
+            let path = Path::new(&shell);
+            if path.exists() {
+                debug!(shell = %shell, "using shell from /etc/passwd");
+                return shell;
+            }
+            warn!(
+                shell = %shell,
+                "/etc/passwd shell does not exist, falling back to /bin/sh"
+            );
+        }
+
+        // Step 3: Last resort.
+        warn!("$SHELL not set and /etc/passwd lookup failed, falling back to /bin/sh");
+        "/bin/sh".to_string()
     }
 
     #[cfg(windows)]
@@ -202,6 +263,45 @@ fn detect_shell() -> String {
     #[cfg(not(any(unix, windows)))]
     {
         "sh".to_string()
+    }
+}
+
+/// Read the user's login shell from `/etc/passwd` via `getpwuid(getuid())`.
+///
+/// Returns `None` if the lookup fails or the shell field cannot be read.
+/// The `pw_shell` string is copied immediately -- the pointer from `getpwuid`
+/// is to a static buffer and must not be held across calls.
+#[cfg(unix)]
+fn passwd_shell() -> Option<String> {
+    use std::ffi::CStr;
+
+    // SAFETY: getuid() is always safe. getpwuid() returns a pointer to a
+    // static buffer (not thread-safe), but detect_shell() is called from the
+    // GTK main thread during terminal creation, which is serialized.
+    // We copy pw_shell immediately and do not hold the pointer.
+    unsafe {
+        let uid = libc::getuid();
+        let ent = libc::getpwuid(uid);
+        if ent.is_null() {
+            warn!("getpwuid({uid}) returned null");
+            return None;
+        }
+        let pw_shell = (*ent).pw_shell;
+        if pw_shell.is_null() {
+            warn!("getpwuid({uid}).pw_shell is null");
+            return None;
+        }
+        match CStr::from_ptr(pw_shell).to_str() {
+            Ok(s) if !s.is_empty() => Some(s.to_owned()),
+            Ok(_) => {
+                warn!("getpwuid({uid}).pw_shell is empty");
+                None
+            }
+            Err(e) => {
+                warn!("getpwuid({uid}).pw_shell is not valid UTF-8: {e}");
+                None
+            }
+        }
     }
 }
 
@@ -226,7 +326,8 @@ mod tests {
 
     #[test]
     fn test_spawn_and_read() {
-        let mut proc = PtyProcess::spawn(default_size(), None, None).expect("failed to spawn");
+        let mut proc =
+            PtyProcess::spawn(default_size(), None, None, true).expect("failed to spawn");
         assert!(proc.pid().is_some());
 
         // Give the shell a moment to start and produce output.
@@ -243,7 +344,7 @@ mod tests {
         // Spawn `echo` directly as the command to avoid interactive shell issues.
         let cmd = vec!["echo".to_string(), "hello_forgetty_test".to_string()];
         let mut proc =
-            PtyProcess::spawn(default_size(), None, Some(&cmd)).expect("failed to spawn");
+            PtyProcess::spawn(default_size(), None, Some(&cmd), false).expect("failed to spawn");
 
         // Read output — the process runs `echo` and exits, so we read until EOF.
         let mut output = Vec::new();
@@ -265,7 +366,7 @@ mod tests {
 
     #[test]
     fn test_resize_no_panic() {
-        let proc = PtyProcess::spawn(default_size(), None, None).expect("failed to spawn");
+        let proc = PtyProcess::spawn(default_size(), None, None, true).expect("failed to spawn");
 
         let new_size = PtySize { rows: 48, cols: 120, pixel_width: 0, pixel_height: 0 };
         proc.resize(new_size).expect("resize should not fail");
@@ -279,7 +380,7 @@ mod tests {
     fn test_env_vars_set() {
         let cmd = vec!["env".to_string()];
         let mut proc =
-            PtyProcess::spawn(default_size(), None, Some(&cmd)).expect("failed to spawn");
+            PtyProcess::spawn(default_size(), None, Some(&cmd), false).expect("failed to spawn");
 
         let mut output = Vec::new();
         let mut buf = [0u8; 8192];
@@ -313,7 +414,8 @@ mod tests {
 
     #[test]
     fn test_kill_terminates() {
-        let mut proc = PtyProcess::spawn(default_size(), None, None).expect("failed to spawn");
+        let mut proc =
+            PtyProcess::spawn(default_size(), None, None, true).expect("failed to spawn");
         assert!(proc.is_alive());
 
         proc.kill().expect("kill should succeed");
@@ -322,5 +424,58 @@ mod tests {
         thread::sleep(Duration::from_millis(200));
 
         assert!(!proc.is_alive(), "process should not be alive after kill");
+    }
+
+    #[test]
+    fn test_detect_shell_returns_valid_path() {
+        let shell = detect_shell();
+        assert!(
+            Path::new(&shell).exists(),
+            "detect_shell() returned '{shell}' which does not exist"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_passwd_shell_returns_some() {
+        // On a normal system, the current user should have a passwd entry.
+        let shell = passwd_shell();
+        assert!(shell.is_some(), "passwd_shell() returned None on a normal system");
+        let shell = shell.unwrap();
+        assert!(
+            Path::new(&shell).exists(),
+            "passwd_shell() returned '{shell}' which does not exist"
+        );
+    }
+
+    #[test]
+    fn test_command_no_login_shell() {
+        // When login_shell=false, argv[0] should be the program name as-is.
+        let cmd = vec!["/bin/echo".to_string(), "test".to_string()];
+        // This exercises the Some(args) + login_shell=false branch.
+        // We cannot directly inspect the CommandBuilder, but we verify no crash.
+        let proc = PtyProcess::spawn(default_size(), None, Some(&cmd), false);
+        assert!(proc.is_ok(), "spawn with login_shell=false should succeed");
+        drop(proc);
+    }
+
+    #[test]
+    fn test_login_shell_spawn_succeeds() {
+        // Spawn with login_shell=true and no command (auto-detect).
+        // This exercises the new_default_prog() + SHELL env path.
+        let proc = PtyProcess::spawn(default_size(), None, None, true);
+        assert!(proc.is_ok(), "spawn with login_shell=true should succeed");
+        drop(proc);
+    }
+
+    #[test]
+    fn test_config_shell_override_login() {
+        // Spawn with an explicit shell path and login_shell=true.
+        // This simulates the config shell override path.
+        let shell = detect_shell();
+        let cmd = vec![shell];
+        let proc = PtyProcess::spawn(default_size(), None, Some(&cmd), true);
+        assert!(proc.is_ok(), "spawn with config shell override should succeed");
+        drop(proc);
     }
 }

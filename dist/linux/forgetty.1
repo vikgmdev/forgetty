@@ -54,9 +54,16 @@ Print usage information and exit.
 .B SHELL
 The default shell to launch if no
 .B \-e
-flag is given. Falls back to
-.B /bin/bash
-if not set.
+flag is given and no
+.B shell
+key is set in config.toml. If
+.B $SHELL
+is unset or points to a nonexistent path, Forgetty consults the user's
+.I /etc/passwd
+entry via
+.BR getpwuid (3).
+If that also fails, falls back to
+.BR /bin/sh .
 .TP
 .B TERM
 Set by Forgetty to advertise terminal capabilities.

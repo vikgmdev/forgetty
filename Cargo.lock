@@ -1094,6 +1094,7 @@ name = "forgetty-pty"
 version = "0.1.0"
 dependencies = [
  "forgetty-core",
+ "libc",
  "portable-pty",
  "tracing",
 ]

@@ -52,7 +52,10 @@ impl PtyMultiplexer {
         let id = PtyId(self.next_id);
         self.next_id += 1;
 
-        let process = PtyProcess::spawn(size, working_dir, command)?;
+        // Multiplexer spawns are always interactive shells (no -e commands),
+        // so use login shell semantics.
+        let login_shell = command.is_none();
+        let process = PtyProcess::spawn(size, working_dir, command, login_shell)?;
         debug!(%id, pid = ?process.pid(), "multiplexer spawned new PTY");
         self.sessions.insert(id, process);
 
