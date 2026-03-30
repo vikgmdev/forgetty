@@ -88,7 +88,7 @@ sudo pacman -S --needed \
 ### Build
 
 ```sh
-git clone --recursive https://github.com/totem-labs-forge/forgetty.git
+git clone --recursive https://github.com/vikgmdev/forgetty.git
 cd forgetty
 cargo build --release
 ```
@@ -111,7 +111,7 @@ No additional libraries are needed; macOS provides the required frameworks
 ### Build
 
 ```sh
-git clone --recursive https://github.com/totem-labs-forge/forgetty.git
+git clone --recursive https://github.com/vikgmdev/forgetty.git
 cd forgetty
 cargo build --release
 ```
@@ -144,7 +144,7 @@ Or download directly from [ziglang.org/download](https://ziglang.org/download/).
 ### Build
 
 ```powershell
-git clone --recursive https://github.com/totem-labs-forge/forgetty.git
+git clone --recursive https://github.com/vikgmdev/forgetty.git
 cd forgetty
 cargo build --release
 ```

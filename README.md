@@ -136,7 +136,7 @@ sudo dpkg -i forgetty_0.1.0_amd64.deb
 ### Install script (any Linux)
 
 ```sh
-git clone https://github.com/totem-labs-forge/forgetty.git
+git clone https://github.com/vikgmdev/forgetty.git
 cd forgetty
 cargo build --release
 ./install.sh
@@ -196,7 +196,7 @@ Or use the appearance sidebar (`Ctrl+,`) to change theme, font, and size with li
 ### Build
 
 ```sh
-git clone https://github.com/totem-labs-forge/forgetty.git
+git clone https://github.com/vikgmdev/forgetty.git
 cd forgetty
 cargo build --release
 cargo run --release

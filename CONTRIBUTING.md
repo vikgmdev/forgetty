@@ -28,7 +28,7 @@ sudo pacman -S gtk4 libadwaita
 ### Clone and build
 
 ```sh
-git clone --recursive https://github.com/totem-labs-forge/forgetty.git
+git clone --recursive https://github.com/vikgmdev/forgetty.git
 cd forgetty
 cargo build --release
 ```
