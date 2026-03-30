@@ -27,7 +27,7 @@ wgpu = "23"
 winit = "0.30"
 glyphon = "0.7"
 cosmic-text = "0.12"
-wry = "0.48"
+wry = "0.55"
 pulldown-cmark = "0.12"
 notify = "7"
 tokio = { version = "1", features = ["full"] }
