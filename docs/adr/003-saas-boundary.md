@@ -52,11 +52,11 @@ well-defined interface.
 
 Maintain **two separate repositories**:
 
-1. **`totem-labs-forge/forgetty`** (this repo) — The open-source terminal
+1. **`vikgmdev/forgetty`** (this repo) — The open-source terminal
    emulator. MIT licensed. Contains all crates needed to build and run a
    fully functional terminal.
 
-2. **`totem-labs-forge/forgetty-cloud`** (private) — The SaaS backend and
+2. **`vikgmdev/forgetty-cloud`** (private) — The SaaS backend and
    sync client. Contains the authentication service, sync protocol, payment
    integration, and a thin client library that connects to the terminal via
    the socket API.
@@ -75,7 +75,7 @@ The open-source terminal includes a `[sync]` configuration section with
 `enabled = false` by default. When enabled, it looks for a `forgetty-sync`
 binary on `PATH` and launches it as a child process, communicating via the
 socket API. The sync binary is distributed separately (e.g., via `brew install
-totem-labs-forge/tap/forgetty-sync`).
+vikgmdev/tap/forgetty-sync`).
 
 This means:
 - The open-source terminal has zero SaaS code.
