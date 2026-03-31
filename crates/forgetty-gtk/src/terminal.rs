@@ -747,8 +747,9 @@ pub fn create_terminal(
                     return glib::Propagation::Proceed;
                 };
 
-                // Ctrl+C with a selection → propagate to GTK so win.copy accelerator fires.
-                // Without a selection, fall through to ghostty encoder (sends SIGINT).
+                // Ctrl+C with a selection → activate win.copy directly (bypasses GTK accelerators
+                // so Ctrl+C without selection still reaches the encoder as SIGINT).
+                // Without a selection, fall through to ghostty encoder (sends 0x03 / SIGINT).
                 let ctrl_only = modifier
                     & (gdk::ModifierType::CONTROL_MASK
                         | gdk::ModifierType::SHIFT_MASK
@@ -758,7 +759,9 @@ pub fn create_terminal(
                     && (keyval == gdk::Key::c || keyval == gdk::Key::C)
                     && s.selection.is_some()
                 {
-                    return glib::Propagation::Proceed;
+                    drop(s);
+                    da_for_key.activate_action("win.copy", None).ok();
+                    return glib::Propagation::Stop;
                 }
 
                 // Escape clears selection when mouse tracking is off (AC-19).
