@@ -17,7 +17,8 @@ use std::time::Duration;
 
 use std::path::PathBuf;
 
-use forgetty_config::{load_config, Config};
+use crate::terminal::NotificationPayload;
+use forgetty_config::{load_config, Config, NotificationMode};
 use forgetty_watcher::ConfigWatcher;
 use gtk4::gio;
 use gtk4::glib;
@@ -1015,11 +1016,7 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
                 let ft = active_focus_tracker(&wm_ws);
                 close_command_palette(&palette_ref_ws, &ft);
             }
-            toggle_workspace_selector(
-                &selector_ref,
-                &lb_ref,
-                &wm_selector,
-            );
+            toggle_workspace_selector(&selector_ref, &lb_ref, &wm_selector);
         });
         window.add_action(&action);
     }
@@ -1410,7 +1407,14 @@ fn build_pane_tree(
             };
 
             let on_exit = make_on_exit_callback(tab_view, tab_states, window);
-            match terminal::create_terminal(config, Some(on_exit), Some(&effective_cwd), None) {
+            let on_notify = make_on_notify_callback(tab_view, tab_states, window);
+            match terminal::create_terminal(
+                config,
+                Some(on_exit),
+                Some(on_notify),
+                Some(&effective_cwd),
+                None,
+            ) {
                 Ok((pane_vbox, drawing_area, state)) => {
                     let pane_id = next_pane_id();
                     drawing_area.set_widget_name(&pane_id);
@@ -1702,6 +1706,164 @@ fn make_on_exit_callback(
     })
 }
 
+/// Build the `on_notify` callback for a terminal pane.
+///
+/// This callback is invoked from the 8ms timer when an OSC 9/99/777 or BEL
+/// notification fires on an unfocused pane. It:
+///
+/// 1. Sets `adw::TabPage::set_needs_attention(true)` on the tab containing
+///    the notifying pane.
+/// 2. For OSC notifications (source is Some): fires a desktop notification
+///    via `notify-rust` in a background thread (D-Bus, non-blocking).
+///    BEL payloads (source is None) skip the desktop notification.
+/// 3. Implements click-to-focus: when the desktop notification is clicked,
+///    brings the Forgetty window to the foreground and focuses the pane.
+fn make_on_notify_callback(
+    tab_view: &adw::TabView,
+    tab_states: &TabStateMap,
+    window: &adw::ApplicationWindow,
+) -> Rc<dyn Fn(NotificationPayload)> {
+    let tv = tab_view.clone();
+    let states = Rc::clone(tab_states);
+    let win = window.clone();
+
+    Rc::new(move |payload: NotificationPayload| {
+        // --- 1. Tab badge ---
+        // Find the TabPage that contains the notifying pane and mark it as
+        // needing attention. We iterate all pages and collect leaf DAs.
+        let n_pages = tv.n_pages();
+        for i in 0..n_pages {
+            let page = tv.nth_page(i);
+            let container = page.child();
+            let leaves = collect_leaf_drawing_areas(&container);
+            if leaves.iter().any(|da| da.widget_name().as_str() == payload.pane_name) {
+                page.set_needs_attention(true);
+                break;
+            }
+        }
+
+        // --- 2. Desktop notification (OSC only, not BEL) ---
+        // `payload.source == None` means this was a BEL -- skip desktop notify.
+        // `payload.source == Some(...)` means OSC 9/99/777 -- fire desktop notify.
+        let source = payload.source;
+        if source.is_none() {
+            // BEL: ring + badge only, no desktop notification.
+            return;
+        }
+
+        // Check notification_mode on any pane (they all share the same config).
+        let mode = {
+            let Ok(map) = states.try_borrow() else { return };
+            map.get(&payload.pane_name)
+                .and_then(|rc| rc.try_borrow().ok())
+                .map(|s| s.config.notification_mode)
+                .unwrap_or(NotificationMode::All)
+        };
+
+        if mode == NotificationMode::RingOnly || mode == NotificationMode::None {
+            return;
+        }
+
+        let title = payload.title.clone();
+        let body = payload.body.clone();
+        let pane_name = payload.pane_name.clone();
+
+        // --- 3. Spawn background thread for D-Bus notification ---
+        // `notify-rust::Notification::show()` may block waiting for D-Bus.
+        // This MUST NOT run on the GTK main thread.
+        //
+        // Click-to-focus bridge uses std::sync::mpsc + a glib::timeout_add_local
+        // polling timer (50ms interval, auto-cancels on receipt):
+        //   1. Background thread: show notification, wait_for_action
+        //   2. On action: send pane_name via mpsc channel (Send)
+        //   3. Main thread: polling timer detects message, performs focus
+        //
+        // This avoids capturing non-Send GTK types (WeakRef, Rc) in the
+        // spawned thread.
+        #[cfg(target_os = "linux")]
+        {
+            let pane_name_thread = pane_name.clone();
+            let win_weak = win.downgrade();
+            let tv_weak = tv.downgrade();
+            let states_for_focus = Rc::clone(&states);
+
+            let (focus_tx, focus_rx) = std::sync::mpsc::channel::<String>();
+            let focus_rx = std::rc::Rc::new(std::cell::RefCell::new(focus_rx));
+
+            // Register a polling timer on the GTK main thread.
+            // It polls the mpsc receiver every 50ms and stops once it gets a message.
+            glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+                match focus_rx.borrow().try_recv() {
+                    Ok(pn) => {
+                        if let Some(win) = win_weak.upgrade() {
+                            win.present();
+                        }
+                        focus_pane_by_name(&pn, &tv_weak, &states_for_focus);
+                        glib::ControlFlow::Break
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        // Channel disconnected (thread done without clicking)
+                        glib::ControlFlow::Break
+                    }
+                }
+            });
+
+            std::thread::spawn(move || {
+                let result = notify_rust::Notification::new()
+                    .appname("Forgetty")
+                    .summary(&title)
+                    .body(&body)
+                    .icon("dev.forgetty.Forgetty")
+                    .hint(notify_rust::Hint::Category("im.received".to_owned()))
+                    .action("focus", "Focus")
+                    .show();
+
+                match result {
+                    Ok(handle) => {
+                        // Block until user clicks / dismisses.
+                        handle.wait_for_action(|action| {
+                            if action == "focus" || action == "__closed" {
+                                let _ = focus_tx.send(pane_name_thread.clone());
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!("Desktop notification failed: {e}");
+                    }
+                }
+                // Channel drops here, causing Disconnected on the receiver side.
+            });
+        }
+
+        // On non-Linux platforms, suppress unused variable warnings.
+        #[cfg(not(target_os = "linux"))]
+        let _ = pane_name;
+    })
+}
+
+/// Focus a pane by name: switch to its tab and call `grab_focus()`.
+///
+/// Used by the desktop notification click-to-focus callback.
+fn focus_pane_by_name(
+    pane_name: &str,
+    tv_weak: &glib::WeakRef<adw::TabView>,
+    _tab_states: &TabStateMap,
+) {
+    let Some(tv) = tv_weak.upgrade() else { return };
+    let n_pages = tv.n_pages();
+    for i in 0..n_pages {
+        let page = tv.nth_page(i);
+        let container = page.child();
+        let leaves = collect_leaf_drawing_areas(&container);
+        if let Some(da) = leaves.iter().find(|da| da.widget_name().as_str() == pane_name) {
+            tv.set_selected_page(&page);
+            da.grab_focus();
+            return;
+        }
+    }
+}
+
 fn add_new_tab(
     tab_view: &adw::TabView,
     config: &Config,
@@ -1713,7 +1875,8 @@ fn add_new_tab(
     command: Option<&[String]>,
 ) {
     let on_exit = make_on_exit_callback(tab_view, tab_states, window);
-    match terminal::create_terminal(config, Some(on_exit), working_dir, command) {
+    let on_notify = make_on_notify_callback(tab_view, tab_states, window);
+    match terminal::create_terminal(config, Some(on_exit), Some(on_notify), working_dir, command) {
         Ok((pane_vbox, drawing_area, state)) => {
             // Assign a unique widget name for registry lookup
             let pane_id = next_pane_id();
@@ -1847,8 +2010,9 @@ fn split_pane(
 
     // Create the new terminal pane (splits always get default shell + default CWD)
     let on_exit = make_on_exit_callback(tab_view, tab_states, window);
+    let on_notify = make_on_notify_callback(tab_view, tab_states, window);
     let (new_pane_vbox, new_da, new_state) =
-        match terminal::create_terminal(config, Some(on_exit), None, None) {
+        match terminal::create_terminal(config, Some(on_exit), Some(on_notify), None, None) {
             Ok(triple) => triple,
             Err(e) => {
                 tracing::error!("Failed to create terminal for split: {e}");
@@ -2668,8 +2832,38 @@ fn wire_focus_tracking(
             if let Ok(mut name) = tracker.try_borrow_mut() {
                 *name = pane_name.clone();
             }
-            // Redraw to show the focus indicator
+
+            // Clear notification ring for this pane when it gains focus.
+            if let Ok(map) = states.try_borrow() {
+                if let Some(state_rc) = map.get(&pane_name) {
+                    if let Ok(mut s) = state_rc.try_borrow_mut() {
+                        s.notification_ring = false;
+                    }
+                }
+            }
+
+            // Redraw to show the focus indicator (and clear the ring)
             da.queue_draw();
+
+            // Clear tab badge if ALL panes in the tab have notification_ring == false.
+            // (AC-14 / AC-15: only clear badge if the specific ringed pane is focused)
+            if let Some(page) = tv.selected_page() {
+                let container = page.child();
+                let leaves = collect_leaf_drawing_areas(&container);
+                let any_ring = leaves.iter().any(|leaf_da| {
+                    let leaf_name = leaf_da.widget_name().to_string();
+                    states
+                        .try_borrow()
+                        .ok()
+                        .and_then(|map| map.get(&leaf_name).cloned())
+                        .and_then(|rc| rc.try_borrow().ok().map(|s| s.notification_ring))
+                        .unwrap_or(false)
+                });
+                if !any_ring {
+                    page.set_needs_attention(false);
+                }
+            }
+
             // Update tab title immediately from this pane's CWD
             // (skip if user has set a custom title for this page)
             if let Some(page) = tv.selected_page() {

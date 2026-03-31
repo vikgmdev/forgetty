@@ -12,7 +12,7 @@ use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use forgetty_config::{BellMode, Config, CursorStyle};
+use forgetty_config::{BellMode, Config, CursorStyle, NotificationMode};
 use forgetty_core::Rgba;
 use forgetty_vt::screen::Color;
 use forgetty_vt::selection::{Selection, SelectionMode};
@@ -70,6 +70,32 @@ struct HoverUrl {
     screen_row: usize,
     col_start: usize,
     col_end: usize, // exclusive
+}
+
+/// Which OSC protocol triggered this notification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationSource {
+    /// OSC 9 (ConEmu/Windows Terminal style).
+    Osc9,
+    /// OSC 99 (Kitty notification protocol, simplified).
+    Osc99,
+    /// OSC 777 (DesktopNotify/URxvt style).
+    Osc777,
+}
+
+/// Payload produced by the OSC notification scanner.
+///
+/// Passed from the PTY scanner to the GTK layer via the `on_notify` callback.
+#[derive(Debug, Clone)]
+pub struct NotificationPayload {
+    /// Notification summary/title for the desktop notification.
+    pub title: String,
+    /// Notification body text.
+    pub body: String,
+    /// Widget name of the DrawingArea that emitted this notification.
+    pub pane_name: String,
+    /// Which protocol triggered this notification (None for BEL).
+    pub source: Option<NotificationSource>,
 }
 
 /// Shared terminal state accessible from multiple GTK callbacks.
@@ -135,15 +161,30 @@ pub struct TerminalState {
     /// period. Reset to `false` when new PTY data arrives. Prevents calling
     /// `malloc_trim` repeatedly during sustained idle periods.
     pub malloc_trimmed: bool,
+    /// Whether this pane currently has a notification ring drawn around it.
+    /// Set when an OSC or BEL notification fires on an unfocused pane.
+    /// Cleared when the user focuses this pane.
+    pub notification_ring: bool,
+    /// Timestamp of the last desktop notification sent from this pane.
+    /// Used for 2-second rate limiting to suppress notification spam.
+    pub last_notification: Instant,
+    /// Callback invoked when a notification triggers (OSC 9/99/777 or BEL).
+    /// Wired by `app.rs` to handle tab badge updates and desktop notifications.
+    /// `None` until the caller registers it via `set_on_notify()`.
+    pub on_notify: Option<Rc<dyn Fn(NotificationPayload)>>,
 }
 
 /// Result of draining the PTY output channel.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct DrainResult {
     /// Whether any data was fed to the VT parser this tick.
     pub had_data: bool,
     /// Whether the PTY reader thread has exited (channel disconnected).
     pub pty_exited: bool,
+    /// An OSC notification detected in the raw PTY stream this tick.
+    /// Contains title/body extracted from OSC 9, 99, or 777 sequences.
+    /// `pane_name` is empty here -- it is filled in by the caller.
+    pub notification: Option<NotificationPayload>,
 }
 
 impl TerminalState {
@@ -158,6 +199,7 @@ impl TerminalState {
         let mut had_data = false;
         let mut disconnected = false;
         let mut bytes_drained: usize = 0;
+        let mut notification: Option<NotificationPayload> = None;
         loop {
             if bytes_drained >= MAX_DRAIN_BYTES {
                 break; // yield back to the GTK main loop
@@ -166,6 +208,13 @@ impl TerminalState {
                 Ok(data) => {
                     bytes_drained += data.len();
                     had_data = true;
+
+                    // Scan for OSC notification sequences BEFORE feeding to VT parser.
+                    // We only capture the first notification per tick to keep it simple.
+                    if notification.is_none() {
+                        notification = scan_osc_notification(&data);
+                    }
+
                     self.terminal.feed(&data);
 
                     // Drain write-PTY responses (DA responses, mode queries, etc.)
@@ -192,8 +241,133 @@ impl TerminalState {
                 }
             }
         }
-        DrainResult { had_data, pty_exited: disconnected }
+        DrainResult { had_data, pty_exited: disconnected, notification }
     }
+}
+
+// ---------------------------------------------------------------------------
+// OSC notification scanner
+// ---------------------------------------------------------------------------
+
+/// Scan raw PTY bytes for OSC 9, OSC 99, or OSC 777 notification sequences.
+///
+/// This is an O(n) byte scan with no heap allocation in the common case
+/// (no ESC ] bytes present). Called on every PTY chunk before feeding to
+/// the VT parser, so it must stay fast.
+///
+/// Returns the first notification found in the buffer, or `None`.
+///
+/// Handles both BEL (`\x07`) and ST (`\x1b\`) terminators per ECMA-48.
+fn scan_osc_notification(data: &[u8]) -> Option<NotificationPayload> {
+    let len = data.len();
+    let mut i = 0;
+
+    while i + 1 < len {
+        // Look for ESC ] (OSC start)
+        if data[i] != 0x1b || data[i + 1] != b']' {
+            i += 1;
+            continue;
+        }
+
+        // Found ESC ] at position i -- find the terminator (BEL or ST).
+        let osc_start = i + 2; // byte after ESC ]
+
+        // Scan forward for BEL (0x07) or ST (ESC \)
+        let term_pos = {
+            let mut pos = None;
+            let mut j = osc_start;
+            while j < len {
+                if data[j] == 0x07 {
+                    pos = Some((j, false)); // BEL terminator
+                    break;
+                }
+                if j + 1 < len && data[j] == 0x1b && data[j + 1] == b'\\' {
+                    pos = Some((j, true)); // ST terminator (ESC \)
+                    break;
+                }
+                j += 1;
+            }
+            pos
+        };
+
+        let (term_idx, _is_st) = match term_pos {
+            Some(t) => t,
+            None => break, // unterminated OSC -- bail out
+        };
+
+        let osc_body = &data[osc_start..term_idx];
+
+        if let Some(payload) = parse_osc_body(osc_body) {
+            return Some(payload);
+        }
+
+        // Advance past the terminator
+        i = term_idx + 1;
+    }
+
+    None
+}
+
+/// Parse an OSC body (bytes between ESC ] and the terminator).
+///
+/// Checks for OSC 9, 99, or 777 notification formats and extracts title/body.
+/// Returns `None` for any other OSC sequence.
+fn parse_osc_body(body: &[u8]) -> Option<NotificationPayload> {
+    // OSC 777 ; notify ; <title> ; <body>
+    if body.starts_with(b"777;notify;") {
+        let rest = &body[b"777;notify;".len()..];
+        // Split on first ';' to get title and body
+        let (title, notif_body) = if let Some(sep) = rest.iter().position(|&b| b == b';') {
+            let title = String::from_utf8_lossy(&rest[..sep]).into_owned();
+            let body_text = String::from_utf8_lossy(&rest[sep + 1..]).into_owned();
+            (title, body_text)
+        } else {
+            // No separator -- entire rest is the title
+            (String::from_utf8_lossy(rest).into_owned(), String::new())
+        };
+        return Some(NotificationPayload {
+            title,
+            body: notif_body,
+            pane_name: String::new(),
+            source: Some(NotificationSource::Osc777),
+        });
+    }
+
+    // OSC 99 ; <params> ; <title/body>  (Kitty notification, simplified)
+    if body.starts_with(b"99;") {
+        let rest = &body[b"99;".len()..];
+        // Simplified: split on last ';', text after is the summary
+        let text = if let Some(sep) = rest.iter().rposition(|&b| b == b';') {
+            String::from_utf8_lossy(&rest[sep + 1..]).into_owned()
+        } else {
+            String::from_utf8_lossy(rest).into_owned()
+        };
+        return Some(NotificationPayload {
+            title: "Forgetty".to_string(),
+            body: text,
+            pane_name: String::new(),
+            source: Some(NotificationSource::Osc99),
+        });
+    }
+
+    // OSC 9 ; <text>  (ConEmu style)
+    // IMPORTANT: skip OSC 9;4;<percent> which is the ConEmu progress bar protocol.
+    if body.starts_with(b"9;") {
+        let rest = &body[b"9;".len()..];
+        // Skip progress bar sequences: 9;4;<n> or 9;4
+        if rest.starts_with(b"4;") || rest == b"4" {
+            return None;
+        }
+        let text = String::from_utf8_lossy(rest).into_owned();
+        return Some(NotificationPayload {
+            title: "Forgetty".to_string(),
+            body: text,
+            pane_name: String::new(),
+            source: Some(NotificationSource::Osc9),
+        });
+    }
+
+    None
 }
 
 /// Measure the cell dimensions for a monospace font using Pango.
@@ -230,11 +404,15 @@ fn font_description_with_size(config: &Config, size: f32) -> pango::FontDescript
 /// disconnects (shell exited). The callback receives the DrawingArea's
 /// widget name so the caller can close the correct pane.
 ///
+/// `on_notify` is an optional callback invoked when a notification fires
+/// (OSC 9/99/777 or BEL on an unfocused pane). Wired by `app.rs`.
+///
 /// `working_dir` and `command` are CLI launch overrides for the initial pane.
 /// Pass `None` for both when creating tabs/splits (they use defaults).
 pub fn create_terminal(
     config: &Config,
     on_exit: Option<Rc<dyn Fn(String)>>,
+    on_notify: Option<Rc<dyn Fn(NotificationPayload)>>,
     working_dir: Option<&Path>,
     command: Option<&[String]>,
 ) -> Result<(gtk4::Box, DrawingArea, Rc<RefCell<TerminalState>>), String> {
@@ -291,6 +469,9 @@ pub fn create_terminal(
         last_bell: Instant::now() - Duration::from_secs(1),
         last_pty_data: Instant::now(),
         malloc_trimmed: false,
+        notification_ring: false,
+        last_notification: Instant::now() - Duration::from_secs(10),
+        on_notify,
     }));
 
     // Create DrawingArea
@@ -340,7 +521,8 @@ pub fn create_terminal(
             s.viewport_offset = offset; // keep cache fresh
             let was_at_bottom = total <= len || offset + len >= total;
 
-            let DrainResult { had_data, pty_exited } = s.drain_pty_output();
+            let DrainResult { had_data, pty_exited, notification: osc_notification } =
+                s.drain_pty_output();
 
             // Detect alternate screen → primary screen transitions (e.g., htop exit).
             // Re-feed DECSCUSR 1 (blinking block) to restore our blink default,
@@ -354,6 +536,7 @@ pub fn create_terminal(
             // Drain terminal events (bell, title changes) so they don't
             // accumulate unboundedly in the event buffer.
             let events = s.terminal.drain_events();
+            let mut bell_notify_payload: Option<NotificationPayload> = None;
             for event in events {
                 if let TerminalEvent::Bell = event {
                     let now = Instant::now();
@@ -376,7 +559,40 @@ pub fn create_terminal(
                         }
                         BellMode::None => {}
                     }
+
+                    // BEL triggers ring + badge but NOT a desktop notification.
+                    // Only fire if the pane is not currently focused.
+                    if !da.has_focus() && s.config.notification_mode != NotificationMode::None {
+                        s.notification_ring = true;
+                        bell_notify_payload = Some(NotificationPayload {
+                            title: String::new(),
+                            body: String::new(),
+                            pane_name: da.widget_name().to_string(),
+                            source: None, // BEL has no source
+                        });
+                    }
                 }
+            }
+
+            // Handle OSC notification detected during drain.
+            let osc_notify_payload = if let Some(mut payload) = osc_notification {
+                if !da.has_focus() && s.config.notification_mode != NotificationMode::None {
+                    s.notification_ring = true;
+                    payload.pane_name = da.widget_name().to_string();
+                    Some(payload)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            // Clone on_notify Rc and rate-limit state before dropping the borrow.
+            let on_notify_cb = s.on_notify.clone();
+            let last_notif = s.last_notification;
+            let can_send_desktop = last_notif.elapsed() >= Duration::from_secs(2);
+            if can_send_desktop && (bell_notify_payload.is_some() || osc_notify_payload.is_some()) {
+                s.last_notification = Instant::now();
             }
 
             if had_data {
@@ -460,9 +676,33 @@ pub fn create_terminal(
 
                 // Also redraw while the bell flash overlay is active.
                 let bell_active = s.bell_flash_until.is_some();
-                if needs_redraw || bell_active {
+                // Also redraw when the notification ring state changed.
+                let ring_changed = bell_notify_payload.is_some() || osc_notify_payload.is_some();
+                if needs_redraw || bell_active || ring_changed {
                     drop(s);
                     da.queue_draw();
+                }
+            }
+
+            // Fire notification callbacks outside the TerminalState borrow.
+            // BEL: ring + badge but NO desktop notification.
+            if let Some(payload) = bell_notify_payload {
+                if let Some(ref cb) = on_notify_cb {
+                    cb(payload);
+                }
+            }
+            // OSC: ring + badge + desktop notification (subject to rate limiting).
+            if let Some(payload) = osc_notify_payload {
+                if let Some(ref cb) = on_notify_cb {
+                    // Mark whether the desktop notification is rate-limited.
+                    // We already updated last_notification above if can_send_desktop.
+                    let mut p = payload;
+                    if !can_send_desktop {
+                        // Suppress desktop notification by clearing source
+                        // (on_notify callback checks source == None to skip it).
+                        p.source = None;
+                    }
+                    cb(p);
                 }
             }
 
@@ -1802,6 +2042,9 @@ pub fn apply_config_change(state: &mut TerminalState, new_config: &Config, da: &
     // Update bell mode -- takes effect on next BEL event.
     state.config.bell_mode = new_config.bell_mode;
 
+    // Update notification mode -- takes effect on next OSC/BEL notification.
+    state.config.notification_mode = new_config.notification_mode;
+
     // Update font family (needed even if size didn't change, for font_description_with_size).
     state.config.font_family = new_config.font_family.clone();
 
@@ -2546,5 +2789,16 @@ fn draw_terminal(
         } else {
             s.bell_flash_until = None;
         }
+    }
+
+    // 9. Notification ring -- amber border when this pane has a pending notification.
+    // Drawn AFTER step 7 (dim overlay) so it is visible on unfocused panes,
+    // and AFTER step 8 (bell flash) so it persists through bell events.
+    let has_notification_ring = s.notification_ring;
+    if has_notification_ring {
+        ctx.set_source_rgba(1.0, 0.78, 0.0, 0.9); // amber
+        ctx.set_line_width(3.0);
+        ctx.rectangle(1.5, 1.5, width as f64 - 3.0, height as f64 - 3.0);
+        ctx.stroke().ok();
     }
 }

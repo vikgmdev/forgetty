@@ -20,3 +20,4 @@ uuid = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+notify-rust = { version = "4", default-features = false, features = ["d"] }
