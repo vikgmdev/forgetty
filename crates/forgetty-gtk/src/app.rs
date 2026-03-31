@@ -194,10 +194,10 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
     // Section 1 -- Clipboard
     let clipboard_section = gio::Menu::new();
     let copy_item = gio::MenuItem::new(Some("Copy"), Some("win.copy"));
-    copy_item.set_attribute_value("accel", Some(&"<Control><Shift>c".to_variant()));
+    copy_item.set_attribute_value("accel", Some(&"<Control>c".to_variant()));
     clipboard_section.append_item(&copy_item);
     let paste_item = gio::MenuItem::new(Some("Paste"), Some("win.paste"));
-    paste_item.set_attribute_value("accel", Some(&"<Control><Shift>v".to_variant()));
+    paste_item.set_attribute_value("accel", Some(&"<Control>v".to_variant()));
     clipboard_section.append_item(&paste_item);
     menu.append_section(None, &clipboard_section);
 
@@ -588,7 +588,7 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
         window.add_action(&action);
     }
 
-    app.set_accels_for_action("win.copy", &["<Control><Shift>c"]);
+    app.set_accels_for_action("win.copy", &["<Control>c", "<Control><Shift>c"]);
 
     // --- Search in terminal action (Ctrl+Shift+F) ---
     {
@@ -628,7 +628,7 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
         window.add_action(&action);
     }
 
-    app.set_accels_for_action("win.paste", &["<Control><Shift>v"]);
+    app.set_accels_for_action("win.paste", &["<Control>v", "<Control><Shift>v"]);
 
     // --- Select All action (context menu only, no accelerator) ---
     {
@@ -3264,8 +3264,8 @@ fn build_shortcuts_window() -> gtk4::ShortcutsWindow {
 
     // --- Clipboard ---
     let clipboard_group = shortcut_group("Clipboard");
-    clipboard_group.add_shortcut(&shortcut("<Control><Shift>c", "Copy Selection"));
-    clipboard_group.add_shortcut(&shortcut("<Control><Shift>v", "Paste"));
+    clipboard_group.add_shortcut(&shortcut("<Control>c", "Copy Selection"));
+    clipboard_group.add_shortcut(&shortcut("<Control>v", "Paste"));
     section.add_group(&clipboard_group);
 
     // --- Search ---
@@ -3608,12 +3608,12 @@ fn command_registry() -> &'static [CommandEntry] {
         CommandEntry {
             display_name: "Copy",
             action_name: "win.copy",
-            shortcut_label: "Ctrl+Shift+C",
+            shortcut_label: "Ctrl+C",
         },
         CommandEntry {
             display_name: "Paste",
             action_name: "win.paste",
-            shortcut_label: "Ctrl+Shift+V",
+            shortcut_label: "Ctrl+V",
         },
         CommandEntry {
             display_name: "New Window",

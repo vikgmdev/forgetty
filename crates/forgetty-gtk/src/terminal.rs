@@ -747,6 +747,20 @@ pub fn create_terminal(
                     return glib::Propagation::Proceed;
                 };
 
+                // Ctrl+C with a selection → propagate to GTK so win.copy accelerator fires.
+                // Without a selection, fall through to ghostty encoder (sends SIGINT).
+                let ctrl_only = modifier
+                    & (gdk::ModifierType::CONTROL_MASK
+                        | gdk::ModifierType::SHIFT_MASK
+                        | gdk::ModifierType::ALT_MASK)
+                    == gdk::ModifierType::CONTROL_MASK;
+                if ctrl_only
+                    && (keyval == gdk::Key::c || keyval == gdk::Key::C)
+                    && s.selection.is_some()
+                {
+                    return glib::Propagation::Proceed;
+                }
+
                 // Escape clears selection when mouse tracking is off (AC-19).
                 // When mouse tracking is on (e.g., vim), Escape should go to the app.
                 if keyval == gdk::Key::Escape
@@ -1607,7 +1621,7 @@ fn is_app_shortcut(keyval: gdk::Key, modifier: gdk::ModifierType) -> bool {
     if mods == ctrl_shift && (keyval == gdk::Key::w || keyval == gdk::Key::W) {
         return true;
     }
-    // Copy selection: Ctrl+Shift+C
+    // Copy selection: Ctrl+Shift+C (Ctrl+C is handled after state borrow — only when selection exists)
     if mods == ctrl_shift && (keyval == gdk::Key::c || keyval == gdk::Key::C) {
         return true;
     }
@@ -1615,8 +1629,10 @@ fn is_app_shortcut(keyval: gdk::Key, modifier: gdk::ModifierType) -> bool {
     if mods == ctrl_shift && (keyval == gdk::Key::f || keyval == gdk::Key::F) {
         return true;
     }
-    // Paste: Ctrl+Shift+V
-    if mods == ctrl_shift && (keyval == gdk::Key::v || keyval == gdk::Key::V) {
+    // Paste: Ctrl+V or Ctrl+Shift+V (always intercept — paste beats ^V literal-next)
+    if (mods == gdk::ModifierType::CONTROL_MASK || mods == ctrl_shift)
+        && (keyval == gdk::Key::v || keyval == gdk::Key::V)
+    {
         return true;
     }
     // Pane navigation: Alt+Arrow
@@ -1715,12 +1731,12 @@ fn build_context_menu_box(
     let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
 
     // --- Copy ---
-    let copy_btn = make_menu_button("Copy", Some("Shift+Ctrl+C"), "win.copy", None, popover);
+    let copy_btn = make_menu_button("Copy", Some("Ctrl+C"), "win.copy", None, popover);
     copy_btn.set_sensitive(has_selection);
     vbox.append(&copy_btn);
 
     // --- Paste ---
-    let paste_btn = make_menu_button("Paste", Some("Shift+Ctrl+V"), "win.paste", None, popover);
+    let paste_btn = make_menu_button("Paste", Some("Ctrl+V"), "win.paste", None, popover);
     vbox.append(&paste_btn);
 
     // --- Separator ---
