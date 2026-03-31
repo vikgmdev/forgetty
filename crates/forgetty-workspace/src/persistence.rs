@@ -163,4 +163,113 @@ mod tests {
         assert_eq!(restored.window_width, Some(960));
         assert_eq!(restored.window_height, Some(640));
     }
+
+    #[test]
+    fn multi_workspace_round_trip() {
+        let state = WorkspaceState {
+            version: 1,
+            workspaces: vec![
+                Workspace {
+                    id: Uuid::new_v4(),
+                    name: "Default".into(),
+                    root_paths: vec![],
+                    tabs: vec![
+                        TabState {
+                            title: "shell".into(),
+                            pane_tree: PaneTreeState::Leaf { cwd: PathBuf::from("/home/user") },
+                        },
+                        TabState {
+                            title: "build".into(),
+                            pane_tree: PaneTreeState::Leaf {
+                                cwd: PathBuf::from("/home/user/project"),
+                            },
+                        },
+                    ],
+                    active_tab: 1,
+                },
+                Workspace {
+                    id: Uuid::new_v4(),
+                    name: "Range".into(),
+                    root_paths: vec![],
+                    tabs: vec![TabState {
+                        title: "dev".into(),
+                        pane_tree: PaneTreeState::Split {
+                            direction: "horizontal".into(),
+                            ratio: 0.5,
+                            first: Box::new(PaneTreeState::Leaf {
+                                cwd: PathBuf::from("/tmp/range"),
+                            }),
+                            second: Box::new(PaneTreeState::Leaf {
+                                cwd: PathBuf::from("/tmp/range/src"),
+                            }),
+                        },
+                    }],
+                    active_tab: 0,
+                },
+                Workspace {
+                    id: Uuid::new_v4(),
+                    name: "Personal".into(),
+                    root_paths: vec![],
+                    tabs: vec![TabState {
+                        title: "notes".into(),
+                        pane_tree: PaneTreeState::Leaf { cwd: PathBuf::from("/home/user/notes") },
+                    }],
+                    active_tab: 0,
+                },
+            ],
+            active_workspace: 1,
+            window_width: Some(1200),
+            window_height: Some(800),
+        };
+
+        let json = serde_json::to_string_pretty(&state).unwrap();
+        let restored: WorkspaceState = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.version, 1);
+        assert_eq!(restored.workspaces.len(), 3);
+        assert_eq!(restored.active_workspace, 1);
+        assert_eq!(restored.window_width, Some(1200));
+        assert_eq!(restored.window_height, Some(800));
+
+        assert_eq!(restored.workspaces[0].name, "Default");
+        assert_eq!(restored.workspaces[0].tabs.len(), 2);
+        assert_eq!(restored.workspaces[0].active_tab, 1);
+
+        assert_eq!(restored.workspaces[1].name, "Range");
+        assert_eq!(restored.workspaces[1].tabs.len(), 1);
+        assert_eq!(restored.workspaces[1].active_tab, 0);
+
+        assert_eq!(restored.workspaces[2].name, "Personal");
+        assert_eq!(restored.workspaces[2].tabs.len(), 1);
+    }
+
+    #[test]
+    fn backward_compat_single_workspace_default_name() {
+        // T-029 format: single workspace named "default" (lowercase).
+        // Should deserialize fine -- the GTK layer capitalizes it on restore.
+        let state = WorkspaceState {
+            version: 1,
+            workspaces: vec![Workspace {
+                id: Uuid::new_v4(),
+                name: "default".into(),
+                root_paths: vec![],
+                tabs: vec![TabState {
+                    title: "shell".into(),
+                    pane_tree: PaneTreeState::Leaf { cwd: PathBuf::from("/home/user") },
+                }],
+                active_tab: 0,
+            }],
+            active_workspace: 0,
+            window_width: None,
+            window_height: None,
+        };
+
+        let json = serde_json::to_string_pretty(&state).unwrap();
+        let restored: WorkspaceState = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.workspaces.len(), 1);
+        assert_eq!(restored.workspaces[0].name, "default");
+        assert_eq!(restored.workspaces[0].tabs.len(), 1);
+        assert_eq!(restored.active_workspace, 0);
+    }
 }

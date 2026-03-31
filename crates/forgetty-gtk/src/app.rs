@@ -10,7 +10,7 @@
 //! two subtrees). This container allows us to swap the root widget of a tab
 //! during split/close operations without removing and re-inserting the TabPage.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::Duration;
@@ -83,6 +83,30 @@ type FocusTracker = Rc<RefCell<String>>;
 /// Removing the key (or setting an empty title) re-enables automatic CWD polling.
 type CustomTitles = Rc<RefCell<HashSet<String>>>;
 
+/// Per-workspace GTK state -- owns the TabView and associated state for one workspace.
+struct WorkspaceView {
+    /// Unique ID matching the Workspace in the session file.
+    id: uuid::Uuid,
+    /// Human-readable name.
+    name: String,
+    /// The adw::TabView holding this workspace's pages.
+    tab_view: adw::TabView,
+    /// Pane states for terminals in this workspace.
+    tab_states: TabStateMap,
+    /// Focus tracker for this workspace.
+    focus_tracker: FocusTracker,
+    /// Custom title tracker for this workspace.
+    custom_titles: CustomTitles,
+}
+
+/// Shared state tracking all workspaces and which is active.
+type WorkspaceManager = Rc<RefCell<WorkspaceManagerInner>>;
+
+struct WorkspaceManagerInner {
+    workspaces: Vec<WorkspaceView>,
+    active_index: usize,
+}
+
 /// CLI-derived launch parameters for this specific invocation.
 ///
 /// Re-exported from the binary crate. These are runtime overrides, NOT
@@ -140,6 +164,13 @@ fn next_pane_id() -> String {
 fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
     info!("Building Forgetty GTK4 window");
 
+    // CLI overrides skip both session restore AND session save so a one-off
+    // launch (e.g. `forgetty --working-directory /tmp`) never overwrites the
+    // user's real saved session.
+    let has_cli_override =
+        launch.working_directory.is_some() || launch.command.is_some() || launch.no_restore;
+    let skip_session_save = Rc::new(Cell::new(has_cli_override));
+
     // --- Widget hierarchy ---
     // adw::ApplicationWindow
     //   content: gtk::Box (vertical)
@@ -182,7 +213,20 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
     window_tab_section.append_item(&close_tab_item);
     menu.append_section(None, &window_tab_section);
 
-    // Section 3 -- Split submenu
+    // Section 3 -- Workspace management
+    let workspace_section = gio::Menu::new();
+    let new_ws_item = gio::MenuItem::new(Some("New Workspace"), Some("win.new-workspace"));
+    new_ws_item.set_attribute_value("accel", Some(&"<Control><Alt>n".to_variant()));
+    workspace_section.append_item(&new_ws_item);
+    workspace_section.append(Some("Rename Workspace\u{2026}"), Some("win.rename-workspace"));
+    workspace_section.append(Some("Delete Workspace"), Some("win.delete-workspace"));
+    let ws_selector_item =
+        gio::MenuItem::new(Some("Workspace Selector"), Some("win.workspace-selector"));
+    ws_selector_item.set_attribute_value("accel", Some(&"<Control><Alt>w".to_variant()));
+    workspace_section.append_item(&ws_selector_item);
+    menu.append_section(None, &workspace_section);
+
+    // Section 4 -- Split submenu
     let split_section = gio::Menu::new();
     let split_submenu = gio::Menu::new();
     split_submenu.append(Some("Up"), Some("win.split-up"));
@@ -196,13 +240,13 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
     split_section.append_submenu(Some("Split"), &split_submenu);
     menu.append_section(None, &split_section);
 
-    // Section 4 -- Terminal operations
+    // Section 5 -- Terminal operations
     let terminal_section = gio::Menu::new();
     terminal_section.append(Some("Clear"), Some("win.clear"));
     terminal_section.append(Some("Reset"), Some("win.reset"));
     menu.append_section(None, &terminal_section);
 
-    // Section 5 -- Configuration & Help
+    // Section 6 -- Configuration & Help
     let config_help_section = gio::Menu::new();
     let cmd_palette_item = gio::MenuItem::new(Some("Command Palette"), Some("win.command-palette"));
     cmd_palette_item.set_attribute_value("accel", Some(&"<Control><Shift>p".to_variant()));
@@ -219,7 +263,7 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
     config_help_section.append(Some("About Forgetty"), Some("win.show-about"));
     menu.append_section(None, &config_help_section);
 
-    // Section 6 -- Application
+    // Section 7 -- Application
     let app_section = gio::Menu::new();
     let quit_item = gio::MenuItem::new(Some("Quit"), Some("app.quit"));
     quit_item.set_attribute_value("accel", Some(&"<Control><Shift>q".to_variant()));
@@ -261,12 +305,13 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
     dropdown_button.set_tooltip_text(Some("Tab and Split Actions"));
     header.pack_start(&dropdown_button);
 
-    let tab_view = adw::TabView::new();
-    tab_view.set_vexpand(true);
-    tab_view.set_hexpand(true);
+    // Create the initial TabView for the default workspace.
+    let initial_tab_view = adw::TabView::new();
+    initial_tab_view.set_vexpand(true);
+    initial_tab_view.set_hexpand(true);
 
     let tab_bar = adw::TabBar::new();
-    tab_bar.set_view(Some(&tab_view));
+    tab_bar.set_view(Some(&initial_tab_view));
     tab_bar.set_autohide(true);
     tab_bar.set_hexpand(true);
 
@@ -278,7 +323,7 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
     // The sidebar slides in from the right when the user clicks "Appearance".
     let main_area = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     main_area.set_vexpand(true);
-    main_area.append(&tab_view);
+    main_area.append(&initial_tab_view);
 
     // Wrap main_area in an Overlay so the command palette can float on top.
     let main_overlay = gtk4::Overlay::new();
@@ -298,33 +343,57 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
         .content(&content)
         .build();
 
-    // Pane state registry -- maps pane widget names to their TerminalState
-    let tab_states: TabStateMap = Rc::new(RefCell::new(HashMap::new()));
+    // --- Workspace Manager ---
+    // Holds all workspaces with their per-workspace GTK state.
+    // The initial workspace is created here; additional workspaces are added
+    // via the "New Workspace" action or session restore.
+    let initial_tab_states: TabStateMap = Rc::new(RefCell::new(HashMap::new()));
+    let initial_focus_tracker: FocusTracker = Rc::new(RefCell::new(String::new()));
+    let initial_custom_titles: CustomTitles = Rc::new(RefCell::new(HashSet::new()));
 
-    // Focus tracker -- widget name of the currently focused DrawingArea
-    let focus_tracker: FocusTracker = Rc::new(RefCell::new(String::new()));
+    let workspace_manager: WorkspaceManager = Rc::new(RefCell::new(WorkspaceManagerInner {
+        workspaces: vec![WorkspaceView {
+            id: uuid::Uuid::new_v4(),
+            name: String::from("Default"),
+            tab_view: initial_tab_view.clone(),
+            tab_states: Rc::clone(&initial_tab_states),
+            focus_tracker: Rc::clone(&initial_focus_tracker),
+            custom_titles: Rc::clone(&initial_custom_titles),
+        }],
+        active_index: 0,
+    }));
 
-    // Custom title tracker -- pages with user-set titles (skip CWD polling)
-    let custom_titles: CustomTitles = Rc::new(RefCell::new(HashSet::new()));
+    // Convenience aliases for the active workspace's state during initial setup.
+    // These point to the initial workspace; after session restore they may be
+    // replaced if the default workspace is rebuilt.
+    let tab_states = Rc::clone(&initial_tab_states);
+    let focus_tracker = Rc::clone(&initial_focus_tracker);
+    let _custom_titles = Rc::clone(&initial_custom_titles);
 
     // Shared config -- updated on hot reload, read by new tab/split creation.
     // All action closures that create terminals capture a clone of this Rc.
     let shared_config: SharedConfig = Rc::new(RefCell::new(config.clone()));
 
     // --- Appearance sidebar (right panel, built after shared state is ready) ---
+    // Use the workspace manager for config apply so it hits all workspaces.
     let appearance_revealer =
         preferences::build_appearance_sidebar(&shared_config, &tab_states, &window);
     main_area.append(&appearance_revealer);
 
-    // --- Command palette overlay (built after focus_tracker is ready) ---
-    let command_palette = build_command_palette(&window, &focus_tracker);
+    // --- Command palette overlay (built after workspace_manager is ready) ---
+    let command_palette = build_command_palette(&window, &workspace_manager);
     main_overlay.add_overlay(&command_palette);
+
+    // --- Workspace selector overlay ---
+    let (workspace_selector, workspace_selector_lb) =
+        build_workspace_selector(&workspace_manager, &main_area, &tab_bar, &window);
+    main_overlay.add_overlay(&workspace_selector);
 
     // Click-outside-to-close: a GestureClick on the overlay detects clicks
     // that land outside the palette card and closes it.
     {
         let palette_ref = command_palette.clone();
-        let ft_click = Rc::clone(&focus_tracker);
+        let wm_click = Rc::clone(&workspace_manager);
         let click_gesture = gtk4::GestureClick::new();
         click_gesture.set_propagation_phase(gtk4::PropagationPhase::Capture);
         click_gesture.connect_pressed(move |gesture, _n_press, x, y| {
@@ -347,7 +416,8 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
                 && y <= (bounds.y() + bounds.height()) as f64;
 
             if !inside {
-                close_command_palette(&palette_ref, &ft_click);
+                let ft = active_focus_tracker(&wm_click);
+                close_command_palette(&palette_ref, &ft);
                 gesture.set_state(gtk4::EventSequenceState::Claimed);
             } else {
                 gesture.set_state(gtk4::EventSequenceState::None);
@@ -360,10 +430,12 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
     // When a tab's close button is clicked, kill ALL PTYs in the tab's
     // widget tree (may contain nested Paned widgets with multiple panes).
     // If it is the last tab, close the window (exits the application).
+    // NOTE: we wire this on the initial tab_view here; newly created workspace
+    // tab_views get the same handler in `create_workspace_view()`.
     {
         let window_close = window.clone();
         let states_close = Rc::clone(&tab_states);
-        tab_view.connect_close_page(move |tv, page| {
+        initial_tab_view.connect_close_page(move |tv, page| {
             let container = page.child();
             kill_all_panes_in_subtree(&container, &states_close);
 
@@ -384,7 +456,7 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
     // When switching tabs, find a leaf DrawingArea in the new tab and focus it.
     {
         let focus_switch = Rc::clone(&focus_tracker);
-        tab_view.connect_selected_page_notify(move |tv| {
+        initial_tab_view.connect_selected_page_notify(move |tv| {
             if let Some(page) = tv.selected_page() {
                 let container = page.child();
                 // Try to focus the pane that was last focused in this tab,
@@ -405,22 +477,23 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
     // --- New tab action (Ctrl+Shift+T) ---
     {
         let config_action = Rc::clone(&shared_config);
-        let tv_action = tab_view.clone();
-        let states_action = Rc::clone(&tab_states);
-        let focus_action = Rc::clone(&focus_tracker);
-        let ct_action = Rc::clone(&custom_titles);
+        let wm_action = Rc::clone(&workspace_manager);
         let win_action = window.clone();
         let action = gio::SimpleAction::new("new-tab", None);
         action.connect_activate(move |_action, _param| {
             let Ok(cfg) = config_action.try_borrow() else {
                 return;
             };
+            let Ok(mgr) = wm_action.try_borrow() else {
+                return;
+            };
+            let ws = &mgr.workspaces[mgr.active_index];
             add_new_tab(
-                &tv_action,
+                &ws.tab_view,
                 &cfg,
-                &states_action,
-                &focus_action,
-                &ct_action,
+                &ws.tab_states,
+                &ws.focus_tracker,
+                &ws.custom_titles,
                 &win_action,
                 None,
                 None,
@@ -431,127 +504,64 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
 
     app.set_accels_for_action("win.new-tab", &["<Control><Shift>t"]);
 
-    // --- Split right action (Alt+Shift+=) ---
-    {
+    // --- Split actions (all four directions use workspace manager) ---
+    for (action_name, orientation, before, accels) in [
+        (
+            "split-right",
+            gtk4::Orientation::Horizontal,
+            false,
+            vec!["<Alt><Shift>equal", "<Alt>plus"],
+        ),
+        (
+            "split-down",
+            gtk4::Orientation::Vertical,
+            false,
+            vec!["<Alt><Shift>minus", "<Alt>underscore"],
+        ),
+        ("split-left", gtk4::Orientation::Horizontal, true, vec![]),
+        ("split-up", gtk4::Orientation::Vertical, true, vec![]),
+    ] {
         let config_split = Rc::clone(&shared_config);
-        let tv_split = tab_view.clone();
-        let states_split = Rc::clone(&tab_states);
-        let focus_split = Rc::clone(&focus_tracker);
-        let ct_split = Rc::clone(&custom_titles);
+        let wm_split = Rc::clone(&workspace_manager);
         let win_split = window.clone();
-        let action = gio::SimpleAction::new("split-right", None);
+        let action = gio::SimpleAction::new(action_name, None);
         action.connect_activate(move |_action, _param| {
             let Ok(cfg) = config_split.try_borrow() else {
                 return;
             };
-            split_pane(
-                &tv_split,
-                &cfg,
-                &states_split,
-                &focus_split,
-                &ct_split,
-                gtk4::Orientation::Horizontal,
-                false,
-                &win_split,
-            );
-        });
-        window.add_action(&action);
-    }
-
-    app.set_accels_for_action("win.split-right", &["<Alt><Shift>equal", "<Alt>plus"]);
-
-    // --- Split down action (Alt+Shift+-) ---
-    {
-        let config_split = Rc::clone(&shared_config);
-        let tv_split = tab_view.clone();
-        let states_split = Rc::clone(&tab_states);
-        let focus_split = Rc::clone(&focus_tracker);
-        let ct_split = Rc::clone(&custom_titles);
-        let win_split = window.clone();
-        let action = gio::SimpleAction::new("split-down", None);
-        action.connect_activate(move |_action, _param| {
-            let Ok(cfg) = config_split.try_borrow() else {
+            let Ok(mgr) = wm_split.try_borrow() else {
                 return;
             };
+            let ws = &mgr.workspaces[mgr.active_index];
             split_pane(
-                &tv_split,
+                &ws.tab_view,
                 &cfg,
-                &states_split,
-                &focus_split,
-                &ct_split,
-                gtk4::Orientation::Vertical,
-                false,
+                &ws.tab_states,
+                &ws.focus_tracker,
+                &ws.custom_titles,
+                orientation,
+                before,
                 &win_split,
             );
         });
         window.add_action(&action);
-    }
-
-    app.set_accels_for_action("win.split-down", &["<Alt><Shift>minus", "<Alt>underscore"]);
-
-    // --- Split left action (dropdown menu only, no default accelerator) ---
-    {
-        let config_split = Rc::clone(&shared_config);
-        let tv_split = tab_view.clone();
-        let states_split = Rc::clone(&tab_states);
-        let focus_split = Rc::clone(&focus_tracker);
-        let ct_split = Rc::clone(&custom_titles);
-        let win_split = window.clone();
-        let action = gio::SimpleAction::new("split-left", None);
-        action.connect_activate(move |_action, _param| {
-            let Ok(cfg) = config_split.try_borrow() else {
-                return;
-            };
-            split_pane(
-                &tv_split,
-                &cfg,
-                &states_split,
-                &focus_split,
-                &ct_split,
-                gtk4::Orientation::Horizontal,
-                true,
-                &win_split,
-            );
-        });
-        window.add_action(&action);
-    }
-
-    // --- Split up action (dropdown menu only, no default accelerator) ---
-    {
-        let config_split = Rc::clone(&shared_config);
-        let tv_split = tab_view.clone();
-        let states_split = Rc::clone(&tab_states);
-        let focus_split = Rc::clone(&focus_tracker);
-        let ct_split = Rc::clone(&custom_titles);
-        let win_split = window.clone();
-        let action = gio::SimpleAction::new("split-up", None);
-        action.connect_activate(move |_action, _param| {
-            let Ok(cfg) = config_split.try_borrow() else {
-                return;
-            };
-            split_pane(
-                &tv_split,
-                &cfg,
-                &states_split,
-                &focus_split,
-                &ct_split,
-                gtk4::Orientation::Vertical,
-                true,
-                &win_split,
-            );
-        });
-        window.add_action(&action);
+        if !accels.is_empty() {
+            let accel_strs: Vec<&str> = accels.iter().map(|s| s.as_ref()).collect();
+            app.set_accels_for_action(&format!("win.{action_name}"), &accel_strs);
+        }
     }
 
     // --- Close pane action (Ctrl+Shift+W) ---
     {
-        let tv_close = tab_view.clone();
-        let states_close = Rc::clone(&tab_states);
-        let focus_close = Rc::clone(&focus_tracker);
+        let wm_close = Rc::clone(&workspace_manager);
         let window_close = window.clone();
         let action = gio::SimpleAction::new("close-pane", None);
         action.connect_activate(move |_action, _param| {
-            close_focused_pane(&tv_close, &states_close, &focus_close, &window_close);
+            let Ok(mgr) = wm_close.try_borrow() else {
+                return;
+            };
+            let ws = &mgr.workspaces[mgr.active_index];
+            close_focused_pane(&ws.tab_view, &ws.tab_states, &ws.focus_tracker, &window_close);
         });
         window.add_action(&action);
     }
@@ -560,12 +570,19 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
 
     // --- Copy selection action (Ctrl+Shift+C) ---
     {
-        let states_copy = Rc::clone(&tab_states);
-        let focus_copy = Rc::clone(&focus_tracker);
+        let wm_copy = Rc::clone(&workspace_manager);
         let window_copy = window.clone();
         let action = gio::SimpleAction::new("copy", None);
         action.connect_activate(move |_action, _param| {
-            copy_selection(&states_copy, &focus_copy, &window_copy);
+            let (ts, ft) = {
+                let Ok(mgr) = wm_copy.try_borrow() else {
+                    tracing::warn!("copy: workspace_manager borrow failed");
+                    return;
+                };
+                let ws = &mgr.workspaces[mgr.active_index];
+                (Rc::clone(&ws.tab_states), Rc::clone(&ws.focus_tracker))
+            };
+            copy_selection(&ts, &ft, &window_copy);
         });
         window.add_action(&action);
     }
@@ -574,11 +591,17 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
 
     // --- Search in terminal action (Ctrl+Shift+F) ---
     {
-        let states_search = Rc::clone(&tab_states);
-        let focus_search = Rc::clone(&focus_tracker);
+        let wm_search = Rc::clone(&workspace_manager);
         let action = gio::SimpleAction::new("search", None);
         action.connect_activate(move |_action, _param| {
-            toggle_search_on_focused_pane(&states_search, &focus_search);
+            let (ts, ft) = {
+                let Ok(mgr) = wm_search.try_borrow() else {
+                    return;
+                };
+                let ws = &mgr.workspaces[mgr.active_index];
+                (Rc::clone(&ws.tab_states), Rc::clone(&ws.focus_tracker))
+            };
+            toggle_search_on_focused_pane(&ts, &ft);
         });
         window.add_action(&action);
     }
@@ -587,12 +610,19 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
 
     // --- Paste action (Ctrl+Shift+V) ---
     {
-        let states_paste = Rc::clone(&tab_states);
-        let focus_paste = Rc::clone(&focus_tracker);
+        let wm_paste = Rc::clone(&workspace_manager);
         let window_paste = window.clone();
         let action = gio::SimpleAction::new("paste", None);
         action.connect_activate(move |_action, _param| {
-            paste_clipboard(&states_paste, &focus_paste, &window_paste);
+            let (ts, ft) = {
+                let Ok(mgr) = wm_paste.try_borrow() else {
+                    tracing::warn!("paste: workspace_manager borrow failed");
+                    return;
+                };
+                let ws = &mgr.workspaces[mgr.active_index];
+                (Rc::clone(&ws.tab_states), Rc::clone(&ws.focus_tracker))
+            };
+            paste_clipboard(&ts, &ft, &window_paste);
         });
         window.add_action(&action);
     }
@@ -601,11 +631,14 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
 
     // --- Select All action (context menu only, no accelerator) ---
     {
-        let states_sel = Rc::clone(&tab_states);
-        let focus_sel = Rc::clone(&focus_tracker);
+        let wm_sel = Rc::clone(&workspace_manager);
         let action = gio::SimpleAction::new("select-all", None);
         action.connect_activate(move |_action, _param| {
-            select_all_on_focused_pane(&states_sel, &focus_sel);
+            let Ok(mgr) = wm_sel.try_borrow() else {
+                return;
+            };
+            let ws = &mgr.workspaces[mgr.active_index];
+            select_all_on_focused_pane(&ws.tab_states, &ws.focus_tracker);
         });
         window.add_action(&action);
     }
@@ -630,11 +663,14 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
         ("focus-pane-up", Direction::Up),
         ("focus-pane-down", Direction::Down),
     ] {
-        let tv_nav = tab_view.clone();
-        let focus_nav = Rc::clone(&focus_tracker);
+        let wm_nav = Rc::clone(&workspace_manager);
         let action = gio::SimpleAction::new(name, None);
         action.connect_activate(move |_action, _param| {
-            navigate_pane(&tv_nav, &focus_nav, direction);
+            let Ok(mgr) = wm_nav.try_borrow() else {
+                return;
+            };
+            let ws = &mgr.workspaces[mgr.active_index];
+            navigate_pane(&ws.tab_view, &ws.focus_tracker, direction);
         });
         window.add_action(&action);
     }
@@ -644,44 +680,25 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
     app.set_accels_for_action("win.focus-pane-up", &["<Alt>Up"]);
     app.set_accels_for_action("win.focus-pane-down", &["<Alt>Down"]);
 
-    // --- Zoom in action (Ctrl+= / Ctrl++) ---
-    {
-        let states_zoom = Rc::clone(&tab_states);
-        let focus_zoom = Rc::clone(&focus_tracker);
-        let action = gio::SimpleAction::new("zoom-in", None);
+    // --- Zoom actions (all three use workspace manager) ---
+    for (action_name, dir, accels) in [
+        ("zoom-in", ZoomDirection::In, vec!["<Control>equal", "<Control>plus"]),
+        ("zoom-out", ZoomDirection::Out, vec!["<Control>minus"]),
+        ("zoom-reset", ZoomDirection::Reset, vec!["<Control>0"]),
+    ] {
+        let wm_zoom = Rc::clone(&workspace_manager);
+        let action = gio::SimpleAction::new(action_name, None);
         action.connect_activate(move |_action, _param| {
-            zoom_focused_pane(&states_zoom, &focus_zoom, ZoomDirection::In);
+            let Ok(mgr) = wm_zoom.try_borrow() else {
+                return;
+            };
+            let ws = &mgr.workspaces[mgr.active_index];
+            zoom_focused_pane(&ws.tab_states, &ws.focus_tracker, dir);
         });
         window.add_action(&action);
+        let accel_strs: Vec<&str> = accels.iter().map(|s| s.as_ref()).collect();
+        app.set_accels_for_action(&format!("win.{action_name}"), &accel_strs);
     }
-
-    app.set_accels_for_action("win.zoom-in", &["<Control>equal", "<Control>plus"]);
-
-    // --- Zoom out action (Ctrl+-) ---
-    {
-        let states_zoom = Rc::clone(&tab_states);
-        let focus_zoom = Rc::clone(&focus_tracker);
-        let action = gio::SimpleAction::new("zoom-out", None);
-        action.connect_activate(move |_action, _param| {
-            zoom_focused_pane(&states_zoom, &focus_zoom, ZoomDirection::Out);
-        });
-        window.add_action(&action);
-    }
-
-    app.set_accels_for_action("win.zoom-out", &["<Control>minus"]);
-
-    // --- Zoom reset action (Ctrl+0) ---
-    {
-        let states_zoom = Rc::clone(&tab_states);
-        let focus_zoom = Rc::clone(&focus_tracker);
-        let action = gio::SimpleAction::new("zoom-reset", None);
-        action.connect_activate(move |_action, _param| {
-            zoom_focused_pane(&states_zoom, &focus_zoom, ZoomDirection::Reset);
-        });
-        window.add_action(&action);
-    }
-
-    app.set_accels_for_action("win.zoom-reset", &["<Control>0"]);
 
     // --- Show shortcuts window action (F1 / Ctrl+?) ---
     {
@@ -743,21 +760,24 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
 
     // --- Close Tab action (menu only) ---
     {
-        let tv_close_tab = tab_view.clone();
-        let states_close_tab = Rc::clone(&tab_states);
+        let wm_close_tab = Rc::clone(&workspace_manager);
         let window_close_tab = window.clone();
         let action = gio::SimpleAction::new("close-tab", None);
         action.connect_activate(move |_action, _param| {
-            let Some(page) = tv_close_tab.selected_page() else {
+            let Ok(mgr) = wm_close_tab.try_borrow() else {
+                return;
+            };
+            let ws = &mgr.workspaces[mgr.active_index];
+            let Some(page) = ws.tab_view.selected_page() else {
                 return;
             };
             let container = page.child();
-            kill_all_panes_in_subtree(&container, &states_close_tab);
+            kill_all_panes_in_subtree(&container, &ws.tab_states);
 
-            if tv_close_tab.n_pages() <= 1 {
+            if ws.tab_view.n_pages() <= 1 {
                 window_close_tab.close();
             } else {
-                tv_close_tab.close_page(&page);
+                ws.tab_view.close_page(&page);
             }
         });
         window.add_action(&action);
@@ -765,28 +785,34 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
 
     // --- Change Tab Title action (menu only) ---
     {
-        let tv_title = tab_view.clone();
-        let ct_title = Rc::clone(&custom_titles);
+        let wm_title = Rc::clone(&workspace_manager);
         let win_title = window.clone();
         let action = gio::SimpleAction::new("change-tab-title", None);
         action.connect_activate(move |_action, _param| {
-            let Some(page) = tv_title.selected_page() else {
+            let Ok(mgr) = wm_title.try_borrow() else {
                 return;
             };
-            show_change_tab_title_dialog(&win_title, &page, &ct_title);
+            let ws = &mgr.workspaces[mgr.active_index];
+            let Some(page) = ws.tab_view.selected_page() else {
+                return;
+            };
+            show_change_tab_title_dialog(&win_title, &page, &ws.custom_titles);
         });
         window.add_action(&action);
     }
 
     // --- Clear terminal action (menu only) ---
     // Write Ctrl+L (form feed) to the PTY so the shell clears the screen AND
-    // redraws the prompt — identical to pressing Ctrl+L interactively.
+    // redraws the prompt -- identical to pressing Ctrl+L interactively.
     {
-        let states_clear = Rc::clone(&tab_states);
-        let focus_clear = Rc::clone(&focus_tracker);
+        let wm_clear = Rc::clone(&workspace_manager);
         let action = gio::SimpleAction::new("clear", None);
         action.connect_activate(move |_action, _param| {
-            write_to_focused_pty(&states_clear, &focus_clear, b"\x0c");
+            let Ok(mgr) = wm_clear.try_borrow() else {
+                return;
+            };
+            let ws = &mgr.workspaces[mgr.active_index];
+            write_to_focused_pty(&ws.tab_states, &ws.focus_tracker, b"\x0c");
         });
         window.add_action(&action);
     }
@@ -795,12 +821,15 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
     // Use the proper ghostty_terminal_reset() API to perform a full RIS, then
     // Ctrl+L to PTY so the shell redraws its prompt in default colors.
     {
-        let states_reset = Rc::clone(&tab_states);
-        let focus_reset = Rc::clone(&focus_tracker);
+        let wm_reset = Rc::clone(&workspace_manager);
         let action = gio::SimpleAction::new("reset", None);
         action.connect_activate(move |_action, _param| {
-            reset_focused_pane(&states_reset, &focus_reset);
-            write_to_focused_pty(&states_reset, &focus_reset, b"\x0c");
+            let Ok(mgr) = wm_reset.try_borrow() else {
+                return;
+            };
+            let ws = &mgr.workspaces[mgr.active_index];
+            reset_focused_pane(&ws.tab_states, &ws.focus_tracker);
+            write_to_focused_pty(&ws.tab_states, &ws.focus_tracker, b"\x0c");
         });
         window.add_action(&action);
     }
@@ -817,11 +846,11 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
     // --- Reload Configuration action (menu only) ---
     {
         let shared_cfg_reload = Rc::clone(&shared_config);
-        let states_reload_action = Rc::clone(&tab_states);
+        let wm_reload = Rc::clone(&workspace_manager);
         let win_reload = window.clone();
         let action = gio::SimpleAction::new("reload-config", None);
         action.connect_activate(move |_action, _param| {
-            reload_config(&shared_cfg_reload, &states_reload_action, &win_reload);
+            reload_config_all_workspaces(&shared_cfg_reload, &wm_reload, &win_reload);
         });
         window.add_action(&action);
     }
@@ -843,13 +872,15 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
     // CRITICAL: save session BEFORE killing PTYs (CWD read needs /proc/{pid}/cwd).
     {
         let app_quit = app.clone();
-        let tab_states_quit = Rc::clone(&tab_states);
-        let tv_quit_save = tab_view.clone();
+        let wm_quit = Rc::clone(&workspace_manager);
         let win_quit_save = window.clone();
+        let skip_save_quit = Rc::clone(&skip_session_save);
         let action = gio::SimpleAction::new("quit", None);
         action.connect_activate(move |_action, _param| {
-            save_current_session(&tv_quit_save, &tab_states_quit, &win_quit_save);
-            kill_all_ptys(&tab_states_quit, "Quit action");
+            if !skip_save_quit.get() {
+                save_all_workspaces(&wm_quit, &win_quit_save);
+            }
+            kill_all_workspace_ptys(&wm_quit, "Quit action");
             app_quit.quit();
         });
         app.add_action(&action);
@@ -857,14 +888,153 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
 
     app.set_accels_for_action("app.quit", &["<Control><Shift>q"]);
 
+    // --- New Workspace action (Ctrl+Alt+N) ---
+    {
+        let wm_new = Rc::clone(&workspace_manager);
+        let cfg_new = Rc::clone(&shared_config);
+        let main_area_new = main_area.clone();
+        let tab_bar_new = tab_bar.clone();
+        let win_new = window.clone();
+        let action = gio::SimpleAction::new("new-workspace", None);
+        action.connect_activate(move |_action, _param| {
+            show_new_workspace_dialog(&win_new, &wm_new, &cfg_new, &main_area_new, &tab_bar_new);
+        });
+        window.add_action(&action);
+    }
+
+    app.set_accels_for_action("win.new-workspace", &["<Control><Alt>n"]);
+
+    // --- Rename Workspace action (menu only) ---
+    {
+        let wm_rename = Rc::clone(&workspace_manager);
+        let win_rename = window.clone();
+        let action = gio::SimpleAction::new("rename-workspace", None);
+        action.connect_activate(move |_action, _param| {
+            show_rename_workspace_dialog(&win_rename, &wm_rename);
+        });
+        window.add_action(&action);
+    }
+
+    // --- Delete Workspace action (menu only) ---
+    {
+        let wm_delete = Rc::clone(&workspace_manager);
+        let main_area_del = main_area.clone();
+        let tab_bar_del = tab_bar.clone();
+        let win_del = window.clone();
+        let delete_action = gio::SimpleAction::new("delete-workspace", None);
+        {
+            // Disable if only one workspace
+            let has_multiple =
+                workspace_manager.try_borrow().map(|mgr| mgr.workspaces.len() > 1).unwrap_or(false);
+            delete_action.set_enabled(has_multiple);
+        }
+        delete_action.connect_activate(move |_action, _param| {
+            delete_current_workspace(&wm_delete, &main_area_del, &tab_bar_del, &win_del);
+        });
+        window.add_action(&delete_action);
+    }
+
+    // --- Switch Workspace by index (Ctrl+Alt+1 through 9) ---
+    for i in 1..=9u32 {
+        let wm_switch = Rc::clone(&workspace_manager);
+        let main_area_sw = main_area.clone();
+        let tab_bar_sw = tab_bar.clone();
+        let win_sw = window.clone();
+        let action_name = format!("switch-workspace-{i}");
+        let action = gio::SimpleAction::new(&action_name, None);
+        action.connect_activate(move |_action, _param| {
+            let target = (i - 1) as usize;
+            switch_workspace(&wm_switch, target, &main_area_sw, &tab_bar_sw, &win_sw);
+        });
+        window.add_action(&action);
+        app.set_accels_for_action(
+            &format!("win.switch-workspace-{i}"),
+            &[&format!("<Control><Alt>{i}")],
+        );
+    }
+
+    // --- Previous Workspace (Ctrl+Alt+Left) ---
+    {
+        let wm_prev = Rc::clone(&workspace_manager);
+        let main_area_prev = main_area.clone();
+        let tab_bar_prev = tab_bar.clone();
+        let win_prev = window.clone();
+        let action = gio::SimpleAction::new("prev-workspace", None);
+        action.connect_activate(move |_action, _param| {
+            let Ok(mgr) = wm_prev.try_borrow() else {
+                return;
+            };
+            let count = mgr.workspaces.len();
+            if count <= 1 {
+                return;
+            }
+            let target = if mgr.active_index == 0 { count - 1 } else { mgr.active_index - 1 };
+            drop(mgr);
+            switch_workspace(&wm_prev, target, &main_area_prev, &tab_bar_prev, &win_prev);
+        });
+        window.add_action(&action);
+    }
+
+    app.set_accels_for_action("win.prev-workspace", &["<Control><Alt>Page_Up"]);
+
+    // --- Next Workspace (Ctrl+Alt+Right) ---
+    {
+        let wm_next = Rc::clone(&workspace_manager);
+        let main_area_next = main_area.clone();
+        let tab_bar_next = tab_bar.clone();
+        let win_next = window.clone();
+        let action = gio::SimpleAction::new("next-workspace", None);
+        action.connect_activate(move |_action, _param| {
+            let Ok(mgr) = wm_next.try_borrow() else {
+                return;
+            };
+            let count = mgr.workspaces.len();
+            if count <= 1 {
+                return;
+            }
+            let target = (mgr.active_index + 1) % count;
+            drop(mgr);
+            switch_workspace(&wm_next, target, &main_area_next, &tab_bar_next, &win_next);
+        });
+        window.add_action(&action);
+    }
+
+    app.set_accels_for_action("win.next-workspace", &["<Control><Alt>Page_Down"]);
+
+    // --- Workspace Selector overlay (Ctrl+Alt+W) ---
+    {
+        let wm_selector = Rc::clone(&workspace_manager);
+        let selector_ref = workspace_selector.clone();
+        let lb_ref = workspace_selector_lb.clone();
+        let palette_ref_ws = command_palette.clone();
+        let wm_ws = Rc::clone(&workspace_manager);
+        let action = gio::SimpleAction::new("workspace-selector", None);
+        action.connect_activate(move |_action, _param| {
+            // Close command palette if open
+            if palette_ref_ws.is_visible() {
+                let ft = active_focus_tracker(&wm_ws);
+                close_command_palette(&palette_ref_ws, &ft);
+            }
+            toggle_workspace_selector(
+                &selector_ref,
+                &lb_ref,
+                &wm_selector,
+            );
+        });
+        window.add_action(&action);
+    }
+
+    app.set_accels_for_action("win.workspace-selector", &["<Control><Alt>w"]);
+
     // --- Command Palette action (Ctrl+Shift+P) ---
     {
         let palette_ref = command_palette.clone();
-        let ft_palette = Rc::clone(&focus_tracker);
+        let wm_palette = Rc::clone(&workspace_manager);
         let win_ref = window.clone();
         let action = gio::SimpleAction::new("command-palette", None);
         action.connect_activate(move |_action, _param| {
-            toggle_command_palette(&palette_ref, &ft_palette, &win_ref);
+            let ft = active_focus_tracker(&wm_palette);
+            toggle_command_palette(&palette_ref, &ft, &win_ref);
         });
         window.add_action(&action);
     }
@@ -879,25 +1049,25 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
     }
 
     // --- Create the first tab (or restore session) ---
-    // CLI overrides (working_directory, command, no_restore) skip session restore.
-    let has_cli_override =
-        launch.working_directory.is_some() || launch.command.is_some() || launch.no_restore;
 
     let mut restored = false;
     if !has_cli_override {
         match forgetty_workspace::load_session() {
             Ok(Some(state)) => {
-                if state.workspaces.first().map_or(true, |ws| ws.tabs.is_empty()) {
+                let has_tabs = state.workspaces.iter().any(|ws| !ws.tabs.is_empty());
+                if !has_tabs {
                     tracing::info!("Session file has no tabs, opening default tab");
                 } else {
-                    tracing::info!("Restoring saved session");
-                    restored = restore_session(
+                    tracing::info!(
+                        "Restoring saved session ({} workspace(s))",
+                        state.workspaces.len()
+                    );
+                    restored = restore_all_workspaces(
                         &state,
-                        &tab_view,
+                        &workspace_manager,
                         config,
-                        &tab_states,
-                        &focus_tracker,
-                        &custom_titles,
+                        &main_area,
+                        &tab_bar,
                         &window,
                     );
                 }
@@ -912,17 +1082,26 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
     }
 
     if !restored {
+        // Add a tab to the default workspace.
+        let Ok(mgr) = workspace_manager.try_borrow() else {
+            return;
+        };
+        let ws = &mgr.workspaces[0];
         add_new_tab(
-            &tab_view,
+            &ws.tab_view,
             config,
-            &tab_states,
-            &focus_tracker,
-            &custom_titles,
+            &ws.tab_states,
+            &ws.focus_tracker,
+            &ws.custom_titles,
             &window,
             launch.working_directory.as_deref(),
             launch.command.as_deref(),
         );
+        drop(mgr);
     }
+
+    // Update the window title based on workspace count.
+    update_window_title_for_workspace(&workspace_manager, &window);
 
     // --- Window close request handler ---
     // Fires when the user clicks the CSD X button, when window.close() is
@@ -930,12 +1109,14 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
     // Runs BEFORE the window is destroyed, so all state is still accessible.
     // CRITICAL: save session BEFORE killing PTYs (CWD read needs /proc/{pid}/cwd).
     {
-        let tab_states_close = Rc::clone(&tab_states);
-        let tv_close_save = tab_view.clone();
+        let wm_close = Rc::clone(&workspace_manager);
         let win_close_save = window.clone();
+        let skip_save_close = Rc::clone(&skip_session_save);
         window.connect_close_request(move |_win| {
-            save_current_session(&tv_close_save, &tab_states_close, &win_close_save);
-            kill_all_ptys(&tab_states_close, "Window close request");
+            if !skip_save_close.get() {
+                save_all_workspaces(&wm_close, &win_close_save);
+            }
+            kill_all_workspace_ptys(&wm_close, "Window close request");
             glib::Propagation::Proceed
         });
     }
@@ -950,14 +1131,16 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
         let signals: &[(i32, &str)] =
             &[(SIGTERM, "SIGTERM"), (SIGHUP, "SIGHUP"), (SIGINT, "SIGINT")];
         for &(signum, name) in signals {
-            let tab_states_signal = Rc::clone(&tab_states);
+            let wm_signal = Rc::clone(&workspace_manager);
             let app_signal = app.clone();
-            let tv_signal_save = tab_view.clone();
             let win_signal_save = window.clone();
+            let skip_save_signal = Rc::clone(&skip_session_save);
             glib::unix_signal_add_local(signum, move || {
                 tracing::info!("Received {name} (signal {signum}), initiating clean shutdown");
-                save_current_session(&tv_signal_save, &tab_states_signal, &win_signal_save);
-                kill_all_ptys(&tab_states_signal, name);
+                if !skip_save_signal.get() {
+                    save_all_workspaces(&wm_signal, &win_signal_save);
+                }
+                kill_all_workspace_ptys(&wm_signal, name);
                 app_signal.quit();
                 glib::ControlFlow::Break
             });
@@ -966,37 +1149,43 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
 
     window.present();
 
-    // Grab focus on the first tab's DrawingArea
-    if let Some(page) = tab_view.selected_page() {
-        let container = page.child();
-        let leaves = collect_leaf_drawing_areas(&container);
-        if let Some(da) = leaves.first() {
-            da.grab_focus();
+    // Grab focus on the active workspace's selected tab's first DrawingArea
+    {
+        let Ok(mgr) = workspace_manager.try_borrow() else {
+            return;
+        };
+        let ws = &mgr.workspaces[mgr.active_index];
+        if let Some(page) = ws.tab_view.selected_page() {
+            let container = page.child();
+            let leaves = collect_leaf_drawing_areas(&container);
+            if let Some(da) = leaves.first() {
+                da.grab_focus();
+            }
         }
     }
 
     // --- Auto-save timer (30s) ---
-    // Periodically saves the session file so crash recovery loses at most 30s.
+    // Periodically saves ALL workspaces so crash recovery loses at most 30s.
     // Uses a weak window reference to stop the timer after window destruction.
-    {
-        let tv_autosave = tab_view.clone();
-        let states_autosave = Rc::clone(&tab_states);
+    // Skipped when launched with CLI overrides to avoid overwriting the real session.
+    if !has_cli_override {
+        let wm_autosave = Rc::clone(&workspace_manager);
         let window_weak_save = window.downgrade();
         glib::timeout_add_local(Duration::from_secs(AUTO_SAVE_SECS), move || {
             let Some(win) = window_weak_save.upgrade() else {
                 return glib::ControlFlow::Break;
             };
-            save_current_session(&tv_autosave, &states_autosave, &win);
+            save_all_workspaces(&wm_autosave, &win);
             glib::ControlFlow::Continue
         });
     }
 
     // --- Config hot reload timer ---
     // Polls the config watcher every 500ms. On change, reloads config.toml
-    // and applies diffs (font, theme, bell) to all existing panes.
+    // and applies diffs (font, theme, bell) to all existing panes in ALL workspaces.
     if let Some(mut config_watcher) = ConfigWatcher::new() {
         let shared_cfg = Rc::clone(&shared_config);
-        let states_reload = Rc::clone(&tab_states);
+        let wm_reload = Rc::clone(&workspace_manager);
         let window_weak = window.downgrade();
 
         glib::timeout_add_local(Duration::from_millis(CONFIG_POLL_MS), move || {
@@ -1025,23 +1214,28 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
                 *cfg = new_config.clone();
             }
 
-            // Apply changes to every existing pane.
-            let Ok(states) = states_reload.try_borrow() else {
+            // Apply changes to every pane in every workspace.
+            let Ok(mgr) = wm_reload.try_borrow() else {
                 return glib::ControlFlow::Continue;
             };
 
-            let state_entries: Vec<_> =
-                states.iter().map(|(name, rc)| (name.clone(), Rc::clone(rc))).collect();
-            drop(states);
+            for ws in &mgr.workspaces {
+                let Ok(states) = ws.tab_states.try_borrow() else {
+                    continue;
+                };
+                let state_entries: Vec<_> =
+                    states.iter().map(|(name, rc)| (name.clone(), Rc::clone(rc))).collect();
+                drop(states);
 
-            for (pane_name, state_rc) in &state_entries {
-                let Ok(mut s) = state_rc.try_borrow_mut() else {
-                    continue;
-                };
-                let Some(da) = find_drawing_area_by_name(&win, pane_name) else {
-                    continue;
-                };
-                terminal::apply_config_change(&mut s, &new_config, &da);
+                for (pane_name, state_rc) in &state_entries {
+                    let Ok(mut s) = state_rc.try_borrow_mut() else {
+                        continue;
+                    };
+                    let Some(da) = find_drawing_area_by_name(&win, pane_name) else {
+                        continue;
+                    };
+                    terminal::apply_config_change(&mut s, &new_config, &da);
+                }
             }
 
             glib::ControlFlow::Continue
@@ -1126,61 +1320,68 @@ fn snapshot_pane_tree(widget: &gtk4::Widget, tab_states: &TabStateMap) -> Option
     None
 }
 
-/// Snapshot the current workspace layout for session persistence.
-///
-/// Walks the TabView pages and widget tree, reading CWDs from `/proc/{pid}/cwd`.
-/// Returns a `WorkspaceState` ready for serialization to JSON.
-fn snapshot_workspace_state(
-    tab_view: &adw::TabView,
-    tab_states: &TabStateMap,
-    window: &adw::ApplicationWindow,
-) -> WorkspaceState {
-    let n_pages = tab_view.n_pages();
-    let active_tab = tab_view
+/// Snapshot a single workspace's layout for session persistence.
+fn snapshot_single_workspace(ws: &WorkspaceView) -> Workspace {
+    let n_pages = ws.tab_view.n_pages();
+    let active_tab = ws
+        .tab_view
         .selected_page()
-        .map(|p| (0..n_pages).find(|&i| tab_view.nth_page(i) == p).unwrap_or(0) as usize)
+        .map(|p| (0..n_pages).find(|&i| ws.tab_view.nth_page(i) == p).unwrap_or(0) as usize)
         .unwrap_or(0);
 
     let mut tabs = Vec::with_capacity(n_pages as usize);
     for i in 0..n_pages {
-        let page = tab_view.nth_page(i);
+        let page = ws.tab_view.nth_page(i);
         let title = page.title().to_string();
         let container = page.child();
 
-        let pane_tree = snapshot_pane_tree(&container, tab_states)
+        let pane_tree = snapshot_pane_tree(&container, &ws.tab_states)
             .unwrap_or_else(|| PaneTreeState::Leaf { cwd: home_dir_fallback() });
 
         tabs.push(TabState { title, pane_tree });
     }
 
-    let workspace = Workspace {
-        id: uuid::Uuid::new_v4(),
-        name: String::from("default"),
-        root_paths: Vec::new(),
-        tabs,
-        active_tab,
+    Workspace { id: ws.id, name: ws.name.clone(), root_paths: Vec::new(), tabs, active_tab }
+}
+
+/// Snapshot ALL workspaces for session persistence.
+fn snapshot_all_workspaces(
+    workspace_manager: &WorkspaceManager,
+    window: &adw::ApplicationWindow,
+) -> WorkspaceState {
+    let Ok(mgr) = workspace_manager.try_borrow() else {
+        return WorkspaceState::new();
     };
+
+    let workspaces: Vec<Workspace> = mgr.workspaces.iter().map(snapshot_single_workspace).collect();
 
     WorkspaceState {
         version: 1,
-        workspaces: vec![workspace],
-        active_workspace: 0,
+        workspaces,
+        active_workspace: mgr.active_index,
         window_width: Some(window.width()),
         window_height: Some(window.height()),
     }
 }
 
-/// Save the current session to disk. Logs errors but does not propagate them.
-fn save_current_session(
-    tab_view: &adw::TabView,
-    tab_states: &TabStateMap,
-    window: &adw::ApplicationWindow,
-) {
-    let state = snapshot_workspace_state(tab_view, tab_states, window);
+/// Save ALL workspaces to disk. Logs errors but does not propagate them.
+fn save_all_workspaces(workspace_manager: &WorkspaceManager, window: &adw::ApplicationWindow) {
+    let state = snapshot_all_workspaces(workspace_manager, window);
     if let Err(e) = forgetty_workspace::save_session(&state) {
         tracing::warn!("Failed to save session: {e}");
     } else {
-        tracing::debug!("Session saved successfully");
+        tracing::debug!("Session saved ({} workspace(s))", state.workspaces.len());
+    }
+}
+
+/// Kill all PTYs across all workspaces.
+fn kill_all_workspace_ptys(workspace_manager: &WorkspaceManager, reason: &str) {
+    let Ok(mgr) = workspace_manager.try_borrow() else {
+        tracing::warn!("kill_all_workspace_ptys: could not borrow workspace manager");
+        return;
+    };
+    for ws in &mgr.workspaces {
+        kill_all_ptys(&ws.tab_states, reason);
     }
 }
 
@@ -1294,12 +1495,11 @@ fn build_pane_tree(
     }
 }
 
-/// Restore a saved session into the live window.
+/// Restore tabs into a single workspace's TabView from a saved `Workspace`.
 ///
-/// Creates tabs, splits, and terminals matching the saved `WorkspaceState`.
-/// Returns `true` if the session was successfully restored.
-fn restore_session(
-    state: &WorkspaceState,
+/// Returns `true` if at least one tab was successfully restored.
+fn restore_workspace_tabs(
+    saved: &Workspace,
     tab_view: &adw::TabView,
     config: &Config,
     tab_states: &TabStateMap,
@@ -1307,25 +1507,11 @@ fn restore_session(
     custom_titles: &CustomTitles,
     window: &adw::ApplicationWindow,
 ) -> bool {
-    // Restore window dimensions.
-    if let (Some(w), Some(h)) = (state.window_width, state.window_height) {
-        if w > 0 && h > 0 {
-            window.set_default_size(w, h);
-        }
-    }
-
-    let workspace = match state.workspaces.first() {
-        Some(ws) => ws,
-        None => return false,
-    };
-
-    if workspace.tabs.is_empty() {
+    if saved.tabs.is_empty() {
         return false;
     }
 
-    let mut first_da: Option<gtk4::DrawingArea> = None;
-
-    for (idx, tab) in workspace.tabs.iter().enumerate() {
+    for (idx, tab) in saved.tabs.iter().enumerate() {
         let result = build_pane_tree(
             &tab.pane_tree,
             config,
@@ -1336,7 +1522,7 @@ fn restore_session(
             window,
         );
 
-        let Some((root_widget, leaf_da)) = result else {
+        let Some((root_widget, _leaf_da)) = result else {
             tracing::warn!("Failed to restore tab {idx}, skipping");
             continue;
         };
@@ -1352,29 +1538,142 @@ fn restore_session(
 
         // Register title polling timer for this tab.
         register_title_timer(&page, tab_view, tab_states, focus_tracker, custom_titles, window);
-
-        if first_da.is_none() {
-            first_da = Some(leaf_da);
-        }
     }
 
     // Select the saved active tab.
-    let active = workspace.active_tab.min(tab_view.n_pages().saturating_sub(1) as usize);
+    let active = saved.active_tab.min(tab_view.n_pages().saturating_sub(1) as usize);
     if tab_view.n_pages() > 0 {
         let page = tab_view.nth_page(active as i32);
         tab_view.set_selected_page(&page);
     }
 
-    // Focus the first leaf in the selected tab.
-    if let Some(page) = tab_view.selected_page() {
-        let container = page.child();
-        let leaves = collect_leaf_drawing_areas(&container);
-        if let Some(da) = leaves.first() {
-            da.grab_focus();
+    tab_view.n_pages() > 0
+}
+
+/// Restore ALL workspaces from a saved session.
+///
+/// Replaces the workspace manager contents. The first workspace reuses the
+/// initial TabView that is already parented in main_area. Additional workspaces
+/// get new TabViews that are kept unparented until switched to.
+/// Returns `true` if at least one workspace was restored.
+fn restore_all_workspaces(
+    state: &WorkspaceState,
+    workspace_manager: &WorkspaceManager,
+    config: &Config,
+    main_area: &gtk4::Box,
+    tab_bar: &adw::TabBar,
+    window: &adw::ApplicationWindow,
+) -> bool {
+    if state.workspaces.is_empty() {
+        return false;
+    }
+
+    // Restore window dimensions.
+    if let (Some(w), Some(h)) = (state.window_width, state.window_height) {
+        if w > 0 && h > 0 {
+            window.set_default_size(w, h);
         }
     }
 
-    tab_view.n_pages() > 0
+    let Ok(mut mgr) = workspace_manager.try_borrow_mut() else {
+        return false;
+    };
+
+    // Get a reference to the initial TabView (the one already in main_area).
+    let initial_tab_view = mgr.workspaces[0].tab_view.clone();
+
+    // Clear the existing single default workspace -- we will rebuild all from saved state.
+    mgr.workspaces.clear();
+
+    let mut any_restored = false;
+
+    for (ws_idx, saved_ws) in state.workspaces.iter().enumerate() {
+        // Backward compat: capitalize "default" -> "Default"
+        let name =
+            if saved_ws.name == "default" { "Default".to_string() } else { saved_ws.name.clone() };
+
+        // First workspace reuses the initial TabView.
+        // Subsequent workspaces get fresh TabViews.
+        let tab_view = if ws_idx == 0 {
+            initial_tab_view.clone()
+        } else {
+            let tv = adw::TabView::new();
+            tv.set_vexpand(true);
+            tv.set_hexpand(true);
+            tv
+        };
+
+        let tab_states: TabStateMap = Rc::new(RefCell::new(HashMap::new()));
+        let focus_tracker: FocusTracker = Rc::new(RefCell::new(String::new()));
+        let custom_titles: CustomTitles = Rc::new(RefCell::new(HashSet::new()));
+
+        // Wire tab close and focus management on new TabViews.
+        if ws_idx > 0 {
+            wire_tab_view_handlers(&tab_view, &tab_states, &focus_tracker, window);
+        }
+
+        let restored = restore_workspace_tabs(
+            saved_ws,
+            &tab_view,
+            config,
+            &tab_states,
+            &focus_tracker,
+            &custom_titles,
+            window,
+        );
+
+        if restored {
+            any_restored = true;
+        }
+
+        mgr.workspaces.push(WorkspaceView {
+            id: saved_ws.id,
+            name,
+            tab_view,
+            tab_states,
+            focus_tracker,
+            custom_titles,
+        });
+    }
+
+    // Set the active workspace to the saved one.
+    let active = state.active_workspace.min(mgr.workspaces.len().saturating_sub(1));
+    mgr.active_index = active;
+
+    // If the active workspace is not the first, swap the TabView in main_area.
+    if active > 0 {
+        // Remove the initial tab_view, insert the active one.
+        let active_tv = mgr.workspaces[active].tab_view.clone();
+        // Find and remove the initial tab_view from main_area.
+        // It is the first child of main_area.
+        let mut child = main_area.first_child();
+        while let Some(c) = child {
+            if c == *initial_tab_view.upcast_ref::<gtk4::Widget>() {
+                main_area.remove(&c);
+                break;
+            }
+            child = c.next_sibling();
+        }
+        main_area.prepend(&active_tv);
+        tab_bar.set_view(Some(&active_tv));
+    }
+
+    // Focus the first leaf in the active workspace's selected tab.
+    if let Some(ws) = mgr.workspaces.get(active) {
+        if let Some(page) = ws.tab_view.selected_page() {
+            let container = page.child();
+            let leaves = collect_leaf_drawing_areas(&container);
+            if let Some(da) = leaves.first() {
+                da.grab_focus();
+            }
+        }
+    }
+
+    // Update delete-workspace action enabled state.
+    drop(mgr);
+    update_delete_workspace_action(workspace_manager, window);
+
+    any_restored
 }
 
 // ---------------------------------------------------------------------------
@@ -1444,7 +1743,8 @@ fn add_new_tab(
 
             // --- Set initial window title immediately ---
             if let Ok(s) = state.try_borrow() {
-                window.set_title(Some(&compute_window_title(&s)));
+                let pane_title = compute_window_title(&s);
+                set_window_title_preserving_workspace(window, &pane_title);
                 page.set_title(&compute_display_title(&s));
             }
 
@@ -2408,6 +2708,29 @@ fn wire_focus_tracking(
 // Title polling
 // ---------------------------------------------------------------------------
 
+/// Update the window title, preserving any workspace prefix.
+///
+/// If the current window title has a workspace prefix (`WsName -- ...`),
+/// the prefix is preserved and only the pane portion is updated.
+/// This allows the title polling timer to update `user@host:~/path` without
+/// clobbering the workspace name set by workspace switch/create/rename.
+fn set_window_title_preserving_workspace(win: &adw::ApplicationWindow, pane_title: &str) {
+    let current = win.title().map(|t| t.to_string()).unwrap_or_default();
+    // Check if current title has a workspace prefix (contains em-dash separator).
+    if let Some(prefix_end) = current.find(" \u{2014} ") {
+        let prefix = &current[..prefix_end];
+        let new_title = format!("{prefix} \u{2014} {pane_title}");
+        if current != new_title {
+            win.set_title(Some(&new_title));
+        }
+    } else {
+        // No workspace prefix -- single workspace mode.
+        if current != pane_title {
+            win.set_title(Some(pane_title));
+        }
+    }
+}
+
 /// Register a title polling timer for a tab page.
 ///
 /// Periodically updates the tab title from the focused pane's CWD. The timer
@@ -2460,10 +2783,11 @@ fn register_title_timer(
                 if let Some(state_rc) = states.get(&focused_name).cloned() {
                     drop(states);
                     if let Ok(s) = state_rc.try_borrow() {
-                        if let Some(win) = win_weak.upgrade() {
-                            let win_title = compute_window_title(&s);
-                            if win.title().map(|t| t.as_str() != win_title).unwrap_or(true) {
-                                win.set_title(Some(&win_title));
+                        // Only update window title if this workspace is visible (active).
+                        if tv.parent().is_some() {
+                            if let Some(win) = win_weak.upgrade() {
+                                let pane_title = compute_window_title(&s);
+                                set_window_title_preserving_workspace(&win, &pane_title);
                             }
                         }
                     }
@@ -2509,11 +2833,13 @@ fn register_title_timer(
             if current_title.as_str() != title {
                 page.set_title(&title);
             }
-            // Update window title bar with user@host:cwd for the focused pane
-            if let Some(win) = win_weak.upgrade() {
-                let win_title = compute_window_title(&s);
-                if win.title().map(|t| t.as_str() != win_title).unwrap_or(true) {
-                    win.set_title(Some(&win_title));
+            // Update window title bar with user@host:cwd for the focused pane,
+            // preserving any workspace prefix. Only if this workspace is active
+            // (tab_view is parented in the widget tree).
+            if tv.parent().is_some() {
+                if let Some(win) = win_weak.upgrade() {
+                    let pane_title = compute_window_title(&s);
+                    set_window_title_preserving_workspace(&win, &pane_title);
                 }
             }
         }
@@ -2768,6 +3094,15 @@ fn build_shortcuts_window() -> gtk4::ShortcutsWindow {
     terminal_group.add_shortcut(&shortcut_no_accel("Reset", "Via hamburger menu"));
     section.add_group(&terminal_group);
 
+    // --- Workspaces ---
+    let workspace_group = shortcut_group("Workspaces");
+    workspace_group.add_shortcut(&shortcut("<Control><Alt>n", "New Workspace"));
+    workspace_group.add_shortcut(&shortcut("<Control><Alt>1", "Switch to Workspace 1\u{2013}9"));
+    workspace_group.add_shortcut(&shortcut("<Control><Alt>Page_Up", "Previous Workspace"));
+    workspace_group.add_shortcut(&shortcut("<Control><Alt>Page_Down", "Next Workspace"));
+    workspace_group.add_shortcut(&shortcut("<Control><Alt>w", "Workspace Selector"));
+    section.add_group(&workspace_group);
+
     // --- Navigation ---
     let nav_group = shortcut_group("Navigation");
     nav_group.add_shortcut(
@@ -2862,6 +3197,7 @@ fn reset_focused_pane(tab_states: &TabStateMap, focus_tracker: &FocusTracker) {
 ///
 /// Used by the Clear menu action. The bytes are fed directly into
 /// the VT parser (same path as PTY data), then the pane is redrawn.
+#[allow(dead_code)]
 fn feed_escape_to_focused_pane(
     tab_states: &TabStateMap,
     focus_tracker: &FocusTracker,
@@ -3056,50 +3392,6 @@ fn open_config_file() {
     }
 }
 
-/// Reload configuration from disk and apply to all existing panes.
-///
-/// This is the same logic used by the config watcher timer, extracted so that
-/// the "Reload Configuration" menu action can trigger an immediate reload.
-fn reload_config(
-    shared_config: &SharedConfig,
-    tab_states: &TabStateMap,
-    window: &adw::ApplicationWindow,
-) {
-    let new_config = match load_config(None) {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            tracing::warn!("Config reload failed: {e}");
-            return;
-        }
-    };
-
-    info!("Config reloaded via menu action");
-
-    // Update the shared config so new tabs/splits use the new values.
-    if let Ok(mut cfg) = shared_config.try_borrow_mut() {
-        *cfg = new_config.clone();
-    }
-
-    // Apply changes to every existing pane.
-    let Ok(states) = tab_states.try_borrow() else {
-        return;
-    };
-
-    let state_entries: Vec<_> =
-        states.iter().map(|(name, rc)| (name.clone(), Rc::clone(rc))).collect();
-    drop(states);
-
-    for (pane_name, state_rc) in &state_entries {
-        let Ok(mut s) = state_rc.try_borrow_mut() else {
-            continue;
-        };
-        let Some(da) = find_drawing_area_by_name(window, pane_name) else {
-            continue;
-        };
-        terminal::apply_config_change(&mut s, &new_config, &da);
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Command Palette
 // ---------------------------------------------------------------------------
@@ -3157,6 +3449,36 @@ fn command_registry() -> &'static [CommandEntry] {
             display_name: "Change Tab Title",
             action_name: "win.change-tab-title",
             shortcut_label: "",
+        },
+        CommandEntry {
+            display_name: "New Workspace",
+            action_name: "win.new-workspace",
+            shortcut_label: "Ctrl+Alt+N",
+        },
+        CommandEntry {
+            display_name: "Rename Workspace",
+            action_name: "win.rename-workspace",
+            shortcut_label: "",
+        },
+        CommandEntry {
+            display_name: "Delete Workspace",
+            action_name: "win.delete-workspace",
+            shortcut_label: "",
+        },
+        CommandEntry {
+            display_name: "Workspace Selector",
+            action_name: "win.workspace-selector",
+            shortcut_label: "Ctrl+Alt+W",
+        },
+        CommandEntry {
+            display_name: "Previous Workspace",
+            action_name: "win.prev-workspace",
+            shortcut_label: "Ctrl+Alt+PgUp",
+        },
+        CommandEntry {
+            display_name: "Next Workspace",
+            action_name: "win.next-workspace",
+            shortcut_label: "Ctrl+Alt+PgDn",
         },
         CommandEntry { display_name: "Split Up", action_name: "win.split-up", shortcut_label: "" },
         CommandEntry {
@@ -3260,7 +3582,7 @@ fn command_registry() -> &'static [CommandEntry] {
 /// as an overlay child on the `main_overlay` and toggles visibility.
 fn build_command_palette(
     window: &adw::ApplicationWindow,
-    focus_tracker: &FocusTracker,
+    workspace_manager: &WorkspaceManager,
 ) -> gtk4::Box {
     let registry = command_registry();
 
@@ -3360,11 +3682,12 @@ fn build_command_palette(
         let lb = list_box.clone();
         let outer_ref = outer.clone();
         let win = window.clone();
-        let ft = Rc::clone(focus_tracker);
+        let wm = Rc::clone(workspace_manager);
         let key_controller = gtk4::EventControllerKey::new();
         key_controller.connect_key_pressed(move |_ctrl, key, _code, _mods| {
             match key {
                 gtk4::gdk::Key::Escape => {
+                    let ft = active_focus_tracker(&wm);
                     close_command_palette(&outer_ref, &ft);
                     glib::Propagation::Stop
                 }
@@ -3374,6 +3697,7 @@ fn build_command_palette(
                         let registry = command_registry();
                         if let Some(cmd) = registry.get(index as usize) {
                             let action_name = cmd.action_name.to_string();
+                            let ft = active_focus_tracker(&wm);
                             close_command_palette(&outer_ref, &ft);
                             // Defer action dispatch so the palette is fully hidden
                             // before any dialog opens (e.g. "Change Tab Title").
@@ -3407,12 +3731,13 @@ fn build_command_palette(
     {
         let outer_ref = outer.clone();
         let win = window.clone();
-        let ft = Rc::clone(focus_tracker);
+        let wm = Rc::clone(workspace_manager);
         list_box.connect_row_activated(move |_lb, row| {
             let index = row.index();
             let registry = command_registry();
             if let Some(cmd) = registry.get(index as usize) {
                 let action_name = cmd.action_name.to_string();
+                let ft = active_focus_tracker(&wm);
                 close_command_palette(&outer_ref, &ft);
                 // Defer action dispatch so the palette is fully hidden
                 // before any dialog opens (e.g. "Change Tab Title").
@@ -3589,4 +3914,687 @@ fn toggle_command_palette(
     } else {
         open_command_palette(palette, window);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Workspace management
+// ---------------------------------------------------------------------------
+
+/// Get the active workspace's focus tracker from the workspace manager.
+///
+/// Returns the active workspace's FocusTracker, or a new empty one if the
+/// manager cannot be borrowed (should never happen in normal flow).
+fn active_focus_tracker(workspace_manager: &WorkspaceManager) -> FocusTracker {
+    workspace_manager
+        .try_borrow()
+        .ok()
+        .map(|mgr| Rc::clone(&mgr.workspaces[mgr.active_index].focus_tracker))
+        .unwrap_or_else(|| Rc::new(RefCell::new(String::new())))
+}
+
+/// Wire the standard tab close and focus management handlers on a TabView.
+///
+/// Called for every workspace TabView except the initial one (which has these
+/// handlers wired inline during build_ui setup).
+fn wire_tab_view_handlers(
+    tab_view: &adw::TabView,
+    tab_states: &TabStateMap,
+    focus_tracker: &FocusTracker,
+    window: &adw::ApplicationWindow,
+) {
+    // Tab close handling
+    {
+        let window_close = window.clone();
+        let states_close = Rc::clone(tab_states);
+        tab_view.connect_close_page(move |tv, page| {
+            let container = page.child();
+            kill_all_panes_in_subtree(&container, &states_close);
+
+            if tv.n_pages() <= 1 {
+                window_close.close();
+            }
+
+            tv.close_page_finish(page, true);
+            glib::Propagation::Stop
+        });
+    }
+
+    // Focus management on tab switch
+    {
+        let focus_switch = Rc::clone(focus_tracker);
+        tab_view.connect_selected_page_notify(move |tv| {
+            if let Some(page) = tv.selected_page() {
+                let container = page.child();
+                let focused_name = focus_switch.borrow().clone();
+                let leaves = collect_leaf_drawing_areas(&container);
+                let target = leaves
+                    .iter()
+                    .find(|da| da.widget_name().as_str() == focused_name)
+                    .or_else(|| leaves.first());
+                if let Some(da) = target {
+                    da.grab_focus();
+                }
+            }
+        });
+    }
+}
+
+/// Switch to the workspace at `target_index`.
+///
+/// Swaps the TabView in main_area and rebinds the TabBar.
+/// No-op if target does not exist or is already active.
+fn switch_workspace(
+    workspace_manager: &WorkspaceManager,
+    target_index: usize,
+    main_area: &gtk4::Box,
+    tab_bar: &adw::TabBar,
+    window: &adw::ApplicationWindow,
+) {
+    let Ok(mut mgr) = workspace_manager.try_borrow_mut() else {
+        return;
+    };
+
+    if target_index >= mgr.workspaces.len() || target_index == mgr.active_index {
+        return;
+    }
+
+    let old_tv = mgr.workspaces[mgr.active_index].tab_view.clone();
+    let new_tv = mgr.workspaces[target_index].tab_view.clone();
+
+    // Remove the old TabView from main_area.
+    let mut child = main_area.first_child();
+    while let Some(c) = child {
+        if c == *old_tv.upcast_ref::<gtk4::Widget>() {
+            main_area.remove(&c);
+            break;
+        }
+        child = c.next_sibling();
+    }
+
+    // Insert the new TabView at the front (before the appearance sidebar).
+    main_area.prepend(&new_tv);
+
+    // Rebind the TabBar to the new TabView.
+    tab_bar.set_view(Some(&new_tv));
+
+    mgr.active_index = target_index;
+
+    // Focus the first leaf in the new workspace's selected tab.
+    let ws = &mgr.workspaces[target_index];
+    if let Some(page) = ws.tab_view.selected_page() {
+        let container = page.child();
+        let leaves = collect_leaf_drawing_areas(&container);
+        if let Some(da) = leaves.first() {
+            da.grab_focus();
+        }
+    }
+
+    // Update window title.
+    let ws_count = mgr.workspaces.len();
+    let ws_name = ws.name.clone();
+    drop(mgr);
+    update_window_title_with_workspace(ws_count, &ws_name, workspace_manager, window);
+}
+
+/// Show the "New Workspace" dialog. On confirm, creates a new WorkspaceView
+/// and switches to it.
+#[allow(deprecated)]
+fn show_new_workspace_dialog(
+    window: &adw::ApplicationWindow,
+    workspace_manager: &WorkspaceManager,
+    shared_config: &SharedConfig,
+    main_area: &gtk4::Box,
+    tab_bar: &adw::TabBar,
+) {
+    let dialog = adw::MessageDialog::new(
+        Some(window),
+        Some("New Workspace"),
+        Some("Enter a name for the new workspace."),
+    );
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("create", "Create");
+    dialog.set_response_appearance("create", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("create"));
+    dialog.set_close_response("cancel");
+
+    let entry = gtk4::Entry::new();
+    entry.set_placeholder_text(Some("Workspace name"));
+    dialog.set_extra_child(Some(&entry));
+
+    // Allow Enter in the entry to trigger the "create" response.
+    let dialog_for_enter = dialog.clone();
+    entry.connect_activate(move |_entry| {
+        dialog_for_enter.response("create");
+    });
+
+    let wm = Rc::clone(workspace_manager);
+    let cfg = Rc::clone(shared_config);
+    let ma = main_area.clone();
+    let tb = tab_bar.clone();
+    let win = window.clone();
+    dialog.connect_response(None, move |dialog, response| {
+        if response != "create" {
+            dialog.close();
+            return;
+        }
+        let name = entry.text().to_string().trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+
+        dialog.close();
+
+        let Ok(cfg_ref) = cfg.try_borrow() else {
+            return;
+        };
+        let config = cfg_ref.clone();
+        drop(cfg_ref);
+
+        create_and_switch_to_new_workspace(&wm, &name, &config, &ma, &tb, &win);
+    });
+
+    dialog.present();
+}
+
+/// Create a new workspace and switch to it.
+fn create_and_switch_to_new_workspace(
+    workspace_manager: &WorkspaceManager,
+    name: &str,
+    config: &Config,
+    main_area: &gtk4::Box,
+    tab_bar: &adw::TabBar,
+    window: &adw::ApplicationWindow,
+) {
+    let new_tv = adw::TabView::new();
+    new_tv.set_vexpand(true);
+    new_tv.set_hexpand(true);
+
+    let new_tab_states: TabStateMap = Rc::new(RefCell::new(HashMap::new()));
+    let new_focus_tracker: FocusTracker = Rc::new(RefCell::new(String::new()));
+    let new_custom_titles: CustomTitles = Rc::new(RefCell::new(HashSet::new()));
+
+    wire_tab_view_handlers(&new_tv, &new_tab_states, &new_focus_tracker, window);
+
+    // Add a default tab to the new workspace.
+    add_new_tab(
+        &new_tv,
+        config,
+        &new_tab_states,
+        &new_focus_tracker,
+        &new_custom_titles,
+        window,
+        None,
+        None,
+    );
+
+    let new_index = {
+        let Ok(mut mgr) = workspace_manager.try_borrow_mut() else {
+            return;
+        };
+
+        // Remove old TabView from main_area.
+        let old_tv = mgr.workspaces[mgr.active_index].tab_view.clone();
+        let mut child = main_area.first_child();
+        while let Some(c) = child {
+            if c == *old_tv.upcast_ref::<gtk4::Widget>() {
+                main_area.remove(&c);
+                break;
+            }
+            child = c.next_sibling();
+        }
+
+        // Insert new TabView.
+        main_area.prepend(&new_tv);
+        tab_bar.set_view(Some(&new_tv));
+
+        mgr.workspaces.push(WorkspaceView {
+            id: uuid::Uuid::new_v4(),
+            name: name.to_string(),
+            tab_view: new_tv,
+            tab_states: new_tab_states,
+            focus_tracker: new_focus_tracker,
+            custom_titles: new_custom_titles,
+        });
+
+        let idx = mgr.workspaces.len() - 1;
+        mgr.active_index = idx;
+        idx
+    };
+
+    // Update delete-workspace enabled state.
+    update_delete_workspace_action(workspace_manager, window);
+
+    // Update window title.
+    let Ok(mgr) = workspace_manager.try_borrow() else {
+        return;
+    };
+    let ws_count = mgr.workspaces.len();
+    let ws_name = mgr.workspaces[new_index].name.clone();
+    drop(mgr);
+    update_window_title_with_workspace(ws_count, &ws_name, workspace_manager, window);
+}
+
+/// Show the "Rename Workspace" dialog.
+#[allow(deprecated)]
+fn show_rename_workspace_dialog(
+    window: &adw::ApplicationWindow,
+    workspace_manager: &WorkspaceManager,
+) {
+    let Ok(mgr) = workspace_manager.try_borrow() else {
+        return;
+    };
+    let current_name = mgr.workspaces[mgr.active_index].name.clone();
+    drop(mgr);
+
+    let dialog = adw::MessageDialog::new(
+        Some(window),
+        Some("Rename Workspace"),
+        Some("Enter a new name for the current workspace."),
+    );
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("rename", "Rename");
+    dialog.set_response_appearance("rename", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("rename"));
+    dialog.set_close_response("cancel");
+
+    let entry = gtk4::Entry::new();
+    entry.set_placeholder_text(Some("Workspace name"));
+    entry.set_text(&current_name);
+    entry.select_region(0, -1);
+    dialog.set_extra_child(Some(&entry));
+
+    let dialog_for_enter = dialog.clone();
+    entry.connect_activate(move |_entry| {
+        dialog_for_enter.response("rename");
+    });
+
+    let wm = Rc::clone(workspace_manager);
+    let win = window.clone();
+    dialog.connect_response(None, move |dialog, response| {
+        if response != "rename" {
+            dialog.close();
+            return;
+        }
+        let new_name = entry.text().to_string().trim().to_string();
+        if new_name.is_empty() {
+            return;
+        }
+
+        dialog.close();
+
+        let Ok(mut mgr) = wm.try_borrow_mut() else {
+            return;
+        };
+        let active = mgr.active_index;
+        mgr.workspaces[active].name = new_name.clone();
+        let ws_count = mgr.workspaces.len();
+        drop(mgr);
+
+        update_window_title_with_workspace(ws_count, &new_name, &wm, &win);
+    });
+
+    dialog.present();
+}
+
+/// Delete the current workspace. Kills all its PTYs and switches to an adjacent one.
+fn delete_current_workspace(
+    workspace_manager: &WorkspaceManager,
+    main_area: &gtk4::Box,
+    tab_bar: &adw::TabBar,
+    window: &adw::ApplicationWindow,
+) {
+    let Ok(mut mgr) = workspace_manager.try_borrow_mut() else {
+        return;
+    };
+
+    if mgr.workspaces.len() <= 1 {
+        return; // Cannot delete the last workspace.
+    }
+
+    let delete_idx = mgr.active_index;
+    let ws = &mgr.workspaces[delete_idx];
+
+    // Kill all PTYs in the workspace.
+    kill_all_ptys(&ws.tab_states, "Delete workspace");
+
+    // Remove the TabView from main_area if it is currently visible.
+    let old_tv = ws.tab_view.clone();
+    let mut child = main_area.first_child();
+    while let Some(c) = child {
+        if c == *old_tv.upcast_ref::<gtk4::Widget>() {
+            main_area.remove(&c);
+            break;
+        }
+        child = c.next_sibling();
+    }
+
+    // Remove the workspace from the list.
+    mgr.workspaces.remove(delete_idx);
+
+    // Choose the new active workspace.
+    let new_active =
+        if delete_idx >= mgr.workspaces.len() { mgr.workspaces.len() - 1 } else { delete_idx };
+    mgr.active_index = new_active;
+
+    // Insert the new active workspace's TabView.
+    let new_tv = mgr.workspaces[new_active].tab_view.clone();
+    main_area.prepend(&new_tv);
+    tab_bar.set_view(Some(&new_tv));
+
+    // Focus the first leaf.
+    if let Some(page) = mgr.workspaces[new_active].tab_view.selected_page() {
+        let container = page.child();
+        let leaves = collect_leaf_drawing_areas(&container);
+        if let Some(da) = leaves.first() {
+            da.grab_focus();
+        }
+    }
+
+    let ws_count = mgr.workspaces.len();
+    let ws_name = mgr.workspaces[new_active].name.clone();
+    drop(mgr);
+
+    // Update delete-workspace enabled state.
+    update_delete_workspace_action(workspace_manager, window);
+    update_window_title_with_workspace(ws_count, &ws_name, workspace_manager, window);
+}
+
+/// Update the enabled state of the delete-workspace action.
+fn update_delete_workspace_action(
+    workspace_manager: &WorkspaceManager,
+    window: &adw::ApplicationWindow,
+) {
+    let Ok(mgr) = workspace_manager.try_borrow() else {
+        return;
+    };
+    let has_multiple = mgr.workspaces.len() > 1;
+    drop(mgr);
+
+    if let Some(action) = window
+        .lookup_action("delete-workspace")
+        .and_then(|a| a.downcast::<gio::SimpleAction>().ok())
+    {
+        action.set_enabled(has_multiple);
+    }
+}
+
+/// Update the window title to reflect the current workspace.
+///
+/// AC-09: When only one workspace exists, no workspace name in title.
+/// When multiple exist: "workspacename -- user@host:~/path -- Forgetty"
+fn update_window_title_for_workspace(
+    workspace_manager: &WorkspaceManager,
+    window: &adw::ApplicationWindow,
+) {
+    let Ok(mgr) = workspace_manager.try_borrow() else {
+        return;
+    };
+    let ws_count = mgr.workspaces.len();
+    let ws_name = mgr.workspaces[mgr.active_index].name.clone();
+    drop(mgr);
+
+    update_window_title_with_workspace(ws_count, &ws_name, workspace_manager, window);
+}
+
+/// Compute and set the window title incorporating workspace info.
+fn update_window_title_with_workspace(
+    ws_count: usize,
+    ws_name: &str,
+    workspace_manager: &WorkspaceManager,
+    window: &adw::ApplicationWindow,
+) {
+    // Try to get the focused pane's terminal state for user@host:cwd.
+    let pane_title = {
+        let Ok(mgr) = workspace_manager.try_borrow() else {
+            return;
+        };
+        let ws = &mgr.workspaces[mgr.active_index];
+        let focused_name =
+            ws.focus_tracker.try_borrow().ok().map(|n| n.clone()).unwrap_or_default();
+        if !focused_name.is_empty() {
+            ws.tab_states
+                .try_borrow()
+                .ok()
+                .and_then(|states| states.get(&focused_name).cloned())
+                .and_then(|state_rc| state_rc.try_borrow().ok().map(|s| compute_window_title(&s)))
+        } else {
+            None
+        }
+    };
+
+    let title = if ws_count <= 1 {
+        // Single workspace: no workspace name in title (AC-09).
+        pane_title.unwrap_or_else(|| "Forgetty".to_string())
+    } else if let Some(ref pane) = pane_title {
+        format!("{ws_name} \u{2014} {pane}")
+    } else {
+        format!("{ws_name} \u{2014} Forgetty")
+    };
+
+    window.set_title(Some(&title));
+}
+
+/// Reload configuration and apply to all panes in all workspaces.
+fn reload_config_all_workspaces(
+    shared_config: &SharedConfig,
+    workspace_manager: &WorkspaceManager,
+    window: &adw::ApplicationWindow,
+) {
+    let new_config = match load_config(None) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            tracing::warn!("Config reload failed: {e}");
+            return;
+        }
+    };
+
+    info!("Config reloaded via menu action");
+
+    if let Ok(mut cfg) = shared_config.try_borrow_mut() {
+        *cfg = new_config.clone();
+    }
+
+    let Ok(mgr) = workspace_manager.try_borrow() else {
+        return;
+    };
+
+    for ws in &mgr.workspaces {
+        let Ok(states) = ws.tab_states.try_borrow() else {
+            continue;
+        };
+        let state_entries: Vec<_> =
+            states.iter().map(|(name, rc)| (name.clone(), Rc::clone(rc))).collect();
+        drop(states);
+
+        for (pane_name, state_rc) in &state_entries {
+            let Ok(mut s) = state_rc.try_borrow_mut() else {
+                continue;
+            };
+            let Some(da) = find_drawing_area_by_name(window, pane_name) else {
+                continue;
+            };
+            terminal::apply_config_change(&mut s, &new_config, &da);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Workspace selector overlay
+// ---------------------------------------------------------------------------
+
+/// Build the workspace selector overlay widget.
+///
+/// Shows a card with a ListBox of workspace names. Active workspace is
+/// highlighted. Click or Enter switches, Escape closes.
+/// Returns (outer_container, list_box) so callers can pass the ListBox directly.
+fn build_workspace_selector(
+    workspace_manager: &WorkspaceManager,
+    main_area: &gtk4::Box,
+    tab_bar: &adw::TabBar,
+    window: &adw::ApplicationWindow,
+) -> (gtk4::Box, gtk4::ListBox) {
+    let outer = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    outer.set_halign(gtk4::Align::Center);
+    outer.set_valign(gtk4::Align::Start);
+    outer.set_margin_top(60);
+    outer.set_hexpand(true);
+    outer.set_vexpand(true);
+    outer.set_width_request(300);
+    outer.set_visible(false);
+    outer.set_can_focus(false);
+    outer.add_css_class("card");
+
+    let title_label = gtk4::Label::new(Some("Workspaces"));
+    title_label.add_css_class("title-4");
+    title_label.set_margin_top(12);
+    title_label.set_margin_bottom(8);
+    outer.append(&title_label);
+
+    let separator = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+    outer.append(&separator);
+
+    let list_box = gtk4::ListBox::new();
+    list_box.set_selection_mode(gtk4::SelectionMode::Single);
+    list_box.add_css_class("navigation-sidebar");
+    list_box.set_focusable(true);
+    list_box.set_can_focus(true);
+
+    let scrolled = gtk4::ScrolledWindow::new();
+    scrolled.set_child(Some(&list_box));
+    scrolled.set_vexpand(true);
+    scrolled.set_propagate_natural_height(true);
+    scrolled.set_max_content_height(400);
+    scrolled.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
+    outer.append(&scrolled);
+
+    // Row activation (click or Enter)
+    {
+        let outer_ref = outer.clone();
+        let wm = Rc::clone(workspace_manager);
+        let ma = main_area.clone();
+        let tb = tab_bar.clone();
+        let win = window.clone();
+        list_box.connect_row_activated(move |_lb, row| {
+            let target = row.index() as usize;
+            outer_ref.set_visible(false);
+            switch_workspace(&wm, target, &ma, &tb, &win);
+        });
+    }
+
+    // Keyboard handling on the list box
+    {
+        let outer_ref = outer.clone();
+        let wm = Rc::clone(workspace_manager);
+        let ma = main_area.clone();
+        let tb = tab_bar.clone();
+        let win = window.clone();
+        let lb = list_box.clone();
+        let key_controller = gtk4::EventControllerKey::new();
+        key_controller.connect_key_pressed(move |_ctrl, key, _code, _mods| {
+            match key {
+                gtk4::gdk::Key::Escape => {
+                    outer_ref.set_visible(false);
+                    // Restore focus to the active workspace's pane.
+                    if let Ok(mgr) = wm.try_borrow() {
+                        let ws = &mgr.workspaces[mgr.active_index];
+                        if let Some(page) = ws.tab_view.selected_page() {
+                            let container = page.child();
+                            let leaves = collect_leaf_drawing_areas(&container);
+                            if let Some(da) = leaves.first() {
+                                da.grab_focus();
+                            }
+                        }
+                    }
+                    glib::Propagation::Stop
+                }
+                gtk4::gdk::Key::Return | gtk4::gdk::Key::KP_Enter => {
+                    if let Some(row) = lb.selected_row() {
+                        let target = row.index() as usize;
+                        outer_ref.set_visible(false);
+                        switch_workspace(&wm, target, &ma, &tb, &win);
+                    }
+                    glib::Propagation::Stop
+                }
+                _ => glib::Propagation::Proceed,
+            }
+        });
+        list_box.add_controller(key_controller);
+    }
+
+    (outer, list_box)
+}
+
+/// Populate the workspace selector with current workspace names and show/hide it.
+fn toggle_workspace_selector(
+    selector: &gtk4::Box,
+    lb: &gtk4::ListBox,
+    workspace_manager: &WorkspaceManager,
+) {
+    if selector.is_visible() {
+        selector.set_visible(false);
+        // Restore focus to the active workspace.
+        if let Ok(mgr) = workspace_manager.try_borrow() {
+            let ws = &mgr.workspaces[mgr.active_index];
+            if let Some(page) = ws.tab_view.selected_page() {
+                let container = page.child();
+                let leaves = collect_leaf_drawing_areas(&container);
+                if let Some(da) = leaves.first() {
+                    da.grab_focus();
+                }
+            }
+        }
+        return;
+    }
+
+    // Rebuild the list contents from the current workspace manager state.
+    let Ok(mgr) = workspace_manager.try_borrow() else {
+        return;
+    };
+
+    // Remove all existing rows.
+    while let Some(row) = lb.row_at_index(0) {
+        lb.remove(&row);
+    }
+
+    // Add a row for each workspace.
+    for (i, ws) in mgr.workspaces.iter().enumerate() {
+        let hbox = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        hbox.set_margin_start(12);
+        hbox.set_margin_end(12);
+        hbox.set_margin_top(6);
+        hbox.set_margin_bottom(6);
+
+        let label = gtk4::Label::new(Some(&ws.name));
+        label.set_halign(gtk4::Align::Start);
+        label.set_hexpand(true);
+        if i == mgr.active_index {
+            label.add_css_class("heading");
+        }
+        hbox.append(&label);
+
+        // Show position number
+        let pos_label = gtk4::Label::new(Some(&format!("{}", i + 1)));
+        pos_label.add_css_class("dim-label");
+        pos_label.set_halign(gtk4::Align::End);
+        hbox.append(&pos_label);
+
+        let row = gtk4::ListBoxRow::new();
+        row.set_child(Some(&hbox));
+        lb.append(&row);
+    }
+
+    // Select the active workspace row.
+    if let Some(row) = lb.row_at_index(mgr.active_index as i32) {
+        lb.select_row(Some(&row));
+    }
+
+    drop(mgr);
+
+    selector.set_visible(true);
+
+    // Defer focus grab to next idle tick so GTK finishes overlay layout first.
+    let lb_focus = lb.clone();
+    glib::idle_add_local_once(move || {
+        lb_focus.grab_focus();
+    });
 }
