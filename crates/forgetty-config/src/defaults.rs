@@ -3,7 +3,7 @@
 //! Provides a sensible default configuration for users who have not yet
 //! created a configuration file.
 
-use crate::schema::{BellMode, Config, CursorStyle};
+use crate::schema::{BellMode, Config, CursorStyle, NotificationMode};
 use std::collections::HashMap;
 
 /// Returns the default Forgetty configuration.
@@ -24,6 +24,7 @@ pub fn default_config() -> Config {
         scrollback_lines: 10_000,
         cursor_style: CursorStyle::Block,
         bell_mode: BellMode::Visual,
+        notification_mode: NotificationMode::All,
         keybindings: HashMap::new(),
     }
 }

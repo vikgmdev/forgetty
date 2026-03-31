@@ -10,7 +10,7 @@ pub mod schema;
 pub mod theme;
 
 pub use loader::{load_config, save_config};
-pub use schema::{BellMode, Config, CursorStyle};
+pub use schema::{BellMode, Config, CursorStyle, NotificationMode};
 pub use theme::{
     load_theme_by_name, load_theme_catalog, parse_theme_file, PreviewColors, Theme,
     ThemeCatalogEntry, ThemeSource,

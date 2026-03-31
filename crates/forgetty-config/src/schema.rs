@@ -41,6 +41,19 @@ pub enum CursorStyle {
     BlockHollow,
 }
 
+/// The notification mode -- controls which notification outputs fire on OSC/BEL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum NotificationMode {
+    /// Ring + tab badge + desktop notification for OSC; ring + badge for BEL.
+    #[default]
+    All,
+    /// Ring and tab badge only; desktop notifications are suppressed.
+    RingOnly,
+    /// All notifications (ring, badge, desktop) are suppressed.
+    None,
+}
+
 /// The top-level Forgetty configuration.
 ///
 /// Supports two theme formats for backward compatibility:
@@ -78,6 +91,9 @@ pub struct Config {
     /// The bell mode (visual, audio, both, or none).
     pub bell_mode: BellMode,
 
+    /// The notification mode (all, ringonly, none).
+    pub notification_mode: NotificationMode,
+
     /// Custom keybindings mapping action names to key combinations.
     pub keybindings: HashMap<String, String>,
 }
@@ -101,9 +117,9 @@ impl Serialize for Config {
         use serde::ser::SerializeMap;
 
         // Count fields: font_family, font_size, theme/theme_name, shell?,
-        // scrollback_lines, cursor_style, bell_mode, keybindings?
-        let mut len = 5; // font_family, font_size, theme, scrollback_lines, cursor_style, bell_mode
-        len += 1; // bell_mode
+        // scrollback_lines, cursor_style, bell_mode, notification_mode, keybindings?
+        let mut len = 5; // font_family, font_size, theme, scrollback_lines, cursor_style
+        len += 2; // bell_mode, notification_mode
         if self.shell.is_some() {
             len += 1;
         }
@@ -130,6 +146,7 @@ impl Serialize for Config {
         map.serialize_entry("scrollback_lines", &self.scrollback_lines)?;
         map.serialize_entry("cursor_style", &self.cursor_style)?;
         map.serialize_entry("bell_mode", &self.bell_mode)?;
+        map.serialize_entry("notification_mode", &self.notification_mode)?;
 
         if !self.keybindings.is_empty() {
             map.serialize_entry("keybindings", &self.keybindings)?;
@@ -174,6 +191,9 @@ impl<'de> Deserialize<'de> for Config {
             bell_mode: BellMode,
 
             #[serde(default)]
+            notification_mode: NotificationMode,
+
+            #[serde(default)]
             keybindings: HashMap<String, String>,
         }
 
@@ -208,6 +228,7 @@ impl<'de> Deserialize<'de> for Config {
             scrollback_lines: raw.scrollback_lines,
             cursor_style: raw.cursor_style,
             bell_mode: raw.bell_mode,
+            notification_mode: raw.notification_mode,
             keybindings: raw.keybindings,
         })
     }
