@@ -1423,6 +1423,35 @@ fn is_app_shortcut(keyval: gdk::Key, modifier: gdk::ModifierType) -> bool {
         return true;
     }
 
+    let ctrl_alt = gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::ALT_MASK;
+
+    // Workspace switching: Ctrl+Alt+1 through Ctrl+Alt+9
+    if mods == ctrl_alt
+        && (keyval == gdk::Key::_1
+            || keyval == gdk::Key::_2
+            || keyval == gdk::Key::_3
+            || keyval == gdk::Key::_4
+            || keyval == gdk::Key::_5
+            || keyval == gdk::Key::_6
+            || keyval == gdk::Key::_7
+            || keyval == gdk::Key::_8
+            || keyval == gdk::Key::_9)
+    {
+        return true;
+    }
+    // New workspace: Ctrl+Alt+N
+    if mods == ctrl_alt && (keyval == gdk::Key::n || keyval == gdk::Key::N) {
+        return true;
+    }
+    // Workspace selector: Ctrl+Alt+W
+    if mods == ctrl_alt && (keyval == gdk::Key::w || keyval == gdk::Key::W) {
+        return true;
+    }
+    // Previous/Next workspace: Ctrl+Alt+PageUp/PageDown
+    if mods == ctrl_alt && (keyval == gdk::Key::Page_Up || keyval == gdk::Key::Page_Down) {
+        return true;
+    }
+
     false
 }
 
