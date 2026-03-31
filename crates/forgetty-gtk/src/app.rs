@@ -26,6 +26,8 @@ use libadwaita as adw;
 use libadwaita::prelude::*;
 use tracing::info;
 
+use forgetty_workspace::{self, PaneTreeState, TabState, Workspace, WorkspaceState};
+
 use crate::clipboard;
 use crate::preferences;
 use crate::terminal::{self, TerminalState};
@@ -48,6 +50,9 @@ const DEFAULT_HEIGHT: i32 = 640;
 /// Interval for polling CWD / OSC title changes (milliseconds).
 /// Kept low (100ms) so `cd` updates feel instant — readlink on /proc is ~1μs.
 const TITLE_POLL_MS: u64 = 100;
+
+/// Interval for auto-saving the session file (seconds).
+const AUTO_SAVE_SECS: u64 = 30;
 
 // POSIX signal numbers — stable constants, avoids adding a `libc` dependency.
 /// Hangup (terminal closed, session leader death).
@@ -92,6 +97,9 @@ pub struct LaunchOptions {
 
     /// WM_CLASS override for the GTK application ID.
     pub class: Option<String>,
+
+    /// Skip session restore and open a fresh single-tab window.
+    pub no_restore: bool,
 }
 
 /// Run the GTK4/libadwaita application.
@@ -832,11 +840,15 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
     }
 
     // --- Quit action (Ctrl+Shift+Q) ---
+    // CRITICAL: save session BEFORE killing PTYs (CWD read needs /proc/{pid}/cwd).
     {
         let app_quit = app.clone();
         let tab_states_quit = Rc::clone(&tab_states);
+        let tv_quit_save = tab_view.clone();
+        let win_quit_save = window.clone();
         let action = gio::SimpleAction::new("quit", None);
         action.connect_activate(move |_action, _param| {
+            save_current_session(&tv_quit_save, &tab_states_quit, &win_quit_save);
             kill_all_ptys(&tab_states_quit, "Quit action");
             app_quit.quit();
         });
@@ -866,26 +878,63 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
         window.add_action(&action);
     }
 
-    // --- Create the first tab ---
-    // CLI launch options (working_directory, command) apply only to the initial pane.
-    add_new_tab(
-        &tab_view,
-        config,
-        &tab_states,
-        &focus_tracker,
-        &custom_titles,
-        &window,
-        launch.working_directory.as_deref(),
-        launch.command.as_deref(),
-    );
+    // --- Create the first tab (or restore session) ---
+    // CLI overrides (working_directory, command, no_restore) skip session restore.
+    let has_cli_override =
+        launch.working_directory.is_some() || launch.command.is_some() || launch.no_restore;
+
+    let mut restored = false;
+    if !has_cli_override {
+        match forgetty_workspace::load_session() {
+            Ok(Some(state)) => {
+                if state.workspaces.first().map_or(true, |ws| ws.tabs.is_empty()) {
+                    tracing::info!("Session file has no tabs, opening default tab");
+                } else {
+                    tracing::info!("Restoring saved session");
+                    restored = restore_session(
+                        &state,
+                        &tab_view,
+                        config,
+                        &tab_states,
+                        &focus_tracker,
+                        &custom_titles,
+                        &window,
+                    );
+                }
+            }
+            Ok(None) => {
+                tracing::debug!("No session file found, opening default tab");
+            }
+            Err(e) => {
+                tracing::warn!("Failed to load session ({e}), opening default tab");
+            }
+        }
+    }
+
+    if !restored {
+        add_new_tab(
+            &tab_view,
+            config,
+            &tab_states,
+            &focus_tracker,
+            &custom_titles,
+            &window,
+            launch.working_directory.as_deref(),
+            launch.command.as_deref(),
+        );
+    }
 
     // --- Window close request handler ---
     // Fires when the user clicks the CSD X button, when window.close() is
     // called programmatically, or when the window manager requests a close.
     // Runs BEFORE the window is destroyed, so all state is still accessible.
+    // CRITICAL: save session BEFORE killing PTYs (CWD read needs /proc/{pid}/cwd).
     {
         let tab_states_close = Rc::clone(&tab_states);
+        let tv_close_save = tab_view.clone();
+        let win_close_save = window.clone();
         window.connect_close_request(move |_win| {
+            save_current_session(&tv_close_save, &tab_states_close, &win_close_save);
             kill_all_ptys(&tab_states_close, "Window close request");
             glib::Propagation::Proceed
         });
@@ -896,14 +945,18 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
     // GLib source callbacks on the main thread, avoiding async-signal-safety
     // issues. Must be registered before window.present() so signals arriving
     // immediately after startup are caught.
+    // CRITICAL: save session BEFORE killing PTYs (CWD read needs /proc/{pid}/cwd).
     {
         let signals: &[(i32, &str)] =
             &[(SIGTERM, "SIGTERM"), (SIGHUP, "SIGHUP"), (SIGINT, "SIGINT")];
         for &(signum, name) in signals {
             let tab_states_signal = Rc::clone(&tab_states);
             let app_signal = app.clone();
+            let tv_signal_save = tab_view.clone();
+            let win_signal_save = window.clone();
             glib::unix_signal_add_local(signum, move || {
                 tracing::info!("Received {name} (signal {signum}), initiating clean shutdown");
+                save_current_session(&tv_signal_save, &tab_states_signal, &win_signal_save);
                 kill_all_ptys(&tab_states_signal, name);
                 app_signal.quit();
                 glib::ControlFlow::Break
@@ -920,6 +973,22 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
         if let Some(da) = leaves.first() {
             da.grab_focus();
         }
+    }
+
+    // --- Auto-save timer (30s) ---
+    // Periodically saves the session file so crash recovery loses at most 30s.
+    // Uses a weak window reference to stop the timer after window destruction.
+    {
+        let tv_autosave = tab_view.clone();
+        let states_autosave = Rc::clone(&tab_states);
+        let window_weak_save = window.downgrade();
+        glib::timeout_add_local(Duration::from_secs(AUTO_SAVE_SECS), move || {
+            let Some(win) = window_weak_save.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            save_current_session(&tv_autosave, &states_autosave, &win);
+            glib::ControlFlow::Continue
+        });
     }
 
     // --- Config hot reload timer ---
@@ -978,6 +1047,334 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
             glib::ControlFlow::Continue
         });
     }
+}
+
+// ---------------------------------------------------------------------------
+// Session persistence
+// ---------------------------------------------------------------------------
+
+/// Return $HOME or "/" as a fallback directory.
+fn home_dir_fallback() -> PathBuf {
+    std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/"))
+}
+
+/// Read the CWD of a PTY child process via `/proc/{pid}/cwd`.
+///
+/// Returns `None` if the PID is unavailable or the symlink cannot be read.
+fn read_pane_cwd(state_rc: &Rc<RefCell<TerminalState>>) -> Option<PathBuf> {
+    let s = state_rc.try_borrow().ok()?;
+    let pid = s.pty.pid()?;
+    let link = format!("/proc/{pid}/cwd");
+    std::fs::read_link(&link).ok()
+}
+
+/// Walk a widget subtree and produce a `PaneTreeState` for session persistence.
+///
+/// Recognises the three widget types used in the tab layout:
+/// - `DrawingArea` → leaf pane
+/// - `Paned` → split with two children
+/// - `Box` → pane container wrapper (recurse into first child)
+fn snapshot_pane_tree(widget: &gtk4::Widget, tab_states: &TabStateMap) -> Option<PaneTreeState> {
+    if let Some(da) = widget.downcast_ref::<gtk4::DrawingArea>() {
+        let pane_id = da.widget_name().to_string();
+        let cwd = tab_states
+            .try_borrow()
+            .ok()
+            .and_then(|states| states.get(&pane_id).cloned())
+            .and_then(|state_rc| read_pane_cwd(&state_rc))
+            .unwrap_or_else(|| home_dir_fallback());
+        return Some(PaneTreeState::Leaf { cwd });
+    }
+
+    if let Some(paned) = widget.downcast_ref::<gtk4::Paned>() {
+        let direction = match paned.orientation() {
+            gtk4::Orientation::Horizontal => "horizontal",
+            _ => "vertical",
+        };
+
+        let size = match paned.orientation() {
+            gtk4::Orientation::Horizontal => paned.width(),
+            _ => paned.height(),
+        };
+        let pos = paned.position();
+        let ratio = if size > 0 { pos as f32 / size as f32 } else { 0.5 };
+
+        let first = paned.start_child().and_then(|c| snapshot_pane_tree(&c, tab_states));
+        let second = paned.end_child().and_then(|c| snapshot_pane_tree(&c, tab_states));
+
+        if let (Some(first), Some(second)) = (first, second) {
+            return Some(PaneTreeState::Split {
+                direction: direction.to_string(),
+                ratio,
+                first: Box::new(first),
+                second: Box::new(second),
+            });
+        }
+    }
+
+    // Box container: recurse into first child (the pane-vbox or Paned).
+    if let Some(bx) = widget.downcast_ref::<gtk4::Box>() {
+        let mut child = bx.first_child();
+        while let Some(c) = child {
+            if let Some(tree) = snapshot_pane_tree(&c, tab_states) {
+                return Some(tree);
+            }
+            child = c.next_sibling();
+        }
+    }
+
+    None
+}
+
+/// Snapshot the current workspace layout for session persistence.
+///
+/// Walks the TabView pages and widget tree, reading CWDs from `/proc/{pid}/cwd`.
+/// Returns a `WorkspaceState` ready for serialization to JSON.
+fn snapshot_workspace_state(
+    tab_view: &adw::TabView,
+    tab_states: &TabStateMap,
+    window: &adw::ApplicationWindow,
+) -> WorkspaceState {
+    let n_pages = tab_view.n_pages();
+    let active_tab = tab_view
+        .selected_page()
+        .map(|p| (0..n_pages).find(|&i| tab_view.nth_page(i) == p).unwrap_or(0) as usize)
+        .unwrap_or(0);
+
+    let mut tabs = Vec::with_capacity(n_pages as usize);
+    for i in 0..n_pages {
+        let page = tab_view.nth_page(i);
+        let title = page.title().to_string();
+        let container = page.child();
+
+        let pane_tree = snapshot_pane_tree(&container, tab_states)
+            .unwrap_or_else(|| PaneTreeState::Leaf { cwd: home_dir_fallback() });
+
+        tabs.push(TabState { title, pane_tree });
+    }
+
+    let workspace = Workspace {
+        id: uuid::Uuid::new_v4(),
+        name: String::from("default"),
+        root_paths: Vec::new(),
+        tabs,
+        active_tab,
+    };
+
+    WorkspaceState {
+        version: 1,
+        workspaces: vec![workspace],
+        active_workspace: 0,
+        window_width: Some(window.width()),
+        window_height: Some(window.height()),
+    }
+}
+
+/// Save the current session to disk. Logs errors but does not propagate them.
+fn save_current_session(
+    tab_view: &adw::TabView,
+    tab_states: &TabStateMap,
+    window: &adw::ApplicationWindow,
+) {
+    let state = snapshot_workspace_state(tab_view, tab_states, window);
+    if let Err(e) = forgetty_workspace::save_session(&state) {
+        tracing::warn!("Failed to save session: {e}");
+    } else {
+        tracing::debug!("Session saved successfully");
+    }
+}
+
+/// Recursively build the pane tree for a single tab from a `PaneTreeState`.
+///
+/// Returns `(root_widget, first_leaf_drawing_area)` where root_widget is either
+/// the pane vbox (leaf) or a Paned (split), and first_leaf_drawing_area is the
+/// leftmost/topmost leaf (used for focus).
+fn build_pane_tree(
+    tree: &PaneTreeState,
+    config: &Config,
+    tab_states: &TabStateMap,
+    focus_tracker: &FocusTracker,
+    custom_titles: &CustomTitles,
+    tab_view: &adw::TabView,
+    window: &adw::ApplicationWindow,
+) -> Option<(gtk4::Widget, gtk4::DrawingArea)> {
+    match tree {
+        PaneTreeState::Leaf { cwd } => {
+            // Fall back to $HOME if saved CWD no longer exists.
+            let effective_cwd = if cwd.is_dir() {
+                cwd.clone()
+            } else {
+                tracing::warn!("Saved CWD {:?} no longer exists, falling back to $HOME", cwd);
+                home_dir_fallback()
+            };
+
+            let on_exit = make_on_exit_callback(tab_view, tab_states, window);
+            match terminal::create_terminal(config, Some(on_exit), Some(&effective_cwd), None) {
+                Ok((pane_vbox, drawing_area, state)) => {
+                    let pane_id = next_pane_id();
+                    drawing_area.set_widget_name(&pane_id);
+                    tab_states.borrow_mut().insert(pane_id, Rc::clone(&state));
+                    wire_focus_tracking(
+                        &drawing_area,
+                        focus_tracker,
+                        tab_view,
+                        tab_states,
+                        custom_titles,
+                    );
+                    Some((pane_vbox.upcast::<gtk4::Widget>(), drawing_area))
+                }
+                Err(e) => {
+                    tracing::error!("Failed to create terminal for restored pane: {e}");
+                    None
+                }
+            }
+        }
+        PaneTreeState::Split { direction, ratio, first, second } => {
+            let orientation = if direction == "horizontal" {
+                gtk4::Orientation::Horizontal
+            } else {
+                gtk4::Orientation::Vertical
+            };
+
+            let first_result = build_pane_tree(
+                first,
+                config,
+                tab_states,
+                focus_tracker,
+                custom_titles,
+                tab_view,
+                window,
+            );
+            let second_result = build_pane_tree(
+                second,
+                config,
+                tab_states,
+                focus_tracker,
+                custom_titles,
+                tab_view,
+                window,
+            );
+
+            let (Some((first_widget, first_da)), Some((second_widget, _second_da))) =
+                (first_result, second_result)
+            else {
+                return None;
+            };
+
+            let paned = gtk4::Paned::new(orientation);
+            paned.set_wide_handle(true);
+            paned.set_resize_start_child(true);
+            paned.set_resize_end_child(true);
+            paned.set_shrink_start_child(false);
+            paned.set_shrink_end_child(false);
+            paned.set_hexpand(true);
+            paned.set_vexpand(true);
+
+            paned.set_start_child(Some(&first_widget));
+            paned.set_end_child(Some(&second_widget));
+
+            // Defer set_position after realization so the widget has a size.
+            let saved_ratio = *ratio;
+            let paned_weak = paned.downgrade();
+            glib::idle_add_local_once(move || {
+                let Some(paned) = paned_weak.upgrade() else {
+                    return;
+                };
+                let size = match paned.orientation() {
+                    gtk4::Orientation::Horizontal => paned.width(),
+                    _ => paned.height(),
+                };
+                if size > 0 {
+                    paned.set_position((size as f32 * saved_ratio) as i32);
+                }
+            });
+
+            Some((paned.upcast::<gtk4::Widget>(), first_da))
+        }
+    }
+}
+
+/// Restore a saved session into the live window.
+///
+/// Creates tabs, splits, and terminals matching the saved `WorkspaceState`.
+/// Returns `true` if the session was successfully restored.
+fn restore_session(
+    state: &WorkspaceState,
+    tab_view: &adw::TabView,
+    config: &Config,
+    tab_states: &TabStateMap,
+    focus_tracker: &FocusTracker,
+    custom_titles: &CustomTitles,
+    window: &adw::ApplicationWindow,
+) -> bool {
+    // Restore window dimensions.
+    if let (Some(w), Some(h)) = (state.window_width, state.window_height) {
+        if w > 0 && h > 0 {
+            window.set_default_size(w, h);
+        }
+    }
+
+    let workspace = match state.workspaces.first() {
+        Some(ws) => ws,
+        None => return false,
+    };
+
+    if workspace.tabs.is_empty() {
+        return false;
+    }
+
+    let mut first_da: Option<gtk4::DrawingArea> = None;
+
+    for (idx, tab) in workspace.tabs.iter().enumerate() {
+        let result = build_pane_tree(
+            &tab.pane_tree,
+            config,
+            tab_states,
+            focus_tracker,
+            custom_titles,
+            tab_view,
+            window,
+        );
+
+        let Some((root_widget, leaf_da)) = result else {
+            tracing::warn!("Failed to restore tab {idx}, skipping");
+            continue;
+        };
+
+        // Wrap in pane container Box (same pattern as add_new_tab).
+        let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        container.set_hexpand(true);
+        container.set_vexpand(true);
+        container.append(&root_widget);
+
+        let page = tab_view.append(&container);
+        page.set_title(&tab.title);
+
+        // Register title polling timer for this tab.
+        register_title_timer(&page, tab_view, tab_states, focus_tracker, custom_titles, window);
+
+        if first_da.is_none() {
+            first_da = Some(leaf_da);
+        }
+    }
+
+    // Select the saved active tab.
+    let active = workspace.active_tab.min(tab_view.n_pages().saturating_sub(1) as usize);
+    if tab_view.n_pages() > 0 {
+        let page = tab_view.nth_page(active as i32);
+        tab_view.set_selected_page(&page);
+    }
+
+    // Focus the first leaf in the selected tab.
+    if let Some(page) = tab_view.selected_page() {
+        let container = page.child();
+        let leaves = collect_leaf_drawing_areas(&container);
+        if let Some(da) = leaves.first() {
+            da.grab_focus();
+        }
+    }
+
+    tab_view.n_pages() > 0
 }
 
 // ---------------------------------------------------------------------------

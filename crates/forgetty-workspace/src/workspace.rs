@@ -18,6 +18,12 @@ pub struct WorkspaceState {
     pub workspaces: Vec<Workspace>,
     /// Index of the currently active workspace.
     pub active_workspace: usize,
+    /// Saved window width (pixels). `None` means use default.
+    #[serde(default)]
+    pub window_width: Option<i32>,
+    /// Saved window height (pixels). `None` means use default.
+    #[serde(default)]
+    pub window_height: Option<i32>,
 }
 
 /// A single workspace — a named group of tabs rooted in one or more directories.
@@ -68,7 +74,13 @@ pub enum PaneTreeState {
 impl WorkspaceState {
     /// Create a new, empty workspace state.
     pub fn new() -> Self {
-        Self { version: 1, workspaces: Vec::new(), active_workspace: 0 }
+        Self {
+            version: 1,
+            workspaces: Vec::new(),
+            active_workspace: 0,
+            window_width: None,
+            window_height: None,
+        }
     }
 }
 

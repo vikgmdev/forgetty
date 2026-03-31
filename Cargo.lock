@@ -1081,12 +1081,14 @@ dependencies = [
  "forgetty-pty",
  "forgetty-vt",
  "forgetty-watcher",
+ "forgetty-workspace",
  "gtk4",
  "libadwaita",
  "libc",
  "pangocairo",
  "toml 0.8.2",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1178,6 +1180,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "toml 0.8.2",
+ "tracing",
  "uuid",
 ]
 

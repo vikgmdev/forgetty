@@ -53,6 +53,7 @@ fn main() {
         working_directory,
         command: if args.execute.is_empty() { None } else { Some(args.execute) },
         class: args.class,
+        no_restore: args.no_restore,
     };
 
     if let Err(e) = forgetty_gtk::app::run(config, launch_opts) {

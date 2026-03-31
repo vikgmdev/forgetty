@@ -20,7 +20,9 @@ pub fn session_path() -> PathBuf {
 
 /// Persist the workspace state as JSON to the default session file.
 ///
-/// Creates parent directories if they do not already exist.
+/// Uses atomic write (write to `.tmp`, then `rename()`) to avoid corrupt
+/// files if the process is killed mid-write. Creates parent directories
+/// if they do not already exist.
 pub fn save_session(state: &WorkspaceState) -> Result<()> {
     let path = session_path();
     if let Some(parent) = path.parent() {
@@ -28,7 +30,14 @@ pub fn save_session(state: &WorkspaceState) -> Result<()> {
     }
     let json = serde_json::to_string_pretty(state)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    fs::write(&path, json)?;
+
+    // Atomic write: write to temp file, then rename.
+    let tmp_path = path.with_extension("json.tmp");
+    fs::write(&tmp_path, &json)?;
+    if let Err(e) = fs::rename(&tmp_path, &path) {
+        tracing::warn!("Atomic rename failed ({e}), falling back to direct write");
+        fs::write(&path, &json)?;
+    }
     Ok(())
 }
 
@@ -44,8 +53,9 @@ pub fn load_session() -> Result<Option<WorkspaceState>> {
     let contents = fs::read_to_string(&path)?;
     match serde_json::from_str::<WorkspaceState>(&contents) {
         Ok(state) => Ok(Some(state)),
-        Err(_e) => {
+        Err(e) => {
             // Corrupt or incompatible session file — treat as missing.
+            tracing::warn!("Session file is corrupt or incompatible ({e}), ignoring");
             Ok(None)
         }
     }
@@ -80,6 +90,8 @@ mod tests {
                 active_tab: 0,
             }],
             active_workspace: 0,
+            window_width: Some(960),
+            window_height: Some(640),
         }
     }
 
@@ -120,5 +132,35 @@ mod tests {
         let bad_json = "not json at all";
         let result = serde_json::from_str::<WorkspaceState>(bad_json);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn backward_compat_no_window_dimensions() {
+        // Old session files without window_width/window_height should still
+        // deserialize successfully (serde(default) fills None).
+        let state = sample_state();
+        let mut json_value: serde_json::Value = serde_json::to_value(&state).unwrap();
+
+        // Remove the window dimension fields to simulate an old session file.
+        if let Some(obj) = json_value.as_object_mut() {
+            obj.remove("window_width");
+            obj.remove("window_height");
+        }
+
+        let old_json = serde_json::to_string_pretty(&json_value).unwrap();
+        let restored: WorkspaceState = serde_json::from_str(&old_json).unwrap();
+        assert_eq!(restored.version, 1);
+        assert!(restored.window_width.is_none());
+        assert!(restored.window_height.is_none());
+        assert_eq!(restored.workspaces[0].name, "my-project");
+    }
+
+    #[test]
+    fn window_dimensions_round_trip() {
+        let state = sample_state();
+        let json = serde_json::to_string_pretty(&state).unwrap();
+        let restored: WorkspaceState = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.window_width, Some(960));
+        assert_eq!(restored.window_height, Some(640));
     }
 }

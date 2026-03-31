@@ -10,11 +10,13 @@ forgetty-config = { path = "../forgetty-config" }
 forgetty-vt = { path = "../forgetty-vt" }
 forgetty-pty = { path = "../forgetty-pty" }
 forgetty-watcher = { path = "../forgetty-watcher" }
+forgetty-workspace = { path = "../forgetty-workspace" }
 gtk4 = { workspace = true }
 libadwaita = { workspace = true }
 pangocairo = "0.20"
 toml = { workspace = true }
 tracing = { workspace = true }
+uuid = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
