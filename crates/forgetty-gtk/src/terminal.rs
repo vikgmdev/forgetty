@@ -12,6 +12,9 @@ use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
+use libc;
+
 use forgetty_config::{BellMode, Config, CursorStyle, NotificationMode};
 use forgetty_core::Rgba;
 use forgetty_vt::screen::Color;
@@ -771,7 +774,19 @@ pub fn create_terminal(
                         drop(s);
                         da_for_key.activate_action("win.copy", None).ok();
                     } else {
+                        // Write 0x03 for PTY echo + cooked-mode line discipline.
                         s.pty.write(&[0x03]).ok();
+                        // Also send SIGINT directly to the PTY's actual foreground
+                        // process group. This is necessary when the child puts the PTY
+                        // into raw mode (ISIG disabled, e.g. Node.js / pm2), which
+                        // prevents the line discipline from converting 0x03 to SIGINT.
+                        // We get the slave fd via /proc/<shell_pid>/fd/0 (stdin of the
+                        // shell = the slave PTY) and call tcgetpgrp to find whoever is
+                        // currently in the foreground — which may be a grandchild
+                        // process (pm2, sleep, etc.) with its own process group.
+                        if let Some(shell_pid) = s.pty.pid() {
+                            send_sigint_to_fg_pgrp(shell_pid);
+                        }
                         s.cursor_blink_visible = true;
                         s.last_blink_toggle = Instant::now();
                         // Suppress the shell's BEL response (zsh beeps on SIGINT).
@@ -1619,6 +1634,29 @@ fn color_to_rgb(color: &Color, default: &Rgba) -> (f64, f64, f64) {
 /// Check if a key combination is an app-level shortcut that should NOT be
 /// consumed by the terminal's key encoder. These shortcuts must propagate
 /// to GTK accelerators (defined in app.rs) instead.
+/// Send SIGINT to the PTY's actual foreground process group.
+///
+/// Writing 0x03 to the PTY master is not enough when the child has put the
+/// slave into raw mode (ISIG disabled). We open the child's stdin via
+/// `/proc/<pid>/fd/0` — which is a symlink to the slave PTY device — and call
+/// `tcgetpgrp` to get the current foreground process group, then `kill(-pgid,
+/// SIGINT)`. This correctly handles grandchild processes (Node.js, pm2, etc.)
+/// that are in their own process group.
+#[cfg(target_os = "linux")]
+fn send_sigint_to_fg_pgrp(shell_pid: u32) {
+    use std::os::unix::io::AsRawFd;
+    let slave_proc_path = format!("/proc/{shell_pid}/fd/0");
+    if let Ok(f) = std::fs::File::open(&slave_proc_path) {
+        let pgid = unsafe { libc::tcgetpgrp(f.as_raw_fd()) };
+        if pgid > 0 && pgid as u32 != std::process::id() {
+            unsafe { libc::kill(-(pgid as libc::c_int), libc::SIGINT) };
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn send_sigint_to_fg_pgrp(_shell_pid: u32) {}
+
 fn is_app_shortcut(keyval: gdk::Key, modifier: gdk::ModifierType) -> bool {
     // Mask to only the modifier bits we care about (ignore NumLock, etc.)
     let mods = modifier
