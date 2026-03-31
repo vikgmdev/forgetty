@@ -23,4 +23,8 @@ pub struct Args {
     /// Flags like --working-directory must come BEFORE -e.
     #[arg(short = 'e', long = "execute", trailing_var_arg = true, allow_hyphen_values = true, num_args = 1..)]
     pub execute: Vec<String>,
+
+    /// Skip session restore and open a fresh single-tab window
+    #[arg(long)]
+    pub no_restore: bool,
 }
