@@ -747,20 +747,24 @@ pub fn create_terminal(
                     return glib::Propagation::Proceed;
                 };
 
-                // Ctrl+C with a selection → activate win.copy directly (bypasses GTK accelerators
-                // so Ctrl+C without selection still reaches the encoder as SIGINT).
-                // Without a selection, fall through to ghostty encoder (sends 0x03 / SIGINT).
+                // Ctrl+C: copy if selection exists, otherwise send SIGINT (0x03) directly.
+                // We bypass the ghostty encoder for both cases — the encoder may return None
+                // for Ctrl+C in some keyboard protocol modes, causing Propagation::Proceed
+                // which triggers the GTK system bell and the T-014 visual flash.
                 let ctrl_only = modifier
                     & (gdk::ModifierType::CONTROL_MASK
                         | gdk::ModifierType::SHIFT_MASK
                         | gdk::ModifierType::ALT_MASK)
                     == gdk::ModifierType::CONTROL_MASK;
-                if ctrl_only
-                    && (keyval == gdk::Key::c || keyval == gdk::Key::C)
-                    && s.selection.is_some()
-                {
-                    drop(s);
-                    da_for_key.activate_action("win.copy", None).ok();
+                if ctrl_only && (keyval == gdk::Key::c || keyval == gdk::Key::C) {
+                    if s.selection.is_some() {
+                        drop(s);
+                        da_for_key.activate_action("win.copy", None).ok();
+                    } else {
+                        s.pty.write(&[0x03]).ok();
+                        s.cursor_blink_visible = true;
+                        s.last_blink_toggle = Instant::now();
+                    }
                     return glib::Propagation::Stop;
                 }
 
