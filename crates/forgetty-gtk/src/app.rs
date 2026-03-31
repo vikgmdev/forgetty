@@ -1822,8 +1822,9 @@ fn make_on_notify_callback(
                 match result {
                     Ok(handle) => {
                         // Block until user clicks / dismisses.
+                        // "__closed" fires on dismiss/timeout — do NOT focus on dismiss.
                         handle.wait_for_action(|action| {
-                            if action == "focus" || action == "__closed" {
+                            if action == "focus" {
                                 let _ = focus_tx.send(pane_name_thread.clone());
                             }
                         });
