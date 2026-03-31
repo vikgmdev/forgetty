@@ -1644,11 +1644,20 @@ fn color_to_rgb(color: &Color, default: &Rgba) -> (f64, f64, f64) {
 /// that are in their own process group.
 #[cfg(target_os = "linux")]
 fn send_sigint_to_fg_pgrp(shell_pid: u32) {
+    use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::AsRawFd;
     let slave_proc_path = format!("/proc/{shell_pid}/fd/0");
-    if let Ok(f) = std::fs::File::open(&slave_proc_path) {
+    // O_NOCTTY is critical: without it, opening a TTY device can steal the
+    // controlling terminal of the forgetty process itself, causing tcgetpgrp
+    // to fail or return unexpected results.
+    if let Ok(f) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open(&slave_proc_path)
+    {
         let pgid = unsafe { libc::tcgetpgrp(f.as_raw_fd()) };
-        if pgid > 0 && pgid as u32 != std::process::id() {
+        let my_pid = std::process::id() as libc::pid_t;
+        if pgid > 0 && pgid != my_pid {
             unsafe { libc::kill(-(pgid as libc::c_int), libc::SIGINT) };
         }
     }
