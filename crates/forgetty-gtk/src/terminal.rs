@@ -154,6 +154,9 @@ pub struct TerminalState {
     pub bell_flash_until: Option<Instant>,
     /// Timestamp of the last bell response, for rate limiting (200ms cooldown).
     pub last_bell: Instant,
+    /// Suppress BEL flash until this instant. Set when Ctrl+C is written so the
+    /// shell's readline BEL response (zsh beeps on SIGINT) doesn't cause a flash.
+    pub suppress_bell_until: Option<Instant>,
     /// Timestamp of the last PTY data received. Used to detect idle periods
     /// for calling `malloc_trim(0)` to return freed memory to the OS (T-028).
     pub last_pty_data: Instant,
@@ -467,6 +470,7 @@ pub fn create_terminal(
         was_alternate_screen: false,
         bell_flash_until: None,
         last_bell: Instant::now() - Duration::from_secs(1),
+        suppress_bell_until: None,
         last_pty_data: Instant::now(),
         malloc_trimmed: false,
         notification_ring: false,
@@ -542,6 +546,12 @@ pub fn create_terminal(
                     let now = Instant::now();
                     // Rate limit: suppress bells within 200ms of the last one.
                     if now.duration_since(s.last_bell) < Duration::from_millis(200) {
+                        continue;
+                    }
+                    // Suppress the shell's BEL response that follows a Ctrl+C press
+                    // (zsh beeps on SIGINT, which would show an unwanted visual flash).
+                    if s.suppress_bell_until.map_or(false, |t| now < t) {
+                        s.suppress_bell_until = None;
                         continue;
                     }
                     s.last_bell = now;
@@ -764,6 +774,9 @@ pub fn create_terminal(
                         s.pty.write(&[0x03]).ok();
                         s.cursor_blink_visible = true;
                         s.last_blink_toggle = Instant::now();
+                        // Suppress the shell's BEL response (zsh beeps on SIGINT).
+                        s.suppress_bell_until =
+                            Some(Instant::now() + Duration::from_millis(300));
                     }
                     return glib::Propagation::Stop;
                 }
