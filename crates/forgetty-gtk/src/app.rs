@@ -588,7 +588,7 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
         window.add_action(&action);
     }
 
-    app.set_accels_for_action("win.copy", &["<Control>c", "<Control><Shift>c"]);
+    app.set_accels_for_action("win.copy", &["<Control><Shift>c"]);
 
     // --- Search in terminal action (Ctrl+Shift+F) ---
     {
