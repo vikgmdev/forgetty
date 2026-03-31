@@ -188,6 +188,16 @@ impl PtyProcess {
         self.child.process_id()
     }
 
+    /// Get the foreground process group of the PTY session.
+    ///
+    /// Calls `tcgetpgrp` on the master PTY fd, which returns the process group
+    /// ID of whatever process is currently in the foreground on this terminal.
+    /// Returns `None` if the master does not expose a raw fd or `tcgetpgrp`
+    /// fails (e.g., no foreground process group set yet).
+    pub fn foreground_pgrp(&self) -> Option<i32> {
+        self.master.process_group_leader()
+    }
+
     /// Kill the child process.
     pub fn kill(&mut self) -> Result<()> {
         self.child.kill().map_err(|e| ForgettyError::Pty(format!("failed to kill child: {e}")))

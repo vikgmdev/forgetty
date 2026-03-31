@@ -777,16 +777,11 @@ pub fn create_terminal(
                         // Write 0x03 for PTY echo + cooked-mode line discipline.
                         s.pty.write(&[0x03]).ok();
                         // Also send SIGINT directly to the PTY's actual foreground
-                        // process group. This is necessary when the child puts the PTY
-                        // into raw mode (ISIG disabled, e.g. Node.js / pm2), which
-                        // prevents the line discipline from converting 0x03 to SIGINT.
-                        // We get the slave fd via /proc/<shell_pid>/fd/0 (stdin of the
-                        // shell = the slave PTY) and call tcgetpgrp to find whoever is
-                        // currently in the foreground — which may be a grandchild
-                        // process (pm2, sleep, etc.) with its own process group.
-                        if let Some(shell_pid) = s.pty.pid() {
-                            send_sigint_to_fg_pgrp(shell_pid);
-                        }
+                        // process group via tcgetpgrp on the master PTY fd. This is
+                        // necessary when a child has disabled ISIG (e.g. Node.js /
+                        // pm2), preventing the line discipline from converting 0x03
+                        // to SIGINT automatically.
+                        send_sigint_to_fg_pgrp(&s.pty);
                         s.cursor_blink_visible = true;
                         s.last_blink_toggle = Instant::now();
                         // Suppress the shell's BEL response (zsh beeps on SIGINT).
@@ -1637,34 +1632,23 @@ fn color_to_rgb(color: &Color, default: &Rgba) -> (f64, f64, f64) {
 /// Send SIGINT to the PTY's actual foreground process group.
 ///
 /// Writing 0x03 to the PTY master is not enough when the child has put the
-/// slave into raw mode (ISIG disabled). We open the child's stdin via
-/// `/proc/<pid>/fd/0` — which is a symlink to the slave PTY device — and call
-/// `tcgetpgrp` to get the current foreground process group, then `kill(-pgid,
-/// SIGINT)`. This correctly handles grandchild processes (Node.js, pm2, etc.)
-/// that are in their own process group.
-#[cfg(target_os = "linux")]
-fn send_sigint_to_fg_pgrp(shell_pid: u32) {
-    use std::os::unix::fs::OpenOptionsExt;
-    use std::os::unix::io::AsRawFd;
-    let slave_proc_path = format!("/proc/{shell_pid}/fd/0");
-    // O_NOCTTY is critical: without it, opening a TTY device can steal the
-    // controlling terminal of the forgetty process itself, causing tcgetpgrp
-    // to fail or return unexpected results.
-    if let Ok(f) = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOCTTY)
-        .open(&slave_proc_path)
+/// slave into raw mode (ISIG disabled). We call `tcgetpgrp` via the master
+/// PTY fd (already held by `pty`) to get the current foreground process group,
+/// then `kill(-pgid, SIGINT)`. This correctly handles grandchild processes
+/// (Node.js, pm2, etc.) that are in their own process group.
+fn send_sigint_to_fg_pgrp(pty: &forgetty_pty::PtyProcess) {
+    #[cfg(target_os = "linux")]
     {
-        let pgid = unsafe { libc::tcgetpgrp(f.as_raw_fd()) };
-        let my_pid = std::process::id() as libc::pid_t;
-        if pgid > 0 && pgid != my_pid {
-            unsafe { libc::kill(-(pgid as libc::c_int), libc::SIGINT) };
+        if let Some(pgid) = pty.foreground_pgrp() {
+            let my_pid = std::process::id() as libc::pid_t;
+            if pgid > 0 && pgid != my_pid {
+                unsafe { libc::kill(-(pgid as libc::c_int), libc::SIGINT) };
+            }
         }
     }
+    #[cfg(not(target_os = "linux"))]
+    let _ = pty;
 }
-
-#[cfg(not(target_os = "linux"))]
-fn send_sigint_to_fg_pgrp(_shell_pid: u32) {}
 
 fn is_app_shortcut(keyval: gdk::Key, modifier: gdk::ModifierType) -> bool {
     // Mask to only the modifier bits we care about (ignore NumLock, etc.)
