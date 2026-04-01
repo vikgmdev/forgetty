@@ -295,10 +295,18 @@ async fn pair_with_daemon(ep: &Endpoint, endpoint_id: iroh::EndpointId) -> anyho
         .map_err(|e| anyhow::anyhow!("pairing connect failed: {e}"))?;
 
     // Daemon opens bi-stream and sends greeting line.
-    let (mut send, mut recv) = conn
-        .accept_bi()
-        .await
-        .map_err(|e| anyhow::anyhow!("accept_bi for pairing failed: {e}"))?;
+    // Exception: known devices get an immediate close with code 0 ("connected-ok")
+    // without a bi-stream — that means we're already paired, treat as success.
+    let (mut send, mut recv) = match conn.accept_bi().await {
+        Ok(s) => s,
+        Err(e) => {
+            if e.to_string().contains("connected-ok") {
+                eprintln!("stream-test [pair]: already paired (daemon closed with connected-ok)");
+                return Ok(());
+            }
+            return Err(anyhow::anyhow!("accept_bi for pairing failed: {e}"));
+        }
+    };
 
     let mut lines = BufReader::new(&mut recv).lines();
     let greeting = lines
