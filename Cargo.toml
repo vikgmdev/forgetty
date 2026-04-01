@@ -75,6 +75,10 @@ path = "src/daemon.rs"
 [[bin]]
 name = "forgetty-pair-test"
 path = "src/pair_test.rs"
+required-features = ["qa-tools"]
+
+[features]
+qa-tools = []
 
 [dependencies]
 forgetty-core = { path = "crates/forgetty-core" }
@@ -89,5 +93,6 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde_json = { workspace = true }
 anyhow = "1"
+dirs = { workspace = true }
 iroh = { workspace = true }
 rand = { workspace = true }

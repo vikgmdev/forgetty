@@ -457,6 +457,9 @@ fn build_device_list_page(dc: Arc<DaemonClient>, _stack: &gtk4::Stack) -> gtk4::
         list_box.set_selection_mode(gtk4::SelectionMode::None);
 
         for device in devices {
+            // Create the row first so it can be captured by the revoke closure.
+            let row = gtk4::ListBoxRow::new();
+
             let row_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
             row_box.set_margin_top(4);
             row_box.set_margin_bottom(4);
@@ -480,24 +483,22 @@ fn build_device_list_page(dc: Arc<DaemonClient>, _stack: &gtk4::Stack) -> gtk4::
             {
                 let dc_rev = Arc::clone(&dc);
                 let device_id = device.device_id.clone();
-                let row_box_ref = row_box.clone();
+                let row_ref = row.clone();
                 revoke_btn.connect_clicked(move |_| {
                     if let Err(e) = dc_rev.revoke_device(&device_id) {
                         tracing::warn!("revoke_device failed: {e}");
                     }
-                    // Remove the row from the parent widget (hide immediately).
-                    if let Some(parent) = row_box_ref.parent() {
-                        if let Some(lb) = parent.downcast_ref::<gtk4::ListBox>() {
-                            if let Some(row) = row_box_ref.parent().and_then(|p| p.parent()) {
-                                lb.remove(&row);
-                            }
-                        }
+                    // Remove the row from its ListBox parent directly.
+                    if let Some(lb) = row_ref
+                        .parent()
+                        .and_then(|p| p.downcast::<gtk4::ListBox>().ok())
+                    {
+                        lb.remove(&row_ref);
                     }
                 });
             }
             row_box.append(&revoke_btn);
 
-            let row = gtk4::ListBoxRow::new();
             row.set_child(Some(&row_box));
             list_box.append(&row);
         }
@@ -576,7 +577,29 @@ fn show_qr_view(stack: &gtk4::Stack, dc: Arc<DaemonClient>) {
     stack.add_named(&qr_page, Some("qr"));
     stack.set_visible_child_name("qr");
 
-    // Done button: go back to devices view.
+    // Poll for newly paired devices every 2 seconds while QR is visible.
+    // The timer self-cancels when the stack switches away from the "qr" page.
+    {
+        let stack_poll = stack.clone();
+        let dc_poll = Arc::clone(&dc);
+        gtk4::glib::timeout_add_local(
+            std::time::Duration::from_secs(2),
+            move || {
+                if stack_poll.visible_child_name().as_deref() != Some("qr") {
+                    return gtk4::glib::ControlFlow::Break;
+                }
+                // Rebuild the device list page in-place so it reflects any new pairings.
+                if let Some(old) = stack_poll.child_by_name("devices") {
+                    stack_poll.remove(&old);
+                }
+                let new_list = build_device_list_page(Arc::clone(&dc_poll), &stack_poll);
+                stack_poll.add_named(&new_list, Some("devices"));
+                gtk4::glib::ControlFlow::Continue
+            },
+        );
+    }
+
+    // Done button: go back to devices view (also stops the polling timer above).
     {
         let stack_done = stack.clone();
         done_btn.connect_clicked(move |_| {

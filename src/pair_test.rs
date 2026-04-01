@@ -17,6 +17,8 @@
 //! forgetty-pair-test --dial <node_id>
 //! ```
 
+use std::path::PathBuf;
+
 use clap::Parser;
 use iroh::{Endpoint, EndpointAddr, SecretKey, endpoint::presets};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -58,8 +60,9 @@ async fn run() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("invalid node_id '{}': {e}", args.dial))?;
     let addr: EndpointAddr = EndpointAddr::from(endpoint_id);
 
-    // Create a fresh ephemeral endpoint for this test run.
-    let secret_key = SecretKey::generate(&mut rand::rng());
+    // Load or generate a persistent identity so the same device_id is used
+    // across runs, enabling "known device reconnects without re-pairing" (AC-9).
+    let secret_key = load_or_generate_pair_test_key()?;
     let ep = Endpoint::builder(presets::N0)
         .secret_key(secret_key)
         .bind()
@@ -107,4 +110,35 @@ async fn run() -> anyhow::Result<()> {
     conn.close(0u8.into(), b"done");
     ep.close().await;
     Ok(())
+}
+
+/// Load the pair-test identity from `~/.local/share/forgetty/pair-test.key`,
+/// or generate and persist a new one.
+///
+/// Using a persistent identity means reconnect tests always present the same
+/// device_id, enabling AC-9 (known device reconnects without re-pairing).
+fn load_or_generate_pair_test_key() -> anyhow::Result<SecretKey> {
+    let path: PathBuf = dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("~/.local/share"))
+        .join("forgetty")
+        .join("pair-test.key");
+
+    if path.exists() {
+        let bytes = std::fs::read(&path)?;
+        let arr: [u8; 32] = bytes.try_into().map_err(|_| {
+            anyhow::anyhow!("pair-test.key is not 32 bytes; delete it to regenerate")
+        })?;
+        Ok(SecretKey::from_bytes(&arr))
+    } else {
+        let key = SecretKey::generate(&mut rand::rng());
+        std::fs::create_dir_all(path.parent().expect("pair-test path has parent"))?;
+        std::fs::write(&path, key.to_bytes())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        eprintln!("pair-test: new identity generated, saved to {}", path.display());
+        Ok(key)
+    }
 }

@@ -97,6 +97,14 @@ impl SyncEndpoint {
         self.event_tx.subscribe()
     }
 
+    /// Close the iroh endpoint gracefully.
+    ///
+    /// Must be called before dropping the endpoint to avoid the iroh error:
+    /// `ERROR Endpoint dropped without calling Endpoint::close. Aborting ungracefully.`
+    pub async fn close(&self) {
+        self.endpoint.close().await;
+    }
+
     /// Run the accept loop.
     ///
     /// Accepts incoming iroh connections indefinitely and dispatches each to the
