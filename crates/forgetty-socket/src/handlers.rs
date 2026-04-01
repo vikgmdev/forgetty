@@ -37,6 +37,8 @@ pub fn dispatch(request: &Request, sm: Arc<SessionManager>) -> Response {
         methods::SEND_INPUT => handle_send_input(request, &sm),
         methods::GET_SCREEN => handle_get_screen(request, &sm),
         methods::GET_PANE_INFO => handle_get_pane_info(request, &sm),
+        methods::RESIZE_PANE => handle_resize_pane(request, &sm),
+        methods::SEND_SIGINT => handle_send_sigint(request, &sm),
         _ => Response::error(
             request.id.clone(),
             protocol::METHOD_NOT_FOUND,
@@ -281,6 +283,68 @@ fn handle_get_pane_info(request: &Request, sm: &SessionManager) -> Response {
             "pid": info.pid,
         }),
     )
+}
+
+fn handle_resize_pane(request: &Request, sm: &SessionManager) -> Response {
+    let id = match require_pane_id(request, sm) {
+        Ok(id) => id,
+        Err(e) => return e,
+    };
+
+    let rows = match request.params.get("rows").and_then(|v| v.as_u64()) {
+        Some(r) => r as u16,
+        None => {
+            return Response::error(
+                request.id.clone(),
+                protocol::INVALID_PARAMS,
+                "missing param: rows".to_string(),
+            )
+        }
+    };
+
+    let cols = match request.params.get("cols").and_then(|v| v.as_u64()) {
+        Some(c) => c as u16,
+        None => {
+            return Response::error(
+                request.id.clone(),
+                protocol::INVALID_PARAMS,
+                "missing param: cols".to_string(),
+            )
+        }
+    };
+
+    let size = PtySize { rows, cols, pixel_width: 0, pixel_height: 0 };
+
+    match sm.resize_pane(id, size) {
+        Ok(()) => Response::success(request.id.clone(), serde_json::json!({ "ok": true })),
+        Err(e) => Response::error(
+            request.id.clone(),
+            protocol::INTERNAL_ERROR,
+            format!("failed to resize pane: {e}"),
+        ),
+    }
+}
+
+fn handle_send_sigint(request: &Request, sm: &SessionManager) -> Response {
+    let id = match require_pane_id(request, sm) {
+        Ok(id) => id,
+        Err(e) => return e,
+    };
+
+    // Write 0x03 (ETX / Ctrl+C) to the PTY.
+    // The daemon owns the master PTY fd; it can also do the kill(-pgid, SIGINT).
+    match sm.write_pty(id, &[0x03]) {
+        Ok(()) => {
+            // Also send SIGINT to the foreground process group via the session manager.
+            sm.send_sigint(id);
+            Response::success(request.id.clone(), serde_json::json!({ "ok": true }))
+        }
+        Err(e) => Response::error(
+            request.id.clone(),
+            protocol::INTERNAL_ERROR,
+            format!("failed to send SIGINT: {e}"),
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------

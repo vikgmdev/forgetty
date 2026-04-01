@@ -1099,6 +1099,7 @@ dependencies = [
 name = "forgetty-gtk"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "forgetty-config",
  "forgetty-core",
  "forgetty-pty",
@@ -1111,6 +1112,8 @@ dependencies = [
  "libc",
  "notify-rust",
  "pangocairo",
+ "serde_json",
+ "tokio",
  "toml 0.8.2",
  "tracing",
  "uuid",
@@ -1152,6 +1155,7 @@ dependencies = [
  "forgetty-pty",
  "forgetty-vt",
  "forgetty-workspace",
+ "libc",
  "serde",
  "tokio",
  "tracing",

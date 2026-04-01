@@ -7,6 +7,7 @@
 
 pub mod app;
 pub mod clipboard;
+pub mod daemon_client;
 pub mod input;
 pub mod preferences;
 pub mod pty_bridge;

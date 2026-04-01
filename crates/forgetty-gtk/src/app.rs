@@ -13,10 +13,12 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use std::path::PathBuf;
 
+use crate::daemon_client::DaemonClient;
 use crate::terminal::NotificationPayload;
 use forgetty_config::{load_config, Config, NotificationMode};
 use forgetty_watcher::ConfigWatcher;
@@ -127,6 +129,73 @@ pub struct LaunchOptions {
     pub no_restore: bool,
 }
 
+/// Determine the default socket path for the daemon.
+fn default_socket_path() -> PathBuf {
+    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
+        PathBuf::from(runtime_dir).join("forgetty.sock")
+    } else {
+        PathBuf::from("/tmp/forgetty.sock")
+    }
+}
+
+/// Try to connect to the running daemon; if not running, spawn it and retry.
+///
+/// Returns `Some(DaemonClient)` on success, `None` if daemon is unavailable
+/// (in which case GTK falls back to self-contained PTY mode).
+fn ensure_daemon(socket_path: &std::path::Path) -> Option<Arc<DaemonClient>> {
+    // 1. Try to connect immediately (daemon may already be running).
+    if let Ok(dc) = DaemonClient::connect(socket_path) {
+        info!("ensure_daemon: connected to existing daemon at {:?}", socket_path);
+        return Some(Arc::new(dc));
+    }
+
+    // 2. Daemon not running — find the binary.
+    let daemon_binary: Option<PathBuf> = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("forgetty-daemon")))
+        .filter(|p| p.exists())
+        .or_else(|| {
+            // PATH fallback
+            std::env::var("PATH").ok().and_then(|path_var| {
+                path_var.split(':').find_map(|dir| {
+                    let p = PathBuf::from(dir).join("forgetty-daemon");
+                    if p.exists() { Some(p) } else { None }
+                })
+            })
+        });
+
+    let Some(daemon_path) = daemon_binary else {
+        tracing::warn!("ensure_daemon: forgetty-daemon binary not found; falling back to local PTY mode");
+        return None;
+    };
+
+    // 3. Spawn the daemon (non-blocking; store child to prevent Drop from killing it).
+    match std::process::Command::new(&daemon_path).spawn() {
+        Ok(child) => {
+            // Leak the child handle so Drop is never called, keeping the process alive.
+            std::mem::forget(child);
+            info!("ensure_daemon: spawned {:?}", daemon_path);
+        }
+        Err(e) => {
+            tracing::warn!("ensure_daemon: failed to spawn daemon: {e}; falling back to local PTY mode");
+            return None;
+        }
+    }
+
+    // 4. Retry with exponential-ish backoff (up to ~1s total).
+    for attempt in 0..20 {
+        let delay_ms = if attempt < 5 { 25 } else { 50 };
+        std::thread::sleep(Duration::from_millis(delay_ms));
+        if let Ok(dc) = DaemonClient::connect(socket_path) {
+            info!("ensure_daemon: connected after {} attempt(s)", attempt + 1);
+            return Some(Arc::new(dc));
+        }
+    }
+
+    tracing::warn!("ensure_daemon: daemon did not become ready in time; falling back to local PTY mode");
+    None
+}
+
 /// Run the GTK4/libadwaita application.
 ///
 /// This function blocks until the window is closed. It initialises libadwaita,
@@ -135,13 +204,23 @@ pub struct LaunchOptions {
 pub fn run(config: Config, launch: LaunchOptions) -> Result<(), Box<dyn std::error::Error>> {
     let app_id = launch.class.as_deref().unwrap_or(APP_ID);
 
+    // Attempt to connect to (or spawn) the daemon before entering the GTK loop.
+    // This is done outside connect_activate so it runs once, not once per window.
+    let socket_path = default_socket_path();
+    let daemon_client: Option<Arc<DaemonClient>> = ensure_daemon(&socket_path);
+    if daemon_client.is_some() {
+        info!("GTK running in daemon-client mode: sessions survive window close");
+    } else {
+        info!("GTK running in self-contained mode: no daemon, PTYs owned locally");
+    }
+
     let app = adw::Application::builder()
         .application_id(app_id)
         .flags(gio::ApplicationFlags::NON_UNIQUE)
         .build();
 
     app.connect_activate(move |app| {
-        build_ui(app, &config, &launch);
+        build_ui(app, &config, &launch, daemon_client.clone());
     });
 
     // GTK expects argv-style arguments; pass empty since clap already parsed.
@@ -162,7 +241,7 @@ fn next_pane_id() -> String {
 }
 
 /// Build the main application window with tab bar and initial terminal tab.
-fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
+fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions, daemon_client: Option<Arc<DaemonClient>>) {
     info!("Building Forgetty GTK4 window");
 
     // CLI overrides skip both session restore AND session save so a one-off
@@ -428,17 +507,24 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
     }
 
     // --- Tab close handling ---
-    // When a tab's close button is clicked, kill ALL PTYs in the tab's
-    // widget tree (may contain nested Paned widgets with multiple panes).
+    // When a tab's close button is clicked:
+    //   - In local mode: kill all PTYs in the tab's widget tree.
+    //   - In daemon mode: send close_tab RPC for each pane; don't kill locally.
     // If it is the last tab, close the window (exits the application).
     // NOTE: we wire this on the initial tab_view here; newly created workspace
     // tab_views get the same handler in `create_workspace_view()`.
     {
         let window_close = window.clone();
         let states_close = Rc::clone(&tab_states);
+        let dc_close = daemon_client.clone();
         initial_tab_view.connect_close_page(move |tv, page| {
             let container = page.child();
-            kill_all_panes_in_subtree(&container, &states_close);
+            if let Some(ref dc) = dc_close {
+                // Daemon mode: send close_tab RPC for each pane in the subtree.
+                daemon_close_panes_in_subtree(&container, &states_close, dc);
+            } else {
+                kill_all_panes_in_subtree(&container, &states_close);
+            }
 
             // If this is the last page, close the window
             if tv.n_pages() <= 1 {
@@ -480,6 +566,7 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
         let config_action = Rc::clone(&shared_config);
         let wm_action = Rc::clone(&workspace_manager);
         let win_action = window.clone();
+        let dc_newtab = daemon_client.clone();
         let action = gio::SimpleAction::new("new-tab", None);
         action.connect_activate(move |_action, _param| {
             let Ok(cfg) = config_action.try_borrow() else {
@@ -498,6 +585,7 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
                 &win_action,
                 None,
                 None,
+                dc_newtab.clone(),
             );
         });
         window.add_action(&action);
@@ -525,6 +613,7 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
         let config_split = Rc::clone(&shared_config);
         let wm_split = Rc::clone(&workspace_manager);
         let win_split = window.clone();
+        let dc_split = daemon_client.clone();
         let action = gio::SimpleAction::new(action_name, None);
         action.connect_activate(move |_action, _param| {
             let Ok(cfg) = config_split.try_borrow() else {
@@ -543,6 +632,7 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
                 orientation,
                 before,
                 &win_split,
+                dc_split.clone(),
             );
         });
         window.add_action(&action);
@@ -556,13 +646,14 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
     {
         let wm_close = Rc::clone(&workspace_manager);
         let window_close = window.clone();
+        let dc_closepane = daemon_client.clone();
         let action = gio::SimpleAction::new("close-pane", None);
         action.connect_activate(move |_action, _param| {
             let Ok(mgr) = wm_close.try_borrow() else {
                 return;
             };
             let ws = &mgr.workspaces[mgr.active_index];
-            close_focused_pane(&ws.tab_view, &ws.tab_states, &ws.focus_tracker, &window_close);
+            close_focused_pane(&ws.tab_view, &ws.tab_states, &ws.focus_tracker, &window_close, dc_closepane.clone());
         });
         window.add_action(&action);
     }
@@ -613,6 +704,7 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
     {
         let wm_paste = Rc::clone(&workspace_manager);
         let window_paste = window.clone();
+        let dc_paste = daemon_client.clone();
         let action = gio::SimpleAction::new("paste", None);
         action.connect_activate(move |_action, _param| {
             let (ts, ft) = {
@@ -623,7 +715,7 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
                 let ws = &mgr.workspaces[mgr.active_index];
                 (Rc::clone(&ws.tab_states), Rc::clone(&ws.focus_tracker))
             };
-            paste_clipboard(&ts, &ft, &window_paste);
+            paste_clipboard(&ts, &ft, &window_paste, dc_paste.clone());
         });
         window.add_action(&action);
     }
@@ -763,6 +855,7 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
     {
         let wm_close_tab = Rc::clone(&workspace_manager);
         let window_close_tab = window.clone();
+        let dc_closetab = daemon_client.clone();
         let action = gio::SimpleAction::new("close-tab", None);
         action.connect_activate(move |_action, _param| {
             let Ok(mgr) = wm_close_tab.try_borrow() else {
@@ -773,7 +866,11 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
                 return;
             };
             let container = page.child();
-            kill_all_panes_in_subtree(&container, &ws.tab_states);
+            if let Some(ref dc) = dc_closetab {
+                daemon_close_panes_in_subtree(&container, &ws.tab_states, dc);
+            } else {
+                kill_all_panes_in_subtree(&container, &ws.tab_states);
+            }
 
             if ws.tab_view.n_pages() <= 1 {
                 window_close_tab.close();
@@ -807,13 +904,14 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
     // redraws the prompt -- identical to pressing Ctrl+L interactively.
     {
         let wm_clear = Rc::clone(&workspace_manager);
+        let dc_clear = daemon_client.clone();
         let action = gio::SimpleAction::new("clear", None);
         action.connect_activate(move |_action, _param| {
             let Ok(mgr) = wm_clear.try_borrow() else {
                 return;
             };
             let ws = &mgr.workspaces[mgr.active_index];
-            write_to_focused_pty(&ws.tab_states, &ws.focus_tracker, b"\x0c");
+            write_to_focused_pty_or_daemon(&ws.tab_states, &ws.focus_tracker, b"\x0c", dc_clear.as_deref());
         });
         window.add_action(&action);
     }
@@ -823,6 +921,7 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
     // Ctrl+L to PTY so the shell redraws its prompt in default colors.
     {
         let wm_reset = Rc::clone(&workspace_manager);
+        let dc_reset = daemon_client.clone();
         let action = gio::SimpleAction::new("reset", None);
         action.connect_activate(move |_action, _param| {
             let Ok(mgr) = wm_reset.try_borrow() else {
@@ -830,7 +929,7 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
             };
             let ws = &mgr.workspaces[mgr.active_index];
             reset_focused_pane(&ws.tab_states, &ws.focus_tracker);
-            write_to_focused_pty(&ws.tab_states, &ws.focus_tracker, b"\x0c");
+            write_to_focused_pty_or_daemon(&ws.tab_states, &ws.focus_tracker, b"\x0c", dc_reset.as_deref());
         });
         window.add_action(&action);
     }
@@ -871,17 +970,22 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
 
     // --- Quit action (Ctrl+Shift+Q) ---
     // CRITICAL: save session BEFORE killing PTYs (CWD read needs /proc/{pid}/cwd).
+    // In daemon mode: do NOT kill daemon PTYs — sessions survive the quit.
     {
         let app_quit = app.clone();
         let wm_quit = Rc::clone(&workspace_manager);
         let win_quit_save = window.clone();
         let skip_save_quit = Rc::clone(&skip_session_save);
+        let dc_quit = daemon_client.clone();
         let action = gio::SimpleAction::new("quit", None);
         action.connect_activate(move |_action, _param| {
             if !skip_save_quit.get() {
                 save_all_workspaces(&wm_quit, &win_quit_save);
             }
-            kill_all_workspace_ptys(&wm_quit, "Quit action");
+            // Only kill PTYs in self-contained mode (no daemon).
+            if dc_quit.is_none() {
+                kill_all_workspace_ptys(&wm_quit, "Quit action");
+            }
             app_quit.quit();
         });
         app.add_action(&action);
@@ -1046,9 +1150,89 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
     }
 
     // --- Create the first tab (or restore session) ---
+    //
+    // In daemon-client mode: reconcile from the daemon's live pane list.
+    //   - If the daemon has live panes, create a DrawingArea + subscribe_output
+    //     stream for each (AC-12, AC-14).
+    //   - If the daemon has no panes, fall through to the normal "first tab" path.
+    // In self-contained mode: restore from the session file as before.
 
     let mut restored = false;
-    if !has_cli_override {
+
+    if let Some(ref dc) = daemon_client {
+        // Daemon mode: reconcile live panes from daemon on startup.
+        match dc.list_tabs() {
+            Ok(panes) if !panes.is_empty() => {
+                tracing::info!("Reconnecting to {} live daemon pane(s)", panes.len());
+                let Ok(mgr) = workspace_manager.try_borrow() else {
+                    tracing::warn!("Failed to borrow workspace_manager for daemon reconcile");
+                    return;
+                };
+                let ws = &mgr.workspaces[0];
+                for pane_info in &panes {
+                    let (mpsc_tx, mpsc_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+                    if let Err(e) = dc.subscribe_output(pane_info.pane_id, mpsc_tx) {
+                        tracing::warn!("subscribe_output failed for {}: {e}", pane_info.pane_id);
+                    }
+                    let on_exit = make_on_exit_callback(&ws.tab_view, &ws.tab_states, &window, Some(Arc::clone(dc)));
+                    let on_notify =
+                        make_on_notify_callback(&ws.tab_view, &ws.tab_states, &window);
+                    // Fetch initial screen snapshot for this pane.
+                    let snapshot = dc.get_screen(pane_info.pane_id).ok();
+                    match terminal::create_terminal_for_pane(
+                        config,
+                        pane_info.pane_id,
+                        Arc::clone(dc),
+                        mpsc_rx,
+                        snapshot.as_ref(),
+                        Some(on_exit),
+                        Some(on_notify),
+                    ) {
+                        Ok((pane_vbox, drawing_area, state)) => {
+                            let pane_widget_name = next_pane_id();
+                            drawing_area.set_widget_name(&pane_widget_name);
+                            ws.tab_states.borrow_mut().insert(pane_widget_name.clone(), Rc::clone(&state));
+                            wire_focus_tracking(
+                                &drawing_area,
+                                &ws.focus_tracker,
+                                &ws.tab_view,
+                                &ws.tab_states,
+                                &ws.custom_titles,
+                            );
+                            let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+                            container.set_hexpand(true);
+                            container.set_vexpand(true);
+                            container.append(&pane_vbox);
+                            let page = ws.tab_view.append(&container);
+                            let title = if pane_info.title.is_empty() { "shell" } else { pane_info.title.as_str() };
+                            page.set_title(title);
+                            ws.tab_view.set_selected_page(&page);
+                            drawing_area.grab_focus();
+                            register_title_timer(
+                                &page,
+                                &ws.tab_view,
+                                &ws.tab_states,
+                                &ws.focus_tracker,
+                                &ws.custom_titles,
+                                &window,
+                            );
+                            restored = true;
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to create terminal for daemon pane: {e}");
+                        }
+                    }
+                }
+            }
+            Ok(_) => {
+                tracing::info!("Daemon has no live panes — creating initial tab via RPC");
+            }
+            Err(e) => {
+                tracing::warn!("list_tabs RPC failed: {e} — creating initial tab locally");
+            }
+        }
+    } else if !has_cli_override {
+        // Self-contained mode: restore from session file.
         match forgetty_workspace::load_session() {
             Ok(Some(state)) => {
                 let has_tabs = state.workspaces.iter().any(|ws| !ws.tabs.is_empty());
@@ -1066,6 +1250,7 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
                         &main_area,
                         &tab_bar,
                         &window,
+                        None,
                     );
                 }
             }
@@ -1093,6 +1278,7 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
             &window,
             launch.working_directory.as_deref(),
             launch.command.as_deref(),
+            daemon_client.clone(),
         );
         drop(mgr);
     }
@@ -1103,17 +1289,22 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
     // --- Window close request handler ---
     // Fires when the user clicks the CSD X button, when window.close() is
     // called programmatically, or when the window manager requests a close.
-    // Runs BEFORE the window is destroyed, so all state is still accessible.
-    // CRITICAL: save session BEFORE killing PTYs (CWD read needs /proc/{pid}/cwd).
+    // CRITICAL: In daemon mode, do NOT kill PTYs — sessions must survive the close.
+    // In self-contained mode: save session then kill PTYs as before.
     {
         let wm_close = Rc::clone(&workspace_manager);
         let win_close_save = window.clone();
         let skip_save_close = Rc::clone(&skip_session_save);
+        let dc_window_close = daemon_client.clone();
         window.connect_close_request(move |_win| {
-            if !skip_save_close.get() {
-                save_all_workspaces(&wm_close, &win_close_save);
+            if dc_window_close.is_none() {
+                // Self-contained mode: save and kill.
+                if !skip_save_close.get() {
+                    save_all_workspaces(&wm_close, &win_close_save);
+                }
+                kill_all_workspace_ptys(&wm_close, "Window close request");
             }
-            kill_all_workspace_ptys(&wm_close, "Window close request");
+            // Daemon mode: sessions survive. Just let the window close.
             glib::Propagation::Proceed
         });
     }
@@ -1123,7 +1314,7 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
     // GLib source callbacks on the main thread, avoiding async-signal-safety
     // issues. Must be registered before window.present() so signals arriving
     // immediately after startup are caught.
-    // CRITICAL: save session BEFORE killing PTYs (CWD read needs /proc/{pid}/cwd).
+    // In daemon mode: do NOT kill daemon PTYs on signal.
     {
         let signals: &[(i32, &str)] =
             &[(SIGTERM, "SIGTERM"), (SIGHUP, "SIGHUP"), (SIGINT, "SIGINT")];
@@ -1132,12 +1323,15 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions) {
             let app_signal = app.clone();
             let win_signal_save = window.clone();
             let skip_save_signal = Rc::clone(&skip_session_save);
+            let dc_signal = daemon_client.clone();
             glib::unix_signal_add_local(signum, move || {
                 tracing::info!("Received {name} (signal {signum}), initiating clean shutdown");
-                if !skip_save_signal.get() {
-                    save_all_workspaces(&wm_signal, &win_signal_save);
+                if dc_signal.is_none() {
+                    if !skip_save_signal.get() {
+                        save_all_workspaces(&wm_signal, &win_signal_save);
+                    }
+                    kill_all_workspace_ptys(&wm_signal, name);
                 }
-                kill_all_workspace_ptys(&wm_signal, name);
                 app_signal.quit();
                 glib::ControlFlow::Break
             });
@@ -1254,7 +1448,7 @@ fn home_dir_fallback() -> PathBuf {
 /// Returns `None` if the PID is unavailable or the symlink cannot be read.
 fn read_pane_cwd(state_rc: &Rc<RefCell<TerminalState>>) -> Option<PathBuf> {
     let s = state_rc.try_borrow().ok()?;
-    let pid = s.pty.pid()?;
+    let pid = s.pty.as_ref().and_then(|p| p.pid())?;
     let link = format!("/proc/{pid}/cwd");
     std::fs::read_link(&link).ok()
 }
@@ -1406,7 +1600,7 @@ fn build_pane_tree(
                 home_dir_fallback()
             };
 
-            let on_exit = make_on_exit_callback(tab_view, tab_states, window);
+            let on_exit = make_on_exit_callback(tab_view, tab_states, window, None);
             let on_notify = make_on_notify_callback(tab_view, tab_states, window);
             match terminal::create_terminal(
                 config,
@@ -1567,7 +1761,9 @@ fn restore_all_workspaces(
     main_area: &gtk4::Box,
     tab_bar: &adw::TabBar,
     window: &adw::ApplicationWindow,
+    daemon_client: Option<Arc<DaemonClient>>,
 ) -> bool {
+    let _ = daemon_client; // reserved for future workspace-aware daemon restore
     if state.workspaces.is_empty() {
         return false;
     }
@@ -1697,12 +1893,13 @@ fn make_on_exit_callback(
     tab_view: &adw::TabView,
     tab_states: &TabStateMap,
     window: &adw::ApplicationWindow,
+    daemon_client: Option<Arc<DaemonClient>>,
 ) -> Rc<dyn Fn(String)> {
     let tv = tab_view.clone();
     let states = Rc::clone(tab_states);
     let win = window.clone();
     Rc::new(move |pane_name: String| {
-        close_pane_by_name(&pane_name, &tv, &states, &win);
+        close_pane_by_name(&pane_name, &tv, &states, &win, daemon_client.clone());
     })
 }
 
@@ -1874,9 +2071,58 @@ fn add_new_tab(
     window: &adw::ApplicationWindow,
     working_dir: Option<&std::path::Path>,
     command: Option<&[String]>,
+    daemon_client: Option<Arc<DaemonClient>>,
 ) {
-    let on_exit = make_on_exit_callback(tab_view, tab_states, window);
+    let on_exit = make_on_exit_callback(tab_view, tab_states, window, daemon_client.clone());
     let on_notify = make_on_notify_callback(tab_view, tab_states, window);
+
+    // --- Daemon mode: create pane via RPC and subscribe to output. ---
+    if let Some(ref dc) = daemon_client {
+        match dc.new_tab() {
+            Ok(pane_id) => {
+                let (mpsc_tx, mpsc_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+                if let Err(e) = dc.subscribe_output(pane_id, mpsc_tx) {
+                    tracing::warn!("subscribe_output failed for new pane {pane_id}: {e}");
+                }
+                let snapshot = dc.get_screen(pane_id).ok();
+                match terminal::create_terminal_for_pane(
+                    config,
+                    pane_id,
+                    Arc::clone(dc),
+                    mpsc_rx,
+                    snapshot.as_ref(),
+                    Some(on_exit),
+                    Some(on_notify),
+                ) {
+                    Ok((pane_vbox, drawing_area, state)) => {
+                        let widget_name = next_pane_id();
+                        drawing_area.set_widget_name(&widget_name);
+                        tab_states.borrow_mut().insert(widget_name, Rc::clone(&state));
+                        wire_focus_tracking(&drawing_area, focus_tracker, tab_view, tab_states, custom_titles);
+                        let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+                        container.set_hexpand(true);
+                        container.set_vexpand(true);
+                        container.append(&pane_vbox);
+                        let page = tab_view.append(&container);
+                        page.set_title("shell");
+                        tab_view.set_selected_page(&page);
+                        drawing_area.grab_focus();
+                        register_title_timer(&page, tab_view, tab_states, focus_tracker, custom_titles, window);
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to create terminal widget for daemon pane: {e}");
+                    }
+                }
+                return;
+            }
+            Err(e) => {
+                tracing::warn!("new_tab RPC failed: {e}; falling back to local PTY");
+                // Fall through to local PTY creation below.
+            }
+        }
+    }
+
+    // --- Local / fallback mode: spawn PTY directly. ---
     match terminal::create_terminal(config, Some(on_exit), Some(on_notify), working_dir, command) {
         Ok((pane_vbox, drawing_area, state)) => {
             // Assign a unique widget name for registry lookup
@@ -1977,6 +2223,7 @@ fn split_pane(
     orientation: gtk4::Orientation,
     before: bool,
     window: &adw::ApplicationWindow,
+    daemon_client: Option<Arc<DaemonClient>>,
 ) {
     // Find the currently focused DrawingArea
     let focused_name = {
@@ -2010,16 +2257,45 @@ fn split_pane(
     };
 
     // Create the new terminal pane (splits always get default shell + default CWD)
-    let on_exit = make_on_exit_callback(tab_view, tab_states, window);
+    let on_exit = make_on_exit_callback(tab_view, tab_states, window, daemon_client.clone());
     let on_notify = make_on_notify_callback(tab_view, tab_states, window);
-    let (new_pane_vbox, new_da, new_state) =
-        match terminal::create_terminal(config, Some(on_exit), Some(on_notify), None, None) {
-            Ok(triple) => triple,
-            Err(e) => {
-                tracing::error!("Failed to create terminal for split: {e}");
-                return;
+
+    // Determine whether to create via daemon or local PTY.
+    let new_pane_result: Result<(gtk4::Box, gtk4::DrawingArea, Rc<RefCell<TerminalState>>), String> =
+        if let Some(ref dc) = daemon_client {
+            match dc.new_tab() {
+                Ok(pane_id) => {
+                    let (mpsc_tx, mpsc_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+                    if let Err(e) = dc.subscribe_output(pane_id, mpsc_tx) {
+                        tracing::warn!("subscribe_output failed for split pane {pane_id}: {e}");
+                    }
+                    let snapshot = dc.get_screen(pane_id).ok();
+                    terminal::create_terminal_for_pane(
+                        config,
+                        pane_id,
+                        Arc::clone(dc),
+                        mpsc_rx,
+                        snapshot.as_ref(),
+                        Some(on_exit),
+                        Some(on_notify),
+                    )
+                }
+                Err(e) => {
+                    tracing::warn!("new_tab RPC failed for split: {e}; falling back to local PTY");
+                    terminal::create_terminal(config, Some(on_exit), Some(on_notify), None, None)
+                }
             }
+        } else {
+            terminal::create_terminal(config, Some(on_exit), Some(on_notify), None, None)
         };
+
+    let (new_pane_vbox, new_da, new_state) = match new_pane_result {
+        Ok(triple) => triple,
+        Err(e) => {
+            tracing::error!("Failed to create terminal for split: {e}");
+            return;
+        }
+    };
 
     let new_pane_id = next_pane_id();
     new_da.set_widget_name(&new_pane_id);
@@ -2147,6 +2423,7 @@ fn close_focused_pane(
     tab_states: &TabStateMap,
     focus_tracker: &FocusTracker,
     window: &adw::ApplicationWindow,
+    daemon_client: Option<Arc<DaemonClient>>,
 ) {
     let focused_name = {
         let Ok(name) = focus_tracker.try_borrow() else {
@@ -2159,7 +2436,7 @@ fn close_focused_pane(
         return;
     }
 
-    close_pane_by_name(&focused_name, tab_view, tab_states, window);
+    close_pane_by_name(&focused_name, tab_view, tab_states, window, daemon_client);
 }
 
 /// Close a specific pane identified by its DrawingArea widget name.
@@ -2175,6 +2452,7 @@ fn close_pane_by_name(
     tab_view: &adw::TabView,
     tab_states: &TabStateMap,
     window: &adw::ApplicationWindow,
+    daemon_client: Option<Arc<DaemonClient>>,
 ) {
     // Idempotency guard: if the pane is already gone from the registry,
     // it was already closed (e.g., by a concurrent manual Ctrl+Shift+W).
@@ -2222,8 +2500,8 @@ fn close_pane_by_name(
 
     // If this is the only pane in the tab, close the tab
     if leaves.len() <= 1 {
-        // Kill the PTY
-        kill_pane(pane_name, tab_states);
+        // Kill or close the PTY (local or daemon).
+        kill_or_daemon_close_pane(pane_name, tab_states, daemon_client.as_deref());
 
         if tab_view.n_pages() <= 1 {
             window.close();
@@ -2265,8 +2543,8 @@ fn close_pane_by_name(
     parent_paned.set_start_child(gtk4::Widget::NONE);
     parent_paned.set_end_child(gtk4::Widget::NONE);
 
-    // Kill the closed pane's PTY and remove from registry
-    kill_pane(pane_name, tab_states);
+    // Kill or close the PTY (local or daemon) and remove from registry.
+    kill_or_daemon_close_pane(pane_name, tab_states, daemon_client.as_deref());
 
     // Replace the Paned with the surviving sibling.
     // Check if the Paned was the direct content of the pane container.
@@ -2772,8 +3050,10 @@ fn kill_all_panes_in_subtree(widget: &gtk4::Widget, tab_states: &TabStateMap) {
 fn kill_pane(pane_id: &str, tab_states: &TabStateMap) {
     if let Some(state_rc) = tab_states.borrow().get(pane_id).cloned() {
         if let Ok(mut s) = state_rc.try_borrow_mut() {
-            if let Err(e) = s.pty.kill() {
-                tracing::warn!("Failed to kill PTY for pane {pane_id}: {e}");
+            if let Some(ref mut pty) = s.pty {
+                if let Err(e) = pty.kill() {
+                    tracing::warn!("Failed to kill PTY for pane {pane_id}: {e}");
+                }
             }
         }
     }
@@ -2797,9 +3077,92 @@ fn kill_all_ptys(tab_states: &TabStateMap, reason: &str) {
     }
     for (pane_id, state_rc) in states.iter() {
         if let Ok(mut s) = state_rc.try_borrow_mut() {
-            if let Err(e) = s.pty.kill() {
-                tracing::warn!("Failed to kill PTY for pane {pane_id}: {e}");
+            if let Some(ref mut pty) = s.pty {
+                if let Err(e) = pty.kill() {
+                    tracing::warn!("Failed to kill PTY for pane {pane_id}: {e}");
+                }
             }
+        }
+    }
+}
+
+/// Kill a local PTY or send close_tab RPC to daemon, then remove from registry.
+fn kill_or_daemon_close_pane(
+    pane_name: &str,
+    tab_states: &TabStateMap,
+    daemon_client: Option<&DaemonClient>,
+) {
+    if let Some(dc) = daemon_client {
+        // In daemon mode: look up the PaneId from the TerminalState and send close_tab RPC.
+        if let Some(state_rc) = tab_states.borrow().get(pane_name).cloned() {
+            if let Ok(s) = state_rc.try_borrow() {
+                if let Some(pane_id) = s.daemon_pane_id {
+                    if let Err(e) = dc.close_tab(pane_id) {
+                        tracing::warn!("close_tab RPC failed for {pane_name}: {e}");
+                    }
+                }
+            }
+        }
+        tab_states.borrow_mut().remove(pane_name);
+    } else {
+        kill_pane(pane_name, tab_states);
+    }
+}
+
+/// Walk a widget subtree, send close_tab RPC for each pane, remove from registry.
+fn daemon_close_panes_in_subtree(
+    widget: &gtk4::Widget,
+    tab_states: &TabStateMap,
+    daemon_client: &DaemonClient,
+) {
+    if let Some(da) = widget.downcast_ref::<gtk4::DrawingArea>() {
+        let pane_name = da.widget_name().to_string();
+        kill_or_daemon_close_pane(&pane_name, tab_states, Some(daemon_client));
+        return;
+    }
+
+    // Recurse into children.
+    let mut child = widget.first_child();
+    while let Some(c) = child {
+        daemon_close_panes_in_subtree(&c, tab_states, daemon_client);
+        child = c.next_sibling();
+    }
+}
+
+/// Write bytes to the focused pane's PTY — either via daemon RPC or local pty.
+fn write_to_focused_pty_or_daemon(
+    tab_states: &TabStateMap,
+    focus_tracker: &FocusTracker,
+    bytes: &[u8],
+    daemon_client: Option<&DaemonClient>,
+) {
+    let focused_name = {
+        let Ok(name) = focus_tracker.try_borrow() else { return };
+        name.clone()
+    };
+    if focused_name.is_empty() {
+        return;
+    }
+    let Ok(states) = tab_states.try_borrow() else { return };
+    let Some(state_rc) = states.get(&focused_name).cloned() else { return };
+    drop(states);
+
+    if let Some(dc) = daemon_client {
+        if let Ok(s) = state_rc.try_borrow() {
+            if let Some(pane_id) = s.daemon_pane_id {
+                if let Err(e) = dc.send_input(pane_id, bytes) {
+                    tracing::warn!("send_input RPC failed: {e}");
+                }
+                return;
+            }
+        }
+    }
+
+    // Fallback: local PTY.
+    let Ok(mut s) = state_rc.try_borrow_mut() else { return };
+    if let Some(ref mut pty) = s.pty {
+        if let Err(e) = pty.write(bytes) {
+            tracing::warn!("Failed to write to PTY: {e}");
         }
     }
 }
@@ -3049,7 +3412,7 @@ fn register_title_timer(
 /// Adapted from `crates/forgetty-ui/src/pane.rs::display_title()`.
 fn compute_display_title(state: &TerminalState) -> String {
     // Try to read CWD from /proc/{pid}/cwd
-    if let Some(pid) = state.pty.pid() {
+    if let Some(pid) = state.pty.as_ref().and_then(|p| p.pid()) {
         let proc_path = format!("/proc/{}/cwd", pid);
         if let Ok(target) = std::fs::read_link(&proc_path) {
             let cwd = target.to_string_lossy().to_string();
@@ -3081,7 +3444,7 @@ fn compute_window_title(state: &TerminalState) -> String {
     // Strip domain from hostname (e.g. "totemlabs-lap.local" → "totemlabs-lap")
     let short_host = hostname.split('.').next().unwrap_or(&hostname);
 
-    if let Some(pid) = state.pty.pid() {
+    if let Some(pid) = state.pty.as_ref().and_then(|p| p.pid()) {
         let proc_path = format!("/proc/{}/cwd", pid);
         if let Ok(target) = std::fs::read_link(&proc_path) {
             let cwd = target.to_string_lossy().to_string();
@@ -3112,6 +3475,7 @@ fn paste_clipboard(
     tab_states: &TabStateMap,
     focus_tracker: &FocusTracker,
     window: &adw::ApplicationWindow,
+    daemon_client: Option<Arc<DaemonClient>>,
 ) {
     let focused_name = {
         let Ok(name) = focus_tracker.try_borrow() else {
@@ -3137,8 +3501,9 @@ fn paste_clipboard(
     let display = gtk4::prelude::WidgetExt::display(window);
     let clipboard = display.clipboard();
 
-    // Clone state_rc for the async callback
+    // Clone state_rc and daemon_client for the async callback
     let state_for_cb = Rc::clone(&state_rc);
+    let dc_paste = daemon_client.clone();
     clipboard.read_text_async(gio::Cancellable::NONE, move |result| {
         let text = match result {
             Ok(Some(text)) => text.to_string(),
@@ -3153,13 +3518,24 @@ fn paste_clipboard(
             return;
         }
 
-        // Write the pasted text to the PTY
+        // Route paste through daemon if available, else local PTY.
+        if let Some(ref dc) = dc_paste {
+            if let Ok(s) = state_for_cb.try_borrow() {
+                if let Some(pane_id) = s.daemon_pane_id {
+                    let _ = dc.send_input(pane_id, text.as_bytes());
+                    return;
+                }
+            }
+        }
+
         let Ok(mut s) = state_for_cb.try_borrow_mut() else {
             return;
         };
 
-        if let Err(e) = s.pty.write(text.as_bytes()) {
-            tracing::warn!("Failed to write paste to PTY: {e}");
+        if let Some(ref mut pty) = s.pty {
+            if let Err(e) = pty.write(text.as_bytes()) {
+                tracing::warn!("Failed to write paste to PTY: {e}");
+            }
         }
     });
 }
@@ -3436,39 +3812,6 @@ fn feed_escape_to_focused_pane(
     }
 }
 
-/// Write raw bytes to the focused pane's PTY (shell stdin).
-///
-/// Used by Clear (sends Ctrl+L so the shell redraws the prompt) and Reset
-/// (sends a newline after the VT-level RIS to trigger a fresh prompt).
-fn write_to_focused_pty(tab_states: &TabStateMap, focus_tracker: &FocusTracker, bytes: &[u8]) {
-    let focused_name = {
-        let Ok(name) = focus_tracker.try_borrow() else {
-            return;
-        };
-        name.clone()
-    };
-
-    if focused_name.is_empty() {
-        return;
-    }
-
-    let Ok(states) = tab_states.try_borrow() else {
-        return;
-    };
-
-    let Some(state_rc) = states.get(&focused_name).cloned() else {
-        return;
-    };
-    drop(states);
-
-    let Ok(mut s) = state_rc.try_borrow_mut() else {
-        return;
-    };
-
-    if let Err(e) = s.pty.write(bytes) {
-        tracing::warn!("Failed to write to PTY: {e}");
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Change Tab Title dialog
@@ -4312,6 +4655,7 @@ fn create_and_switch_to_new_workspace(
         window,
         None,
         None,
+        None, // new workspaces are always local, no daemon client
     );
 
     let new_index = {

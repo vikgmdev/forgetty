@@ -10,6 +10,9 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
+#[cfg(target_os = "linux")]
+use libc;
+
 use forgetty_core::{PaneId, Result};
 use forgetty_pty::PtySize;
 use forgetty_workspace::WorkspaceState;
@@ -336,6 +339,30 @@ impl SessionManager {
     // -----------------------------------------------------------------------
     // Shutdown
     // -----------------------------------------------------------------------
+
+    /// Send SIGINT to the foreground process group of a pane.
+    ///
+    /// This is the daemon-side implementation of the Ctrl+C signal path described
+    /// in CLAUDE.md. It does two things:
+    /// 1. The caller (handle_send_sigint) already wrote 0x03 via write_pty.
+    /// 2. This method calls kill(-pgid, SIGINT) via tcgetpgrp on the master PTY fd.
+    ///    This is necessary when the child has disabled ISIG (e.g. Node.js, pm2).
+    pub fn send_sigint(&self, id: PaneId) {
+        #[cfg(target_os = "linux")]
+        {
+            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(pane) = inner.panes.get(&id) {
+                if let Some(pgid) = pane.pty_bridge.pty.foreground_pgrp() {
+                    let my_pid = std::process::id() as libc::pid_t;
+                    if pgid > 0 && pgid != my_pid {
+                        unsafe { libc::kill(-(pgid as libc::c_int), libc::SIGINT) };
+                    }
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = id;
+    }
 
     /// Kill every live PTY process (for clean shutdown).
     pub fn kill_all(&self) {

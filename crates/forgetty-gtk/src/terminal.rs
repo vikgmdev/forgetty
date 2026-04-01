@@ -9,7 +9,7 @@
 use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
@@ -30,6 +30,7 @@ use gtk4::pango;
 use gtk4::prelude::*;
 use gtk4::{glib, DrawingArea};
 
+use crate::daemon_client::DaemonClient;
 use crate::input::{GhosttyInput, ScrollAction};
 use crate::pty_bridge;
 
@@ -84,7 +85,8 @@ struct HoverUrl {
 /// All access happens on the GTK main thread via `Rc<RefCell<>>`.
 pub struct TerminalState {
     pub terminal: forgetty_vt::Terminal,
-    pub pty: forgetty_pty::PtyProcess,
+    /// Local PTY process. `None` for daemon-backed panes.
+    pub pty: Option<forgetty_pty::PtyProcess>,
     pub pty_rx: mpsc::Receiver<Vec<u8>>,
     pub input: GhosttyInput,
     pub config: Config,
@@ -156,6 +158,10 @@ pub struct TerminalState {
     /// Wired by `app.rs` to handle tab badge updates and desktop notifications.
     /// `None` until the caller registers it via `set_on_notify()`.
     pub on_notify: Option<Rc<dyn Fn(NotificationPayload)>>,
+    /// For daemon-backed panes: the remote pane ID in the daemon.
+    pub daemon_pane_id: Option<forgetty_core::PaneId>,
+    /// For daemon-backed panes: handle for routing write-pty responses.
+    pub daemon_client: Option<Arc<DaemonClient>>,
 }
 
 impl TerminalState {
@@ -191,8 +197,14 @@ impl TerminalState {
                     // Drain write-PTY responses (DA responses, mode queries, etc.)
                     let responses = self.terminal.drain_write_pty();
                     for chunk in responses {
-                        if let Err(e) = self.pty.write(&chunk) {
-                            tracing::warn!("Failed to write PTY response: {e}");
+                        if let Some(ref dc) = self.daemon_client {
+                            if let Some(pane_id) = self.daemon_pane_id {
+                                let _ = dc.send_input(pane_id, &chunk);
+                            }
+                        } else if let Some(ref mut pty) = self.pty {
+                            if let Err(e) = pty.write(&chunk) {
+                                tracing::warn!("Failed to write PTY response: {e}");
+                            }
                         }
                     }
                 }
@@ -201,8 +213,12 @@ impl TerminalState {
                     // killed externally. In that case orphan children can
                     // keep the PTY slave fd open, so the reader thread never
                     // gets EOF.  Detect this by checking the child status.
-                    if !self.pty.is_alive() {
-                        disconnected = true;
+                    if self.daemon_pane_id.is_none() {
+                        if let Some(ref mut pty) = self.pty {
+                            if !pty.is_alive() {
+                                disconnected = true;
+                            }
+                        }
                     }
                     break;
                 }
@@ -290,7 +306,7 @@ pub fn create_terminal(
 
     let state = Rc::new(RefCell::new(TerminalState {
         terminal,
-        pty,
+        pty: Some(pty),
         pty_rx,
         input,
         config: config.clone(),
@@ -321,6 +337,8 @@ pub fn create_terminal(
         notification_ring: false,
         last_notification: Instant::now() - Duration::from_secs(10),
         on_notify,
+        daemon_pane_id: None,
+        daemon_client: None,
     }));
 
     // Create DrawingArea
@@ -617,13 +635,15 @@ pub fn create_terminal(
                         da_for_key.activate_action("win.copy", None).ok();
                     } else {
                         // Write 0x03 for PTY echo + cooked-mode line discipline.
-                        s.pty.write(&[0x03]).ok();
-                        // Also send SIGINT directly to the PTY's actual foreground
-                        // process group via tcgetpgrp on the master PTY fd. This is
-                        // necessary when a child has disabled ISIG (e.g. Node.js /
-                        // pm2), preventing the line discipline from converting 0x03
-                        // to SIGINT automatically.
-                        send_sigint_to_fg_pgrp(&s.pty);
+                        if let Some(ref mut pty) = s.pty {
+                            pty.write(&[0x03]).ok();
+                            // Also send SIGINT directly to the PTY's actual foreground
+                            // process group via tcgetpgrp on the master PTY fd. This is
+                            // necessary when a child has disabled ISIG (e.g. Node.js /
+                            // pm2), preventing the line discipline from converting 0x03
+                            // to SIGINT automatically.
+                            send_sigint_to_fg_pgrp(pty);
+                        }
                         s.cursor_blink_visible = true;
                         s.last_blink_toggle = Instant::now();
                         // Suppress the shell's BEL response (zsh beeps on SIGINT).
@@ -650,8 +670,10 @@ pub fn create_terminal(
                 if let Some(bytes) =
                     s.input.encode_key_press(keyval, keycode, modifier, terminal_handle)
                 {
-                    if let Err(e) = s.pty.write(&bytes) {
-                        tracing::warn!("Failed to write to PTY: {e}");
+                    if let Some(ref mut pty) = s.pty {
+                        if let Err(e) = pty.write(&bytes) {
+                            tracing::warn!("Failed to write to PTY: {e}");
+                        }
                     }
                     // Reset cursor blink on keypress: make cursor solid and
                     // restart the blink countdown (AC-2).
@@ -677,8 +699,10 @@ pub fn create_terminal(
                 if let Some(bytes) =
                     s.input.encode_key_release(keyval, keycode, modifier, terminal_handle)
                 {
-                    if let Err(e) = s.pty.write(&bytes) {
-                        tracing::warn!("Failed to write to PTY: {e}");
+                    if let Some(ref mut pty) = s.pty {
+                        if let Err(e) = pty.write(&bytes) {
+                            tracing::warn!("Failed to write to PTY: {e}");
+                        }
                     }
                     da_for_release.queue_draw();
                 }
@@ -702,8 +726,10 @@ pub fn create_terminal(
                 };
                 if s.terminal.is_focus_reporting() {
                     if let Some(bytes) = GhosttyInput::encode_focus(true) {
-                        if let Err(e) = s.pty.write(&bytes) {
-                            tracing::warn!("Failed to write focus-in to PTY: {e}");
+                        if let Some(ref mut pty) = s.pty {
+                            if let Err(e) = pty.write(&bytes) {
+                                tracing::warn!("Failed to write focus-in to PTY: {e}");
+                            }
                         }
                         da_focus.queue_draw();
                     }
@@ -721,8 +747,10 @@ pub fn create_terminal(
                 };
                 if s.terminal.is_focus_reporting() {
                     if let Some(bytes) = GhosttyInput::encode_focus(false) {
-                        if let Err(e) = s.pty.write(&bytes) {
-                            tracing::warn!("Failed to write focus-out to PTY: {e}");
+                        if let Some(ref mut pty) = s.pty {
+                            if let Err(e) = pty.write(&bytes) {
+                                tracing::warn!("Failed to write focus-out to PTY: {e}");
+                            }
                         }
                         da_focus.queue_draw();
                     }
@@ -896,8 +924,10 @@ pub fn create_terminal(
                     screen_size,
                     cell_size,
                 ) {
-                    if let Err(e) = s.pty.write(&bytes) {
-                        tracing::warn!("Failed to write mouse press to PTY: {e}");
+                    if let Some(ref mut pty) = s.pty {
+                        if let Err(e) = pty.write(&bytes) {
+                            tracing::warn!("Failed to write mouse press to PTY: {e}");
+                        }
                     }
                     da_click.queue_draw();
                 }
@@ -951,8 +981,10 @@ pub fn create_terminal(
                     screen_size,
                     cell_size,
                 ) {
-                    if let Err(e) = s.pty.write(&bytes) {
-                        tracing::warn!("Failed to write mouse release to PTY: {e}");
+                    if let Some(ref mut pty) = s.pty {
+                        if let Err(e) = pty.write(&bytes) {
+                            tracing::warn!("Failed to write mouse release to PTY: {e}");
+                        }
                     }
                     da_release.queue_draw();
                 }
@@ -1073,8 +1105,10 @@ pub fn create_terminal(
                     screen_size,
                     cell_size,
                 ) {
-                    if let Err(e) = s.pty.write(&bytes) {
-                        tracing::warn!("Failed to write mouse motion to PTY: {e}");
+                    if let Some(ref mut pty) = s.pty {
+                        if let Err(e) = pty.write(&bytes) {
+                            tracing::warn!("Failed to write mouse motion to PTY: {e}");
+                        }
                     }
                     da_motion.queue_draw();
                 }
@@ -1164,8 +1198,10 @@ pub fn create_terminal(
 
                 match action {
                     ScrollAction::WriteBytes(bytes) => {
-                        if let Err(e) = s.pty.write(&bytes) {
-                            tracing::warn!("Failed to write scroll to PTY: {e}");
+                        if let Some(ref mut pty) = s.pty {
+                            if let Err(e) = pty.write(&bytes) {
+                                tracing::warn!("Failed to write scroll to PTY: {e}");
+                            }
                         }
                     }
                     ScrollAction::ScrollViewport(delta) => {
@@ -1228,13 +1264,15 @@ pub fn create_terminal(
                 // so the selection survives the resize (AC-16).
                 // 12 ticks × 8ms = ~100ms grace period covers drag-resize bursts.
                 s.suppress_selection_clear_ticks = 12;
-                if let Err(e) = s.pty.resize(forgetty_pty::PtySize {
-                    rows: new_rows as u16,
-                    cols: new_cols as u16,
-                    pixel_width: width as u16,
-                    pixel_height: height as u16,
-                }) {
-                    tracing::warn!("Failed to resize PTY: {e}");
+                if let Some(ref mut pty) = s.pty {
+                    if let Err(e) = pty.resize(forgetty_pty::PtySize {
+                        rows: new_rows as u16,
+                        cols: new_cols as u16,
+                        pixel_width: width as u16,
+                        pixel_height: height as u16,
+                    }) {
+                        tracing::warn!("Failed to resize PTY: {e}");
+                    }
                 }
                 drop(s);
                 da.queue_draw();
@@ -1451,6 +1489,696 @@ pub fn create_terminal(
     context_popover.set_halign(gtk4::Align::Start);
     context_popover.add_css_class("menu");
     context_popover.set_widget_name("forgetty-context-menu");
+
+    Ok((vbox, drawing_area, state))
+}
+
+/// Create a daemon-backed terminal widget for an existing daemon pane.
+///
+/// Like `create_terminal()` but connects to a remote pane managed by
+/// `forgetty-daemon` rather than spawning a local PTY. PTY I/O goes through
+/// the daemon's JSON-RPC API (`send_input` / `subscribe_output`).
+///
+/// `daemon_rx` is the receiver end of an mpsc channel whose sender was passed
+/// to `DaemonClient::subscribe_output()`. The 8ms poll timer reads bytes from
+/// this channel instead of a local PTY reader thread.
+///
+/// `snapshot` is an optional initial screen state fed to the VT parser to
+/// make the first rendered frame show content rather than a blank terminal.
+pub fn create_terminal_for_pane(
+    config: &Config,
+    pane_id: forgetty_core::PaneId,
+    daemon_client: Arc<DaemonClient>,
+    daemon_rx: mpsc::Receiver<Vec<u8>>,
+    snapshot: Option<&crate::daemon_client::ScreenSnapshot>,
+    on_exit: Option<Rc<dyn Fn(String)>>,
+    on_notify: Option<Rc<dyn Fn(NotificationPayload)>>,
+) -> Result<(gtk4::Box, DrawingArea, Rc<RefCell<TerminalState>>), String> {
+    let initial_rows: usize = 24;
+    let initial_cols: usize = 80;
+
+    // Create terminal VT state (no local PTY)
+    let mut terminal = forgetty_vt::Terminal::new(initial_rows, initial_cols);
+    terminal.feed(b"\x1b[1 q");
+
+    // Prime VT state with snapshot lines so the first frame shows content.
+    if let Some(snap) = snapshot {
+        for line in &snap.lines {
+            if !line.is_empty() {
+                terminal.feed(line.as_bytes());
+                terminal.feed(b"\r\n");
+            }
+        }
+    }
+
+    let input = GhosttyInput::new();
+
+    let state = Rc::new(RefCell::new(TerminalState {
+        terminal,
+        pty: None,
+        pty_rx: daemon_rx,
+        input,
+        config: config.clone(),
+        cell_width: 8.0,
+        cell_height: 16.0,
+        cols: initial_cols,
+        rows: initial_rows,
+        selection: None,
+        selecting: false,
+        word_anchor: None,
+        drag_origin: None,
+        suppress_selection_clear_ticks: 0,
+        updating_scrollbar: false,
+        viewport_offset: 0,
+        search: SearchState::default(),
+        font_size: config.font_size,
+        default_font_size: config.font_size,
+        hover_url: None,
+        last_hover_cell: (usize::MAX, usize::MAX),
+        cursor_blink_visible: true,
+        last_blink_toggle: Instant::now(),
+        was_alternate_screen: false,
+        bell_flash_until: None,
+        last_bell: Instant::now() - Duration::from_secs(1),
+        suppress_bell_until: None,
+        last_pty_data: Instant::now(),
+        malloc_trimmed: false,
+        notification_ring: false,
+        last_notification: Instant::now() - Duration::from_secs(10),
+        on_notify,
+        daemon_pane_id: Some(pane_id),
+        daemon_client: Some(daemon_client),
+    }));
+
+    // Create DrawingArea
+    let drawing_area = DrawingArea::new();
+    drawing_area.set_hexpand(true);
+    drawing_area.set_vexpand(true);
+    drawing_area.set_focusable(true);
+    drawing_area.set_can_focus(true);
+    drawing_area.set_cursor_from_name(Some("text"));
+
+    // Track whether cell dimensions have been measured from an actual Pango context
+    let cell_measured = Rc::new(RefCell::new(false));
+
+    // --- Draw callback ---
+    {
+        let state = Rc::clone(&state);
+        let cell_measured = Rc::clone(&cell_measured);
+        drawing_area.set_draw_func(move |da, ctx, width, height| {
+            draw_terminal(da, ctx, width, height, &state, &cell_measured);
+        });
+    }
+
+    // --- Poll daemon output with a GLib timeout (8ms ~ 120Hz) ---
+    {
+        let state = Rc::clone(&state);
+        let da_weak = drawing_area.downgrade();
+        let on_exit = on_exit.map(|cb| Rc::new(std::cell::Cell::new(Some(cb))));
+        glib::timeout_add_local(Duration::from_millis(8), move || {
+            let Some(da) = da_weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+
+            let Ok(mut s) = state.try_borrow_mut() else {
+                return glib::ControlFlow::Continue;
+            };
+
+            let (total, offset, len) = s.terminal.scrollbar_state();
+            s.viewport_offset = offset;
+            let was_at_bottom = total <= len || offset + len >= total;
+
+            let DrainResult { had_data, pty_exited, notification: osc_notification, .. } =
+                s.drain_pty_output();
+
+            let is_alt = s.terminal.is_alternate_screen();
+            if s.was_alternate_screen && !is_alt {
+                s.terminal.feed(b"\x1b[1 q");
+            }
+            s.was_alternate_screen = is_alt;
+
+            let events = s.terminal.drain_events();
+            let mut bell_notify_payload: Option<NotificationPayload> = None;
+            for event in events {
+                if let TerminalEvent::Bell = event {
+                    let now = Instant::now();
+                    if now.duration_since(s.last_bell) < Duration::from_millis(200) {
+                        continue;
+                    }
+                    if s.suppress_bell_until.map_or(false, |t| now < t) {
+                        s.suppress_bell_until = None;
+                        continue;
+                    }
+                    s.last_bell = now;
+
+                    match s.config.bell_mode {
+                        BellMode::Visual => {
+                            s.bell_flash_until = Some(Instant::now() + Duration::from_millis(150));
+                        }
+                        BellMode::Audio => {
+                            da.error_bell();
+                        }
+                        BellMode::Both => {
+                            s.bell_flash_until = Some(Instant::now() + Duration::from_millis(150));
+                            da.error_bell();
+                        }
+                        BellMode::None => {}
+                    }
+
+                    if !da.has_focus() && s.config.notification_mode != NotificationMode::None {
+                        s.notification_ring = true;
+                        bell_notify_payload = Some(NotificationPayload {
+                            title: String::new(),
+                            body: String::new(),
+                            pane_name: da.widget_name().to_string(),
+                            source: None,
+                        });
+                    }
+                }
+            }
+
+            let osc_notify_payload = if let Some(mut payload) = osc_notification {
+                if !da.has_focus() && s.config.notification_mode != NotificationMode::None {
+                    s.notification_ring = true;
+                    payload.pane_name = da.widget_name().to_string();
+                    Some(payload)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            let on_notify_cb = s.on_notify.clone();
+            let last_notif = s.last_notification;
+            let can_send_desktop = last_notif.elapsed() >= Duration::from_secs(2);
+            if can_send_desktop && (bell_notify_payload.is_some() || osc_notify_payload.is_some()) {
+                s.last_notification = Instant::now();
+            }
+
+            if had_data {
+                s.last_pty_data = Instant::now();
+                s.malloc_trimmed = false;
+
+                if was_at_bottom {
+                    s.terminal.scroll_viewport_bottom();
+                    let (_, off, _) = s.terminal.scrollbar_state();
+                    s.viewport_offset = off;
+                }
+
+                if s.suppress_selection_clear_ticks > 0 {
+                    s.suppress_selection_clear_ticks -= 1;
+                } else if s.selection.is_some() {
+                    s.selection = None;
+                    s.selecting = false;
+                    s.word_anchor = None;
+                }
+
+                if s.search.active && !s.search.all_matches.is_empty() {
+                    s.search.all_matches.clear();
+                    s.search.matches.clear();
+                    s.search.current_index = 0;
+                    s.search.current_viewport_index = None;
+                }
+
+                let now = Instant::now();
+                if now.duration_since(s.last_blink_toggle) >= Duration::from_millis(600) {
+                    s.cursor_blink_visible = !s.cursor_blink_visible;
+                    s.last_blink_toggle = now;
+                }
+
+                drop(s);
+                da.queue_draw();
+            } else {
+                let now = Instant::now();
+                let needs_redraw =
+                    if now.duration_since(s.last_blink_toggle) >= Duration::from_millis(600) {
+                        s.cursor_blink_visible = !s.cursor_blink_visible;
+                        s.last_blink_toggle = now;
+                        true
+                    } else {
+                        false
+                    };
+
+                #[cfg(target_os = "linux")]
+                if !s.malloc_trimmed
+                    && now.duration_since(s.last_pty_data) >= Duration::from_secs(5)
+                {
+                    s.malloc_trimmed = true;
+                    unsafe {
+                        libc::malloc_trim(0);
+                    }
+                    tracing::debug!("malloc_trim(0) called after 5s idle (daemon pane)");
+                }
+
+                let bell_active = s.bell_flash_until.is_some();
+                let ring_changed = bell_notify_payload.is_some() || osc_notify_payload.is_some();
+                if needs_redraw || bell_active || ring_changed {
+                    drop(s);
+                    da.queue_draw();
+                }
+            }
+
+            if let Some(payload) = bell_notify_payload {
+                if let Some(ref cb) = on_notify_cb {
+                    cb(payload);
+                }
+            }
+            if let Some(payload) = osc_notify_payload {
+                if let Some(ref cb) = on_notify_cb {
+                    let mut p = payload;
+                    if !can_send_desktop {
+                        p.source = None;
+                    }
+                    cb(p);
+                }
+            }
+
+            // Daemon panes don't exit via pty_exited normally, but handle it gracefully.
+            if pty_exited {
+                tracing::debug!(
+                    "Daemon pane channel closed for {:?}, scheduling close",
+                    da.widget_name()
+                );
+                if let Some(ref exit_cell) = on_exit {
+                    if let Some(cb) = exit_cell.take() {
+                        let pane_name = da.widget_name().to_string();
+                        glib::idle_add_local_once(move || {
+                            cb(pane_name);
+                        });
+                    }
+                }
+                return glib::ControlFlow::Break;
+            }
+
+            glib::ControlFlow::Continue
+        });
+    }
+
+    // --- Keyboard input (via ghostty key encoder) ---
+    {
+        let key_controller = gtk4::EventControllerKey::new();
+
+        {
+            let state = Rc::clone(&state);
+            let da_for_key = drawing_area.clone();
+            key_controller.connect_key_pressed(move |_controller, keyval, keycode, modifier| {
+                if is_app_shortcut(keyval, modifier) {
+                    return glib::Propagation::Proceed;
+                }
+
+                let Ok(mut s) = state.try_borrow_mut() else {
+                    return glib::Propagation::Proceed;
+                };
+
+                let ctrl_only = modifier
+                    & (gdk::ModifierType::CONTROL_MASK
+                        | gdk::ModifierType::SHIFT_MASK
+                        | gdk::ModifierType::ALT_MASK)
+                    == gdk::ModifierType::CONTROL_MASK;
+                if ctrl_only && (keyval == gdk::Key::c || keyval == gdk::Key::C) {
+                    if s.selection.is_some() {
+                        drop(s);
+                        da_for_key.activate_action("win.copy", None).ok();
+                    } else {
+                        // In daemon mode, send SIGINT via daemon RPC.
+                        if let (Some(ref dc), Some(pid)) = (s.daemon_client.clone(), s.daemon_pane_id) {
+                            let _ = dc.send_sigint(pid);
+                        }
+                        s.cursor_blink_visible = true;
+                        s.last_blink_toggle = Instant::now();
+                        s.suppress_bell_until = Some(Instant::now() + Duration::from_millis(300));
+                    }
+                    return glib::Propagation::Stop;
+                }
+
+                if keyval == gdk::Key::Escape
+                    && s.selection.is_some()
+                    && !s.terminal.is_mouse_tracking()
+                {
+                    s.selection = None;
+                    s.selecting = false;
+                    s.word_anchor = None;
+                    drop(s);
+                    da_for_key.queue_draw();
+                    return glib::Propagation::Stop;
+                }
+
+                let terminal_handle = s.terminal.raw_handle();
+                if let Some(bytes) =
+                    s.input.encode_key_press(keyval, keycode, modifier, terminal_handle)
+                {
+                    if let (Some(ref dc), Some(pid)) = (s.daemon_client.clone(), s.daemon_pane_id) {
+                        let _ = dc.send_input(pid, &bytes);
+                    }
+                    s.cursor_blink_visible = true;
+                    s.last_blink_toggle = Instant::now();
+                    da_for_key.queue_draw();
+                    return glib::Propagation::Stop;
+                }
+                glib::Propagation::Proceed
+            });
+        }
+
+        {
+            let state = Rc::clone(&state);
+            let da_for_release = drawing_area.clone();
+            key_controller.connect_key_released(move |_controller, keyval, keycode, modifier| {
+                let Ok(mut s) = state.try_borrow_mut() else {
+                    return;
+                };
+                let terminal_handle = s.terminal.raw_handle();
+                if let Some(bytes) =
+                    s.input.encode_key_release(keyval, keycode, modifier, terminal_handle)
+                {
+                    if let (Some(ref dc), Some(pid)) = (s.daemon_client.clone(), s.daemon_pane_id) {
+                        let _ = dc.send_input(pid, &bytes);
+                    }
+                    da_for_release.queue_draw();
+                }
+            });
+        }
+
+        drawing_area.add_controller(key_controller);
+    }
+
+    // --- Focus controller ---
+    {
+        let focus_controller = gtk4::EventControllerFocus::new();
+
+        {
+            let state = Rc::clone(&state);
+            let da_focus = drawing_area.clone();
+            focus_controller.connect_enter(move |_controller| {
+                let Ok(s) = state.try_borrow() else {
+                    return;
+                };
+                if s.terminal.is_focus_reporting() {
+                    if let Some(bytes) = GhosttyInput::encode_focus(true) {
+                        if let (Some(ref dc), Some(pid)) =
+                            (s.daemon_client.clone(), s.daemon_pane_id)
+                        {
+                            let _ = dc.send_input(pid, &bytes);
+                        }
+                        da_focus.queue_draw();
+                    }
+                }
+            });
+        }
+
+        {
+            let state = Rc::clone(&state);
+            let da_focus = drawing_area.clone();
+            focus_controller.connect_leave(move |_controller| {
+                let Ok(s) = state.try_borrow() else {
+                    return;
+                };
+                if s.terminal.is_focus_reporting() {
+                    if let Some(bytes) = GhosttyInput::encode_focus(false) {
+                        if let (Some(ref dc), Some(pid)) =
+                            (s.daemon_client.clone(), s.daemon_pane_id)
+                        {
+                            let _ = dc.send_input(pid, &bytes);
+                        }
+                        da_focus.queue_draw();
+                    }
+                }
+            });
+        }
+
+        drawing_area.add_controller(focus_controller);
+    }
+
+    // --- Mouse gesture controller ---
+    {
+        let gesture = gtk4::GestureClick::new();
+        gesture.set_button(0);
+
+        {
+            let state = Rc::clone(&state);
+            let da_click = drawing_area.clone();
+            gesture.connect_pressed(move |gesture, n_press, x, y| {
+                let button = gesture.current_button();
+                let modifier = gesture.current_event_state();
+                let Ok(mut s) = state.try_borrow_mut() else {
+                    return;
+                };
+
+                // Right-click: show context menu (same as local PTY pane)
+                if button == 3 {
+                    gesture.set_state(gtk4::EventSequenceState::Claimed);
+                    drop(s);
+                    da_click.queue_draw();
+                    return;
+                }
+
+                if button != 1 {
+                    return;
+                }
+
+                let shift_held = modifier.contains(gdk::ModifierType::SHIFT_MASK);
+                let use_selection = !s.terminal.is_mouse_tracking() || shift_held;
+
+                if button == 1 && use_selection {
+                    gesture.set_state(gtk4::EventSequenceState::Claimed);
+                    let (screen_row, col) =
+                        pixel_to_cell(x, y, s.cell_width, s.cell_height, s.cols, s.rows);
+                    let vp_offset = s.viewport_offset;
+                    let abs_row = screen_row + vp_offset as usize;
+
+                    match n_press {
+                        1 => {
+                            if shift_held {
+                                if let Some(ref mut sel) = s.selection {
+                                    sel.update(abs_row, col);
+                                    s.selecting = false;
+                                    drop(s);
+                                    da_click.queue_draw();
+                                    return;
+                                }
+                            }
+                            s.selection = None;
+                            s.selecting = true;
+                            s.word_anchor = None;
+                            s.drag_origin = Some((abs_row, col));
+                        }
+                        2 => {
+                            let screen = s.terminal.screen();
+                            let (word_start, word_end) =
+                                find_word_boundaries(screen, screen_row, col);
+                            let mut sel =
+                                Selection::new(abs_row, word_start, SelectionMode::Word);
+                            sel.update(abs_row, word_end);
+                            s.selection = Some(sel);
+                            s.selecting = true;
+                            s.word_anchor = Some((word_start, word_end));
+                        }
+                        3 => {
+                            let screen = s.terminal.screen();
+                            let last_col = last_non_whitespace_col(screen, screen_row);
+                            let mut sel = Selection::new(abs_row, 0, SelectionMode::Line);
+                            sel.update(abs_row, last_col);
+                            s.selection = Some(sel);
+                            s.selecting = false;
+                            s.word_anchor = None;
+                        }
+                        _ => {}
+                    }
+                    drop(s);
+                    da_click.queue_draw();
+                    return;
+                }
+
+                let terminal_handle = s.terminal.raw_handle();
+                let screen_size =
+                    ((s.cols as f64 * s.cell_width) as u32, (s.rows as f64 * s.cell_height) as u32);
+                let cell_size = (s.cell_width as u32, s.cell_height as u32);
+
+                if let Some(bytes) = s.input.encode_mouse_button(
+                    button, true, (x, y), modifier, terminal_handle, screen_size, cell_size,
+                ) {
+                    if let (Some(ref dc), Some(pid)) = (s.daemon_client.clone(), s.daemon_pane_id) {
+                        let _ = dc.send_input(pid, &bytes);
+                    }
+                    da_click.queue_draw();
+                }
+            });
+        }
+
+        {
+            let state = Rc::clone(&state);
+            let da_release = drawing_area.clone();
+            gesture.connect_released(move |gesture, _n_press, x, y| {
+                let button = gesture.current_button();
+                let modifier = gesture.current_event_state();
+                let Ok(mut s) = state.try_borrow_mut() else {
+                    return;
+                };
+
+                if button == 1 && s.selecting {
+                    s.selecting = false;
+                    s.word_anchor = None;
+                    s.drag_origin = None;
+
+                    if let Some(ref sel) = s.selection {
+                        if sel.is_empty() && sel.mode == SelectionMode::Normal {
+                            s.selection = None;
+                        }
+                    }
+
+                    drop(s);
+                    da_release.queue_draw();
+                    return;
+                }
+
+                let terminal_handle = s.terminal.raw_handle();
+                let screen_size =
+                    ((s.cols as f64 * s.cell_width) as u32, (s.rows as f64 * s.cell_height) as u32);
+                let cell_size = (s.cell_width as u32, s.cell_height as u32);
+
+                if let Some(bytes) = s.input.encode_mouse_button(
+                    button, false, (x, y), modifier, terminal_handle, screen_size, cell_size,
+                ) {
+                    if let (Some(ref dc), Some(pid)) = (s.daemon_client.clone(), s.daemon_pane_id) {
+                        let _ = dc.send_input(pid, &bytes);
+                    }
+                    da_release.queue_draw();
+                }
+            });
+        }
+
+        drawing_area.add_controller(gesture);
+    }
+
+    // --- Resize handler ---
+    {
+        let state = Rc::clone(&state);
+        let cell_measured_resize = Rc::clone(&cell_measured);
+        drawing_area.connect_resize(move |_da, _width, _height| {
+            if !*cell_measured_resize.borrow() {
+                return;
+            }
+            // For daemon panes, resize is sent via daemon RPC not local pty.
+            // The draw callback will pick up the new dimensions.
+            let _ = state.try_borrow();
+        });
+    }
+
+    // --- Scrollbar ---
+    let adjustment = gtk4::Adjustment::new(0.0, 0.0, 0.0, 1.0, 10.0, 0.0);
+    let scrollbar = gtk4::Scrollbar::new(gtk4::Orientation::Vertical, Some(&adjustment));
+    scrollbar.set_vexpand(true);
+    scrollbar.set_visible(false);
+
+    {
+        let state = Rc::clone(&state);
+        let da_scroll = drawing_area.clone();
+        adjustment.connect_value_changed(move |adj| {
+            let Ok(mut s) = state.try_borrow_mut() else {
+                return;
+            };
+            if s.updating_scrollbar {
+                return;
+            }
+            let new_offset = adj.value() as i64;
+            let (_total, current_offset, _len) = s.terminal.scrollbar_state();
+            let delta = new_offset - current_offset as i64;
+            if delta != 0 {
+                s.terminal.scroll_viewport_delta(delta as isize);
+                s.viewport_offset = new_offset as u64;
+                drop(s);
+                da_scroll.queue_draw();
+            }
+        });
+    }
+
+    {
+        let state = Rc::clone(&state);
+        let adj = adjustment.clone();
+        let sb_widget = scrollbar.clone();
+        let da_weak = drawing_area.downgrade();
+        glib::timeout_add_local(Duration::from_millis(16), move || {
+            let Some(_da) = da_weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            let Ok(mut s) = state.try_borrow_mut() else {
+                return glib::ControlFlow::Continue;
+            };
+            let (total, offset, len) = s.terminal.scrollbar_state();
+            s.viewport_offset = offset;
+            let has_scrollback = total > len;
+            sb_widget.set_visible(has_scrollback);
+            if has_scrollback {
+                s.updating_scrollbar = true;
+                adj.set_lower(0.0);
+                adj.set_upper(total as f64);
+                adj.set_page_size(len as f64);
+                adj.set_value(offset as f64);
+                s.updating_scrollbar = false;
+            }
+            glib::ControlFlow::Continue
+        });
+    }
+
+    let hbox = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    hbox.set_hexpand(true);
+    hbox.set_vexpand(true);
+    hbox.append(&drawing_area);
+    hbox.append(&scrollbar);
+
+    // --- Search bar ---
+    let search_entry = gtk4::SearchEntry::new();
+    search_entry.set_hexpand(true);
+    search_entry.set_placeholder_text(Some("Search..."));
+
+    let match_label = gtk4::Label::new(Some(""));
+    match_label.add_css_class("dim-label");
+
+    let search_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+    search_box.append(&search_entry);
+    search_box.append(&match_label);
+    search_box.set_margin_start(6);
+    search_box.set_margin_end(6);
+
+    let search_bar = gtk4::SearchBar::new();
+    search_bar.set_child(Some(&search_box));
+    search_bar.connect_entry(&search_entry);
+    search_bar.set_show_close_button(false);
+    search_bar.set_search_mode(false);
+
+    {
+        let state = Rc::clone(&state);
+        let da_search = drawing_area.clone();
+        let ml = match_label.clone();
+        search_entry.connect_search_changed(move |entry| {
+            let query = entry.text().to_string();
+            let Ok(mut s) = state.try_borrow_mut() else {
+                return;
+            };
+            s.search.query = query.to_lowercase();
+            recompute_all_search_matches(&mut s);
+            update_match_label(&s.search, &ml);
+            drop(s);
+            da_search.queue_draw();
+        });
+    }
+
+    search_bar.set_widget_name("forgetty-search-bar");
+
+    // --- Context menu ---
+    let context_popover = gtk4::Popover::new();
+    context_popover.set_parent(&drawing_area);
+    context_popover.set_has_arrow(false);
+    context_popover.set_halign(gtk4::Align::Start);
+    context_popover.add_css_class("menu");
+    context_popover.set_widget_name("forgetty-context-menu");
+
+    // --- Vertical container ---
+    let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    vbox.set_hexpand(true);
+    vbox.set_vexpand(true);
+    vbox.append(&search_bar);
+    vbox.append(&hbox);
 
     Ok((vbox, drawing_area, state))
 }
@@ -1916,12 +2644,14 @@ pub fn apply_font_zoom(state: &mut TerminalState, da: &DrawingArea) {
     state.rows = new_rows;
     state.terminal.resize(new_rows, new_cols);
     state.suppress_selection_clear_ticks = 12;
-    let _ = state.pty.resize(forgetty_pty::PtySize {
-        rows: new_rows as u16,
-        cols: new_cols as u16,
-        pixel_width: width as u16,
-        pixel_height: height as u16,
-    });
+    if let Some(ref mut pty) = state.pty {
+        let _ = pty.resize(forgetty_pty::PtySize {
+            rows: new_rows as u16,
+            cols: new_cols as u16,
+            pixel_width: width as u16,
+            pixel_height: height as u16,
+        });
+    }
 
     // Recompute search highlights so they render at the new cell dimensions.
     if !state.search.query.is_empty() {
@@ -2407,13 +3137,15 @@ fn draw_terminal(
                 s.cols = new_cols;
                 s.rows = new_rows;
                 s.terminal.resize(new_rows, new_cols);
-                if let Err(e) = s.pty.resize(forgetty_pty::PtySize {
-                    rows: new_rows as u16,
-                    cols: new_cols as u16,
-                    pixel_width: width as u16,
-                    pixel_height: height as u16,
-                }) {
-                    tracing::warn!("Failed to resize PTY on initial measure: {e}");
+                if let Some(ref mut pty) = s.pty {
+                    if let Err(e) = pty.resize(forgetty_pty::PtySize {
+                        rows: new_rows as u16,
+                        cols: new_cols as u16,
+                        pixel_width: width as u16,
+                        pixel_height: height as u16,
+                    }) {
+                        tracing::warn!("Failed to resize PTY on initial measure: {e}");
+                    }
                 }
             }
         }
