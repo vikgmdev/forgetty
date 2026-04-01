@@ -12,6 +12,7 @@ members = [
     "crates/forgetty-watcher",
     "crates/forgetty-workspace",
     "crates/forgetty-socket",
+    "crates/forgetty-session",
 ]
 
 [workspace.package]

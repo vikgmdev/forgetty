@@ -17,6 +17,10 @@ use libc;
 
 use forgetty_config::{BellMode, Config, CursorStyle, NotificationMode};
 use forgetty_core::Rgba;
+// NotificationPayload, NotificationSource, DrainResult, scan_osc_notification
+// live in forgetty-session (platform-agnostic types moved there in T-048).
+use forgetty_session::events::scan_osc_notification;
+pub use forgetty_session::{DrainResult, NotificationPayload, NotificationSource};
 use forgetty_vt::screen::Color;
 use forgetty_vt::selection::{Selection, SelectionMode};
 use forgetty_vt::TerminalEvent;
@@ -73,32 +77,6 @@ struct HoverUrl {
     screen_row: usize,
     col_start: usize,
     col_end: usize, // exclusive
-}
-
-/// Which OSC protocol triggered this notification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NotificationSource {
-    /// OSC 9 (ConEmu/Windows Terminal style).
-    Osc9,
-    /// OSC 99 (Kitty notification protocol, simplified).
-    Osc99,
-    /// OSC 777 (DesktopNotify/URxvt style).
-    Osc777,
-}
-
-/// Payload produced by the OSC notification scanner.
-///
-/// Passed from the PTY scanner to the GTK layer via the `on_notify` callback.
-#[derive(Debug, Clone)]
-pub struct NotificationPayload {
-    /// Notification summary/title for the desktop notification.
-    pub title: String,
-    /// Notification body text.
-    pub body: String,
-    /// Widget name of the DrawingArea that emitted this notification.
-    pub pane_name: String,
-    /// Which protocol triggered this notification (None for BEL).
-    pub source: Option<NotificationSource>,
 }
 
 /// Shared terminal state accessible from multiple GTK callbacks.
@@ -180,19 +158,6 @@ pub struct TerminalState {
     pub on_notify: Option<Rc<dyn Fn(NotificationPayload)>>,
 }
 
-/// Result of draining the PTY output channel.
-#[derive(Debug, Clone)]
-pub struct DrainResult {
-    /// Whether any data was fed to the VT parser this tick.
-    pub had_data: bool,
-    /// Whether the PTY reader thread has exited (channel disconnected).
-    pub pty_exited: bool,
-    /// An OSC notification detected in the raw PTY stream this tick.
-    /// Contains title/body extracted from OSC 9, 99, or 777 sequences.
-    /// `pane_name` is empty here -- it is filled in by the caller.
-    pub notification: Option<NotificationPayload>,
-}
-
 impl TerminalState {
     /// Drain pending PTY output from the channel and feed it to the
     /// terminal VT parser.  Caps the amount of data processed per tick
@@ -247,133 +212,10 @@ impl TerminalState {
                 }
             }
         }
-        DrainResult { had_data, pty_exited: disconnected, notification }
+        // raw_bytes is not used by the GTK drain path (it feeds directly to
+        // self.terminal above). It exists in DrainResult for session consumers.
+        DrainResult { had_data, pty_exited: disconnected, notification, raw_bytes: Vec::new() }
     }
-}
-
-// ---------------------------------------------------------------------------
-// OSC notification scanner
-// ---------------------------------------------------------------------------
-
-/// Scan raw PTY bytes for OSC 9, OSC 99, or OSC 777 notification sequences.
-///
-/// This is an O(n) byte scan with no heap allocation in the common case
-/// (no ESC ] bytes present). Called on every PTY chunk before feeding to
-/// the VT parser, so it must stay fast.
-///
-/// Returns the first notification found in the buffer, or `None`.
-///
-/// Handles both BEL (`\x07`) and ST (`\x1b\`) terminators per ECMA-48.
-fn scan_osc_notification(data: &[u8]) -> Option<NotificationPayload> {
-    let len = data.len();
-    let mut i = 0;
-
-    while i + 1 < len {
-        // Look for ESC ] (OSC start)
-        if data[i] != 0x1b || data[i + 1] != b']' {
-            i += 1;
-            continue;
-        }
-
-        // Found ESC ] at position i -- find the terminator (BEL or ST).
-        let osc_start = i + 2; // byte after ESC ]
-
-        // Scan forward for BEL (0x07) or ST (ESC \)
-        let term_pos = {
-            let mut pos = None;
-            let mut j = osc_start;
-            while j < len {
-                if data[j] == 0x07 {
-                    pos = Some((j, false)); // BEL terminator
-                    break;
-                }
-                if j + 1 < len && data[j] == 0x1b && data[j + 1] == b'\\' {
-                    pos = Some((j, true)); // ST terminator (ESC \)
-                    break;
-                }
-                j += 1;
-            }
-            pos
-        };
-
-        let (term_idx, _is_st) = match term_pos {
-            Some(t) => t,
-            None => break, // unterminated OSC -- bail out
-        };
-
-        let osc_body = &data[osc_start..term_idx];
-
-        if let Some(payload) = parse_osc_body(osc_body) {
-            return Some(payload);
-        }
-
-        // Advance past the terminator
-        i = term_idx + 1;
-    }
-
-    None
-}
-
-/// Parse an OSC body (bytes between ESC ] and the terminator).
-///
-/// Checks for OSC 9, 99, or 777 notification formats and extracts title/body.
-/// Returns `None` for any other OSC sequence.
-fn parse_osc_body(body: &[u8]) -> Option<NotificationPayload> {
-    // OSC 777 ; notify ; <title> ; <body>
-    if body.starts_with(b"777;notify;") {
-        let rest = &body[b"777;notify;".len()..];
-        // Split on first ';' to get title and body
-        let (title, notif_body) = if let Some(sep) = rest.iter().position(|&b| b == b';') {
-            let title = String::from_utf8_lossy(&rest[..sep]).into_owned();
-            let body_text = String::from_utf8_lossy(&rest[sep + 1..]).into_owned();
-            (title, body_text)
-        } else {
-            // No separator -- entire rest is the title
-            (String::from_utf8_lossy(rest).into_owned(), String::new())
-        };
-        return Some(NotificationPayload {
-            title,
-            body: notif_body,
-            pane_name: String::new(),
-            source: Some(NotificationSource::Osc777),
-        });
-    }
-
-    // OSC 99 ; <params> ; <title/body>  (Kitty notification, simplified)
-    if body.starts_with(b"99;") {
-        let rest = &body[b"99;".len()..];
-        // Simplified: split on last ';', text after is the summary
-        let text = if let Some(sep) = rest.iter().rposition(|&b| b == b';') {
-            String::from_utf8_lossy(&rest[sep + 1..]).into_owned()
-        } else {
-            String::from_utf8_lossy(rest).into_owned()
-        };
-        return Some(NotificationPayload {
-            title: "Forgetty".to_string(),
-            body: text,
-            pane_name: String::new(),
-            source: Some(NotificationSource::Osc99),
-        });
-    }
-
-    // OSC 9 ; <text>  (ConEmu style)
-    // IMPORTANT: skip OSC 9;4;<percent> which is the ConEmu progress bar protocol.
-    if body.starts_with(b"9;") {
-        let rest = &body[b"9;".len()..];
-        // Skip progress bar sequences: 9;4;<n> or 9;4
-        if rest.starts_with(b"4;") || rest == b"4" {
-            return None;
-        }
-        let text = String::from_utf8_lossy(rest).into_owned();
-        return Some(NotificationPayload {
-            title: "Forgetty".to_string(),
-            body: text,
-            pane_name: String::new(),
-            source: Some(NotificationSource::Osc9),
-        });
-    }
-
-    None
 }
 
 /// Measure the cell dimensions for a monospace font using Pango.
@@ -528,7 +370,7 @@ pub fn create_terminal(
             s.viewport_offset = offset; // keep cache fresh
             let was_at_bottom = total <= len || offset + len >= total;
 
-            let DrainResult { had_data, pty_exited, notification: osc_notification } =
+            let DrainResult { had_data, pty_exited, notification: osc_notification, .. } =
                 s.drain_pty_output();
 
             // Detect alternate screen → primary screen transitions (e.g., htop exit).
@@ -785,8 +627,7 @@ pub fn create_terminal(
                         s.cursor_blink_visible = true;
                         s.last_blink_toggle = Instant::now();
                         // Suppress the shell's BEL response (zsh beeps on SIGINT).
-                        s.suppress_bell_until =
-                            Some(Instant::now() + Duration::from_millis(300));
+                        s.suppress_bell_until = Some(Instant::now() + Duration::from_millis(300));
                     }
                     return glib::Propagation::Stop;
                 }
