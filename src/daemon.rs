@@ -17,6 +17,8 @@
 //! ```
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
 use tokio::signal::unix::{signal, SignalKind};
@@ -25,7 +27,7 @@ use tracing_subscriber::EnvFilter;
 
 use forgetty_config::{load_config, Config};
 use forgetty_session::SessionManager;
-use forgetty_socket::{handlers, SocketServer};
+use forgetty_socket::SocketServer;
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -137,7 +139,7 @@ async fn main_async() -> std::io::Result<()> {
     };
 
     // Create the platform-agnostic session manager.
-    let session_manager = SessionManager::new();
+    let session_manager = Arc::new(SessionManager::new());
 
     // Resolve the socket path.
     let socket_path = args.socket_path.unwrap_or_else(default_socket_path);
@@ -147,12 +149,31 @@ async fn main_async() -> std::io::Result<()> {
 
     info!("forgetty-daemon started, socket at {}", socket_path.display());
 
-    // Spawn the socket server on the tokio executor.
-    let _socket_task = tokio::spawn(async move {
-        if let Err(e) = socket_server.run(|req| handlers::dispatch(&req)).await {
-            error!("Socket server error: {e}");
-        }
-    });
+    // Background drain loop: polls all live panes every 20ms (50 Hz).
+    // This drives the session-side VT (for get_screen) and fires
+    // SessionEvent::PtyOutput on the broadcast channel (for subscribe_output).
+    {
+        let sm = Arc::clone(&session_manager);
+        tokio::spawn(async move {
+            loop {
+                let pane_ids = sm.list_panes();
+                for id in pane_ids {
+                    let _ = sm.drain_output(id);
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+    }
+
+    // Spawn the socket server with full SessionManager integration.
+    let _socket_task = {
+        let sm = Arc::clone(&session_manager);
+        tokio::spawn(async move {
+            if let Err(e) = socket_server.run_with_streaming(sm).await {
+                error!("Socket server error: {e}");
+            }
+        })
+    };
 
     // Wait for SIGTERM (from systemd stop) or SIGINT (Ctrl-C in --foreground mode).
     let mut sigterm = signal(SignalKind::terminate())?;

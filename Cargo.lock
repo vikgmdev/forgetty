@@ -1162,11 +1162,16 @@ dependencies = [
 name = "forgetty-socket"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "bytes",
  "forgetty-core",
+ "forgetty-pty",
+ "forgetty-session",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

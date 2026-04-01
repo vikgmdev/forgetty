@@ -7,11 +7,15 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use base64::Engine as _;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tracing::{debug, error, info, warn};
 
-use crate::protocol::{Request, Response};
+use forgetty_session::{SessionEvent, SessionManager};
+
+use crate::handlers;
+use crate::protocol::{methods, Request, Response};
 
 /// The Forgetty JSON-RPC socket server.
 pub struct SocketServer {
@@ -56,6 +60,10 @@ impl SocketServer {
     /// The `handler` callback is invoked for each incoming request and must
     /// return a `Response`. The server processes line-delimited JSON on each
     /// connection.
+    ///
+    /// This method is kept for backward compatibility with the existing
+    /// round-trip test. For production use with a real `SessionManager`,
+    /// prefer `run_with_streaming`.
     pub async fn run<F>(&self, handler: F) -> std::io::Result<()>
     where
         F: Fn(Request) -> Response + Send + Sync + 'static,
@@ -82,6 +90,37 @@ impl SocketServer {
             }
         }
     }
+
+    /// Run the server with full `SessionManager` integration, including
+    /// streaming support for `subscribe_output`.
+    ///
+    /// For `subscribe_output` requests, the server validates the pane,
+    /// subscribes to the broadcast channel, sends an initial `{"ok":true}`
+    /// response, and then streams JSON notifications until the pane closes
+    /// or the client disconnects.
+    ///
+    /// All other methods are dispatched synchronously via `handlers::dispatch`.
+    pub async fn run_with_streaming(&self, sm: Arc<SessionManager>) -> std::io::Result<()> {
+        let listener = UnixListener::bind(&self.socket_path)?;
+        info!("Socket server listening on {:?}", self.socket_path);
+
+        loop {
+            match listener.accept().await {
+                Ok((stream, _addr)) => {
+                    debug!("Accepted socket connection");
+                    let sm = Arc::clone(&sm);
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_streaming_connection(stream, sm).await {
+                            warn!("Connection error: {e}");
+                        }
+                    });
+                }
+                Err(e) => {
+                    error!("Failed to accept connection: {e}");
+                }
+            }
+        }
+    }
 }
 
 impl Drop for SocketServer {
@@ -91,8 +130,14 @@ impl Drop for SocketServer {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Connection handlers
+// ---------------------------------------------------------------------------
+
 /// Handle a single client connection: read line-delimited JSON requests,
 /// dispatch them, and write back JSON responses.
+///
+/// Used by the backward-compatible `run` method.
 async fn handle_connection<F>(
     stream: tokio::net::UnixStream,
     handler: Arc<F>,
@@ -134,6 +179,165 @@ where
     Ok(())
 }
 
+/// Handle a single client connection with streaming support.
+///
+/// For `subscribe_output`: validates the pane, subscribes, sends `{"ok":true}`,
+/// then streams `output` notifications until the pane closes or the client
+/// disconnects.
+///
+/// For all other methods: delegates synchronously to `handlers::dispatch`.
+async fn handle_streaming_connection(
+    stream: tokio::net::UnixStream,
+    sm: Arc<SessionManager>,
+) -> std::io::Result<()> {
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+
+    while let Some(line) = lines.next_line().await? {
+        let line = line.trim().to_string();
+        if line.is_empty() {
+            continue;
+        }
+
+        let request = match Request::parse(&line) {
+            Ok(r) => r,
+            Err(err_response) => {
+                write_response(&mut writer, &err_response).await?;
+                continue;
+            }
+        };
+
+        debug!("Received request: method={}", request.method);
+
+        if request.method == methods::SUBSCRIBE_OUTPUT {
+            // Validate pane_id first so we can return a proper error before
+            // entering the streaming loop.
+            let pane_id_str = match request.params.get("pane_id").and_then(|v| v.as_str()) {
+                Some(s) => s.to_string(),
+                None => {
+                    let err = Response::error(
+                        request.id.clone(),
+                        crate::protocol::INVALID_PARAMS,
+                        "missing param: pane_id".to_string(),
+                    );
+                    write_response(&mut writer, &err).await?;
+                    continue;
+                }
+            };
+
+            let uuid = match uuid::Uuid::parse_str(&pane_id_str) {
+                Ok(u) => u,
+                Err(_) => {
+                    let err = Response::error(
+                        request.id.clone(),
+                        crate::protocol::INVALID_PARAMS,
+                        format!("invalid UUID: {pane_id_str}"),
+                    );
+                    write_response(&mut writer, &err).await?;
+                    continue;
+                }
+            };
+
+            let pane_id = forgetty_core::PaneId(uuid);
+
+            if sm.pane_info(pane_id).is_none() {
+                let err = Response::error(
+                    request.id.clone(),
+                    crate::protocol::INVALID_PARAMS,
+                    format!("pane not found: {pane_id_str}"),
+                );
+                write_response(&mut writer, &err).await?;
+                continue;
+            }
+
+            // Subscribe to the broadcast channel before sending the initial
+            // response so we don't miss any events that arrive during the
+            // round-trip.
+            let mut rx = sm.subscribe_output();
+
+            // Send the initial acknowledgment.
+            let ack = Response::success(request.id.clone(), serde_json::json!({ "ok": true }));
+            write_response(&mut writer, &ack).await?;
+
+            // Stream output notifications until the pane closes or the
+            // write fails (client disconnected).
+            loop {
+                match rx.recv().await {
+                    Ok(SessionEvent::PtyOutput { pane_id: evt_id, data }) => {
+                        if evt_id != pane_id {
+                            continue;
+                        }
+                        let encoded =
+                            base64::engine::general_purpose::STANDARD.encode(&data[..]);
+                        let notification = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "method": "output",
+                            "params": {
+                                "pane_id": pane_id.to_string(),
+                                "data": encoded,
+                            }
+                        });
+                        let mut out = serde_json::to_string(&notification)
+                            .unwrap_or_else(|_| "{}".to_string());
+                        out.push('\n');
+                        if writer.write_all(out.as_bytes()).await.is_err() {
+                            break;
+                        }
+                        if writer.flush().await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(SessionEvent::PaneClosed { pane_id: closed_id }) => {
+                        if closed_id == pane_id {
+                            // Pane exited — end the stream.
+                            break;
+                        }
+                    }
+                    Ok(_) => {
+                        // Other events (PaneCreated, Notification) are not
+                        // forwarded to subscribe_output clients.
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // Consumer fell behind; continue from here.
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        // Channel shut down (daemon exiting).
+                        break;
+                    }
+                }
+            }
+
+            // Connection ends after subscribe_output stream terminates.
+            return Ok(());
+        }
+
+        // Synchronous handler for all other methods.
+        let response = handlers::dispatch(&request, Arc::clone(&sm));
+        write_response(&mut writer, &response).await?;
+    }
+
+    debug!("Client disconnected");
+    Ok(())
+}
+
+/// Serialize and write a JSON-RPC response as a newline-terminated line.
+async fn write_response(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    response: &Response,
+) -> std::io::Result<()> {
+    let mut out = serde_json::to_string(response).unwrap_or_else(|e| {
+        let fallback = Response::error(
+            None,
+            crate::protocol::INTERNAL_ERROR,
+            format!("Failed to serialize response: {e}"),
+        );
+        serde_json::to_string(&fallback).expect("fallback must serialize")
+    });
+    out.push('\n');
+    writer.write_all(out.as_bytes()).await?;
+    writer.flush().await
+}
+
 /// Determine the default socket path.
 fn default_socket_path() -> PathBuf {
     if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
@@ -143,9 +347,14 @@ fn default_socket_path() -> PathBuf {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use forgetty_session::SessionManager;
 
     #[test]
     fn default_socket_path_with_xdg() {
@@ -169,10 +378,14 @@ mod tests {
         let _server = SocketServer { socket_path: sock_path.clone() };
 
         let listener = UnixListener::bind(&sock_path).unwrap();
+        let sm = Arc::new(SessionManager::new());
 
         // Spawn server accept loop in background.
         let handle = tokio::spawn(async move {
-            let handler = Arc::new(|req: Request| crate::handlers::dispatch(&req));
+            let sm_inner = Arc::clone(&sm);
+            let handler = Arc::new(move |req: Request| {
+                handlers::dispatch(&req, Arc::clone(&sm_inner))
+            });
             let (stream, _) = listener.accept().await.unwrap();
             handle_connection(stream, handler).await.unwrap();
         });

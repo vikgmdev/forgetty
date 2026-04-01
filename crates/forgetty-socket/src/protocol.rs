@@ -97,6 +97,7 @@ pub mod methods {
     pub const SEND_INPUT: &str = "send_input";
     pub const GET_SCREEN: &str = "get_screen";
     pub const GET_PANE_INFO: &str = "get_pane_info";
+    pub const SUBSCRIBE_OUTPUT: &str = "subscribe_output";
 }
 
 #[cfg(test)]
