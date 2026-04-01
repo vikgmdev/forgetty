@@ -221,7 +221,7 @@ async fn handle_streaming_connection(
                         "missing param: pane_id".to_string(),
                     );
                     write_response(&mut writer, &err).await?;
-                    continue;
+                    return Ok(());
                 }
             };
 
@@ -234,7 +234,7 @@ async fn handle_streaming_connection(
                         format!("invalid UUID: {pane_id_str}"),
                     );
                     write_response(&mut writer, &err).await?;
-                    continue;
+                    return Ok(());
                 }
             };
 
@@ -247,7 +247,7 @@ async fn handle_streaming_connection(
                     format!("pane not found: {pane_id_str}"),
                 );
                 write_response(&mut writer, &err).await?;
-                continue;
+                return Ok(());
             }
 
             // Subscribe to the broadcast channel before sending the initial
