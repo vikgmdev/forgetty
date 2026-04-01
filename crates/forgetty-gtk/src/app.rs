@@ -454,10 +454,14 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions, dae
     // All action closures that create terminals capture a clone of this Rc.
     let shared_config: SharedConfig = Rc::new(RefCell::new(config.clone()));
 
-    // --- Appearance sidebar (right panel, built after shared state is ready) ---
+    // --- Settings sidebar (right panel, built after shared state is ready) ---
     // Use the workspace manager for config apply so it hits all workspaces.
-    let appearance_revealer =
-        preferences::build_appearance_sidebar(&shared_config, &tab_states, &window);
+    let appearance_revealer = preferences::build_appearance_sidebar(
+        &shared_config,
+        &tab_states,
+        &window,
+        daemon_client.clone(),
+    );
     main_area.append(&appearance_revealer);
 
     // --- Command palette overlay (built after workspace_manager is ready) ---

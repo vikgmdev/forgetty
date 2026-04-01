@@ -100,6 +100,10 @@ pub mod methods {
     pub const SUBSCRIBE_OUTPUT: &str = "subscribe_output";
     pub const RESIZE_PANE: &str = "resize_pane";
     pub const SEND_SIGINT: &str = "send_sigint";
+    // Sync / pairing methods (T-052).
+    pub const LIST_DEVICES: &str = "list_devices";
+    pub const REVOKE_DEVICE: &str = "revoke_device";
+    pub const GET_PAIRING_INFO: &str = "get_pairing_info";
 }
 
 #[cfg(test)]

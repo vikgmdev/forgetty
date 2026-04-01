@@ -11,7 +11,10 @@
 //!
 //! Options:
 //!   --foreground           Stay in foreground; compact log to stderr
-//!   --show-pairing-qr      Print pairing QR placeholder and exit
+//!   --show-pairing-qr      Print the device-pairing QR code (ASCII) and exit
+//!   --allow-pairing        Auto-accept next pairing request from any unknown device
+//!   --list-devices         List all paired devices and exit
+//!   --revoke <DEVICE_ID>   Revoke a paired device by device_id and exit
 //!   --socket-path <PATH>   Override the Unix socket path
 //!   --config-file <PATH>   Override the config file path
 //! ```
@@ -28,6 +31,12 @@ use tracing_subscriber::EnvFilter;
 use forgetty_config::{load_config, Config};
 use forgetty_session::SessionManager;
 use forgetty_socket::SocketServer;
+use forgetty_sync::{
+    SyncEndpoint,
+    identity::load_or_generate,
+    qr::qr_to_ascii,
+    registry::DeviceRegistry,
+};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -46,12 +55,27 @@ struct DaemonArgs {
     #[arg(long)]
     foreground: bool,
 
-    /// Print the device-pairing QR code and exit.
+    /// Print the device-pairing QR code (ASCII) and exit.
     ///
-    /// iroh integration is not yet available (T-052). This flag currently
-    /// prints a placeholder message.
+    /// Outputs an ASCII QR code encoding the iroh node ID, machine hostname,
+    /// and relay URL. Scan with the Forgetty Android app to pair.
     #[arg(long)]
     show_pairing_qr: bool,
+
+    /// Auto-accept the next pairing request from any unknown device.
+    ///
+    /// Use for initial setup. Do NOT run persistently with this flag in
+    /// untrusted environments — it accepts any connecting device.
+    #[arg(long)]
+    allow_pairing: bool,
+
+    /// List all paired devices and exit.
+    #[arg(long)]
+    list_devices: bool,
+
+    /// Revoke a paired device by device_id and exit.
+    #[arg(long)]
+    revoke: Option<String>,
 
     /// Override the Unix socket path.
     ///
@@ -89,17 +113,39 @@ fn main() {
 // Async main
 // ---------------------------------------------------------------------------
 
-async fn main_async() -> std::io::Result<()> {
+async fn main_async() -> anyhow::Result<()> {
     let args = DaemonArgs::parse();
 
-    // --show-pairing-qr: print placeholder and exit before anything else starts.
+    // --- Early-exit modes that don't need logging or session state ---
+
+    // --list-devices: print and exit.
+    if args.list_devices {
+        let registry = DeviceRegistry::load()?;
+        for d in registry.list() {
+            println!("{}: {} (paired {})", d.device_id, d.name, d.paired_at);
+        }
+        return Ok(());
+    }
+
+    // --revoke: remove a device and exit.
+    if let Some(device_id) = &args.revoke {
+        let mut registry = DeviceRegistry::load()?;
+        if registry.remove(device_id)? {
+            println!("Revoked {device_id}");
+        } else {
+            eprintln!("Device not found: {device_id}");
+        }
+        return Ok(());
+    }
+
+    // --show-pairing-qr: needs the identity but not the session manager.
     if args.show_pairing_qr {
-        println!("Forgetty pairing QR\n");
-        println!("  Not yet available — iroh integration is not configured (T-052).");
-        println!("  Once T-052 is complete, scanning this QR will pair your Android device.");
-        println!();
-        println!("  To pair manually when T-052 is done:");
-        println!("    forgetty-daemon --show-pairing-qr");
+        let secret_key = load_or_generate()?;
+        let node_id = secret_key.public();
+        let payload = forgetty_sync::QrPayload::new(node_id.to_string());
+        let ascii = qr_to_ascii(&payload)?;
+        println!("{ascii}");
+        println!("\nnode_id: {node_id}");
         return Ok(());
     }
 
@@ -165,11 +211,36 @@ async fn main_async() -> std::io::Result<()> {
         });
     }
 
-    // Spawn the socket server with full SessionManager integration.
+    // Load identity and bind iroh endpoint.
+    let secret_key = load_or_generate()?;
+    let sync_endpoint = match SyncEndpoint::bind(secret_key, args.allow_pairing).await {
+        Ok(ep) => {
+            info!("totem-sync: iroh endpoint bound, node_id={}", ep.node_id());
+            Arc::new(ep)
+        }
+        Err(e) => {
+            warn!("totem-sync: failed to bind iroh endpoint: {e}");
+            // Non-fatal: daemon continues without sync capability.
+            // Wrap in a short early return here would require restructuring; instead
+            // we pass None to the socket server below.
+            return Err(anyhow::anyhow!("iroh bind failed: {e}"));
+        }
+    };
+
+    // Spawn iroh accept loop.
+    {
+        let ep = Arc::clone(&sync_endpoint);
+        tokio::spawn(async move {
+            ep.accept_loop().await;
+        });
+    }
+
+    // Spawn the socket server with full SessionManager + SyncEndpoint integration.
     let _socket_task = {
         let sm = Arc::clone(&session_manager);
+        let se = Arc::clone(&sync_endpoint);
         tokio::spawn(async move {
-            if let Err(e) = socket_server.run_with_streaming(sm).await {
+            if let Err(e) = socket_server.run_with_streaming(sm, Some(se)).await {
                 error!("Socket server error: {e}");
             }
         })

@@ -40,6 +40,24 @@ pub struct PaneInfo {
     pub title: String,
 }
 
+/// Information about a single paired device (from `list_devices` RPC).
+#[derive(Debug, Clone)]
+pub struct DeviceInfo {
+    pub device_id: String,
+    pub name: String,
+    pub paired_at: String,
+    pub last_seen: Option<String>,
+}
+
+/// QR pairing information returned by `get_pairing_info` RPC.
+#[derive(Debug, Clone)]
+pub struct PairingInfo {
+    pub node_id: String,
+    pub machine: String,
+    /// Base64-encoded PNG bytes of the QR code image.
+    pub qr_png_base64: String,
+}
+
 /// Error type for daemon client operations.
 #[derive(Debug)]
 pub struct DaemonError(pub String);
@@ -233,6 +251,55 @@ impl DaemonClient {
             .unwrap_or(0) as usize;
 
         Ok(ScreenSnapshot { lines, cursor_row, cursor_col })
+    }
+
+    // -----------------------------------------------------------------------
+    // Sync / pairing API (T-052)
+    // -----------------------------------------------------------------------
+
+    /// List all paired devices from the daemon.
+    pub fn list_devices(&self) -> Result<Vec<DeviceInfo>, DaemonError> {
+        let result = self.rpc("list_devices", serde_json::json!({}))?;
+        let devs = result
+            .get("devices")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| DaemonError("list_devices: missing devices array".into()))?;
+
+        let mut infos = Vec::new();
+        for d in devs {
+            let device_id = d
+                .get("device_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let name = d.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let paired_at =
+                d.get("paired_at").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let last_seen = d.get("last_seen").and_then(|v| v.as_str()).map(|s| s.to_string());
+            infos.push(DeviceInfo { device_id, name, paired_at, last_seen });
+        }
+        Ok(infos)
+    }
+
+    /// Revoke a paired device by its `device_id`.
+    pub fn revoke_device(&self, device_id: &str) -> Result<(), DaemonError> {
+        self.rpc("revoke_device", serde_json::json!({ "device_id": device_id }))?;
+        Ok(())
+    }
+
+    /// Get the current pairing info (node ID + QR PNG as base64).
+    pub fn get_pairing_info(&self) -> Result<PairingInfo, DaemonError> {
+        let result = self.rpc("get_pairing_info", serde_json::json!({}))?;
+        let node_id =
+            result.get("node_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let machine =
+            result.get("machine").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let qr_png_base64 = result
+            .get("qr_png_base64")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| DaemonError("get_pairing_info: missing qr_png_base64".into()))?
+            .to_string();
+        Ok(PairingInfo { node_id, machine, qr_png_base64 })
     }
 
     /// Open a `subscribe_output` stream for a pane.

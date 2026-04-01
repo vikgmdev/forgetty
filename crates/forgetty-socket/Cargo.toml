@@ -8,6 +8,7 @@ license.workspace = true
 forgetty-core = { path = "../forgetty-core" }
 forgetty-pty = { path = "../forgetty-pty" }
 forgetty-session = { path = "../forgetty-session" }
+forgetty-sync = { path = "../forgetty-sync" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -15,6 +16,7 @@ tracing = { workspace = true }
 base64 = "0.22"
 bytes = "1"
 uuid = { workspace = true }
+hostname = "0.4"
 
 [dev-dependencies]
 tokio = { workspace = true }
