@@ -77,6 +77,11 @@ name = "forgetty-pair-test"
 path = "src/pair_test.rs"
 required-features = ["qa-tools"]
 
+[[bin]]
+name = "forgetty-stream-test"
+path = "src/stream_test.rs"
+required-features = ["qa-tools"]
+
 [features]
 qa-tools = []
 
@@ -96,3 +101,5 @@ anyhow = "1"
 dirs = { workspace = true }
 iroh = { workspace = true }
 rand = { workspace = true }
+rmp-serde = "1"
+serde_bytes = "0.11"

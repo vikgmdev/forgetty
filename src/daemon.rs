@@ -213,7 +213,7 @@ async fn main_async() -> anyhow::Result<()> {
 
     // Load identity and bind iroh endpoint.
     let secret_key = load_or_generate()?;
-    let sync_endpoint = match SyncEndpoint::bind(secret_key, args.allow_pairing).await {
+    let sync_endpoint = match SyncEndpoint::bind(secret_key, args.allow_pairing, Arc::clone(&session_manager)).await {
         Ok(ep) => {
             info!("totem-sync: iroh endpoint bound, node_id={}", ep.node_id());
             Arc::new(ep)
