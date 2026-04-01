@@ -1099,6 +1099,7 @@ dependencies = [
  "forgetty-config",
  "forgetty-core",
  "forgetty-pty",
+ "forgetty-session",
  "forgetty-vt",
  "forgetty-watcher",
  "forgetty-workspace",
@@ -1137,6 +1138,21 @@ dependencies = [
  "tracing",
  "wgpu",
  "winit",
+]
+
+[[package]]
+name = "forgetty-session"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "forgetty-core",
+ "forgetty-pty",
+ "forgetty-vt",
+ "forgetty-workspace",
+ "serde",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

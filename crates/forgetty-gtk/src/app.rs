@@ -3605,16 +3605,8 @@ struct CommandEntry {
 /// (terminal-inspector) are excluded.
 fn command_registry() -> &'static [CommandEntry] {
     static COMMANDS: &[CommandEntry] = &[
-        CommandEntry {
-            display_name: "Copy",
-            action_name: "win.copy",
-            shortcut_label: "Ctrl+C",
-        },
-        CommandEntry {
-            display_name: "Paste",
-            action_name: "win.paste",
-            shortcut_label: "Ctrl+V",
-        },
+        CommandEntry { display_name: "Copy", action_name: "win.copy", shortcut_label: "Ctrl+C" },
+        CommandEntry { display_name: "Paste", action_name: "win.paste", shortcut_label: "Ctrl+V" },
         CommandEntry {
             display_name: "New Window",
             action_name: "win.new-window",
