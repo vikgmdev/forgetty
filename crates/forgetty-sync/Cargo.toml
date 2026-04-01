@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 forgetty-core = { path = "../forgetty-core" }
+forgetty-session = { path = "../forgetty-session" }
 # iroh 0.97 (latest stable). The spec was written for 0.35; API diverged significantly.
 # Key differences documented in src/endpoint.rs.
 iroh = { version = "0.97", default-features = false, features = ["metrics", "portmapper"] }
@@ -17,7 +18,11 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 dirs = { workspace = true }
 thiserror = { workspace = true }
+uuid = { workspace = true }
 rand = "0.9"
 base64 = "0.22"
 hostname = "0.4"
 anyhow = "1"
+bytes = "1"
+rmp-serde = "1"
+serde_bytes = "0.11"

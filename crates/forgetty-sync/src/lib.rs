@@ -18,6 +18,7 @@ pub mod identity;
 pub mod pairing;
 pub mod qr;
 pub mod registry;
+pub mod stream;
 
 pub use endpoint::{SyncEndpoint, SyncEvent};
 pub use identity::load_or_generate;
