@@ -1,17 +1,20 @@
-//! Appearance sidebar for live visual configuration editing.
+//! Settings sidebar for live visual configuration editing and device pairing.
 //!
-//! Provides an in-window sidebar (right-panel) with Theme, Font Family, and
-//! Font Size dropdowns. All changes apply immediately with live preview and
-//! are saved to disk.
+//! Provides an in-window sidebar (right-panel) with Theme, Font Family, Font
+//! Size dropdowns, and a Paired Devices / QR pairing section. All appearance
+//! changes apply immediately with live preview and are saved to disk.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 
+use base64::Engine as _;
 use forgetty_config::{load_theme_by_name, load_theme_catalog, save_config, Config};
 use gtk4::prelude::*;
 use libadwaita as adw;
 
+use crate::daemon_client::DaemonClient;
 use crate::terminal::{self, TerminalState};
 
 /// Shared config state, matching the type alias in `app.rs`.
@@ -20,7 +23,7 @@ type SharedConfig = Rc<RefCell<Config>>;
 /// Pane state map, matching the type alias in `app.rs`.
 type TabStateMap = Rc<RefCell<HashMap<String, Rc<RefCell<TerminalState>>>>>;
 
-/// Build the Appearance sidebar as a `gtk4::Revealer`.
+/// Build the Settings sidebar as a `gtk4::Revealer`.
 ///
 /// The revealer uses `SlideLeft` transition and starts hidden. The caller
 /// places it in the layout and connects a menu action to toggle visibility.
@@ -30,10 +33,14 @@ type TabStateMap = Rc<RefCell<HashMap<String, Rc<RefCell<TerminalState>>>>>;
 /// - Enter to confirm (save to config.toml).
 /// - Escape to revert to the original theme.
 /// - Close sidebar (X button or toggle) also reverts if no Enter was pressed.
+///
+/// `daemon_client` is used to populate the "Paired Devices" sync section.
+/// Pass `None` if the daemon is unavailable.
 pub fn build_appearance_sidebar(
     shared_config: &SharedConfig,
     tab_states: &TabStateMap,
     window: &adw::ApplicationWindow,
+    daemon_client: Option<Arc<DaemonClient>>,
 ) -> gtk4::Revealer {
     let revealer = gtk4::Revealer::new();
     revealer.set_transition_type(gtk4::RevealerTransitionType::None);
@@ -60,7 +67,7 @@ pub fn build_appearance_sidebar(
     title_bar.set_margin_start(12);
     title_bar.set_margin_end(12);
 
-    let title_label = gtk4::Label::new(Some("Appearance"));
+    let title_label = gtk4::Label::new(Some("Settings"));
     title_label.add_css_class("title-3");
     title_label.set_halign(gtk4::Align::Start);
     title_label.set_hexpand(true);
@@ -102,6 +109,10 @@ pub fn build_appearance_sidebar(
     let font_size_section =
         build_font_size_section(&current_config, shared_config, tab_states, window);
     content_box.append(&font_size_section);
+
+    // --- Sync / Paired Devices section ---
+    let sync_section = build_sync_section(daemon_client);
+    content_box.append(&sync_section);
 
     // Wrap content in a ScrolledWindow for long option lists.
     let scrolled_sidebar = gtk4::ScrolledWindow::new();
@@ -370,6 +381,208 @@ fn build_font_size_section(
 
     section.append(&dropdown);
     section
+}
+
+// ---------------------------------------------------------------------------
+// Sync / Paired Devices section
+// ---------------------------------------------------------------------------
+
+/// Build the "Paired Devices" sync section.
+///
+/// Shows a list of paired devices with Revoke buttons and a "Pair new device"
+/// button that displays the QR code. If `daemon_client` is `None`, shows a
+/// placeholder message.
+pub fn build_sync_section(daemon_client: Option<Arc<DaemonClient>>) -> gtk4::Box {
+    let section = make_section_box();
+
+    let label = make_section_label("Paired Devices");
+    section.append(&label);
+
+    let separator = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+    separator.set_margin_bottom(8);
+    section.append(&separator);
+
+    let Some(dc) = daemon_client else {
+        let placeholder = gtk4::Label::new(Some("Daemon not connected"));
+        placeholder.set_halign(gtk4::Align::Start);
+        placeholder.set_margin_start(4);
+        section.append(&placeholder);
+        return section;
+    };
+
+    // Container that shows either the device list or the QR code view.
+    let stack = gtk4::Stack::new();
+    stack.set_transition_type(gtk4::StackTransitionType::None);
+
+    // --- Device list page ---
+    let list_page = build_device_list_page(Arc::clone(&dc), &stack);
+    stack.add_named(&list_page, Some("devices"));
+
+    // Show "pair new device" button below the stack on the devices page.
+    section.append(&stack);
+
+    // Pair new device button.
+    let pair_btn = gtk4::Button::with_label("Pair new device");
+    pair_btn.add_css_class("suggested-action");
+    pair_btn.set_margin_top(8);
+    pair_btn.set_halign(gtk4::Align::Start);
+    {
+        let stack_clone = stack.clone();
+        let dc_btn = Arc::clone(&dc);
+        pair_btn.connect_clicked(move |_| {
+            show_qr_view(&stack_clone, Arc::clone(&dc_btn));
+        });
+    }
+    section.append(&pair_btn);
+
+    section
+}
+
+/// Build the device list page for the stack.
+fn build_device_list_page(dc: Arc<DaemonClient>, _stack: &gtk4::Stack) -> gtk4::Box {
+    let page = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+
+    // Populate the list with current devices.
+    let devices = dc.list_devices().unwrap_or_default();
+
+    if devices.is_empty() {
+        let lbl = gtk4::Label::new(Some("No paired devices"));
+        lbl.set_halign(gtk4::Align::Start);
+        lbl.add_css_class("dim-label");
+        lbl.set_margin_start(4);
+        page.append(&lbl);
+    } else {
+        let list_box = gtk4::ListBox::new();
+        list_box.add_css_class("boxed-list");
+        list_box.set_selection_mode(gtk4::SelectionMode::None);
+
+        for device in devices {
+            let row_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+            row_box.set_margin_top(4);
+            row_box.set_margin_bottom(4);
+            row_box.set_margin_start(8);
+            row_box.set_margin_end(8);
+
+            let last_seen_text = device
+                .last_seen
+                .as_deref()
+                .unwrap_or("never");
+            let label_text = format!("{}  —  last seen: {}", device.name, last_seen_text);
+            let dev_label = gtk4::Label::new(Some(&label_text));
+            dev_label.set_halign(gtk4::Align::Start);
+            dev_label.set_hexpand(true);
+            dev_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+            row_box.append(&dev_label);
+
+            let revoke_btn = gtk4::Button::with_label("Revoke");
+            revoke_btn.add_css_class("destructive-action");
+            revoke_btn.add_css_class("flat");
+            {
+                let dc_rev = Arc::clone(&dc);
+                let device_id = device.device_id.clone();
+                let row_box_ref = row_box.clone();
+                revoke_btn.connect_clicked(move |_| {
+                    if let Err(e) = dc_rev.revoke_device(&device_id) {
+                        tracing::warn!("revoke_device failed: {e}");
+                    }
+                    // Remove the row from the parent widget (hide immediately).
+                    if let Some(parent) = row_box_ref.parent() {
+                        if let Some(lb) = parent.downcast_ref::<gtk4::ListBox>() {
+                            if let Some(row) = row_box_ref.parent().and_then(|p| p.parent()) {
+                                lb.remove(&row);
+                            }
+                        }
+                    }
+                });
+            }
+            row_box.append(&revoke_btn);
+
+            let row = gtk4::ListBoxRow::new();
+            row.set_child(Some(&row_box));
+            list_box.append(&row);
+        }
+
+        page.append(&list_box);
+    }
+
+    page
+}
+
+/// Switch the stack to show the QR code view.
+fn show_qr_view(stack: &gtk4::Stack, dc: Arc<DaemonClient>) {
+    // Fetch pairing info from daemon.
+    let info = match dc.get_pairing_info() {
+        Ok(i) => i,
+        Err(e) => {
+            tracing::warn!("get_pairing_info failed: {e}");
+            return;
+        }
+    };
+
+    // Decode QR PNG from base64.
+    let png_bytes = match base64::engine::general_purpose::STANDARD.decode(&info.qr_png_base64) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!("QR base64 decode failed: {e}");
+            return;
+        }
+    };
+
+    // Create GTK image from PNG bytes via gdk_pixbuf.
+    let bytes = gtk4::glib::Bytes::from(&png_bytes);
+    let stream = gtk4::gio::MemoryInputStream::from_bytes(&bytes);
+    let pixbuf = match gdk_pixbuf::Pixbuf::from_stream(
+        &stream,
+        gtk4::gio::Cancellable::NONE,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("Pixbuf::from_stream failed: {e}");
+            return;
+        }
+    };
+
+    // Convert Pixbuf → Texture → Paintable to avoid the deprecated from_pixbuf path.
+    let texture = gtk4::gdk::Texture::for_pixbuf(&pixbuf);
+    let qr_image = gtk4::Image::from_paintable(Some(&texture));
+    qr_image.set_pixel_size(250);
+
+    // Truncate node_id to 16 chars for display.
+    let node_id_short = if info.node_id.len() > 16 {
+        format!("{}…", &info.node_id[..16])
+    } else {
+        info.node_id.clone()
+    };
+    let node_label = gtk4::Label::new(Some(&format!("node: {node_id_short}")));
+    node_label.add_css_class("monospace");
+    node_label.add_css_class("dim-label");
+    node_label.set_margin_top(4);
+
+    let done_btn = gtk4::Button::with_label("Done");
+    done_btn.set_margin_top(8);
+    done_btn.set_halign(gtk4::Align::Start);
+
+    let qr_page = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+    qr_page.append(&qr_image);
+    qr_page.append(&node_label);
+    qr_page.append(&done_btn);
+
+    // Remove previous QR page if any, then add and show.
+    if stack.child_by_name("qr").is_some() {
+        if let Some(old) = stack.child_by_name("qr") {
+            stack.remove(&old);
+        }
+    }
+    stack.add_named(&qr_page, Some("qr"));
+    stack.set_visible_child_name("qr");
+
+    // Done button: go back to devices view.
+    {
+        let stack_done = stack.clone();
+        done_btn.connect_clicked(move |_| {
+            stack_done.set_visible_child_name("devices");
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------

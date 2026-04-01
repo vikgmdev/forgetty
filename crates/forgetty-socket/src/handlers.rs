@@ -11,6 +11,7 @@ use base64::Engine as _;
 use forgetty_core::PaneId;
 use forgetty_pty::PtySize;
 use forgetty_session::SessionManager;
+use forgetty_sync::SyncEndpoint;
 use uuid::Uuid;
 
 use crate::protocol::{self, methods, Request, Response};
@@ -27,7 +28,14 @@ const DEFAULT_COLS: u16 = 80;
 ///
 /// `subscribe_output` is intentionally absent here — it is handled in the
 /// streaming path in `server.rs` before `dispatch` is called.
-pub fn dispatch(request: &Request, sm: Arc<SessionManager>) -> Response {
+///
+/// `sync_endpoint` is `None` when the daemon was started without iroh support;
+/// sync-related methods return a graceful `METHOD_NOT_FOUND` in that case.
+pub fn dispatch(
+    request: &Request,
+    sm: Arc<SessionManager>,
+    sync_endpoint: Option<Arc<SyncEndpoint>>,
+) -> Response {
     match request.method.as_str() {
         methods::LIST_TABS => handle_list_tabs(request, &sm),
         methods::NEW_TAB => handle_new_tab(request, &sm),
@@ -39,6 +47,10 @@ pub fn dispatch(request: &Request, sm: Arc<SessionManager>) -> Response {
         methods::GET_PANE_INFO => handle_get_pane_info(request, &sm),
         methods::RESIZE_PANE => handle_resize_pane(request, &sm),
         methods::SEND_SIGINT => handle_send_sigint(request, &sm),
+        // Sync / pairing methods — require sync_endpoint.
+        methods::LIST_DEVICES => handle_list_devices(request, sync_endpoint.as_deref()),
+        methods::REVOKE_DEVICE => handle_revoke_device(request, sync_endpoint.as_deref()),
+        methods::GET_PAIRING_INFO => handle_get_pairing_info(request, sync_endpoint.as_deref()),
         _ => Response::error(
             request.id.clone(),
             protocol::METHOD_NOT_FOUND,
@@ -348,6 +360,103 @@ fn handle_send_sigint(request: &Request, sm: &SessionManager) -> Response {
 }
 
 // ---------------------------------------------------------------------------
+// Sync / pairing handlers (T-052)
+// ---------------------------------------------------------------------------
+
+/// Return a "sync not available" error when the daemon was started without iroh.
+fn sync_unavailable(request: &Request) -> Response {
+    Response::error(
+        request.id.clone(),
+        protocol::METHOD_NOT_FOUND,
+        "sync endpoint not available (daemon started without --allow-pairing?)".to_string(),
+    )
+}
+
+fn handle_list_devices(request: &Request, se: Option<&SyncEndpoint>) -> Response {
+    let Some(se) = se else { return sync_unavailable(request) };
+    let registry = se.registry();
+    let reg = registry.lock().unwrap();
+    let devices: Vec<serde_json::Value> = reg
+        .list()
+        .iter()
+        .map(|d| {
+            serde_json::json!({
+                "device_id": d.device_id,
+                "name": d.name,
+                "paired_at": d.paired_at,
+                "last_seen": d.last_seen,
+            })
+        })
+        .collect();
+    Response::success(request.id.clone(), serde_json::json!({ "devices": devices }))
+}
+
+fn handle_revoke_device(request: &Request, se: Option<&SyncEndpoint>) -> Response {
+    let Some(se) = se else { return sync_unavailable(request) };
+
+    let device_id = match request.params.get("device_id").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            return Response::error(
+                request.id.clone(),
+                protocol::INVALID_PARAMS,
+                "missing param: device_id".to_string(),
+            )
+        }
+    };
+
+    let registry = se.registry();
+    let mut reg = registry.lock().unwrap();
+    match reg.remove(&device_id) {
+        Ok(found) => {
+            if found {
+                // Emit revoke event (best-effort; ignore if no receivers).
+                let _ = se.event_tx.send(forgetty_sync::SyncEvent::DeviceRevoked {
+                    device_id: device_id.clone(),
+                });
+            }
+            Response::success(request.id.clone(), serde_json::json!({ "ok": found }))
+        }
+        Err(e) => Response::error(
+            request.id.clone(),
+            protocol::INTERNAL_ERROR,
+            format!("failed to revoke device: {e}"),
+        ),
+    }
+}
+
+fn handle_get_pairing_info(request: &Request, se: Option<&SyncEndpoint>) -> Response {
+    let Some(se) = se else { return sync_unavailable(request) };
+
+    let node_id = se.node_id().to_string();
+    let machine = hostname::get()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "unknown".to_string());
+
+    let payload = forgetty_sync::QrPayload::new(node_id.clone());
+    let png_bytes = match forgetty_sync::qr::qr_to_png(&payload, 8) {
+        Ok(b) => b,
+        Err(e) => {
+            return Response::error(
+                request.id.clone(),
+                protocol::INTERNAL_ERROR,
+                format!("QR PNG generation failed: {e}"),
+            )
+        }
+    };
+
+    let qr_b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
+    Response::success(
+        request.id.clone(),
+        serde_json::json!({
+            "node_id": node_id,
+            "machine": machine,
+            "qr_png_base64": qr_b64,
+        }),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
 
@@ -372,7 +481,7 @@ mod tests {
     #[test]
     fn dispatch_list_tabs_empty() {
         let sm = make_sm();
-        let resp = dispatch(&make_request("list_tabs"), sm);
+        let resp = dispatch(&make_request("list_tabs"), sm, None);
         assert!(resp.result.is_some());
         assert!(resp.error.is_none());
         let tabs = resp.result.unwrap()["tabs"].as_array().unwrap().len();
@@ -382,7 +491,7 @@ mod tests {
     #[test]
     fn dispatch_focus_tab_stub() {
         let sm = make_sm();
-        let resp = dispatch(&make_request("focus_tab"), sm);
+        let resp = dispatch(&make_request("focus_tab"), sm, None);
         assert!(resp.result.is_some());
         assert_eq!(resp.result.unwrap()["ok"], true);
     }
@@ -390,14 +499,14 @@ mod tests {
     #[test]
     fn dispatch_split_pane_stub() {
         let sm = make_sm();
-        let resp = dispatch(&make_request("split_pane"), sm);
+        let resp = dispatch(&make_request("split_pane"), sm, None);
         assert!(resp.result.is_some());
     }
 
     #[test]
     fn dispatch_unknown_method() {
         let sm = make_sm();
-        let resp = dispatch(&make_request("nonexistent"), sm);
+        let resp = dispatch(&make_request("nonexistent"), sm, None);
         assert!(resp.error.is_some());
         assert_eq!(resp.error.unwrap().code, protocol::METHOD_NOT_FOUND);
     }
@@ -411,7 +520,7 @@ mod tests {
             params: serde_json::Value::Null,
             id: Some(serde_json::json!("abc-123")),
         };
-        let resp = dispatch(&req, sm);
+        let resp = dispatch(&req, sm, None);
         assert_eq!(resp.id, Some(serde_json::json!("abc-123")));
     }
 
@@ -424,7 +533,7 @@ mod tests {
             params: serde_json::json!({ "data": "dGVzdAo=" }),
             id: Some(serde_json::json!(1)),
         };
-        let resp = dispatch(&req, sm);
+        let resp = dispatch(&req, sm, None);
         assert!(resp.error.is_some());
         assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
     }
@@ -438,7 +547,7 @@ mod tests {
             params: serde_json::json!({ "pane_id": "not-a-uuid", "data": "dGVzdAo=" }),
             id: Some(serde_json::json!(1)),
         };
-        let resp = dispatch(&req, sm);
+        let resp = dispatch(&req, sm, None);
         assert!(resp.error.is_some());
         assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
     }
@@ -455,7 +564,7 @@ mod tests {
             }),
             id: Some(serde_json::json!(1)),
         };
-        let resp = dispatch(&req, sm);
+        let resp = dispatch(&req, sm, None);
         assert!(resp.error.is_some());
         assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
     }
@@ -473,7 +582,7 @@ mod tests {
             params: serde_json::json!({ "pane_id": id.to_string(), "data": "!!!notbase64!!!" }),
             id: Some(serde_json::json!(1)),
         };
-        let resp = dispatch(&req, Arc::clone(&sm));
+        let resp = dispatch(&req, Arc::clone(&sm), None);
         assert!(resp.error.is_some());
         assert_eq!(resp.error.as_ref().unwrap().code, protocol::INVALID_PARAMS);
 
@@ -489,7 +598,7 @@ mod tests {
             params: serde_json::json!({ "pane_id": "00000000-0000-0000-0000-000000000000" }),
             id: Some(serde_json::json!(1)),
         };
-        let resp = dispatch(&req, sm);
+        let resp = dispatch(&req, sm, None);
         assert!(resp.error.is_some());
         assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
     }
@@ -503,7 +612,7 @@ mod tests {
             params: serde_json::json!({ "pane_id": "00000000-0000-0000-0000-000000000000" }),
             id: Some(serde_json::json!(1)),
         };
-        let resp = dispatch(&req, sm);
+        let resp = dispatch(&req, sm, None);
         assert!(resp.error.is_some());
         assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
     }
@@ -517,7 +626,7 @@ mod tests {
             params: serde_json::json!({ "pane_id": "00000000-0000-0000-0000-000000000000" }),
             id: Some(serde_json::json!(1)),
         };
-        let resp = dispatch(&req, sm);
+        let resp = dispatch(&req, sm, None);
         assert!(resp.error.is_some());
         assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
     }

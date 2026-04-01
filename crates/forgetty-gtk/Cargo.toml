@@ -14,6 +14,7 @@ forgetty-watcher = { path = "../forgetty-watcher" }
 forgetty-workspace = { path = "../forgetty-workspace" }
 gtk4 = { workspace = true }
 libadwaita = { workspace = true }
+gdk-pixbuf = "0.20"
 pangocairo = "0.20"
 toml = { workspace = true }
 tracing = { workspace = true }

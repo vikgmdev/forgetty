@@ -13,6 +13,7 @@ use tokio::net::UnixListener;
 use tracing::{debug, error, info, warn};
 
 use forgetty_session::{SessionEvent, SessionManager};
+use forgetty_sync::SyncEndpoint;
 
 use crate::handlers;
 use crate::protocol::{methods, Request, Response};
@@ -100,7 +101,14 @@ impl SocketServer {
     /// or the client disconnects.
     ///
     /// All other methods are dispatched synchronously via `handlers::dispatch`.
-    pub async fn run_with_streaming(&self, sm: Arc<SessionManager>) -> std::io::Result<()> {
+    ///
+    /// `sync_endpoint` is optional so the socket server degrades gracefully
+    /// when the iroh endpoint is unavailable (R-6).
+    pub async fn run_with_streaming(
+        &self,
+        sm: Arc<SessionManager>,
+        sync_endpoint: Option<Arc<SyncEndpoint>>,
+    ) -> std::io::Result<()> {
         let listener = UnixListener::bind(&self.socket_path)?;
         info!("Socket server listening on {:?}", self.socket_path);
 
@@ -109,8 +117,9 @@ impl SocketServer {
                 Ok((stream, _addr)) => {
                     debug!("Accepted socket connection");
                     let sm = Arc::clone(&sm);
+                    let se = sync_endpoint.as_ref().map(Arc::clone);
                     tokio::spawn(async move {
-                        if let Err(e) = handle_streaming_connection(stream, sm).await {
+                        if let Err(e) = handle_streaming_connection(stream, sm, se).await {
                             warn!("Connection error: {e}");
                         }
                     });
@@ -189,6 +198,7 @@ where
 async fn handle_streaming_connection(
     stream: tokio::net::UnixStream,
     sm: Arc<SessionManager>,
+    sync_endpoint: Option<Arc<SyncEndpoint>>,
 ) -> std::io::Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -312,7 +322,8 @@ async fn handle_streaming_connection(
         }
 
         // Synchronous handler for all other methods.
-        let response = handlers::dispatch(&request, Arc::clone(&sm));
+        let response =
+            handlers::dispatch(&request, Arc::clone(&sm), sync_endpoint.as_ref().map(Arc::clone));
         write_response(&mut writer, &response).await?;
     }
 
@@ -384,7 +395,7 @@ mod tests {
         let handle = tokio::spawn(async move {
             let sm_inner = Arc::clone(&sm);
             let handler = Arc::new(move |req: Request| {
-                handlers::dispatch(&req, Arc::clone(&sm_inner))
+                handlers::dispatch(&req, Arc::clone(&sm_inner), None)
             });
             let (stream, _) = listener.accept().await.unwrap();
             handle_connection(stream, handler).await.unwrap();

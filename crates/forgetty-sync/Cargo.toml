@@ -1,0 +1,23 @@
+[package]
+name = "forgetty-sync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+forgetty-core = { path = "../forgetty-core" }
+# iroh 0.97 (latest stable). The spec was written for 0.35; API diverged significantly.
+# Key differences documented in src/endpoint.rs.
+iroh = { version = "0.97", default-features = false, features = ["metrics", "portmapper"] }
+qrcode = "0.14"
+image = { version = "0.25", default-features = false, features = ["png"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+dirs = { workspace = true }
+thiserror = { workspace = true }
+rand = "0.9"
+base64 = "0.22"
+hostname = "0.4"
+anyhow = "1"
