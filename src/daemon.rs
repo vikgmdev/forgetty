@@ -256,6 +256,7 @@ async fn main_async() -> anyhow::Result<()> {
     }
 
     info!("forgetty-daemon shutting down");
+    sync_endpoint.close().await;
     session_manager.kill_all();
 
     Ok(())
