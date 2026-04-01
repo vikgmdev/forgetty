@@ -61,10 +61,17 @@ build = "build.rs"
 name = "forgetty"
 path = "src/main.rs"
 
+[[bin]]
+name = "forgetty-daemon"
+path = "src/daemon.rs"
+
 [dependencies]
 forgetty-core = { path = "crates/forgetty-core" }
 forgetty-config = { path = "crates/forgetty-config" }
 forgetty-gtk = { path = "crates/forgetty-gtk" }
+forgetty-session = { path = "crates/forgetty-session" }
+forgetty-socket = { path = "crates/forgetty-socket" }
+tokio = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
