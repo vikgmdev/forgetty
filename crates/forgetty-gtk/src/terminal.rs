@@ -1924,12 +1924,47 @@ pub fn create_terminal_for_pane(
                     return;
                 };
 
-                // Right-click: show context menu (same as local PTY pane)
+                // Right-click: show context menu (same as local PTY pane).
+                // Button 3 always opens the menu even in mouse-tracking mode.
                 if button == 3 {
-                    gesture.set_state(gtk4::EventSequenceState::Claimed);
+                    let (screen_row, col) =
+                        pixel_to_cell(x, y, s.cell_width, s.cell_height, s.cols, s.rows);
+                    let screen = s.terminal.screen();
+                    let hover = detect_url_at(screen, screen_row, col);
+                    let url_str = hover.map(|h| h.url);
+                    let has_selection = s.selection.is_some();
                     drop(s);
-                    da_click.queue_draw();
+                    if let Some(popover) = find_context_popover(&da_click) {
+                        let menu_box =
+                            build_context_menu_box(&popover, url_str.as_deref(), has_selection);
+                        popover.set_child(Some(&menu_box));
+                        popover.set_pointing_to(Some(&gdk::Rectangle::new(
+                            x as i32, y as i32, 1, 1,
+                        )));
+                        popover.popup();
+                    }
                     return;
+                }
+
+                // Ctrl+Click to open URL (only when mouse tracking is off).
+                if button == 1
+                    && modifier.contains(gdk::ModifierType::CONTROL_MASK)
+                    && !modifier.contains(gdk::ModifierType::SHIFT_MASK)
+                    && !s.terminal.is_mouse_tracking()
+                {
+                    let (screen_row, col) =
+                        pixel_to_cell(x, y, s.cell_width, s.cell_height, s.cols, s.rows);
+                    // Scope `screen` so its borrow of `s.terminal` ends before
+                    // we potentially move `s` below.
+                    let hover = {
+                        let screen = s.terminal.screen();
+                        detect_url_at(screen, screen_row, col)
+                    };
+                    if let Some(hu) = hover {
+                        drop(s);
+                        crate::app::open_url_in_browser(&hu.url);
+                        return;
+                    }
                 }
 
                 if button != 1 {
