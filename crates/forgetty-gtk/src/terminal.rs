@@ -2050,17 +2050,252 @@ pub fn create_terminal_for_pane(
         drawing_area.add_controller(gesture);
     }
 
+    // --- Motion controller ---
+    {
+        let motion_controller = gtk4::EventControllerMotion::new();
+
+        {
+            let state = Rc::clone(&state);
+            let da_motion = drawing_area.clone();
+            motion_controller.connect_motion(move |controller, x, y| {
+                let modifier = controller.current_event_state();
+                let Ok(mut s) = state.try_borrow_mut() else {
+                    return;
+                };
+
+                // If we are actively dragging a selection, update the endpoint
+                if s.selecting {
+                    // Auto-scroll when dragging past viewport edges
+                    let viewport_height = s.rows as f64 * s.cell_height;
+                    if y < 0.0 {
+                        s.terminal.scroll_viewport_delta(-3);
+                        let (_, off, _) = s.terminal.scrollbar_state();
+                        s.viewport_offset = off;
+                    } else if y > viewport_height {
+                        s.terminal.scroll_viewport_delta(3);
+                        let (_, off, _) = s.terminal.scrollbar_state();
+                        s.viewport_offset = off;
+                    }
+
+                    let (screen_row, col) =
+                        pixel_to_cell(x, y, s.cell_width, s.cell_height, s.cols, s.rows);
+
+                    let vp_offset = s.viewport_offset;
+                    let abs_row = screen_row + vp_offset as usize;
+
+                    if s.selection.is_none() {
+                        if let Some((origin_row, origin_col)) = s.drag_origin.take() {
+                            s.selection =
+                                Some(Selection::new(origin_row, origin_col, SelectionMode::Normal));
+                        }
+                    }
+
+                    let sel_mode = s.selection.as_ref().map(|sel| sel.mode);
+                    let word_anchor = s.word_anchor;
+                    let anchor_row = s.selection.as_ref().map(|sel| sel.start.0);
+
+                    let word_bounds = if sel_mode == Some(SelectionMode::Word) {
+                        let screen = s.terminal.screen();
+                        Some(find_word_boundaries(screen, screen_row, col))
+                    } else {
+                        None
+                    };
+
+                    if let Some(ref mut sel) = s.selection {
+                        match sel.mode {
+                            SelectionMode::Word => {
+                                let (drag_word_start, drag_word_end) =
+                                    word_bounds.unwrap_or((col, col));
+
+                                if let (Some((anchor_start, anchor_end)), Some(a_row)) =
+                                    (word_anchor, anchor_row)
+                                {
+                                    if abs_row < a_row
+                                        || (abs_row == a_row && drag_word_start < anchor_start)
+                                    {
+                                        sel.start = (a_row, anchor_end);
+                                        sel.end = (abs_row, drag_word_start);
+                                    } else {
+                                        sel.start = (a_row, anchor_start);
+                                        sel.end = (abs_row, drag_word_end);
+                                    }
+                                } else {
+                                    sel.update(abs_row, drag_word_end);
+                                }
+                            }
+                            _ => {
+                                sel.update(abs_row, col);
+                            }
+                        }
+                    }
+
+                    drop(s);
+                    da_motion.queue_draw();
+                    return;
+                }
+
+                // Forward motion to mouse encoder if not selecting
+                let terminal_handle = s.terminal.raw_handle();
+                let screen_size =
+                    ((s.cols as f64 * s.cell_width) as u32, (s.rows as f64 * s.cell_height) as u32);
+                let cell_size = (s.cell_width as u32, s.cell_height as u32);
+
+                if let Some(bytes) = s.input.encode_mouse_motion(
+                    (x, y),
+                    modifier,
+                    terminal_handle,
+                    screen_size,
+                    cell_size,
+                ) {
+                    if let (Some(ref dc), Some(pid)) = (s.daemon_client.clone(), s.daemon_pane_id) {
+                        let _ = dc.send_input(pid, &bytes);
+                    }
+                    da_motion.queue_draw();
+                }
+
+                // --- Hover URL detection ---
+                let (screen_row, col) =
+                    pixel_to_cell(x, y, s.cell_width, s.cell_height, s.cols, s.rows);
+                if s.last_hover_cell == (screen_row, col) {
+                    return;
+                }
+                s.last_hover_cell = (screen_row, col);
+                let screen = s.terminal.screen();
+                let new_hover = detect_url_at(screen, screen_row, col);
+                let changed = s.hover_url != new_hover;
+                if changed {
+                    let want_pointer = new_hover.is_some();
+                    s.hover_url = new_hover;
+                    drop(s);
+                    if want_pointer {
+                        da_motion.set_cursor_from_name(Some("pointer"));
+                    } else {
+                        da_motion.set_cursor_from_name(Some("text"));
+                    }
+                    da_motion.queue_draw();
+                }
+            });
+        }
+
+        {
+            let state = Rc::clone(&state);
+            let da_leave = drawing_area.clone();
+            motion_controller.connect_leave(move |_controller| {
+                let Ok(mut s) = state.try_borrow_mut() else {
+                    return;
+                };
+                if s.hover_url.is_some() {
+                    s.hover_url = None;
+                    drop(s);
+                    da_leave.set_cursor_from_name(Some("text"));
+                    da_leave.queue_draw();
+                }
+            });
+        }
+
+        drawing_area.add_controller(motion_controller);
+    }
+
+    // --- Scroll controller ---
+    {
+        let scroll_controller = gtk4::EventControllerScroll::new(
+            gtk4::EventControllerScrollFlags::VERTICAL | gtk4::EventControllerScrollFlags::DISCRETE,
+        );
+
+        {
+            let state = Rc::clone(&state);
+            let da_scroll = drawing_area.clone();
+            scroll_controller.connect_scroll(move |controller, _dx, dy| {
+                let modifier = controller.current_event_state();
+                let Ok(mut s) = state.try_borrow_mut() else {
+                    return glib::Propagation::Proceed;
+                };
+
+                let terminal_handle = s.terminal.raw_handle();
+                let mouse_tracking = s.terminal.is_mouse_tracking();
+                let screen_size =
+                    ((s.cols as f64 * s.cell_width) as u32, (s.rows as f64 * s.cell_height) as u32);
+                let cell_size = (s.cell_width as u32, s.cell_height as u32);
+
+                let position = (0.0, 0.0);
+
+                let action = s.input.encode_scroll(
+                    dy,
+                    position,
+                    modifier,
+                    terminal_handle,
+                    mouse_tracking,
+                    screen_size,
+                    cell_size,
+                );
+
+                match action {
+                    ScrollAction::WriteBytes(bytes) => {
+                        if let (Some(ref dc), Some(pid)) =
+                            (s.daemon_client.clone(), s.daemon_pane_id)
+                        {
+                            let _ = dc.send_input(pid, &bytes);
+                        }
+                    }
+                    ScrollAction::ScrollViewport(delta) => {
+                        s.terminal.scroll_viewport_delta(delta);
+                        let (_, off, _) = s.terminal.scrollbar_state();
+                        s.viewport_offset = off;
+                    }
+                }
+
+                s.hover_url = None;
+                s.last_hover_cell = (usize::MAX, usize::MAX);
+
+                drop(s);
+                da_scroll.set_cursor_from_name(Some("text"));
+                da_scroll.queue_draw();
+                glib::Propagation::Stop
+            });
+        }
+
+        drawing_area.add_controller(scroll_controller);
+    }
+
     // --- Resize handler ---
     {
         let state = Rc::clone(&state);
         let cell_measured_resize = Rc::clone(&cell_measured);
-        drawing_area.connect_resize(move |_da, _width, _height| {
+        drawing_area.connect_resize(move |da, width, height| {
             if !*cell_measured_resize.borrow() {
                 return;
             }
-            // For daemon panes, resize is sent via daemon RPC not local pty.
-            // The draw callback will pick up the new dimensions.
-            let _ = state.try_borrow();
+
+            let Ok(s) = state.try_borrow() else {
+                return;
+            };
+            let (cw, ch) = (s.cell_width, s.cell_height);
+            drop(s);
+
+            if cw < 1.0 || ch < 1.0 {
+                return;
+            }
+
+            let new_cols = ((width as f64) / cw).max(1.0) as usize;
+            let new_rows = ((height as f64) / ch).max(1.0) as usize;
+
+            let Ok(mut s) = state.try_borrow_mut() else {
+                return;
+            };
+            if new_cols != s.cols || new_rows != s.rows {
+                s.cols = new_cols;
+                s.rows = new_rows;
+                s.terminal.resize(new_rows, new_cols);
+                let (_, off, _) = s.terminal.scrollbar_state();
+                s.viewport_offset = off;
+                if let (Some(ref dc), Some(pane_id)) =
+                    (s.daemon_client.clone(), s.daemon_pane_id)
+                {
+                    let _ = dc.resize_pane(pane_id, new_rows as u16, new_cols as u16);
+                }
+                drop(s);
+                da.queue_draw();
+            }
         });
     }
 
