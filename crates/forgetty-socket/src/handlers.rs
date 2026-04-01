@@ -259,8 +259,16 @@ fn handle_get_pane_info(request: &Request, sm: &SessionManager) -> Response {
         Err(e) => return e,
     };
 
-    // pane_info is guaranteed Some because require_pane_id already verified it.
-    let info = sm.pane_info(id).expect("pane_info must be Some after require_pane_id");
+    let info = match sm.pane_info(id) {
+        Some(i) => i,
+        None => {
+            return Response::error(
+                request.id.clone(),
+                crate::protocol::INVALID_PARAMS,
+                format!("pane not found: {id}"),
+            );
+        }
+    };
 
     Response::success(
         request.id.clone(),
