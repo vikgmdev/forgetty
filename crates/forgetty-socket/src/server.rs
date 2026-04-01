@@ -24,8 +24,15 @@ impl SocketServer {
     /// The socket path is `$XDG_RUNTIME_DIR/forgetty.sock` on Linux,
     /// falling back to `/tmp/forgetty.sock`.
     pub fn new() -> std::io::Result<Self> {
-        let socket_path = default_socket_path();
+        Self::new_with_path(default_socket_path())
+    }
 
+    /// Create a new server bound to an explicit socket path.
+    ///
+    /// Removes any stale socket file and creates the parent directory if
+    /// needed. Use this when the caller needs to override the default path
+    /// (e.g., `forgetty-daemon --socket-path`).
+    pub fn new_with_path(socket_path: PathBuf) -> std::io::Result<Self> {
         // Remove stale socket file if it exists.
         if socket_path.exists() {
             std::fs::remove_file(&socket_path)?;

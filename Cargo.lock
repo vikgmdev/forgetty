@@ -1067,6 +1067,9 @@ dependencies = [
  "forgetty-config",
  "forgetty-core",
  "forgetty-gtk",
+ "forgetty-session",
+ "forgetty-socket",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]

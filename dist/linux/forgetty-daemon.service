@@ -1,0 +1,24 @@
+[Unit]
+Description=Forgetty terminal session daemon
+Documentation=https://forgetty.dev
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/forgetty-daemon
+Restart=on-failure
+RestartSec=5s
+
+# Daemon writes to stderr; systemd captures it to the journal.
+# Read with: journalctl --user -u forgetty-daemon -f
+StandardOutput=journal
+StandardError=journal
+
+# XDG_RUNTIME_DIR is set automatically by systemd for user services.
+
+# Guard rails: idle target is 25 MB; limits give headroom for active PTY sessions.
+MemoryHigh=30M
+MemoryMax=50M
+
+[Install]
+WantedBy=default.target
