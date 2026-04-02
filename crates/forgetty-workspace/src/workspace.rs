@@ -48,6 +48,12 @@ pub struct TabState {
     pub title: String,
     /// Tree of panes within the tab.
     pub pane_tree: PaneTreeState,
+    /// Daemon pane ID of the root pane (daemon mode only).
+    /// Used to reconnect this tab to the correct live daemon pane after
+    /// the GTK window is closed and reopened. `None` in self-contained mode
+    /// or for session files written before this field was added.
+    #[serde(default)]
+    pub pane_id: Option<uuid::Uuid>,
 }
 
 /// Recursive tree describing the pane layout inside a tab.
@@ -100,6 +106,7 @@ impl Workspace {
             tabs: vec![TabState {
                 title: String::from("Shell"),
                 pane_tree: PaneTreeState::Leaf { cwd: root },
+                pane_id: None,
             }],
             active_tab: 0,
         }
