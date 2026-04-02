@@ -1531,12 +1531,16 @@ pub fn create_terminal_for_pane(
 
     // Prime VT state with snapshot lines so the first frame shows content.
     if let Some(snap) = snapshot {
+        // Position cursor at top-left before replaying so row indices match.
+        terminal.feed(b"\x1b[H");
         for line in &snap.lines {
-            if !line.is_empty() {
-                terminal.feed(line.as_bytes());
-                terminal.feed(b"\r\n");
-            }
+            terminal.feed(line.as_bytes());
+            terminal.feed(b"\r\n");
         }
+        // Restore cursor to where it was in the live session.
+        let row = snap.cursor_row + 1;
+        let col = snap.cursor_col + 1;
+        terminal.feed(format!("\x1b[{row};{col}H").as_bytes());
     }
 
     let input = GhosttyInput::new();

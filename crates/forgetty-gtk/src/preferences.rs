@@ -511,6 +511,11 @@ fn build_device_list_page(dc: Arc<DaemonClient>, _stack: &gtk4::Stack) -> gtk4::
 
 /// Switch the stack to show the QR code view.
 fn show_qr_view(stack: &gtk4::Stack, dc: Arc<DaemonClient>) {
+    // Open a 2-minute pairing window before fetching the QR code.
+    if let Err(e) = dc.enable_pairing(120) {
+        tracing::warn!("enable_pairing failed: {e}");
+    }
+
     // Fetch pairing info from daemon.
     let info = match dc.get_pairing_info() {
         Ok(i) => i,

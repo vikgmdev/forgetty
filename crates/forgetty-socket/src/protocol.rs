@@ -104,6 +104,7 @@ pub mod methods {
     pub const LIST_DEVICES: &str = "list_devices";
     pub const REVOKE_DEVICE: &str = "revoke_device";
     pub const GET_PAIRING_INFO: &str = "get_pairing_info";
+    pub const ENABLE_PAIRING: &str = "enable_pairing";
 }
 
 #[cfg(test)]

@@ -8,6 +8,7 @@ license.workspace = true
 forgetty-core = { path = "../forgetty-core" }
 forgetty-pty = { path = "../forgetty-pty" }
 forgetty-session = { path = "../forgetty-session" }
+forgetty-vt = { path = "../forgetty-vt" }
 forgetty-sync = { path = "../forgetty-sync" }
 tokio = { workspace = true }
 serde = { workspace = true }
