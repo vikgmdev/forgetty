@@ -670,7 +670,160 @@ Edge cases:
 **Scope:** After a reboot (daemon starts fresh, zero live panes), restore the full previous session. Phase 1: wire the ignored `Ok(_)` cold-start branch to load `default.json` and call `reconnect_pane_tree` with an empty pane_map — each leaf spawns a fresh daemon pane at its saved CWD via a new optional `cwd` param on the `new_tab` RPC. Phase 2: daemon writes per-pane VT screen snapshots to `~/.local/share/forgetty/sessions/snapshots/<uuid>.json` on SIGTERM; cold-start restore pre-seeds each new pane's VT with its snapshot via a new `preseed_snapshot` RPC before the GTK client subscribes, so the user sees their last screen content rather than a blank terminal.
 **AC:** After reboot: same tabs, same split layout, shells start at saved CWDs. Screen content visible (not blank) after graceful daemon stop+start. Corrupt/missing snapshots open blank without crashing. Closing a tab deletes its snapshot file.
 
-### [ ] T-054: Full interactive from Android — bidirectional PTY input
+---
+
+## Milestone 4: Daemon Owns Layout (Stateless Clients)
+
+> **Why:** The daemon must be the single source of truth for all session state — tabs, splits, CWDs, ordering. GTK (and future Android/Windows/macOS clients) must be stateless renderers that connect to a daemon and build their UI from the daemon's layout. This ensures: one source of truth, no stale session files, multi-client support (two GTK windows see the same tabs), and the same architecture works for every platform.
+>
+> **Dependency graph:**
+> ```
+> T-059 ──→ T-060 ──→ T-061 (daemon saves session)
+>               │
+>               ├──→ T-062 (RPCs) ──→ T-064 (GTK reads layout from daemon)
+>               │                              │
+>               └──→ T-063 (events) ───────────┴──→ T-065 (GTK fully stateless)
+> ```
+>
+> After T-065: GTK is a pure renderer. Android/Windows clients connect to their local daemon and get the exact same experience. Two GTK windows see each other's tab changes in real time.
+
+### [ ] T-059: Introduce `SessionLayout` struct in `SessionManager`
+**Scope:** Add a `SessionLayout` struct to `SessionManagerInner` that holds the live tab/split tree hierarchy: `workspaces → tabs → PaneTreeLayout` with `PaneId` references at leaves. This is a live, mutable data structure — not a serialization-only type. Populate it from existing `create_pane` (each new pane becomes a new tab with a single leaf in the default workspace). Update it on `close_pane` (remove the leaf, remove the tab if empty). Add `pub fn layout(&self) -> SessionLayout` to `SessionManager`. Add unit tests.
+
+Key types (new file `crates/forgetty-session/src/layout.rs`):
+- `SessionLayout { workspaces, active_workspace }`
+- `SessionWorkspace { id, name, tabs, active_tab }`
+- `SessionTab { id: Uuid, title: String, pane_tree: PaneTreeLayout }`
+- Reuse existing `PaneTreeLayout` enum from `workspace.rs`
+
+This task does NOT change any RPC handlers or GTK code — purely internal daemon state.
+
+**Files:** `crates/forgetty-session/src/layout.rs` (new), `crates/forgetty-session/src/manager.rs`, `crates/forgetty-session/src/lib.rs`
+**Pain point solved:** "SessionManager has no concept of tabs or splits — it only knows about a flat list of panes."
+**AC:**
+- [ ] `SessionLayout` struct exists with workspaces/tabs/pane_tree hierarchy
+- [ ] `create_pane()` adds a new tab to the default workspace's layout
+- [ ] `close_pane()` removes the pane from the layout tree (and its containing tab if now empty)
+- [ ] `SessionManager::layout()` returns a consistent snapshot after any sequence of create/close
+- [ ] Unit tests: create 3 panes → layout has 3 tabs; close middle → 2 tabs; create after close → 3 tabs in correct order
+- [ ] No RPC, GTK, or serialization changes — purely internal
+
+### [ ] T-060: Layout mutation methods on `SessionManager`
+**Scope:** Add structured layout mutation methods that modify `SessionLayout` AND spawn/close panes atomically:
+- `create_tab(workspace_idx, cwd, size) → (PaneId, Uuid/*tab_id*/)` — creates a pane AND inserts a new tab
+- `split_pane(pane_id, direction, size, cwd) → PaneId` — creates a new pane AND replaces the leaf containing `pane_id` with a Split node
+- `close_tab(tab_id)` — closes ALL panes in the tab's tree and removes the tab
+- `move_tab(tab_id, new_index)` — reorders a tab within its workspace
+- `set_active_tab(workspace_idx, tab_idx)` — updates active_tab
+
+These replace the current flat `create_pane`/`close_pane` for layout-aware operations. Existing primitives remain as low-level internals.
+
+**Files:** `crates/forgetty-session/src/manager.rs`, `crates/forgetty-session/src/layout.rs`
+**Pain point solved:** "`split_pane` and `focus_tab` are stubs in the socket handlers because the daemon has no layout tree to mutate."
+**Dependencies:** T-059
+**AC:**
+- [ ] `create_tab()` returns tab_id + pane_id; layout reflects new tab
+- [ ] `split_pane(pane_id, "horizontal")` replaces leaf with Split node containing two leaves
+- [ ] `close_tab(tab_id)` removes tab and kills all panes in its tree
+- [ ] `move_tab(tab_id, 0)` moves tab to first position
+- [ ] Unit tests for each mutation confirm layout + pane registry consistency
+- [ ] Existing code compiles (create_pane/close_pane still public)
+
+### [ ] T-061: Daemon saves `default.json` itself
+**Scope:** The daemon becomes responsible for persisting `default.json`. Add `SessionManager::snapshot_to_workspace_state() → WorkspaceState` that converts the live `SessionLayout` into the existing serialization format (resolving live CWD from each pane's `/proc/{pid}/cwd`). Wire into:
+1. Daemon SIGTERM/SIGINT shutdown (alongside existing `save_all_snapshots`)
+2. Debounced auto-save: after any layout mutation, schedule a save within 5 seconds (coalesce rapid changes)
+3. Periodic safety save every 60 seconds
+
+GTK's `save_all_workspaces` remains for now (dual-write) — removed in T-065.
+
+**Files:** `crates/forgetty-session/src/manager.rs`, `crates/forgetty-session/src/layout.rs`, `src/daemon.rs`
+**Pain point solved:** "If GTK crashes or is SIGKILL'd, the session file is stale because only GTK writes it."
+**Dependencies:** T-059, T-060
+**AC:**
+- [ ] SIGTERM to daemon → `default.json` written with current layout (workspaces, tabs, CWDs)
+- [ ] Create 3 tabs via RPC → wait 6 seconds → `default.json` contains 3 tabs (debounced auto-save)
+- [ ] `default.json` written by daemon is loadable by existing `load_session()` (same schema)
+- [ ] GTK `save_all_workspaces` still works (not removed yet — dual-write for backward compat)
+
+### [ ] T-062: `get_layout` and layout mutation RPCs
+**Scope:** Wire layout methods to the JSON-RPC socket API:
+- `get_layout` — returns full `SessionLayout` as JSON
+- Rewrite `new_tab` handler to call `sm.create_tab()` (returns tab_id + pane_id)
+- Rewrite `close_tab` handler to call `sm.close_tab(tab_id)` (backward compat: accept pane_id too)
+- Implement `split_pane` handler (currently a stub) → `sm.split_pane()`
+- Implement `focus_tab` handler (currently a stub) → `sm.set_active_tab()`
+- Add `move_tab` RPC
+- Add `DaemonClient` methods for all new RPCs
+
+**Files:** `crates/forgetty-socket/src/handlers.rs`, `crates/forgetty-socket/src/protocol.rs`, `crates/forgetty-gtk/src/daemon_client.rs`
+**Pain point solved:** "`split_pane` and `focus_tab` RPC handlers are stubs that do nothing."
+**Dependencies:** T-060
+**AC:**
+- [ ] `socat` call to `get_layout` returns JSON with workspaces/tabs/pane_tree
+- [ ] `new_tab` RPC returns `tab_id` AND `pane_id`; `get_layout` shows new tab
+- [ ] `split_pane` RPC creates a split; `get_layout` shows the Split node
+- [ ] `close_tab` with tab_id works; legacy `close_tab` with pane_id still works
+- [ ] `focus_tab` updates `active_tab`; `move_tab` reorders tabs
+
+### [ ] T-063: Layout change event broadcast
+**Scope:** Add layout-specific events to `SessionEvent`:
+- `TabCreated { workspace_idx, tab_id, pane_id }`
+- `TabClosed { workspace_idx, tab_id }`
+- `PaneSplit { tab_id, parent_pane_id, new_pane_id, direction }`
+- `TabMoved { workspace_idx, tab_id, new_index }`
+- `ActiveTabChanged { workspace_idx, tab_idx }`
+
+Fire from layout mutation methods. Add `subscribe_layout` RPC that streams layout events to connected clients (same pattern as `subscribe_output`). Enables multi-client.
+
+**Files:** `crates/forgetty-session/src/events.rs`, `crates/forgetty-session/src/manager.rs`, `crates/forgetty-socket/src/protocol.rs`, `crates/forgetty-socket/src/server.rs`
+**Pain point solved:** "Two GTK windows can't see the same layout changes in real time."
+**Dependencies:** T-060
+**AC:**
+- [ ] `subscribe_layout` RPC starts a streaming connection
+- [ ] Create tab → subscriber receives `TabCreated` within 100ms
+- [ ] Split pane → subscriber receives `PaneSplit`
+- [ ] Close tab → subscriber receives `TabClosed`
+- [ ] Existing `subscribe_output` unaffected
+
+### [ ] T-064: GTK calls `get_layout` on connect
+**Scope:** Replace the current daemon-mode reconnect path in `app.rs` — which loads `default.json` from disk and cross-references `list_tabs` — with a single `get_layout` RPC call. GTK calls `dc.get_layout()` on startup and builds its entire widget tree from the response. Remove `load_session()` from GTK daemon mode. Add `get_layout()` to `DaemonClient`.
+
+Cold-start: daemon starts → loads `default.json` itself (T-061) → rebuilds layout → creates panes at saved CWDs. GTK connects → calls `get_layout` → gets the restored layout → builds widgets. Clean separation.
+
+**Files:** `crates/forgetty-gtk/src/app.rs`, `crates/forgetty-gtk/src/daemon_client.rs`
+**Pain point solved:** "GTK reads a stale session file that may disagree with the daemon's live state."
+**Dependencies:** T-062
+**AC:**
+- [ ] GTK reconnect calls `get_layout` instead of `load_session` + `list_tabs`
+- [ ] Daemon with 3 tabs (one split) → open GTK → 3 tabs with correct split layout
+- [ ] Daemon with 0 panes (fresh start, no session file) → GTK creates one new tab via RPC
+- [ ] `default.json` is NOT read by GTK in daemon mode
+- [ ] Self-contained mode (no daemon) unaffected
+
+### [ ] T-065: GTK tab/split actions send RPCs — fully stateless client
+**Scope:** In daemon mode, change user-initiated layout actions to send RPCs instead of directly mutating the widget tree:
+- `Ctrl+Shift+T` → `new_tab` RPC → daemon creates tab → GTK adds widget
+- `Alt+Shift+=` → `split_pane` RPC → daemon splits → GTK creates `gtk::Paned`
+- `Ctrl+Shift+W` → `close_tab`/`close_pane` RPC → daemon updates layout → GTK removes widget
+- Tab drag-reorder → `move_tab` RPC
+
+Subscribe to `subscribe_layout` so layout changes from other clients (second GTK window, socat, Android) are reflected. Remove `save_all_workspaces` from GTK daemon mode — daemon handles persistence (T-061).
+
+**Files:** `crates/forgetty-gtk/src/app.rs`, `crates/forgetty-gtk/src/daemon_client.rs`
+**Pain point solved:** "Layout mutations happen in GTK's widget tree and the daemon doesn't know about them — two GTK windows show different layouts."
+**Dependencies:** T-063, T-064
+**AC:**
+- [ ] Ctrl+Shift+T → `new_tab` RPC → tab appears in GTK
+- [ ] Alt+Shift+= → `split_pane` RPC → split appears
+- [ ] Ctrl+Shift+W → close RPC → pane removed
+- [ ] `save_all_workspaces` no longer called in daemon mode
+- [ ] Two GTK windows: create tab in A → appears in B (via `subscribe_layout`)
+- [ ] Self-contained mode unaffected
+
+---
+
+### [ ] T-054: Full interactive from Android — bidirectional PTY input *(ON HOLD — resume after Linux GTK client is complete)*
 **Scope:** Android sends keystrokes, paste, and control sequences to daemon via iroh QUIC stream. Daemon routes to correct PTY master. Full interactive support: vim works (cursor movement, modes, save/quit), htop works, Claude Code interactive prompts answerable from phone. Key encoding: same logic as desktop key encoder (encode Android key events to correct PTY bytes). Control sequences: Ctrl+C, Ctrl+D, arrow keys, Escape, Tab, function keys.
 **Pain point solved:** "I need to step away from my laptop but Claude Code needs a response."
 **AC:** Type in Android → appears in desktop PTY within 100ms (LAN) / 300ms (relay). `vim` fully works from Android. `htop` fully works. Ctrl+C kills running process. Claude Code interactive prompt answerable from Android. Paste from Android clipboard → PTY. Input from either Android or GTK both reach same PTY.

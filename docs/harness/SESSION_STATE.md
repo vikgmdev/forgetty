@@ -1,8 +1,8 @@
 # Session State
 
-**Last updated:** 2026-04-02
-**Current task:** T-058 complete (QA PASS: 9/9/9/8)
-**Current phase:** T-056 + T-057 + T-058 complete; ready for T-054 (next uncompleted task)
+**Last updated:** 2026-04-03
+**Current task:** T-059 (not started)
+**Current phase:** Starting M4: Daemon Owns Layout (T-059→T-065). Architectural refactor — daemon becomes single source of truth for session state, GTK becomes a stateless renderer.
 
 ## What's been completed
 
@@ -536,26 +536,22 @@ All 9 manual QA tests passing. GTK daemon client is fully wired.
 
 ## What's next
 
-**Milestone 3.5 — Daemon Architecture + Android Sync (STARTS NOW, before public launch).**
+**Milestone 4: Daemon Owns Layout (T-059→T-065) — ACTIVE**
 
-Architecture fully designed and documented in `docs/architecture/DAEMON_SYNC_ARCHITECTURE.md`. This is the primary product differentiator. Build order:
+Architectural refactor: daemon becomes single source of truth for all session state. GTK becomes a stateless renderer. This ensures consistent state, multi-client support, and the same architecture for every platform (Android, Windows, macOS).
 
-1. ~~**T-048**~~ — ✓ DONE: `forgetty-session` crate with SessionManager
-2. ~~**T-049**~~ — ✓ DONE: `forgetty-daemon` binary: headless, systemd user service
-3. ~~**T-050**~~ — ✓ DONE: Wire `forgetty-socket` to real daemon state
-4. ~~**T-051**~~ — ✓ DONE: GTK refactor as daemon client
-5. ~~**T-052**~~ — ✓ DONE: totem-sync / iroh: persistent identity, QR pairing, device registry
-6. ~~**T-053**~~ — ✓ DONE: Full terminal stream to Android (raw PTY bytes over iroh QUIC)
-7. ~~**T-055**~~ — ✓ DONE: Session file as daemon reconnect source of truth
-8. ~~**T-056**~~ — ✓ DONE: Daemon reconnect visual fixes (tab titles + blank space)
-9. ~~**T-057**~~ — ✓ DONE: Fix split-pane session save/restore in daemon mode
-10. ~~**T-058**~~ — ✓ DONE: Cold-start session restore (layout, CWDs, VT buffer persistence)
-11. **T-054** — Full interactive from Android (bidirectional input over iroh) ← NEXT
+1. **T-059** — `SessionLayout` struct in `SessionManager` ← NEXT
+2. **T-060** — Layout mutation methods (create_tab, split_pane, close_tab, move_tab)
+3. **T-061** — Daemon saves `default.json` itself (shutdown + debounced + periodic)
+4. **T-062** — `get_layout` + layout mutation RPCs
+5. **T-063** — Layout change event broadcast (`subscribe_layout`)
+6. **T-064** — GTK calls `get_layout` on connect (replaces `load_session` + `list_tabs`)
+7. **T-065** — GTK tab/split actions send RPCs (fully stateless, `save_all_workspaces` removed)
 
-After M3.5, resume M3 AI features (T-032+). Android team (MA-005+) unblocks in parallel once T-052 ships.
+**After M4:** Resume M3 AI features (T-032→T-036), known issues, pre-launch testing, then Android (T-054).
 
-> **T-026, T-027, T-028** deferred to pre-launch (after M3.5).
-> **T-037 (Windows), old T-038/T-039** superseded — see BACKLOG.md M3.5 section.
+M3.5 daemon chain (all done):
+- ~~T-048~~ ✓ ~~T-049~~ ✓ ~~T-050/051~~ ✓ ~~T-052~~ ✓ ~~T-053~~ ✓ ~~T-055~~ ✓ ~~T-056~~ ✓ ~~T-057~~ ✓ ~~T-058~~ ✓
 
 ## Known issues for future tasks
 
