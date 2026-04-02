@@ -1,8 +1,8 @@
 # Session State
 
 **Last updated:** 2026-04-02
-**Current task:** T-057 complete (QA PASS: 9/9/8/7)
-**Current phase:** T-056 + T-057 complete; ready for T-054 (next uncompleted task)
+**Current task:** T-058 complete (QA PASS: 9/9/9/8)
+**Current phase:** T-056 + T-057 + T-058 complete; ready for T-054 (next uncompleted task)
 
 ## What's been completed
 
@@ -549,7 +549,8 @@ Architecture fully designed and documented in `docs/architecture/DAEMON_SYNC_ARC
 7. ~~**T-055**~~ — ✓ DONE: Session file as daemon reconnect source of truth
 8. ~~**T-056**~~ — ✓ DONE: Daemon reconnect visual fixes (tab titles + blank space)
 9. ~~**T-057**~~ — ✓ DONE: Fix split-pane session save/restore in daemon mode
-10. **T-054** — Full interactive from Android (bidirectional input over iroh) ← NEXT
+10. ~~**T-058**~~ — ✓ DONE: Cold-start session restore (layout, CWDs, VT buffer persistence)
+11. **T-054** — Full interactive from Android (bidirectional input over iroh) ← NEXT
 
 After M3.5, resume M3 AI features (T-032+). Android team (MA-005+) unblocks in parallel once T-052 ships.
 

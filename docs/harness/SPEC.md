@@ -1,282 +1,372 @@
-# SPEC — T-057: Fix Split-Pane Session Save and Restore (Daemon Mode)
+# SPEC — T-058: Cold-Start Session Restore (Layout, CWDs, and VT Buffer)
 
-**Task:** T-057
+**Task:** T-058
 **Date:** 2026-04-02
 **Status:** Ready to implement
+**Phase 1 complexity:** Low (~80 lines, 3 files)
+**Phase 2 complexity:** Medium (~200 lines, 7 files)
 
 ---
 
 ## 1. Summary
 
-When a GTK tab contains split panes (`gtk::Paned` with multiple `DrawingArea` children), closing and reopening the window restores each split pane as a **separate tab** instead of reconstructing the split layout within the original tab.
+After a system reboot — or any situation where `forgetty-daemon` starts with no live panes — the GTK client must restore the previous session: same tabs in the same order, same split-pane layout per tab, each pane's shell starting in the correct CWD, and (Phase 2) each pane showing the last visible screen content rather than a blank terminal.
 
-Session JSON evidence — 4 flat tabs instead of 2 tabs (one split):
-```json
-{ "title": "opt",  "pane_tree": { "Leaf": { "cwd": "/home/vick" } }, "pane_id": "uuid-1" },
-{ "title": "tmp",  "pane_tree": { "Leaf": { "cwd": "/home/vick" } }, "pane_id": "uuid-2" },
-{ "title": "vick", "pane_tree": { "Leaf": { "cwd": "/home/vick" } }, "pane_id": "uuid-3" },
-{ "title": "vick", "pane_tree": { "Leaf": { "cwd": "/home/vick" } }, "pane_id": "uuid-4" }
-```
-
-Self-contained mode (no daemon) does NOT have this bug — `snapshot_pane_tree` and `build_pane_tree` both handle splits correctly in that path.
+Requirements 1-3 (layout, splits, CWDs) are already stored in `default.json` by T-057. The problem is purely in the **cold-start code path**: the `Ok(_)` branch of `dc.list_tabs()` in `app.rs` ignores the session file entirely. Phase 2 adds daemon-side VT snapshot persistence to disk on shutdown and pre-seeding on cold-start pane creation.
 
 ---
 
 ## 2. Root Cause
 
-### B-1 — `PaneTreeState::Leaf` has no `pane_id` field
+### 2a. The broken branch
 
-**File:** `crates/forgetty-workspace/src/workspace.rs`
+**File:** `crates/forgetty-gtk/src/app.rs`, ~line 1395:
 
 ```rust
-// Current — no pane_id in Leaf
-Leaf { cwd: PathBuf }
+Ok(_) => {
+    tracing::info!("Daemon has no live panes — creating initial tab via RPC");
+}
 ```
 
-`find_first_daemon_pane_id` walks the widget tree and returns only the **first** leaf's daemon UUID, stored at `TabState.pane_id`. For a split tab with pane A and pane B, only pane A's UUID is saved. Pane B's UUID is discarded entirely.
+This fires when `list_tabs` returns `Ok(vec![])` — exactly the cold-start state after a reboot. It logs one line and falls through to `!restored`, creating a single fresh tab. The session file is never consulted.
 
-### B-2 — Daemon reconnect ignores `pane_tree`, uses only `TabState.pane_id`
+### 2b. CWD gap: `new_tab()` has no CWD parameter
 
-**File:** `crates/forgetty-gtk/src/app.rs`, daemon reconnect block (~line 1166)
+**File:** `crates/forgetty-socket/src/handlers.rs`, `handle_new_tab`:
 
-The block builds a flat `Vec<(PaneId, title, cwd)>` from `session_tabs.iter()`, reads `tab.pane_id` (single field), and creates **one flat tab per entry**. `tab.pane_tree` (which contains the correct `Split` structure from `snapshot_pane_tree`) is never read. Even if B-1 were fixed, the reconnect would still create flat tabs.
+```rust
+match sm.create_pane(size, None, None, None, true) {
+```
 
-### How both bugs combine to produce the symptom
+`SessionManager::create_pane` already accepts `cwd: Option<PathBuf>` but the RPC handler always passes `None`. The fix is to read an optional `cwd` param from the JSON-RPC request.
 
-1. `snapshot_pane_tree` correctly builds a `Split` tree for a split tab — this part works.
-2. `find_first_daemon_pane_id` only captures pane A's UUID → `TabState.pane_id = Some(uuid-A)`.
-3. On reopen: pane A is matched via `TabState.pane_id` → one flat tab created.
-4. Pane B's UUID was never saved → it lands in the "remaining live panes" pass → a second flat tab.
-5. Result: 1 split tab → 2 flat tabs.
+### 2c. VT buffer gap: no persistence mechanism
+
+The daemon's VT state lives purely in memory. On SIGTERM it calls `kill_all()` without writing any screen state to disk. No load path exists on cold start.
 
 ---
 
-## 3. Schema Changes
+## 3. Phase 1: Layout + CWD Restore
 
-### `PaneTreeState::Leaf` — add `pane_id`
+### 3a. Extend `new_tab` RPC to accept optional `cwd`
 
-**File:** `crates/forgetty-workspace/src/workspace.rs`
+**File:** `crates/forgetty-socket/src/handlers.rs`, `handle_new_tab`:
 
 ```rust
-// Before
-Leaf {
-    cwd: PathBuf,
-},
+fn handle_new_tab(request: &Request, sm: &SessionManager) -> Response {
+    let size = PtySize { rows: DEFAULT_ROWS, cols: DEFAULT_COLS, pixel_width: 0, pixel_height: 0 };
 
-// After
-Leaf {
-    cwd: PathBuf,
-    /// Daemon pane ID for this leaf. None in self-contained mode or
-    /// old session files. serde(default) ensures backward compatibility.
-    #[serde(default)]
-    pane_id: Option<uuid::Uuid>,
-},
+    let cwd: Option<PathBuf> = request
+        .params
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir()); // silently ignore nonexistent dirs
+
+    match sm.create_pane(size, cwd, None, None, true) { ... }
+}
 ```
 
-Correct serialized form for a split tab:
-```json
-{
-  "title": "myproject",
-  "pane_tree": {
-    "Split": {
-      "direction": "horizontal",
-      "ratio": 0.5,
-      "first":  { "Leaf": { "cwd": "/home/vick/foo", "pane_id": "uuid-A" } },
-      "second": { "Leaf": { "cwd": "/home/vick/bar", "pane_id": "uuid-B" } }
+Backward compatible: callers that omit `cwd` still get home-directory fallback.
+
+### 3b. Add `new_tab_with_cwd` to `DaemonClient`
+
+**File:** `crates/forgetty-gtk/src/daemon_client.rs`:
+
+```rust
+pub fn new_tab_with_cwd(&self, cwd: Option<&Path>) -> Result<PaneId, DaemonError> {
+    let params = match cwd {
+        Some(p) => serde_json::json!({ "cwd": p.to_string_lossy().as_ref() }),
+        None => serde_json::json!({}),
+    };
+    let result = self.rpc("new_tab", params)?;
+    // ... parse tab_id UUID ...
+}
+
+pub fn new_tab(&self) -> Result<PaneId, DaemonError> {
+    self.new_tab_with_cwd(None)
+}
+```
+
+### 3c. Update `reconnect_pane_tree` to pass CWD on fresh pane creation
+
+**File:** `crates/forgetty-gtk/src/app.rs`, in the `PaneTreeState::Leaf` arm of `reconnect_pane_tree`, both places that call `dc.new_tab()` for a missing/fresh pane:
+
+```rust
+// Before:
+match dc.new_tab() { Ok(pid) => (pid, None), ... }
+
+// After:
+let leaf_cwd = if cwd.is_dir() { Some(cwd.as_path()) } else { None };
+match dc.new_tab_with_cwd(leaf_cwd) { Ok(pid) => (pid, None), ... }
+```
+
+Where `cwd` is the `PathBuf` from `PaneTreeState::Leaf { cwd, .. }`.
+
+### 3d. Fix the cold-start branch
+
+**File:** `crates/forgetty-gtk/src/app.rs`, ~line 1395. Replace the no-op `Ok(_)` arm:
+
+```rust
+Ok(_) => {
+    tracing::info!("Daemon has no live panes — attempting cold-start session restore");
+    let Ok(mgr) = workspace_manager.try_borrow() else { return; };
+    let ws = &mgr.workspaces[0];
+
+    let session_tabs: Vec<TabState> = forgetty_workspace::load_session()
+        .ok().flatten()
+        .and_then(|s| s.workspaces.into_iter().next())
+        .map(|w| w.tabs)
+        .unwrap_or_default();
+
+    if !session_tabs.is_empty() {
+        let mut pane_map: HashMap<uuid::Uuid, PaneInfo> = HashMap::new(); // empty — cold start
+
+        for tab in &session_tabs {
+            let legacy_pane_id = tab.pane_id;
+            let Some((root_widget, first_da)) = reconnect_pane_tree(
+                &tab.pane_tree, &mut pane_map, dc, config,
+                &ws.tab_states, &ws.focus_tracker, &ws.custom_titles,
+                &window, &ws.tab_view, legacy_pane_id,
+            ) else {
+                tracing::warn!("reconnect_pane_tree failed for tab {:?}", tab.title);
+                continue;
+            };
+
+            let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+            container.set_hexpand(true);
+            container.set_vexpand(true);
+            container.append(&root_widget);
+            let page = ws.tab_view.append(&container);
+            page.set_title(if tab.title.is_empty() { "shell" } else { &tab.title });
+            ws.tab_view.set_selected_page(&page);
+            first_da.grab_focus();
+            register_title_timer(&page, &ws.tab_view, &ws.tab_states,
+                &ws.focus_tracker, &ws.custom_titles, &window);
+            restored = true;
+        }
     }
-  },
-  "pane_id": null
 }
 ```
 
 ---
 
-## 4. Save Path Fix
+## 4. Phase 2: VT Buffer Persistence
 
-### 4a. `snapshot_pane_tree` — embed `daemon_pane_id` in every `Leaf`
+### 4a. Snapshot format
 
-**File:** `crates/forgetty-gtk/src/app.rs`
-**Function:** `snapshot_pane_tree`
-
-In the `DrawingArea` arm, after reading the `cwd`, also read `daemon_pane_id` from `TerminalState` and store it in the `Leaf`:
-
-```rust
-// In the DrawingArea arm of snapshot_pane_tree:
-let daemon_pane_id = tab_states
-    .try_borrow()
-    .ok()
-    .and_then(|states| states.get(&widget_name).cloned())
-    .and_then(|rc| rc.try_borrow().ok().map(|s| s.daemon_pane_id))
-    .flatten()
-    .map(|pid| pid.0); // PaneId(uuid) → uuid::Uuid
-
-return Some(PaneTreeState::Leaf { cwd, pane_id: daemon_pane_id });
+Same as the `get_screen` RPC response body:
+```json
+{ "lines": ["<ANSI row string>", ...], "cursor": { "row": 2, "col": 5 } }
 ```
 
-### 4b. `snapshot_single_workspace` — stop writing top-level `pane_id`
+Storage: `~/.local/share/forgetty/sessions/snapshots/<pane-uuid>.json`
 
-**File:** `crates/forgetty-gtk/src/app.rs`
-**Function:** `snapshot_single_workspace`
+### 4b. New persistence helpers in `forgetty-workspace`
 
-Replace `find_first_daemon_pane_id` call with `pane_id: None`:
+**File:** `crates/forgetty-workspace/src/persistence.rs` — add:
 
+- `snapshot_path(pane_id: uuid::Uuid) -> PathBuf`
+- `save_vt_snapshot(pane_id, lines, cursor_row, cursor_col) -> io::Result<()>` — atomic write via temp+rename
+- `load_vt_snapshot(pane_id) -> Option<(Vec<String>, usize, usize)>` — returns None if absent/corrupt
+- `delete_vt_snapshot(pane_id)` — silent if file not found
+
+Re-export all four from `crates/forgetty-workspace/src/lib.rs`.
+
+### 4c. Extract `serialize_row_ansi` helper in `forgetty-socket`
+
+**File:** `crates/forgetty-socket/src/handlers.rs`
+
+Factor the per-row ANSI serialization logic out of `handle_get_screen` into:
 ```rust
-// Before
-let pane_id = find_first_daemon_pane_id(&container, &ws.tab_states);
-tabs.push(TabState { title, pane_tree, pane_id });
-
-// After — pane_id is now per-Leaf inside pane_tree
-tabs.push(TabState { title, pane_tree, pane_id: None });
+fn serialize_row_ansi(row: &[Cell]) -> String { ... }
 ```
 
----
+Both `handle_get_screen` and the new `save_all_snapshots` call this.
 
-## 5. Restore Path Fix
+### 4d. `save_all_snapshots` — called by daemon on shutdown
 
-### 5a. New helper: `reconnect_pane_tree`
-
-Add a recursive function to `app.rs` that mirrors `build_pane_tree` (self-contained) but uses daemon pane IDs:
+**File:** `crates/forgetty-socket/src/handlers.rs`:
 
 ```rust
-fn reconnect_pane_tree(
-    tree: &PaneTreeState,
-    pane_map: &mut HashMap<uuid::Uuid, PaneInfo>,
-    dc: &Arc<DaemonClient>,
-    config: &Config,
-    tab_states: &TabStateMap,
-    focus_tracker: &FocusTracker,
-    custom_titles: &CustomTitles,
-    window: &adw::ApplicationWindow,
-    tab_view: &adw::TabView,
-    // legacy fallback: TabState.pane_id for T-055-era session files
-    legacy_pane_id: Option<uuid::Uuid>,
-) -> Option<(gtk4::Widget, gtk4::DrawingArea)>
+pub fn save_all_snapshots(sm: &SessionManager) -> usize {
+    let pane_ids = sm.list_panes();
+    let mut saved = 0usize;
+    for id in &pane_ids {
+        let result = sm.with_vt(*id, |terminal| {
+            let screen = terminal.screen();
+            let rows = screen.rows();
+            let lines: Vec<String> = (0..rows).map(|r| serialize_row_ansi(screen.row(r))).collect();
+            let (cur_row, cur_col) = terminal.cursor_position();
+            (lines, cur_row, cur_col)
+        });
+        if let Ok((lines, cur_row, cur_col)) = result {
+            if forgetty_workspace::save_vt_snapshot(id.0, &lines, cur_row, cur_col).is_ok() {
+                saved += 1;
+            }
+        }
+    }
+    saved
+}
 ```
 
-**`Leaf` arm:**
-1. Determine the pane UUID: `tree.pane_id` first, then `legacy_pane_id` fallback (T-055 compat).
-2. If UUID is `Some(uid)` and `pane_map.remove(&uid)` returns a `PaneInfo`:
-   - Subscribe, `create_terminal_for_pane` with that pane's `cwd`.
-3. Otherwise (pane gone or no UUID):
-   - `dc.new_tab()` → fresh pane, subscribe, `create_terminal_for_pane(cwd=None)`.
-4. Wire focus tracking, register pane in `tab_states`.
-5. Return `Some((pane_vbox.upcast::<gtk4::Widget>(), drawing_area))`.
+Expose from `crates/forgetty-socket/src/lib.rs`: `pub use handlers::save_all_snapshots;`
 
-**`Split` arm:**
-1. Recurse: `reconnect_pane_tree(first, ...)` → `(first_widget, first_da)`.
-2. Recurse: `reconnect_pane_tree(second, ...)` → `(second_widget, _)`.
-3. Create `gtk::Paned`:
-   ```rust
-   let orientation = if direction == "horizontal" {
-       gtk4::Orientation::Horizontal
-   } else {
-       gtk4::Orientation::Vertical
-   };
-   let paned = gtk4::Paned::new(orientation);
-   paned.set_start_child(Some(&first_widget));
-   paned.set_end_child(Some(&second_widget));
-   paned.set_hexpand(true);
-   paned.set_vexpand(true);
-   ```
-4. Schedule ratio restore via `glib::idle_add_local_once` (same pattern as `build_pane_tree`):
-   ```rust
-   let paned_weak = paned.downgrade();
-   let ratio = *ratio;
-   glib::idle_add_local_once(move || {
-       if let Some(p) = paned_weak.upgrade() {
-           let size = if orientation == gtk4::Orientation::Horizontal {
-               p.width()
-           } else {
-               p.height()
-           };
-           if size > 0 {
-               p.set_position((size as f64 * ratio) as i32);
-           }
-       }
-   });
-   ```
-5. Return `Some((paned.upcast::<gtk4::Widget>(), first_da))`.
+### 4e. Wire into daemon SIGTERM shutdown
 
-### 5b. Replace the flat loop in the daemon reconnect block
-
-**File:** `crates/forgetty-gtk/src/app.rs`, ~line 1166
-
-Replace the `for (pane_id, title, cwd) in &ordered` loop with:
+**File:** `src/daemon.rs`, in the shutdown block, before `kill_all()`:
 
 ```rust
-for tab in &session_tabs {
-    let legacy_pane_id = tab.pane_id; // backward compat with T-055 session files
-    let Some((root_widget, first_da)) = reconnect_pane_tree(
-        &tab.pane_tree,
-        &mut pane_map,
-        dc,
-        config,
-        &ws.tab_states,
-        &ws.focus_tracker,
-        &ws.custom_titles,
-        &window,
-        &ws.tab_view,
-        legacy_pane_id,
-    ) else {
-        tracing::warn!("reconnect_pane_tree failed for tab {:?}", tab.title);
-        continue;
+let saved = forgetty_socket::save_all_snapshots(&session_manager);
+info!("Saved VT snapshots for {saved} pane(s)");
+session_manager.kill_all();
+```
+
+### 4f. New RPC: `preseed_snapshot`
+
+**File:** `crates/forgetty-socket/src/protocol.rs`:
+```rust
+pub const PRESEED_SNAPSHOT: &str = "preseed_snapshot";
+```
+
+**File:** `crates/forgetty-socket/src/handlers.rs`:
+
+```rust
+fn handle_preseed_snapshot(request: &Request, sm: &SessionManager) -> Response {
+    // params: { "pane_id": "<new live pane>", "snapshot_id": "<old saved pane>" }
+    let new_pane_id = match require_pane_id(request, sm) { Ok(id) => id, Err(e) => return e };
+    let snapshot_uuid = match parse_snapshot_id(request) { Ok(u) => u, Err(e) => return e };
+
+    let Some((lines, cur_row, cur_col)) = forgetty_workspace::load_vt_snapshot(snapshot_uuid) else {
+        return Response::success(request.id.clone(), serde_json::json!({ "ok": true, "seeded": false }));
     };
 
-    let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-    container.set_hexpand(true);
-    container.set_vexpand(true);
-    container.append(&root_widget);
-    let page = ws.tab_view.append(&container);
-    let tab_title = if tab.title.is_empty() { "shell" } else { &tab.title };
-    page.set_title(tab_title);
-    register_title_timer(
-        &page, &ws.tab_view, &ws.tab_states,
-        &ws.focus_tracker, &ws.custom_titles, &window,
-    );
-    restored = true;
-}
+    let mut payload: Vec<u8> = Vec::new();
+    payload.extend_from_slice(b"\x1b[2J\x1b[H"); // clear + home
+    for (i, line) in lines.iter().enumerate() {
+        payload.extend_from_slice(format!("\x1b[{};1H{}", i + 1, line).as_bytes());
+    }
+    payload.extend_from_slice(format!("\x1b[{};{}H", cur_row + 1, cur_col + 1).as_bytes());
 
-// Append remaining live daemon panes not referenced by any session leaf.
-for info in pane_map.into_values() {
-    // ... existing orphan-pane tab creation (add_new_tab or equivalent) ...
+    match sm.with_vt_mut(new_pane_id, |t| t.feed(&payload)) {
+        Ok(()) => {
+            forgetty_workspace::delete_vt_snapshot(snapshot_uuid);
+            Response::success(request.id.clone(), serde_json::json!({ "ok": true, "seeded": true }))
+        }
+        Err(e) => Response::error(request.id.clone(), protocol::INTERNAL_ERROR, e.to_string()),
+    }
 }
-ws.tab_view.set_selected_page(&ws.tab_view.nth_page(0).unwrap_or_else(|| ws.tab_view.nth_page(0).unwrap()));
 ```
 
-The `ordered` variable and its construction can be removed entirely.
+Wire in `dispatch`: `methods::PRESEED_SNAPSHOT => handle_preseed_snapshot(request, &sm),`
+
+### 4g. `preseed_snapshot` in `DaemonClient`
+
+**File:** `crates/forgetty-gtk/src/daemon_client.rs`:
+
+```rust
+pub fn preseed_snapshot(&self, new_pane_id: PaneId, old_uuid: uuid::Uuid) -> Result<bool, DaemonError> {
+    let result = self.rpc("preseed_snapshot", serde_json::json!({
+        "pane_id": new_pane_id.to_string(),
+        "snapshot_id": old_uuid.to_string(),
+    }))?;
+    Ok(result.get("seeded").and_then(|v| v.as_bool()).unwrap_or(false))
+}
+```
+
+### 4h. Call `preseed_snapshot` in `reconnect_pane_tree`
+
+**File:** `crates/forgetty-gtk/src/app.rs`, in the Leaf arm after `new_tab_with_cwd` succeeds, before `subscribe_output`:
+
+```rust
+// If this leaf had a saved pane UUID, pre-seed the new pane's VT with the snapshot.
+if let Some(old_uuid) = uid {
+    if let Err(e) = dc.preseed_snapshot(new_pane_id, old_uuid) {
+        tracing::warn!("preseed_snapshot failed: {e}");
+    }
+}
+```
+
+`uid` is the UUID that was tried (from `leaf.pane_id` or `legacy_pane_id`). After pre-seeding, the subsequent `dc.get_screen(new_pane_id)` call already in `reconnect_pane_tree` will return the snapshot content and `create_terminal_for_pane` will display it.
+
+### 4i. Delete snapshot on clean pane close
+
+**File:** `crates/forgetty-socket/src/handlers.rs`, `handle_close_tab`, after `sm.close_pane(id)` succeeds:
+
+```rust
+forgetty_workspace::delete_vt_snapshot(id.0);
+```
 
 ---
 
-## 6. Acceptance Criteria
+## 5. Acceptance Criteria
 
-- **AC-1:** Close GTK with a tab containing a horizontal split of two daemon panes → `default.json` contains a `"Split"` `pane_tree` with two `"Leaf"` children, each with a non-null `"pane_id"`. `TabState.pane_id` at top level is `null`.
-- **AC-2:** Reopen GTK → the split tab is restored as **one tab** with a `gtk::Paned` containing two live panes. Not two separate flat tabs.
-- **AC-3:** Reopen GTK → split divider position is approximately preserved (within ±5% of saved ratio).
-- **AC-4:** Reopen GTK → each pane in the restored split shows the correct CWD from its daemon pane.
-- **AC-5:** Single-pane tabs (no split) are unaffected — `Leaf { pane_id: Some(...) }` and restore as before.
-- **AC-6:** Self-contained mode (no daemon) session save/restore still works. `Leaf.pane_id` defaults to `None`, `build_pane_tree` ignores it, spawns fresh PTYs.
-- **AC-7:** Deeply nested splits (3+ panes) save and restore correctly.
-- **AC-8:** Old session file (no `pane_id` in `Leaf`) deserializes without error, `pane_id` defaults to `None`, fresh panes created on reconnect.
-- **AC-9:** T-055-era session file (`TabState.pane_id` set, `Leaf.pane_id` absent) reconnects the single pane correctly via the `legacy_pane_id` fallback.
+### Phase 1
+- **AC-1.1** After reboot (daemon starts fresh), `forgetty` restores the same number of tabs in the same order
+- **AC-1.2** Split-pane layout within each tab is restored
+- **AC-1.3** Each pane's shell starts at the saved CWD (`pwd` matches `default.json` leaf `cwd`)
+- **AC-1.4** Saved CWD that no longer exists → pane starts at `$HOME`, no crash
+- **AC-1.5** No `default.json` → single blank tab as before, no panic
+- **AC-1.6** `new_tab` RPC with no `cwd` param is backward compatible
+- **AC-1.7** `new_tab` RPC with nonexistent `cwd` silently falls back to home
+
+### Phase 2
+- **AC-2.1** `systemctl --user stop forgetty-daemon` → snapshot files written to `~/.local/share/forgetty/sessions/snapshots/`
+- **AC-2.2** After cold-start restore, each pane displays the content it showed before shutdown
+- **AC-2.3** Snapshot content is display-only — no bytes sent to the live PTY (no re-execution)
+- **AC-2.4** Closing a tab via UI deletes its snapshot file
+- **AC-2.5** Corrupt/missing snapshot → pane opens blank, no crash
+- **AC-2.6** `systemctl --user start forgetty-daemon` followed by `forgetty` shows saved screen state
 
 ---
 
-## 7. Edge Cases
+## 6. Edge Cases
 
 | Case | Handling |
 |------|----------|
-| One pane of split closed in daemon before reopen | `pane_map.remove` returns `None` → fresh `dc.new_tab()`. Split layout preserved, one pane is fresh shell. |
-| Both panes of split closed | Both fall back to `dc.new_tab()`. Layout preserved, both are fresh shells. |
-| Deeply nested splits (3+ panes) | Recursive `reconnect_pane_tree` handles arbitrarily deep trees. |
-| Ratio restore timing | `idle_add_local_once` guard: `if size > 0`. If widget not yet realized, defaults to 50/50. |
-| `pane_map` orphans after reconnect | Appended as flat tabs (existing behavior). |
-| Vertical splits | `direction == "vertical"` → `gtk4::Orientation::Vertical`. Handled by same code path. |
+| Saved CWD deleted | `p.is_dir()` guard → `None` → `new_tab_with_cwd(None)` → home |
+| `new_tab_with_cwd` fails | `reconnect_pane_tree` returns `None` → tab skipped, others restored |
+| No session file | `session_tabs` is empty → `!restored` → single blank tab |
+| SIGKILL (no graceful shutdown) | Snapshots not written → Phase 1 restores layout+CWD, panes open blank |
+| Corrupt snapshot | `load_vt_snapshot` returns `None` → `preseed_snapshot` returns `seeded: false` → blank pane |
+| Old session file (no Leaf.pane_id) | `uid = None` → no preseed → blank pane at correct CWD |
+| T-055 session file (TabState.pane_id set) | `legacy_pane_id` fallback → `preseed_snapshot(new_id, legacy_uuid)` → snapshot loaded if present |
 
 ---
 
-## 8. Files to Change
+## 7. Files to Change
+
+### Phase 1 (3 files)
 
 | File | Change |
 |------|--------|
-| `crates/forgetty-workspace/src/workspace.rs` | Add `pane_id: Option<uuid::Uuid>` with `#[serde(default)]` to `PaneTreeState::Leaf` |
-| `crates/forgetty-gtk/src/app.rs` | (1) Embed `daemon_pane_id` in `snapshot_pane_tree` leaf arm; (2) Stop writing `TabState.pane_id` in `snapshot_single_workspace`; (3) Add `reconnect_pane_tree` recursive helper; (4) Replace flat `ordered` loop with `reconnect_pane_tree`-based loop |
+| `crates/forgetty-socket/src/handlers.rs` | `handle_new_tab`: read optional `cwd` param |
+| `crates/forgetty-gtk/src/daemon_client.rs` | Add `new_tab_with_cwd`; refactor `new_tab` as wrapper |
+| `crates/forgetty-gtk/src/app.rs` | Fix `Ok(_)` cold-start branch; update `new_tab()` → `new_tab_with_cwd(leaf_cwd)` in `reconnect_pane_tree` |
+
+### Phase 2 (7 files, incremental on Phase 1)
+
+| File | Change |
+|------|--------|
+| `crates/forgetty-workspace/src/persistence.rs` | Add 4 snapshot helpers |
+| `crates/forgetty-workspace/src/lib.rs` | Re-export snapshot helpers |
+| `crates/forgetty-socket/src/handlers.rs` | Extract `serialize_row_ansi`; add `save_all_snapshots`, `handle_preseed_snapshot`; wire in dispatch; delete snapshot in `handle_close_tab` |
+| `crates/forgetty-socket/src/protocol.rs` | Add `PRESEED_SNAPSHOT` constant |
+| `crates/forgetty-socket/src/lib.rs` | Export `save_all_snapshots` |
+| `src/daemon.rs` | Call `save_all_snapshots` before `kill_all` on SIGTERM |
+| `crates/forgetty-gtk/src/daemon_client.rs` | Add `preseed_snapshot` method |
+| `crates/forgetty-gtk/src/app.rs` | Call `preseed_snapshot` in `reconnect_pane_tree` after fresh pane creation |
+
+---
+
+## 8. Implementation Order
+
+1. Phase 1 fully — verify AC-1.1–1.7 with a real reboot
+2. Add snapshot helpers to `forgetty-workspace` (unit testable in isolation)
+3. Extract `serialize_row_ansi`, add `save_all_snapshots` to `forgetty-socket`
+4. Wire daemon SIGTERM hook
+5. Add `handle_preseed_snapshot`, wire in dispatch
+6. Add `preseed_snapshot` to `DaemonClient`
+7. Call in `reconnect_pane_tree`
+8. End-to-end Phase 2 test
