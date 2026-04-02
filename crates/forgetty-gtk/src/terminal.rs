@@ -1531,16 +1531,24 @@ pub fn create_terminal_for_pane(
 
     // Prime VT state with snapshot lines so the first frame shows content.
     if let Some(snap) = snapshot {
-        // Position cursor at top-left before replaying so row indices match.
-        terminal.feed(b"\x1b[H");
-        for line in &snap.lines {
+        let snap_rows = snap.lines.len();
+        // Place content at the BOTTOM of the oversized initial VT (initial_rows
+        // rows tall).  On the first draw the VT shrinks to the actual widget
+        // size; libghostty-vt removes rows from the TOP on a shrink, keeping the
+        // bottom rows visible.  If we put the content at the top (row 1) it
+        // would disappear into scrollback — placing it at the bottom ensures it
+        // survives the resize.
+        let start_row = initial_rows.saturating_sub(snap_rows) + 1; // 1-indexed
+        for (i, line) in snap.lines.iter().enumerate() {
+            let row = start_row + i;
+            // Explicit CUP per row avoids accidental scrolling at the boundary.
+            terminal.feed(format!("\x1b[{row};1H").as_bytes());
             terminal.feed(line.as_bytes());
-            terminal.feed(b"\r\n");
         }
-        // Restore cursor to where it was in the live session.
-        let row = snap.cursor_row + 1;
-        let col = snap.cursor_col + 1;
-        terminal.feed(format!("\x1b[{row};{col}H").as_bytes());
+        // Restore cursor to its position within the snapshot coordinate space.
+        let cur_row = start_row + snap.cursor_row; // absolute 1-indexed row in oversized VT
+        let cur_col = snap.cursor_col + 1;
+        terminal.feed(format!("\x1b[{cur_row};{cur_col}H").as_bytes());
     }
 
     let input = GhosttyInput::new();

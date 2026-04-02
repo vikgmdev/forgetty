@@ -39,6 +39,10 @@ const BROADCAST_CAPACITY: usize = 1024;
 
 struct SessionManagerInner {
     panes: HashMap<PaneId, PaneState>,
+    /// Tracks insertion order so `list_panes()` returns panes in creation order.
+    /// `HashMap` iteration is non-deterministic; preserving order ensures tabs
+    /// are restored in the same visual position after a window reopen.
+    pane_order: Vec<PaneId>,
     event_tx: broadcast::Sender<SessionEvent>,
 }
 
@@ -60,7 +64,11 @@ impl SessionManager {
     pub fn new() -> Self {
         let (event_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         Self {
-            inner: Arc::new(Mutex::new(SessionManagerInner { panes: HashMap::new(), event_tx })),
+            inner: Arc::new(Mutex::new(SessionManagerInner {
+                panes: HashMap::new(),
+                pane_order: Vec::new(),
+                event_tx,
+            })),
         }
     }
 
@@ -111,6 +119,7 @@ impl SessionManager {
         {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             inner.panes.insert(id, pane);
+            inner.pane_order.push(id);
             let _ = inner.event_tx.send(SessionEvent::PaneCreated { pane_id: id });
         }
 
@@ -124,6 +133,7 @@ impl SessionManager {
     pub fn close_pane(&self, id: PaneId) -> Result<()> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(mut pane) = inner.panes.remove(&id) {
+            inner.pane_order.retain(|&p| p != id);
             if let Err(e) = pane.pty_bridge.pty.kill() {
                 warn!(%id, "failed to kill PTY on close_pane: {e}");
             }
@@ -306,7 +316,7 @@ impl SessionManager {
     /// List all live pane IDs.
     pub fn list_panes(&self) -> Vec<PaneId> {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner.panes.keys().copied().collect()
+        inner.pane_order.clone()
     }
 
     // -----------------------------------------------------------------------
