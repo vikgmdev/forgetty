@@ -7,7 +7,7 @@
 //! Pango for text layout.
 
 use std::cell::RefCell;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
@@ -162,6 +162,9 @@ pub struct TerminalState {
     pub daemon_pane_id: Option<forgetty_core::PaneId>,
     /// For daemon-backed panes: handle for routing write-pty responses.
     pub daemon_client: Option<Arc<DaemonClient>>,
+    /// For daemon-backed panes: the CWD from `PaneInfo` at connect time.
+    /// Used as a fallback tab title until the shell emits OSC 0/2.
+    pub daemon_cwd: Option<PathBuf>,
 }
 
 impl TerminalState {
@@ -345,6 +348,7 @@ pub fn create_terminal(
         on_notify,
         daemon_pane_id: None,
         daemon_client: None,
+        daemon_cwd: None,
     }));
 
     // Create DrawingArea
@@ -1517,6 +1521,7 @@ pub fn create_terminal_for_pane(
     daemon_client: Arc<DaemonClient>,
     daemon_rx: mpsc::Receiver<Vec<u8>>,
     snapshot: Option<&crate::daemon_client::ScreenSnapshot>,
+    cwd: Option<PathBuf>,
     on_exit: Option<Rc<dyn Fn(String)>>,
     on_notify: Option<Rc<dyn Fn(NotificationPayload)>>,
 ) -> Result<(gtk4::Box, DrawingArea, Rc<RefCell<TerminalState>>), String> {
@@ -1531,7 +1536,17 @@ pub fn create_terminal_for_pane(
 
     // Prime VT state with snapshot lines so the first frame shows content.
     if let Some(snap) = snapshot {
-        let snap_rows = snap.lines.len();
+        // Discard blank leading rows — they produce a large empty region in the
+        // viewport after the first-draw resize.  Only lines from the first
+        // non-empty row onward are replayed, so the cursor lands at the same
+        // relative position within the visible content.
+        let first_content = snap.lines.iter()
+            .position(|l| !l.is_empty())
+            .unwrap_or(snap.lines.len().saturating_sub(1)); // keep at least cursor row
+        let effective_lines = &snap.lines[first_content..];
+        let effective_cursor_row = snap.cursor_row.saturating_sub(first_content);
+
+        let snap_rows = effective_lines.len();
         // Place content at the BOTTOM of the oversized initial VT (initial_rows
         // rows tall).  On the first draw the VT shrinks to the actual widget
         // size; libghostty-vt removes rows from the TOP on a shrink, keeping the
@@ -1539,14 +1554,14 @@ pub fn create_terminal_for_pane(
         // would disappear into scrollback — placing it at the bottom ensures it
         // survives the resize.
         let start_row = initial_rows.saturating_sub(snap_rows) + 1; // 1-indexed
-        for (i, line) in snap.lines.iter().enumerate() {
+        for (i, line) in effective_lines.iter().enumerate() {
             let row = start_row + i;
             // Explicit CUP per row avoids accidental scrolling at the boundary.
             terminal.feed(format!("\x1b[{row};1H").as_bytes());
             terminal.feed(line.as_bytes());
         }
-        // Restore cursor to its position within the snapshot coordinate space.
-        let cur_row = start_row + snap.cursor_row; // absolute 1-indexed row in oversized VT
+        // Restore cursor to its position within the effective content slice.
+        let cur_row = start_row + effective_cursor_row; // absolute 1-indexed row in oversized VT
         let cur_col = snap.cursor_col + 1;
         terminal.feed(format!("\x1b[{cur_row};{cur_col}H").as_bytes());
     }
@@ -1588,6 +1603,7 @@ pub fn create_terminal_for_pane(
         on_notify,
         daemon_pane_id: Some(pane_id),
         daemon_client: Some(daemon_client),
+        daemon_cwd: cwd,
     }));
 
     // Create DrawingArea
