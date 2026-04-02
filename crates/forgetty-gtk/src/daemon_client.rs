@@ -176,9 +176,14 @@ impl DaemonClient {
         Ok(infos)
     }
 
-    /// Create a new pane in the daemon. Returns the assigned `PaneId`.
-    pub fn new_tab(&self) -> Result<PaneId, DaemonError> {
-        let result = self.rpc("new_tab", serde_json::json!({}))?;
+    /// Create a new pane in the daemon with an optional starting CWD.
+    /// Returns the assigned `PaneId`.
+    pub fn new_tab_with_cwd(&self, cwd: Option<&std::path::Path>) -> Result<PaneId, DaemonError> {
+        let params = match cwd {
+            Some(p) => serde_json::json!({ "cwd": p.to_string_lossy().as_ref() }),
+            None => serde_json::json!({}),
+        };
+        let result = self.rpc("new_tab", params)?;
         let tab_id_str = result
             .get("tab_id")
             .and_then(|v| v.as_str())
@@ -186,6 +191,11 @@ impl DaemonClient {
         let uuid = uuid::Uuid::parse_str(tab_id_str)
             .map_err(|e| DaemonError(format!("new_tab: invalid UUID: {e}")))?;
         Ok(PaneId(uuid))
+    }
+
+    /// Create a new pane in the daemon. Returns the assigned `PaneId`.
+    pub fn new_tab(&self) -> Result<PaneId, DaemonError> {
+        self.new_tab_with_cwd(None)
     }
 
     /// Close a pane in the daemon.
@@ -251,6 +261,25 @@ impl DaemonClient {
             .unwrap_or(0) as usize;
 
         Ok(ScreenSnapshot { lines, cursor_row, cursor_col })
+    }
+
+    /// Pre-seed a new pane's VT buffer with the saved snapshot from an old pane.
+    ///
+    /// Returns `Ok(true)` if the snapshot was found and applied, `Ok(false)`
+    /// if no snapshot existed (pane opens blank).
+    pub fn preseed_snapshot(
+        &self,
+        new_pane_id: PaneId,
+        old_uuid: uuid::Uuid,
+    ) -> Result<bool, DaemonError> {
+        let result = self.rpc(
+            "preseed_snapshot",
+            serde_json::json!({
+                "pane_id": new_pane_id.to_string(),
+                "snapshot_id": old_uuid.to_string(),
+            }),
+        )?;
+        Ok(result.get("seeded").and_then(|v| v.as_bool()).unwrap_or(false))
     }
 
     // -----------------------------------------------------------------------

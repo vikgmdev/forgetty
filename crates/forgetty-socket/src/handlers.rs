@@ -5,6 +5,7 @@
 //! synchronous (non-streaming) methods; `subscribe_output` is handled
 //! directly in `server.rs` because it requires an async streaming loop.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use base64::Engine as _;
@@ -12,7 +13,7 @@ use forgetty_core::PaneId;
 use forgetty_pty::PtySize;
 use forgetty_session::SessionManager;
 use forgetty_sync::SyncEndpoint;
-use forgetty_vt::{CellAttributes, Color};
+use forgetty_vt::{Cell, CellAttributes, Color};
 use uuid::Uuid;
 
 use crate::protocol::{self, methods, Request, Response};
@@ -48,6 +49,7 @@ pub fn dispatch(
         methods::GET_PANE_INFO => handle_get_pane_info(request, &sm),
         methods::RESIZE_PANE => handle_resize_pane(request, &sm),
         methods::SEND_SIGINT => handle_send_sigint(request, &sm),
+        methods::PRESEED_SNAPSHOT => handle_preseed_snapshot(request, &sm),
         // Sync / pairing methods — require sync_endpoint.
         methods::LIST_DEVICES => handle_list_devices(request, sync_endpoint.as_deref()),
         methods::REVOKE_DEVICE => handle_revoke_device(request, sync_endpoint.as_deref()),
@@ -141,7 +143,15 @@ fn handle_list_tabs(request: &Request, sm: &SessionManager) -> Response {
 fn handle_new_tab(request: &Request, sm: &SessionManager) -> Response {
     let size = PtySize { rows: DEFAULT_ROWS, cols: DEFAULT_COLS, pixel_width: 0, pixel_height: 0 };
 
-    match sm.create_pane(size, None, None, None, true) {
+    let cwd: Option<PathBuf> = request
+        .params
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir()); // silently ignore nonexistent dirs
+
+    match sm.create_pane(size, cwd, None, None, true) {
         Ok(id) => {
             Response::success(request.id.clone(), serde_json::json!({ "tab_id": id.to_string() }))
         }
@@ -160,7 +170,10 @@ fn handle_close_tab(request: &Request, sm: &SessionManager) -> Response {
     };
 
     match sm.close_pane(id) {
-        Ok(()) => Response::success(request.id.clone(), serde_json::json!({ "ok": true })),
+        Ok(()) => {
+            forgetty_workspace::delete_vt_snapshot(id.0);
+            Response::success(request.id.clone(), serde_json::json!({ "ok": true }))
+        }
         Err(e) => Response::error(
             request.id.clone(),
             protocol::INTERNAL_ERROR,
@@ -217,6 +230,105 @@ fn handle_send_input(request: &Request, sm: &SessionManager) -> Response {
     }
 }
 
+/// Serialize a single terminal row to an ANSI-escaped string.
+///
+/// Trailing blank cells with default attributes are omitted to keep payloads
+/// small. Any open SGR sequence is closed at the end of each line so that
+/// rows don't bleed into each other when replayed into the VT.
+fn serialize_row_ansi(row: &[Cell]) -> String {
+    // Find the last cell with non-default content so we can stop
+    // emitting escape codes after it (trailing blank cells are
+    // skipped to keep snapshot payloads small).
+    let content_end = row
+        .iter()
+        .rposition(|c| c.grapheme != " " || c.attrs != CellAttributes::default())
+        .map(|i| i + 1)
+        .unwrap_or(0);
+
+    let mut line = String::new();
+    let mut prev_fg = Color::Default;
+    let mut prev_bg = Color::Default;
+    let mut prev_bold = false;
+    let mut prev_italic = false;
+    let mut prev_underline = false;
+    let mut prev_strike = false;
+    let mut prev_inverse = false;
+    let mut prev_dim = false;
+    let mut emitted_escape = false;
+
+    for cell in row.iter().take(content_end) {
+        let a = &cell.attrs;
+        let changed = a.fg != prev_fg
+            || a.bg != prev_bg
+            || a.bold != prev_bold
+            || a.italic != prev_italic
+            || a.underline != prev_underline
+            || a.strikethrough != prev_strike
+            || a.inverse != prev_inverse
+            || a.dim != prev_dim;
+
+        if changed {
+            // Reset then re-emit all non-default attributes.
+            line.push_str("\x1b[0m");
+            if a.bold { line.push_str("\x1b[1m"); }
+            if a.dim { line.push_str("\x1b[2m"); }
+            if a.italic { line.push_str("\x1b[3m"); }
+            if a.underline { line.push_str("\x1b[4m"); }
+            if a.inverse { line.push_str("\x1b[7m"); }
+            if a.strikethrough { line.push_str("\x1b[9m"); }
+            if let Color::Rgb(r, g, b) = a.fg {
+                line.push_str(&format!("\x1b[38;2;{r};{g};{b}m"));
+            }
+            if let Color::Rgb(r, g, b) = a.bg {
+                line.push_str(&format!("\x1b[48;2;{r};{g};{b}m"));
+            }
+            prev_fg = a.fg;
+            prev_bg = a.bg;
+            prev_bold = a.bold;
+            prev_italic = a.italic;
+            prev_underline = a.underline;
+            prev_strike = a.strikethrough;
+            prev_inverse = a.inverse;
+            prev_dim = a.dim;
+            emitted_escape = true;
+        }
+
+        line.push_str(&cell.grapheme);
+    }
+
+    // Terminate any open SGR sequence so lines don't bleed into
+    // each other when the snapshot is replayed into the VT.
+    if emitted_escape {
+        line.push_str("\x1b[0m");
+    }
+
+    line
+}
+
+/// Save VT snapshots for all live panes to disk.
+///
+/// Called by the daemon on SIGTERM/SIGINT before killing PTY processes.
+/// Returns the number of snapshots successfully written.
+pub fn save_all_snapshots(sm: &SessionManager) -> usize {
+    let pane_ids = sm.list_panes();
+    let mut saved = 0usize;
+    for id in &pane_ids {
+        let result = sm.with_vt(*id, |terminal| {
+            let screen = terminal.screen();
+            let rows = screen.rows();
+            let lines: Vec<String> = (0..rows).map(|r| serialize_row_ansi(screen.row(r))).collect();
+            let (cur_row, cur_col) = terminal.cursor();
+            (lines, cur_row, cur_col)
+        });
+        if let Ok((lines, cur_row, cur_col)) = result {
+            if forgetty_workspace::save_vt_snapshot(id.0, &lines, cur_row, cur_col).is_ok() {
+                saved += 1;
+            }
+        }
+    }
+    saved
+}
+
 fn handle_get_screen(request: &Request, sm: &SessionManager) -> Response {
     let id = match require_pane_id(request, sm) {
         Ok(id) => id,
@@ -228,83 +340,7 @@ fn handle_get_screen(request: &Request, sm: &SessionManager) -> Response {
     let result = sm.with_vt(id, |terminal| {
         let screen = terminal.screen();
         let rows = screen.rows();
-
-        let lines: Vec<String> = (0..rows)
-            .map(|r| {
-                let row = screen.row(r);
-
-                // Find the last cell with non-default content so we can stop
-                // emitting escape codes after it (trailing blank cells are
-                // skipped to keep snapshot payloads small).
-                let content_end = row
-                    .iter()
-                    .rposition(|c| {
-                        c.grapheme != " " || c.attrs != CellAttributes::default()
-                    })
-                    .map(|i| i + 1)
-                    .unwrap_or(0);
-
-                let mut line = String::new();
-                let mut prev_fg = Color::Default;
-                let mut prev_bg = Color::Default;
-                let mut prev_bold = false;
-                let mut prev_italic = false;
-                let mut prev_underline = false;
-                let mut prev_strike = false;
-                let mut prev_inverse = false;
-                let mut prev_dim = false;
-                let mut emitted_escape = false;
-
-                for cell in row.iter().take(content_end) {
-                    let a = &cell.attrs;
-                    let changed = a.fg != prev_fg
-                        || a.bg != prev_bg
-                        || a.bold != prev_bold
-                        || a.italic != prev_italic
-                        || a.underline != prev_underline
-                        || a.strikethrough != prev_strike
-                        || a.inverse != prev_inverse
-                        || a.dim != prev_dim;
-
-                    if changed {
-                        // Reset then re-emit all non-default attributes.
-                        line.push_str("\x1b[0m");
-                        if a.bold { line.push_str("\x1b[1m"); }
-                        if a.dim { line.push_str("\x1b[2m"); }
-                        if a.italic { line.push_str("\x1b[3m"); }
-                        if a.underline { line.push_str("\x1b[4m"); }
-                        if a.inverse { line.push_str("\x1b[7m"); }
-                        if a.strikethrough { line.push_str("\x1b[9m"); }
-                        if let Color::Rgb(r, g, b) = a.fg {
-                            line.push_str(&format!("\x1b[38;2;{r};{g};{b}m"));
-                        }
-                        if let Color::Rgb(r, g, b) = a.bg {
-                            line.push_str(&format!("\x1b[48;2;{r};{g};{b}m"));
-                        }
-                        prev_fg = a.fg;
-                        prev_bg = a.bg;
-                        prev_bold = a.bold;
-                        prev_italic = a.italic;
-                        prev_underline = a.underline;
-                        prev_strike = a.strikethrough;
-                        prev_inverse = a.inverse;
-                        prev_dim = a.dim;
-                        emitted_escape = true;
-                    }
-
-                    line.push_str(&cell.grapheme);
-                }
-
-                // Terminate any open SGR sequence so lines don't bleed into
-                // each other when the snapshot is replayed into the VT.
-                if emitted_escape {
-                    line.push_str("\x1b[0m");
-                }
-
-                line
-            })
-            .collect();
-
+        let lines: Vec<String> = (0..rows).map(|r| serialize_row_ansi(screen.row(r))).collect();
         let (cur_row, cur_col) = terminal.cursor();
         (lines, cur_row, cur_col)
     });
@@ -413,6 +449,61 @@ fn handle_send_sigint(request: &Request, sm: &SessionManager) -> Response {
             request.id.clone(),
             protocol::INTERNAL_ERROR,
             format!("failed to send SIGINT: {e}"),
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VT snapshot handler (T-058)
+// ---------------------------------------------------------------------------
+
+fn handle_preseed_snapshot(request: &Request, sm: &SessionManager) -> Response {
+    // params: { "pane_id": "<new live pane>", "snapshot_id": "<old saved pane>" }
+    let new_pane_id = match require_pane_id(request, sm) {
+        Ok(id) => id,
+        Err(e) => return e,
+    };
+
+    let snapshot_uuid = match request
+        .params
+        .get("snapshot_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing param: snapshot_id".to_string())
+        .and_then(|s| Uuid::parse_str(s).map_err(|e| format!("invalid snapshot_id UUID: {e}")))
+    {
+        Ok(u) => u,
+        Err(msg) => {
+            return Response::error(request.id.clone(), protocol::INVALID_PARAMS, msg);
+        }
+    };
+
+    let Some((lines, cur_row, cur_col)) = forgetty_workspace::load_vt_snapshot(snapshot_uuid)
+    else {
+        return Response::success(
+            request.id.clone(),
+            serde_json::json!({ "ok": true, "seeded": false }),
+        );
+    };
+
+    let mut payload: Vec<u8> = Vec::new();
+    payload.extend_from_slice(b"\x1b[2J\x1b[H"); // clear + home
+    for (i, line) in lines.iter().enumerate() {
+        payload.extend_from_slice(format!("\x1b[{};1H{}", i + 1, line).as_bytes());
+    }
+    payload.extend_from_slice(format!("\x1b[{};{}H", cur_row + 1, cur_col + 1).as_bytes());
+
+    match sm.with_vt_mut(new_pane_id, |t| t.feed(&payload)) {
+        Ok(()) => {
+            forgetty_workspace::delete_vt_snapshot(snapshot_uuid);
+            Response::success(
+                request.id.clone(),
+                serde_json::json!({ "ok": true, "seeded": true }),
+            )
+        }
+        Err(e) => Response::error(
+            request.id.clone(),
+            protocol::INTERNAL_ERROR,
+            e.to_string(),
         ),
     }
 }

@@ -257,6 +257,8 @@ async fn main_async() -> anyhow::Result<()> {
 
     info!("forgetty-daemon shutting down");
     sync_endpoint.close().await;
+    let saved = forgetty_socket::save_all_snapshots(&session_manager);
+    info!("Saved VT snapshots for {saved} pane(s)");
     session_manager.kill_all();
 
     Ok(())

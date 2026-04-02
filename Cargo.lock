@@ -1664,6 +1664,7 @@ dependencies = [
  "forgetty-session",
  "forgetty-sync",
  "forgetty-vt",
+ "forgetty-workspace",
  "hostname",
  "serde",
  "serde_json",
