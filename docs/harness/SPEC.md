@@ -1,8 +1,8 @@
-# SPEC — T-056: Daemon Reconnect Visual Fixes
+# SPEC — T-056: Daemon Reconnect Visual Fixes (Fix Cycle — 2026-04-02)
 
 **Task:** T-056
-**Date:** 2026-04-02
-**Status:** Implementation exists (commit `181a61d`). Builder must verify against this spec and fix any gaps.
+**Date:** 2026-04-02 (original); Fix cycle opened 2026-04-02 after AC-3 failure in live testing.
+**Status:** Prior fix attempt (commit `181a61d`) incomplete — AC-3 still fails in live testing.
 
 ---
 
@@ -10,123 +10,143 @@
 
 T-056 fixes two visual regressions in the daemon-mode reconnect path after T-055. Neither bug exists in self-contained (non-daemon) mode.
 
-**Bug 1 — Tab titles always show "shell":** The title timer fires 100 ms after pane creation and calls `compute_display_title`, which returns `"shell"` for daemon panes because there is no local PTY (`/proc/{pid}/cwd` unavailable) and the shell has not yet emitted OSC 0/2. The correct title set in the reconnect loop is immediately overwritten.
+**Bug 1 — Tab titles always show "shell":** Fixed in commit `181a61d`. Verified correct by code inspection. No change needed.
 
-**Bug 2 — Large blank area above the shell prompt:** `get_screen` returns all N rows of the daemon VT. For an idle shell, rows 0–43 are blank; only the last few contain the prompt. The snapshot replay places all rows into an oversized 80-row VT, then the first-draw resize removes top rows — but the blank rows fill the visible area, pushing the prompt to the bottom.
-
----
-
-## Root Cause Analysis
-
-### Bug 1: Tab titles show "shell"
-
-**File:** `crates/forgetty-gtk/src/app.rs`
-
-1. Reconnect loop sets `page.set_title(correct_title)` — correct.
-2. `register_title_timer` installs a 100 ms GLib timer.
-3. Timer calls `compute_display_title(state)` every tick:
-   - `state.pty` → `None` (no local PTY for daemon panes) → skips `/proc/{pid}/cwd`
-   - `state.terminal.title()` → `""` (fresh VT, no OSC 0/2 yet)
-   - Falls through to `return "shell".to_string()`
-4. `page.set_title("shell")` permanently overwrites the correct title within 100 ms.
-
-**Missing:** `TerminalState` has no field to store the daemon-supplied CWD as a title fallback.
-
-### Bug 2: Blank area above shell prompt
-
-**File:** `crates/forgetty-gtk/src/terminal.rs`, `create_terminal_for_pane`
-
-1. `get_screen` returns `ScreenSnapshot` with `lines.len() == screen.rows()` (e.g. 46).
-2. For idle shell: lines 0–43 are `""`, lines 44–45 contain the prompt.
-3. `snap_rows = 46`, `start_row = 80 - 46 + 1 = 35`.
-4. All 46 rows (44 blank + 2 prompt) replayed into rows 35–80 of the 80-row VT.
-5. First-draw resize 80→46 removes top 34 rows.
-6. Post-resize: rows 1–44 are blank, rows 45–46 have the prompt. User sees ~90% blank area.
-
-**Missing:** No stripping of leading blank rows before computing `start_row`.
+**Bug 2 — Large blank area above the shell prompt:** Commit `181a61d` contains a fix attempt that strips leading blank snapshot lines before replay. The fix does not work. Live testing (AC-3) still shows a large blank area above the shell prompt.
 
 ---
 
-## Implementation Plan
+## Root Cause Analysis — Bug 2 (Revised)
 
-### Fix 1 — `daemon_cwd` field + title fallback
+### What the daemon serializes for blank rows
 
-**`crates/forgetty-gtk/src/terminal.rs`**
+**File:** `crates/forgetty-socket/src/handlers.rs`, `handle_get_screen`
 
-1. Change `use std::path::Path;` → `use std::path::{Path, PathBuf};`
+For each row, `content_end` is computed as:
+```rust
+let content_end = row
+    .iter()
+    .rposition(|c| c.grapheme != " " || c.attrs != CellAttributes::default())
+    .map(|i| i + 1)
+    .unwrap_or(0);
+```
+For a completely blank row every cell is the default, `rposition` returns `None`, `content_end = 0`, and the loop runs zero times. The resulting line string is `""` (empty). **Blank rows are serialized as `""` — the `is_empty()` check in the prior fix was correct.**
 
-2. Add field to `TerminalState` struct (after `daemon_client`):
-   ```rust
-   /// For daemon-backed panes: the CWD from `PaneInfo` at connect time.
-   /// Used as a fallback tab title until the shell emits OSC 0/2.
-   pub daemon_cwd: Option<PathBuf>,
-   ```
+### Why the prior fix didn't work
 
-3. In `create_terminal()` struct literal: `daemon_cwd: None,`
-
-4. Add `cwd: Option<PathBuf>` parameter to `create_terminal_for_pane` (between `snapshot` and `on_exit`):
-   ```rust
-   pub fn create_terminal_for_pane(
-       config: &Config,
-       pane_id: forgetty_core::PaneId,
-       daemon_client: Arc<DaemonClient>,
-       daemon_rx: mpsc::Receiver<Vec<u8>>,
-       snapshot: Option<&crate::daemon_client::ScreenSnapshot>,
-       cwd: Option<PathBuf>,
-       on_exit: Option<Rc<dyn Fn(String)>>,
-       on_notify: Option<Rc<dyn Fn(NotificationPayload)>>,
-   )
-   ```
-
-5. In `create_terminal_for_pane` struct literal: `daemon_cwd: cwd,`
-
-**`crates/forgetty-gtk/src/app.rs`**
-
-6. In `compute_display_title`, add daemon_cwd fallback after OSC check, before `"shell"` return:
-   ```rust
-   // Daemon fallback: use CWD basename from pane_info until shell emits OSC 0/2.
-   if let Some(cwd) = &state.daemon_cwd {
-       if let Some(name) = cwd.file_name() {
-           return name.to_string_lossy().to_string();
-       }
-   }
-   ```
-   Also update the doc comment priority line to:
-   `/// Priority: /proc CWD basename > OSC title > daemon_cwd basename > "shell".`
-
-7. Change `ordered` from `Vec<(PaneId, String)>` to `Vec<(PaneId, String, Option<String>)>`.
-   - Live pane reconnect: `cwd = if info.cwd.is_empty() { None } else { Some(info.cwd.clone()) }`
-   - Fresh/new panes (closed between sessions): `None`
-   - Remaining live panes (not in session file): same as live pane reconnect
-
-8. In the wire-up loop: `let daemon_cwd = cwd.as_ref().map(|s| PathBuf::from(s));` and pass to `create_terminal_for_pane`.
-
-9. All other call sites (`add_new_tab`, `split_pane`): pass `None` for `cwd`.
-
-### Fix 2 — Strip leading blank snapshot lines
-
-**`crates/forgetty-gtk/src/terminal.rs`**, inside `if let Some(snap) = snapshot` block:
+The prior fix strips leading blank rows correctly. The bug is in the **placement strategy**, not the blank-row detection:
 
 ```rust
-// Discard blank leading rows — they produce a large empty region in the
-// viewport after the first-draw resize.
-let first_content = snap.lines.iter()
-    .position(|l| !l.is_empty())
-    .unwrap_or(snap.lines.len().saturating_sub(1)); // keep at least cursor row
-let effective_lines = &snap.lines[first_content..];
-let effective_cursor_row = snap.cursor_row.saturating_sub(first_content);
-
-let snap_rows = effective_lines.len();
-let start_row = initial_rows.saturating_sub(snap_rows) + 1;
-for (i, line) in effective_lines.iter().enumerate() {
-    let row = start_row + i;
-    terminal.feed(format!("\x1b[{row};1H").as_bytes());
-    terminal.feed(line.as_bytes());
-}
-let cur_row = start_row + effective_cursor_row;
-let cur_col = snap.cursor_col + 1;
-terminal.feed(format!("\x1b[{cur_row};{cur_col}H").as_bytes());
+// BROKEN — places content at the BOTTOM of the 80-row VT
+let start_row = initial_rows.saturating_sub(snap_rows) + 1; // e.g. 80 - 2 + 1 = 79
 ```
+
+The comment in the prior code said: *"libghostty-vt removes rows from the TOP on a shrink"*. **This is wrong.**
+
+### Actual Ghostty resize behavior
+
+**File:** `crates/forgetty-vt/ghostty/src/terminal/PageList.zig`, `resizeWithoutReflow` (~line 2064)
+
+```zig
+// Making rows smaller:
+// If our rows are shrinking, we prefer to trim trailing
+// blank lines from the active area instead of creating
+// history if we can.
+const trimmed = self.trimTrailingBlankRows(self.rows - rows);
+```
+
+`trimTrailingBlankRows` removes blank rows from the **bottom** of the active area. Only when there are insufficient trailing blank rows does content get pushed to scrollback/history.
+
+### Why bottom-placement fails
+
+With `start_row = 79` for a 2-row prompt:
+- VT layout: rows 1–78 blank, rows 79–80 have the prompt
+- First-draw resize 80 → 46 (delta = 34): `trimTrailingBlankRows(34)` scans up from row 80 — row 80 has the prompt (content). Stops immediately. `trimmed = 0`
+- Ghostty pushes rows 1–34 into history to satisfy the row count reduction
+- Visible screen becomes rows 35–80: rows 35–78 blank, rows 79–80 prompt
+- **User sees 44 blank rows above the prompt — AC-3 fails**
+
+### Why top-placement is correct
+
+With `start_row = 1` for a 2-row prompt:
+- VT layout: rows 1–2 have the prompt, rows 3–80 blank (78 trailing blanks)
+- First-draw resize 80 → 46 (delta = 34): `trimTrailingBlankRows(34)` removes rows 47–80 cleanly
+- Visible screen: rows 1–46, prompt at rows 1–2, blank rows 3–46
+- **No blank area above the prompt — AC-3 passes**
+
+### Why self-contained mode never had this problem
+
+`create_terminal()` starts a completely empty VT (no snapshot replay). The shell draws its prompt starting at row 1. Blank rows are naturally below it. Resize trims trailing blanks. Prompt stays at top. No blank area.
+
+---
+
+## Correct Fix
+
+**File:** `crates/forgetty-gtk/src/terminal.rs`
+**Location:** `create_terminal_for_pane`, inside `if let Some(snap) = snapshot` block
+
+**Change:** `start_row = initial_rows.saturating_sub(snap_rows) + 1` → `start_row = 1_usize`
+
+### Full replacement block (after)
+
+```rust
+if let Some(snap) = snapshot {
+    // Strip leading blank rows.  Blank rows from the daemon are serialized as
+    // "" (empty string): handle_get_screen only emits bytes up to the last
+    // non-default cell, so an all-blank row produces zero bytes.
+    let first_content = snap.lines.iter()
+        .position(|l| !l.is_empty())
+        .unwrap_or(snap.lines.len().saturating_sub(1)); // keep at least cursor row
+    let effective_lines = &snap.lines[first_content..];
+    let effective_cursor_row = snap.cursor_row.saturating_sub(first_content);
+
+    // Place content at the TOP of the oversized initial VT (row 1).
+    //
+    // libghostty-vt (PageList::resizeWithoutReflow) shrinks by calling
+    // trimTrailingBlankRows(), which removes blank rows from the BOTTOM of
+    // the active area — NOT the top.  Placing content at row 1 means the
+    // trailing blank rows sit below it; the first-draw resize trims them
+    // cleanly and content stays visible at the top.
+    //
+    // The prior strategy (place at bottom, start_row = initial_rows - snap_rows + 1)
+    // was wrong: with content at the bottom there are no trailing blank rows,
+    // nothing gets trimmed, and blank rows above the content are pushed into
+    // the visible window instead of history.
+    let start_row = 1_usize; // 1-indexed; content always at top
+    for (i, line) in effective_lines.iter().enumerate() {
+        let row = start_row + i;
+        // Explicit CUP per row avoids accidental scrolling at the boundary.
+        terminal.feed(format!("\x1b[{row};1H").as_bytes());
+        terminal.feed(line.as_bytes());
+    }
+    // Restore cursor to its position within the effective content slice.
+    let cur_row = start_row + effective_cursor_row; // absolute 1-indexed row in oversized VT
+    let cur_col = snap.cursor_col + 1;
+    terminal.feed(format!("\x1b[{cur_row};{cur_col}H").as_bytes());
+}
+```
+
+Also update the `initial_rows` comment block just above the snapshot block:
+
+```rust
+// Over-estimate rows so the first-draw resize is always a SHRINK.
+// libghostty-vt shrinks by trimming trailing blank rows from the BOTTOM;
+// snapshot content is placed at row 1 (top) so the blank rows sit below
+// it and get trimmed cleanly on the first resize.
+// 80 rows covers any realistic monitor+font combination.
+let initial_rows: usize = 80;
+let initial_cols: usize = 240;
+```
+
+---
+
+## Files Changed
+
+| File | Change |
+|------|--------|
+| `crates/forgetty-gtk/src/terminal.rs` | One semantic change: `start_row = 1` instead of `initial_rows - snap_rows + 1`; updated comments |
+
+Bug 1 fixes (tab titles, `daemon_cwd`) from commit `181a61d` are correct — no changes needed there.
 
 ---
 
@@ -141,52 +161,42 @@ terminal.feed(format!("\x1b[{cur_row};{cur_col}H").as_bytes());
 
 ---
 
-## Risks and Edge Cases
+## Edge Cases
 
-| Case | Handling |
+| Case | Analysis |
 |------|----------|
-| `daemon_cwd` is `/` (root path) | `file_name()` returns `None`; falls through to `"shell"`. Acceptable. |
-| `info.cwd` is `""` | Mapped to `None` before `PathBuf::from`. Branch skipped cleanly. |
-| OSC 0/2 emits literal `"shell"` | Guard `osc_title != "shell"` prevents it; `daemon_cwd` fallback fires. |
-| All snapshot lines empty (brand-new pane) | `first_content = len - 1`; one-row slice placed at row 80. Correct. |
-| Cursor row < `first_content` | `saturating_sub` clamps to 0; cursor at top of effective slice. Safe. |
-| Full-screen program (htop, vim) | All rows non-empty → `first_content = 0` → no-op. AC-4 satisfied. |
+| Fresh shell — all blank rows | `first_content = len-1`; one blank row at row 1; cursor at row 1. Trailing rows 2–80 trimmed. Prompt at row 1. |
+| Full-screen program — all rows non-blank | `first_content = 0`; rows 1–N have content; rows N+1–80 blank and trimmed. AC-4 satisfied. |
+| `snap_rows > 80` (very tall daemon terminal) | Rows fed beyond row 80 cause VT to scroll; early rows go to history. Visible content = last `actual_rows` of snapshot. Acceptable — 80 covers all realistic monitors. |
+| Cursor row < `first_content` | `saturating_sub` clamps to 0; cursor at row 1. Safe — does not occur in practice. |
+| Empty snapshot | `effective_lines = &[]`; no VT writes; cursor at `\x1b[1;1H`. Clean no-op. |
 
 ---
 
-## Files Changed
+## Manual Testing Instructions
 
-| File | Change |
-|------|--------|
-| `crates/forgetty-gtk/src/terminal.rs` | `PathBuf` import; `daemon_cwd` field; `cwd` param in `create_terminal_for_pane`; blank-row stripping |
-| `crates/forgetty-gtk/src/app.rs` | `daemon_cwd` fallback in `compute_display_title`; `ordered` carries CWD; `cwd` threaded to call sites |
-
----
-
-## QA Testing Instructions
-
-**Prerequisites:** Daemon running. At least 2–3 tabs open from a prior session.
+**Prerequisites:** Daemon running. At least 2–3 tabs from a prior session: one with only a shell prompt, one with `htop` running.
 
 **AC-1 — Titles show CWD, not "shell":**
-1. Open Forgetty (daemon mode) with prior session tabs.
-2. Close GTK window (daemon keeps running). Reopen.
-3. Tab titles must show directory name, not `"shell"`.
+1. Open Forgetty (daemon mode) with prior session tabs. Close GTK. Reopen.
+2. Tab titles must show directory name (e.g. `forgetty`), not `"shell"`.
 
 **AC-2 — OSC title takes over after `cd`:**
-1. In a reconnected tab, run `cd /tmp`.
-2. After prompt appears (~1 s), tab title must change to `tmp`.
+1. In a reconnected tab, run `cd /tmp`. Wait ~1s for prompt.
+2. Tab title must change to `tmp`.
 
-**AC-3 — Blank area ≤ 2 rows:**
-1. In a tab with only a shell prompt, close and reopen GTK.
-2. Prompt must appear near top — at most 2 blank rows above it.
+**AC-3 — Blank area ≤ 2 rows (KEY TEST):**
+1. Reopen GTK with a tab that had only a shell prompt when closed.
+2. Prompt must appear near the top of the pane — at most 2 blank rows above it.
+3. FAIL if prompt is in the bottom half of the window with large blank area above.
 
 **AC-4 — Full-screen program shows immediately:**
 1. Run `htop` in a tab. Close GTK. Reopen.
-2. Tab must show `htop` content, not a blank screen.
+2. Tab must show htop content immediately, not a blank pane.
 
 **AC-5 — Self-contained mode not regressed:**
 1. Stop daemon. Open Forgetty in self-contained mode.
-2. `cd` to directories; titles must update from `/proc/{pid}/cwd` as before.
+2. `cd` to directories — tab titles must update from `/proc/{pid}/cwd` as before.
 
 **AC-6 — `"shell"` only as last resort:**
-Verify by code inspection: `compute_display_title` returns `"shell"` only when `/proc` CWD, OSC title, and `daemon_cwd.file_name()` all fail.
+Code inspection: `compute_display_title` in `app.rs` returns `"shell"` only after `/proc CWD`, OSC title, and `daemon_cwd.file_name()` all fail.
