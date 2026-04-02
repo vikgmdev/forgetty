@@ -20,6 +20,8 @@
 //! ALPN before completing the QUIC handshake.
 
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use forgetty_session::SessionManager;
 use iroh::{Endpoint, EndpointId, SecretKey, endpoint::presets};
@@ -67,7 +69,7 @@ pub enum SyncError {
 pub struct SyncEndpoint {
     endpoint: Endpoint,
     registry: Arc<Mutex<DeviceRegistry>>,
-    allow_pairing: bool,
+    allow_pairing: Arc<AtomicBool>,
     session_manager: Arc<SessionManager>,
     /// Broadcast channel for pairing/connection events. Receivers are vended to
     /// socket RPC handlers via `subscribe()`.
@@ -98,6 +100,7 @@ impl SyncEndpoint {
             DeviceRegistry::load().map_err(SyncError::Registry)?,
         ));
         let (event_tx, _) = broadcast::channel(64);
+        let allow_pairing = Arc::new(AtomicBool::new(allow_pairing));
 
         Ok(Self { endpoint, registry, allow_pairing, session_manager, event_tx })
     }
@@ -115,6 +118,19 @@ impl SyncEndpoint {
     /// Subscribe to sync events.
     pub fn subscribe(&self) -> broadcast::Receiver<SyncEvent> {
         self.event_tx.subscribe()
+    }
+
+    /// Temporarily open a pairing window for `secs` seconds.
+    ///
+    /// Sets `allow_pairing` to `true` and spawns a task that resets it to
+    /// `false` after the timeout. Safe to call from any thread.
+    pub fn enable_pairing(&self, secs: u64) {
+        self.allow_pairing.store(true, Ordering::Relaxed);
+        let flag = Arc::clone(&self.allow_pairing);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(secs)).await;
+            flag.store(false, Ordering::Relaxed);
+        });
     }
 
     /// Close the iroh endpoint gracefully.
@@ -167,7 +183,7 @@ impl SyncEndpoint {
             };
 
             let registry    = Arc::clone(&self.registry);
-            let allow_pair  = self.allow_pairing;
+            let allow_pair  = self.allow_pairing.load(Ordering::Relaxed);
             let event_tx    = self.event_tx.clone();
             let sm          = Arc::clone(&self.session_manager);
 

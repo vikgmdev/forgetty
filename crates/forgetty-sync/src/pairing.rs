@@ -25,7 +25,8 @@ use crate::{
 
 /// Handle a single accepted iroh connection through the pairing decision tree.
 ///
-/// `allow_pairing` is read from the daemon CLI flag and does not change at runtime.
+/// `allow_pairing` reflects the current state of the pairing window, sampled
+/// at the moment the connection is accepted.
 pub async fn handle_connection(
     conn: Connection,
     registry: Arc<Mutex<DeviceRegistry>>,

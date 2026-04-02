@@ -12,6 +12,7 @@ use forgetty_core::PaneId;
 use forgetty_pty::PtySize;
 use forgetty_session::SessionManager;
 use forgetty_sync::SyncEndpoint;
+use forgetty_vt::{CellAttributes, Color};
 use uuid::Uuid;
 
 use crate::protocol::{self, methods, Request, Response};
@@ -51,6 +52,7 @@ pub fn dispatch(
         methods::LIST_DEVICES => handle_list_devices(request, sync_endpoint.as_deref()),
         methods::REVOKE_DEVICE => handle_revoke_device(request, sync_endpoint.as_deref()),
         methods::GET_PAIRING_INFO => handle_get_pairing_info(request, sync_endpoint.as_deref()),
+        methods::ENABLE_PAIRING => handle_enable_pairing(request, sync_endpoint.as_deref()),
         _ => Response::error(
             request.id.clone(),
             protocol::METHOD_NOT_FOUND,
@@ -226,23 +228,79 @@ fn handle_get_screen(request: &Request, sm: &SessionManager) -> Response {
     let result = sm.with_vt(id, |terminal| {
         let screen = terminal.screen();
         let rows = screen.rows();
-        let cols = screen.cols();
 
         let lines: Vec<String> = (0..rows)
             .map(|r| {
                 let row = screen.row(r);
-                let mut line = String::with_capacity(cols);
-                for cell in row.iter().take(cols) {
+
+                // Find the last cell with non-default content so we can stop
+                // emitting escape codes after it (trailing blank cells are
+                // skipped to keep snapshot payloads small).
+                let content_end = row
+                    .iter()
+                    .rposition(|c| {
+                        c.grapheme != " " || c.attrs != CellAttributes::default()
+                    })
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+
+                let mut line = String::new();
+                let mut prev_fg = Color::Default;
+                let mut prev_bg = Color::Default;
+                let mut prev_bold = false;
+                let mut prev_italic = false;
+                let mut prev_underline = false;
+                let mut prev_strike = false;
+                let mut prev_inverse = false;
+                let mut prev_dim = false;
+                let mut emitted_escape = false;
+
+                for cell in row.iter().take(content_end) {
+                    let a = &cell.attrs;
+                    let changed = a.fg != prev_fg
+                        || a.bg != prev_bg
+                        || a.bold != prev_bold
+                        || a.italic != prev_italic
+                        || a.underline != prev_underline
+                        || a.strikethrough != prev_strike
+                        || a.inverse != prev_inverse
+                        || a.dim != prev_dim;
+
+                    if changed {
+                        // Reset then re-emit all non-default attributes.
+                        line.push_str("\x1b[0m");
+                        if a.bold { line.push_str("\x1b[1m"); }
+                        if a.dim { line.push_str("\x1b[2m"); }
+                        if a.italic { line.push_str("\x1b[3m"); }
+                        if a.underline { line.push_str("\x1b[4m"); }
+                        if a.inverse { line.push_str("\x1b[7m"); }
+                        if a.strikethrough { line.push_str("\x1b[9m"); }
+                        if let Color::Rgb(r, g, b) = a.fg {
+                            line.push_str(&format!("\x1b[38;2;{r};{g};{b}m"));
+                        }
+                        if let Color::Rgb(r, g, b) = a.bg {
+                            line.push_str(&format!("\x1b[48;2;{r};{g};{b}m"));
+                        }
+                        prev_fg = a.fg;
+                        prev_bg = a.bg;
+                        prev_bold = a.bold;
+                        prev_italic = a.italic;
+                        prev_underline = a.underline;
+                        prev_strike = a.strikethrough;
+                        prev_inverse = a.inverse;
+                        prev_dim = a.dim;
+                        emitted_escape = true;
+                    }
+
                     line.push_str(&cell.grapheme);
                 }
-                // Trim trailing spaces to keep output tidy, but preserve length
-                // contract by right-padding with spaces back to `cols`.
-                let trimmed_len = line.trim_end_matches(' ').len();
-                line.truncate(trimmed_len);
-                // Pad to exactly `cols` characters so clients can rely on width.
-                while line.chars().count() < cols {
-                    line.push(' ');
+
+                // Terminate any open SGR sequence so lines don't bleed into
+                // each other when the snapshot is replayed into the VT.
+                if emitted_escape {
+                    line.push_str("\x1b[0m");
                 }
+
                 line
             })
             .collect();
@@ -423,6 +481,13 @@ fn handle_revoke_device(request: &Request, se: Option<&SyncEndpoint>) -> Respons
             format!("failed to revoke device: {e}"),
         ),
     }
+}
+
+fn handle_enable_pairing(request: &Request, se: Option<&SyncEndpoint>) -> Response {
+    let Some(se) = se else { return sync_unavailable(request) };
+    let secs = request.params.get("secs").and_then(|v| v.as_u64()).unwrap_or(120);
+    se.enable_pairing(secs);
+    Response::success(request.id.clone(), serde_json::json!({ "ok": true, "secs": secs }))
 }
 
 fn handle_get_pairing_info(request: &Request, se: Option<&SyncEndpoint>) -> Response {

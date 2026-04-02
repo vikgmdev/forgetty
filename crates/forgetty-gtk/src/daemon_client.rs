@@ -287,6 +287,15 @@ impl DaemonClient {
         Ok(())
     }
 
+    /// Temporarily open a pairing window in the daemon for `secs` seconds.
+    ///
+    /// The daemon will accept the next unknown device for this duration, then
+    /// automatically close the window. Default: 120 seconds.
+    pub fn enable_pairing(&self, secs: u64) -> Result<(), DaemonError> {
+        self.rpc("enable_pairing", serde_json::json!({ "secs": secs }))?;
+        Ok(())
+    }
+
     /// Get the current pairing info (node ID + QR PNG as base64).
     pub fn get_pairing_info(&self) -> Result<PairingInfo, DaemonError> {
         let result = self.rpc("get_pairing_info", serde_json::json!({}))?;
