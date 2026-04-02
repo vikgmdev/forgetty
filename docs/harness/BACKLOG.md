@@ -580,6 +580,87 @@ Replace the current "call list_tabs, create one tab per daemon pane in daemon or
 - [ ] Daemon pane closed between GTK close and reopen → a fresh pane is created in its slot, no crash
 - [ ] Session file from before this change (no `pane_id` field) → deserializes cleanly, reconnect falls back gracefully
 
+### [ ] T-056: Daemon reconnect visual fixes — tab titles and snapshot blank space
+
+**Scope:** Two visual regressions found during T-055 QA (screenshot evidence, 2026-04-02). Both are in the daemon-mode reconnect path. Neither existed in self-contained mode.
+
+**Pain point solved:** "After reopening the window all tabs are titled 'shell' and there's a huge blank area above the shell prompt."
+
+**Files:** `crates/forgetty-gtk/src/terminal.rs` (both fixes), `crates/forgetty-gtk/src/app.rs` (pass `pane_info.cwd` to terminal state)
+
+---
+
+**Bug 1 — Tab titles always show "shell" in daemon mode**
+
+Root cause chain (verified by code trace):
+1. `page.set_title(correct_title)` is called correctly in the reconnect loop.
+2. `register_title_timer` fires after 100 ms.
+3. `compute_display_title(state)` at `app.rs:3542` is called every tick:
+   - `state.pty` → `None` (daemon panes have no local PTY) → skips `/proc/{pid}/cwd`
+   - `state.terminal.title()` → `""` (fresh VT; no OSC 0/2 emitted by daemon shell yet)
+   - Falls through to `return "shell".to_string()`
+4. `page.set_title("shell")` permanently overwrites the correct title.
+
+Fix — add `daemon_cwd: Option<PathBuf>` to `TerminalState` (`terminal.rs`):
+- Initialise to `None` in `create_terminal()` (self-contained panes).
+- Initialise to `Some(PathBuf::from(&pane_info.cwd))` in `create_terminal_for_pane()`.
+- In `compute_display_title`, add a third fallback **after** the OSC title check and **before** the `"shell"` return:
+  ```rust
+  // Daemon fallback: use CWD basename from pane_info (no local /proc path available).
+  if let Some(cwd) = &state.daemon_cwd {
+      if let Some(name) = cwd.file_name() {
+          return name.to_string_lossy().to_string();
+      }
+  }
+  ```
+- The static daemon_cwd is used until the running shell emits OSC 0/2 (via `subscribe_output` stream), at which point `state.terminal.title()` takes over naturally.
+
+---
+
+**Bug 2 — Large blank area above the shell prompt on reconnect**
+
+Root cause chain (verified by code trace):
+1. `get_screen` RPC returns all `screen.rows()` rows of the daemon VT (e.g. 46 rows).
+2. For a fresh/idle shell, rows 0–43 are **blank**; only rows 44–45 have the prompt.
+3. `create_terminal_for_pane` at `terminal.rs:1541` replaces ALL snapshot rows including blank leading rows:
+   ```
+   start_row = initial_rows(80) − snap_rows(46) + 1 = 35
+   Rows 35-78 in the oversized VT → blank snapshot rows
+   Rows 79-80                     → shell prompt
+   ```
+4. On first-draw resize from 80 → 46 rows (shrink removes top 34):
+   - Rows 35–78 become rows 1–44 in the new VT → **44 blank rows visible**
+   - Rows 79–80 become rows 45–46 → prompt at very bottom
+5. User sees ~90 % blank gray area with the prompt crammed at the bottom.
+
+Fix — strip leading empty snapshot lines before replay in `create_terminal_for_pane`:
+```rust
+// Discard blank leading rows — they produce a large empty region in the
+// viewport after the first-draw resize.  Only lines from the first
+// non-empty row onward are replayed, so the cursor lands at the same
+// relative position within the visible content.
+let first_content = snap.lines.iter()
+    .position(|l| !l.is_empty())
+    .unwrap_or(snap.lines.len().saturating_sub(1)); // keep at least cursor row
+let effective_lines = &snap.lines[first_content..];
+let effective_cursor_row = snap.cursor_row.saturating_sub(first_content);
+// Use effective_lines.len() as snap_rows for start_row calculation.
+```
+
+Edge cases:
+- All lines empty (brand-new pane): `first_content` saturates to `len-1`, keeps one line (the cursor row), positions it at bottom of initial VT. Fresh shell output will fill in normally.
+- Cursor row < first_content (shouldn't happen in practice but if it does): `saturating_sub` keeps cursor at row 0 of the effective slice.
+
+---
+
+**AC:**
+- [ ] Reopen GTK with 3 live daemon panes → tab titles show CWD basename (e.g. `forgetty`), not `"shell"`
+- [ ] Tab title updates to new CWD when user runs `cd /tmp` in a daemon pane (OSC title path takes over from static CWD)
+- [ ] Reopen GTK → visible blank area above prompt is ≤ 2 rows for a fresh shell (no large empty region)
+- [ ] Reopen GTK → pane with a full-screen program running (e.g. `htop`) shows content immediately with no blank area
+- [ ] Self-contained mode (no daemon): tab titles still update from `/proc/{pid}/cwd` as before — no regression
+- [ ] `compute_display_title` returns `"shell"` only as a last resort when both OSC title and daemon_cwd are unavailable
+
 ### [ ] T-054: Full interactive from Android — bidirectional PTY input
 **Scope:** Android sends keystrokes, paste, and control sequences to daemon via iroh QUIC stream. Daemon routes to correct PTY master. Full interactive support: vim works (cursor movement, modes, save/quit), htop works, Claude Code interactive prompts answerable from phone. Key encoding: same logic as desktop key encoder (encode Android key events to correct PTY bytes). Control sequences: Ctrl+C, Ctrl+D, arrow keys, Escape, Tab, function keys.
 **Pain point solved:** "I need to step away from my laptop but Claude Code needs a response."
