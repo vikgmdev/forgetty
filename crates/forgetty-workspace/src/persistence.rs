@@ -81,11 +81,14 @@ mod tests {
                         ratio: 0.5,
                         first: Box::new(PaneTreeState::Leaf {
                             cwd: PathBuf::from("/tmp/my-project"),
+                            pane_id: None,
                         }),
                         second: Box::new(PaneTreeState::Leaf {
                             cwd: PathBuf::from("/tmp/my-project/src"),
+                            pane_id: None,
                         }),
                     },
+                    pane_id: None,
                 }],
                 active_tab: 0,
             }],
@@ -176,13 +179,19 @@ mod tests {
                     tabs: vec![
                         TabState {
                             title: "shell".into(),
-                            pane_tree: PaneTreeState::Leaf { cwd: PathBuf::from("/home/user") },
+                            pane_tree: PaneTreeState::Leaf {
+                                cwd: PathBuf::from("/home/user"),
+                                pane_id: None,
+                            },
+                            pane_id: None,
                         },
                         TabState {
                             title: "build".into(),
                             pane_tree: PaneTreeState::Leaf {
                                 cwd: PathBuf::from("/home/user/project"),
+                                pane_id: None,
                             },
+                            pane_id: None,
                         },
                     ],
                     active_tab: 1,
@@ -198,11 +207,14 @@ mod tests {
                             ratio: 0.5,
                             first: Box::new(PaneTreeState::Leaf {
                                 cwd: PathBuf::from("/tmp/range"),
+                                pane_id: None,
                             }),
                             second: Box::new(PaneTreeState::Leaf {
                                 cwd: PathBuf::from("/tmp/range/src"),
+                                pane_id: None,
                             }),
                         },
+                        pane_id: None,
                     }],
                     active_tab: 0,
                 },
@@ -212,7 +224,11 @@ mod tests {
                     root_paths: vec![],
                     tabs: vec![TabState {
                         title: "notes".into(),
-                        pane_tree: PaneTreeState::Leaf { cwd: PathBuf::from("/home/user/notes") },
+                        pane_tree: PaneTreeState::Leaf {
+                            cwd: PathBuf::from("/home/user/notes"),
+                            pane_id: None,
+                        },
+                        pane_id: None,
                     }],
                     active_tab: 0,
                 },
@@ -255,7 +271,11 @@ mod tests {
                 root_paths: vec![],
                 tabs: vec![TabState {
                     title: "shell".into(),
-                    pane_tree: PaneTreeState::Leaf { cwd: PathBuf::from("/home/user") },
+                    pane_tree: PaneTreeState::Leaf {
+                        cwd: PathBuf::from("/home/user"),
+                        pane_id: None,
+                    },
+                    pane_id: None,
                 }],
                 active_tab: 0,
             }],
