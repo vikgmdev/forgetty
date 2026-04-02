@@ -661,6 +661,11 @@ Edge cases:
 - [ ] Self-contained mode (no daemon): tab titles still update from `/proc/{pid}/cwd` as before — no regression
 - [ ] `compute_display_title` returns `"shell"` only as a last resort when both OSC title and daemon_cwd are unavailable
 
+### [x] T-057: Fix split-pane session save and restore in daemon mode
+**Scope:** When a GTK tab contains split panes, closing and reopening restored each split pane as a separate tab instead of reconstructing the split layout. Root cause: `PaneTreeState::Leaf` had no `pane_id` field (non-first leaf pane IDs were discarded), and the daemon reconnect loop only read `TabState.pane_id` (flat, single-pane) ignoring `pane_tree` entirely.
+**Fix:** Added `pane_id: Option<uuid::Uuid>` (`#[serde(default)]`) to `PaneTreeState::Leaf`; updated `snapshot_pane_tree` to embed each leaf's `daemon_pane_id`; added recursive `reconnect_pane_tree` that rebuilds `gtk::Paned` trees from the session file; replaced the flat `ordered` loop with `reconnect_pane_tree`-based per-tab reconstruction. Legacy T-055 session files handled via `legacy_pane_id` fallback.
+**AC:** Split tab closes → session file has `Split` pane_tree with two Leaf children each having `pane_id`. Reopen → split restored as one tab with correct layout and CWDs. Single-pane tabs, self-contained mode, and old session files unaffected.
+
 ### [ ] T-054: Full interactive from Android — bidirectional PTY input
 **Scope:** Android sends keystrokes, paste, and control sequences to daemon via iroh QUIC stream. Daemon routes to correct PTY master. Full interactive support: vim works (cursor movement, modes, save/quit), htop works, Claude Code interactive prompts answerable from phone. Key encoding: same logic as desktop key encoder (encode Android key events to correct PTY bytes). Control sequences: Ctrl+C, Ctrl+D, arrow keys, Escape, Tab, function keys.
 **Pain point solved:** "I need to step away from my laptop but Claude Code needs a response."

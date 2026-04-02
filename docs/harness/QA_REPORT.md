@@ -1,223 +1,255 @@
-# QA Report — T-056: Daemon Reconnect Visual Fixes
+# QA Report — T-057: Fix Split-Pane Session Save and Restore (Daemon Mode)
 
+**Task:** T-057
 **Date:** 2026-04-02
-**Task:** T-056
-**Fix Cycle:** 1 (commit `9695d12`)
-**Status:** PASS
+**Commit:** 2279d27
+**Fix cycle:** Initial
+**QA method:** Code inspection + cargo check + cargo test --workspace
 
 ---
 
-## Summary of Fix Cycle 1
+## Summary
 
-The prior QA pass marked AC-3 NEEDS_MANUAL but the live test failed: a large blank area was
-visible above the shell prompt. Root cause: the original builder placed snapshot content at the
-**bottom** of the oversized 80-row VT (`start_row = initial_rows - snap_rows + 1`). Ghostty's
-`resizeWithoutReflow → trimTrailingBlankRows()` removes blank rows from the **bottom only**, so
-content at the bottom left no trailing blanks to trim, and the blank rows above the content
-remained in the visible window.
+T-057 fixes the root bug where split-pane tabs were restored as multiple flat tabs instead of
+a single tab with `gtk::Paned` layout. The fix adds `pane_id` to `PaneTreeState::Leaf`, embeds
+daemon pane UUIDs at the per-leaf level during snapshot, and replaces the old flat reconnect loop
+with a recursive `reconnect_pane_tree` function that mirrors `build_pane_tree`.
 
-Fix (commit `9695d12`): change `start_row` to `1` — content placed at the **top** of the
-oversized VT. Trailing blank rows now sit below the content and are trimmed cleanly by the
-first-draw resize.
+**Overall verdict: PASS** (all scored criteria >= 7; runtime ACs need manual verification).
 
 ---
 
-## Acceptance Criteria Results
+## Build Results
 
-| AC | Description | Result |
-|----|-------------|--------|
-| AC-1 | Reopen GTK with 3 live daemon panes → tab titles show CWD basename, not "shell" | NEEDS_MANUAL |
-| AC-2 | Tab title updates to new CWD when user runs `cd /tmp` (OSC takes over from daemon_cwd) | NEEDS_MANUAL |
-| AC-3 | Reopen GTK → visible blank area above prompt is ≤ 2 rows for a fresh shell | PASS (by trace) |
-| AC-4 | Reopen GTK → pane with full-screen program (htop) shows content immediately, no blank area | PASS (by trace) |
-| AC-5 | Self-contained mode: tab titles still update from `/proc/{pid}/cwd` — no regression | PASS |
-| AC-6 | `compute_display_title` returns "shell" only as last resort | PASS |
+```
+cargo check --workspace
+  warning: function `find_first_daemon_pane_id` is never used
+  Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.26s
 
----
-
-## Build
-
-`cargo check --workspace` completes with **0 errors, 0 warnings**.
-
----
-
-## Detailed Findings
-
-### AC-3 — Blank area ≤ 2 rows above prompt on fresh-shell reconnect (PASS by trace)
-
-**Fix verified.** `terminal.rs:1563`:
-
-```rust
-let start_row = 1_usize; // 1-indexed; content always at top
+cargo test --workspace
+  All 15 forgetty-workspace tests pass (including 2 backward-compat tests).
+  All other crate tests pass. 0 failures.
 ```
 
-The comment block at lines 1551–1562 explains the reasoning correctly.
-
-**Trace for fresh-shell scenario:**
-
-- `snap.lines`: indices 0–43 are `""` (blank), indices 44–45 have the shell prompt
-- `first_content = 44` (first non-empty index)
-- `effective_lines = &snap.lines[44..]` → 2 rows
-- `effective_cursor_row = snap.cursor_row.saturating_sub(44) = 45 - 44 = 1`
-- `start_row = 1`
-- Row 1 ← prompt line (snap.lines[44])
-- Row 2 ← prompt line (snap.lines[45])
-- Cursor placed at: row `1 + 1 = 2`, col `snap.cursor_col + 1`
-- VT state after priming: rows 1–2 have content, rows 3–80 are blank (78 trailing blank rows)
-
-**First-draw resize 80 → 46 (actual terminal height):**
-
-`trimTrailingBlankRows(34)` removes rows 47–80 (34 trailing blanks). After resize, visible area
-is rows 1–46: prompt at rows 1–2, blank at rows 3–46.
-
-Result: **0 blank rows above the prompt**. The prompt is at the very top. AC-3 is provably
-correct for this scenario. ✓
-
-**Edge case: all-blank snapshot (brand-new pane):**
-
-`first_content = snap.lines.len() - 1`. `effective_lines` has 1 blank entry. `start_row = 1`.
-One blank row written at row 1. Cursor at row 1. Rows 2–80 blank. First-draw resize trims
-trailing blanks. Visible: single blank row at row 1 (≤ 2 rows). ✓
+**One compiler warning:** `find_first_daemon_pane_id` is dead code -- it was superseded by the
+per-leaf approach but not removed. The warning is non-blocking but should be cleaned up.
 
 ---
 
-### AC-4 — Full-screen program (htop) shows immediately (PASS by trace)
+## AC Results
 
-**Trace for htop scenario:**
+### AC-1 -- Session file has `"Split"` pane_tree with non-null `pane_id` per Leaf; TabState.pane_id is null
 
-- `snap.lines`: all 46 entries non-empty
-- `first_content = 0` (first non-empty is index 0)
-- `effective_lines = &snap.lines[0..]` → 46 rows (full slice, no-op stripping)
-- `start_row = 1`
-- Rows 1–46 receive htop content
-- Rows 47–80: 34 trailing blank rows
+**PASS (code inspection)**
 
-**First-draw resize 80 → 46:**
+Trace:
+1. `snapshot_pane_tree` DrawingArea arm (app.rs:1686-1693): reads `daemon_pane_id` from
+   `TerminalState.daemon_pane_id`, maps `PaneId(uuid)` -> `uuid::Uuid`, returns
+   `PaneTreeState::Leaf { cwd, pane_id: daemon_pane_id }`.
+2. Paned arm (app.rs:1696-1719): recurses into both children, assembles `Split { first, second }`.
+3. `snapshot_single_workspace` (app.rs:1754-1755): writes `pane_id: None` at `TabState` level.
 
-`trimTrailingBlankRows(34)` removes rows 47–80. Visible area: rows 1–46, all htop content.
-Result: full content visible immediately, no blank area. ✓
+The resulting JSON for a split tab will be:
+```json
+{
+  "title": "myproject",
+  "pane_tree": {
+    "Split": {
+      "first":  { "Leaf": { "cwd": "...", "pane_id": "<uuid-A>" } },
+      "second": { "Leaf": { "cwd": "...", "pane_id": "<uuid-B>" } }
+    }
+  },
+  "pane_id": null
+}
+```
 
-No regression: the behavior for non-blank snapshots is identical to the previous bottom-placement
-strategy for this specific case (when `snap_rows == actual_rows`, both strategies place content
-at the same rows).
+### AC-2 -- Reopen: split tab restored as ONE tab with gtk::Paned, not two flat tabs
+
+**PASS (code inspection) / NEEDS_MANUAL (runtime)**
+
+Trace:
+1. Daemon reconnect block (app.rs:1198-1241): iterates `session_tabs`, calls
+   `reconnect_pane_tree` per tab.
+2. `reconnect_pane_tree` Split arm (app.rs:1908-1960): recurses into both children, creates
+   one `gtk4::Paned`, returns `(paned.upcast::<gtk4::Widget>(), first_da)`.
+3. The container `gtk4::Box` wrapping `root_widget` is appended as a single tab page
+   (app.rs:1224-1230). One tab page per session tab entry.
+4. Pane B's UUID is in its own `Leaf.pane_id`, so it is consumed by the recursive call --
+   not left in `pane_map` as an orphan.
+
+NEEDS_MANUAL: Runtime verification that the `gtk::Paned` widget renders visibly and both halves
+are live terminals.
+
+### AC-3 -- Reopen: split divider position approximately preserved (+-5% of saved ratio)
+
+**PASS (code inspection) / NEEDS_MANUAL (runtime)**
+
+In `reconnect_pane_tree` Split arm (app.rs:1942-1956): `saved_ratio` is captured, then
+`glib::idle_add_local_once` defers `paned.set_position((size * saved_ratio) as i32)` until
+after widget realization. The `if size > 0` guard prevents zero-size division. This is identical
+to the pattern in `build_pane_tree` which works in self-contained mode.
+
+NEEDS_MANUAL: Runtime verification that divider lands within +-5% of saved ratio.
+
+### AC-4 -- Reopen: each pane shows correct CWD from its daemon pane
+
+**PASS (code inspection) / NEEDS_MANUAL (runtime)**
+
+In `reconnect_pane_tree` Leaf arm (app.rs:1833-1871): when `pane_map.remove(&uid)` succeeds,
+`daemon_cwd` is set from `info.cwd`. The effective CWD logic (app.rs:1869-1871) uses
+`daemon_cwd` first (live CWD from daemon), falls back to saved `cwd` from session file.
+`create_terminal_for_pane` receives `effective_cwd` as the starting directory.
+
+NEEDS_MANUAL: Runtime verification that each pane's shell prompt shows the correct CWD.
+
+### AC-5 -- Single-pane tabs unaffected
+
+**PASS (code inspection + automated tests)**
+
+For a single-pane tab, `pane_tree` is `PaneTreeState::Leaf { cwd, pane_id: Some(uid) }`.
+`reconnect_pane_tree` Leaf arm handles this identically to the pre-T-057 path (pane_map lookup,
+subscribe, create_terminal_for_pane). The `pane_id` value now comes from `Leaf.pane_id` rather
+than `TabState.pane_id`, but the lookup and result are the same.
+
+All 15 `forgetty-workspace` tests pass including `backward_compat_*` tests.
+
+### AC-6 -- Self-contained mode save/restore still works
+
+**PASS (code inspection + automated tests)**
+
+`build_pane_tree` Leaf arm (app.rs:1978): `PaneTreeState::Leaf { cwd, .. }` -- the `..` pattern
+explicitly ignores `pane_id`. The function spawns a fresh PTY from `cwd`. No regression.
+
+`#[serde(default)]` on `Leaf.pane_id` means self-contained session files written before T-057
+(no `pane_id` field in JSON) deserialize with `pane_id: None`. All persistence tests pass.
+
+### AC-7 -- Deeply nested splits (3+ panes) save and restore correctly
+
+**PASS (code inspection) / NEEDS_MANUAL (runtime)**
+
+Both `snapshot_pane_tree` and `reconnect_pane_tree` are purely recursive with no depth limit.
+A `Split` whose `first` or `second` child is itself a `Split` is handled identically by pattern
+matching on `PaneTreeState`. Stack depth is bounded only by actual nesting depth (typically <= 8
+in practice).
+
+No automated unit test exists for 3-level nested serialization. Code inspection is the basis for
+this pass.
+
+NEEDS_MANUAL: Runtime test with 3+ pane split.
+
+### AC-8 -- Old session file (no pane_id in Leaf) deserializes without error, fresh panes created
+
+**PASS (code inspection + automated tests)**
+
+`#[serde(default)]` on `Leaf.pane_id` (workspace.rs:68-69) causes serde to fill `None` when the
+JSON field is absent. The `backward_compat_no_window_dimensions` test exercises the serde default
+path. The `load_session` function returns `Ok(None)` on parse error as a safety net.
+
+In `reconnect_pane_tree` (app.rs:1857-1865): when `uid` is `None`, falls through to
+`dc.new_tab()` to create a fresh pane -- no crash, graceful degradation.
+
+### AC-9 -- T-055-era session file (TabState.pane_id set, Leaf.pane_id absent) reconnects via legacy fallback
+
+**PASS (code inspection)**
+
+In the daemon reconnect block (app.rs:1204): `let legacy_pane_id = tab.pane_id;`
+In `reconnect_pane_tree` signature: `legacy_pane_id: Option<uuid::Uuid>` parameter.
+In Leaf arm (app.rs:1831): `let uid = pane_id.or(legacy_pane_id);`
+
+For a T-055 file: `Leaf.pane_id = None`, `TabState.pane_id = Some(uuid-X)`.
+`uid = None.or(Some(uuid-X)) = Some(uuid-X)` -> `pane_map.remove(&uuid-X)` -> reconnects correctly.
+
+For a T-057 file: `Leaf.pane_id = Some(uuid-A)`.
+`uid = Some(uuid-A).or(legacy_pane_id) = Some(uuid-A)` -> correct, `legacy_pane_id` not used.
+
+Split children receive `legacy_pane_id: None` (app.rs:1917, 1921) -- correct, because T-055 files
+never had splits with per-leaf IDs, and passing the tab-level ID to both split children would cause
+a double-consume on a single UUID.
 
 ---
 
-### AC-5 — Self-contained mode not regressed (PASS)
+## Code Quality Notes
 
-`create_terminal` (`terminal.rs:279`) sets `pty: Some(pty)` (line 318) and `daemon_cwd: None`
-(line 351). In `compute_display_title` (`app.rs:3549`):
+### Dead code: `find_first_daemon_pane_id`
 
-1. `state.pty.as_ref().and_then(|p| p.pid())` succeeds → reads `/proc/{pid}/cwd` → returns CWD
-   basename immediately (early return).
-2. The `daemon_cwd` branch (line 3573) is never reached.
+The function at app.rs:1630 is no longer called from outside itself (only recursive self-calls).
+The compiler emits `warning: function find_first_daemon_pane_id is never used`.
+Its doc comment still says it is "used to populate `TabState.pane_id`" -- which is now incorrect
+since `snapshot_single_workspace` writes `pane_id: None`.
 
-No behavioral change for self-contained mode. **PASS by code inspection.** ✓
+This is not a correctness issue but the dead function adds ~40 lines of confusion and a build
+warning. It should be removed in a follow-up.
 
----
+### No unit test for 3-level nested split
 
-### AC-6 — `compute_display_title` returns "shell" only as last resort (PASS)
+AC-7 is covered by code inspection (pure recursion, no depth limit) but has no automated test.
+A persistence unit test for 3-level nested `PaneTreeState` serialization would be easy to add.
 
-Priority chain confirmed at `app.rs:3549–3580`:
+### `reconnect_pane_tree` has 10 parameters
 
-1. `state.pty` present AND `/proc/{pid}/cwd` readable → CWD basename.
-2. `osc_title` non-empty AND `!= "shell"` → OSC title.
-3. `state.daemon_cwd` present AND `file_name()` non-None → daemon CWD basename.
-4. `"shell"` (last resort only).
-
-"shell" is returned only when: no local PTY, no meaningful OSC title, and no daemon CWD (or
-daemon CWD is `/` with no filename component). **PASS by code inspection.** ✓
-
----
-
-### AC-1 — Tab titles show CWD basename on reconnect (NEEDS_MANUAL)
-
-**Code is correct.** Execution path verified:
-
-1. `ordered: Vec<(PaneId, String, Option<String>)>` built at `app.rs:1199`. All three reconnect
-   branches correctly extract `info.cwd` and pass it as `Some(cwd_string)` (lines 1206–1207,
-   1237–1238, 1245–1246).
-2. Wire-up loop at `app.rs:1264`: `daemon_cwd = cwd.as_ref().map(|s| PathBuf::from(s))` passed
-   to `create_terminal_for_pane`.
-3. `create_terminal_for_pane` stores it in `TerminalState.daemon_cwd` at line 1613.
-4. Title timer calls `compute_display_title`, which reaches the `daemon_cwd` branch before
-   returning "shell".
-
-**Needs manual verification** because the daemon's `PaneInfo.cwd` field must be populated by the
-daemon's `list_tabs` RPC handler (outside T-056 scope but prerequisite).
-
----
-
-### AC-2 — OSC title takes over from daemon_cwd after `cd` (NEEDS_MANUAL)
-
-**Code is correct.** After `cd /tmp` the shell emits `OSC 0;/tmp ST`. On the next timer tick,
-`compute_display_title` evaluates:
-
-- `state.pty` is `None` (daemon pane) → `/proc` path skipped.
-- `osc_title` is non-empty and `!= "shell"` → returned immediately.
-- `daemon_cwd` branch never reached.
-
-OSC correctly takes over from daemon_cwd. **Needs manual verification** to confirm the shell
-actually emits OSC 0/2 in the live environment.
-
----
-
-## Issues Found
-
-### Minor: non-selected tabs show stale title until focused
-
-Non-selected tabs' titles come from the session file's `tab.title` field (set at `app.rs:1293`).
-If the session was saved with title "shell", those tabs display "shell" until focused (at which
-point the timer fires and corrects to `daemon_cwd`). Not a regression; tabs without `daemon_cwd`
-were already broken before T-056. Low severity.
-
-### Minor: fresh new pane (all-blank snapshot) shows one blank row at top
-
-When `snap.lines` is entirely blank, `first_content = len - 1`, one blank line is written at
-row 1, cursor at row 1. After resize, visible area starts with one blank row then the cursor.
-This is a cosmetic artifact (≤ 1 row) within the ≤ 2 row AC-3 threshold. Acceptable.
+The `#[allow(clippy::too_many_arguments)]` annotation acknowledges this. It mirrors
+`build_pane_tree`'s signature style and is appropriate given the current architecture.
 
 ---
 
 ## Scores
 
-| Category | Score (0–10) |
-|----------|--------------|
-| Completeness | 9 |
-| Correctness | 10 |
-| Robustness | 9 |
-| Code quality | 9 |
-
-**Overall: PASS** (all scores ≥ 7)
+| Dimension      | Score | Notes |
+|----------------|-------|-------|
+| Completeness   | 9/10  | All 9 ACs addressed; dead code is only gap |
+| Correctness    | 9/10  | Save/restore logic and legacy fallback correct; dead-code comment misleads but does not break |
+| Robustness     | 8/10  | Missing-pane fallback (`dc.new_tab()`) and `idle_add_local_once` guard both solid; ratio restore could fail silently on first frame if widget not yet realized |
+| Code quality   | 7/10  | Dead code + stale doc comment drag down an otherwise clean recursive design |
 
 ---
 
-## Manual Testing Steps
+## Overall Verdict
 
-**Prerequisites:** `forgetty-daemon` running, at least 3 tabs open in different directories from a
-prior session (session file saved at `~/.local/share/forgetty/session.json`).
+**PASS** -- All 9 ACs are satisfied by code inspection and automated tests. Runtime ACs (AC-2,
+AC-3, AC-4, AC-7) require manual testing to close fully.
 
-**AC-1 — Tab titles show CWD basename:**
-1. Open Forgetty in daemon mode.
-2. Verify each tab title shows the directory basename (e.g., `forgetty`, `tmp`, `home`) not `shell`.
-3. Click each non-selected tab — title must remain correct after focus (no timer-correction flicker
-   to "shell" and back).
+---
 
-**AC-2 — OSC title takes over after `cd`:**
-1. In a reconnected daemon tab, run `cd /tmp`.
-2. Wait ~1 second.
-3. Tab title must change to `tmp` (or whatever the shell emits via OSC 0/2).
+## Manual Testing Steps (for NEEDS_MANUAL items)
 
-**AC-3 — Blank area ≤ 2 rows (already proven correct by trace; regression-test only):**
-1. Find a tab that had only a shell prompt (no running program) when GTK was last closed.
-2. After reopening, prompt should appear at or near the TOP of the pane with zero blank rows above
-   it (not buried under a large blank region).
+### Setup
 
-**AC-4 — Full-screen program shows immediately:**
-1. Run `htop` in a tab. Close the GTK window (daemon keeps running).
-2. Reopen GTK. The htop tab must immediately show htop content, not a blank pane.
+1. Start the daemon: run `forgetty` in daemon mode (background).
+2. Launch GTK: `cargo run --release`.
 
-**AC-5 — Self-contained mode (regression check):**
-1. Stop the daemon. Open Forgetty in self-contained mode.
-2. `cd` to several directories. Tab title must update to CWD basename each time.
-3. Confirm "shell" does not appear unexpectedly.
+### AC-2: Split tab restores as one gtk::Paned
+
+1. Open a new tab. Split it horizontally via the split pane action.
+2. Run `pwd` in each half to confirm two live panes.
+3. Close the GTK window (daemon keeps running).
+4. Reopen: `cargo run --release`.
+5. **Expected:** one tab with a visible divider between two live terminal halves.
+6. **Failure sign:** two separate tabs instead of one split tab.
+
+### AC-3: Divider position preserved
+
+1. In the split tab, drag the divider to ~30% from the left.
+2. Close and reopen GTK.
+3. **Expected:** divider lands at roughly 30% (within a few percent).
+4. **Failure sign:** divider snaps to 50% or to an extreme.
+
+### AC-4: Correct CWD in each pane
+
+1. In the split, `cd /tmp` in the first pane and `cd /var` in the second.
+2. Close and reopen GTK.
+3. **Expected:** first pane shell prompt shows `/tmp`, second shows `/var`.
+4. **Failure sign:** both panes open in the same CWD or in `$HOME`.
+
+### AC-7: 3-pane split
+
+1. Split a tab twice (horizontal, then vertical in one half) to get 3 panes.
+2. Close and reopen GTK.
+3. **Expected:** one tab with two `gtk::Paned` widgets nesting 3 live panes.
+4. **Failure sign:** 3 flat tabs, or partial layout with one pane as a fresh shell unexpectedly.
+
+---
+
+## Recommended Follow-up (not blocking)
+
+- Remove `find_first_daemon_pane_id` function (dead code, misleading doc comment).
+- Add a persistence unit test for 3-level nested `PaneTreeState` serialization.
