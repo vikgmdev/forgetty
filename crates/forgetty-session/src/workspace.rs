@@ -111,7 +111,7 @@ where
     match tree {
         PaneTreeLayout::Leaf { pane_id } => {
             let cwd = get_cwd(*pane_id);
-            PaneTreeState::Leaf { cwd }
+            PaneTreeState::Leaf { cwd, pane_id: Some(pane_id.0) }
         }
         PaneTreeLayout::Split { direction, ratio, first, second } => PaneTreeState::Split {
             direction: direction.clone(),

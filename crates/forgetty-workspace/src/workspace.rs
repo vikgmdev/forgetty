@@ -63,6 +63,10 @@ pub enum PaneTreeState {
     Leaf {
         /// Working directory of the shell in this pane.
         cwd: PathBuf,
+        /// Daemon pane ID for this leaf. None in self-contained mode or
+        /// old session files. serde(default) ensures backward compatibility.
+        #[serde(default)]
+        pane_id: Option<uuid::Uuid>,
     },
     /// A split containing two children.
     Split {
@@ -105,7 +109,7 @@ impl Workspace {
             root_paths: vec![root.clone()],
             tabs: vec![TabState {
                 title: String::from("Shell"),
-                pane_tree: PaneTreeState::Leaf { cwd: root },
+                pane_tree: PaneTreeState::Leaf { cwd: root, pane_id: None },
                 pane_id: None,
             }],
             active_tab: 0,
