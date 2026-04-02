@@ -1667,14 +1667,22 @@ fn home_dir_fallback() -> PathBuf {
     std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/"))
 }
 
-/// Read the CWD of a PTY child process via `/proc/{pid}/cwd`.
+/// Read the CWD of a terminal pane.
 ///
-/// Returns `None` if the PID is unavailable or the symlink cannot be read.
+/// Self-contained panes: reads `/proc/{pid}/cwd` via the local PTY PID.
+/// Daemon panes: falls back to `daemon_cwd` (set at connect time from `PaneInfo`).
+/// Returns `None` if neither source is available.
 fn read_pane_cwd(state_rc: &Rc<RefCell<TerminalState>>) -> Option<PathBuf> {
     let s = state_rc.try_borrow().ok()?;
-    let pid = s.pty.as_ref().and_then(|p| p.pid())?;
-    let link = format!("/proc/{pid}/cwd");
-    std::fs::read_link(&link).ok()
+    // Self-contained: read live CWD from /proc
+    if let Some(pid) = s.pty.as_ref().and_then(|p| p.pid()) {
+        let link = format!("/proc/{pid}/cwd");
+        if let Ok(path) = std::fs::read_link(&link) {
+            return Some(path);
+        }
+    }
+    // Daemon fallback: CWD from PaneInfo at connect time
+    s.daemon_cwd.clone()
 }
 
 /// Walk a widget subtree and return the daemon pane ID of the first leaf found.
@@ -3858,10 +3866,14 @@ fn register_title_timer(
 
 /// Compute the display title for a terminal tab.
 ///
-/// Priority: /proc CWD basename > OSC title > daemon_cwd basename > "shell".
-/// Adapted from `crates/forgetty-ui/src/pane.rs::display_title()`.
+/// Priority: /proc CWD basename > daemon_cwd basename > OSC title > "shell".
+///
+/// daemon_cwd is preferred over OSC title because OSC 0/2 from zsh/bash emits
+/// the full `user@host:cwd` format (meant for the window title bar), which is
+/// too verbose for a tab label.  daemon_cwd gives just the directory path whose
+/// basename is a clean, short tab title.
 fn compute_display_title(state: &TerminalState) -> String {
-    // Try to read CWD from /proc/{pid}/cwd
+    // Try to read CWD from /proc/{pid}/cwd (self-contained panes only)
     if let Some(pid) = state.pty.as_ref().and_then(|p| p.pid()) {
         let proc_path = format!("/proc/{}/cwd", pid);
         if let Ok(target) = std::fs::read_link(&proc_path) {
@@ -3876,18 +3888,17 @@ fn compute_display_title(state: &TerminalState) -> String {
         }
     }
 
-    // Fall back to OSC title if set
-    let osc_title = state.terminal.title();
-    if !osc_title.is_empty() && osc_title != "shell" {
-        return osc_title.to_string();
-    }
-
-    // Daemon fallback: use CWD basename from pane_info (no local /proc path available).
-    // Used until the running shell emits OSC 0/2, at which point the OSC path above takes over.
+    // Daemon fallback: CWD basename from PaneInfo (set at connect time).
     if let Some(cwd) = &state.daemon_cwd {
         if let Some(name) = cwd.file_name() {
             return name.to_string_lossy().to_string();
         }
+    }
+
+    // Fall back to OSC title if set (e.g. user@host:cwd from zsh).
+    let osc_title = state.terminal.title();
+    if !osc_title.is_empty() && osc_title != "shell" {
+        return osc_title.to_string();
     }
 
     "shell".to_string()
