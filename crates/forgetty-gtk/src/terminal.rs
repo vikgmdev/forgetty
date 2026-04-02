@@ -280,8 +280,14 @@ pub fn create_terminal(
     working_dir: Option<&Path>,
     command: Option<&[String]>,
 ) -> Result<(gtk4::Box, DrawingArea, Rc<RefCell<TerminalState>>), String> {
-    let initial_rows: usize = 24;
-    let initial_cols: usize = 80;
+    // Start with a generous over-estimate so the first-draw resize is always
+    // a SHRINK (not a GROW).  libghostty-vt grows by adding blank rows at the
+    // TOP (cursor maintains distance from bottom), which produces a large blank
+    // area above the shell prompt.  Shrinking drops blank rows from the BOTTOM,
+    // leaving content at the top of the screen.  These values comfortably cover
+    // any realistic monitor+font combination (<80 rows, <240 cols).
+    let initial_rows: usize = 80;
+    let initial_cols: usize = 240;
 
     // Spawn PTY bridge
     let shell = config.shell.as_deref();
@@ -1514,8 +1520,10 @@ pub fn create_terminal_for_pane(
     on_exit: Option<Rc<dyn Fn(String)>>,
     on_notify: Option<Rc<dyn Fn(NotificationPayload)>>,
 ) -> Result<(gtk4::Box, DrawingArea, Rc<RefCell<TerminalState>>), String> {
-    let initial_rows: usize = 24;
-    let initial_cols: usize = 80;
+    // Same over-estimate rationale as create_terminal: ensures the first-draw
+    // resize is a SHRINK so content stays at the top of the screen.
+    let initial_rows: usize = 80;
+    let initial_cols: usize = 240;
 
     // Create terminal VT state (no local PTY)
     let mut terminal = forgetty_vt::Terminal::new(initial_rows, initial_cols);
@@ -3620,15 +3628,26 @@ fn draw_terminal(
     // We convert them to screen-relative rows by subtracting viewport_offset.
     // Only draw the portion of the selection that overlaps the current viewport.
     if let Some(ref sel) = selection {
+        // iTerm2-format themes (which all our bundled themes use) specify selection
+        // as a plain #rrggbb hex — no alpha channel — so Rgba::from_hex returns a=255.
+        // Rendering that at full opacity produces an opaque block that hides the text.
+        // Treat a=255 as "theme didn't specify opacity" and fall back to 40% opacity.
+        // Themes that explicitly set alpha via #rrggbbaa 8-char hex will have a < 255
+        // and their value is respected.
+        let sel_alpha = if selection_color.a == 255 {
+            0.4
+        } else {
+            selection_color.a as f64 / 255.0
+        };
         ctx.set_source_rgba(
             selection_color.r as f64 / 255.0,
             selection_color.g as f64 / 255.0,
             selection_color.b as f64 / 255.0,
-            selection_color.a as f64 / 255.0,
+            sel_alpha,
         );
 
         // Determine the absolute row range of the selection
-        let ((sr, _), (er, _)) = sel.ordered();
+        let ((sr, sc), (er, ec)) = sel.ordered();
 
         // Viewport shows absolute rows [viewport_offset .. viewport_offset + num_rows - 1].
         // Clamp the selection range to the visible viewport.
@@ -3640,17 +3659,42 @@ fn draw_terminal(
             let abs_start = sr.max(vp_start);
             let abs_end = er.min(vp_end);
 
+            // Draw one rectangle per row (not per cell) and ONE fill() for all rows.
+            //
+            // Per-cell fills create a grid-line artifact: each cell rectangle is
+            // composited independently, and at fractional cell widths the adjacent
+            // sub-pixel edges receive slightly different anti-aliasing coverage,
+            // leaving a faint 1px grid between cells.
+            //
+            // With a single path + single fill(), Cairo fills all rectangles in one
+            // pass. Adjacent cell edges within the same row become interior (no
+            // anti-aliasing). Adjacent row edges share the exact same y coordinate,
+            // giving complementary anti-aliasing coverage that adds to 1.0 — seamless.
+            ctx.new_path();
             for abs_row in abs_start..=abs_end {
                 let screen_row = abs_row - viewport_offset;
-                for col in 0..num_cols {
-                    if sel.contains(abs_row, col) {
-                        let sx = col as f64 * cell_w;
-                        let sy = screen_row as f64 * cell_h;
-                        ctx.rectangle(sx, sy, cell_w, cell_h);
-                        ctx.fill().ok();
+                let sy = screen_row as f64 * cell_h;
+
+                let (row_start_col, row_end_col) = match sel.mode {
+                    SelectionMode::Normal | SelectionMode::Word => {
+                        let start = if abs_row == sr { sc } else { 0 };
+                        let end = if abs_row == er { ec + 1 } else { num_cols };
+                        (start, end)
                     }
+                    SelectionMode::Line => (0, num_cols),
+                    SelectionMode::Block => (sc.min(ec), sc.max(ec) + 1),
+                };
+
+                if row_end_col > row_start_col {
+                    ctx.rectangle(
+                        row_start_col as f64 * cell_w,
+                        sy,
+                        (row_end_col - row_start_col) as f64 * cell_w,
+                        cell_h,
+                    );
                 }
             }
+            ctx.fill().ok();
         }
     }
 
