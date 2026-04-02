@@ -1195,15 +1195,16 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions, dae
                     .map(|w| w.tabs)
                     .unwrap_or_default();
 
-                // Build the ordered (PaneId, title) list to wire up.
-                let mut ordered: Vec<(forgetty_core::PaneId, String)> = Vec::new();
+                // Build the ordered (PaneId, title, cwd) list to wire up.
+                let mut ordered: Vec<(forgetty_core::PaneId, String, Option<String>)> = Vec::new();
 
                 if !session_tabs.is_empty() {
                     for tab in &session_tabs {
                         if let Some(uid) = tab.pane_id {
                             if let Some(info) = pane_map.remove(&uid) {
                                 // Live pane found — reconnect in session order.
-                                ordered.push((info.pane_id, tab.title.clone()));
+                                let cwd = if info.cwd.is_empty() { None } else { Some(info.cwd.clone()) };
+                                ordered.push((info.pane_id, tab.title.clone(), cwd));
                             } else {
                                 // Pane closed between GTK close and reopen — create a fresh one.
                                 tracing::info!(
@@ -1211,7 +1212,7 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions, dae
                                     tab.title
                                 );
                                 match dc.new_tab() {
-                                    Ok(pid) => ordered.push((pid, tab.title.clone())),
+                                    Ok(pid) => ordered.push((pid, tab.title.clone(), None)),
                                     Err(e) => tracing::warn!(
                                         "new_tab failed for missing slot {:?}: {e}",
                                         tab.title
@@ -1221,7 +1222,7 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions, dae
                         } else {
                             // Old session format (no pane_id field) — create a fresh pane.
                             match dc.new_tab() {
-                                Ok(pid) => ordered.push((pid, tab.title.clone())),
+                                Ok(pid) => ordered.push((pid, tab.title.clone(), None)),
                                 Err(e) => tracing::warn!(
                                     "new_tab failed for legacy session tab {:?}: {e}",
                                     tab.title
@@ -1233,19 +1234,21 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions, dae
                     for info in pane_map.into_values() {
                         let title =
                             if info.title.is_empty() { "shell".to_string() } else { info.title.clone() };
-                        ordered.push((info.pane_id, title));
+                        let cwd = if info.cwd.is_empty() { None } else { Some(info.cwd.clone()) };
+                        ordered.push((info.pane_id, title, cwd));
                     }
                 } else {
                     // No session file or empty → use live panes in daemon order.
                     for info in pane_map.into_values() {
                         let title =
                             if info.title.is_empty() { "shell".to_string() } else { info.title.clone() };
-                        ordered.push((info.pane_id, title));
+                        let cwd = if info.cwd.is_empty() { None } else { Some(info.cwd.clone()) };
+                        ordered.push((info.pane_id, title, cwd));
                     }
                 }
 
                 // Wire up each pane into a new GTK tab.
-                for (pane_id, title) in &ordered {
+                for (pane_id, title, cwd) in &ordered {
                     let (mpsc_tx, mpsc_rx) = std::sync::mpsc::channel::<Vec<u8>>();
                     if let Err(e) = dc.subscribe_output(*pane_id, mpsc_tx) {
                         tracing::warn!("subscribe_output failed for {}: {e}", pane_id);
@@ -1258,12 +1261,14 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions, dae
                     );
                     let on_notify = make_on_notify_callback(&ws.tab_view, &ws.tab_states, &window);
                     let snapshot = dc.get_screen(*pane_id).ok();
+                    let daemon_cwd = cwd.as_ref().map(|s| PathBuf::from(s));
                     match terminal::create_terminal_for_pane(
                         config,
                         *pane_id,
                         Arc::clone(dc),
                         mpsc_rx,
                         snapshot.as_ref(),
+                        daemon_cwd,
                         Some(on_exit),
                         Some(on_notify),
                     ) {
@@ -2220,6 +2225,7 @@ fn add_new_tab(
                     Arc::clone(dc),
                     mpsc_rx,
                     snapshot.as_ref(),
+                    None,
                     Some(on_exit),
                     Some(on_notify),
                 ) {
@@ -2405,6 +2411,7 @@ fn split_pane(
                         Arc::clone(dc),
                         mpsc_rx,
                         snapshot.as_ref(),
+                        None,
                         Some(on_exit),
                         Some(on_notify),
                     )
@@ -3559,6 +3566,14 @@ fn compute_display_title(state: &TerminalState) -> String {
     let osc_title = state.terminal.title();
     if !osc_title.is_empty() && osc_title != "shell" {
         return osc_title.to_string();
+    }
+
+    // Daemon fallback: use CWD basename from pane_info (no local /proc path available).
+    // Used until the running shell emits OSC 0/2, at which point the OSC path above takes over.
+    if let Some(cwd) = &state.daemon_cwd {
+        if let Some(name) = cwd.file_name() {
+            return name.to_string_lossy().to_string();
+        }
     }
 
     "shell".to_string()
