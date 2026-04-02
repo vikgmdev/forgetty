@@ -1393,7 +1393,60 @@ fn build_ui(app: &adw::Application, config: &Config, launch: &LaunchOptions, dae
                 }
             }
             Ok(_) => {
-                tracing::info!("Daemon has no live panes — creating initial tab via RPC");
+                tracing::info!("Daemon has no live panes — attempting cold-start session restore");
+                let Ok(mgr) = workspace_manager.try_borrow() else { return; };
+                let ws = &mgr.workspaces[0];
+
+                let session_tabs: Vec<TabState> = forgetty_workspace::load_session()
+                    .ok()
+                    .flatten()
+                    .and_then(|s| s.workspaces.into_iter().next())
+                    .map(|w| w.tabs)
+                    .unwrap_or_default();
+
+                if !session_tabs.is_empty() {
+                    let mut pane_map: HashMap<uuid::Uuid, PaneInfo> = HashMap::new(); // empty — cold start
+
+                    for tab in &session_tabs {
+                        let legacy_pane_id = tab.pane_id;
+                        let Some((root_widget, first_da)) = reconnect_pane_tree(
+                            &tab.pane_tree,
+                            &mut pane_map,
+                            dc,
+                            config,
+                            &ws.tab_states,
+                            &ws.focus_tracker,
+                            &ws.custom_titles,
+                            &window,
+                            &ws.tab_view,
+                            legacy_pane_id,
+                        ) else {
+                            tracing::warn!(
+                                "reconnect_pane_tree failed for tab {:?}",
+                                tab.title
+                            );
+                            continue;
+                        };
+
+                        let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+                        container.set_hexpand(true);
+                        container.set_vexpand(true);
+                        container.append(&root_widget);
+                        let page = ws.tab_view.append(&container);
+                        page.set_title(if tab.title.is_empty() { "shell" } else { &tab.title });
+                        ws.tab_view.set_selected_page(&page);
+                        first_da.grab_focus();
+                        register_title_timer(
+                            &page,
+                            &ws.tab_view,
+                            &ws.tab_states,
+                            &ws.focus_tracker,
+                            &ws.custom_titles,
+                            &window,
+                        );
+                        restored = true;
+                    }
+                }
             }
             Err(e) => {
                 tracing::warn!("list_tabs RPC failed: {e} — creating initial tab locally");
@@ -1830,7 +1883,9 @@ fn reconnect_pane_tree(
             // 2. Legacy top-level TabState.pane_id (T-055 compat)
             let uid = pane_id.or(legacy_pane_id);
 
-            let (daemon_pane_id, daemon_cwd) = if let Some(uid) = uid {
+            let leaf_cwd = if cwd.is_dir() { Some(cwd.as_path()) } else { None };
+
+            let (daemon_pane_id, daemon_cwd, fresh_pane) = if let Some(uid) = uid {
                 if let Some(info) = pane_map.remove(&uid) {
                     // Live daemon pane found — reconnect it.
                     let daemon_cwd = if info.cwd.is_empty() {
@@ -1838,7 +1893,7 @@ fn reconnect_pane_tree(
                     } else {
                         Some(PathBuf::from(&info.cwd))
                     };
-                    (info.pane_id, daemon_cwd)
+                    (info.pane_id, daemon_cwd, false)
                 } else {
                     // Pane was closed between GTK close and reopen — fresh pane.
                     tracing::info!(
@@ -1846,8 +1901,8 @@ fn reconnect_pane_tree(
                         uid,
                         cwd
                     );
-                    match dc.new_tab() {
-                        Ok(pid) => (pid, None),
+                    match dc.new_tab_with_cwd(leaf_cwd) {
+                        Ok(pid) => (pid, None, true),
                         Err(e) => {
                             tracing::warn!("new_tab failed for missing leaf pane: {e}");
                             return None;
@@ -1856,8 +1911,8 @@ fn reconnect_pane_tree(
                 }
             } else {
                 // No pane_id at all (old session format or self-contained) — fresh pane.
-                match dc.new_tab() {
-                    Ok(pid) => (pid, None),
+                match dc.new_tab_with_cwd(leaf_cwd) {
+                    Ok(pid) => (pid, None, false),
                     Err(e) => {
                         tracing::warn!("new_tab failed for legacy leaf: {e}");
                         return None;
@@ -1869,6 +1924,15 @@ fn reconnect_pane_tree(
             let effective_cwd = daemon_cwd.or_else(|| {
                 if cwd.is_dir() { Some(cwd.clone()) } else { None }
             });
+
+            // Pre-seed VT buffer with saved snapshot for fresh panes that had a UUID.
+            if fresh_pane {
+                if let Some(old_uuid) = uid {
+                    if let Err(e) = dc.preseed_snapshot(daemon_pane_id, old_uuid) {
+                        tracing::warn!("preseed_snapshot failed: {e}");
+                    }
+                }
+            }
 
             let (mpsc_tx, mpsc_rx) = std::sync::mpsc::channel::<Vec<u8>>();
             if let Err(e) = dc.subscribe_output(daemon_pane_id, mpsc_tx) {

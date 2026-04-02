@@ -105,6 +105,8 @@ pub mod methods {
     pub const REVOKE_DEVICE: &str = "revoke_device";
     pub const GET_PAIRING_INFO: &str = "get_pairing_info";
     pub const ENABLE_PAIRING: &str = "enable_pairing";
+    // VT snapshot methods (T-058).
+    pub const PRESEED_SNAPSHOT: &str = "preseed_snapshot";
 }
 
 #[cfg(test)]
