@@ -3544,7 +3544,7 @@ fn register_title_timer(
 
 /// Compute the display title for a terminal tab.
 ///
-/// Priority: CWD basename > OSC title > "shell".
+/// Priority: /proc CWD basename > OSC title > daemon_cwd basename > "shell".
 /// Adapted from `crates/forgetty-ui/src/pane.rs::display_title()`.
 fn compute_display_title(state: &TerminalState) -> String {
     // Try to read CWD from /proc/{pid}/cwd
