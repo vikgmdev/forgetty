@@ -2,7 +2,7 @@
 
 **Last updated:** 2026-04-02
 **Current task:** T-054 (not started)
-**Current phase:** Ready for T-054 planning
+**Current phase:** T-055 complete; ready for T-054 planning
 
 ## What's been completed
 
@@ -518,6 +518,15 @@ Full audit of `create_terminal_for_pane` against `create_terminal` revealed 5 ga
 
 All 9 manual QA tests passing. GTK daemon client is fully wired.
 
+### T-055: Session file as daemon reconnect source of truth ✓
+
+- Added `pane_id: Option<uuid::Uuid>` to `TabState` (serde default, backward-compat with old session files).
+- Added `find_first_daemon_pane_id()` widget walker in `app.rs` — extracts `daemon_pane_id` from the first leaf `DrawingArea`'s `TerminalState` when snapshotting.
+- Snapshot (`snapshot_single_workspace`) now populates `TabState.pane_id` from the walker.
+- Removed the `if dc_window_close.is_none()` gate on `save_all_workspaces` in both the close-request handler and SIGTERM/SIGHUP signal handlers — session file is now written on GTK close in daemon mode too.
+- Replaced flat `list_tabs` reconnect loop with session-file-ordered algorithm: match session tab → live pane by UUID, create fresh daemon pane for gone slots, append remaining live panes at the end.
+- Fixed `forgetty-session` crate: `TabState` constructor updated with `pane_id: None`.
+
 ## What's next
 
 **Milestone 3.5 — Daemon Architecture + Android Sync (STARTS NOW, before public launch).**
@@ -530,7 +539,8 @@ Architecture fully designed and documented in `docs/architecture/DAEMON_SYNC_ARC
 4. ~~**T-051**~~ — ✓ DONE: GTK refactor as daemon client
 5. ~~**T-052**~~ — ✓ DONE: totem-sync / iroh: persistent identity, QR pairing, device registry
 6. ~~**T-053**~~ — ✓ DONE: Full terminal stream to Android (raw PTY bytes over iroh QUIC)
-7. **T-054** — Full interactive from Android (bidirectional input over iroh) ← NEXT
+7. ~~**T-055**~~ — ✓ DONE: Session file as daemon reconnect source of truth
+8. **T-054** — Full interactive from Android (bidirectional input over iroh) ← NEXT
 
 After M3.5, resume M3 AI features (T-032+). Android team (MA-005+) unblocks in parallel once T-052 ships.
 
