@@ -81,6 +81,7 @@ where
                 .map(|tab_entry| TabState {
                     title: tab_entry.title.clone(),
                     pane_tree: build_pane_tree_state(&tab_entry.pane_tree, &get_cwd),
+                    pane_id: None,
                 })
                 .collect();
 
