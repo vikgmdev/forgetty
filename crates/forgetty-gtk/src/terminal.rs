@@ -1525,8 +1525,11 @@ pub fn create_terminal_for_pane(
     on_exit: Option<Rc<dyn Fn(String)>>,
     on_notify: Option<Rc<dyn Fn(NotificationPayload)>>,
 ) -> Result<(gtk4::Box, DrawingArea, Rc<RefCell<TerminalState>>), String> {
-    // Same over-estimate rationale as create_terminal: ensures the first-draw
-    // resize is a SHRINK so content stays at the top of the screen.
+    // Over-estimate rows so the first-draw resize is always a SHRINK.
+    // libghostty-vt shrinks by trimming trailing blank rows from the BOTTOM;
+    // snapshot content is placed at row 1 (top) so the blank rows sit below
+    // it and get trimmed cleanly on the first resize.
+    // 80 rows covers any realistic monitor+font combination.
     let initial_rows: usize = 80;
     let initial_cols: usize = 240;
 
@@ -1536,24 +1539,28 @@ pub fn create_terminal_for_pane(
 
     // Prime VT state with snapshot lines so the first frame shows content.
     if let Some(snap) = snapshot {
-        // Discard blank leading rows — they produce a large empty region in the
-        // viewport after the first-draw resize.  Only lines from the first
-        // non-empty row onward are replayed, so the cursor lands at the same
-        // relative position within the visible content.
+        // Strip leading blank rows.  Blank rows from the daemon are serialized as
+        // "" (empty string): handle_get_screen only emits bytes up to the last
+        // non-default cell, so an all-blank row produces zero bytes.
         let first_content = snap.lines.iter()
             .position(|l| !l.is_empty())
             .unwrap_or(snap.lines.len().saturating_sub(1)); // keep at least cursor row
         let effective_lines = &snap.lines[first_content..];
         let effective_cursor_row = snap.cursor_row.saturating_sub(first_content);
 
-        let snap_rows = effective_lines.len();
-        // Place content at the BOTTOM of the oversized initial VT (initial_rows
-        // rows tall).  On the first draw the VT shrinks to the actual widget
-        // size; libghostty-vt removes rows from the TOP on a shrink, keeping the
-        // bottom rows visible.  If we put the content at the top (row 1) it
-        // would disappear into scrollback — placing it at the bottom ensures it
-        // survives the resize.
-        let start_row = initial_rows.saturating_sub(snap_rows) + 1; // 1-indexed
+        // Place content at the TOP of the oversized initial VT (row 1).
+        //
+        // libghostty-vt (PageList::resizeWithoutReflow) shrinks by calling
+        // trimTrailingBlankRows(), which removes blank rows from the BOTTOM of
+        // the active area — NOT the top.  Placing content at row 1 means the
+        // trailing blank rows sit below it; the first-draw resize trims them
+        // cleanly and content stays visible at the top.
+        //
+        // The prior strategy (place at bottom, start_row = initial_rows - snap_rows + 1)
+        // was wrong: with content at the bottom there are no trailing blank rows,
+        // nothing gets trimmed, and blank rows above the content are pushed into
+        // the visible window instead of history.
+        let start_row = 1_usize; // 1-indexed; content always at top
         for (i, line) in effective_lines.iter().enumerate() {
             let row = start_row + i;
             // Explicit CUP per row avoids accidental scrolling at the boundary.
