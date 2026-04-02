@@ -580,7 +580,7 @@ Replace the current "call list_tabs, create one tab per daemon pane in daemon or
 - [ ] Daemon pane closed between GTK close and reopen → a fresh pane is created in its slot, no crash
 - [ ] Session file from before this change (no `pane_id` field) → deserializes cleanly, reconnect falls back gracefully
 
-### [ ] T-056: Daemon reconnect visual fixes — tab titles and snapshot blank space
+### [x] T-056: Daemon reconnect visual fixes — tab titles and snapshot blank space
 
 **Scope:** Two visual regressions found during T-055 QA (screenshot evidence, 2026-04-02). Both are in the daemon-mode reconnect path. Neither existed in self-contained mode.
 

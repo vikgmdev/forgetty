@@ -1,8 +1,8 @@
 # Session State
 
 **Last updated:** 2026-04-02
-**Current task:** T-054 (not started)
-**Current phase:** T-055 complete; ready for T-054 planning
+**Current task:** T-056 complete
+**Current phase:** T-056 complete; ready for T-057 (or next uncompleted task)
 
 ## What's been completed
 
@@ -527,6 +527,13 @@ All 9 manual QA tests passing. GTK daemon client is fully wired.
 - Replaced flat `list_tabs` reconnect loop with session-file-ordered algorithm: match session tab → live pane by UUID, create fresh daemon pane for gone slots, append remaining live panes at the end.
 - Fixed `forgetty-session` crate: `TabState` constructor updated with `pane_id: None`.
 
+### T-056: Daemon reconnect visual fixes — tab titles and snapshot blank space ✓
+
+- Added `daemon_cwd: Option<PathBuf>` field to `TerminalState` in `terminal.rs`.
+- `create_terminal_for_pane` gains a `cwd: Option<PathBuf>` parameter; the `ordered` list in the reconnect loop now carries `(PaneId, title, Option<cwd>)` sourced from `pane_info.cwd`.
+- `compute_display_title` has a third fallback (after `/proc` CWD and OSC title) that returns `daemon_cwd.file_name()` basename before falling back to `"shell"`.
+- Blank-area fix: `create_terminal_for_pane` now strips leading empty snapshot lines before replay and adjusts `effective_cursor_row` accordingly, eliminating the large gray area above the shell prompt on reconnect.
+
 ## What's next
 
 **Milestone 3.5 — Daemon Architecture + Android Sync (STARTS NOW, before public launch).**
@@ -540,7 +547,8 @@ Architecture fully designed and documented in `docs/architecture/DAEMON_SYNC_ARC
 5. ~~**T-052**~~ — ✓ DONE: totem-sync / iroh: persistent identity, QR pairing, device registry
 6. ~~**T-053**~~ — ✓ DONE: Full terminal stream to Android (raw PTY bytes over iroh QUIC)
 7. ~~**T-055**~~ — ✓ DONE: Session file as daemon reconnect source of truth
-8. **T-054** — Full interactive from Android (bidirectional input over iroh) ← NEXT
+8. ~~**T-056**~~ — ✓ DONE: Daemon reconnect visual fixes (tab titles + blank space)
+9. **T-054** — Full interactive from Android (bidirectional input over iroh) ← NEXT
 
 After M3.5, resume M3 AI features (T-032+). Android team (MA-005+) unblocks in parallel once T-052 ships.
 
