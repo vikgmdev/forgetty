@@ -1779,6 +1779,8 @@ pub fn create_terminal_for_pane(
                 if needs_redraw || bell_active || ring_changed {
                     drop(s);
                     da.queue_draw();
+                } else {
+                    drop(s);
                 }
             }
 
@@ -1797,19 +1799,35 @@ pub fn create_terminal_for_pane(
                 }
             }
 
-            // Daemon panes don't exit via pty_exited normally, but handle it gracefully.
             if pty_exited {
-                tracing::debug!(
-                    "Daemon pane channel closed for {:?}, scheduling close",
-                    da.widget_name()
-                );
-                if let Some(ref exit_cell) = on_exit {
-                    if let Some(cb) = exit_cell.take() {
-                        let pane_name = da.widget_name().to_string();
-                        glib::idle_add_local_once(move || {
-                            cb(pane_name);
-                        });
+                // Check if the daemon is still alive. If it died (bulk disconnect),
+                // do NOT fire on_exit — the cascade would close all tabs and corrupt
+                // the session file before save_all_workspaces runs.
+                let daemon_alive = {
+                    let Ok(s) = state.try_borrow() else { return glib::ControlFlow::Break; };
+                    s.daemon_client.as_ref()
+                        .map(|dc| dc.list_tabs().is_ok())
+                        .unwrap_or(true) // No daemon_client = self-contained mode → treat as alive
+                };
+
+                if daemon_alive {
+                    tracing::debug!(
+                        "Daemon pane {:?} exited (daemon alive), scheduling close",
+                        da.widget_name()
+                    );
+                    if let Some(ref exit_cell) = on_exit {
+                        if let Some(cb) = exit_cell.take() {
+                            let pane_name = da.widget_name().to_string();
+                            glib::idle_add_local_once(move || {
+                                cb(pane_name);
+                            });
+                        }
                     }
+                } else {
+                    tracing::info!(
+                        "Daemon died — keeping pane {:?} open to preserve session",
+                        da.widget_name()
+                    );
                 }
                 return glib::ControlFlow::Break;
             }
