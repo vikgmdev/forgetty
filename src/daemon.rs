@@ -20,22 +20,20 @@
 //! ```
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
 use tokio::signal::unix::{signal, SignalKind};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use forgetty_config::{load_config, Config};
-use forgetty_session::SessionManager;
+use forgetty_session::{SessionEvent, SessionManager};
 use forgetty_socket::SocketServer;
 use forgetty_sync::{
-    SyncEndpoint,
-    identity::load_or_generate,
-    qr::qr_to_ascii,
-    registry::DeviceRegistry,
+    identity::load_or_generate, qr::qr_to_ascii, registry::DeviceRegistry, SyncEndpoint,
 };
 
 // ---------------------------------------------------------------------------
@@ -211,9 +209,72 @@ async fn main_async() -> anyhow::Result<()> {
         });
     }
 
+    // Dirty-flag: set to true when a layout mutation event (PaneCreated /
+    // PaneClosed) is observed. Shared between the watcher task and the
+    // debounce-save task.
+    let dirty_flag = Arc::new(AtomicBool::new(false));
+
+    // Layout-event watcher task: subscribes to the broadcast channel and sets
+    // the dirty flag on PaneCreated / PaneClosed events.
+    {
+        let sm = Arc::clone(&session_manager);
+        let dirty = Arc::clone(&dirty_flag);
+        tokio::spawn(async move {
+            let mut rx = sm.subscribe_output();
+            loop {
+                match rx.recv().await {
+                    Ok(SessionEvent::PaneCreated { .. }) | Ok(SessionEvent::PaneClosed { .. }) => {
+                        dirty.store(true, Ordering::Relaxed);
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // Fell behind — treat as dirty (many events fired).
+                        dirty.store(true, Ordering::Relaxed);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
+
+    // Debounce-save task: if the dirty flag is set, save once every 5 seconds.
+    // This coalesces rapid layout mutations (e.g. three tabs opened at once)
+    // into a single disk write.
+    {
+        let sm = Arc::clone(&session_manager);
+        let dirty = Arc::clone(&dirty_flag);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                if dirty.swap(false, Ordering::Relaxed) {
+                    save_session_from_layout(&sm);
+                }
+            }
+        });
+    }
+
+    // Periodic safety-save task: unconditionally saves the layout every 60
+    // seconds regardless of the dirty flag. Guarantees at most 60 seconds of
+    // layout changes are lost even if the event watcher misses something.
+    {
+        let sm = Arc::clone(&session_manager);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                save_session_from_layout(&sm);
+            }
+        });
+    }
+
     // Load identity and bind iroh endpoint.
     let secret_key = load_or_generate()?;
-    let sync_endpoint = match SyncEndpoint::bind(secret_key, args.allow_pairing, Arc::clone(&session_manager)).await {
+    let sync_endpoint = match SyncEndpoint::bind(
+        secret_key,
+        args.allow_pairing,
+        Arc::clone(&session_manager),
+    )
+    .await
+    {
         Ok(ep) => {
             info!("totem-sync: iroh endpoint bound, node_id={}", ep.node_id());
             Arc::new(ep)
@@ -259,6 +320,7 @@ async fn main_async() -> anyhow::Result<()> {
     sync_endpoint.close().await;
     let saved = forgetty_socket::save_all_snapshots(&session_manager);
     info!("Saved VT snapshots for {saved} pane(s)");
+    save_session_from_layout(&session_manager);
     session_manager.kill_all();
 
     Ok(())
@@ -267,6 +329,20 @@ async fn main_async() -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Snapshot the live session layout and write it to `default.json`.
+///
+/// This is the single call site used by all three save triggers (SIGTERM/SIGINT
+/// shutdown, debounced auto-save, and the periodic safety save). Save failures
+/// are non-fatal: a warning is logged but no error is propagated.
+fn save_session_from_layout(session_manager: &SessionManager) {
+    let state = session_manager.snapshot_to_workspace_state();
+    let ws_count = state.workspaces.len();
+    match forgetty_workspace::save_session(&state) {
+        Ok(()) => debug!(ws_count, "daemon: session layout saved to default.json"),
+        Err(e) => warn!("daemon: failed to save session layout: {e}"),
+    }
+}
 
 /// Default socket path: `$XDG_RUNTIME_DIR/forgetty.sock` or `/tmp/forgetty.sock`.
 fn default_socket_path() -> PathBuf {
