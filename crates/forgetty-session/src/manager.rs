@@ -19,12 +19,15 @@ use forgetty_workspace::WorkspaceState;
 use tokio::sync::broadcast;
 use tracing::{debug, warn};
 
+use uuid::Uuid;
+
 use crate::drain_result::DrainResult;
 use crate::events::{scan_osc_notification, SessionEvent};
+use crate::layout::{SessionLayout, SessionTab};
 use crate::pane::{PaneInfo, PaneState};
 use crate::pty_bridge::PtyBridge;
 use crate::vt_instance::VtInstance;
-use crate::workspace::{build_workspace_state, WorkspaceLayout};
+use crate::workspace::{build_workspace_state, PaneTreeLayout, WorkspaceLayout};
 
 /// Maximum bytes drained from the PTY channel per `drain_output()` call.
 /// Matches the GTK terminal's `MAX_DRAIN_BYTES` cap (128 KiB per tick).
@@ -44,6 +47,9 @@ struct SessionManagerInner {
     /// are restored in the same visual position after a window reopen.
     pane_order: Vec<PaneId>,
     event_tx: broadcast::Sender<SessionEvent>,
+    /// Daemon-owned layout: workspaces → tabs → pane trees (AD-002, AD-007).
+    /// Mutated by `create_pane` and `close_pane`; exposed via `layout()`.
+    layout: SessionLayout,
 }
 
 // ---------------------------------------------------------------------------
@@ -68,6 +74,7 @@ impl SessionManager {
                 panes: HashMap::new(),
                 pane_order: Vec::new(),
                 event_tx,
+                layout: SessionLayout::new_default(),
             })),
         }
     }
@@ -120,6 +127,16 @@ impl SessionManager {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             inner.panes.insert(id, pane);
             inner.pane_order.push(id);
+            // Mirror the new pane as a single-leaf tab in the default workspace (AD-002).
+            // `active_tab` is NOT advanced here — that is UI state owned by GTK (AD-008).
+            let tab = SessionTab {
+                id: Uuid::new_v4(),
+                title: String::new(),
+                pane_tree: PaneTreeLayout::Leaf { pane_id: id },
+            };
+            if let Some(ws) = inner.layout.workspaces.first_mut() {
+                ws.tabs.push(tab);
+            }
             let _ = inner.event_tx.send(SessionEvent::PaneCreated { pane_id: id });
         }
 
@@ -134,6 +151,21 @@ impl SessionManager {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(mut pane) = inner.panes.remove(&id) {
             inner.pane_order.retain(|&p| p != id);
+            // Remove the matching single-leaf tab from the default workspace.
+            // Only leaf tabs are removed here; split trees are handled by T-060+.
+            // NOTE: do NOT call self.layout() from inside this lock — that deadlocks.
+            if let Some(ws) = inner.layout.workspaces.first_mut() {
+                let before = ws.tabs.len();
+                ws.tabs.retain(
+                    |t| !matches!(&t.pane_tree, PaneTreeLayout::Leaf { pane_id } if *pane_id == id),
+                );
+                let removed = before != ws.tabs.len();
+                // Clamp active_tab when the removed tab was at or past the current index.
+                // Guard against the empty-tabs case (saturating_sub(1) = usize::MAX).
+                if removed && ws.active_tab >= ws.tabs.len() && !ws.tabs.is_empty() {
+                    ws.active_tab = ws.tabs.len() - 1;
+                }
+            }
             if let Err(e) = pane.pty_bridge.pty.kill() {
                 warn!(%id, "failed to kill PTY on close_pane: {e}");
             }
@@ -317,6 +349,19 @@ impl SessionManager {
     pub fn list_panes(&self) -> Vec<PaneId> {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.pane_order.clone()
+    }
+
+    /// Return a snapshot of the current session layout.
+    ///
+    /// Acquires the mutex, clones `inner.layout`, and returns the clone. The
+    /// snapshot reflects the state after all prior `create_pane` and
+    /// `close_pane` calls have completed.
+    ///
+    /// NOTE: do NOT call this from within any code that already holds
+    /// `self.inner` — that deadlocks. See R-1 in T-059 SPEC.
+    pub fn layout(&self) -> SessionLayout {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.layout.clone()
     }
 
     // -----------------------------------------------------------------------
