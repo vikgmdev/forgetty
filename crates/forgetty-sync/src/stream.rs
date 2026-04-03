@@ -63,11 +63,11 @@ pub enum DaemonMsg {
     /// Full viewport snapshot (text only). Sent immediately after `Subscribe`
     /// and again on backpressure recovery.
     FullSnapshot {
-        pane_id:    String,
-        rows:       u16,
-        cols:       u16,
+        pane_id: String,
+        rows: u16,
+        cols: u16,
         /// One string per row, exactly `cols` characters wide (space-padded).
-        lines:      Vec<String>,
+        lines: Vec<String>,
         cursor_row: usize,
         cursor_col: usize,
     },
@@ -75,14 +75,10 @@ pub enum DaemonMsg {
     PtyBytes {
         pane_id: String,
         #[serde(with = "serde_bytes")]
-        data:    Vec<u8>,
+        data: Vec<u8>,
     },
     /// A page of scrollback lines in response to `ClientMsg::RequestScrollback`.
-    ScrollbackPage {
-        pane_id:  String,
-        from_row: i32,
-        lines:    Vec<String>,
-    },
+    ScrollbackPage { pane_id: String, from_row: i32, lines: Vec<String> },
     /// The subscribed pane has closed. Android should disconnect.
     PaneGone { pane_id: String },
     /// Protocol or authorization error.
@@ -192,7 +188,12 @@ fn build_snapshot(sm: &SessionManager, pane_id: PaneId) -> DaemonMsg {
 }
 
 /// Build a `DaemonMsg::ScrollbackPage` for the given pane.
-fn build_scrollback_page(sm: &SessionManager, pane_id: PaneId, from_row: i32, count: u32) -> DaemonMsg {
+fn build_scrollback_page(
+    sm: &SessionManager,
+    pane_id: PaneId,
+    from_row: i32,
+    count: u32,
+) -> DaemonMsg {
     let clamped_count = (count as usize).min(MAX_SCROLLBACK_PAGE);
 
     let result = sm.with_vt(pane_id, |terminal| {
@@ -204,7 +205,11 @@ fn build_scrollback_page(sm: &SessionManager, pane_id: PaneId, from_row: i32, co
         let start = if from_row < 0 {
             // Negative: offset from the newest scrollback line.
             let offset = (-from_row) as usize;
-            if offset >= len { 0 } else { len - offset }
+            if offset >= len {
+                0
+            } else {
+                len - offset
+            }
         } else {
             (from_row as usize).min(len.saturating_sub(1))
         };
@@ -292,9 +297,10 @@ pub async fn handle_stream_connection(
         Some(ClientMsg::Subscribe { pane_id }) => pane_id,
         Some(other) => {
             warn!("stream: expected Subscribe, got {:?} from {device_id}", other);
-            let _ = write_msg(&mut send, &DaemonMsg::Error {
-                message: "expected Subscribe as first message".to_string(),
-            })
+            let _ = write_msg(
+                &mut send,
+                &DaemonMsg::Error { message: "expected Subscribe as first message".to_string() },
+            )
             .await;
             conn.close(1u8.into(), b"protocol-error");
             return;
@@ -310,9 +316,10 @@ pub async fn handle_stream_connection(
     let pane_id: PaneId = match Uuid::parse_str(&pane_id_str) {
         Ok(u) => PaneId(u),
         Err(_) => {
-            let _ = write_msg(&mut send, &DaemonMsg::Error {
-                message: format!("invalid pane_id UUID: {pane_id_str}"),
-            })
+            let _ = write_msg(
+                &mut send,
+                &DaemonMsg::Error { message: format!("invalid pane_id UUID: {pane_id_str}") },
+            )
             .await;
             conn.close(1u8.into(), b"bad-pane-id");
             return;
@@ -320,9 +327,10 @@ pub async fn handle_stream_connection(
     };
 
     if sm.pane_info(pane_id).is_none() {
-        let _ = write_msg(&mut send, &DaemonMsg::Error {
-            message: format!("pane not found: {pane_id_str}"),
-        })
+        let _ = write_msg(
+            &mut send,
+            &DaemonMsg::Error { message: format!("pane not found: {pane_id_str}") },
+        )
         .await;
         conn.close(1u8.into(), b"pane-not-found");
         return;
@@ -469,10 +477,10 @@ mod tests {
     #[test]
     fn serialize_full_snapshot_roundtrip() {
         let msg = DaemonMsg::FullSnapshot {
-            pane_id:    "p1".to_string(),
-            rows:       24,
-            cols:       80,
-            lines:      vec!["hello".to_string()],
+            pane_id: "p1".to_string(),
+            rows: 24,
+            cols: 80,
+            lines: vec!["hello".to_string()],
             cursor_row: 0,
             cursor_col: 5,
         };

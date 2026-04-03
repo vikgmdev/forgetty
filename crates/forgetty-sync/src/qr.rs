@@ -31,12 +31,7 @@ impl QrPayload {
         let machine = hostname::get()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|_| "unknown".to_string());
-        QrPayload {
-            v: 1,
-            node_id: node_id_str,
-            machine,
-            relay: DEFAULT_RELAY.to_string(),
-        }
+        QrPayload { v: 1, node_id: node_id_str, machine, relay: DEFAULT_RELAY.to_string() }
     }
 
     /// Serialise the payload to a compact JSON string (used as QR data).
@@ -61,7 +56,7 @@ pub enum QrError {
 /// Uses the `Dense1x2` Unicode renderer which packs two rows per terminal line,
 /// giving a compact square output.
 pub fn qr_to_ascii(payload: &QrPayload) -> Result<String, QrError> {
-    use qrcode::{QrCode, render::unicode};
+    use qrcode::{render::unicode, QrCode};
     let json = payload.to_json()?;
     let code = QrCode::new(json.as_bytes()).map_err(|e| QrError::Encode(e.to_string()))?;
     let rendered = code
@@ -78,7 +73,7 @@ pub fn qr_to_ascii(payload: &QrPayload) -> Result<String, QrError> {
 /// `module_size`: pixels per QR module. Use `8` for a ~300px image at
 /// QR version 3 (37 modules). GTK will scale via `Image::set_pixel_size(250)`.
 pub fn qr_to_png(payload: &QrPayload, module_size: u32) -> Result<Vec<u8>, QrError> {
-    use image::{DynamicImage, ImageEncoder, Luma, codecs::png::PngEncoder};
+    use image::{codecs::png::PngEncoder, DynamicImage, ImageEncoder, Luma};
     use qrcode::QrCode;
 
     let json = payload.to_json()?;
@@ -100,12 +95,7 @@ pub fn qr_to_png(payload: &QrPayload, module_size: u32) -> Result<Vec<u8>, QrErr
     let encoder = PngEncoder::new(&mut png_bytes);
     let rgba = dynamic.to_rgba8();
     encoder
-        .write_image(
-            rgba.as_raw(),
-            rgba.width(),
-            rgba.height(),
-            image::ColorType::Rgba8.into(),
-        )
+        .write_image(rgba.as_raw(), rgba.width(), rgba.height(), image::ColorType::Rgba8.into())
         .map_err(|e| QrError::Png(e.to_string()))?;
     Ok(png_bytes)
 }

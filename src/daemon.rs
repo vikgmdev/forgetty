@@ -201,7 +201,7 @@ async fn main_async() -> anyhow::Result<()> {
         let default_size = PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
         match forgetty_workspace::load_session() {
             Ok(Some(state)) if !state.workspaces.is_empty() => {
-                let total: usize = state.workspaces.iter().map(|ws| ws.tabs.len()).count();
+                let total: usize = state.workspaces.iter().map(|ws| ws.tabs.len()).sum();
                 info!("cold-start restore: found {} workspace(s), {} tab(s) total",
                     state.workspaces.len(), total);
                 for (ws_idx, workspace) in state.workspaces.iter().enumerate() {

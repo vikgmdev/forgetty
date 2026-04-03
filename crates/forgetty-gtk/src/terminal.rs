@@ -1542,7 +1542,9 @@ pub fn create_terminal_for_pane(
         // Strip leading blank rows.  Blank rows from the daemon are serialized as
         // "" (empty string): handle_get_screen only emits bytes up to the last
         // non-default cell, so an all-blank row produces zero bytes.
-        let first_content = snap.lines.iter()
+        let first_content = snap
+            .lines
+            .iter()
             .position(|l| !l.is_empty())
             .unwrap_or(snap.lines.len().saturating_sub(1)); // keep at least cursor row
         let effective_lines = &snap.lines[first_content..];
@@ -1804,10 +1806,11 @@ pub fn create_terminal_for_pane(
                 // do NOT fire on_exit — the cascade would close all tabs and corrupt
                 // the session file before save_all_workspaces runs.
                 let daemon_alive = {
-                    let Ok(s) = state.try_borrow() else { return glib::ControlFlow::Break; };
-                    s.daemon_client.as_ref()
-                        .map(|dc| dc.list_tabs().is_ok())
-                        .unwrap_or(true) // No daemon_client = self-contained mode → treat as alive
+                    let Ok(s) = state.try_borrow() else {
+                        return glib::ControlFlow::Break;
+                    };
+                    s.daemon_client.as_ref().map(|dc| dc.list_tabs().is_ok()).unwrap_or(true)
+                    // No daemon_client = self-contained mode → treat as alive
                 };
 
                 if daemon_alive {
@@ -1863,7 +1866,9 @@ pub fn create_terminal_for_pane(
                         da_for_key.activate_action("win.copy", None).ok();
                     } else {
                         // In daemon mode, send SIGINT via daemon RPC.
-                        if let (Some(ref dc), Some(pid)) = (s.daemon_client.clone(), s.daemon_pane_id) {
+                        if let (Some(ref dc), Some(pid)) =
+                            (s.daemon_client.clone(), s.daemon_pane_id)
+                        {
                             let _ = dc.send_sigint(pid);
                         }
                         s.cursor_blink_visible = true;
@@ -1999,9 +2004,8 @@ pub fn create_terminal_for_pane(
                         let menu_box =
                             build_context_menu_box(&popover, url_str.as_deref(), has_selection);
                         popover.set_child(Some(&menu_box));
-                        popover.set_pointing_to(Some(&gdk::Rectangle::new(
-                            x as i32, y as i32, 1, 1,
-                        )));
+                        popover
+                            .set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
                         popover.popup();
                     }
                     return;
@@ -2062,8 +2066,7 @@ pub fn create_terminal_for_pane(
                             let screen = s.terminal.screen();
                             let (word_start, word_end) =
                                 find_word_boundaries(screen, screen_row, col);
-                            let mut sel =
-                                Selection::new(abs_row, word_start, SelectionMode::Word);
+                            let mut sel = Selection::new(abs_row, word_start, SelectionMode::Word);
                             sel.update(abs_row, word_end);
                             s.selection = Some(sel);
                             s.selecting = true;
@@ -2091,7 +2094,13 @@ pub fn create_terminal_for_pane(
                 let cell_size = (s.cell_width as u32, s.cell_height as u32);
 
                 if let Some(bytes) = s.input.encode_mouse_button(
-                    button, true, (x, y), modifier, terminal_handle, screen_size, cell_size,
+                    button,
+                    true,
+                    (x, y),
+                    modifier,
+                    terminal_handle,
+                    screen_size,
+                    cell_size,
                 ) {
                     if let (Some(ref dc), Some(pid)) = (s.daemon_client.clone(), s.daemon_pane_id) {
                         let _ = dc.send_input(pid, &bytes);
@@ -2133,7 +2142,13 @@ pub fn create_terminal_for_pane(
                 let cell_size = (s.cell_width as u32, s.cell_height as u32);
 
                 if let Some(bytes) = s.input.encode_mouse_button(
-                    button, false, (x, y), modifier, terminal_handle, screen_size, cell_size,
+                    button,
+                    false,
+                    (x, y),
+                    modifier,
+                    terminal_handle,
+                    screen_size,
+                    cell_size,
                 ) {
                     if let (Some(ref dc), Some(pid)) = (s.daemon_client.clone(), s.daemon_pane_id) {
                         let _ = dc.send_input(pid, &bytes);
@@ -2384,9 +2399,7 @@ pub fn create_terminal_for_pane(
                 s.terminal.resize(new_rows, new_cols);
                 let (_, off, _) = s.terminal.scrollbar_state();
                 s.viewport_offset = off;
-                if let (Some(ref dc), Some(pane_id)) =
-                    (s.daemon_client.clone(), s.daemon_pane_id)
-                {
+                if let (Some(ref dc), Some(pane_id)) = (s.daemon_client.clone(), s.daemon_pane_id) {
                     let _ = dc.resize_pane(pane_id, new_rows as u16, new_cols as u16);
                 }
                 drop(s);
@@ -3687,11 +3700,8 @@ fn draw_terminal(
         // Treat a=255 as "theme didn't specify opacity" and fall back to 40% opacity.
         // Themes that explicitly set alpha via #rrggbbaa 8-char hex will have a < 255
         // and their value is respected.
-        let sel_alpha = if selection_color.a == 255 {
-            0.4
-        } else {
-            selection_color.a as f64 / 255.0
-        };
+        let sel_alpha =
+            if selection_color.a == 255 { 0.4 } else { selection_color.a as f64 / 255.0 };
         ctx.set_source_rgba(
             selection_color.r as f64 / 255.0,
             selection_color.g as f64 / 255.0,

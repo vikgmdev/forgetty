@@ -39,7 +39,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::Parser;
-use iroh::{Endpoint, EndpointAddr, SecretKey, endpoint::presets};
+use iroh::{endpoint::presets, Endpoint, EndpointAddr, SecretKey};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use forgetty_sync::stream::{ClientMsg, DaemonMsg};
@@ -104,10 +104,8 @@ async fn run() -> anyhow::Result<()> {
     let args = Args::parse();
 
     // Parse node_id.
-    let endpoint_id: iroh::EndpointId = args
-        .dial
-        .parse()
-        .map_err(|e| anyhow::anyhow!("invalid node_id '{}': {e}", args.dial))?;
+    let endpoint_id: iroh::EndpointId =
+        args.dial.parse().map_err(|e| anyhow::anyhow!("invalid node_id '{}': {e}", args.dial))?;
 
     // Load or generate identity. We reuse the pair-test.key so the same device_id
     // is recognized without needing a separate pairing step when already paired.
@@ -150,10 +148,8 @@ async fn run() -> anyhow::Result<()> {
     eprintln!("stream-test: connected, remote_id={}", conn.remote_id());
 
     // Open a bidirectional stream (Android side opens the stream).
-    let (mut send, mut recv) = conn
-        .open_bi()
-        .await
-        .map_err(|e| anyhow::anyhow!("open_bi failed: {e}"))?;
+    let (mut send, mut recv) =
+        conn.open_bi().await.map_err(|e| anyhow::anyhow!("open_bi failed: {e}"))?;
 
     // Send Subscribe message.
     let subscribe = ClientMsg::Subscribe { pane_id: pane_id.clone() };
@@ -178,7 +174,11 @@ async fn run() -> anyhow::Result<()> {
             DaemonMsg::FullSnapshot { rows, cols, lines, cursor_row, cursor_col, .. } => {
                 eprintln!(
                     "stream-test: FullSnapshot: {}x{} rows, cursor=({},{}), {} lines",
-                    rows, cols, cursor_row, cursor_col, lines.len()
+                    rows,
+                    cols,
+                    cursor_row,
+                    cursor_col,
+                    lines.len()
                 );
                 // Print the first few lines for visual inspection.
                 for (i, line) in lines.iter().take(5).enumerate() {
@@ -224,7 +224,8 @@ async fn run() -> anyhow::Result<()> {
             DaemonMsg::ScrollbackPage { from_row, lines, .. } => {
                 eprintln!(
                     "stream-test: ScrollbackPage: from_row={}, {} lines",
-                    from_row, lines.len()
+                    from_row,
+                    lines.len()
                 );
                 println!("PASS: ScrollbackPage received ({} lines)", lines.len());
             }
@@ -277,9 +278,7 @@ async fn read_frame(recv: &mut iroh::endpoint::RecvStream) -> anyhow::Result<Dae
     }
 
     let mut payload = vec![0u8; len];
-    recv.read_exact(&mut payload)
-        .await
-        .map_err(|e| anyhow::anyhow!("read payload failed: {e}"))?;
+    recv.read_exact(&mut payload).await.map_err(|e| anyhow::anyhow!("read payload failed: {e}"))?;
 
     rmp_serde::from_slice::<DaemonMsg>(&payload)
         .map_err(|e| anyhow::anyhow!("failed to deserialize DaemonMsg: {e}"))

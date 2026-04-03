@@ -19,20 +19,20 @@
 //! Routing uses `Accepting::alpn().await` (iroh 0.97) to read the negotiated
 //! ALPN before completing the QUIC handshake.
 
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use forgetty_session::SessionManager;
-use iroh::{Endpoint, EndpointId, SecretKey, endpoint::presets};
+use iroh::{endpoint::presets, Endpoint, EndpointId, SecretKey};
 use thiserror::Error;
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
 use crate::{
     pairing,
-    stream,
     registry::{DeviceEntry, DeviceRegistry},
+    stream,
 };
 
 /// ALPN identifier for Forgetty's pairing protocol.
@@ -88,17 +88,12 @@ impl SyncEndpoint {
     ) -> Result<Self, SyncError> {
         let endpoint = Endpoint::builder(presets::N0)
             .secret_key(secret_key)
-            .alpns(vec![
-                FORGETTY_PAIRING_ALPN.to_vec(),
-                FORGETTY_STREAM_ALPN.to_vec(),
-            ])
+            .alpns(vec![FORGETTY_PAIRING_ALPN.to_vec(), FORGETTY_STREAM_ALPN.to_vec()])
             .bind()
             .await
             .map_err(|e| SyncError::Bind(e.to_string()))?;
 
-        let registry = Arc::new(Mutex::new(
-            DeviceRegistry::load().map_err(SyncError::Registry)?,
-        ));
+        let registry = Arc::new(Mutex::new(DeviceRegistry::load().map_err(SyncError::Registry)?));
         let (event_tx, _) = broadcast::channel(64);
         let allow_pairing = Arc::new(AtomicBool::new(allow_pairing));
 
@@ -182,10 +177,10 @@ impl SyncEndpoint {
                 }
             };
 
-            let registry    = Arc::clone(&self.registry);
-            let allow_pair  = self.allow_pairing.load(Ordering::Relaxed);
-            let event_tx    = self.event_tx.clone();
-            let sm          = Arc::clone(&self.session_manager);
+            let registry = Arc::clone(&self.registry);
+            let allow_pair = self.allow_pairing.load(Ordering::Relaxed);
+            let event_tx = self.event_tx.clone();
+            let sm = Arc::clone(&self.session_manager);
 
             tokio::spawn(async move {
                 match accepting.await {
