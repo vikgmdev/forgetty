@@ -242,6 +242,50 @@ impl DaemonClient {
         self.new_tab_with_cwd(None)
     }
 
+    /// Create a new named workspace on the daemon and return the initial pane info.
+    ///
+    /// The daemon creates the workspace and immediately spawns a default tab in it.
+    /// Returns `(workspace_id, workspace_idx, pane_id, tab_id)` on success.
+    pub fn create_workspace(
+        &self,
+        name: &str,
+    ) -> Result<(uuid::Uuid, usize, PaneId, uuid::Uuid), DaemonError> {
+        let result =
+            self.rpc("create_workspace", serde_json::json!({ "name": name }))?;
+
+        let workspace_id_str = result
+            .get("workspace_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| DaemonError("create_workspace: missing workspace_id".into()))?;
+        let workspace_id = uuid::Uuid::parse_str(workspace_id_str).map_err(|e| {
+            DaemonError(format!("create_workspace: invalid workspace_id UUID: {e}"))
+        })?;
+
+        let workspace_idx = result
+            .get("workspace_idx")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| DaemonError("create_workspace: missing workspace_idx".into()))?
+            as usize;
+
+        let pane_id_str = result
+            .get("pane_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| DaemonError("create_workspace: missing pane_id".into()))?;
+        let pane_uuid = uuid::Uuid::parse_str(pane_id_str).map_err(|e| {
+            DaemonError(format!("create_workspace: invalid pane_id UUID: {e}"))
+        })?;
+
+        let tab_id_str = result
+            .get("tab_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| DaemonError("create_workspace: missing tab_id".into()))?;
+        let tab_id = uuid::Uuid::parse_str(tab_id_str).map_err(|e| {
+            DaemonError(format!("create_workspace: invalid tab_id UUID: {e}"))
+        })?;
+
+        Ok((workspace_id, workspace_idx, PaneId(pane_uuid), tab_id))
+    }
+
     /// Close a tab in the daemon by its `tab_id` (UUID).
     pub fn close_tab(&self, tab_id: uuid::Uuid) -> Result<(), DaemonError> {
         self.rpc("close_tab", serde_json::json!({ "tab_id": tab_id.to_string() }))?;

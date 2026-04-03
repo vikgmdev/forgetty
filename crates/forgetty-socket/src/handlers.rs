@@ -55,6 +55,7 @@ pub fn dispatch(
         methods::SEND_SIGINT => handle_send_sigint(request, &sm),
         methods::PRESEED_SNAPSHOT => handle_preseed_snapshot(request, &sm),
         methods::CLOSE_PANE => handle_close_pane(request, &sm),
+        methods::CREATE_WORKSPACE => handle_create_workspace(request, &sm),
         // Sync / pairing methods — require sync_endpoint.
         methods::LIST_DEVICES => handle_list_devices(request, sync_endpoint.as_deref()),
         methods::REVOKE_DEVICE => handle_revoke_device(request, sync_endpoint.as_deref()),
@@ -463,6 +464,36 @@ fn handle_close_pane(request: &Request, sm: &SessionManager) -> Response {
                 format!("close_pane (split leaf) failed: {e}"),
             ),
         }
+    }
+}
+
+fn handle_create_workspace(request: &Request, sm: &SessionManager) -> Response {
+    let name = request
+        .params
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Workspace")
+        .to_string();
+
+    let (workspace_id, workspace_idx) = sm.create_workspace(&name);
+
+    let default_size =
+        PtySize { rows: DEFAULT_ROWS, cols: DEFAULT_COLS, pixel_width: 0, pixel_height: 0 };
+    match sm.create_tab(workspace_idx, None, default_size) {
+        Ok((pane_id, tab_id)) => Response::success(
+            request.id.clone(),
+            serde_json::json!({
+                "workspace_id": workspace_id.to_string(),
+                "workspace_idx": workspace_idx,
+                "pane_id": pane_id.to_string(),
+                "tab_id": tab_id.to_string(),
+            }),
+        ),
+        Err(e) => Response::error(
+            request.id.clone(),
+            protocol::INTERNAL_ERROR,
+            format!("create_workspace: create_tab failed: {e}"),
+        ),
     }
 }
 

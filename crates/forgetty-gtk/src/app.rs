@@ -1073,9 +1073,17 @@ fn build_ui(
         let main_area_new = main_area.clone();
         let tab_bar_new = tab_bar.clone();
         let win_new = window.clone();
+        let dc_new = daemon_client.clone();
         let action = gio::SimpleAction::new("new-workspace", None);
         action.connect_activate(move |_action, _param| {
-            show_new_workspace_dialog(&win_new, &wm_new, &cfg_new, &main_area_new, &tab_bar_new);
+            show_new_workspace_dialog(
+                &win_new,
+                &wm_new,
+                &cfg_new,
+                &main_area_new,
+                &tab_bar_new,
+                dc_new.clone(),
+            );
         });
         window.add_action(&action);
     }
@@ -1901,14 +1909,14 @@ fn build_widget_from_pane_tree(
     }
 }
 
-/// Build the full GTK tab widget tree from a `LayoutInfo` snapshot (T-064).
+/// Build the full GTK tab widget tree from a `LayoutInfo` snapshot (T-064, T-067).
 ///
-/// Iterates `layout.workspaces[active_workspace].tabs` and for each tab calls
-/// `build_widget_from_pane_tree`. Adds each result as a page in the default
-/// workspace's `TabView`. Returns `true` if at least one tab was successfully
-/// created.
+/// For the active workspace, populates GTK's existing workspace[0] TabView.
+/// For every additional workspace in the daemon layout, creates a new TabView +
+/// WorkspaceView and appends it to the workspace_manager so the user can switch
+/// to it with Ctrl+Alt+2/3/etc.
 ///
-/// Only the active workspace is displayed (multi-workspace GTK is T-065+).
+/// Returns `true` if at least one tab was successfully created in the active workspace.
 fn build_widgets_from_layout(
     layout: &LayoutInfo,
     dc: &Arc<DaemonClient>,
@@ -1916,8 +1924,8 @@ fn build_widgets_from_layout(
     workspace_manager: &WorkspaceManager,
     window: &adw::ApplicationWindow,
 ) -> bool {
-    // Determine which workspace to display.
-    let ws_idx = if layout.active_workspace < layout.workspaces.len() {
+    // Determine which workspace to display first.
+    let active_ws_idx = if layout.active_workspace < layout.workspaces.len() {
         layout.active_workspace
     } else {
         if !layout.workspaces.is_empty() {
@@ -1929,72 +1937,195 @@ fn build_widgets_from_layout(
         0
     };
 
-    let Some(ws_info) = layout.workspaces.get(ws_idx) else {
+    let Some(active_ws_info) = layout.workspaces.get(active_ws_idx) else {
         tracing::info!("get_layout: no workspaces in layout — will create a fresh tab");
         return false;
     };
 
-    if ws_info.tabs.is_empty() {
+    if active_ws_info.tabs.is_empty() {
         tracing::info!("get_layout: active workspace has 0 tabs — will create a fresh tab");
         return false;
     }
 
-    let Ok(mgr) = workspace_manager.try_borrow() else {
-        tracing::warn!("build_widgets_from_layout: failed to borrow workspace_manager");
-        return false;
-    };
-    let ws = &mgr.workspaces[0]; // GTK always shows workspace 0 (T-065 will generalize)
-
-    tracing::info!("build_widgets_from_layout: building {} tab(s)", ws_info.tabs.len());
-
-    // (page, first_da) pairs — we need both to select and focus the active tab.
-    let mut created: Vec<(adw::TabPage, gtk4::DrawingArea)> = Vec::new();
-
-    for tab in &ws_info.tabs {
-        let Some((root_widget, first_da)) = build_widget_from_pane_tree(
-            &tab.pane_tree,
-            dc,
-            config,
-            &ws.tab_states,
-            &ws.focus_tracker,
-            &ws.custom_titles,
-            window,
-            &ws.tab_view,
-        ) else {
-            tracing::warn!("build_widget_from_pane_tree failed for tab {:?}", tab.title);
-            continue;
-        };
-
-        let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-        container.set_hexpand(true);
-        container.set_vexpand(true);
-        container.append(&root_widget);
-
-        let page = ws.tab_view.append(&container);
-        let tab_title = if tab.title.is_empty() { "shell" } else { &tab.title };
-        page.set_title(tab_title);
-
-        register_title_timer(
-            &page,
-            &ws.tab_view,
-            &ws.tab_states,
-            &ws.focus_tracker,
-            &ws.custom_titles,
-            window,
+    // -----------------------------------------------------------------------
+    // Build the active workspace into GTK's existing workspace[0].
+    // -----------------------------------------------------------------------
+    let restored = {
+        tracing::info!(
+            "build_widgets_from_layout: building {} tab(s) for active workspace {:?}",
+            active_ws_info.tabs.len(),
+            active_ws_info.name
         );
 
-        created.push((page, first_da));
-    }
+        let (mut created, tab_view_clone) = {
+            let Ok(mgr) = workspace_manager.try_borrow() else {
+                tracing::warn!("build_widgets_from_layout: failed to borrow workspace_manager");
+                return false;
+            };
+            let ws = &mgr.workspaces[0];
+            let mut created: Vec<(adw::TabPage, gtk4::DrawingArea)> = Vec::new();
 
-    if created.is_empty() {
+            for tab in &active_ws_info.tabs {
+                let Some((root_widget, first_da)) = build_widget_from_pane_tree(
+                    &tab.pane_tree,
+                    dc,
+                    config,
+                    &ws.tab_states,
+                    &ws.focus_tracker,
+                    &ws.custom_titles,
+                    window,
+                    &ws.tab_view,
+                ) else {
+                    tracing::warn!("build_widget_from_pane_tree failed for tab {:?}", tab.title);
+                    continue;
+                };
+
+                let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+                container.set_hexpand(true);
+                container.set_vexpand(true);
+                container.append(&root_widget);
+
+                let page = ws.tab_view.append(&container);
+                let tab_title = if tab.title.is_empty() { "shell" } else { &tab.title };
+                page.set_title(tab_title);
+
+                register_title_timer(
+                    &page,
+                    &ws.tab_view,
+                    &ws.tab_states,
+                    &ws.focus_tracker,
+                    &ws.custom_titles,
+                    window,
+                );
+
+                created.push((page, first_da));
+            }
+            (created, ws.tab_view.clone())
+        };
+
+        if created.is_empty() {
+            false
+        } else {
+            // Select the active tab and focus its first DrawingArea.
+            let active_tab_idx =
+                active_ws_info.active_tab.min(created.len().saturating_sub(1));
+            let (ref active_page, ref active_da) = created[active_tab_idx];
+            tab_view_clone.set_selected_page(active_page);
+            active_da.grab_focus();
+
+            // Sync workspace[0]'s id/name with the daemon's active workspace.
+            if let Ok(mut mgr) = workspace_manager.try_borrow_mut() {
+                mgr.workspaces[0].id = active_ws_info.id;
+                mgr.workspaces[0].name = active_ws_info.name.clone();
+            }
+
+            true
+        }
+    };
+
+    if !restored {
         return false;
     }
 
-    // Select the active tab and focus its first DrawingArea.
-    let active_tab_idx = ws_info.active_tab.min(created.len().saturating_sub(1));
-    let (ref active_page, ref active_da) = created[active_tab_idx];
-    ws.tab_view.set_selected_page(active_page);
-    active_da.grab_focus();
+    // -----------------------------------------------------------------------
+    // Build all non-active workspaces as background WorkspaceViews (T-067).
+    // Their TabViews are not shown in main_area until the user switches to them.
+    // -----------------------------------------------------------------------
+    for (daemon_idx, ws_info) in layout.workspaces.iter().enumerate() {
+        if daemon_idx == active_ws_idx {
+            continue; // already handled above
+        }
+        if ws_info.tabs.is_empty() {
+            tracing::debug!(
+                "build_widgets_from_layout: workspace {:?} has 0 tabs, skipping",
+                ws_info.name
+            );
+            continue;
+        }
+
+        let new_tv = adw::TabView::new();
+        new_tv.set_vexpand(true);
+        new_tv.set_hexpand(true);
+
+        let new_tab_states: TabStateMap = Rc::new(RefCell::new(HashMap::new()));
+        let new_focus_tracker: FocusTracker = Rc::new(RefCell::new(String::new()));
+        let new_custom_titles: CustomTitles = Rc::new(RefCell::new(HashSet::new()));
+        let new_tab_id_map: TabIdMap = Rc::new(RefCell::new(HashMap::new()));
+
+        wire_tab_view_handlers(&new_tv, &new_tab_states, &new_focus_tracker, window);
+
+        tracing::info!(
+            "build_widgets_from_layout: building {} tab(s) for workspace {:?}",
+            ws_info.tabs.len(),
+            ws_info.name
+        );
+
+        let mut first_da_opt: Option<gtk4::DrawingArea> = None;
+
+        for tab in &ws_info.tabs {
+            let Some((root_widget, first_da)) = build_widget_from_pane_tree(
+                &tab.pane_tree,
+                dc,
+                config,
+                &new_tab_states,
+                &new_focus_tracker,
+                &new_custom_titles,
+                window,
+                &new_tv,
+            ) else {
+                tracing::warn!(
+                    "build_widget_from_pane_tree failed for tab {:?} in workspace {:?}",
+                    tab.title,
+                    ws_info.name
+                );
+                continue;
+            };
+
+            let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+            container.set_hexpand(true);
+            container.set_vexpand(true);
+            container.append(&root_widget);
+
+            let page = new_tv.append(&container);
+            let tab_title = if tab.title.is_empty() { "shell" } else { &tab.title };
+            page.set_title(tab_title);
+
+            register_title_timer(
+                &page,
+                &new_tv,
+                &new_tab_states,
+                &new_focus_tracker,
+                &new_custom_titles,
+                window,
+            );
+
+            if first_da_opt.is_none() {
+                first_da_opt = Some(first_da);
+            }
+        }
+
+        // Only add the WorkspaceView if at least one tab was created.
+        if new_tv.n_pages() > 0 {
+            let Ok(mut mgr) = workspace_manager.try_borrow_mut() else {
+                tracing::warn!("build_widgets_from_layout: failed to borrow_mut for ws {:?}", ws_info.name);
+                continue;
+            };
+            mgr.workspaces.push(WorkspaceView {
+                id: ws_info.id,
+                name: ws_info.name.clone(),
+                tab_view: new_tv,
+                tab_states: new_tab_states,
+                focus_tracker: new_focus_tracker,
+                custom_titles: new_custom_titles,
+                tab_id_map: new_tab_id_map,
+            });
+            tracing::info!(
+                "build_widgets_from_layout: added WorkspaceView {:?} at gtx_idx={}",
+                ws_info.name,
+                mgr.workspaces.len() - 1
+            );
+        }
+    }
 
     true
 }
@@ -5074,6 +5205,7 @@ fn show_new_workspace_dialog(
     shared_config: &SharedConfig,
     main_area: &gtk4::Box,
     tab_bar: &adw::TabBar,
+    daemon_client: Option<Arc<DaemonClient>>,
 ) {
     let dialog = adw::MessageDialog::new(
         Some(window),
@@ -5101,6 +5233,7 @@ fn show_new_workspace_dialog(
     let ma = main_area.clone();
     let tb = tab_bar.clone();
     let win = window.clone();
+    let dc = daemon_client;
     dialog.connect_response(None, move |dialog, response| {
         if response != "create" {
             dialog.close();
@@ -5119,7 +5252,7 @@ fn show_new_workspace_dialog(
         let config = cfg_ref.clone();
         drop(cfg_ref);
 
-        create_and_switch_to_new_workspace(&wm, &name, &config, &ma, &tb, &win);
+        create_and_switch_to_new_workspace(&wm, &name, &config, &ma, &tb, &win, dc.clone());
     });
 
     dialog.present();
@@ -5133,6 +5266,7 @@ fn create_and_switch_to_new_workspace(
     main_area: &gtk4::Box,
     tab_bar: &adw::TabBar,
     window: &adw::ApplicationWindow,
+    daemon_client: Option<Arc<DaemonClient>>,
 ) {
     let new_tv = adw::TabView::new();
     new_tv.set_vexpand(true);
@@ -5145,19 +5279,107 @@ fn create_and_switch_to_new_workspace(
 
     wire_tab_view_handlers(&new_tv, &new_tab_states, &new_focus_tracker, window);
 
-    // Add a default tab to the new workspace.
-    add_new_tab(
-        &new_tv,
-        config,
-        &new_tab_states,
-        &new_focus_tracker,
-        &new_custom_titles,
-        window,
-        None,
-        None,
-        None, // new workspaces are always local, no daemon client
-        &new_tab_id_map,
-    );
+    // Determine the workspace UUID and add the initial tab.
+    // In daemon mode: create workspace + pane on the daemon and subscribe.
+    // In self-contained mode: spawn a local PTY via add_new_tab.
+    let workspace_id = if let Some(ref dc) = daemon_client {
+        match dc.create_workspace(name) {
+            Ok((ws_id, _ws_idx, pane_id, tab_id)) => {
+                let (mpsc_tx, mpsc_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+                if let Err(e) = dc.subscribe_output(pane_id, mpsc_tx) {
+                    tracing::warn!(
+                        "subscribe_output failed for new workspace pane {pane_id}: {e}"
+                    );
+                }
+                let snapshot = dc.get_screen(pane_id).ok();
+                let on_exit = make_on_exit_callback(
+                    &new_tv,
+                    &new_tab_states,
+                    window,
+                    Some(Arc::clone(dc)),
+                );
+                let on_notify = make_on_notify_callback(&new_tv, &new_tab_states, window);
+                match terminal::create_terminal_for_pane(
+                    config,
+                    pane_id,
+                    Arc::clone(dc),
+                    mpsc_rx,
+                    snapshot.as_ref(),
+                    None,
+                    Some(on_exit),
+                    Some(on_notify),
+                ) {
+                    Ok((pane_vbox, drawing_area, state)) => {
+                        let widget_name = next_pane_id();
+                        drawing_area.set_widget_name(&widget_name);
+                        new_tab_states.borrow_mut().insert(widget_name, Rc::clone(&state));
+                        wire_focus_tracking(
+                            &drawing_area,
+                            &new_focus_tracker,
+                            &new_tv,
+                            &new_tab_states,
+                            &new_custom_titles,
+                        );
+                        let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+                        container.set_hexpand(true);
+                        container.set_vexpand(true);
+                        container.append(&pane_vbox);
+                        let page = new_tv.append(&container);
+                        let page_key = page_identity_key(&page);
+                        new_tab_id_map.borrow_mut().insert(page_key, tab_id);
+                        page.set_title("shell");
+                        new_tv.set_selected_page(&page);
+                        drawing_area.grab_focus();
+                        register_title_timer(
+                            &page,
+                            &new_tv,
+                            &new_tab_states,
+                            &new_focus_tracker,
+                            &new_custom_titles,
+                            window,
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to create terminal widget for new workspace daemon pane: {e}"
+                        );
+                    }
+                }
+                ws_id
+            }
+            Err(e) => {
+                tracing::warn!("create_workspace RPC failed: {e}; falling back to local PTY");
+                add_new_tab(
+                    &new_tv,
+                    config,
+                    &new_tab_states,
+                    &new_focus_tracker,
+                    &new_custom_titles,
+                    window,
+                    None,
+                    None,
+                    None,
+                    &new_tab_id_map,
+                );
+                uuid::Uuid::new_v4()
+            }
+        }
+    } else {
+        // Self-contained mode: spawn a local PTY.
+        add_new_tab(
+            &new_tv,
+            config,
+            &new_tab_states,
+            &new_focus_tracker,
+            &new_custom_titles,
+            window,
+            None,
+            None,
+            None,
+            &new_tab_id_map,
+        );
+        uuid::Uuid::new_v4()
+    };
 
     let new_index = {
         let Ok(mut mgr) = workspace_manager.try_borrow_mut() else {
@@ -5180,7 +5402,7 @@ fn create_and_switch_to_new_workspace(
         tab_bar.set_view(Some(&new_tv));
 
         mgr.workspaces.push(WorkspaceView {
-            id: uuid::Uuid::new_v4(),
+            id: workspace_id,
             name: name.to_string(),
             tab_view: new_tv,
             tab_states: new_tab_states,

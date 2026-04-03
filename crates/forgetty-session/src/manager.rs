@@ -145,8 +145,33 @@ impl SessionManager {
     }
 
     // -----------------------------------------------------------------------
-    // Layout mutation (T-060)
+    // Layout mutation (T-060, T-067)
     // -----------------------------------------------------------------------
+
+    /// Create a new named workspace. Returns `(workspace_id, workspace_idx)`.
+    ///
+    /// The workspace is appended at the end of the workspace list and starts
+    /// empty (no tabs). Callers must follow up with `create_tab(workspace_idx, ...)`
+    /// to populate it. This method is infallible — always appends.
+    pub fn create_workspace(&self, name: &str) -> (Uuid, usize) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let id = Uuid::new_v4();
+        let ws = crate::layout::SessionWorkspace {
+            id,
+            name: name.to_string(),
+            tabs: Vec::new(),
+            active_tab: 0,
+        };
+        inner.layout.workspaces.push(ws);
+        let idx = inner.layout.workspaces.len() - 1;
+        let _ = inner.event_tx.send(SessionEvent::WorkspaceCreated {
+            workspace_idx: idx,
+            workspace_id: id,
+            name: name.to_string(),
+        });
+        debug!(name, workspace_idx = idx, %id, "create_workspace: workspace created");
+        (id, idx)
+    }
 
     /// Create a new tab in the given workspace, spawn a PTY for it, and return
     /// `(pane_id, tab_id)`.
@@ -1327,5 +1352,38 @@ mod tests {
         assert!(err2.is_err(), "should err on workspace_idx out of bounds");
 
         session.close_tab(tab0).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // T-067 unit tests
+    // -----------------------------------------------------------------------
+
+    /// T-067 AC-5: create_workspace appends a new workspace; returned idx matches;
+    /// create_tab on the new workspace succeeds.
+    #[test]
+    fn test_create_workspace() {
+        let session = SessionManager::new();
+        let size = test_size();
+
+        // (a) layout starts with 1 workspace
+        assert_eq!(session.layout().workspaces.len(), 1);
+
+        // create a second workspace
+        let (ws_id, ws_idx) = session.create_workspace("Range");
+
+        // (b) layout now has 2 workspaces
+        let layout = session.layout();
+        assert_eq!(layout.workspaces.len(), 2, "expected 2 workspaces");
+        assert_eq!(ws_idx, 1, "returned workspace_idx should be 1");
+        assert_eq!(layout.workspaces[1].id, ws_id, "workspace id must match");
+        assert_eq!(layout.workspaces[1].name, "Range");
+        assert_eq!(layout.workspaces[1].tabs.len(), 0, "new workspace starts empty");
+
+        // (c) create_tab on the new workspace succeeds
+        let (pane_id, _tab_id) = session.create_tab(ws_idx, None, size).expect("create_tab on new workspace");
+        assert!(session.pane_info(pane_id).is_some());
+        assert_eq!(session.layout().workspaces[1].tabs.len(), 1);
+
+        session.close_pane(pane_id).ok();
     }
 }

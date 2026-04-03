@@ -204,6 +204,22 @@ async fn main_async() -> anyhow::Result<()> {
                 let total: usize = state.workspaces.iter().map(|ws| ws.tabs.len()).sum();
                 info!("cold-start restore: found {} workspace(s), {} tab(s) total",
                     state.workspaces.len(), total);
+
+                // Ensure the daemon has enough workspace slots for all saved workspaces.
+                // SessionLayout::new_default() creates workspace[0]; create the rest.
+                for (ws_idx, saved_ws) in state.workspaces.iter().enumerate() {
+                    if ws_idx == 0 {
+                        // Workspace 0 already exists from new_default(); skip.
+                    } else {
+                        let (_, created_idx) = session_manager.create_workspace(&saved_ws.name);
+                        debug_assert_eq!(
+                            created_idx, ws_idx,
+                            "workspace index mismatch during cold-start restore"
+                        );
+                    }
+                }
+
+                // Now restore tabs for ALL workspaces.
                 for (ws_idx, workspace) in state.workspaces.iter().enumerate() {
                     for tab in &workspace.tabs {
                         // Collect leaf CWDs from this tab's pane tree.
@@ -278,7 +294,8 @@ async fn main_async() -> anyhow::Result<()> {
                     | Ok(SessionEvent::TabClosed { .. })
                     | Ok(SessionEvent::PaneSplit { .. })
                     | Ok(SessionEvent::TabMoved { .. })
-                    | Ok(SessionEvent::ActiveTabChanged { .. }) => {
+                    | Ok(SessionEvent::ActiveTabChanged { .. })
+                    | Ok(SessionEvent::WorkspaceCreated { .. }) => {
                         dirty.store(true, Ordering::Relaxed);
                     }
                     Ok(_) => {}

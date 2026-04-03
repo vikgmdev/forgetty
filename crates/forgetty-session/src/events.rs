@@ -95,6 +95,17 @@ pub enum SessionEvent {
         workspace_idx: usize,
         tab_idx: usize,
     },
+
+    // -----------------------------------------------------------------------
+    // Workspace mutation events (T-067)
+    // -----------------------------------------------------------------------
+
+    /// A new workspace was created.
+    WorkspaceCreated {
+        workspace_idx: usize,
+        workspace_id: Uuid,
+        name: String,
+    },
 }
 
 // ---------------------------------------------------------------------------

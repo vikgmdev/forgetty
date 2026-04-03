@@ -113,6 +113,8 @@ pub mod methods {
     pub const MOVE_TAB: &str = "move_tab";
     // Single-pane close (T-065): closes only one pane within a split.
     pub const CLOSE_PANE: &str = "close_pane";
+    // Workspace management (T-067).
+    pub const CREATE_WORKSPACE: &str = "create_workspace";
 }
 
 #[cfg(test)]
