@@ -644,6 +644,57 @@ impl SessionManager {
         })
     }
 
+    /// Convert the live `SessionLayout` into a `WorkspaceState` suitable for
+    /// writing to `default.json`.
+    ///
+    /// Acquires the mutex **once** and builds the `WorkspaceState` entirely
+    /// from `inner.layout` (the daemon-owned `SessionLayout`) and `inner.panes`
+    /// (for cached CWD). Does **not** call `self.layout()`, `self.pane_info()`,
+    /// or any other locking method — that would deadlock.
+    ///
+    /// `window_width` and `window_height` are set to `None` because the daemon
+    /// has no GTK window. GTK will overwrite these fields with real dimensions
+    /// on the next GTK save (dual-write, T-061 → T-065).
+    pub fn snapshot_to_workspace_state(&self) -> WorkspaceState {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+
+        let workspaces: Vec<forgetty_workspace::Workspace> = inner
+            .layout
+            .workspaces
+            .iter()
+            .map(|session_ws| {
+                let tabs: Vec<forgetty_workspace::TabState> = session_ws
+                    .tabs
+                    .iter()
+                    .map(|session_tab| forgetty_workspace::TabState {
+                        title: session_tab.title.clone(),
+                        pane_id: None,
+                        pane_tree: convert_pane_tree_layout(
+                            &session_tab.pane_tree,
+                            &inner.panes,
+                        ),
+                    })
+                    .collect();
+
+                forgetty_workspace::Workspace {
+                    id: session_ws.id,
+                    name: session_ws.name.clone(),
+                    root_paths: Vec::new(),
+                    tabs,
+                    active_tab: session_ws.active_tab,
+                }
+            })
+            .collect();
+
+        WorkspaceState {
+            version: 1,
+            workspaces,
+            active_workspace: inner.layout.active_workspace,
+            window_width: None,
+            window_height: None,
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Shutdown
     // -----------------------------------------------------------------------
@@ -744,6 +795,38 @@ fn collect_pane_ids(tree: &PaneTreeLayout, out: &mut Vec<PaneId>) {
         PaneTreeLayout::Split { first, second, .. } => {
             collect_pane_ids(first, out);
             collect_pane_ids(second, out);
+        }
+    }
+}
+
+/// Recursively convert a `PaneTreeLayout` (daemon live tree) into a
+/// `forgetty_workspace::PaneTreeState` (serialisable format).
+///
+/// CWD is read from `panes` using the cached value set by the drain loop.
+/// If the pane is not in the map (edge case: pane closed mid-save), the home
+/// directory fallback is used.
+fn convert_pane_tree_layout(
+    tree: &PaneTreeLayout,
+    panes: &HashMap<PaneId, PaneState>,
+) -> forgetty_workspace::PaneTreeState {
+    match tree {
+        PaneTreeLayout::Leaf { pane_id } => {
+            let cwd = panes
+                .get(pane_id)
+                .map(|p| p.cwd.clone())
+                .unwrap_or_else(home_dir_fallback);
+            forgetty_workspace::PaneTreeState::Leaf {
+                cwd,
+                pane_id: Some(pane_id.0),
+            }
+        }
+        PaneTreeLayout::Split { direction, ratio, first, second } => {
+            forgetty_workspace::PaneTreeState::Split {
+                direction: direction.clone(),
+                ratio: *ratio,
+                first: Box::new(convert_pane_tree_layout(first, panes)),
+                second: Box::new(convert_pane_tree_layout(second, panes)),
+            }
         }
     }
 }

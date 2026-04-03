@@ -93,6 +93,7 @@ forgetty-gtk = { path = "crates/forgetty-gtk" }
 forgetty-session = { path = "crates/forgetty-session" }
 forgetty-socket = { path = "crates/forgetty-socket" }
 forgetty-sync = { path = "crates/forgetty-sync" }
+forgetty-workspace = { path = "crates/forgetty-workspace" }
 tokio = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }

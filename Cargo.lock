@@ -1554,6 +1554,7 @@ dependencies = [
  "forgetty-session",
  "forgetty-socket",
  "forgetty-sync",
+ "forgetty-workspace",
  "iroh",
  "rand 0.9.2",
  "rmp-serde",
