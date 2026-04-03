@@ -136,14 +136,20 @@ pub struct LaunchOptions {
 
     /// Skip session restore and open a fresh single-tab window.
     pub no_restore: bool,
+
+    /// Session UUID to attach to (for restore). If not set, a new UUID is generated.
+    pub session_id: Option<uuid::Uuid>,
+
+    /// Restore all saved sessions (open one window per session file).
+    pub restore_all: bool,
 }
 
-/// Determine the default socket path for the daemon.
-fn default_socket_path() -> PathBuf {
+/// Derive the daemon socket path for a given session UUID.
+fn socket_path_for(session_id: uuid::Uuid) -> PathBuf {
     if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
-        PathBuf::from(runtime_dir).join("forgetty.sock")
+        PathBuf::from(runtime_dir).join(format!("forgetty-{session_id}.sock"))
     } else {
-        PathBuf::from("/tmp/forgetty.sock")
+        PathBuf::from(format!("/tmp/forgetty-{session_id}.sock"))
     }
 }
 
@@ -151,9 +157,11 @@ fn default_socket_path() -> PathBuf {
 ///
 /// Returns `Some(DaemonClient)` on success, `None` if daemon is unavailable
 /// (in which case GTK falls back to self-contained PTY mode).
-fn ensure_daemon(socket_path: &std::path::Path) -> Option<Arc<DaemonClient>> {
+fn ensure_daemon(session_id: uuid::Uuid) -> Option<Arc<DaemonClient>> {
+    let socket_path = socket_path_for(session_id);
+
     // 1. Try to connect immediately (daemon may already be running).
-    if let Ok(dc) = DaemonClient::connect(socket_path) {
+    if let Ok(dc) = DaemonClient::connect(&socket_path) {
         info!("ensure_daemon: connected to existing daemon at {:?}", socket_path);
         return Some(Arc::new(dc));
     }
@@ -184,12 +192,16 @@ fn ensure_daemon(socket_path: &std::path::Path) -> Option<Arc<DaemonClient>> {
         return None;
     };
 
-    // 3. Spawn the daemon (non-blocking; store child to prevent Drop from killing it).
-    match std::process::Command::new(&daemon_path).spawn() {
+    // 3. Spawn the daemon with the session UUID (non-blocking).
+    match std::process::Command::new(&daemon_path)
+        .arg("--session-id")
+        .arg(session_id.to_string())
+        .spawn()
+    {
         Ok(child) => {
             // Leak the child handle so Drop is never called, keeping the process alive.
             std::mem::forget(child);
-            info!("ensure_daemon: spawned {:?}", daemon_path);
+            info!("ensure_daemon: spawned {:?} with session_id={session_id}", daemon_path);
         }
         Err(e) => {
             tracing::warn!(
@@ -203,7 +215,7 @@ fn ensure_daemon(socket_path: &std::path::Path) -> Option<Arc<DaemonClient>> {
     for attempt in 0..20 {
         let delay_ms = if attempt < 5 { 25 } else { 50 };
         std::thread::sleep(Duration::from_millis(delay_ms));
-        if let Ok(dc) = DaemonClient::connect(socket_path) {
+        if let Ok(dc) = DaemonClient::connect(&socket_path) {
             info!("ensure_daemon: connected after {} attempt(s)", attempt + 1);
             return Some(Arc::new(dc));
         }
@@ -223,10 +235,13 @@ fn ensure_daemon(socket_path: &std::path::Path) -> Option<Arc<DaemonClient>> {
 pub fn run(config: Config, launch: LaunchOptions) -> Result<(), Box<dyn std::error::Error>> {
     let app_id = launch.class.as_deref().unwrap_or(APP_ID);
 
+    // Resolve or generate the session UUID for this window.
+    let session_id: uuid::Uuid = launch.session_id.unwrap_or_else(uuid::Uuid::new_v4);
+    info!("GTK session_id: {session_id}");
+
     // Attempt to connect to (or spawn) the daemon before entering the GTK loop.
     // This is done outside connect_activate so it runs once, not once per window.
-    let socket_path = default_socket_path();
-    let daemon_client: Option<Arc<DaemonClient>> = ensure_daemon(&socket_path);
+    let daemon_client: Option<Arc<DaemonClient>> = ensure_daemon(session_id);
     if daemon_client.is_some() {
         info!("GTK running in daemon-client mode: sessions survive window close");
     } else {
@@ -239,7 +254,7 @@ pub fn run(config: Config, launch: LaunchOptions) -> Result<(), Box<dyn std::err
         .build();
 
     app.connect_activate(move |app| {
-        build_ui(app, &config, &launch, daemon_client.clone());
+        build_ui(app, &config, &launch, daemon_client.clone(), session_id);
     });
 
     // GTK expects argv-style arguments; pass empty since clap already parsed.
@@ -265,6 +280,7 @@ fn build_ui(
     config: &Config,
     launch: &LaunchOptions,
     daemon_client: Option<Arc<DaemonClient>>,
+    session_id: uuid::Uuid,
 ) {
     info!("Building Forgetty GTK4 window");
 
@@ -1053,7 +1069,7 @@ fn build_ui(
             // In daemon mode, the daemon writes its own session file on every mutation
             // (T-061). GTK must not overwrite it.
             if dc_quit.is_none() && !skip_save_quit.get() {
-                save_all_workspaces(&wm_quit, &win_quit_save);
+                save_all_workspaces(&wm_quit, &win_quit_save, session_id);
             }
             // Only kill PTYs in self-contained mode (no daemon).
             if dc_quit.is_none() {
@@ -1266,8 +1282,8 @@ fn build_ui(
             }
         }
     } else if !has_cli_override {
-        // Self-contained mode: restore from session file.
-        match forgetty_workspace::load_session() {
+        // Self-contained mode: restore from UUID-named session file.
+        match forgetty_workspace::load_session_for(session_id) {
             Ok(Some(state)) => {
                 let has_tabs = state.workspaces.iter().any(|ws| !ws.tabs.is_empty());
                 if !has_tabs {
@@ -1334,7 +1350,7 @@ fn build_ui(
         window.connect_close_request(move |_win| {
             // In daemon mode, the daemon writes its own session file — GTK must not.
             if dc_window_close.is_none() && !skip_save_close.get() {
-                save_all_workspaces(&wm_close, &win_close_save);
+                save_all_workspaces(&wm_close, &win_close_save, session_id);
             }
             if dc_window_close.is_none() {
                 // Self-contained mode only: also kill PTYs.
@@ -1364,7 +1380,7 @@ fn build_ui(
                 tracing::info!("Received {name} (signal {signum}), initiating clean shutdown");
                 // In daemon mode, the daemon writes its own session file — GTK must not.
                 if dc_signal.is_none() && !skip_save_signal.get() {
-                    save_all_workspaces(&wm_signal, &win_signal_save);
+                    save_all_workspaces(&wm_signal, &win_signal_save, session_id);
                 }
                 if dc_signal.is_none() {
                     // Self-contained mode only: also kill PTYs.
@@ -1406,7 +1422,7 @@ fn build_ui(
             let Some(win) = window_weak_save.upgrade() else {
                 return glib::ControlFlow::Break;
             };
-            save_all_workspaces(&wm_autosave, &win);
+            save_all_workspaces(&wm_autosave, &win, session_id);
             glib::ControlFlow::Continue
         });
     }
@@ -1695,10 +1711,15 @@ fn snapshot_all_workspaces(
     }
 }
 
-/// Save ALL workspaces to disk. Logs errors but does not propagate them.
-fn save_all_workspaces(workspace_manager: &WorkspaceManager, window: &adw::ApplicationWindow) {
+/// Save ALL workspaces to disk using the UUID-named session file.
+/// Logs errors but does not propagate them.
+fn save_all_workspaces(
+    workspace_manager: &WorkspaceManager,
+    window: &adw::ApplicationWindow,
+    session_id: uuid::Uuid,
+) {
     let state = snapshot_all_workspaces(workspace_manager, window);
-    if let Err(e) = forgetty_workspace::save_session(&state) {
+    if let Err(e) = forgetty_workspace::save_session_for(session_id, &state) {
         tracing::warn!("Failed to save session: {e}");
     } else {
         tracing::debug!("Session saved ({} workspace(s))", state.workspaces.len());

@@ -49,11 +49,46 @@ fn main() {
         }
     });
 
+    // --restore-all: enumerate saved sessions and spawn one forgetty process per UUID.
+    if args.restore_all {
+        let sessions = forgetty_workspace::list_sessions();
+        if sessions.is_empty() {
+            tracing::info!("--restore-all: no saved sessions found");
+        } else {
+            tracing::info!("--restore-all: restoring {} session(s)", sessions.len());
+            let current_exe = match std::env::current_exe() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("Error: could not determine current executable: {e}");
+                    std::process::exit(1);
+                }
+            };
+            for session_uuid in sessions {
+                match std::process::Command::new(&current_exe)
+                    .arg("--session-id")
+                    .arg(session_uuid.to_string())
+                    .spawn()
+                {
+                    Ok(child) => {
+                        std::mem::forget(child);
+                        tracing::info!("--restore-all: spawned session {session_uuid}");
+                    }
+                    Err(e) => {
+                        tracing::warn!("--restore-all: failed to spawn session {session_uuid}: {e}");
+                    }
+                }
+            }
+        }
+        return;
+    }
+
     let launch_opts = LaunchOptions {
         working_directory,
         command: if args.execute.is_empty() { None } else { Some(args.execute) },
         class: args.class,
         no_restore: args.no_restore,
+        session_id: args.session_id,
+        restore_all: args.restore_all,
     };
 
     if let Err(e) = forgetty_gtk::app::run(config, launch_opts) {

@@ -76,10 +76,19 @@ struct DaemonArgs {
     #[arg(long)]
     revoke: Option<String>,
 
+    /// Session UUID — identifies this daemon instance.
+    ///
+    /// Determines the socket path (`forgetty-{uuid}.sock`) and the session
+    /// file path (`sessions/{uuid}.json`). GTK passes this when spawning the
+    /// daemon. If not provided, a new UUID is generated (useful for manual
+    /// invocation).
+    #[arg(long)]
+    session_id: Option<uuid::Uuid>,
+
     /// Override the Unix socket path.
     ///
-    /// Defaults to `$XDG_RUNTIME_DIR/forgetty.sock`, falling back to
-    /// `/tmp/forgetty.sock` when `XDG_RUNTIME_DIR` is unset.
+    /// Defaults to `$XDG_RUNTIME_DIR/forgetty-{uuid}.sock`, falling back to
+    /// `/tmp/forgetty-{uuid}.sock` when `XDG_RUNTIME_DIR` is unset.
     #[arg(long)]
     socket_path: Option<PathBuf>,
 
@@ -148,6 +157,9 @@ async fn main_async() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Resolve or generate the session UUID for this daemon instance.
+    let session_id = args.session_id.unwrap_or_else(uuid::Uuid::new_v4);
+
     // Configure tracing.
     //
     // When --foreground: compact + colour output to stderr for interactive debugging.
@@ -183,10 +195,12 @@ async fn main_async() -> anyhow::Result<()> {
         }
     };
 
+    info!("session_id: {session_id}");
+
     // Create the platform-agnostic session manager.
     let session_manager = Arc::new(SessionManager::new());
 
-    // Cold-start restore: reload `default.json` into the live SessionLayout.
+    // Cold-start restore: reload the UUID-named session file into the live SessionLayout.
     //
     // This runs synchronously before the socket server starts accepting connections
     // so that by the time GTK connects and calls `get_layout`, the daemon's layout
@@ -199,7 +213,7 @@ async fn main_async() -> anyhow::Result<()> {
     // tree restore across daemon restarts is a future improvement.
     {
         let default_size = PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
-        match forgetty_workspace::load_session() {
+        match forgetty_workspace::load_session_for(session_id) {
             Ok(Some(state)) if !state.workspaces.is_empty() => {
                 let total: usize = state.workspaces.iter().map(|ws| ws.tabs.len()).sum();
                 info!("cold-start restore: found {} workspace(s), {} tab(s) total",
@@ -250,8 +264,14 @@ async fn main_async() -> anyhow::Result<()> {
         }
     }
 
-    // Resolve the socket path.
-    let socket_path = args.socket_path.unwrap_or_else(default_socket_path);
+    // Resolve the socket path: UUID-based by default, override with --socket-path.
+    let socket_path = args.socket_path.unwrap_or_else(|| {
+        if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
+            PathBuf::from(runtime_dir).join(format!("forgetty-{session_id}.sock"))
+        } else {
+            PathBuf::from(format!("/tmp/forgetty-{session_id}.sock"))
+        }
+    });
 
     // Bind the socket server.
     let socket_server = SocketServer::new_with_path(socket_path.clone())?;
@@ -319,7 +339,7 @@ async fn main_async() -> anyhow::Result<()> {
             loop {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 if dirty.swap(false, Ordering::Relaxed) {
-                    save_session_from_layout(&sm);
+                    save_session_from_layout(&sm, session_id);
                 }
             }
         });
@@ -333,7 +353,7 @@ async fn main_async() -> anyhow::Result<()> {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
-                save_session_from_layout(&sm);
+                save_session_from_layout(&sm, session_id);
             }
         });
     }
@@ -392,7 +412,7 @@ async fn main_async() -> anyhow::Result<()> {
     sync_endpoint.close().await;
     let saved = forgetty_socket::save_all_snapshots(&session_manager);
     info!("Saved VT snapshots for {saved} pane(s)");
-    save_session_from_layout(&session_manager);
+    save_session_from_layout(&session_manager, session_id);
     session_manager.kill_all();
 
     Ok(())
@@ -402,26 +422,16 @@ async fn main_async() -> anyhow::Result<()> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Snapshot the live session layout and write it to `default.json`.
+/// Snapshot the live session layout and write it to the UUID-named session file.
 ///
 /// This is the single call site used by all three save triggers (SIGTERM/SIGINT
 /// shutdown, debounced auto-save, and the periodic safety save). Save failures
 /// are non-fatal: a warning is logged but no error is propagated.
-fn save_session_from_layout(session_manager: &SessionManager) {
+fn save_session_from_layout(session_manager: &SessionManager, session_id: uuid::Uuid) {
     let state = session_manager.snapshot_to_workspace_state();
-    let ws_count = state.workspaces.len();
-    match forgetty_workspace::save_session(&state) {
-        Ok(()) => debug!(ws_count, "daemon: session layout saved to default.json"),
+    match forgetty_workspace::save_session_for(session_id, &state) {
+        Ok(()) => debug!(session_id = %session_id, "daemon: session layout saved"),
         Err(e) => warn!("daemon: failed to save session layout: {e}"),
-    }
-}
-
-/// Default socket path: `$XDG_RUNTIME_DIR/forgetty.sock` or `/tmp/forgetty.sock`.
-fn default_socket_path() -> PathBuf {
-    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
-        PathBuf::from(runtime_dir).join("forgetty.sock")
-    } else {
-        PathBuf::from("/tmp/forgetty.sock")
     }
 }
 

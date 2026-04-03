@@ -27,4 +27,12 @@ pub struct Args {
     /// Skip session restore and open a fresh single-tab window
     #[arg(long)]
     pub no_restore: bool,
+
+    /// Session UUID to attach to (for restore). If not set, a new session is created.
+    #[arg(long)]
+    pub session_id: Option<uuid::Uuid>,
+
+    /// Restore all saved sessions (open one window per session file).
+    #[arg(long)]
+    pub restore_all: bool,
 }

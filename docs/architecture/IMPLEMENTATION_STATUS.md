@@ -14,7 +14,7 @@
 
 | AD | Decision | Required | Status | Implemented in | Gap / Notes |
 |----|----------|----------|--------|---------------|-------------|
-| **AD-001** | One daemon per window — UUID socket + UUID session file | Each window has own daemon; socket `forgetty-{uuid}.sock`; session `sessions/{uuid}.json`; restore all windows on launch | ❌ NOT IMPLEMENTED | — | Fixed socket `forgetty.sock`; fixed session `default.json`; all windows share one daemon. T-068 fixes this. |
+| **AD-001** | One daemon per window — UUID socket + UUID session file | Each window has own daemon; socket `forgetty-{uuid}.sock`; session `sessions/{uuid}.json`; restore all windows on launch | ✅ IMPLEMENTED | T-068 | UUID socket + session file per daemon. GTK generates or restores session UUID. `--restore-all` spawns one window per saved session. |
 | **AD-002** | Session hierarchy: Workspaces 1..N → Tabs → Panes | `SessionManager::create_workspace()`; `create_workspace` RPC; multi-workspace cold-start restore | ✅ IMPLEMENTED | T-059–T-065, T-067 | Data model, mutation API, RPC, and cold-start restore all complete. |
 | **AD-003** | Session ownership = device that owns the PTY | GTK/Android are stateless renderers; daemon owns all PTYs | ✅ IMPLEMENTED | T-048, T-051, T-065 | Daemon owns PTYs. GTK subscribes output. Exception: new GTK workspaces still use local PTYs (AD-002 gap). |
 | **AD-004** | Android pairing is asymmetric (like SSH) | Bidirectional I/O; PTY stays on PC; Android is renderer only | ⏸ ON HOLD | — | T-052–T-054 deferred until Linux GTK client is complete. |
@@ -37,9 +37,9 @@
 | `subscribe_layout` streaming | Daemon pushes layout events to connected clients | ✅ IMPLEMENTED | T-063, T-065 | LayoutEvent enum; background tokio task; GLib poll; idempotent handler. |
 | `get_layout` RPC | Returns full `SessionLayout` as JSON | ✅ IMPLEMENTED | T-062 | `get_layout` handler returns all workspaces/tabs/pane-trees. |
 | GTK as thin renderer | GTK connects to daemon socket; sends RPCs for all actions | ✅ IMPLEMENTED | T-051, T-064, T-065 | `ensure_daemon()` pattern. All tab/split/close actions go through RPCs. |
-| Cold-start restore | Daemon loads `default.json` on startup, recreates PTYs | ✅ IMPLEMENTED | T-064, T-067 | CWDs restore. All workspaces restored (T-067). Split tree still flattened (known gap, separate follow-up). |
-| UUID-based socket + session | Per-window isolation via `forgetty-{uuid}.sock` | ❌ NOT IMPLEMENTED | — | T-068 implements this. |
-| Multi-window restore on login | Enumerate `sessions/*.json`, open one window per file | ❌ NOT IMPLEMENTED | — | T-068 implements this. |
+| Cold-start restore | Daemon loads `{uuid}.json` on startup, recreates PTYs | ✅ IMPLEMENTED | T-064, T-067, T-068 | CWDs restore. All workspaces restored (T-067). UUID session file used (T-068). Split tree still flattened (known gap, separate follow-up). |
+| UUID-based socket + session | Per-window isolation via `forgetty-{uuid}.sock` | ✅ IMPLEMENTED | T-068 | `socket_path_for(uuid)` in GTK; `--session-id` flag in daemon; UUID socket + session file paths. |
+| Multi-window restore on login | Enumerate `sessions/*.json`, open one window per file | ✅ IMPLEMENTED | T-068 | `forgetty --restore-all` enumerates `list_sessions()` and spawns one process per UUID. |
 | totem-sync / iroh identity | Persistent Ed25519 keypair; QR payload generation | ✅ IMPLEMENTED | T-052 (partial) | `load_or_generate()` key management done. `QrPayload` struct done. `--show-pairing-qr` flag works. |
 | iroh endpoint + accept loop | Daemon listens for incoming Android iroh connections | ✅ IMPLEMENTED | T-052 (partial) | `SyncEndpoint::bind()` and `accept_loop()` implemented. No actual session streaming yet. |
 | Full terminal stream to Android | Raw PTY bytes over iroh QUIC to Android client | ⏸ ON HOLD | — | T-053 deferred. |
@@ -51,15 +51,13 @@
 
 | Category | Total | ✅ Done | 🟡 Partial | ❌ Missing | ⏸ On hold |
 |----------|-------|---------|-----------|----------|----------|
-| Architecture Decisions (AD-001–AD-008) | 8 | 5 | 0 | 1 | 2 |
-| Daemon/Sync components | 14 | 11 | 0 | 1 | 2 |
+| Architecture Decisions (AD-001–AD-008) | 8 | 6 | 0 | 0 | 2 |
+| Daemon/Sync components | 14 | 13 | 0 | 0 | 2 |
 
-**Last updated by:** T-067 implementation (2026-04-03)
+**Last updated by:** T-068 implementation (2026-04-03)
 
 ---
 
 ## Pending Tasks That Fix Gaps
 
-| Task | Fixes | Expected outcome |
-|------|-------|-----------------|
-| T-068 | AD-001 (not implemented→full) | UUID-based sockets + session files; per-window daemon isolation; multi-window restore on login |
+No outstanding gaps for M4 architecture decisions. AD-004 and AD-005 (Android pairing) remain on hold pending Android client work.

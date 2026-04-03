@@ -104,5 +104,6 @@ anyhow = "1"
 dirs = { workspace = true }
 iroh = { workspace = true }
 rand = { workspace = true }
+uuid = { workspace = true }
 rmp-serde = "1"
 serde_bytes = "0.11"
