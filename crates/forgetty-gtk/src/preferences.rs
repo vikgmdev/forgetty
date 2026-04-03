@@ -466,10 +466,7 @@ fn build_device_list_page(dc: Arc<DaemonClient>, _stack: &gtk4::Stack) -> gtk4::
             row_box.set_margin_start(8);
             row_box.set_margin_end(8);
 
-            let last_seen_text = device
-                .last_seen
-                .as_deref()
-                .unwrap_or("never");
+            let last_seen_text = device.last_seen.as_deref().unwrap_or("never");
             let label_text = format!("{}  —  last seen: {}", device.name, last_seen_text);
             let dev_label = gtk4::Label::new(Some(&label_text));
             dev_label.set_halign(gtk4::Align::Start);
@@ -489,9 +486,8 @@ fn build_device_list_page(dc: Arc<DaemonClient>, _stack: &gtk4::Stack) -> gtk4::
                         tracing::warn!("revoke_device failed: {e}");
                     }
                     // Remove the row from its ListBox parent directly.
-                    if let Some(lb) = row_ref
-                        .parent()
-                        .and_then(|p| p.downcast::<gtk4::ListBox>().ok())
+                    if let Some(lb) =
+                        row_ref.parent().and_then(|p| p.downcast::<gtk4::ListBox>().ok())
                     {
                         lb.remove(&row_ref);
                     }
@@ -537,10 +533,7 @@ fn show_qr_view(stack: &gtk4::Stack, dc: Arc<DaemonClient>) {
     // Create GTK image from PNG bytes via gdk_pixbuf.
     let bytes = gtk4::glib::Bytes::from(&png_bytes);
     let stream = gtk4::gio::MemoryInputStream::from_bytes(&bytes);
-    let pixbuf = match gdk_pixbuf::Pixbuf::from_stream(
-        &stream,
-        gtk4::gio::Cancellable::NONE,
-    ) {
+    let pixbuf = match gdk_pixbuf::Pixbuf::from_stream(&stream, gtk4::gio::Cancellable::NONE) {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!("Pixbuf::from_stream failed: {e}");
@@ -587,21 +580,18 @@ fn show_qr_view(stack: &gtk4::Stack, dc: Arc<DaemonClient>) {
     {
         let stack_poll = stack.clone();
         let dc_poll = Arc::clone(&dc);
-        gtk4::glib::timeout_add_local(
-            std::time::Duration::from_secs(2),
-            move || {
-                if stack_poll.visible_child_name().as_deref() != Some("qr") {
-                    return gtk4::glib::ControlFlow::Break;
-                }
-                // Rebuild the device list page in-place so it reflects any new pairings.
-                if let Some(old) = stack_poll.child_by_name("devices") {
-                    stack_poll.remove(&old);
-                }
-                let new_list = build_device_list_page(Arc::clone(&dc_poll), &stack_poll);
-                stack_poll.add_named(&new_list, Some("devices"));
-                gtk4::glib::ControlFlow::Continue
-            },
-        );
+        gtk4::glib::timeout_add_local(std::time::Duration::from_secs(2), move || {
+            if stack_poll.visible_child_name().as_deref() != Some("qr") {
+                return gtk4::glib::ControlFlow::Break;
+            }
+            // Rebuild the device list page in-place so it reflects any new pairings.
+            if let Some(old) = stack_poll.child_by_name("devices") {
+                stack_poll.remove(&old);
+            }
+            let new_list = build_device_list_page(Arc::clone(&dc_poll), &stack_poll);
+            stack_poll.add_named(&new_list, Some("devices"));
+            gtk4::glib::ControlFlow::Continue
+        });
     }
 
     // Done button: go back to devices view (also stops the polling timer above).

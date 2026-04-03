@@ -20,7 +20,7 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use iroh::{Endpoint, EndpointAddr, SecretKey, endpoint::presets};
+use iroh::{endpoint::presets, Endpoint, EndpointAddr, SecretKey};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 const FORGETTY_PAIRING_ALPN: &[u8] = b"forgetty/pair/1";
@@ -54,10 +54,8 @@ async fn run() -> anyhow::Result<()> {
 
     // Parse the node_id string into an EndpointId (PublicKey), then wrap in
     // EndpointAddr. iroh 0.97: PublicKey implements FromStr (base32).
-    let endpoint_id: iroh::EndpointId = args
-        .dial
-        .parse()
-        .map_err(|e| anyhow::anyhow!("invalid node_id '{}': {e}", args.dial))?;
+    let endpoint_id: iroh::EndpointId =
+        args.dial.parse().map_err(|e| anyhow::anyhow!("invalid node_id '{}': {e}", args.dial))?;
     let addr: EndpointAddr = EndpointAddr::from(endpoint_id);
 
     // Load or generate a persistent identity so the same device_id is used
@@ -80,10 +78,8 @@ async fn run() -> anyhow::Result<()> {
     eprintln!("pair-test: connected, remote_id={}", conn.remote_id());
 
     // The daemon opens a bi-directional stream and sends a greeting line.
-    let (mut send, mut recv) = conn
-        .accept_bi()
-        .await
-        .map_err(|e| anyhow::anyhow!("accept_bi failed: {e}"))?;
+    let (mut send, mut recv) =
+        conn.accept_bi().await.map_err(|e| anyhow::anyhow!("accept_bi failed: {e}"))?;
 
     // Read the daemon's greeting: {"v":1,"status":"ok","machine":"<hostname>"}
     let mut lines = BufReader::new(&mut recv).lines();

@@ -15,12 +15,12 @@
 
 use std::sync::{Arc, Mutex};
 
-use iroh::{EndpointId, endpoint::Connection};
+use iroh::{endpoint::Connection, EndpointId};
 use tracing::{info, warn};
 
 use crate::{
+    registry::{iso8601_now, DeviceEntry, DeviceRegistry},
     SyncEvent,
-    registry::{DeviceEntry, DeviceRegistry, iso8601_now},
 };
 
 /// Handle a single accepted iroh connection through the pairing decision tree.
@@ -60,10 +60,7 @@ pub async fn handle_connection(
         let name = read_client_name(&conn).await.unwrap_or_else(|| {
             let ts = {
                 use std::time::{SystemTime, UNIX_EPOCH};
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs()
+                SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
             };
             format!("device-{ts}")
         });
@@ -129,11 +126,9 @@ async fn read_client_name(conn: &Connection) -> Option<String> {
     }
 
     // Read client response with 5-second timeout.
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        read_line_from_recv(&mut recv),
-    )
-    .await;
+    let result =
+        tokio::time::timeout(std::time::Duration::from_secs(5), read_line_from_recv(&mut recv))
+            .await;
 
     match result {
         Ok(Some(line)) => {

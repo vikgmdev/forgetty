@@ -15,9 +15,9 @@ pub fn load_or_generate() -> anyhow::Result<SecretKey> {
     let path = identity_path();
     if path.exists() {
         let bytes = std::fs::read(&path)?;
-        let arr: [u8; 32] = bytes
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("identity.key is not 32 bytes; delete it to regenerate"))?;
+        let arr: [u8; 32] = bytes.try_into().map_err(|_| {
+            anyhow::anyhow!("identity.key is not 32 bytes; delete it to regenerate")
+        })?;
         Ok(SecretKey::from_bytes(&arr))
     } else {
         let key = SecretKey::generate(&mut rand::rng());

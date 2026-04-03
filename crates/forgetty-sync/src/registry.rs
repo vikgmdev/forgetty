@@ -128,10 +128,7 @@ pub fn registry_path() -> PathBuf {
 pub fn iso8601_now() -> String {
     // Use std::time for minimal deps — no chrono needed for basic ISO 8601.
     use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     // Format as YYYY-MM-DDTHH:MM:SSZ
     let s = secs;
     let secs_in_day = s % 86400;
