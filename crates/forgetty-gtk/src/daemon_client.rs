@@ -469,6 +469,17 @@ impl DaemonClient {
         Ok(PairingInfo { node_id, machine, qr_png_base64 })
     }
 
+    /// Close a single pane (within a split) in the daemon by its `PaneId`.
+    ///
+    /// If the pane is part of a split, only this pane is removed; the sibling
+    /// expands. If the pane is the sole leaf in its tab, the daemon closes the
+    /// entire tab. Use `close_tab_by_pane_id` when you know you want to close
+    /// the entire tab.
+    pub fn close_pane(&self, pane_id: PaneId) -> Result<(), DaemonError> {
+        self.rpc("close_pane", serde_json::json!({ "pane_id": pane_id.to_string() }))?;
+        Ok(())
+    }
+
     /// Open a `subscribe_output` stream for a pane.
     ///
     /// Spawns a background tokio task that reads output notifications from the
@@ -490,6 +501,55 @@ impl DaemonClient {
 
         Ok(())
     }
+
+    /// Open a `subscribe_layout` stream.
+    ///
+    /// Spawns a background tokio task that reads layout notifications from the
+    /// daemon and delivers `LayoutEvent` values to the caller via the provided
+    /// mpsc sender. The GLib layer polls the corresponding receiver via a
+    /// `glib::timeout_add_local` timer and applies idempotent widget updates.
+    pub fn subscribe_layout(
+        &self,
+        tx: std::sync::mpsc::Sender<LayoutEvent>,
+    ) -> Result<(), DaemonError> {
+        let socket_path = self.socket_path.clone();
+
+        self.runtime.spawn(async move {
+            if let Err(e) = subscribe_layout_task(socket_path, tx).await {
+                warn!("subscribe_layout task error: {e}");
+            }
+        });
+
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Layout event types (T-065)
+// ---------------------------------------------------------------------------
+
+/// Layout change events delivered by the `subscribe_layout` background task.
+///
+/// The GLib layer polls these via a `timeout_add_local` timer.  Events for
+/// panes/tabs that already exist in the widget tree should be silently ignored
+/// (idempotency guarantee — see spec Section 4).
+#[derive(Debug, Clone)]
+pub enum LayoutEvent {
+    /// A new tab was created in the given workspace.
+    TabCreated { workspace_idx: usize, tab_id: uuid::Uuid, pane_id: PaneId },
+    /// A tab was closed (all its panes have been killed).
+    TabClosed { workspace_idx: usize, tab_id: uuid::Uuid },
+    /// An existing pane was split, producing a new sibling.
+    PaneSplit {
+        tab_id: uuid::Uuid,
+        parent_pane_id: PaneId,
+        new_pane_id: PaneId,
+        direction: String,
+    },
+    /// A tab was moved to a new position within its workspace.
+    TabMoved { workspace_idx: usize, tab_id: uuid::Uuid, new_index: usize },
+    /// The active tab changed for a workspace.
+    ActiveTabChanged { workspace_idx: usize, tab_idx: usize },
 }
 
 // ---------------------------------------------------------------------------
@@ -612,5 +672,150 @@ async fn subscribe_output_task(
     }
 
     debug!("subscribe_output: stream ended for pane {pane_id}");
+    Ok(())
+}
+
+/// Background tokio task that drives the `subscribe_layout` streaming connection.
+///
+/// Opens a persistent Unix socket, sends `subscribe_layout`, reads the `{"ok":true}`
+/// ack, then reads layout notification lines indefinitely, parsing each into a
+/// `LayoutEvent` and forwarding to the GLib poll timer via the mpsc sender.
+async fn subscribe_layout_task(
+    socket_path: std::path::PathBuf,
+    tx: std::sync::mpsc::Sender<LayoutEvent>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
+    let stream = UnixStream::connect(&socket_path).await?;
+    let (reader, mut writer) = stream.into_split();
+
+    // Send subscribe_layout request.
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "subscribe_layout",
+        "params": {},
+        "id": 1
+    });
+    let mut req_line = serde_json::to_string(&request)?;
+    req_line.push('\n');
+    writer.write_all(req_line.as_bytes()).await?;
+    writer.flush().await?;
+
+    let mut lines = BufReader::new(reader).lines();
+
+    // Read the initial acknowledgment.
+    let Some(ack_line) = lines.next_line().await? else {
+        debug!("subscribe_layout: server closed connection before ack");
+        return Ok(());
+    };
+    let ack: Value = serde_json::from_str(ack_line.trim())?;
+    if ack.get("error").is_some() {
+        return Err(format!("subscribe_layout rejected: {ack}").into());
+    }
+
+    debug!("subscribe_layout: streaming started");
+
+    // Read layout notification lines indefinitely.
+    while let Some(line) = lines.next_line().await? {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let notification: Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("subscribe_layout: failed to parse notification: {e}");
+                continue;
+            }
+        };
+
+        let method = notification.get("method").and_then(|v| v.as_str()).unwrap_or("");
+        let params = notification.get("params").cloned().unwrap_or(Value::Null);
+
+        let event = match method {
+            "tab_created" => {
+                let workspace_idx =
+                    params.get("workspace_idx").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let tab_id_str =
+                    params.get("tab_id").and_then(|v| v.as_str()).unwrap_or("");
+                let pane_id_str =
+                    params.get("pane_id").and_then(|v| v.as_str()).unwrap_or("");
+                let tab_id = match uuid::Uuid::parse_str(tab_id_str) {
+                    Ok(u) => u,
+                    Err(_) => continue,
+                };
+                let pane_uuid = match uuid::Uuid::parse_str(pane_id_str) {
+                    Ok(u) => u,
+                    Err(_) => continue,
+                };
+                LayoutEvent::TabCreated { workspace_idx, tab_id, pane_id: PaneId(pane_uuid) }
+            }
+            "tab_closed" => {
+                let workspace_idx =
+                    params.get("workspace_idx").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let tab_id_str = params.get("tab_id").and_then(|v| v.as_str()).unwrap_or("");
+                let tab_id = match uuid::Uuid::parse_str(tab_id_str) {
+                    Ok(u) => u,
+                    Err(_) => continue,
+                };
+                LayoutEvent::TabClosed { workspace_idx, tab_id }
+            }
+            "pane_split" => {
+                let tab_id_str = params.get("tab_id").and_then(|v| v.as_str()).unwrap_or("");
+                let parent_str =
+                    params.get("parent_pane_id").and_then(|v| v.as_str()).unwrap_or("");
+                let new_str =
+                    params.get("new_pane_id").and_then(|v| v.as_str()).unwrap_or("");
+                let direction =
+                    params.get("direction").and_then(|v| v.as_str()).unwrap_or("horizontal")
+                        .to_string();
+                let tab_id = match uuid::Uuid::parse_str(tab_id_str) {
+                    Ok(u) => u,
+                    Err(_) => continue,
+                };
+                let parent_pane_id = match uuid::Uuid::parse_str(parent_str) {
+                    Ok(u) => PaneId(u),
+                    Err(_) => continue,
+                };
+                let new_pane_id = match uuid::Uuid::parse_str(new_str) {
+                    Ok(u) => PaneId(u),
+                    Err(_) => continue,
+                };
+                LayoutEvent::PaneSplit { tab_id, parent_pane_id, new_pane_id, direction }
+            }
+            "tab_moved" => {
+                let workspace_idx =
+                    params.get("workspace_idx").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let tab_id_str = params.get("tab_id").and_then(|v| v.as_str()).unwrap_or("");
+                let new_index =
+                    params.get("new_index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let tab_id = match uuid::Uuid::parse_str(tab_id_str) {
+                    Ok(u) => u,
+                    Err(_) => continue,
+                };
+                LayoutEvent::TabMoved { workspace_idx, tab_id, new_index }
+            }
+            "active_tab_changed" => {
+                let workspace_idx =
+                    params.get("workspace_idx").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let tab_idx =
+                    params.get("tab_idx").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                LayoutEvent::ActiveTabChanged { workspace_idx, tab_idx }
+            }
+            _ => {
+                // Unknown layout notification — ignore silently.
+                continue;
+            }
+        };
+
+        if tx.send(event).is_err() {
+            debug!("subscribe_layout: mpsc receiver dropped, stopping task");
+            break;
+        }
+    }
+
+    debug!("subscribe_layout: stream ended");
     Ok(())
 }

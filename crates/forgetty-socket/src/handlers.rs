@@ -54,6 +54,7 @@ pub fn dispatch(
         methods::RESIZE_PANE => handle_resize_pane(request, &sm),
         methods::SEND_SIGINT => handle_send_sigint(request, &sm),
         methods::PRESEED_SNAPSHOT => handle_preseed_snapshot(request, &sm),
+        methods::CLOSE_PANE => handle_close_pane(request, &sm),
         // Sync / pairing methods — require sync_endpoint.
         methods::LIST_DEVICES => handle_list_devices(request, sync_endpoint.as_deref()),
         methods::REVOKE_DEVICE => handle_revoke_device(request, sync_endpoint.as_deref()),
@@ -373,6 +374,95 @@ fn handle_focus_tab(request: &Request, sm: &SessionManager) -> Response {
             protocol::INTERNAL_ERROR,
             format!("set_active_tab failed: {e}"),
         ),
+    }
+}
+
+/// Handle `close_pane` RPC — close a single pane within a split.
+///
+/// If the pane is the sole leaf of its tab, the entire tab is closed (same
+/// behaviour as `close_tab`). If it is part of a split, only this pane is
+/// removed and the sibling promoted.
+fn handle_close_pane(request: &Request, sm: &SessionManager) -> Response {
+    let pane_id = match require_pane_id(request, sm) {
+        Ok(id) => id,
+        Err(e) => return e,
+    };
+
+    // Determine if this pane is the sole leaf of its owning tab and find the tab_id.
+    let (tab_uuid, is_sole_in_tab) = {
+        let layout = sm.layout();
+        let mut result = (None, true);
+        'outer: for ws in &layout.workspaces {
+            for tab in &ws.tabs {
+                if tab_contains_pane(tab, pane_id) {
+                    let mut leaf_ids = Vec::new();
+                    collect_all_pane_ids(&tab.pane_tree, &mut leaf_ids);
+                    result = (Some(tab.id), leaf_ids.len() <= 1);
+                    break 'outer;
+                }
+            }
+        }
+        result
+    };
+
+    if is_sole_in_tab {
+        // Close the entire tab that owns this pane.
+        match tab_uuid {
+            Some(tid) => {
+                let pane_ids_to_clean: Vec<PaneId> = {
+                    let layout = sm.layout();
+                    let mut ids = Vec::new();
+                    for ws in &layout.workspaces {
+                        for tab in &ws.tabs {
+                            if tab.id == tid {
+                                collect_all_pane_ids(&tab.pane_tree, &mut ids);
+                            }
+                        }
+                    }
+                    ids
+                };
+                match sm.close_tab(tid) {
+                    Ok(()) => {
+                        for pid in pane_ids_to_clean {
+                            forgetty_workspace::delete_vt_snapshot(pid.0);
+                        }
+                        Response::success(request.id.clone(), serde_json::json!({ "ok": true }))
+                    }
+                    Err(e) => Response::error(
+                        request.id.clone(),
+                        protocol::INTERNAL_ERROR,
+                        format!("close_pane (via close_tab) failed: {e}"),
+                    ),
+                }
+            }
+            None => {
+                // Pane in registry but not in any tab tree — legacy fallback.
+                match sm.close_pane(pane_id) {
+                    Ok(()) => {
+                        forgetty_workspace::delete_vt_snapshot(pane_id.0);
+                        Response::success(request.id.clone(), serde_json::json!({ "ok": true }))
+                    }
+                    Err(e) => Response::error(
+                        request.id.clone(),
+                        protocol::INTERNAL_ERROR,
+                        format!("close_pane (legacy fallback) failed: {e}"),
+                    ),
+                }
+            }
+        }
+    } else {
+        // Pane is part of a split — kill only this pane.
+        match sm.close_pane(pane_id) {
+            Ok(()) => {
+                forgetty_workspace::delete_vt_snapshot(pane_id.0);
+                Response::success(request.id.clone(), serde_json::json!({ "ok": true }))
+            }
+            Err(e) => Response::error(
+                request.id.clone(),
+                protocol::INTERNAL_ERROR,
+                format!("close_pane (split leaf) failed: {e}"),
+            ),
+        }
     }
 }
 
