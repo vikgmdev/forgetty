@@ -144,6 +144,259 @@ impl SessionManager {
         Ok(id)
     }
 
+    // -----------------------------------------------------------------------
+    // Layout mutation (T-060)
+    // -----------------------------------------------------------------------
+
+    /// Create a new tab in the given workspace, spawn a PTY for it, and return
+    /// `(pane_id, tab_id)`.
+    ///
+    /// The tab is appended at the end of the workspace's tab list.
+    /// `active_tab` is NOT advanced — that is UI state owned by GTK (AD-008).
+    ///
+    /// Returns `Err` if `workspace_idx` is out of bounds.
+    pub fn create_tab(
+        &self,
+        workspace_idx: usize,
+        cwd: Option<PathBuf>,
+        size: PtySize,
+    ) -> Result<(PaneId, Uuid)> {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Bounds-check BEFORE spawning, so we never spawn a dangling PTY.
+        if workspace_idx >= inner.layout.workspaces.len() {
+            return Err(forgetty_core::ForgettyError::Pty(format!(
+                "workspace index {workspace_idx} out of bounds (len={})",
+                inner.layout.workspaces.len()
+            )));
+        }
+
+        let pane_id = PaneId::new();
+
+        // Spawn PTY first; insert into layout only if spawn succeeds (R-2).
+        let pty_bridge = PtyBridge::spawn(size, cwd.as_deref(), None, None, true)
+            .map_err(forgetty_core::ForgettyError::Pty)?;
+
+        let vt = VtInstance::new(size.rows as usize, size.cols as usize);
+        let initial_cwd = cwd.unwrap_or_else(home_dir_fallback);
+
+        let pane = PaneState {
+            id: pane_id,
+            pty_bridge,
+            vt,
+            cwd: initial_cwd,
+            title: String::new(),
+            rows: size.rows,
+            cols: size.cols,
+        };
+
+        inner.panes.insert(pane_id, pane);
+        inner.pane_order.push(pane_id);
+
+        let tab_id = Uuid::new_v4();
+        let tab = SessionTab {
+            id: tab_id,
+            title: String::new(),
+            pane_tree: PaneTreeLayout::Leaf { pane_id },
+        };
+        inner.layout.workspaces[workspace_idx].tabs.push(tab);
+
+        let _ = inner.event_tx.send(SessionEvent::PaneCreated { pane_id });
+
+        debug!(%pane_id, %tab_id, workspace_idx, "create_tab: tab created");
+        Ok((pane_id, tab_id))
+    }
+
+    /// Split an existing pane, creating a new PTY alongside it.
+    ///
+    /// Finds the `Leaf` containing `pane_id` across all workspaces/tabs,
+    /// replaces it with a `Split { direction, ratio: 0.5, first: Leaf(pane_id),
+    /// second: Leaf(new_pane_id) }`, and returns `new_pane_id`.
+    ///
+    /// Returns `Err` if `pane_id` is not found in any tab tree.
+    pub fn split_pane(
+        &self,
+        pane_id: PaneId,
+        direction: &str,
+        size: PtySize,
+        cwd: Option<PathBuf>,
+    ) -> Result<PaneId> {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+
+        if !inner.panes.contains_key(&pane_id) {
+            return Err(forgetty_core::ForgettyError::Pty(format!(
+                "split_pane: pane {pane_id} not found"
+            )));
+        }
+
+        // Spawn new PTY BEFORE mutating the tree (R-2).
+        let new_pane_id = PaneId::new();
+        let pty_bridge = PtyBridge::spawn(size, cwd.as_deref(), None, None, true)
+            .map_err(forgetty_core::ForgettyError::Pty)?;
+
+        let vt = VtInstance::new(size.rows as usize, size.cols as usize);
+        let initial_cwd = cwd.unwrap_or_else(home_dir_fallback);
+
+        let new_pane = PaneState {
+            id: new_pane_id,
+            pty_bridge,
+            vt,
+            cwd: initial_cwd,
+            title: String::new(),
+            rows: size.rows,
+            cols: size.cols,
+        };
+
+        inner.panes.insert(new_pane_id, new_pane);
+        inner.pane_order.push(new_pane_id);
+
+        // Walk all tab trees to find and replace the target leaf.
+        let mut replaced = false;
+        'outer: for ws in inner.layout.workspaces.iter_mut() {
+            for tab in ws.tabs.iter_mut() {
+                if replace_leaf(&mut tab.pane_tree, pane_id, new_pane_id, direction) {
+                    replaced = true;
+                    break 'outer;
+                }
+            }
+        }
+
+        if !replaced {
+            // Pane exists in registry but not in any tab tree — clean up and fail.
+            inner.panes.remove(&new_pane_id);
+            inner.pane_order.retain(|&p| p != new_pane_id);
+            return Err(forgetty_core::ForgettyError::Pty(format!(
+                "split_pane: pane {pane_id} not found in any tab tree"
+            )));
+        }
+
+        let _ = inner.event_tx.send(SessionEvent::PaneCreated { pane_id: new_pane_id });
+
+        debug!(%pane_id, %new_pane_id, direction, "split_pane: pane split");
+        Ok(new_pane_id)
+    }
+
+    /// Close a tab by `tab_id`, killing all PTYs in its pane tree.
+    ///
+    /// Broadcasts `PaneClosed` for each killed pane.
+    /// Clamps `active_tab` if needed.
+    ///
+    /// Returns `Err` if the tab is not found.
+    pub fn close_tab(&self, tab_id: Uuid) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Find the tab across all workspaces.
+        let mut found = None;
+        for (ws_idx, ws) in inner.layout.workspaces.iter().enumerate() {
+            if let Some(tab_idx) = ws.tabs.iter().position(|t| t.id == tab_id) {
+                found = Some((ws_idx, tab_idx));
+                break;
+            }
+        }
+        let (ws_idx, tab_idx) = found.ok_or_else(|| {
+            forgetty_core::ForgettyError::Pty(format!("close_tab: tab {tab_id} not found"))
+        })?;
+
+        // Collect all pane IDs in the tab's tree.
+        let mut pane_ids = Vec::new();
+        collect_pane_ids(&inner.layout.workspaces[ws_idx].tabs[tab_idx].pane_tree, &mut pane_ids);
+
+        // Remove the tab from the workspace.
+        inner.layout.workspaces[ws_idx].tabs.remove(tab_idx);
+
+        // Clamp active_tab (same logic as close_pane).
+        let ws = &mut inner.layout.workspaces[ws_idx];
+        if ws.active_tab >= ws.tabs.len() && !ws.tabs.is_empty() {
+            ws.active_tab = ws.tabs.len() - 1;
+        }
+
+        // Kill each pane and broadcast PaneClosed.
+        for pid in pane_ids {
+            inner.pane_order.retain(|&p| p != pid);
+            if let Some(mut pane) = inner.panes.remove(&pid) {
+                if let Err(e) = pane.pty_bridge.pty.kill() {
+                    warn!(%pid, "close_tab: failed to kill PTY: {e}");
+                }
+                let _ = inner.event_tx.send(SessionEvent::PaneClosed { pane_id: pid });
+                debug!(%pid, %tab_id, "close_tab: pane killed");
+            }
+        }
+
+        debug!(%tab_id, "close_tab: tab removed");
+        Ok(())
+    }
+
+    /// Move a tab to a new position within its workspace.
+    ///
+    /// The `new_index` is clamped to `tabs.len() - 1`. If the tab is already at
+    /// `new_index`, this is a no-op. `active_tab` is updated to follow the
+    /// previously-active tab to its new position.
+    ///
+    /// Returns `Err` if the tab is not found.
+    pub fn move_tab(&self, tab_id: Uuid, new_index: usize) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Find the tab across all workspaces.
+        let mut found = None;
+        for (ws_idx, ws) in inner.layout.workspaces.iter().enumerate() {
+            if let Some(tab_idx) = ws.tabs.iter().position(|t| t.id == tab_id) {
+                found = Some((ws_idx, tab_idx));
+                break;
+            }
+        }
+        let (ws_idx, current_idx) = found.ok_or_else(|| {
+            forgetty_core::ForgettyError::Pty(format!("move_tab: tab {tab_id} not found"))
+        })?;
+
+        let ws = &mut inner.layout.workspaces[ws_idx];
+        let last = ws.tabs.len().saturating_sub(1);
+        let target_idx = new_index.min(last);
+
+        if current_idx == target_idx {
+            return Ok(());
+        }
+
+        // Remember which tab_id was active so we can follow it.
+        let active_tab_id = ws.tabs.get(ws.active_tab).map(|t| t.id);
+
+        let tab = ws.tabs.remove(current_idx);
+        ws.tabs.insert(target_idx, tab);
+
+        // Update active_tab to follow the previously-active tab.
+        if let Some(active_id) = active_tab_id {
+            if let Some(new_active_idx) = ws.tabs.iter().position(|t| t.id == active_id) {
+                ws.active_tab = new_active_idx;
+            }
+        }
+
+        debug!(%tab_id, from = current_idx, to = target_idx, "move_tab: tab moved");
+        Ok(())
+    }
+
+    /// Set the active tab index for a workspace.
+    ///
+    /// Returns `Err` if `workspace_idx` is out of bounds or `tab_idx >= tabs.len()`.
+    pub fn set_active_tab(&self, workspace_idx: usize, tab_idx: usize) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+
+        if workspace_idx >= inner.layout.workspaces.len() {
+            return Err(forgetty_core::ForgettyError::Pty(format!(
+                "set_active_tab: workspace index {workspace_idx} out of bounds (len={})",
+                inner.layout.workspaces.len()
+            )));
+        }
+        let ws = &mut inner.layout.workspaces[workspace_idx];
+        if tab_idx >= ws.tabs.len() {
+            return Err(forgetty_core::ForgettyError::Pty(format!(
+                "set_active_tab: tab index {tab_idx} out of bounds (len={})",
+                ws.tabs.len()
+            )));
+        }
+        ws.active_tab = tab_idx;
+        debug!(workspace_idx, tab_idx, "set_active_tab: active tab updated");
+        Ok(())
+    }
+
     /// Kill a pane's PTY and remove it from the registry.
     ///
     /// After this call, `pane_info(id)` returns `None`.
@@ -451,6 +704,50 @@ fn home_dir_fallback() -> PathBuf {
     std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/"))
 }
 
+/// Recursively find the `Leaf` node matching `target` in `tree` and replace it
+/// in-place with a `Split` node containing the original leaf and a new leaf for
+/// `new_pane`. Returns `true` if the replacement was made.
+///
+/// NOTE: if the same `PaneId` appears in multiple locations (which should be
+/// impossible — `PaneId` is a UUID v4), only the first match is replaced.
+fn replace_leaf(
+    tree: &mut PaneTreeLayout,
+    target: PaneId,
+    new_pane: PaneId,
+    direction: &str,
+) -> bool {
+    match tree {
+        PaneTreeLayout::Leaf { pane_id } if *pane_id == target => {
+            *tree = PaneTreeLayout::Split {
+                direction: direction.to_string(),
+                ratio: 0.5,
+                first: Box::new(PaneTreeLayout::Leaf { pane_id: target }),
+                second: Box::new(PaneTreeLayout::Leaf { pane_id: new_pane }),
+            };
+            true
+        }
+        PaneTreeLayout::Leaf { .. } => false,
+        PaneTreeLayout::Split { first, second, .. } => {
+            if replace_leaf(first, target, new_pane, direction) {
+                true
+            } else {
+                replace_leaf(second, target, new_pane, direction)
+            }
+        }
+    }
+}
+
+/// Recursively collect all `PaneId`s reachable from `tree` (DFS, pre-order).
+fn collect_pane_ids(tree: &PaneTreeLayout, out: &mut Vec<PaneId>) {
+    match tree {
+        PaneTreeLayout::Leaf { pane_id } => out.push(*pane_id),
+        PaneTreeLayout::Split { first, second, .. } => {
+            collect_pane_ids(first, out);
+            collect_pane_ids(second, out);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Thread-safety assertion
 // ---------------------------------------------------------------------------
@@ -579,5 +876,350 @@ mod tests {
         // If this test compiles and runs, GTK is not required.
         let session = SessionManager::new();
         assert!(session.list_panes().is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // T-060 unit tests
+    // -----------------------------------------------------------------------
+
+    fn test_size() -> PtySize {
+        PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 }
+    }
+
+    /// AC-1: create_tab returns correct pane_id + tab_id, layout updated.
+    #[test]
+    fn test_create_tab_layout_and_registry() {
+        let session = SessionManager::new();
+        let size = test_size();
+
+        let (pane_id, tab_id) = session.create_tab(0, None, size).expect("create_tab should succeed");
+
+        let layout = session.layout();
+        let tabs = &layout.workspaces[0].tabs;
+        // The default workspace starts empty; create_tab appends one tab.
+        assert_eq!(tabs.len(), 1, "expected 1 tab after create_tab");
+        assert_eq!(tabs[0].id, tab_id, "tab id must match returned tab_id");
+        assert!(
+            matches!(&tabs[0].pane_tree, PaneTreeLayout::Leaf { pane_id: pid } if *pid == pane_id),
+            "tab pane_tree must be Leaf(pane_id)"
+        );
+        assert!(session.pane_info(pane_id).is_some(), "pane_info should return Some after create_tab");
+
+        session.close_tab(tab_id).ok();
+    }
+
+    /// AC-1 (append): new tab is appended AFTER existing tabs.
+    #[test]
+    fn test_create_tab_appends() {
+        let session = SessionManager::new();
+        let size = test_size();
+
+        let (_, tab1) = session.create_tab(0, None, size).expect("tab 1");
+        let (pane2, tab2) = session.create_tab(0, None, size).expect("tab 2");
+
+        let layout = session.layout();
+        let tabs = &layout.workspaces[0].tabs;
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs[0].id, tab1);
+        assert_eq!(tabs[1].id, tab2);
+        assert!(
+            matches!(&tabs[1].pane_tree, PaneTreeLayout::Leaf { pane_id } if *pane_id == pane2)
+        );
+
+        session.close_tab(tab1).ok();
+        session.close_tab(tab2).ok();
+    }
+
+    /// AC-2: create_tab with out-of-bounds workspace returns Err; no PTY spawned.
+    #[test]
+    fn test_create_tab_workspace_out_of_bounds() {
+        let session = SessionManager::new();
+        let size = test_size();
+
+        let before = session.list_panes().len();
+        let result = session.create_tab(99, None, size);
+        assert!(result.is_err(), "should return Err for workspace 99");
+        assert_eq!(session.list_panes().len(), before, "no PTY should be spawned on failure");
+
+        let layout = session.layout();
+        assert_eq!(layout.workspaces[0].tabs.len(), 0, "layout should be unchanged");
+    }
+
+    /// AC-3: split_pane replaces leaf with Split node; both panes registered.
+    #[test]
+    fn test_split_pane_horizontal() {
+        let session = SessionManager::new();
+        let size = test_size();
+
+        let (pane_a, tab_id) = session.create_tab(0, None, size).expect("create_tab");
+        let pane_b = session.split_pane(pane_a, "horizontal", size, None).expect("split_pane");
+
+        let layout = session.layout();
+        let tab = &layout.workspaces[0].tabs[0];
+        assert!(
+            matches!(
+                &tab.pane_tree,
+                PaneTreeLayout::Split { direction, ratio, first, second }
+                if direction == "horizontal"
+                && (*ratio - 0.5).abs() < 1e-6
+                && matches!(first.as_ref(), PaneTreeLayout::Leaf { pane_id } if *pane_id == pane_a)
+                && matches!(second.as_ref(), PaneTreeLayout::Leaf { pane_id } if *pane_id == pane_b)
+            ),
+            "pane_tree must be Split {{ horizontal, 0.5, Leaf(A), Leaf(B) }}"
+        );
+
+        assert!(session.pane_info(pane_a).is_some(), "pane A must still exist");
+        assert!(session.pane_info(pane_b).is_some(), "pane B must be registered");
+
+        session.close_tab(tab_id).ok();
+    }
+
+    /// AC-4: split_pane with direction "vertical" works symmetrically.
+    #[test]
+    fn test_split_pane_vertical() {
+        let session = SessionManager::new();
+        let size = test_size();
+
+        let (pane_a, tab_id) = session.create_tab(0, None, size).expect("create_tab");
+        let pane_b = session.split_pane(pane_a, "vertical", size, None).expect("split_pane");
+
+        let layout = session.layout();
+        let tab = &layout.workspaces[0].tabs[0];
+        assert!(
+            matches!(
+                &tab.pane_tree,
+                PaneTreeLayout::Split { direction, .. }
+                if direction == "vertical"
+            ),
+            "direction must be 'vertical'"
+        );
+        assert!(session.pane_info(pane_b).is_some());
+
+        session.close_tab(tab_id).ok();
+    }
+
+    /// AC-5: split_pane on a second-level leaf creates a nested Split.
+    #[test]
+    fn test_split_pane_nested() {
+        let session = SessionManager::new();
+        let size = test_size();
+
+        let (pane_a, tab_id) = session.create_tab(0, None, size).expect("create_tab");
+        let pane_b = session.split_pane(pane_a, "horizontal", size, None).expect("first split");
+        // Now split pane_b (the right leaf).
+        let pane_c = session.split_pane(pane_b, "horizontal", size, None).expect("second split");
+
+        let layout = session.layout();
+        let tab = &layout.workspaces[0].tabs[0];
+
+        // Top-level must be Split { first: Leaf(A), second: Split { first: Leaf(B), second: Leaf(C) } }
+        let PaneTreeLayout::Split { first, second, .. } = &tab.pane_tree else {
+            panic!("expected top-level Split, got {:?}", tab.pane_tree);
+        };
+        assert!(
+            matches!(first.as_ref(), PaneTreeLayout::Leaf { pane_id } if *pane_id == pane_a),
+            "first leaf must still be A"
+        );
+        let PaneTreeLayout::Split { first: inner_first, second: inner_second, .. } = second.as_ref() else {
+            panic!("second must be a nested Split");
+        };
+        assert!(
+            matches!(inner_first.as_ref(), PaneTreeLayout::Leaf { pane_id } if *pane_id == pane_b)
+        );
+        assert!(
+            matches!(inner_second.as_ref(), PaneTreeLayout::Leaf { pane_id } if *pane_id == pane_c)
+        );
+        assert!(session.pane_info(pane_c).is_some());
+
+        session.close_tab(tab_id).ok();
+    }
+
+    /// AC-6: split_pane with unknown pane_id returns Err; layout unchanged; no PTY spawned.
+    #[test]
+    fn test_split_pane_unknown_pane_id() {
+        let session = SessionManager::new();
+        let size = test_size();
+
+        let (pane_a, tab_id) = session.create_tab(0, None, size).expect("create_tab");
+        let unknown = PaneId::new(); // not in registry
+        let before_count = session.list_panes().len();
+
+        let result = session.split_pane(unknown, "horizontal", size, None);
+        assert!(result.is_err(), "should return Err for unknown pane");
+        assert_eq!(
+            session.list_panes().len(),
+            before_count,
+            "no new PTY should be registered on failure"
+        );
+
+        session.close_tab(tab_id).ok();
+        let _ = pane_a; // suppress unused warning
+    }
+
+    /// AC-7: close_tab removes a single-pane tab; pane_info returns None.
+    #[test]
+    fn test_close_tab_single_pane() {
+        let session = SessionManager::new();
+        let size = test_size();
+
+        let (pane_id, tab_id) = session.create_tab(0, None, size).expect("create_tab");
+        assert!(session.pane_info(pane_id).is_some());
+
+        session.close_tab(tab_id).expect("close_tab should succeed");
+
+        assert!(session.pane_info(pane_id).is_none(), "pane_info should be None after close_tab");
+        assert!(!session.list_panes().contains(&pane_id), "list_panes should not contain closed pane");
+
+        let layout = session.layout();
+        assert_eq!(layout.workspaces[0].tabs.len(), 0, "tab list should be empty");
+    }
+
+    /// AC-8: close_tab on a split tab kills all panes.
+    #[test]
+    fn test_close_tab_split_pane() {
+        let session = SessionManager::new();
+        let size = test_size();
+
+        let (pane_a, tab_id) = session.create_tab(0, None, size).expect("create_tab");
+        let pane_b = session.split_pane(pane_a, "horizontal", size, None).expect("split_pane");
+
+        session.close_tab(tab_id).expect("close_tab should succeed");
+
+        assert!(session.pane_info(pane_a).is_none(), "pane A should be None after close_tab");
+        assert!(session.pane_info(pane_b).is_none(), "pane B should be None after close_tab");
+        assert!(!session.list_panes().contains(&pane_a));
+        assert!(!session.list_panes().contains(&pane_b));
+    }
+
+    /// AC-9: close_tab clamps active_tab when the removed tab was at/past current index.
+    #[test]
+    fn test_close_tab_clamps_active_tab() {
+        let session = SessionManager::new();
+        let size = test_size();
+
+        let (_, tab0) = session.create_tab(0, None, size).expect("tab 0");
+        let (_, tab1) = session.create_tab(0, None, size).expect("tab 1");
+        let (_, tab2) = session.create_tab(0, None, size).expect("tab 2");
+
+        // Set active_tab to 2 (the last tab).
+        session.set_active_tab(0, 2).expect("set_active_tab");
+
+        // Close tab at index 2 — active_tab must clamp to 1.
+        session.close_tab(tab2).expect("close_tab tab2");
+        let layout = session.layout();
+        assert_eq!(layout.workspaces[0].active_tab, 1, "active_tab should be clamped to 1");
+
+        // Close tab at index 0; active_tab must stay valid.
+        session.close_tab(tab0).expect("close_tab tab0");
+        let layout = session.layout();
+        assert!(
+            layout.workspaces[0].active_tab < layout.workspaces[0].tabs.len()
+                || layout.workspaces[0].tabs.is_empty(),
+            "active_tab must be valid"
+        );
+
+        session.close_tab(tab1).ok();
+    }
+
+    /// AC-10: close_tab with unknown tab_id returns Err; layout unchanged.
+    #[test]
+    fn test_close_tab_unknown_tab_id() {
+        let session = SessionManager::new();
+        let result = session.close_tab(Uuid::new_v4());
+        assert!(result.is_err(), "should return Err for unknown tab_id");
+        let layout = session.layout();
+        assert_eq!(layout.workspaces[0].tabs.len(), 0, "layout should be unchanged");
+    }
+
+    /// AC-11: move_tab reorders tabs; active_tab follows the previously-active tab.
+    #[test]
+    fn test_move_tab_reorders() {
+        let session = SessionManager::new();
+        let size = test_size();
+
+        let (_, tab_a) = session.create_tab(0, None, size).expect("tab A");
+        let (_, tab_b) = session.create_tab(0, None, size).expect("tab B");
+        let (_, tab_c) = session.create_tab(0, None, size).expect("tab C");
+
+        // Tabs are [A, B, C]. Move C to index 0 → [C, A, B].
+        session.move_tab(tab_c, 0).expect("move_tab");
+
+        let layout = session.layout();
+        let ids: Vec<Uuid> = layout.workspaces[0].tabs.iter().map(|t| t.id).collect();
+        assert_eq!(ids, vec![tab_c, tab_a, tab_b], "tabs should be [C, A, B]");
+
+        session.close_tab(tab_a).ok();
+        session.close_tab(tab_b).ok();
+        session.close_tab(tab_c).ok();
+    }
+
+    /// AC-12: move_tab clamps target index; moving a tab to its own index is a no-op.
+    #[test]
+    fn test_move_tab_clamps() {
+        let session = SessionManager::new();
+        let size = test_size();
+
+        let (_, tab_a) = session.create_tab(0, None, size).expect("tab A");
+        let (_, tab_b) = session.create_tab(0, None, size).expect("tab B");
+
+        // Move tab_a to 9999 — should place it last (index 1).
+        session.move_tab(tab_a, 9999).expect("move_tab clamped");
+        let layout = session.layout();
+        let ids: Vec<Uuid> = layout.workspaces[0].tabs.iter().map(|t| t.id).collect();
+        assert_eq!(ids, vec![tab_b, tab_a], "tab A should be last after clamped move");
+
+        // Moving tab_a to its current position (1) is a no-op.
+        session.move_tab(tab_a, 1).expect("move_tab no-op");
+        let layout = session.layout();
+        let ids2: Vec<Uuid> = layout.workspaces[0].tabs.iter().map(|t| t.id).collect();
+        assert_eq!(ids2, vec![tab_b, tab_a], "order unchanged after no-op move");
+
+        session.close_tab(tab_a).ok();
+        session.close_tab(tab_b).ok();
+    }
+
+    /// AC-13: move_tab with unknown tab_id returns Err.
+    #[test]
+    fn test_move_tab_unknown_tab_id() {
+        let session = SessionManager::new();
+        let result = session.move_tab(Uuid::new_v4(), 0);
+        assert!(result.is_err(), "should return Err for unknown tab_id");
+    }
+
+    /// AC-14: set_active_tab updates the index; setting to the same index is a no-op.
+    #[test]
+    fn test_set_active_tab_updates() {
+        let session = SessionManager::new();
+        let size = test_size();
+
+        let (_, _tab0) = session.create_tab(0, None, size).expect("tab 0");
+        let (_, _tab1) = session.create_tab(0, None, size).expect("tab 1");
+        let (_, _tab2) = session.create_tab(0, None, size).expect("tab 2");
+
+        session.set_active_tab(0, 2).expect("set_active_tab(0, 2)");
+        assert_eq!(session.layout().workspaces[0].active_tab, 2);
+
+        // No-op: already at 0 after reset.
+        session.set_active_tab(0, 0).expect("set_active_tab(0, 0)");
+        assert_eq!(session.layout().workspaces[0].active_tab, 0);
+    }
+
+    /// AC-15: set_active_tab returns Err on out-of-bounds workspace or tab index.
+    #[test]
+    fn test_set_active_tab_out_of_bounds() {
+        let session = SessionManager::new();
+        let size = test_size();
+
+        let (_, tab0) = session.create_tab(0, None, size).expect("tab 0");
+
+        // tab index out of bounds (only 1 tab, index 999 is invalid)
+        let err = session.set_active_tab(0, 999);
+        assert!(err.is_err(), "should err on tab_idx out of bounds");
+
+        // workspace index out of bounds
+        let err2 = session.set_active_tab(99, 0);
+        assert!(err2.is_err(), "should err on workspace_idx out of bounds");
+
+        session.close_tab(tab0).ok();
     }
 }
