@@ -142,6 +142,10 @@ pub struct LaunchOptions {
 
     /// Restore all saved sessions (open one window per session file).
     pub restore_all: bool,
+
+    /// Open an ephemeral session that is never persisted. No daemon is spawned
+    /// and no session file is written on close.
+    pub temp: bool,
 }
 
 /// Derive the daemon socket path for a given session UUID.
@@ -241,10 +245,17 @@ pub fn run(config: Config, launch: LaunchOptions) -> Result<(), Box<dyn std::err
 
     // Attempt to connect to (or spawn) the daemon before entering the GTK loop.
     // This is done outside connect_activate so it runs once, not once per window.
-    let daemon_client: Option<Arc<DaemonClient>> = ensure_daemon(session_id);
+    // Ephemeral (--temp) sessions skip the daemon entirely — they are self-contained
+    // and leave no session file on close.
+    let daemon_client: Option<Arc<DaemonClient>> = if launch.temp {
+        info!("GTK running in ephemeral mode: no daemon, no session file will be written");
+        None
+    } else {
+        ensure_daemon(session_id)
+    };
     if daemon_client.is_some() {
         info!("GTK running in daemon-client mode: sessions survive window close");
-    } else {
+    } else if !launch.temp {
         info!("GTK running in self-contained mode: no daemon, PTYs owned locally");
     }
 
@@ -287,8 +298,12 @@ fn build_ui(
     // CLI overrides skip both session restore AND session save so a one-off
     // launch (e.g. `forgetty --working-directory /tmp`) never overwrites the
     // user's real saved session.
-    let has_cli_override =
-        launch.working_directory.is_some() || launch.command.is_some() || launch.no_restore;
+    // `--temp` is also treated as a CLI override: ephemeral sessions neither
+    // restore from nor write to a session file.
+    let has_cli_override = launch.working_directory.is_some()
+        || launch.command.is_some()
+        || launch.no_restore
+        || launch.temp;
     let skip_session_save = Rc::new(Cell::new(has_cli_override));
 
     // --- Widget hierarchy ---
@@ -906,11 +921,19 @@ fn build_ui(
     }
 
     // --- New Window action (menu only, no accelerator) ---
+    // Spawns with a fresh UUID so the restore-all logic is bypassed (no session
+    // file exists for that UUID), while the new window still saves its session
+    // on close (persistent, not ephemeral).
     {
         let action = gio::SimpleAction::new("new-window", None);
         action.connect_activate(move |_action, _param| {
             if let Ok(exe) = std::env::current_exe() {
-                if let Err(e) = std::process::Command::new(exe).spawn() {
+                let new_id = uuid::Uuid::new_v4();
+                if let Err(e) = std::process::Command::new(exe)
+                    .arg("--session-id")
+                    .arg(new_id.to_string())
+                    .spawn()
+                {
                     tracing::warn!("Failed to spawn new window: {e}");
                 }
             }
@@ -1269,13 +1292,8 @@ fn build_ui(
         match dc.get_layout() {
             Ok(ref layout) => {
                 tracing::info!("get_layout: received layout from daemon");
-                restored = build_widgets_from_layout(
-                    layout,
-                    dc,
-                    config,
-                    &workspace_manager,
-                    &window,
-                );
+                restored =
+                    build_widgets_from_layout(layout, dc, config, &workspace_manager, &window);
             }
             Err(e) => {
                 tracing::warn!("get_layout RPC failed: {e} — will create a fresh tab");
@@ -1439,8 +1457,7 @@ fn build_ui(
     //
     // AC-6: "subscribe_layout subscription established in daemon mode."
     if let Some(ref dc_layout) = daemon_client {
-        let (layout_tx, layout_rx) =
-            std::sync::mpsc::channel::<LayoutEvent>();
+        let (layout_tx, layout_rx) = std::sync::mpsc::channel::<LayoutEvent>();
         if let Err(e) = dc_layout.subscribe_layout(layout_tx) {
             tracing::warn!("subscribe_layout failed to start: {e}");
         } else {
@@ -1829,8 +1846,7 @@ fn build_widget_from_pane_tree(
             }
 
             let snapshot = dc.get_screen(*pane_id).ok();
-            let on_exit =
-                make_on_exit_callback(tab_view, tab_states, window, Some(Arc::clone(dc)));
+            let on_exit = make_on_exit_callback(tab_view, tab_states, window, Some(Arc::clone(dc)));
             let on_notify = make_on_notify_callback(tab_view, tab_states, window);
 
             match terminal::create_terminal_for_pane(
@@ -1853,6 +1869,7 @@ fn build_widget_from_pane_tree(
                         tab_view,
                         tab_states,
                         custom_titles,
+                        window,
                     );
                     Some((pane_vbox.upcast::<gtk4::Widget>(), drawing_area))
                 }
@@ -2028,8 +2045,7 @@ fn build_widgets_from_layout(
             false
         } else {
             // Select the active tab and focus its first DrawingArea.
-            let active_tab_idx =
-                active_ws_info.active_tab.min(created.len().saturating_sub(1));
+            let active_tab_idx = active_ws_info.active_tab.min(created.len().saturating_sub(1));
             let (ref active_page, ref active_da) = created[active_tab_idx];
             tab_view_clone.set_selected_page(active_page);
             active_da.grab_focus();
@@ -2128,7 +2144,10 @@ fn build_widgets_from_layout(
         // Only add the WorkspaceView if at least one tab was created.
         if new_tv.n_pages() > 0 {
             let Ok(mut mgr) = workspace_manager.try_borrow_mut() else {
-                tracing::warn!("build_widgets_from_layout: failed to borrow_mut for ws {:?}", ws_info.name);
+                tracing::warn!(
+                    "build_widgets_from_layout: failed to borrow_mut for ws {:?}",
+                    ws_info.name
+                );
                 continue;
             };
             mgr.workspaces.push(WorkspaceView {
@@ -2194,6 +2213,7 @@ fn build_pane_tree(
                         tab_view,
                         tab_states,
                         custom_titles,
+                        window,
                     );
                     Some((pane_vbox.upcast::<gtk4::Widget>(), drawing_area))
                 }
@@ -2682,6 +2702,7 @@ fn add_new_tab(
                             tab_view,
                             tab_states,
                             custom_titles,
+                            window,
                         );
                         let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
                         container.set_hexpand(true);
@@ -2727,7 +2748,14 @@ fn add_new_tab(
             tab_states.borrow_mut().insert(pane_id, Rc::clone(&state));
 
             // Wire up focus tracking on this pane
-            wire_focus_tracking(&drawing_area, focus_tracker, tab_view, tab_states, custom_titles);
+            wire_focus_tracking(
+                &drawing_area,
+                focus_tracker,
+                tab_view,
+                tab_states,
+                custom_titles,
+                window,
+            );
 
             // Wrap in a pane container Box (allows swapping root widget later)
             let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
@@ -2897,15 +2925,15 @@ fn split_pane(
                     )
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "split_pane RPC failed: {e}; falling back to local PTY"
-                    );
+                    tracing::warn!("split_pane RPC failed: {e}; falling back to local PTY");
                     terminal::create_terminal(config, Some(on_exit), Some(on_notify), None, None)
                 }
             },
             None => {
                 // Focused pane has no daemon_pane_id — fall back to local PTY.
-                tracing::warn!("split_pane: focused pane has no daemon_pane_id, falling back to local PTY");
+                tracing::warn!(
+                    "split_pane: focused pane has no daemon_pane_id, falling back to local PTY"
+                );
                 terminal::create_terminal(config, Some(on_exit), Some(on_notify), None, None)
             }
         }
@@ -2924,7 +2952,7 @@ fn split_pane(
     let new_pane_id = next_pane_id();
     new_da.set_widget_name(&new_pane_id);
     tab_states.borrow_mut().insert(new_pane_id, new_state);
-    wire_focus_tracking(&new_da, focus_tracker, tab_view, tab_states, custom_titles);
+    wire_focus_tracking(&new_da, focus_tracker, tab_view, tab_states, custom_titles, window);
 
     // Create the Paned container
     let paned = gtk4::Paned::new(orientation);
@@ -3822,16 +3850,18 @@ fn wire_focus_tracking(
     tab_view: &adw::TabView,
     tab_states: &TabStateMap,
     custom_titles: &CustomTitles,
+    window: &adw::ApplicationWindow,
 ) {
     let focus_controller = gtk4::EventControllerFocus::new();
 
-    // Focus gained -- update the tracker and tab title immediately
+    // Focus gained -- update the tracker, tab title, and window title immediately
     {
         let tracker = Rc::clone(focus_tracker);
         let da = drawing_area.clone();
         let tv = tab_view.clone();
         let states = Rc::clone(tab_states);
         let ct = Rc::clone(custom_titles);
+        let win = window.clone();
         focus_controller.connect_enter(move |_controller| {
             let pane_name = da.widget_name().to_string();
             if let Ok(mut name) = tracker.try_borrow_mut() {
@@ -3886,6 +3916,16 @@ fn wire_focus_tracking(
                                 }
                             }
                         }
+                    }
+                }
+            }
+
+            // Update the window title bar immediately for the newly focused pane.
+            if let Ok(map) = states.try_borrow() {
+                if let Some(state_rc) = map.get(&pane_name) {
+                    if let Ok(s) = state_rc.try_borrow() {
+                        let pane_title = compute_window_title(&s);
+                        set_window_title_preserving_workspace(&win, &pane_title);
                     }
                 }
             }
@@ -4047,71 +4087,121 @@ fn register_title_timer(
     });
 }
 
+/// Extract just the CWD from an OSC 0/2 title string.
+///
+/// Shells like zsh/bash set the terminal title to `user@host:path` via OSC 0/2.
+/// This strips the `user@host:` prefix and returns only the path.
+/// If the title doesn't match that pattern, the original string is returned.
+fn cwd_from_osc_title(title: &str) -> &str {
+    if let Some(colon_pos) = title.find(':') {
+        let before = &title[..colon_pos];
+        if before.contains('@') {
+            let after = title[colon_pos + 1..].trim_start_matches(' ');
+            if !after.is_empty() {
+                return after;
+            }
+        }
+    }
+    title
+}
+
 /// Compute the display title for a terminal tab.
 ///
-/// Priority: /proc CWD basename > daemon_cwd basename > OSC title > "shell".
+/// Priority: /proc CWD path > daemon_cwd path > OSC title (path only) > "shell".
 ///
-/// daemon_cwd is preferred over OSC title because OSC 0/2 from zsh/bash emits
-/// the full `user@host:cwd` format (meant for the window title bar), which is
-/// too verbose for a tab label.  daemon_cwd gives just the directory path whose
-/// basename is a clean, short tab title.
+/// Always returns just the path (tilde-collapsed), never `user@host:path`.
 fn compute_display_title(state: &TerminalState) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+
+    let tilde_path = |cwd: &str| -> String {
+        if !home.is_empty() && cwd.starts_with(&home) {
+            let rest = &cwd[home.len()..];
+            if rest.is_empty() {
+                "~".to_string()
+            } else {
+                format!("~{}", rest)
+            }
+        } else {
+            cwd.to_string()
+        }
+    };
+
     // Try to read CWD from /proc/{pid}/cwd (self-contained panes only)
     if let Some(pid) = state.pty.as_ref().and_then(|p| p.pid()) {
         let proc_path = format!("/proc/{}/cwd", pid);
         if let Ok(target) = std::fs::read_link(&proc_path) {
             let cwd = target.to_string_lossy().to_string();
             if !cwd.is_empty() {
-                // Use basename of the CWD
-                return std::path::Path::new(&cwd)
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| cwd.clone());
+                return tilde_path(&cwd);
             }
         }
     }
 
-    // Daemon fallback: CWD basename from PaneInfo (set at connect time).
+    // Daemon fallback: CWD from PaneInfo (set at connect time).
     if let Some(cwd) = &state.daemon_cwd {
-        if let Some(name) = cwd.file_name() {
-            return name.to_string_lossy().to_string();
+        let cwd_str = cwd.to_string_lossy();
+        if !cwd_str.is_empty() {
+            return tilde_path(&cwd_str);
         }
     }
 
-    // Fall back to OSC title if set (e.g. user@host:cwd from zsh).
+    // Fall back to OSC title — extract just the path portion.
     let osc_title = state.terminal.title();
     if !osc_title.is_empty() && osc_title != "shell" {
-        return osc_title.to_string();
+        return tilde_path(cwd_from_osc_title(&osc_title));
     }
 
     "shell".to_string()
 }
 
-/// Compute the window title bar string: `user@hostname:cwd`.
+/// Compute the window title bar string — just the CWD path.
 ///
-/// Mirrors Ghostty's title format shown in the CSD header bar.
+/// Priority:
+/// 1. `/proc/{pid}/cwd` — self-contained panes (live, always current)
+/// 2. OSC 0/2 title — daemon panes (shell sets this on every prompt render)
+/// 3. `daemon_cwd` — daemon panes fallback (connect-time CWD from PaneInfo)
+/// 4. `"Forgetty"` — last resort
 fn compute_window_title(state: &TerminalState) -> String {
-    let user = std::env::var("USER").unwrap_or_default();
-    let hostname = glib::host_name().to_string();
-    // Strip domain from hostname (e.g. "totemlabs-lap.local" → "totemlabs-lap")
-    let short_host = hostname.split('.').next().unwrap_or(&hostname);
+    let home = std::env::var("HOME").unwrap_or_default();
 
+    let tilde_cwd = |cwd: &str| -> String {
+        if !home.is_empty() && cwd.starts_with(&home) {
+            let rest = &cwd[home.len()..];
+            if rest.is_empty() {
+                return "Forgetty".to_string();
+            }
+            format!("~{}", rest)
+        } else {
+            cwd.to_string()
+        }
+    };
+
+    // Self-contained panes: read live CWD from /proc/{pid}/cwd.
     if let Some(pid) = state.pty.as_ref().and_then(|p| p.pid()) {
         let proc_path = format!("/proc/{}/cwd", pid);
         if let Ok(target) = std::fs::read_link(&proc_path) {
             let cwd = target.to_string_lossy().to_string();
-            // Replace /home/user with ~
-            let home = std::env::var("HOME").unwrap_or_default();
-            let display_cwd = if !home.is_empty() && cwd.starts_with(&home) {
-                format!("~{}", &cwd[home.len()..])
-            } else {
-                cwd
-            };
-            return format!("{}@{}:{}", user, short_host, display_cwd);
+            if !cwd.is_empty() {
+                return tilde_cwd(&cwd);
+            }
         }
     }
 
-    format!("{}@{}", user, short_host)
+    // Daemon panes: OSC 0/2 title is set on every prompt render — extract just the path.
+    let osc_title = state.terminal.title();
+    if !osc_title.is_empty() {
+        return tilde_cwd(cwd_from_osc_title(&osc_title));
+    }
+
+    // Daemon panes: fall back to CWD captured at connect time from PaneInfo.
+    if let Some(cwd) = &state.daemon_cwd {
+        let cwd_str = cwd.to_string_lossy();
+        if !cwd_str.is_empty() {
+            return tilde_cwd(&cwd_str);
+        }
+    }
+
+    "Forgetty".to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -5308,17 +5398,11 @@ fn create_and_switch_to_new_workspace(
             Ok((ws_id, _ws_idx, pane_id, tab_id)) => {
                 let (mpsc_tx, mpsc_rx) = std::sync::mpsc::channel::<Vec<u8>>();
                 if let Err(e) = dc.subscribe_output(pane_id, mpsc_tx) {
-                    tracing::warn!(
-                        "subscribe_output failed for new workspace pane {pane_id}: {e}"
-                    );
+                    tracing::warn!("subscribe_output failed for new workspace pane {pane_id}: {e}");
                 }
                 let snapshot = dc.get_screen(pane_id).ok();
-                let on_exit = make_on_exit_callback(
-                    &new_tv,
-                    &new_tab_states,
-                    window,
-                    Some(Arc::clone(dc)),
-                );
+                let on_exit =
+                    make_on_exit_callback(&new_tv, &new_tab_states, window, Some(Arc::clone(dc)));
                 let on_notify = make_on_notify_callback(&new_tv, &new_tab_states, window);
                 match terminal::create_terminal_for_pane(
                     config,
@@ -5340,6 +5424,7 @@ fn create_and_switch_to_new_workspace(
                             &new_tv,
                             &new_tab_states,
                             &new_custom_titles,
+                            window,
                         );
                         let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
                         container.set_hexpand(true);

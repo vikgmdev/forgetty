@@ -216,8 +216,11 @@ async fn main_async() -> anyhow::Result<()> {
         match forgetty_workspace::load_session_for(session_id) {
             Ok(Some(state)) if !state.workspaces.is_empty() => {
                 let total: usize = state.workspaces.iter().map(|ws| ws.tabs.len()).sum();
-                info!("cold-start restore: found {} workspace(s), {} tab(s) total",
-                    state.workspaces.len(), total);
+                info!(
+                    "cold-start restore: found {} workspace(s), {} tab(s) total",
+                    state.workspaces.len(),
+                    total
+                );
 
                 // Ensure the daemon has enough workspace slots for all saved workspaces.
                 // SessionLayout::new_default() creates workspace[0]; create the rest.

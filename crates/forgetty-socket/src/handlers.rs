@@ -156,23 +156,14 @@ fn handle_get_layout(request: &Request, sm: &SessionManager) -> Response {
 }
 
 fn handle_new_tab(request: &Request, sm: &SessionManager) -> Response {
-    let workspace_idx = request
-        .params
-        .get("workspace_idx")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as usize;
+    let workspace_idx =
+        request.params.get("workspace_idx").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
 
-    let rows = request
-        .params
-        .get("rows")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(DEFAULT_ROWS as u64) as u16;
+    let rows =
+        request.params.get("rows").and_then(|v| v.as_u64()).unwrap_or(DEFAULT_ROWS as u64) as u16;
 
-    let cols = request
-        .params
-        .get("cols")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(DEFAULT_COLS as u64) as u16;
+    let cols =
+        request.params.get("cols").and_then(|v| v.as_u64()).unwrap_or(DEFAULT_COLS as u64) as u16;
 
     let size = PtySize { rows, cols, pixel_width: 0, pixel_height: 0 };
 
@@ -468,12 +459,8 @@ fn handle_close_pane(request: &Request, sm: &SessionManager) -> Response {
 }
 
 fn handle_create_workspace(request: &Request, sm: &SessionManager) -> Response {
-    let name = request
-        .params
-        .get("name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("Workspace")
-        .to_string();
+    let name =
+        request.params.get("name").and_then(|v| v.as_str()).unwrap_or("Workspace").to_string();
 
     let (workspace_id, workspace_idx) = sm.create_workspace(&name);
 
@@ -522,17 +509,11 @@ fn handle_split_pane(request: &Request, sm: &SessionManager) -> Response {
         );
     }
 
-    let rows = request
-        .params
-        .get("rows")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(DEFAULT_ROWS as u64) as u16;
+    let rows =
+        request.params.get("rows").and_then(|v| v.as_u64()).unwrap_or(DEFAULT_ROWS as u64) as u16;
 
-    let cols = request
-        .params
-        .get("cols")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(DEFAULT_COLS as u64) as u16;
+    let cols =
+        request.params.get("cols").and_then(|v| v.as_u64()).unwrap_or(DEFAULT_COLS as u64) as u16;
 
     let size = PtySize { rows, cols, pixel_width: 0, pixel_height: 0 };
 
@@ -1354,7 +1335,10 @@ mod tests {
         assert!(resp.result.is_some());
         let result = resp.result.unwrap();
         assert!(result.get("tab_id").and_then(|v| v.as_str()).is_some(), "tab_id must be present");
-        assert!(result.get("pane_id").and_then(|v| v.as_str()).is_some(), "pane_id must be present");
+        assert!(
+            result.get("pane_id").and_then(|v| v.as_str()).is_some(),
+            "pane_id must be present"
+        );
 
         // Cleanup.
         let tab_id_str = result["tab_id"].as_str().unwrap();

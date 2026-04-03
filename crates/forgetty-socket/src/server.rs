@@ -373,7 +373,12 @@ async fn handle_streaming_connection(
                             break;
                         }
                     }
-                    Ok(SessionEvent::PaneSplit { tab_id, parent_pane_id, new_pane_id, direction }) => {
+                    Ok(SessionEvent::PaneSplit {
+                        tab_id,
+                        parent_pane_id,
+                        new_pane_id,
+                        direction,
+                    }) => {
                         let notification = serde_json::json!({
                             "jsonrpc": "2.0",
                             "method": "pane_split",

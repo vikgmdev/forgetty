@@ -60,19 +60,11 @@ pub enum SessionEvent {
     // -----------------------------------------------------------------------
     // Layout mutation events (T-063)
     // -----------------------------------------------------------------------
-
     /// A new tab was created in the given workspace.
-    TabCreated {
-        workspace_idx: usize,
-        tab_id: Uuid,
-        pane_id: PaneId,
-    },
+    TabCreated { workspace_idx: usize, tab_id: Uuid, pane_id: PaneId },
 
     /// A tab was closed (all its panes have been killed).
-    TabClosed {
-        workspace_idx: usize,
-        tab_id: Uuid,
-    },
+    TabClosed { workspace_idx: usize, tab_id: Uuid },
 
     /// An existing pane was split, producing a new sibling pane.
     PaneSplit {
@@ -84,28 +76,16 @@ pub enum SessionEvent {
     },
 
     /// A tab was moved to a new position within its workspace.
-    TabMoved {
-        workspace_idx: usize,
-        tab_id: Uuid,
-        new_index: usize,
-    },
+    TabMoved { workspace_idx: usize, tab_id: Uuid, new_index: usize },
 
     /// The active tab index changed for a workspace.
-    ActiveTabChanged {
-        workspace_idx: usize,
-        tab_idx: usize,
-    },
+    ActiveTabChanged { workspace_idx: usize, tab_idx: usize },
 
     // -----------------------------------------------------------------------
     // Workspace mutation events (T-067)
     // -----------------------------------------------------------------------
-
     /// A new workspace was created.
-    WorkspaceCreated {
-        workspace_idx: usize,
-        workspace_id: Uuid,
-        name: String,
-    },
+    WorkspaceCreated { workspace_idx: usize, workspace_id: Uuid, name: String },
 }
 
 // ---------------------------------------------------------------------------

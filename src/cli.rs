@@ -35,4 +35,9 @@ pub struct Args {
     /// Restore all saved sessions (open one window per session file).
     #[arg(long)]
     pub restore_all: bool,
+
+    /// Open an ephemeral session that is never persisted. The terminal works
+    /// normally but no session file is written on close.
+    #[arg(long)]
+    pub temp: bool,
 }

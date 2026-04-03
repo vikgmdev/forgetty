@@ -438,9 +438,7 @@ impl SessionManager {
             )));
         }
         ws.active_tab = tab_idx;
-        let _ = inner
-            .event_tx
-            .send(SessionEvent::ActiveTabChanged { workspace_idx, tab_idx });
+        let _ = inner.event_tx.send(SessionEvent::ActiveTabChanged { workspace_idx, tab_idx });
         debug!(workspace_idx, tab_idx, "set_active_tab: active tab updated");
         Ok(())
     }
@@ -717,10 +715,7 @@ impl SessionManager {
                     .map(|session_tab| forgetty_workspace::TabState {
                         title: session_tab.title.clone(),
                         pane_id: None,
-                        pane_tree: convert_pane_tree_layout(
-                            &session_tab.pane_tree,
-                            &inner.panes,
-                        ),
+                        pane_tree: convert_pane_tree_layout(&session_tab.pane_tree, &inner.panes),
                     })
                     .collect();
 
@@ -859,14 +854,8 @@ fn convert_pane_tree_layout(
 ) -> forgetty_workspace::PaneTreeState {
     match tree {
         PaneTreeLayout::Leaf { pane_id } => {
-            let cwd = panes
-                .get(pane_id)
-                .map(|p| p.cwd.clone())
-                .unwrap_or_else(home_dir_fallback);
-            forgetty_workspace::PaneTreeState::Leaf {
-                cwd,
-                pane_id: Some(pane_id.0),
-            }
+            let cwd = panes.get(pane_id).map(|p| p.cwd.clone()).unwrap_or_else(home_dir_fallback);
+            forgetty_workspace::PaneTreeState::Leaf { cwd, pane_id: Some(pane_id.0) }
         }
         PaneTreeLayout::Split { direction, ratio, first, second } => {
             forgetty_workspace::PaneTreeState::Split {
@@ -1023,7 +1012,8 @@ mod tests {
         let session = SessionManager::new();
         let size = test_size();
 
-        let (pane_id, tab_id) = session.create_tab(0, None, size).expect("create_tab should succeed");
+        let (pane_id, tab_id) =
+            session.create_tab(0, None, size).expect("create_tab should succeed");
 
         let layout = session.layout();
         let tabs = &layout.workspaces[0].tabs;
@@ -1034,7 +1024,10 @@ mod tests {
             matches!(&tabs[0].pane_tree, PaneTreeLayout::Leaf { pane_id: pid } if *pid == pane_id),
             "tab pane_tree must be Leaf(pane_id)"
         );
-        assert!(session.pane_info(pane_id).is_some(), "pane_info should return Some after create_tab");
+        assert!(
+            session.pane_info(pane_id).is_some(),
+            "pane_info should return Some after create_tab"
+        );
 
         session.close_tab(tab_id).ok();
     }
@@ -1151,7 +1144,9 @@ mod tests {
             matches!(first.as_ref(), PaneTreeLayout::Leaf { pane_id } if *pane_id == pane_a),
             "first leaf must still be A"
         );
-        let PaneTreeLayout::Split { first: inner_first, second: inner_second, .. } = second.as_ref() else {
+        let PaneTreeLayout::Split { first: inner_first, second: inner_second, .. } =
+            second.as_ref()
+        else {
             panic!("second must be a nested Split");
         };
         assert!(
@@ -1199,7 +1194,10 @@ mod tests {
         session.close_tab(tab_id).expect("close_tab should succeed");
 
         assert!(session.pane_info(pane_id).is_none(), "pane_info should be None after close_tab");
-        assert!(!session.list_panes().contains(&pane_id), "list_panes should not contain closed pane");
+        assert!(
+            !session.list_panes().contains(&pane_id),
+            "list_panes should not contain closed pane"
+        );
 
         let layout = session.layout();
         assert_eq!(layout.workspaces[0].tabs.len(), 0, "tab list should be empty");
@@ -1380,7 +1378,8 @@ mod tests {
         assert_eq!(layout.workspaces[1].tabs.len(), 0, "new workspace starts empty");
 
         // (c) create_tab on the new workspace succeeds
-        let (pane_id, _tab_id) = session.create_tab(ws_idx, None, size).expect("create_tab on new workspace");
+        let (pane_id, _tab_id) =
+            session.create_tab(ws_idx, None, size).expect("create_tab on new workspace");
         assert!(session.pane_info(pane_id).is_some());
         assert_eq!(session.layout().workspaces[1].tabs.len(), 1);
 

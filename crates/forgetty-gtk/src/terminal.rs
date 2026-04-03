@@ -1984,6 +1984,9 @@ pub fn create_terminal_for_pane(
             let state = Rc::clone(&state);
             let da_click = drawing_area.clone();
             gesture.connect_pressed(move |gesture, n_press, x, y| {
+                // Clicking on a pane should focus it (for split pane navigation).
+                da_click.grab_focus();
+
                 let button = gesture.current_button();
                 let modifier = gesture.current_event_state();
                 let Ok(mut s) = state.try_borrow_mut() else {

@@ -250,8 +250,7 @@ impl DaemonClient {
         &self,
         name: &str,
     ) -> Result<(uuid::Uuid, usize, PaneId, uuid::Uuid), DaemonError> {
-        let result =
-            self.rpc("create_workspace", serde_json::json!({ "name": name }))?;
+        let result = self.rpc("create_workspace", serde_json::json!({ "name": name }))?;
 
         let workspace_id_str = result
             .get("workspace_id")
@@ -271,17 +270,15 @@ impl DaemonClient {
             .get("pane_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| DaemonError("create_workspace: missing pane_id".into()))?;
-        let pane_uuid = uuid::Uuid::parse_str(pane_id_str).map_err(|e| {
-            DaemonError(format!("create_workspace: invalid pane_id UUID: {e}"))
-        })?;
+        let pane_uuid = uuid::Uuid::parse_str(pane_id_str)
+            .map_err(|e| DaemonError(format!("create_workspace: invalid pane_id UUID: {e}")))?;
 
         let tab_id_str = result
             .get("tab_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| DaemonError("create_workspace: missing tab_id".into()))?;
-        let tab_id = uuid::Uuid::parse_str(tab_id_str).map_err(|e| {
-            DaemonError(format!("create_workspace: invalid tab_id UUID: {e}"))
-        })?;
+        let tab_id = uuid::Uuid::parse_str(tab_id_str)
+            .map_err(|e| DaemonError(format!("create_workspace: invalid tab_id UUID: {e}")))?;
 
         Ok((workspace_id, workspace_idx, PaneId(pane_uuid), tab_id))
     }
@@ -371,9 +368,8 @@ impl DaemonClient {
                     .get("id")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| DaemonError("get_layout: tab missing id".into()))?;
-                let tab_id = uuid::Uuid::parse_str(tab_id_str).map_err(|e| {
-                    DaemonError(format!("get_layout: invalid tab id UUID: {e}"))
-                })?;
+                let tab_id = uuid::Uuid::parse_str(tab_id_str)
+                    .map_err(|e| DaemonError(format!("get_layout: invalid tab id UUID: {e}")))?;
                 let title = tab.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let pane_tree_val = tab
                     .get("pane_tree")
@@ -584,12 +580,7 @@ pub enum LayoutEvent {
     /// A tab was closed (all its panes have been killed).
     TabClosed { workspace_idx: usize, tab_id: uuid::Uuid },
     /// An existing pane was split, producing a new sibling.
-    PaneSplit {
-        tab_id: uuid::Uuid,
-        parent_pane_id: PaneId,
-        new_pane_id: PaneId,
-        direction: String,
-    },
+    PaneSplit { tab_id: uuid::Uuid, parent_pane_id: PaneId, new_pane_id: PaneId, direction: String },
     /// A tab was moved to a new position within its workspace.
     TabMoved { workspace_idx: usize, tab_id: uuid::Uuid, new_index: usize },
     /// The active tab changed for a workspace.
@@ -782,10 +773,8 @@ async fn subscribe_layout_task(
             "tab_created" => {
                 let workspace_idx =
                     params.get("workspace_idx").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                let tab_id_str =
-                    params.get("tab_id").and_then(|v| v.as_str()).unwrap_or("");
-                let pane_id_str =
-                    params.get("pane_id").and_then(|v| v.as_str()).unwrap_or("");
+                let tab_id_str = params.get("tab_id").and_then(|v| v.as_str()).unwrap_or("");
+                let pane_id_str = params.get("pane_id").and_then(|v| v.as_str()).unwrap_or("");
                 let tab_id = match uuid::Uuid::parse_str(tab_id_str) {
                     Ok(u) => u,
                     Err(_) => continue,
@@ -810,11 +799,12 @@ async fn subscribe_layout_task(
                 let tab_id_str = params.get("tab_id").and_then(|v| v.as_str()).unwrap_or("");
                 let parent_str =
                     params.get("parent_pane_id").and_then(|v| v.as_str()).unwrap_or("");
-                let new_str =
-                    params.get("new_pane_id").and_then(|v| v.as_str()).unwrap_or("");
-                let direction =
-                    params.get("direction").and_then(|v| v.as_str()).unwrap_or("horizontal")
-                        .to_string();
+                let new_str = params.get("new_pane_id").and_then(|v| v.as_str()).unwrap_or("");
+                let direction = params
+                    .get("direction")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("horizontal")
+                    .to_string();
                 let tab_id = match uuid::Uuid::parse_str(tab_id_str) {
                     Ok(u) => u,
                     Err(_) => continue,
@@ -844,8 +834,7 @@ async fn subscribe_layout_task(
             "active_tab_changed" => {
                 let workspace_idx =
                     params.get("workspace_idx").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                let tab_idx =
-                    params.get("tab_idx").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let tab_idx = params.get("tab_idx").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 LayoutEvent::ActiveTabChanged { workspace_idx, tab_idx }
             }
             _ => {

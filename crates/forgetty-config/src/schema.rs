@@ -54,6 +54,17 @@ pub enum NotificationMode {
     None,
 }
 
+/// The behavior when Forgetty is launched with no explicit flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum OnLaunch {
+    /// Restore all saved sessions (default, like Chrome).
+    #[default]
+    Restore,
+    /// Always open a fresh window, ignoring saved sessions.
+    New,
+}
+
 /// The top-level Forgetty configuration.
 ///
 /// Supports two theme formats for backward compatibility:
@@ -96,6 +107,10 @@ pub struct Config {
 
     /// Custom keybindings mapping action names to key combinations.
     pub keybindings: HashMap<String, String>,
+
+    /// Behavior on bare launch (no flags). `Restore` (default) restores all
+    /// saved sessions; `New` always opens a fresh window.
+    pub on_launch: OnLaunch,
 }
 
 impl Default for Config {
@@ -117,8 +132,8 @@ impl Serialize for Config {
         use serde::ser::SerializeMap;
 
         // Count fields: font_family, font_size, theme/theme_name, shell?,
-        // scrollback_lines, cursor_style, bell_mode, notification_mode, keybindings?
-        let mut len = 5; // font_family, font_size, theme, scrollback_lines, cursor_style
+        // scrollback_lines, cursor_style, bell_mode, notification_mode, on_launch, keybindings?
+        let mut len = 6; // font_family, font_size, theme, scrollback_lines, cursor_style, on_launch
         len += 2; // bell_mode, notification_mode
         if self.shell.is_some() {
             len += 1;
@@ -147,6 +162,7 @@ impl Serialize for Config {
         map.serialize_entry("cursor_style", &self.cursor_style)?;
         map.serialize_entry("bell_mode", &self.bell_mode)?;
         map.serialize_entry("notification_mode", &self.notification_mode)?;
+        map.serialize_entry("on_launch", &self.on_launch)?;
 
         if !self.keybindings.is_empty() {
             map.serialize_entry("keybindings", &self.keybindings)?;
@@ -195,6 +211,11 @@ impl<'de> Deserialize<'de> for Config {
 
             #[serde(default)]
             keybindings: HashMap<String, String>,
+
+            /// Deserialized as raw string so unknown values can fall back to
+            /// the default with a warning rather than failing to load config.
+            #[serde(default)]
+            on_launch: Option<String>,
         }
 
         let raw = RawConfig::deserialize(deserializer)?;
@@ -219,6 +240,18 @@ impl<'de> Deserialize<'de> for Config {
             _ => (Theme::default(), None),
         };
 
+        let on_launch = match raw.on_launch.as_deref() {
+            None | Some("restore") => OnLaunch::Restore,
+            Some("new") => OnLaunch::New,
+            Some(unknown) => {
+                tracing::warn!(
+                    "Unknown on_launch value {:?}, falling back to \"restore\"",
+                    unknown
+                );
+                OnLaunch::Restore
+            }
+        };
+
         Ok(Config {
             font_family: raw.font_family,
             font_size: raw.font_size,
@@ -230,6 +263,7 @@ impl<'de> Deserialize<'de> for Config {
             bell_mode: raw.bell_mode,
             notification_mode: raw.notification_mode,
             keybindings: raw.keybindings,
+            on_launch,
         })
     }
 }
