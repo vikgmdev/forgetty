@@ -8,6 +8,7 @@
 use bytes::Bytes;
 use forgetty_core::PaneId;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 /// Which OSC protocol triggered this notification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,6 +41,11 @@ pub struct NotificationPayload {
 /// In T-048 GTK does not yet consume this channel — it still polls via
 /// `drain_output()`. The channel is wired now so T-050 can activate it
 /// without further structural changes.
+///
+/// As of T-063 this channel also carries layout mutation events
+/// (`TabCreated`, `TabClosed`, `PaneSplit`, `TabMoved`, `ActiveTabChanged`).
+/// Subscribers that only care about one class of event should filter in the
+/// receive loop.
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
     /// Raw output bytes from a pane's PTY.
@@ -50,6 +56,45 @@ pub enum SessionEvent {
     PaneClosed { pane_id: PaneId },
     /// An OSC notification was detected in the PTY stream.
     Notification { pane_id: PaneId, payload: NotificationPayload },
+
+    // -----------------------------------------------------------------------
+    // Layout mutation events (T-063)
+    // -----------------------------------------------------------------------
+
+    /// A new tab was created in the given workspace.
+    TabCreated {
+        workspace_idx: usize,
+        tab_id: Uuid,
+        pane_id: PaneId,
+    },
+
+    /// A tab was closed (all its panes have been killed).
+    TabClosed {
+        workspace_idx: usize,
+        tab_id: Uuid,
+    },
+
+    /// An existing pane was split, producing a new sibling pane.
+    PaneSplit {
+        tab_id: Uuid,
+        parent_pane_id: PaneId,
+        new_pane_id: PaneId,
+        /// "horizontal" | "vertical"
+        direction: String,
+    },
+
+    /// A tab was moved to a new position within its workspace.
+    TabMoved {
+        workspace_idx: usize,
+        tab_id: Uuid,
+        new_index: usize,
+    },
+
+    /// The active tab index changed for a workspace.
+    ActiveTabChanged {
+        workspace_idx: usize,
+        tab_idx: usize,
+    },
 }
 
 // ---------------------------------------------------------------------------

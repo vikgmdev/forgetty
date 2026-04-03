@@ -202,6 +202,7 @@ impl SessionManager {
         inner.layout.workspaces[workspace_idx].tabs.push(tab);
 
         let _ = inner.event_tx.send(SessionEvent::PaneCreated { pane_id });
+        let _ = inner.event_tx.send(SessionEvent::TabCreated { workspace_idx, tab_id, pane_id });
 
         debug!(%pane_id, %tab_id, workspace_idx, "create_tab: tab created");
         Ok((pane_id, tab_id))
@@ -251,11 +252,14 @@ impl SessionManager {
         inner.pane_order.push(new_pane_id);
 
         // Walk all tab trees to find and replace the target leaf.
+        // Also capture the tab_id for the PaneSplit event (R-1).
         let mut replaced = false;
+        let mut found_tab_id: Option<Uuid> = None;
         'outer: for ws in inner.layout.workspaces.iter_mut() {
             for tab in ws.tabs.iter_mut() {
                 if replace_leaf(&mut tab.pane_tree, pane_id, new_pane_id, direction) {
                     replaced = true;
+                    found_tab_id = Some(tab.id);
                     break 'outer;
                 }
             }
@@ -271,6 +275,14 @@ impl SessionManager {
         }
 
         let _ = inner.event_tx.send(SessionEvent::PaneCreated { pane_id: new_pane_id });
+        if let Some(tab_id) = found_tab_id {
+            let _ = inner.event_tx.send(SessionEvent::PaneSplit {
+                tab_id,
+                parent_pane_id: pane_id,
+                new_pane_id,
+                direction: direction.to_string(),
+            });
+        }
 
         debug!(%pane_id, %new_pane_id, direction, "split_pane: pane split");
         Ok(new_pane_id)
@@ -322,6 +334,8 @@ impl SessionManager {
             }
         }
 
+        let _ = inner.event_tx.send(SessionEvent::TabClosed { workspace_idx: ws_idx, tab_id });
+
         debug!(%tab_id, "close_tab: tab removed");
         Ok(())
     }
@@ -369,6 +383,12 @@ impl SessionManager {
             }
         }
 
+        let _ = inner.event_tx.send(SessionEvent::TabMoved {
+            workspace_idx: ws_idx,
+            tab_id,
+            new_index: target_idx,
+        });
+
         debug!(%tab_id, from = current_idx, to = target_idx, "move_tab: tab moved");
         Ok(())
     }
@@ -393,6 +413,9 @@ impl SessionManager {
             )));
         }
         ws.active_tab = tab_idx;
+        let _ = inner
+            .event_tx
+            .send(SessionEvent::ActiveTabChanged { workspace_idx, tab_idx });
         debug!(workspace_idx, tab_idx, "set_active_tab: active tab updated");
         Ok(())
     }

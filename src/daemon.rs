@@ -223,7 +223,12 @@ async fn main_async() -> anyhow::Result<()> {
             let mut rx = sm.subscribe_output();
             loop {
                 match rx.recv().await {
-                    Ok(SessionEvent::PaneCreated { .. }) | Ok(SessionEvent::PaneClosed { .. }) => {
+                    Ok(SessionEvent::PaneCreated { .. })
+                    | Ok(SessionEvent::PaneClosed { .. })
+                    | Ok(SessionEvent::TabCreated { .. })
+                    | Ok(SessionEvent::TabClosed { .. })
+                    | Ok(SessionEvent::PaneSplit { .. })
+                    | Ok(SessionEvent::TabMoved { .. }) => {
                         dirty.store(true, Ordering::Relaxed);
                     }
                     Ok(_) => {}

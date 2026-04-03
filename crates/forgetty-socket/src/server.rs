@@ -277,8 +277,7 @@ async fn handle_streaming_connection(
                         if evt_id != pane_id {
                             continue;
                         }
-                        let encoded =
-                            base64::engine::general_purpose::STANDARD.encode(&data[..]);
+                        let encoded = base64::engine::general_purpose::STANDARD.encode(&data[..]);
                         let notification = serde_json::json!({
                             "jsonrpc": "2.0",
                             "method": "output",
@@ -318,6 +317,137 @@ async fn handle_streaming_connection(
             }
 
             // Connection ends after subscribe_output stream terminates.
+            return Ok(());
+        }
+
+        if request.method == methods::SUBSCRIBE_LAYOUT {
+            // No parameter validation — the layout stream is connection-wide.
+            // Reuse the same broadcast channel as subscribe_output; we filter
+            // to layout variants in the loop below.
+            let mut rx = sm.subscribe_output();
+
+            // Send the initial acknowledgment.
+            let ack = Response::success(request.id.clone(), serde_json::json!({ "ok": true }));
+            write_response(&mut writer, &ack).await?;
+
+            // Stream layout notifications until the daemon shuts down or the
+            // client disconnects.
+            loop {
+                match rx.recv().await {
+                    Ok(SessionEvent::TabCreated { workspace_idx, tab_id, pane_id }) => {
+                        let notification = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "method": "tab_created",
+                            "params": {
+                                "workspace_idx": workspace_idx,
+                                "tab_id": tab_id.to_string(),
+                                "pane_id": pane_id.to_string(),
+                            }
+                        });
+                        let mut out = serde_json::to_string(&notification)
+                            .unwrap_or_else(|_| "{}".to_string());
+                        out.push('\n');
+                        if writer.write_all(out.as_bytes()).await.is_err() {
+                            break;
+                        }
+                        if writer.flush().await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(SessionEvent::TabClosed { workspace_idx, tab_id }) => {
+                        let notification = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "method": "tab_closed",
+                            "params": {
+                                "workspace_idx": workspace_idx,
+                                "tab_id": tab_id.to_string(),
+                            }
+                        });
+                        let mut out = serde_json::to_string(&notification)
+                            .unwrap_or_else(|_| "{}".to_string());
+                        out.push('\n');
+                        if writer.write_all(out.as_bytes()).await.is_err() {
+                            break;
+                        }
+                        if writer.flush().await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(SessionEvent::PaneSplit { tab_id, parent_pane_id, new_pane_id, direction }) => {
+                        let notification = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "method": "pane_split",
+                            "params": {
+                                "tab_id": tab_id.to_string(),
+                                "parent_pane_id": parent_pane_id.to_string(),
+                                "new_pane_id": new_pane_id.to_string(),
+                                "direction": direction,
+                            }
+                        });
+                        let mut out = serde_json::to_string(&notification)
+                            .unwrap_or_else(|_| "{}".to_string());
+                        out.push('\n');
+                        if writer.write_all(out.as_bytes()).await.is_err() {
+                            break;
+                        }
+                        if writer.flush().await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(SessionEvent::TabMoved { workspace_idx, tab_id, new_index }) => {
+                        let notification = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "method": "tab_moved",
+                            "params": {
+                                "workspace_idx": workspace_idx,
+                                "tab_id": tab_id.to_string(),
+                                "new_index": new_index,
+                            }
+                        });
+                        let mut out = serde_json::to_string(&notification)
+                            .unwrap_or_else(|_| "{}".to_string());
+                        out.push('\n');
+                        if writer.write_all(out.as_bytes()).await.is_err() {
+                            break;
+                        }
+                        if writer.flush().await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(SessionEvent::ActiveTabChanged { workspace_idx, tab_idx }) => {
+                        let notification = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "method": "active_tab_changed",
+                            "params": {
+                                "workspace_idx": workspace_idx,
+                                "tab_idx": tab_idx,
+                            }
+                        });
+                        let mut out = serde_json::to_string(&notification)
+                            .unwrap_or_else(|_| "{}".to_string());
+                        out.push('\n');
+                        if writer.write_all(out.as_bytes()).await.is_err() {
+                            break;
+                        }
+                        if writer.flush().await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(_) => {
+                        // Output events (PtyOutput, PaneCreated, PaneClosed,
+                        // Notification) are not forwarded to subscribe_layout clients.
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // Consumer fell behind; continue from here.
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        // Channel shut down (daemon exiting).
+                        break;
+                    }
+                }
+            }
+
+            // Connection ends after subscribe_layout stream terminates.
             return Ok(());
         }
 
@@ -394,9 +524,8 @@ mod tests {
         // Spawn server accept loop in background.
         let handle = tokio::spawn(async move {
             let sm_inner = Arc::clone(&sm);
-            let handler = Arc::new(move |req: Request| {
-                handlers::dispatch(&req, Arc::clone(&sm_inner), None)
-            });
+            let handler =
+                Arc::new(move |req: Request| handlers::dispatch(&req, Arc::clone(&sm_inner), None));
             let (stream, _) = listener.accept().await.unwrap();
             handle_connection(stream, handler).await.unwrap();
         });

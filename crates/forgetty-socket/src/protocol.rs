@@ -98,6 +98,7 @@ pub mod methods {
     pub const GET_SCREEN: &str = "get_screen";
     pub const GET_PANE_INFO: &str = "get_pane_info";
     pub const SUBSCRIBE_OUTPUT: &str = "subscribe_output";
+    pub const SUBSCRIBE_LAYOUT: &str = "subscribe_layout";
     pub const RESIZE_PANE: &str = "resize_pane";
     pub const SEND_SIGINT: &str = "send_sigint";
     // Sync / pairing methods (T-052).
