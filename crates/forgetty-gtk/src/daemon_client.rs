@@ -40,6 +40,37 @@ pub struct PaneInfo {
     pub title: String,
 }
 
+/// Recursive pane tree node as returned by `get_layout`.
+#[derive(Debug, Clone)]
+pub enum PaneTreeNode {
+    Leaf { pane_id: PaneId },
+    Split { direction: String, ratio: f32, first: Box<PaneTreeNode>, second: Box<PaneTreeNode> },
+}
+
+/// One tab in the layout (from `get_layout`).
+#[derive(Debug, Clone)]
+pub struct TabInfo {
+    pub tab_id: uuid::Uuid,
+    pub title: String,
+    pub pane_tree: PaneTreeNode,
+}
+
+/// One workspace in the layout (from `get_layout`).
+#[derive(Debug, Clone)]
+pub struct WorkspaceInfo {
+    pub id: uuid::Uuid,
+    pub name: String,
+    pub active_tab: usize,
+    pub tabs: Vec<TabInfo>,
+}
+
+/// Full layout snapshot returned by `get_layout`.
+#[derive(Debug, Clone)]
+pub struct LayoutInfo {
+    pub active_workspace: usize,
+    pub workspaces: Vec<WorkspaceInfo>,
+}
+
 /// Information about a single paired device (from `list_devices` RPC).
 #[derive(Debug, Clone)]
 pub struct DeviceInfo {
@@ -126,7 +157,9 @@ impl DaemonClient {
         let mut line = serde_json::to_string(&request)
             .map_err(|e| DaemonError(format!("serialize request: {e}")))?;
         line.push('\n');
-        stream.write_all(line.as_bytes()).map_err(|e| DaemonError(format!("write request: {e}")))?;
+        stream
+            .write_all(line.as_bytes())
+            .map_err(|e| DaemonError(format!("write request: {e}")))?;
         stream.flush().map_err(|e| DaemonError(format!("flush: {e}")))?;
 
         let mut reader = BufReader::new(&stream);
@@ -176,32 +209,139 @@ impl DaemonClient {
         Ok(infos)
     }
 
-    /// Create a new pane in the daemon with an optional starting CWD.
-    /// Returns the assigned `PaneId`.
-    pub fn new_tab_with_cwd(&self, cwd: Option<&std::path::Path>) -> Result<PaneId, DaemonError> {
+    /// Create a new tab in the daemon with an optional starting CWD.
+    /// Returns `(pane_id, tab_id)`.
+    pub fn new_tab_with_cwd(
+        &self,
+        cwd: Option<&std::path::Path>,
+    ) -> Result<(PaneId, uuid::Uuid), DaemonError> {
         let params = match cwd {
             Some(p) => serde_json::json!({ "cwd": p.to_string_lossy().as_ref() }),
             None => serde_json::json!({}),
         };
         let result = self.rpc("new_tab", params)?;
+        let pane_id_str = result
+            .get("pane_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| DaemonError("new_tab: missing pane_id".into()))?;
+        let pane_uuid = uuid::Uuid::parse_str(pane_id_str)
+            .map_err(|e| DaemonError(format!("new_tab: invalid pane_id UUID: {e}")))?;
+
         let tab_id_str = result
             .get("tab_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| DaemonError("new_tab: missing tab_id".into()))?;
-        let uuid = uuid::Uuid::parse_str(tab_id_str)
-            .map_err(|e| DaemonError(format!("new_tab: invalid UUID: {e}")))?;
-        Ok(PaneId(uuid))
+        let tab_uuid = uuid::Uuid::parse_str(tab_id_str)
+            .map_err(|e| DaemonError(format!("new_tab: invalid tab_id UUID: {e}")))?;
+
+        Ok((PaneId(pane_uuid), tab_uuid))
     }
 
-    /// Create a new pane in the daemon. Returns the assigned `PaneId`.
-    pub fn new_tab(&self) -> Result<PaneId, DaemonError> {
+    /// Create a new tab in the daemon. Returns `(pane_id, tab_id)`.
+    pub fn new_tab(&self) -> Result<(PaneId, uuid::Uuid), DaemonError> {
         self.new_tab_with_cwd(None)
     }
 
-    /// Close a pane in the daemon.
-    pub fn close_tab(&self, pane_id: PaneId) -> Result<(), DaemonError> {
+    /// Close a tab in the daemon by its `tab_id` (UUID).
+    pub fn close_tab(&self, tab_id: uuid::Uuid) -> Result<(), DaemonError> {
+        self.rpc("close_tab", serde_json::json!({ "tab_id": tab_id.to_string() }))?;
+        Ok(())
+    }
+
+    /// Close a tab in the daemon using a legacy `pane_id`.
+    ///
+    /// The daemon will look up the tab that owns this pane and close it.
+    /// Use `close_tab(tab_id)` when a real tab UUID is available.
+    pub fn close_tab_by_pane_id(&self, pane_id: PaneId) -> Result<(), DaemonError> {
         self.rpc("close_tab", serde_json::json!({ "pane_id": pane_id.to_string() }))?;
         Ok(())
+    }
+
+    /// Split a pane in the daemon. Returns the new `PaneId`.
+    pub fn split_pane(&self, pane_id: PaneId, direction: &str) -> Result<PaneId, DaemonError> {
+        let result = self.rpc(
+            "split_pane",
+            serde_json::json!({
+                "pane_id": pane_id.to_string(),
+                "direction": direction,
+            }),
+        )?;
+        let new_pane_id_str = result
+            .get("pane_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| DaemonError("split_pane: missing pane_id in response".into()))?;
+        let uuid = uuid::Uuid::parse_str(new_pane_id_str)
+            .map_err(|e| DaemonError(format!("split_pane: invalid UUID: {e}")))?;
+        Ok(PaneId(uuid))
+    }
+
+    /// Focus (set as active) a tab in the daemon by its `tab_id`.
+    pub fn focus_tab(&self, tab_id: uuid::Uuid) -> Result<(), DaemonError> {
+        self.rpc("focus_tab", serde_json::json!({ "tab_id": tab_id.to_string() }))?;
+        Ok(())
+    }
+
+    /// Move a tab to a new position in its workspace.
+    pub fn move_tab(&self, tab_id: uuid::Uuid, new_index: usize) -> Result<(), DaemonError> {
+        self.rpc(
+            "move_tab",
+            serde_json::json!({
+                "tab_id": tab_id.to_string(),
+                "new_index": new_index,
+            }),
+        )?;
+        Ok(())
+    }
+
+    /// Retrieve the full layout snapshot from the daemon.
+    pub fn get_layout(&self) -> Result<LayoutInfo, DaemonError> {
+        let result = self.rpc("get_layout", serde_json::json!({}))?;
+
+        let active_workspace =
+            result.get("active_workspace").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+
+        let ws_array = result
+            .get("workspaces")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| DaemonError("get_layout: missing workspaces".into()))?;
+
+        let mut workspaces = Vec::new();
+        for ws in ws_array {
+            let id_str = ws
+                .get("id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| DaemonError("get_layout: workspace missing id".into()))?;
+            let id = uuid::Uuid::parse_str(id_str)
+                .map_err(|e| DaemonError(format!("get_layout: invalid workspace id UUID: {e}")))?;
+            let name = ws.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let active_tab = ws.get("active_tab").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+
+            let tabs_array = ws
+                .get("tabs")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| DaemonError("get_layout: workspace missing tabs".into()))?;
+
+            let mut tabs = Vec::new();
+            for tab in tabs_array {
+                let tab_id_str = tab
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| DaemonError("get_layout: tab missing id".into()))?;
+                let tab_id = uuid::Uuid::parse_str(tab_id_str).map_err(|e| {
+                    DaemonError(format!("get_layout: invalid tab id UUID: {e}"))
+                })?;
+                let title = tab.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let pane_tree_val = tab
+                    .get("pane_tree")
+                    .ok_or_else(|| DaemonError("get_layout: tab missing pane_tree".into()))?;
+                let pane_tree = parse_pane_tree(pane_tree_val)?;
+                tabs.push(TabInfo { tab_id, title, pane_tree });
+            }
+
+            workspaces.push(WorkspaceInfo { id, name, active_tab, tabs });
+        }
+
+        Ok(LayoutInfo { active_workspace, workspaces })
     }
 
     /// Resize a pane in the daemon.
@@ -251,14 +391,10 @@ impl DaemonClient {
             lines_val.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect();
 
         let cursor = result.get("cursor");
-        let cursor_row = cursor
-            .and_then(|c| c.get("row"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as usize;
-        let cursor_col = cursor
-            .and_then(|c| c.get("col"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as usize;
+        let cursor_row =
+            cursor.and_then(|c| c.get("row")).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let cursor_col =
+            cursor.and_then(|c| c.get("col")).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
 
         Ok(ScreenSnapshot { lines, cursor_row, cursor_col })
     }
@@ -296,14 +432,9 @@ impl DaemonClient {
 
         let mut infos = Vec::new();
         for d in devs {
-            let device_id = d
-                .get("device_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+            let device_id = d.get("device_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let name = d.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let paired_at =
-                d.get("paired_at").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let paired_at = d.get("paired_at").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let last_seen = d.get("last_seen").and_then(|v| v.as_str()).map(|s| s.to_string());
             infos.push(DeviceInfo { device_id, name, paired_at, last_seen });
         }
@@ -328,10 +459,8 @@ impl DaemonClient {
     /// Get the current pairing info (node ID + QR PNG as base64).
     pub fn get_pairing_info(&self) -> Result<PairingInfo, DaemonError> {
         let result = self.rpc("get_pairing_info", serde_json::json!({}))?;
-        let node_id =
-            result.get("node_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let machine =
-            result.get("machine").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let node_id = result.get("node_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let machine = result.get("machine").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let qr_png_base64 = result
             .get("qr_png_base64")
             .and_then(|v| v.as_str())
@@ -354,15 +483,50 @@ impl DaemonClient {
         let socket_path = self.socket_path.clone();
 
         self.runtime.spawn(async move {
-            if let Err(e) =
-                subscribe_output_task(socket_path, pane_id, tx).await
-            {
+            if let Err(e) = subscribe_output_task(socket_path, pane_id, tx).await {
                 warn!("subscribe_output task error for pane {pane_id}: {e}");
             }
         });
 
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Private helpers
+// ---------------------------------------------------------------------------
+
+/// Parse a `PaneTreeNode` from a JSON `Value` produced by the daemon's
+/// `get_layout` response.
+///
+/// The JSON shape mirrors `PaneTreeLayout`'s externally-tagged serde repr:
+/// - `{"Leaf": {"pane_id": "..."}}` → `PaneTreeNode::Leaf`
+/// - `{"Split": {"direction":"...","ratio":...,"first":{...},"second":{...}}}` → `PaneTreeNode::Split`
+fn parse_pane_tree(v: &Value) -> Result<PaneTreeNode, DaemonError> {
+    if let Some(leaf) = v.get("Leaf") {
+        let pane_id_str = leaf
+            .get("pane_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| DaemonError("parse_pane_tree: Leaf missing pane_id".into()))?;
+        let uuid = uuid::Uuid::parse_str(pane_id_str)
+            .map_err(|e| DaemonError(format!("parse_pane_tree: invalid pane_id UUID: {e}")))?;
+        return Ok(PaneTreeNode::Leaf { pane_id: PaneId(uuid) });
+    }
+    if let Some(split) = v.get("Split") {
+        let direction =
+            split.get("direction").and_then(|v| v.as_str()).unwrap_or("horizontal").to_string();
+        let ratio = split.get("ratio").and_then(|v| v.as_f64()).unwrap_or(0.5) as f32;
+        let first_val = split
+            .get("first")
+            .ok_or_else(|| DaemonError("parse_pane_tree: Split missing first".into()))?;
+        let second_val = split
+            .get("second")
+            .ok_or_else(|| DaemonError("parse_pane_tree: Split missing second".into()))?;
+        let first = Box::new(parse_pane_tree(first_val)?);
+        let second = Box::new(parse_pane_tree(second_val)?);
+        return Ok(PaneTreeNode::Split { direction, ratio, first, second });
+    }
+    Err(DaemonError(format!("parse_pane_tree: unrecognized shape: {v}")))
 }
 
 /// Background tokio task that drives the `subscribe_output` streaming connection.

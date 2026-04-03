@@ -107,6 +107,9 @@ pub mod methods {
     pub const ENABLE_PAIRING: &str = "enable_pairing";
     // VT snapshot methods (T-058).
     pub const PRESEED_SNAPSHOT: &str = "preseed_snapshot";
+    // Layout query + mutation methods (T-062).
+    pub const GET_LAYOUT: &str = "get_layout";
+    pub const MOVE_TAB: &str = "move_tab";
 }
 
 #[cfg(test)]
