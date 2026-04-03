@@ -90,6 +90,7 @@ qa-tools = []
 forgetty-core = { path = "crates/forgetty-core" }
 forgetty-config = { path = "crates/forgetty-config" }
 forgetty-gtk = { path = "crates/forgetty-gtk" }
+forgetty-pty = { path = "crates/forgetty-pty" }
 forgetty-session = { path = "crates/forgetty-session" }
 forgetty-socket = { path = "crates/forgetty-socket" }
 forgetty-sync = { path = "crates/forgetty-sync" }

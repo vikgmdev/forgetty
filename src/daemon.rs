@@ -30,6 +30,7 @@ use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use forgetty_config::{load_config, Config};
+use forgetty_pty::PtySize;
 use forgetty_session::{SessionEvent, SessionManager};
 use forgetty_socket::SocketServer;
 use forgetty_sync::{
@@ -185,6 +186,54 @@ async fn main_async() -> anyhow::Result<()> {
     // Create the platform-agnostic session manager.
     let session_manager = Arc::new(SessionManager::new());
 
+    // Cold-start restore: reload `default.json` into the live SessionLayout.
+    //
+    // This runs synchronously before the socket server starts accepting connections
+    // so that by the time GTK connects and calls `get_layout`, the daemon's layout
+    // already reflects the last-saved session. Failures are non-fatal — a fresh
+    // start (empty layout) is acceptable if the file is absent or corrupt.
+    //
+    // Split structure is not reconstructed here (T-064 scope): each leaf pane in
+    // the session file becomes a flat top-level tab in the daemon. The GTK client
+    // will still see individual pane tabs and display them correctly. Full split
+    // tree restore across daemon restarts is a future improvement.
+    {
+        let default_size = PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
+        match forgetty_workspace::load_session() {
+            Ok(Some(state)) if !state.workspaces.is_empty() => {
+                let total: usize = state.workspaces.iter().map(|ws| ws.tabs.len()).count();
+                info!("cold-start restore: found {} workspace(s), {} tab(s) total",
+                    state.workspaces.len(), total);
+                for (ws_idx, workspace) in state.workspaces.iter().enumerate() {
+                    for tab in &workspace.tabs {
+                        // Collect leaf CWDs from this tab's pane tree.
+                        let leaf_cwds = collect_leaf_cwds(&tab.pane_tree);
+                        for cwd in leaf_cwds {
+                            let effective_cwd = if cwd.is_dir() { Some(cwd) } else { None };
+                            match session_manager.create_tab(ws_idx, effective_cwd, default_size) {
+                                Ok((pane_id, _tab_id)) => {
+                                    debug!("cold-start restore: created pane {pane_id} for workspace {ws_idx}");
+                                }
+                                Err(e) => {
+                                    warn!("cold-start restore: create_tab failed for workspace {ws_idx}: {e}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(Some(_)) => {
+                debug!("cold-start restore: session file has no workspaces, starting fresh");
+            }
+            Ok(None) => {
+                debug!("cold-start restore: no session file found, starting fresh");
+            }
+            Err(e) => {
+                warn!("cold-start restore: failed to load session file: {e}");
+            }
+        }
+    }
+
     // Resolve the socket path.
     let socket_path = args.socket_path.unwrap_or_else(default_socket_path);
 
@@ -228,7 +277,8 @@ async fn main_async() -> anyhow::Result<()> {
                     | Ok(SessionEvent::TabCreated { .. })
                     | Ok(SessionEvent::TabClosed { .. })
                     | Ok(SessionEvent::PaneSplit { .. })
-                    | Ok(SessionEvent::TabMoved { .. }) => {
+                    | Ok(SessionEvent::TabMoved { .. })
+                    | Ok(SessionEvent::ActiveTabChanged { .. }) => {
                         dirty.store(true, Ordering::Relaxed);
                     }
                     Ok(_) => {}
@@ -355,5 +405,20 @@ fn default_socket_path() -> PathBuf {
         PathBuf::from(runtime_dir).join("forgetty.sock")
     } else {
         PathBuf::from("/tmp/forgetty.sock")
+    }
+}
+
+/// Walk a `PaneTreeState` recursively and collect all leaf CWDs.
+///
+/// Used by cold-start restore to flatten the saved pane tree into individual
+/// tabs. Split structure is lost on cold-start; each leaf becomes a flat tab.
+fn collect_leaf_cwds(tree: &forgetty_workspace::PaneTreeState) -> Vec<std::path::PathBuf> {
+    match tree {
+        forgetty_workspace::PaneTreeState::Leaf { cwd, .. } => vec![cwd.clone()],
+        forgetty_workspace::PaneTreeState::Split { first, second, .. } => {
+            let mut cwds = collect_leaf_cwds(first);
+            cwds.extend(collect_leaf_cwds(second));
+            cwds
+        }
     }
 }
