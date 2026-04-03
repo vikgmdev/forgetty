@@ -111,6 +111,8 @@ pub mod methods {
     // Layout query + mutation methods (T-062).
     pub const GET_LAYOUT: &str = "get_layout";
     pub const MOVE_TAB: &str = "move_tab";
+    // Single-pane close (T-065): closes only one pane within a split.
+    pub const CLOSE_PANE: &str = "close_pane";
 }
 
 #[cfg(test)]

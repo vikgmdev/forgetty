@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use std::path::PathBuf;
 
-use crate::daemon_client::{DaemonClient, LayoutInfo, PaneTreeNode};
+use crate::daemon_client::{DaemonClient, LayoutEvent, LayoutInfo, PaneTreeNode};
 use crate::terminal::NotificationPayload;
 use forgetty_config::{load_config, Config, NotificationMode};
 use forgetty_watcher::ConfigWatcher;
@@ -86,6 +86,13 @@ type FocusTracker = Rc<RefCell<String>>;
 /// Removing the key (or setting an empty title) re-enables automatic CWD polling.
 type CustomTitles = Rc<RefCell<HashSet<String>>>;
 
+/// Maps a tab page's identity key (see `page_identity_key()`) to the daemon tab UUID.
+///
+/// Populated in `add_new_tab` when the daemon returns a `tab_id`.
+/// Used by the `page-reordered` handler to send `move_tab` RPCs.
+/// Keys are removed on tab close.
+type TabIdMap = Rc<RefCell<HashMap<String, uuid::Uuid>>>;
+
 /// Per-workspace GTK state -- owns the TabView and associated state for one workspace.
 struct WorkspaceView {
     /// Unique ID matching the Workspace in the session file.
@@ -100,6 +107,8 @@ struct WorkspaceView {
     focus_tracker: FocusTracker,
     /// Custom title tracker for this workspace.
     custom_titles: CustomTitles,
+    /// Maps page identity key → daemon tab UUID (daemon mode only).
+    tab_id_map: TabIdMap,
 }
 
 /// Shared state tracking all workspaces and which is active.
@@ -445,6 +454,7 @@ fn build_ui(
     let initial_tab_states: TabStateMap = Rc::new(RefCell::new(HashMap::new()));
     let initial_focus_tracker: FocusTracker = Rc::new(RefCell::new(String::new()));
     let initial_custom_titles: CustomTitles = Rc::new(RefCell::new(HashSet::new()));
+    let initial_tab_id_map: TabIdMap = Rc::new(RefCell::new(HashMap::new()));
 
     let workspace_manager: WorkspaceManager = Rc::new(RefCell::new(WorkspaceManagerInner {
         workspaces: vec![WorkspaceView {
@@ -454,6 +464,7 @@ fn build_ui(
             tab_states: Rc::clone(&initial_tab_states),
             focus_tracker: Rc::clone(&initial_focus_tracker),
             custom_titles: Rc::clone(&initial_custom_titles),
+            tab_id_map: Rc::clone(&initial_tab_id_map),
         }],
         active_index: 0,
     }));
@@ -464,6 +475,7 @@ fn build_ui(
     let tab_states = Rc::clone(&initial_tab_states);
     let focus_tracker = Rc::clone(&initial_focus_tracker);
     let _custom_titles = Rc::clone(&initial_custom_titles);
+    let tab_id_map = Rc::clone(&initial_tab_id_map);
 
     // Shared config -- updated on hot reload, read by new tab/split creation.
     // All action closures that create terminals capture a clone of this Rc.
@@ -580,6 +592,29 @@ fn build_ui(
         });
     }
 
+    // --- Tab drag reorder → move_tab RPC (daemon mode only) ---
+    // When the user drags a tab to a new position in the TabBar, send a
+    // `move_tab` RPC so the daemon updates its SessionLayout.
+    // The adw::TabView handles the visual reorder automatically; we just
+    // need to tell the daemon.
+    if let Some(ref dc_reorder) = daemon_client {
+        let dc_ro = Arc::clone(dc_reorder);
+        let tim_ro = Rc::clone(&tab_id_map);
+        initial_tab_view.connect_page_reordered(move |_tv, page, new_position| {
+            let page_key = page_identity_key(page);
+            let tab_id = tim_ro.borrow().get(&page_key).copied();
+            if let Some(tid) = tab_id {
+                if let Err(e) = dc_ro.move_tab(tid, new_position as usize) {
+                    tracing::warn!("move_tab RPC failed for tab {tid}: {e}");
+                }
+            } else {
+                tracing::debug!(
+                    "page-reordered: no tab_id found for page key {page_key}, skipping move_tab RPC"
+                );
+            }
+        });
+    }
+
     // --- New tab action (Ctrl+Shift+T) ---
     {
         let config_action = Rc::clone(&shared_config);
@@ -605,6 +640,7 @@ fn build_ui(
                 None,
                 None,
                 dc_newtab.clone(),
+                &ws.tab_id_map,
             );
         });
         window.add_action(&action);
@@ -1014,7 +1050,9 @@ fn build_ui(
         let dc_quit = daemon_client.clone();
         let action = gio::SimpleAction::new("quit", None);
         action.connect_activate(move |_action, _param| {
-            if !skip_save_quit.get() {
+            // In daemon mode, the daemon writes its own session file on every mutation
+            // (T-061). GTK must not overwrite it.
+            if dc_quit.is_none() && !skip_save_quit.get() {
                 save_all_workspaces(&wm_quit, &win_quit_save);
             }
             // Only kill PTYs in self-contained mode (no daemon).
@@ -1267,6 +1305,7 @@ fn build_ui(
             launch.working_directory.as_deref(),
             launch.command.as_deref(),
             daemon_client.clone(),
+            &ws.tab_id_map,
         );
         drop(mgr);
     }
@@ -1285,8 +1324,8 @@ fn build_ui(
         let skip_save_close = Rc::clone(&skip_session_save);
         let dc_window_close = daemon_client.clone();
         window.connect_close_request(move |_win| {
-            // Save session in both modes (daemon needs it for ordered reconnect).
-            if !skip_save_close.get() {
+            // In daemon mode, the daemon writes its own session file — GTK must not.
+            if dc_window_close.is_none() && !skip_save_close.get() {
                 save_all_workspaces(&wm_close, &win_close_save);
             }
             if dc_window_close.is_none() {
@@ -1315,8 +1354,8 @@ fn build_ui(
             let dc_signal = daemon_client.clone();
             glib::unix_signal_add_local(signum, move || {
                 tracing::info!("Received {name} (signal {signum}), initiating clean shutdown");
-                // Save session in both modes (daemon needs it for ordered reconnect).
-                if !skip_save_signal.get() {
+                // In daemon mode, the daemon writes its own session file — GTK must not.
+                if dc_signal.is_none() && !skip_save_signal.get() {
                     save_all_workspaces(&wm_signal, &win_signal_save);
                 }
                 if dc_signal.is_none() {
@@ -1350,7 +1389,9 @@ fn build_ui(
     // Periodically saves ALL workspaces so crash recovery loses at most 30s.
     // Uses a weak window reference to stop the timer after window destruction.
     // Skipped when launched with CLI overrides to avoid overwriting the real session.
-    if !has_cli_override {
+    // In daemon mode: the daemon writes its own session file on every mutation (T-061)
+    // so this timer is not needed and must not run.
+    if !has_cli_override && daemon_client.is_none() {
         let wm_autosave = Rc::clone(&workspace_manager);
         let window_weak_save = window.downgrade();
         glib::timeout_add_local(Duration::from_secs(AUTO_SAVE_SECS), move || {
@@ -1360,6 +1401,45 @@ fn build_ui(
             save_all_workspaces(&wm_autosave, &win);
             glib::ControlFlow::Continue
         });
+    }
+
+    // --- subscribe_layout background stream + GLib poll timer (daemon mode only) ---
+    //
+    // Opens a persistent `subscribe_layout` connection to the daemon. A background
+    // tokio task reads layout notifications and delivers them via an mpsc channel.
+    // A GLib timer polls the channel and applies idempotent widget updates.
+    //
+    // The only event handled here is `TabCreated` from external sources (e.g. Android
+    // remote view). Events for panes/tabs that GTK already built synchronously (via
+    // the action handlers above) are silently ignored.
+    //
+    // AC-6: "subscribe_layout subscription established in daemon mode."
+    if let Some(ref dc_layout) = daemon_client {
+        let (layout_tx, layout_rx) =
+            std::sync::mpsc::channel::<LayoutEvent>();
+        if let Err(e) = dc_layout.subscribe_layout(layout_tx) {
+            tracing::warn!("subscribe_layout failed to start: {e}");
+        } else {
+            let wm_layout = Rc::clone(&workspace_manager);
+            let layout_rx = std::sync::Mutex::new(layout_rx);
+            // Drain layout events every 200ms on the GLib main thread.
+            glib::timeout_add_local(Duration::from_millis(200), move || {
+                let rx = layout_rx.lock().unwrap_or_else(|e| e.into_inner());
+                loop {
+                    match rx.try_recv() {
+                        Ok(event) => {
+                            handle_layout_event(event, &wm_layout);
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            tracing::info!("subscribe_layout stream closed, stopping poll timer");
+                            return glib::ControlFlow::Break;
+                        }
+                    }
+                }
+                glib::ControlFlow::Continue
+            });
+        }
     }
 
     // --- Config hot reload timer ---
@@ -1617,6 +1697,69 @@ fn save_all_workspaces(workspace_manager: &WorkspaceManager, window: &adw::Appli
     }
 }
 
+/// Process a single `LayoutEvent` delivered by the `subscribe_layout` background task.
+///
+/// This function runs on the GLib main thread (via the poll timer). All widget
+/// mutations happen synchronously. Events for tabs/panes already present in the
+/// widget tree are silently ignored (idempotency — spec Section 4).
+///
+/// Currently handles `TabCreated` for external sources (e.g. Android remote view).
+/// Other events (`TabClosed`, `PaneSplit`, `TabMoved`, `ActiveTabChanged`) are
+/// logged but not acted upon — GTK already processed these synchronously when it
+/// sent the original RPC, so acting again would double-execute.
+fn handle_layout_event(event: LayoutEvent, workspace_manager: &WorkspaceManager) {
+    match event {
+        LayoutEvent::TabCreated { workspace_idx, tab_id, pane_id } => {
+            // Check if this tab is already in the widget tree (GTK created it
+            // synchronously when it sent the new_tab RPC). If so, skip.
+            let already_exists = {
+                let Ok(mgr) = workspace_manager.try_borrow() else { return };
+                if workspace_idx >= mgr.workspaces.len() {
+                    return;
+                }
+                let ws = &mgr.workspaces[workspace_idx];
+                let found = ws.tab_id_map.borrow().values().any(|&tid| tid == tab_id);
+                found
+            };
+
+            if already_exists {
+                tracing::debug!(
+                    "subscribe_layout: TabCreated {tab_id} already in widget tree — skipping"
+                );
+                return;
+            }
+
+            // External tab creation (e.g. Android pairing, socat test). Log it for now.
+            // Full implementation would call add_new_tab / add_tab_for_pane here.
+            // This is safe as a no-op because we do not have a daemon_client reference
+            // here — the full implementation is deferred to T-066 (Android pairing).
+            tracing::info!(
+                "subscribe_layout: external TabCreated ws={workspace_idx} tab={tab_id} pane={pane_id} (deferred widget build)"
+            );
+        }
+        LayoutEvent::TabClosed { workspace_idx, tab_id } => {
+            tracing::debug!(
+                "subscribe_layout: TabClosed ws={workspace_idx} tab={tab_id} (already handled synchronously)"
+            );
+        }
+        LayoutEvent::PaneSplit { tab_id, parent_pane_id, new_pane_id, direction } => {
+            tracing::debug!(
+                "subscribe_layout: PaneSplit tab={tab_id} parent={parent_pane_id} new={new_pane_id} dir={direction} (already handled synchronously)"
+            );
+        }
+        LayoutEvent::TabMoved { workspace_idx, tab_id, new_index } => {
+            tracing::debug!(
+                "subscribe_layout: TabMoved ws={workspace_idx} tab={tab_id} new_idx={new_index} (already handled synchronously)"
+            );
+        }
+        LayoutEvent::ActiveTabChanged { workspace_idx, tab_idx } => {
+            tracing::debug!(
+                "subscribe_layout: ActiveTabChanged ws={workspace_idx} tab_idx={tab_idx} (already handled synchronously)"
+            );
+        }
+    }
+}
+
 /// Kill all PTYs across all workspaces.
 fn kill_all_workspace_ptys(workspace_manager: &WorkspaceManager, reason: &str) {
     let Ok(mgr) = workspace_manager.try_borrow() else {
@@ -1804,8 +1947,8 @@ fn build_widgets_from_layout(
 
     tracing::info!("build_widgets_from_layout: building {} tab(s)", ws_info.tabs.len());
 
-    let mut created_pages: Vec<adw::TabPage> = Vec::new();
-    let mut last_first_da: Option<gtk4::DrawingArea> = None;
+    // (page, first_da) pairs — we need both to select and focus the active tab.
+    let mut created: Vec<(adw::TabPage, gtk4::DrawingArea)> = Vec::new();
 
     for tab in &ws_info.tabs {
         let Some((root_widget, first_da)) = build_widget_from_pane_tree(
@@ -1840,22 +1983,18 @@ fn build_widgets_from_layout(
             window,
         );
 
-        created_pages.push(page);
-        last_first_da = Some(first_da);
+        created.push((page, first_da));
     }
 
-    if created_pages.is_empty() {
+    if created.is_empty() {
         return false;
     }
 
     // Select the active tab and focus its first DrawingArea.
-    let active_tab_idx = ws_info.active_tab.min(created_pages.len().saturating_sub(1));
-    ws.tab_view.set_selected_page(&created_pages[active_tab_idx]);
-
-    // Focus the first drawing area of the active tab's first page.
-    if let Some(da) = last_first_da {
-        da.grab_focus();
-    }
+    let active_tab_idx = ws_info.active_tab.min(created.len().saturating_sub(1));
+    let (ref active_page, ref active_da) = created[active_tab_idx];
+    ws.tab_view.set_selected_page(active_page);
+    active_da.grab_focus();
 
     true
 }
@@ -2117,6 +2256,7 @@ fn restore_all_workspaces(
             tab_states,
             focus_tracker,
             custom_titles,
+            tab_id_map: Rc::new(RefCell::new(HashMap::new())),
         });
     }
 
@@ -2356,6 +2496,7 @@ fn add_new_tab(
     working_dir: Option<&std::path::Path>,
     command: Option<&[String]>,
     daemon_client: Option<Arc<DaemonClient>>,
+    tab_id_map: &TabIdMap,
 ) {
     let on_exit = make_on_exit_callback(tab_view, tab_states, window, daemon_client.clone());
     let on_notify = make_on_notify_callback(tab_view, tab_states, window);
@@ -2363,7 +2504,7 @@ fn add_new_tab(
     // --- Daemon mode: create pane via RPC and subscribe to output. ---
     if let Some(ref dc) = daemon_client {
         match dc.new_tab() {
-            Ok((pane_id, _tab_id)) => {
+            Ok((pane_id, tab_id)) => {
                 let (mpsc_tx, mpsc_rx) = std::sync::mpsc::channel::<Vec<u8>>();
                 if let Err(e) = dc.subscribe_output(pane_id, mpsc_tx) {
                     tracing::warn!("subscribe_output failed for new pane {pane_id}: {e}");
@@ -2395,6 +2536,9 @@ fn add_new_tab(
                         container.set_vexpand(true);
                         container.append(&pane_vbox);
                         let page = tab_view.append(&container);
+                        // Store tab_id in the map so page-reordered can send move_tab RPC.
+                        let page_key = page_identity_key(&page);
+                        tab_id_map.borrow_mut().insert(page_key, tab_id);
                         page.set_title("shell");
                         tab_view.set_selected_page(&page);
                         drawing_area.grab_focus();
@@ -2559,30 +2703,57 @@ fn split_pane(
     let on_notify = make_on_notify_callback(tab_view, tab_states, window);
 
     // Determine whether to create via daemon or local PTY.
+    //
+    // Daemon mode: call dc.split_pane(focused_pane_id, direction_str) — this tells
+    // the daemon to create a sibling PTY and update SessionLayout. The new pane is
+    // NOT a new top-level tab (that was the old bug). Returns the new PaneId.
     let new_pane_result: Result<
         (gtk4::Box, gtk4::DrawingArea, Rc<RefCell<TerminalState>>),
         String,
     > = if let Some(ref dc) = daemon_client {
-        match dc.new_tab() {
-            Ok((pane_id, _tab_id)) => {
-                let (mpsc_tx, mpsc_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-                if let Err(e) = dc.subscribe_output(pane_id, mpsc_tx) {
-                    tracing::warn!("subscribe_output failed for split pane {pane_id}: {e}");
+        // Get the daemon PaneId for the currently focused DrawingArea.
+        let focused_daemon_pane_id = {
+            tab_states
+                .borrow()
+                .get(&focused_name)
+                .and_then(|s| s.try_borrow().ok())
+                .and_then(|s| s.daemon_pane_id)
+        };
+
+        let direction_str = match orientation {
+            gtk4::Orientation::Horizontal => "horizontal",
+            _ => "vertical",
+        };
+
+        match focused_daemon_pane_id {
+            Some(parent_pane_id) => match dc.split_pane(parent_pane_id, direction_str) {
+                Ok(new_pane_id) => {
+                    let (mpsc_tx, mpsc_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+                    if let Err(e) = dc.subscribe_output(new_pane_id, mpsc_tx) {
+                        tracing::warn!("subscribe_output failed for split pane {new_pane_id}: {e}");
+                    }
+                    let snapshot = dc.get_screen(new_pane_id).ok();
+                    terminal::create_terminal_for_pane(
+                        config,
+                        new_pane_id,
+                        Arc::clone(dc),
+                        mpsc_rx,
+                        snapshot.as_ref(),
+                        None,
+                        Some(on_exit),
+                        Some(on_notify),
+                    )
                 }
-                let snapshot = dc.get_screen(pane_id).ok();
-                terminal::create_terminal_for_pane(
-                    config,
-                    pane_id,
-                    Arc::clone(dc),
-                    mpsc_rx,
-                    snapshot.as_ref(),
-                    None,
-                    Some(on_exit),
-                    Some(on_notify),
-                )
-            }
-            Err(e) => {
-                tracing::warn!("new_tab RPC failed for split: {e}; falling back to local PTY");
+                Err(e) => {
+                    tracing::warn!(
+                        "split_pane RPC failed: {e}; falling back to local PTY"
+                    );
+                    terminal::create_terminal(config, Some(on_exit), Some(on_notify), None, None)
+                }
+            },
+            None => {
+                // Focused pane has no daemon_pane_id — fall back to local PTY.
+                tracing::warn!("split_pane: focused pane has no daemon_pane_id, falling back to local PTY");
                 terminal::create_terminal(config, Some(on_exit), Some(on_notify), None, None)
             }
         }
@@ -2802,7 +2973,8 @@ fn close_pane_by_name(
     // If this is the only pane in the tab, close the tab
     if leaves.len() <= 1 {
         // Kill or close the PTY (local or daemon).
-        kill_or_daemon_close_pane(pane_name, tab_states, daemon_client.as_deref());
+        // is_sole_pane=true → close_tab RPC (or local kill)
+        kill_or_daemon_close_pane(pane_name, tab_states, daemon_client.as_deref(), true);
 
         if tab_view.n_pages() <= 1 {
             window.close();
@@ -2845,7 +3017,8 @@ fn close_pane_by_name(
     parent_paned.set_end_child(gtk4::Widget::NONE);
 
     // Kill or close the PTY (local or daemon) and remove from registry.
-    kill_or_daemon_close_pane(pane_name, tab_states, daemon_client.as_deref());
+    // is_sole_pane=false → close_pane RPC (pane is part of a split)
+    kill_or_daemon_close_pane(pane_name, tab_states, daemon_client.as_deref(), false);
 
     // Replace the Paned with the surviving sibling.
     // Check if the Paned was the direct content of the pane container.
@@ -3387,19 +3560,30 @@ fn kill_all_ptys(tab_states: &TabStateMap, reason: &str) {
     }
 }
 
-/// Kill a local PTY or send close_tab RPC to daemon, then remove from registry.
+/// Kill a local PTY or send the appropriate close RPC to daemon, then remove from registry.
+///
+/// `is_sole_pane` indicates whether this pane is the only leaf in its tab:
+/// - `true`  → send `close_tab_by_pane_id` (closes the whole tab)
+/// - `false` → send `close_pane` (closes only this split leaf; sibling promoted by daemon)
 fn kill_or_daemon_close_pane(
     pane_name: &str,
     tab_states: &TabStateMap,
     daemon_client: Option<&DaemonClient>,
+    is_sole_pane: bool,
 ) {
     if let Some(dc) = daemon_client {
-        // In daemon mode: look up the PaneId from the TerminalState and send close_tab RPC.
+        // In daemon mode: look up the PaneId from the TerminalState and send the correct RPC.
         if let Some(state_rc) = tab_states.borrow().get(pane_name).cloned() {
             if let Ok(s) = state_rc.try_borrow() {
                 if let Some(pane_id) = s.daemon_pane_id {
-                    if let Err(e) = dc.close_tab_by_pane_id(pane_id) {
-                        tracing::warn!("close_tab RPC failed for {pane_name}: {e}");
+                    if is_sole_pane {
+                        if let Err(e) = dc.close_tab_by_pane_id(pane_id) {
+                            tracing::warn!("close_tab RPC failed for {pane_name}: {e}");
+                        }
+                    } else {
+                        if let Err(e) = dc.close_pane(pane_id) {
+                            tracing::warn!("close_pane RPC failed for {pane_name}: {e}");
+                        }
                     }
                 }
             }
@@ -3411,6 +3595,9 @@ fn kill_or_daemon_close_pane(
 }
 
 /// Walk a widget subtree, send close_tab RPC for each pane, remove from registry.
+///
+/// Used when an entire tab is being closed (e.g. tab-bar X button). All panes
+/// in the subtree are treated as "sole pane" so that each sends a `close_tab` RPC.
 fn daemon_close_panes_in_subtree(
     widget: &gtk4::Widget,
     tab_states: &TabStateMap,
@@ -3418,7 +3605,8 @@ fn daemon_close_panes_in_subtree(
 ) {
     if let Some(da) = widget.downcast_ref::<gtk4::DrawingArea>() {
         let pane_name = da.widget_name().to_string();
-        kill_or_daemon_close_pane(&pane_name, tab_states, Some(daemon_client));
+        // is_sole_pane=true: we're closing the whole tab, so use close_tab RPC.
+        kill_or_daemon_close_pane(&pane_name, tab_states, Some(daemon_client), true);
         return;
     }
 
@@ -4953,6 +5141,7 @@ fn create_and_switch_to_new_workspace(
     let new_tab_states: TabStateMap = Rc::new(RefCell::new(HashMap::new()));
     let new_focus_tracker: FocusTracker = Rc::new(RefCell::new(String::new()));
     let new_custom_titles: CustomTitles = Rc::new(RefCell::new(HashSet::new()));
+    let new_tab_id_map: TabIdMap = Rc::new(RefCell::new(HashMap::new()));
 
     wire_tab_view_handlers(&new_tv, &new_tab_states, &new_focus_tracker, window);
 
@@ -4967,6 +5156,7 @@ fn create_and_switch_to_new_workspace(
         None,
         None,
         None, // new workspaces are always local, no daemon client
+        &new_tab_id_map,
     );
 
     let new_index = {
@@ -4996,6 +5186,7 @@ fn create_and_switch_to_new_workspace(
             tab_states: new_tab_states,
             focus_tracker: new_focus_tracker,
             custom_titles: new_custom_titles,
+            tab_id_map: new_tab_id_map,
         });
 
         let idx = mgr.workspaces.len() - 1;
