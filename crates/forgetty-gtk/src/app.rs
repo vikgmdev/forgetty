@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use std::path::PathBuf;
 
-use crate::daemon_client::{DaemonClient, PaneInfo};
+use crate::daemon_client::{DaemonClient, LayoutInfo, PaneTreeNode};
 use crate::terminal::NotificationPayload;
 use forgetty_config::{load_config, Config, NotificationMode};
 use forgetty_watcher::ConfigWatcher;
@@ -1195,285 +1195,28 @@ fn build_ui(
     let mut restored = false;
 
     if let Some(ref dc) = daemon_client {
-        // Daemon mode: session-file-ordered reconnect.
+        // Daemon mode: call get_layout → build widget tree from the daemon's live state.
         //
-        // Algorithm:
-        //   1. Call list_tabs → build UUID→PaneInfo map of live daemon panes.
-        //   2. Load session file → ordered tab list with pane_ids.
-        //   3. For each session tab:
-        //      - pane_id matches live map  → reconnect it (remove from map)
-        //      - pane gone / no pane_id   → create a fresh daemon pane in its slot
-        //   4. Append remaining live panes (opened since last save) as extra tabs.
-        //   5. No session file → fall through to "create one new tab" path.
-        match dc.list_tabs() {
-            Ok(live_panes) if !live_panes.is_empty() => {
-                tracing::info!("Reconnecting to {} live daemon pane(s)", live_panes.len());
-                let Ok(mgr) = workspace_manager.try_borrow() else {
-                    tracing::warn!("Failed to borrow workspace_manager for daemon reconcile");
-                    return;
-                };
-                let ws = &mgr.workspaces[0];
-
-                // UUID→PaneInfo map for O(1) session-file matching.
-                let mut pane_map: HashMap<uuid::Uuid, PaneInfo> =
-                    live_panes.into_iter().map(|p| (p.pane_id.0, p)).collect();
-
-                // Load the session file to get ordered tabs (may be absent).
-                let session_tabs: Vec<TabState> = forgetty_workspace::load_session()
-                    .ok()
-                    .flatten()
-                    .and_then(|s| s.workspaces.into_iter().next())
-                    .map(|w| w.tabs)
-                    .unwrap_or_default();
-
-                if !session_tabs.is_empty() {
-                    // Reconnect each session tab, preserving its split layout.
-                    for tab in &session_tabs {
-                        // Legacy compat: T-055 session files stored the pane UUID at the
-                        // tab level instead of per-leaf. Pass it as fallback to
-                        // reconnect_pane_tree so those files still reconnect correctly.
-                        let legacy_pane_id = tab.pane_id;
-                        let Some((root_widget, first_da)) = reconnect_pane_tree(
-                            &tab.pane_tree,
-                            &mut pane_map,
-                            dc,
-                            config,
-                            &ws.tab_states,
-                            &ws.focus_tracker,
-                            &ws.custom_titles,
-                            &window,
-                            &ws.tab_view,
-                            legacy_pane_id,
-                        ) else {
-                            tracing::warn!("reconnect_pane_tree failed for tab {:?}", tab.title);
-                            continue;
-                        };
-
-                        let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-                        container.set_hexpand(true);
-                        container.set_vexpand(true);
-                        container.append(&root_widget);
-                        let page = ws.tab_view.append(&container);
-                        let tab_title = if tab.title.is_empty() { "shell" } else { &tab.title };
-                        page.set_title(tab_title);
-                        ws.tab_view.set_selected_page(&page);
-                        first_da.grab_focus();
-                        register_title_timer(
-                            &page,
-                            &ws.tab_view,
-                            &ws.tab_states,
-                            &ws.focus_tracker,
-                            &ws.custom_titles,
-                            &window,
-                        );
-                        restored = true;
-                    }
-
-                    // Append any live daemon panes not referenced by any session leaf.
-                    for info in pane_map.into_values() {
-                        let title = if info.title.is_empty() {
-                            "shell".to_string()
-                        } else {
-                            info.title.clone()
-                        };
-                        let cwd = if info.cwd.is_empty() { None } else { Some(info.cwd.clone()) };
-                        let (mpsc_tx, mpsc_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-                        if let Err(e) = dc.subscribe_output(info.pane_id, mpsc_tx) {
-                            tracing::warn!(
-                                "subscribe_output failed for orphan {}: {e}",
-                                info.pane_id
-                            );
-                        }
-                        let on_exit = make_on_exit_callback(
-                            &ws.tab_view,
-                            &ws.tab_states,
-                            &window,
-                            Some(Arc::clone(dc)),
-                        );
-                        let on_notify =
-                            make_on_notify_callback(&ws.tab_view, &ws.tab_states, &window);
-                        let snapshot = dc.get_screen(info.pane_id).ok();
-                        let daemon_cwd = cwd.as_ref().map(PathBuf::from);
-                        match terminal::create_terminal_for_pane(
-                            config,
-                            info.pane_id,
-                            Arc::clone(dc),
-                            mpsc_rx,
-                            snapshot.as_ref(),
-                            daemon_cwd,
-                            Some(on_exit),
-                            Some(on_notify),
-                        ) {
-                            Ok((pane_vbox, drawing_area, state)) => {
-                                let pane_widget_name = next_pane_id();
-                                drawing_area.set_widget_name(&pane_widget_name);
-                                ws.tab_states
-                                    .borrow_mut()
-                                    .insert(pane_widget_name, Rc::clone(&state));
-                                wire_focus_tracking(
-                                    &drawing_area,
-                                    &ws.focus_tracker,
-                                    &ws.tab_view,
-                                    &ws.tab_states,
-                                    &ws.custom_titles,
-                                );
-                                let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-                                container.set_hexpand(true);
-                                container.set_vexpand(true);
-                                container.append(&pane_vbox);
-                                let page = ws.tab_view.append(&container);
-                                page.set_title(&title);
-                                ws.tab_view.set_selected_page(&page);
-                                drawing_area.grab_focus();
-                                register_title_timer(
-                                    &page,
-                                    &ws.tab_view,
-                                    &ws.tab_states,
-                                    &ws.focus_tracker,
-                                    &ws.custom_titles,
-                                    &window,
-                                );
-                                restored = true;
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    "Failed to create terminal for orphan pane {}: {e}",
-                                    info.pane_id
-                                );
-                            }
-                        }
-                    }
-                } else {
-                    // No session file or empty → use live panes in daemon order as flat tabs.
-                    for info in pane_map.into_values() {
-                        let title = if info.title.is_empty() {
-                            "shell".to_string()
-                        } else {
-                            info.title.clone()
-                        };
-                        let cwd = if info.cwd.is_empty() { None } else { Some(info.cwd.clone()) };
-                        let (mpsc_tx, mpsc_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-                        if let Err(e) = dc.subscribe_output(info.pane_id, mpsc_tx) {
-                            tracing::warn!("subscribe_output failed for {}: {e}", info.pane_id);
-                        }
-                        let on_exit = make_on_exit_callback(
-                            &ws.tab_view,
-                            &ws.tab_states,
-                            &window,
-                            Some(Arc::clone(dc)),
-                        );
-                        let on_notify =
-                            make_on_notify_callback(&ws.tab_view, &ws.tab_states, &window);
-                        let snapshot = dc.get_screen(info.pane_id).ok();
-                        let daemon_cwd = cwd.as_ref().map(PathBuf::from);
-                        match terminal::create_terminal_for_pane(
-                            config,
-                            info.pane_id,
-                            Arc::clone(dc),
-                            mpsc_rx,
-                            snapshot.as_ref(),
-                            daemon_cwd,
-                            Some(on_exit),
-                            Some(on_notify),
-                        ) {
-                            Ok((pane_vbox, drawing_area, state)) => {
-                                let pane_widget_name = next_pane_id();
-                                drawing_area.set_widget_name(&pane_widget_name);
-                                ws.tab_states
-                                    .borrow_mut()
-                                    .insert(pane_widget_name, Rc::clone(&state));
-                                wire_focus_tracking(
-                                    &drawing_area,
-                                    &ws.focus_tracker,
-                                    &ws.tab_view,
-                                    &ws.tab_states,
-                                    &ws.custom_titles,
-                                );
-                                let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-                                container.set_hexpand(true);
-                                container.set_vexpand(true);
-                                container.append(&pane_vbox);
-                                let page = ws.tab_view.append(&container);
-                                page.set_title(&title);
-                                ws.tab_view.set_selected_page(&page);
-                                drawing_area.grab_focus();
-                                register_title_timer(
-                                    &page,
-                                    &ws.tab_view,
-                                    &ws.tab_states,
-                                    &ws.focus_tracker,
-                                    &ws.custom_titles,
-                                    &window,
-                                );
-                                restored = true;
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    "Failed to create terminal for daemon pane {}: {e}",
-                                    info.pane_id
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(_) => {
-                tracing::info!("Daemon has no live panes — attempting cold-start session restore");
-                let Ok(mgr) = workspace_manager.try_borrow() else {
-                    return;
-                };
-                let ws = &mgr.workspaces[0];
-
-                let session_tabs: Vec<TabState> = forgetty_workspace::load_session()
-                    .ok()
-                    .flatten()
-                    .and_then(|s| s.workspaces.into_iter().next())
-                    .map(|w| w.tabs)
-                    .unwrap_or_default();
-
-                if !session_tabs.is_empty() {
-                    let mut pane_map: HashMap<uuid::Uuid, PaneInfo> = HashMap::new(); // empty — cold start
-
-                    for tab in &session_tabs {
-                        let legacy_pane_id = tab.pane_id;
-                        let Some((root_widget, first_da)) = reconnect_pane_tree(
-                            &tab.pane_tree,
-                            &mut pane_map,
-                            dc,
-                            config,
-                            &ws.tab_states,
-                            &ws.focus_tracker,
-                            &ws.custom_titles,
-                            &window,
-                            &ws.tab_view,
-                            legacy_pane_id,
-                        ) else {
-                            tracing::warn!("reconnect_pane_tree failed for tab {:?}", tab.title);
-                            continue;
-                        };
-
-                        let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-                        container.set_hexpand(true);
-                        container.set_vexpand(true);
-                        container.append(&root_widget);
-                        let page = ws.tab_view.append(&container);
-                        page.set_title(if tab.title.is_empty() { "shell" } else { &tab.title });
-                        ws.tab_view.set_selected_page(&page);
-                        first_da.grab_focus();
-                        register_title_timer(
-                            &page,
-                            &ws.tab_view,
-                            &ws.tab_states,
-                            &ws.focus_tracker,
-                            &ws.custom_titles,
-                            &window,
-                        );
-                        restored = true;
-                    }
-                }
+        // The daemon is the single source of truth for layout (T-064). No session file
+        // is read in this branch — all pane IDs from get_layout are guaranteed live.
+        //
+        // Flow:
+        //   1. dc.get_layout() → LayoutInfo
+        //   2. Layout has tabs  → build_widgets_from_layout() → restored = true
+        //   3. Layout is empty (or Err) → fall through to !restored block → add_new_tab()
+        match dc.get_layout() {
+            Ok(ref layout) => {
+                tracing::info!("get_layout: received layout from daemon");
+                restored = build_widgets_from_layout(
+                    layout,
+                    dc,
+                    config,
+                    &workspace_manager,
+                    &window,
+                );
             }
             Err(e) => {
-                tracing::warn!("list_tabs RPC failed: {e} — creating initial tab locally");
+                tracing::warn!("get_layout RPC failed: {e} — will create a fresh tab");
             }
         }
     } else if !has_cli_override {
@@ -1712,6 +1455,7 @@ fn read_pane_cwd(state_rc: &Rc<RefCell<TerminalState>>) -> Option<PathBuf> {
 /// Walk a widget subtree and return the daemon pane ID of the first leaf found.
 ///
 /// Used to populate `TabState.pane_id` when snapshotting in daemon mode.
+#[allow(dead_code)]
 fn find_first_daemon_pane_id(
     widget: &gtk4::Widget,
     tab_states: &TabStateMap,
@@ -1884,21 +1628,17 @@ fn kill_all_workspace_ptys(workspace_manager: &WorkspaceManager, reason: &str) {
     }
 }
 
-/// Recursively reconnect a daemon pane tree for a single tab during GTK reopen.
+/// Recursively build a GTK widget tree from a daemon `PaneTreeNode` (T-064).
 ///
-/// Mirrors `build_pane_tree` (self-contained mode) but uses live daemon panes
-/// instead of spawning new PTYs. Each `Leaf` looks up its pane UUID in
-/// `pane_map`, subscribes to the daemon output stream, and creates a
-/// `DrawingArea` connected to the live pane. `Split` nodes recurse and
-/// produce a `gtk::Paned` with the ratio restored via `idle_add_local_once`.
+/// Every `Leaf` pane_id is a live daemon pane — no pane_map lookup needed.
+/// `Split` nodes produce a `gtk::Paned` with the ratio restored via
+/// `idle_add_local_once`.
 ///
-/// `legacy_pane_id` is the `TabState.pane_id` from T-055-era session files
-/// (where pane IDs were stored at the tab level, not per-leaf). It is used as
-/// a fallback when the leaf's own `pane_id` is `None`.
+/// Returns `Some((root_widget, first_leaf_drawing_area))` on success, `None`
+/// if any sub-tree fails (partial split widgets are not displayed).
 #[allow(clippy::too_many_arguments)]
-fn reconnect_pane_tree(
-    tree: &PaneTreeState,
-    pane_map: &mut HashMap<uuid::Uuid, PaneInfo>,
+fn build_widget_from_pane_tree(
+    node: &PaneTreeNode,
     dc: &Arc<DaemonClient>,
     config: &Config,
     tab_states: &TabStateMap,
@@ -1906,78 +1646,28 @@ fn reconnect_pane_tree(
     custom_titles: &CustomTitles,
     window: &adw::ApplicationWindow,
     tab_view: &adw::TabView,
-    legacy_pane_id: Option<uuid::Uuid>,
 ) -> Option<(gtk4::Widget, gtk4::DrawingArea)> {
-    match tree {
-        PaneTreeState::Leaf { cwd, pane_id } => {
-            // Determine which daemon pane to reconnect:
-            // 1. Per-leaf pane_id (new format, T-057+)
-            // 2. Legacy top-level TabState.pane_id (T-055 compat)
-            let uid = pane_id.or(legacy_pane_id);
-
-            let leaf_cwd = if cwd.is_dir() { Some(cwd.as_path()) } else { None };
-
-            let (daemon_pane_id, daemon_cwd, fresh_pane) = if let Some(uid) = uid {
-                if let Some(info) = pane_map.remove(&uid) {
-                    // Live daemon pane found — reconnect it.
-                    let daemon_cwd =
-                        if info.cwd.is_empty() { None } else { Some(PathBuf::from(&info.cwd)) };
-                    (info.pane_id, daemon_cwd, false)
-                } else {
-                    // Pane was closed between GTK close and reopen — fresh pane.
-                    tracing::info!(
-                        "Daemon pane {:?} gone — creating fresh pane for leaf {:?}",
-                        uid,
-                        cwd
-                    );
-                    match dc.new_tab_with_cwd(leaf_cwd) {
-                        Ok((pid, _tab_id)) => (pid, None, true),
-                        Err(e) => {
-                            tracing::warn!("new_tab failed for missing leaf pane: {e}");
-                            return None;
-                        }
-                    }
-                }
-            } else {
-                // No pane_id at all (old session format or self-contained) — fresh pane.
-                match dc.new_tab_with_cwd(leaf_cwd) {
-                    Ok((pid, _tab_id)) => (pid, None, false),
-                    Err(e) => {
-                        tracing::warn!("new_tab failed for legacy leaf: {e}");
-                        return None;
-                    }
-                }
-            };
-
-            // Effective CWD: daemon's live CWD > saved CWD > home.
-            let effective_cwd =
-                daemon_cwd.or_else(|| if cwd.is_dir() { Some(cwd.clone()) } else { None });
-
-            // Pre-seed VT buffer with saved snapshot for fresh panes that had a UUID.
-            if fresh_pane {
-                if let Some(old_uuid) = uid {
-                    if let Err(e) = dc.preseed_snapshot(daemon_pane_id, old_uuid) {
-                        tracing::warn!("preseed_snapshot failed: {e}");
-                    }
-                }
-            }
-
+    match node {
+        PaneTreeNode::Leaf { pane_id } => {
+            // pane_id is a live daemon pane — subscribe directly, no lookup needed.
             let (mpsc_tx, mpsc_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-            if let Err(e) = dc.subscribe_output(daemon_pane_id, mpsc_tx) {
-                tracing::warn!("subscribe_output failed for {}: {e}", daemon_pane_id);
+            if let Err(e) = dc.subscribe_output(*pane_id, mpsc_tx) {
+                tracing::warn!("subscribe_output failed for pane {pane_id}: {e}");
+                return None;
             }
 
-            let on_exit = make_on_exit_callback(tab_view, tab_states, window, Some(Arc::clone(dc)));
+            let snapshot = dc.get_screen(*pane_id).ok();
+            let on_exit =
+                make_on_exit_callback(tab_view, tab_states, window, Some(Arc::clone(dc)));
             let on_notify = make_on_notify_callback(tab_view, tab_states, window);
-            let snapshot = dc.get_screen(daemon_pane_id).ok();
 
             match terminal::create_terminal_for_pane(
                 config,
-                daemon_pane_id,
+                *pane_id,
                 Arc::clone(dc),
                 mpsc_rx,
                 snapshot.as_ref(),
-                effective_cwd,
+                None, // CWD not needed — daemon pane's PTY is already running
                 Some(on_exit),
                 Some(on_notify),
             ) {
@@ -1995,24 +1685,21 @@ fn reconnect_pane_tree(
                     Some((pane_vbox.upcast::<gtk4::Widget>(), drawing_area))
                 }
                 Err(e) => {
-                    tracing::error!(
-                        "Failed to create terminal for daemon pane {daemon_pane_id}: {e}"
-                    );
+                    tracing::error!("Failed to create terminal widget for pane {pane_id}: {e}");
                     None
                 }
             }
         }
 
-        PaneTreeState::Split { direction, ratio, first, second } => {
+        PaneTreeNode::Split { direction, ratio, first, second } => {
             let orientation = if direction == "horizontal" {
                 gtk4::Orientation::Horizontal
             } else {
                 gtk4::Orientation::Vertical
             };
 
-            let first_result = reconnect_pane_tree(
+            let first_result = build_widget_from_pane_tree(
                 first,
-                pane_map,
                 dc,
                 config,
                 tab_states,
@@ -2020,11 +1707,9 @@ fn reconnect_pane_tree(
                 custom_titles,
                 window,
                 tab_view,
-                None,
             );
-            let second_result = reconnect_pane_tree(
+            let second_result = build_widget_from_pane_tree(
                 second,
-                pane_map,
                 dc,
                 config,
                 tab_states,
@@ -2032,7 +1717,6 @@ fn reconnect_pane_tree(
                 custom_titles,
                 window,
                 tab_view,
-                None,
             );
 
             let (Some((first_widget, first_da)), Some((second_widget, _))) =
@@ -2053,7 +1737,7 @@ fn reconnect_pane_tree(
             paned.set_start_child(Some(&first_widget));
             paned.set_end_child(Some(&second_widget));
 
-            // Defer set_position after realization so the widget has a size.
+            // Defer set_position after realization so the widget has a non-zero size.
             let saved_ratio = *ratio;
             let paned_weak = paned.downgrade();
             glib::idle_add_local_once(move || {
@@ -2072,6 +1756,108 @@ fn reconnect_pane_tree(
             Some((paned.upcast::<gtk4::Widget>(), first_da))
         }
     }
+}
+
+/// Build the full GTK tab widget tree from a `LayoutInfo` snapshot (T-064).
+///
+/// Iterates `layout.workspaces[active_workspace].tabs` and for each tab calls
+/// `build_widget_from_pane_tree`. Adds each result as a page in the default
+/// workspace's `TabView`. Returns `true` if at least one tab was successfully
+/// created.
+///
+/// Only the active workspace is displayed (multi-workspace GTK is T-065+).
+fn build_widgets_from_layout(
+    layout: &LayoutInfo,
+    dc: &Arc<DaemonClient>,
+    config: &Config,
+    workspace_manager: &WorkspaceManager,
+    window: &adw::ApplicationWindow,
+) -> bool {
+    // Determine which workspace to display.
+    let ws_idx = if layout.active_workspace < layout.workspaces.len() {
+        layout.active_workspace
+    } else {
+        if !layout.workspaces.is_empty() {
+            tracing::debug!(
+                "get_layout: active_workspace {} out of range, using 0",
+                layout.active_workspace
+            );
+        }
+        0
+    };
+
+    let Some(ws_info) = layout.workspaces.get(ws_idx) else {
+        tracing::info!("get_layout: no workspaces in layout — will create a fresh tab");
+        return false;
+    };
+
+    if ws_info.tabs.is_empty() {
+        tracing::info!("get_layout: active workspace has 0 tabs — will create a fresh tab");
+        return false;
+    }
+
+    let Ok(mgr) = workspace_manager.try_borrow() else {
+        tracing::warn!("build_widgets_from_layout: failed to borrow workspace_manager");
+        return false;
+    };
+    let ws = &mgr.workspaces[0]; // GTK always shows workspace 0 (T-065 will generalize)
+
+    tracing::info!("build_widgets_from_layout: building {} tab(s)", ws_info.tabs.len());
+
+    let mut created_pages: Vec<adw::TabPage> = Vec::new();
+    let mut last_first_da: Option<gtk4::DrawingArea> = None;
+
+    for tab in &ws_info.tabs {
+        let Some((root_widget, first_da)) = build_widget_from_pane_tree(
+            &tab.pane_tree,
+            dc,
+            config,
+            &ws.tab_states,
+            &ws.focus_tracker,
+            &ws.custom_titles,
+            window,
+            &ws.tab_view,
+        ) else {
+            tracing::warn!("build_widget_from_pane_tree failed for tab {:?}", tab.title);
+            continue;
+        };
+
+        let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        container.set_hexpand(true);
+        container.set_vexpand(true);
+        container.append(&root_widget);
+
+        let page = ws.tab_view.append(&container);
+        let tab_title = if tab.title.is_empty() { "shell" } else { &tab.title };
+        page.set_title(tab_title);
+
+        register_title_timer(
+            &page,
+            &ws.tab_view,
+            &ws.tab_states,
+            &ws.focus_tracker,
+            &ws.custom_titles,
+            window,
+        );
+
+        created_pages.push(page);
+        last_first_da = Some(first_da);
+    }
+
+    if created_pages.is_empty() {
+        return false;
+    }
+
+    // Select the active tab and focus its first DrawingArea.
+    let active_tab_idx = ws_info.active_tab.min(created_pages.len().saturating_sub(1));
+    ws.tab_view.set_selected_page(&created_pages[active_tab_idx]);
+
+    // Focus the first drawing area of the active tab's first page.
+    if let Some(da) = last_first_da {
+        da.grab_focus();
+    }
+
+    true
 }
 
 /// Recursively build the pane tree for a single tab from a `PaneTreeState`.

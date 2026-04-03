@@ -1551,6 +1551,7 @@ dependencies = [
  "forgetty-config",
  "forgetty-core",
  "forgetty-gtk",
+ "forgetty-pty",
  "forgetty-session",
  "forgetty-socket",
  "forgetty-sync",
