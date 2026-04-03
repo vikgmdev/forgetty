@@ -11,6 +11,8 @@ use std::sync::Arc;
 use base64::Engine as _;
 use forgetty_core::PaneId;
 use forgetty_pty::PtySize;
+use forgetty_session::layout::{SessionLayout, SessionTab};
+use forgetty_session::workspace::PaneTreeLayout;
 use forgetty_session::SessionManager;
 use forgetty_sync::SyncEndpoint;
 use forgetty_vt::{Cell, CellAttributes, Color};
@@ -40,10 +42,12 @@ pub fn dispatch(
 ) -> Response {
     match request.method.as_str() {
         methods::LIST_TABS => handle_list_tabs(request, &sm),
+        methods::GET_LAYOUT => handle_get_layout(request, &sm),
         methods::NEW_TAB => handle_new_tab(request, &sm),
         methods::CLOSE_TAB => handle_close_tab(request, &sm),
-        methods::FOCUS_TAB => handle_focus_tab(request),
-        methods::SPLIT_PANE => handle_split_pane(request),
+        methods::FOCUS_TAB => handle_focus_tab(request, &sm),
+        methods::SPLIT_PANE => handle_split_pane(request, &sm),
+        methods::MOVE_TAB => handle_move_tab(request, &sm),
         methods::SEND_INPUT => handle_send_input(request, &sm),
         methods::GET_SCREEN => handle_get_screen(request, &sm),
         methods::GET_PANE_INFO => handle_get_pane_info(request, &sm),
@@ -73,10 +77,7 @@ pub fn dispatch(
 /// - missing `pane_id` field  → `-32602` "missing param: pane_id"
 /// - non-UUID string          → `-32602` "invalid UUID: <value>"
 /// - pane not in live registry → `-32602` "pane not found: <uuid>"
-fn require_pane_id(
-    request: &Request,
-    sm: &SessionManager,
-) -> Result<PaneId, Response> {
+fn require_pane_id(request: &Request, sm: &SessionManager) -> Result<PaneId, Response> {
     let params = &request.params;
 
     let raw = match params.get("pane_id").and_then(|v| v.as_str()) {
@@ -140,8 +141,38 @@ fn handle_list_tabs(request: &Request, sm: &SessionManager) -> Response {
     Response::success(request.id.clone(), serde_json::json!({ "tabs": tabs }))
 }
 
+fn handle_get_layout(request: &Request, sm: &SessionManager) -> Response {
+    let layout = sm.layout();
+    match serde_json::to_value(&layout) {
+        Ok(v) => Response::success(request.id.clone(), v),
+        Err(e) => Response::error(
+            request.id.clone(),
+            protocol::INTERNAL_ERROR,
+            format!("failed to serialize layout: {e}"),
+        ),
+    }
+}
+
 fn handle_new_tab(request: &Request, sm: &SessionManager) -> Response {
-    let size = PtySize { rows: DEFAULT_ROWS, cols: DEFAULT_COLS, pixel_width: 0, pixel_height: 0 };
+    let workspace_idx = request
+        .params
+        .get("workspace_idx")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+
+    let rows = request
+        .params
+        .get("rows")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(DEFAULT_ROWS as u64) as u16;
+
+    let cols = request
+        .params
+        .get("cols")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(DEFAULT_COLS as u64) as u16;
+
+    let size = PtySize { rows, cols, pixel_width: 0, pixel_height: 0 };
 
     let cwd: Option<PathBuf> = request
         .params
@@ -151,45 +182,343 @@ fn handle_new_tab(request: &Request, sm: &SessionManager) -> Response {
         .map(PathBuf::from)
         .filter(|p| p.is_dir()); // silently ignore nonexistent dirs
 
-    match sm.create_pane(size, cwd, None, None, true) {
-        Ok(id) => {
-            Response::success(request.id.clone(), serde_json::json!({ "tab_id": id.to_string() }))
-        }
+    match sm.create_tab(workspace_idx, cwd, size) {
+        Ok((pane_id, tab_id)) => Response::success(
+            request.id.clone(),
+            serde_json::json!({
+                "tab_id": tab_id.to_string(),
+                "pane_id": pane_id.to_string(),
+            }),
+        ),
         Err(e) => Response::error(
             request.id.clone(),
             protocol::INTERNAL_ERROR,
-            format!("failed to create pane: {e}"),
+            format!("failed to create tab: {e}"),
         ),
     }
 }
 
 fn handle_close_tab(request: &Request, sm: &SessionManager) -> Response {
-    let id = match require_pane_id(request, sm) {
-        Ok(id) => id,
-        Err(e) => return e,
+    // Try tab_id first (preferred path).
+    if let Some(tab_id_str) = request.params.get("tab_id").and_then(|v| v.as_str()) {
+        let tab_uuid = match Uuid::parse_str(tab_id_str) {
+            Ok(u) => u,
+            Err(_) => {
+                return Response::error(
+                    request.id.clone(),
+                    protocol::INVALID_PARAMS,
+                    format!("invalid UUID: {tab_id_str}"),
+                )
+            }
+        };
+
+        // Collect pane IDs from this tab BEFORE closing, for snapshot cleanup.
+        let pane_ids_to_clean: Vec<PaneId> = {
+            let layout = sm.layout();
+            let mut ids = Vec::new();
+            'outer: for ws in &layout.workspaces {
+                for tab in &ws.tabs {
+                    if tab.id == tab_uuid {
+                        collect_all_pane_ids(&tab.pane_tree, &mut ids);
+                        break 'outer;
+                    }
+                }
+            }
+            ids
+        };
+
+        match sm.close_tab(tab_uuid) {
+            Ok(()) => {
+                for pid in pane_ids_to_clean {
+                    forgetty_workspace::delete_vt_snapshot(pid.0);
+                }
+                Response::success(request.id.clone(), serde_json::json!({ "ok": true }))
+            }
+            Err(e) => Response::error(
+                request.id.clone(),
+                protocol::INTERNAL_ERROR,
+                format!("failed to close tab: {e}"),
+            ),
+        }
+    } else if let Some(pane_id_str) = request.params.get("pane_id").and_then(|v| v.as_str()) {
+        // Legacy path: pane_id was provided.
+        let pane_uuid = match Uuid::parse_str(pane_id_str) {
+            Ok(u) => u,
+            Err(_) => {
+                return Response::error(
+                    request.id.clone(),
+                    protocol::INVALID_PARAMS,
+                    format!("invalid UUID: {pane_id_str}"),
+                )
+            }
+        };
+        let pane_id = PaneId(pane_uuid);
+
+        // Verify pane is alive.
+        if sm.pane_info(pane_id).is_none() {
+            return Response::error(
+                request.id.clone(),
+                protocol::INVALID_PARAMS,
+                format!("pane not found: {pane_id_str}"),
+            );
+        }
+
+        // Try to find the tab that owns this pane.
+        let layout = sm.layout();
+        if let Some(tab_uuid) = find_tab_for_pane(&layout, pane_id) {
+            // Collect all pane IDs in the tab for snapshot cleanup.
+            let pane_ids_to_clean: Vec<PaneId> = {
+                let mut ids = Vec::new();
+                'outer: for ws in &layout.workspaces {
+                    for tab in &ws.tabs {
+                        if tab.id == tab_uuid {
+                            collect_all_pane_ids(&tab.pane_tree, &mut ids);
+                            break 'outer;
+                        }
+                    }
+                }
+                ids
+            };
+            // Drop layout before calling close_tab (no reentry).
+            drop(layout);
+
+            match sm.close_tab(tab_uuid) {
+                Ok(()) => {
+                    for pid in pane_ids_to_clean {
+                        forgetty_workspace::delete_vt_snapshot(pid.0);
+                    }
+                    Response::success(request.id.clone(), serde_json::json!({ "ok": true }))
+                }
+                Err(e) => Response::error(
+                    request.id.clone(),
+                    protocol::INTERNAL_ERROR,
+                    format!("failed to close tab: {e}"),
+                ),
+            }
+        } else {
+            // Pane exists in registry but not in any tab tree — legacy fallback.
+            drop(layout);
+            match sm.close_pane(pane_id) {
+                Ok(()) => {
+                    forgetty_workspace::delete_vt_snapshot(pane_id.0);
+                    Response::success(request.id.clone(), serde_json::json!({ "ok": true }))
+                }
+                Err(e) => Response::error(
+                    request.id.clone(),
+                    protocol::INTERNAL_ERROR,
+                    format!("failed to close pane: {e}"),
+                ),
+            }
+        }
+    } else {
+        Response::error(
+            request.id.clone(),
+            protocol::INVALID_PARAMS,
+            "missing param: tab_id or pane_id".to_string(),
+        )
+    }
+}
+
+fn handle_focus_tab(request: &Request, sm: &SessionManager) -> Response {
+    let tab_id_str = match request.params.get("tab_id").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            return Response::error(
+                request.id.clone(),
+                protocol::INVALID_PARAMS,
+                "missing param: tab_id".to_string(),
+            )
+        }
     };
 
-    match sm.close_pane(id) {
-        Ok(()) => {
-            forgetty_workspace::delete_vt_snapshot(id.0);
-            Response::success(request.id.clone(), serde_json::json!({ "ok": true }))
+    let tab_uuid = match Uuid::parse_str(&tab_id_str) {
+        Ok(u) => u,
+        Err(_) => {
+            return Response::error(
+                request.id.clone(),
+                protocol::INVALID_PARAMS,
+                format!("invalid UUID: {tab_id_str}"),
+            )
         }
+    };
+
+    // Find which workspace and tab index the tab lives in.
+    let layout = sm.layout();
+    let mut found: Option<(usize, usize)> = None;
+    'outer: for (ws_idx, ws) in layout.workspaces.iter().enumerate() {
+        for (tab_idx, tab) in ws.tabs.iter().enumerate() {
+            if tab.id == tab_uuid {
+                found = Some((ws_idx, tab_idx));
+                break 'outer;
+            }
+        }
+    }
+    drop(layout);
+
+    let (ws_idx, tab_idx) = match found {
+        Some(pair) => pair,
+        None => {
+            return Response::error(
+                request.id.clone(),
+                protocol::INVALID_PARAMS,
+                format!("tab not found: {tab_id_str}"),
+            )
+        }
+    };
+
+    match sm.set_active_tab(ws_idx, tab_idx) {
+        Ok(()) => Response::success(request.id.clone(), serde_json::json!({ "ok": true })),
         Err(e) => Response::error(
             request.id.clone(),
             protocol::INTERNAL_ERROR,
-            format!("failed to close pane: {e}"),
+            format!("set_active_tab failed: {e}"),
         ),
     }
 }
 
-fn handle_focus_tab(request: &Request) -> Response {
-    // Stub — requires GTK widget manipulation, deferred to T-051.
-    Response::success(request.id.clone(), serde_json::json!({ "ok": true }))
+fn handle_split_pane(request: &Request, sm: &SessionManager) -> Response {
+    let pane_id = match require_pane_id(request, sm) {
+        Ok(id) => id,
+        Err(e) => return e,
+    };
+
+    let direction = match request.params.get("direction").and_then(|v| v.as_str()) {
+        Some(d) => d.to_string(),
+        None => {
+            return Response::error(
+                request.id.clone(),
+                protocol::INVALID_PARAMS,
+                "missing param: direction".to_string(),
+            )
+        }
+    };
+
+    if direction != "horizontal" && direction != "vertical" {
+        return Response::error(
+            request.id.clone(),
+            protocol::INVALID_PARAMS,
+            "direction must be 'horizontal' or 'vertical'".to_string(),
+        );
+    }
+
+    let rows = request
+        .params
+        .get("rows")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(DEFAULT_ROWS as u64) as u16;
+
+    let cols = request
+        .params
+        .get("cols")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(DEFAULT_COLS as u64) as u16;
+
+    let size = PtySize { rows, cols, pixel_width: 0, pixel_height: 0 };
+
+    let cwd: Option<PathBuf> = request
+        .params
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir());
+
+    match sm.split_pane(pane_id, &direction, size, cwd) {
+        Ok(new_pane_id) => Response::success(
+            request.id.clone(),
+            serde_json::json!({ "pane_id": new_pane_id.to_string() }),
+        ),
+        Err(e) => Response::error(
+            request.id.clone(),
+            protocol::INTERNAL_ERROR,
+            format!("split_pane failed: {e}"),
+        ),
+    }
 }
 
-fn handle_split_pane(request: &Request) -> Response {
-    // Stub — requires GTK layout tree update, deferred to T-051.
-    Response::success(request.id.clone(), serde_json::json!({ "ok": true }))
+fn handle_move_tab(request: &Request, sm: &SessionManager) -> Response {
+    let tab_id_str = match request.params.get("tab_id").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            return Response::error(
+                request.id.clone(),
+                protocol::INVALID_PARAMS,
+                "missing param: tab_id".to_string(),
+            )
+        }
+    };
+
+    let tab_uuid = match Uuid::parse_str(&tab_id_str) {
+        Ok(u) => u,
+        Err(_) => {
+            return Response::error(
+                request.id.clone(),
+                protocol::INVALID_PARAMS,
+                format!("invalid UUID: {tab_id_str}"),
+            )
+        }
+    };
+
+    let new_index = match request.params.get("new_index").and_then(|v| v.as_u64()) {
+        Some(n) => n as usize,
+        None => {
+            return Response::error(
+                request.id.clone(),
+                protocol::INVALID_PARAMS,
+                "missing param: new_index".to_string(),
+            )
+        }
+    };
+
+    match sm.move_tab(tab_uuid, new_index) {
+        Ok(()) => Response::success(request.id.clone(), serde_json::json!({ "ok": true })),
+        Err(e) => Response::error(
+            request.id.clone(),
+            protocol::INTERNAL_ERROR,
+            format!("move_tab failed: {e}"),
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Private helpers for layout walking
+// ---------------------------------------------------------------------------
+
+/// Walk a `PaneTreeLayout` recursively, collecting all leaf pane IDs into `out`.
+fn collect_all_pane_ids(tree: &PaneTreeLayout, out: &mut Vec<PaneId>) {
+    match tree {
+        PaneTreeLayout::Leaf { pane_id } => out.push(*pane_id),
+        PaneTreeLayout::Split { first, second, .. } => {
+            collect_all_pane_ids(first, out);
+            collect_all_pane_ids(second, out);
+        }
+    }
+}
+
+/// Walk the `SessionLayout` to find the `tab.id` (Uuid) of the tab whose pane
+/// tree contains the given `pane_id`. Returns `None` if not found.
+fn find_tab_for_pane(layout: &SessionLayout, pane_id: PaneId) -> Option<Uuid> {
+    for ws in &layout.workspaces {
+        for tab in &ws.tabs {
+            if tab_contains_pane(tab, pane_id) {
+                return Some(tab.id);
+            }
+        }
+    }
+    None
+}
+
+fn tab_contains_pane(tab: &SessionTab, pane_id: PaneId) -> bool {
+    tree_contains_pane(&tab.pane_tree, pane_id)
+}
+
+fn tree_contains_pane(tree: &PaneTreeLayout, pane_id: PaneId) -> bool {
+    match tree {
+        PaneTreeLayout::Leaf { pane_id: id } => *id == pane_id,
+        PaneTreeLayout::Split { first, second, .. } => {
+            tree_contains_pane(first, pane_id) || tree_contains_pane(second, pane_id)
+        }
+    }
 }
 
 fn handle_send_input(request: &Request, sm: &SessionManager) -> Response {
@@ -270,12 +599,24 @@ fn serialize_row_ansi(row: &[Cell]) -> String {
         if changed {
             // Reset then re-emit all non-default attributes.
             line.push_str("\x1b[0m");
-            if a.bold { line.push_str("\x1b[1m"); }
-            if a.dim { line.push_str("\x1b[2m"); }
-            if a.italic { line.push_str("\x1b[3m"); }
-            if a.underline { line.push_str("\x1b[4m"); }
-            if a.inverse { line.push_str("\x1b[7m"); }
-            if a.strikethrough { line.push_str("\x1b[9m"); }
+            if a.bold {
+                line.push_str("\x1b[1m");
+            }
+            if a.dim {
+                line.push_str("\x1b[2m");
+            }
+            if a.italic {
+                line.push_str("\x1b[3m");
+            }
+            if a.underline {
+                line.push_str("\x1b[4m");
+            }
+            if a.inverse {
+                line.push_str("\x1b[7m");
+            }
+            if a.strikethrough {
+                line.push_str("\x1b[9m");
+            }
             if let Color::Rgb(r, g, b) = a.fg {
                 line.push_str(&format!("\x1b[38;2;{r};{g};{b}m"));
             }
@@ -495,16 +836,9 @@ fn handle_preseed_snapshot(request: &Request, sm: &SessionManager) -> Response {
     match sm.with_vt_mut(new_pane_id, |t| t.feed(&payload)) {
         Ok(()) => {
             forgetty_workspace::delete_vt_snapshot(snapshot_uuid);
-            Response::success(
-                request.id.clone(),
-                serde_json::json!({ "ok": true, "seeded": true }),
-            )
+            Response::success(request.id.clone(), serde_json::json!({ "ok": true, "seeded": true }))
         }
-        Err(e) => Response::error(
-            request.id.clone(),
-            protocol::INTERNAL_ERROR,
-            e.to_string(),
-        ),
+        Err(e) => Response::error(request.id.clone(), protocol::INTERNAL_ERROR, e.to_string()),
     }
 }
 
@@ -560,9 +894,9 @@ fn handle_revoke_device(request: &Request, se: Option<&SyncEndpoint>) -> Respons
         Ok(found) => {
             if found {
                 // Emit revoke event (best-effort; ignore if no receivers).
-                let _ = se.event_tx.send(forgetty_sync::SyncEvent::DeviceRevoked {
-                    device_id: device_id.clone(),
-                });
+                let _ = se
+                    .event_tx
+                    .send(forgetty_sync::SyncEvent::DeviceRevoked { device_id: device_id.clone() });
             }
             Response::success(request.id.clone(), serde_json::json!({ "ok": found }))
         }
@@ -645,18 +979,95 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_focus_tab_stub() {
+    fn dispatch_focus_tab_missing_tab_id_returns_invalid_params() {
         let sm = make_sm();
+        // No tab_id in params → INVALID_PARAMS.
         let resp = dispatch(&make_request("focus_tab"), sm, None);
-        assert!(resp.result.is_some());
-        assert_eq!(resp.result.unwrap()["ok"], true);
+        assert!(resp.error.is_some());
+        assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
     }
 
     #[test]
-    fn dispatch_split_pane_stub() {
+    fn dispatch_focus_tab_unknown_uuid_returns_invalid_params() {
         let sm = make_sm();
-        let resp = dispatch(&make_request("split_pane"), sm, None);
+        let req = Request {
+            jsonrpc: "2.0".to_string(),
+            method: "focus_tab".to_string(),
+            params: serde_json::json!({ "tab_id": "00000000-0000-0000-0000-000000000000" }),
+            id: Some(serde_json::json!(1)),
+        };
+        let resp = dispatch(&req, sm, None);
+        assert!(resp.error.is_some());
+        assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn dispatch_focus_tab_real_tab_succeeds() {
+        let sm = make_sm();
+        // Create a tab via new_tab RPC.
+        let new_req = Request {
+            jsonrpc: "2.0".to_string(),
+            method: "new_tab".to_string(),
+            params: serde_json::json!({}),
+            id: Some(serde_json::json!(1)),
+        };
+        let new_resp = dispatch(&new_req, Arc::clone(&sm), None);
+        assert!(new_resp.result.is_some(), "new_tab should succeed");
+        let tab_id = new_resp.result.unwrap()["tab_id"].as_str().unwrap().to_string();
+
+        let focus_req = Request {
+            jsonrpc: "2.0".to_string(),
+            method: "focus_tab".to_string(),
+            params: serde_json::json!({ "tab_id": tab_id }),
+            id: Some(serde_json::json!(2)),
+        };
+        let resp = dispatch(&focus_req, Arc::clone(&sm), None);
         assert!(resp.result.is_some());
+        assert_eq!(resp.result.unwrap()["ok"], true);
+
+        // Cleanup.
+        let layout = sm.layout();
+        let tab_uuid = uuid::Uuid::parse_str(&tab_id).unwrap();
+        sm.close_tab(tab_uuid).ok();
+        drop(layout);
+    }
+
+    #[test]
+    fn dispatch_split_pane_missing_pane_id_returns_invalid_params() {
+        let sm = make_sm();
+        let req = Request {
+            jsonrpc: "2.0".to_string(),
+            method: "split_pane".to_string(),
+            params: serde_json::json!({ "direction": "horizontal" }),
+            id: Some(serde_json::json!(1)),
+        };
+        let resp = dispatch(&req, sm, None);
+        assert!(resp.error.is_some());
+        assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn dispatch_split_pane_invalid_direction_returns_invalid_params() {
+        let sm = make_sm();
+        // Create a real pane first.
+        let new_req = Request {
+            jsonrpc: "2.0".to_string(),
+            method: "new_tab".to_string(),
+            params: serde_json::json!({}),
+            id: Some(serde_json::json!(1)),
+        };
+        let new_resp = dispatch(&new_req, Arc::clone(&sm), None);
+        let pane_id = new_resp.result.unwrap()["pane_id"].as_str().unwrap().to_string();
+
+        let req = Request {
+            jsonrpc: "2.0".to_string(),
+            method: "split_pane".to_string(),
+            params: serde_json::json!({ "pane_id": pane_id, "direction": "diagonal" }),
+            id: Some(serde_json::json!(2)),
+        };
+        let resp = dispatch(&req, Arc::clone(&sm), None);
+        assert!(resp.error.is_some());
+        assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
     }
 
     #[test]
@@ -782,6 +1193,64 @@ mod tests {
             params: serde_json::json!({ "pane_id": "00000000-0000-0000-0000-000000000000" }),
             id: Some(serde_json::json!(1)),
         };
+        let resp = dispatch(&req, sm, None);
+        assert!(resp.error.is_some());
+        assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn close_tab_missing_params_returns_invalid_params() {
+        let sm = make_sm();
+        let resp = dispatch(&make_request("close_tab"), sm, None);
+        assert!(resp.error.is_some());
+        assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn dispatch_get_layout_empty() {
+        let sm = make_sm();
+        let resp = dispatch(&make_request("get_layout"), sm, None);
+        assert!(resp.result.is_some());
+        assert!(resp.error.is_none());
+        let result = resp.result.unwrap();
+        // Fresh daemon: one default workspace, zero tabs.
+        let workspaces = result["workspaces"].as_array().unwrap();
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(workspaces[0]["name"], "Default");
+        assert_eq!(workspaces[0]["tabs"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn dispatch_new_tab_returns_tab_id_and_pane_id() {
+        let sm = make_sm();
+        let req = Request {
+            jsonrpc: "2.0".to_string(),
+            method: "new_tab".to_string(),
+            params: serde_json::json!({}),
+            id: Some(serde_json::json!(1)),
+        };
+        let resp = dispatch(&req, Arc::clone(&sm), None);
+        assert!(resp.result.is_some());
+        let result = resp.result.unwrap();
+        assert!(result.get("tab_id").and_then(|v| v.as_str()).is_some(), "tab_id must be present");
+        assert!(result.get("pane_id").and_then(|v| v.as_str()).is_some(), "pane_id must be present");
+
+        // Cleanup.
+        let tab_id_str = result["tab_id"].as_str().unwrap();
+        let tab_uuid = uuid::Uuid::parse_str(tab_id_str).unwrap();
+        sm.close_tab(tab_uuid).ok();
+    }
+
+    #[test]
+    fn dispatch_move_tab_missing_params_returns_invalid_params() {
+        let sm = make_sm();
+        let req = Request {
+            jsonrpc: "2.0".to_string(),
+            method: "move_tab".to_string(),
+            params: serde_json::json!({ "tab_id": "00000000-0000-0000-0000-000000000000" }),
+            id: Some(serde_json::json!(1)),
+        };
+        // missing new_index
         let resp = dispatch(&req, sm, None);
         assert!(resp.error.is_some());
         assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);

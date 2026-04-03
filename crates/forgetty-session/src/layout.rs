@@ -10,10 +10,12 @@
 //!         └── Pane tree          ← PaneTreeLayout (from crate::workspace)
 //! ```
 //!
-//! These types intentionally do NOT derive `Serialize`/`Deserialize` — that is
-//! T-062's concern. They derive `Debug` and `Clone` so callers can snapshot
-//! and inspect the layout without taking a mutex guard beyond the call site.
+//! T-062 adds `Serialize` (but not `Deserialize`) to these types so they can
+//! be serialized to JSON for the `get_layout` RPC. They still do not derive
+//! `Deserialize` — they are daemon-internal state, never deserialized from
+//! socket input.
 
+use serde::Serialize;
 use uuid::Uuid;
 
 use crate::workspace::PaneTreeLayout;
@@ -24,14 +26,14 @@ use crate::workspace::PaneTreeLayout;
 
 /// The full daemon-owned layout: an ordered list of workspaces plus the index
 /// of the currently active one.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SessionLayout {
     pub workspaces: Vec<SessionWorkspace>,
     pub active_workspace: usize,
 }
 
 /// One workspace within the layout: holds an ordered list of tabs.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SessionWorkspace {
     pub id: Uuid,
     pub name: String,
@@ -43,7 +45,7 @@ pub struct SessionWorkspace {
 
 /// One tab within a workspace: holds a pane tree (a leaf for a single pane,
 /// or a `Split` tree for a split layout managed by T-060+).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SessionTab {
     pub id: Uuid,
     /// Tab title, populated from OSC sequences in T-060+. Empty until then.
