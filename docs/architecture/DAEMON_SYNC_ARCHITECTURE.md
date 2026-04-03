@@ -3,6 +3,10 @@
 > **Decided:** 2026-04-01 after full architecture review.
 > **Status:** Approved. Implementation starts with T-048.
 > **This doc supersedes** the earlier "GTK owns everything" model.
+>
+> **IMPORTANT — Read `ARCHITECTURE_DECISIONS.md` first.** That file contains decisions made after this doc was written (2026-04-03) that override the following statements in this doc:
+> - "Multiple GTK windows → Both attach to same daemon simultaneously" → **WRONG.** Each window has its own daemon (AD-001).
+> - Android pairing: see AD-004 and AD-005 for the full ownership and pairing rules.
 
 ---
 
