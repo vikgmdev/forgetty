@@ -6167,7 +6167,38 @@ fn show_tab_context_menu(
     popover.set_parent(tab_bar);
     popover.set_has_arrow(false);
     popover.add_css_class("menu");
+    // Explicit autohide — ensures click-outside closes the popover on Wayland.
+    popover.set_autohide(true);
     popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+
+    // Bug fix: grab_focus() inside menu actions fires while the popover is still
+    // open, so GTK silently ignores it (popover holds modal focus).  Wire a
+    // `closed` handler that re-grabs the active terminal pane after the popover
+    // is fully dismissed.
+    {
+        let ft = Rc::clone(focus_tracker);
+        let ts = Rc::clone(tab_states);
+        let win_c = window.clone();
+        popover.connect_closed(move |_| {
+            // Re-focus the pane that had focus when the menu was opened.
+            let name = ft.borrow().clone();
+            if !name.is_empty() {
+                if let Some(da) = find_drawing_area_by_name(&win_c, &name) {
+                    da.grab_focus();
+                    return;
+                }
+            }
+            // Fallback: focus the first leaf pane in the first visible page.
+            let leaves: Vec<gtk4::DrawingArea> = ts
+                .borrow()
+                .keys()
+                .filter_map(|k| find_drawing_area_by_name(&win_c, k))
+                .collect();
+            if let Some(da) = leaves.first() {
+                da.grab_focus();
+            }
+        });
+    }
 
     let menu_box = build_tab_context_menu_box(
         &popover,
