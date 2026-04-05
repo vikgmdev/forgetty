@@ -115,6 +115,9 @@ pub mod methods {
     pub const CLOSE_PANE: &str = "close_pane";
     // Workspace management (T-067).
     pub const CREATE_WORKSPACE: &str = "create_workspace";
+    // Daemon lifecycle (T-070, T-072).
+    pub const SHUTDOWN: &str = "shutdown";       // permanent close: exit immediately, no save
+    pub const SHUTDOWN_SAVE: &str = "shutdown_save"; // normal close: save session then exit
 }
 
 #[cfg(test)]

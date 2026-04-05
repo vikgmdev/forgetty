@@ -520,6 +520,25 @@ impl DaemonClient {
         Ok(())
     }
 
+    /// Request the daemon to save its session file and exit.
+    ///
+    /// Used on every normal GTK window close (X button, Ctrl+Shift+Q, SIGTERM).
+    /// The daemon saves the session layout so restore-by-default can bring it
+    /// back on the next bare `forgetty` launch, then exits — no orphan process.
+    /// Best-effort: errors are ignored if the daemon is already gone.
+    pub fn shutdown_save(&self) {
+        let _ = self.rpc("shutdown_save", serde_json::json!({}));
+    }
+
+    /// Request the daemon to shut down immediately without saving session state.
+    ///
+    /// Used by "Close Window Permanently" (T-070). Called after the session file
+    /// has already been deleted, so the daemon must not re-save it on exit.
+    /// Best-effort: errors are ignored because the daemon may have already exited.
+    pub fn shutdown(&self) {
+        let _ = self.rpc("shutdown", serde_json::json!({}));
+    }
+
     /// Open a `subscribe_output` stream for a pane.
     ///
     /// Spawns a background tokio task that reads output notifications from the

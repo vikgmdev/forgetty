@@ -14,6 +14,7 @@ use tracing::{debug, error, info, warn};
 
 use forgetty_session::{SessionEvent, SessionManager};
 use forgetty_sync::SyncEndpoint;
+use forgetty_workspace;
 
 use crate::handlers;
 use crate::protocol::{methods, Request, Response};
@@ -21,10 +22,13 @@ use crate::protocol::{methods, Request, Response};
 /// The Forgetty JSON-RPC socket server.
 pub struct SocketServer {
     socket_path: PathBuf,
+    /// Session UUID — used by `shutdown_save` to write the correct session file.
+    /// `None` in test/legacy contexts where session_id is not relevant.
+    session_id: Option<uuid::Uuid>,
 }
 
 impl SocketServer {
-    /// Create a new server bound to the default socket path.
+    /// Create a new server bound to the default socket path (no session_id).
     ///
     /// The socket path is `$XDG_RUNTIME_DIR/forgetty.sock` on Linux,
     /// falling back to `/tmp/forgetty.sock`.
@@ -32,7 +36,7 @@ impl SocketServer {
         Self::new_with_path(default_socket_path())
     }
 
-    /// Create a new server bound to an explicit socket path.
+    /// Create a new server bound to an explicit socket path (no session_id).
     ///
     /// Removes any stale socket file and creates the parent directory if
     /// needed. Use this when the caller needs to override the default path
@@ -48,7 +52,17 @@ impl SocketServer {
             std::fs::create_dir_all(parent)?;
         }
 
-        Ok(Self { socket_path })
+        Ok(Self { socket_path, session_id: None })
+    }
+
+    /// Create a new server bound to an explicit socket path with a session UUID.
+    ///
+    /// The session UUID is used by the `shutdown_save` RPC to write the
+    /// correct `sessions/{uuid}.json` file before the daemon exits.
+    pub fn new_with_session(socket_path: PathBuf, session_id: uuid::Uuid) -> std::io::Result<Self> {
+        let mut server = Self::new_with_path(socket_path)?;
+        server.session_id = Some(session_id);
+        Ok(server)
     }
 
     /// Get the socket path.
@@ -112,6 +126,7 @@ impl SocketServer {
         let listener = UnixListener::bind(&self.socket_path)?;
         info!("Socket server listening on {:?}", self.socket_path);
 
+        let session_id = self.session_id;
         loop {
             match listener.accept().await {
                 Ok((stream, _addr)) => {
@@ -119,7 +134,9 @@ impl SocketServer {
                     let sm = Arc::clone(&sm);
                     let se = sync_endpoint.as_ref().map(Arc::clone);
                     tokio::spawn(async move {
-                        if let Err(e) = handle_streaming_connection(stream, sm, se).await {
+                        if let Err(e) =
+                            handle_streaming_connection(stream, sm, se, session_id).await
+                        {
                             warn!("Connection error: {e}");
                         }
                     });
@@ -199,6 +216,7 @@ async fn handle_streaming_connection(
     stream: tokio::net::UnixStream,
     sm: Arc<SessionManager>,
     sync_endpoint: Option<Arc<SyncEndpoint>>,
+    session_id: Option<uuid::Uuid>,
 ) -> std::io::Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -457,6 +475,33 @@ async fn handle_streaming_connection(
         }
 
         // Synchronous handler for all other methods.
+        if request.method == methods::SHUTDOWN_SAVE {
+            // Acknowledge before saving so the client unblocks immediately.
+            let resp = Response::success(request.id, serde_json::json!({ "ok": true }));
+            write_response(&mut writer, &resp).await?;
+            info!("Received shutdown_save RPC — saving session and exiting");
+            // Save VT snapshots for all live panes (used by cold-start preseed).
+            let saved = crate::handlers::save_all_snapshots(&sm);
+            info!("shutdown_save: saved {saved} VT snapshot(s)");
+            // Save the session layout so restore-by-default can bring it back.
+            if let Some(sid) = session_id {
+                let state = sm.snapshot_to_workspace_state();
+                match forgetty_workspace::save_session_for(sid, &state) {
+                    Ok(()) => info!("shutdown_save: session {sid} saved"),
+                    Err(e) => warn!("shutdown_save: failed to save session: {e}"),
+                }
+            }
+            std::process::exit(0);
+        }
+
+        if request.method == methods::SHUTDOWN {
+            // Acknowledge before exiting so the client doesn't see a broken pipe.
+            let resp = Response::success(request.id, serde_json::json!({ "ok": true }));
+            write_response(&mut writer, &resp).await?;
+            info!("Received shutdown RPC — exiting daemon");
+            std::process::exit(0);
+        }
+
         let response =
             handlers::dispatch(&request, Arc::clone(&sm), sync_endpoint.as_ref().map(Arc::clone));
         write_response(&mut writer, &response).await?;

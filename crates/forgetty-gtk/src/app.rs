@@ -338,7 +338,14 @@ fn build_ui(
     // Section 2 -- Window & Tab management
     let window_tab_section = gio::Menu::new();
     window_tab_section.append(Some("New Window"), Some("win.new-window"));
+    let new_temp_window_item =
+        gio::MenuItem::new(Some("New Temporary Window"), Some("win.new-temp-window"));
+    new_temp_window_item
+        .set_attribute_value("accel", Some(&"<Control><Shift>n".to_variant()));
+    window_tab_section.append_item(&new_temp_window_item);
     window_tab_section.append(Some("Close Window"), Some("win.close-window"));
+    window_tab_section
+        .append(Some("Close Window Permanently"), Some("win.close-window-permanently"));
     window_tab_section.append(Some("Change Tab Title\u{2026}"), Some("win.change-tab-title"));
     let new_tab_menu_item = gio::MenuItem::new(Some("New Tab"), Some("win.new-tab"));
     new_tab_menu_item.set_attribute_value("accel", Some(&"<Control><Shift>t".to_variant()));
@@ -951,6 +958,52 @@ fn build_ui(
         window.add_action(&action);
     }
 
+    // --- New Temporary Window action (Ctrl+Shift+N) ---
+    // Spawns `forgetty --temp` so the new window is ephemeral: no session file
+    // is written on close and no daemon is started.
+    {
+        let action = gio::SimpleAction::new("new-temp-window", None);
+        action.connect_activate(move |_action, _param| {
+            if let Ok(exe) = std::env::current_exe() {
+                if let Err(e) = std::process::Command::new(exe).arg("--temp").spawn() {
+                    tracing::warn!("Failed to spawn temporary window: {e}");
+                }
+            }
+        });
+        window.add_action(&action);
+    }
+
+    // --- Close Window Permanently action (menu only, no accelerator) ---
+    // Deletes the session file so the window is never restored on next launch,
+    // then kills the daemon (if running) and closes the window.
+    // In --temp mode: session file does not exist, so skip deletion.
+    {
+        let win_perm_close = window.clone();
+        let dc_perm_close = daemon_client.clone();
+        let skip_save_perm = Rc::clone(&skip_session_save);
+        let is_temp = launch.temp;
+        let action = gio::SimpleAction::new("close-window-permanently", None);
+        action.connect_activate(move |_action, _param| {
+            // Prevent the window close handler from re-writing the session file.
+            skip_save_perm.set(true);
+            // Delete the UUID session file so restore-all won't bring it back.
+            if !is_temp {
+                let path = forgetty_workspace::session_path_for(session_id);
+                if path.exists() {
+                    if let Err(e) = std::fs::remove_file(&path) {
+                        tracing::warn!("Failed to delete session file on permanent close: {e}");
+                    }
+                }
+            }
+            // Kill the daemon so it can't auto-save the file back to disk.
+            if let Some(ref dc) = dc_perm_close {
+                dc.shutdown();
+            }
+            win_perm_close.close();
+        });
+        window.add_action(&action);
+    }
+
     // --- Close Tab action (menu only) ---
     {
         let wm_close_tab = Rc::clone(&workspace_manager);
@@ -1097,6 +1150,10 @@ fn build_ui(
             // Only kill PTYs in self-contained mode (no daemon).
             if dc_quit.is_none() {
                 kill_all_workspace_ptys(&wm_quit, "Quit action");
+            }
+            // Daemon mode: tell daemon to save and exit cleanly.
+            if let Some(ref dc) = dc_quit {
+                dc.shutdown_save();
             }
             app_quit.quit();
         });
@@ -1260,6 +1317,7 @@ fn build_ui(
         window.add_action(&action);
     }
 
+    app.set_accels_for_action("win.new-temp-window", &["<Control><Shift>n"]);
     app.set_accels_for_action("win.command-palette", &["<Control><Shift>p"]);
 
     // --- Terminal Inspector placeholder (greyed out) ---
@@ -1374,7 +1432,11 @@ fn build_ui(
                 // Self-contained mode only: also kill PTYs.
                 kill_all_workspace_ptys(&wm_close, "Window close request");
             }
-            // Daemon mode: PTY sessions survive the GTK close.
+            // Daemon mode: tell the daemon to save and exit so it doesn't
+            // linger as an orphan process after the GTK window closes.
+            if let Some(ref dc) = dc_window_close {
+                dc.shutdown_save();
+            }
             glib::Propagation::Proceed
         });
     }
@@ -1403,6 +1465,10 @@ fn build_ui(
                 if dc_signal.is_none() {
                     // Self-contained mode only: also kill PTYs.
                     kill_all_workspace_ptys(&wm_signal, name);
+                }
+                // Daemon mode: tell daemon to save and exit cleanly.
+                if let Some(ref dc) = dc_signal {
+                    dc.shutdown_save();
                 }
                 app_signal.quit();
                 glib::ControlFlow::Break
@@ -4697,8 +4763,18 @@ fn command_registry() -> &'static [CommandEntry] {
             shortcut_label: "",
         },
         CommandEntry {
+            display_name: "New Temporary Window",
+            action_name: "win.new-temp-window",
+            shortcut_label: "Ctrl+Shift+N",
+        },
+        CommandEntry {
             display_name: "Close Window",
             action_name: "win.close-window",
+            shortcut_label: "",
+        },
+        CommandEntry {
+            display_name: "Close Window Permanently",
+            action_name: "win.close-window-permanently",
             shortcut_label: "",
         },
         CommandEntry {

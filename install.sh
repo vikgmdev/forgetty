@@ -8,6 +8,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BINARY="$SCRIPT_DIR/target/release/forgetty"
+DAEMON_BINARY="$SCRIPT_DIR/target/release/forgetty-daemon"
 
 # ── Colours (no-op when piped) ──────────────────────────────────────
 if [ -t 1 ]; then
@@ -28,6 +29,11 @@ info "Building release binary..."
 
 if [ ! -f "$BINARY" ]; then
     error "Build failed: release binary not found at $BINARY"
+    exit 1
+fi
+
+if [ ! -f "$DAEMON_BINARY" ]; then
+    error "Build failed: forgetty-daemon binary not found at $DAEMON_BINARY"
     exit 1
 fi
 
@@ -63,9 +69,12 @@ fi
 
 info "Found shared library in: $SO_DIR"
 
-# ── Install binary (requires sudo) ─────────────────────────────────
+# ── Install binaries (requires sudo) ───────────────────────────────
 info "Installing binary to /usr/local/bin/forgetty"
 sudo install -Dm755 "$BINARY" /usr/local/bin/forgetty
+
+info "Installing daemon to /usr/local/bin/forgetty-daemon"
+sudo install -Dm755 "$DAEMON_BINARY" /usr/local/bin/forgetty-daemon
 
 # ── Install shared library (requires sudo) ──────────────────────────
 info "Installing $SO_NAME to /usr/local/lib/"
@@ -98,6 +107,7 @@ gtk-update-icon-cache -f -t "$HOME/.local/share/icons/hicolor/" 2>/dev/null || t
 printf "\n${BOLD}${GREEN}Forgetty installed successfully!${RESET}\n"
 echo ""
 echo "  Binary:   /usr/local/bin/forgetty"
+echo "  Daemon:   /usr/local/bin/forgetty-daemon"
 echo "  Library:  /usr/local/lib/$SO_NAME"
 echo "  Desktop:  $DESKTOP_DST"
 echo "  Icon:     $ICON_DST"

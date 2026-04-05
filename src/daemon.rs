@@ -276,8 +276,8 @@ async fn main_async() -> anyhow::Result<()> {
         }
     });
 
-    // Bind the socket server.
-    let socket_server = SocketServer::new_with_path(socket_path.clone())?;
+    // Bind the socket server (with session_id so shutdown_save can write the correct file).
+    let socket_server = SocketServer::new_with_session(socket_path.clone(), session_id)?;
 
     info!("forgetty-daemon started, socket at {}", socket_path.display());
 
