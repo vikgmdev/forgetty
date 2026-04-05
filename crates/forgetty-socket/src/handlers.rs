@@ -517,13 +517,16 @@ fn handle_split_pane(request: &Request, sm: &SessionManager) -> Response {
 
     let size = PtySize { rows, cols, pixel_width: 0, pixel_height: 0 };
 
+    // Use the explicitly-provided CWD, or inherit the source pane's CWD so that
+    // the new split opens in the same directory as the pane being split.
     let cwd: Option<PathBuf> = request
         .params
         .get("cwd")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
-        .filter(|p| p.is_dir());
+        .filter(|p| p.is_dir())
+        .or_else(|| sm.pane_info(pane_id).map(|info| info.cwd));
 
     match sm.split_pane(pane_id, &direction, size, cwd) {
         Ok(new_pane_id) => Response::success(

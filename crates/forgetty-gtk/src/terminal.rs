@@ -3494,6 +3494,13 @@ fn draw_terminal(
                         tracing::warn!("Failed to resize PTY on initial measure: {e}");
                     }
                 }
+                // Daemon mode: notify the daemon so the PTY gets the real size.
+                // The connect_resize handler skips until cell_measured is true, so
+                // this is the only place the initial size reaches the daemon PTY.
+                if let (Some(ref dc), Some(pane_id)) = (s.daemon_client.clone(), s.daemon_pane_id)
+                {
+                    let _ = dc.resize_pane(pane_id, new_rows as u16, new_cols as u16);
+                }
             }
         }
     }
