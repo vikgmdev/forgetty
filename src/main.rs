@@ -93,9 +93,7 @@ fn main() {
                 // would connect two GTK clients to the same single-tenant daemon
                 // (violates AD-001/AD-006).
                 if is_session_live(session_uuid) {
-                    tracing::info!(
-                        "--restore-all: skipping {session_uuid} — session already open"
-                    );
+                    tracing::info!("--restore-all: skipping {session_uuid} — session already open");
                     continue;
                 }
                 match std::process::Command::new(&current_exe)
@@ -149,10 +147,7 @@ fn main() {
                 .collect();
 
             if !to_restore.is_empty() {
-                tracing::info!(
-                    "restore-by-default: restoring {} session(s)",
-                    to_restore.len()
-                );
+                tracing::info!("restore-by-default: restoring {} session(s)", to_restore.len());
                 let current_exe = match std::env::current_exe() {
                     Ok(p) => p,
                     Err(e) => {
@@ -168,9 +163,7 @@ fn main() {
                     {
                         Ok(child) => {
                             std::mem::forget(child);
-                            tracing::info!(
-                                "restore-by-default: spawned session {session_uuid}"
-                            );
+                            tracing::info!("restore-by-default: spawned session {session_uuid}");
                         }
                         Err(e) => {
                             tracing::warn!(

@@ -390,12 +390,10 @@ fn build_ui(
 
     // Section 6 -- Configuration & Help
     let config_help_section = gio::Menu::new();
-    let cmd_palette_item = gio::MenuItem::new(Some("Command Palette"), Some("win.command-palette"));
-    cmd_palette_item.set_attribute_value("accel", Some(&"<Control><Shift>p".to_variant()));
-    config_help_section.append_item(&cmd_palette_item);
+    let settings_item = gio::MenuItem::new(Some("Settings"), Some("win.open-settings"));
+    settings_item.set_attribute_value("accel", Some(&"<Control>period".to_variant()));
+    config_help_section.append_item(&settings_item);
     config_help_section.append(Some("Terminal Inspector"), Some("win.terminal-inspector"));
-    config_help_section.append(Some("Open Configuration"), Some("win.open-config"));
-    config_help_section.append(Some("Reload Configuration"), Some("win.reload-config"));
     let appearance_item = gio::MenuItem::new(Some("Appearance"), Some("win.appearance"));
     appearance_item.set_attribute_value("accel", Some(&"<Control>comma".to_variant()));
     config_help_section.append_item(&appearance_item);
@@ -480,17 +478,23 @@ fn build_ui(
     main_overlay.set_child(Some(&terminal_row));
     main_overlay.set_vexpand(true);
 
-    let content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-    content.append(&header);
-    content.append(&tab_bar);
-    content.append(&main_overlay);
+    // Outer stack: "terminal" page (normal UI) and "settings" page (full takeover).
+    // The settings page is added lazily on first open to avoid building it at startup.
+    let terminal_page = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    terminal_page.append(&header);
+    terminal_page.append(&tab_bar);
+    terminal_page.append(&main_overlay);
+
+    let outer_stack = gtk4::Stack::new();
+    outer_stack.set_transition_type(gtk4::StackTransitionType::None);
+    outer_stack.add_named(&terminal_page, Some("terminal"));
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("Forgetty")
         .default_width(DEFAULT_WIDTH)
         .default_height(DEFAULT_HEIGHT)
-        .content(&content)
+        .content(&outer_stack)
         .build();
 
     // --- Workspace sidebar CSS ---
@@ -546,13 +550,9 @@ fn build_ui(
     let shared_config: SharedConfig = Rc::new(RefCell::new(config.clone()));
 
     // --- Settings sidebar (right panel, built after shared state is ready) ---
-    // Use the workspace manager for config apply so it hits all workspaces.
-    let appearance_revealer = preferences::build_appearance_sidebar(
-        &shared_config,
-        &tab_states,
-        &window,
-        daemon_client.clone(),
-    );
+    // Shows Theme, Font Family, Font Size only. Paired Devices is in Settings view.
+    let appearance_revealer =
+        preferences::build_appearance_sidebar(&shared_config, &tab_states, &window);
     main_area.append(&appearance_revealer);
 
     // --- Command palette overlay (built after workspace_manager is ready) ---
@@ -1157,6 +1157,49 @@ fn build_ui(
         });
         window.add_action(&action);
         app.set_accels_for_action("win.appearance", &["<Control>comma"]);
+    }
+
+    app.set_accels_for_action("win.open-settings", &["<Control>period"]);
+
+    // --- Settings full-window takeover action (Ctrl+. or hamburger "Settings") ---
+    // Toggles: Ctrl+. opens settings, and pressing again (or Escape) closes it.
+    // The settings view is rebuilt on each open so controls always reflect the
+    // current shared_config (important after JSON editor saves).
+    {
+        let stk = outer_stack.clone();
+        let shared_cfg_sv = Rc::clone(&shared_config);
+        let win_sv = window.clone();
+        let dc_sv = daemon_client.clone();
+        let wm_sv = Rc::clone(&workspace_manager);
+        let action = gio::SimpleAction::new("open-settings", None);
+        action.connect_activate(move |_action, _param| {
+            // Toggle: if settings is already open, close it.
+            if stk.visible_child_name().as_deref() == Some("settings") {
+                stk.set_visible_child_name("terminal");
+                win_sv.set_title(Some("Forgetty"));
+                refocus_active_pane(&wm_sv, &win_sv);
+                return;
+            }
+
+            // Remove the previous settings page (if any) so we get fresh controls.
+            if let Some(old) = stk.child_by_name("settings") {
+                stk.remove(&old);
+            }
+            let stk_back = stk.clone();
+            let win_back = win_sv.clone();
+            let wm_back = Rc::clone(&wm_sv);
+            let on_back = move || {
+                stk_back.set_visible_child_name("terminal");
+                win_back.set_title(Some("Forgetty"));
+                refocus_active_pane(&wm_back, &win_back);
+            };
+            let sv =
+                crate::settings_view::build_settings_view(&shared_cfg_sv, dc_sv.clone(), on_back);
+            stk.add_named(&sv, Some("settings"));
+            stk.set_visible_child_name("settings");
+            win_sv.set_title(Some("Settings — Forgetty"));
+        });
+        window.add_action(&action);
     }
 
     // --- Quit action (Ctrl+Shift+Q) ---
@@ -4530,6 +4573,8 @@ fn build_shortcuts_window() -> gtk4::ShortcutsWindow {
     // --- Help ---
     let help_group = shortcut_group("Help");
     help_group.add_shortcut(&shortcut("F1", "Keyboard Shortcuts"));
+    help_group.add_shortcut(&shortcut("<Control>period", "Settings"));
+    help_group.add_shortcut(&shortcut("<Control>comma", "Appearance Sidebar"));
     help_group.add_shortcut(&shortcut("<Control><Shift>q", "Quit"));
     section.add_group(&help_group);
 
@@ -5310,6 +5355,20 @@ fn active_focus_tracker(workspace_manager: &WorkspaceManager) -> FocusTracker {
         .ok()
         .map(|mgr| Rc::clone(&mgr.workspaces[mgr.active_index].focus_tracker))
         .unwrap_or_else(|| Rc::new(RefCell::new(String::new())))
+}
+
+/// Re-focus the terminal pane that was last active in the current workspace.
+///
+/// Called after closing the Settings view so keyboard input returns immediately
+/// to the terminal without requiring a click.
+fn refocus_active_pane(workspace_manager: &WorkspaceManager, window: &adw::ApplicationWindow) {
+    let focused_name = active_focus_tracker(workspace_manager).borrow().clone();
+    if focused_name.is_empty() {
+        return;
+    }
+    if let Some(da) = find_drawing_area_by_name(window, &focused_name) {
+        da.grab_focus();
+    }
 }
 
 /// Wire the standard tab close and focus management handlers on a TabView.

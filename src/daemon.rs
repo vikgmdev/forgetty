@@ -30,8 +30,8 @@ use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use forgetty_config::{load_config, Config};
-use forgetty_pty::PtySize;
 use forgetty_core::PaneId;
+use forgetty_pty::PtySize;
 use forgetty_session::{SessionEvent, SessionManager};
 use forgetty_socket::SocketServer;
 use forgetty_sync::{
@@ -241,12 +241,18 @@ async fn main_async() -> anyhow::Result<()> {
                     for tab in &workspace.tabs {
                         // Create the root pane using the leftmost leaf's CWD.
                         let root_cwd = first_leaf_cwd(&tab.pane_tree);
-                        let effective_root_cwd = if root_cwd.is_dir() { Some(root_cwd.to_path_buf()) } else { None };
+                        let effective_root_cwd =
+                            if root_cwd.is_dir() { Some(root_cwd.to_path_buf()) } else { None };
                         match session_manager.create_tab(ws_idx, effective_root_cwd, default_size) {
                             Ok((root_pane_id, _tab_id)) => {
                                 debug!("cold-start restore: created root pane {root_pane_id} for workspace {ws_idx}");
                                 // Restore the full split tree rooted at this pane.
-                                restore_subtree(&session_manager, root_pane_id, &tab.pane_tree, default_size);
+                                restore_subtree(
+                                    &session_manager,
+                                    root_pane_id,
+                                    &tab.pane_tree,
+                                    default_size,
+                                );
                             }
                             Err(e) => {
                                 warn!("cold-start restore: create_tab failed for workspace {ws_idx}: {e}");
@@ -465,7 +471,13 @@ fn restore_subtree(
         let second_cwd = first_leaf_cwd(second);
         let effective_cwd = if second_cwd.is_dir() { Some(second_cwd.to_path_buf()) } else { None };
 
-        match session_manager.split_pane_with_ratio(anchor_id, direction, *ratio, size, effective_cwd) {
+        match session_manager.split_pane_with_ratio(
+            anchor_id,
+            direction,
+            *ratio,
+            size,
+            effective_cwd,
+        ) {
             Ok(second_pane_id) => {
                 restore_subtree(session_manager, anchor_id, first, size);
                 restore_subtree(session_manager, second_pane_id, second, size);

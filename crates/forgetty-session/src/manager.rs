@@ -356,7 +356,13 @@ impl SessionManager {
         let mut found_tab_id: Option<Uuid> = None;
         'outer: for ws in inner.layout.workspaces.iter_mut() {
             for tab in ws.tabs.iter_mut() {
-                if replace_leaf_with_ratio(&mut tab.pane_tree, pane_id, new_pane_id, direction, ratio) {
+                if replace_leaf_with_ratio(
+                    &mut tab.pane_tree,
+                    pane_id,
+                    new_pane_id,
+                    direction,
+                    ratio,
+                ) {
                     replaced = true;
                     found_tab_id = Some(tab.id);
                     break 'outer;

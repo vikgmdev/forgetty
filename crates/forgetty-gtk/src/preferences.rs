@@ -34,13 +34,12 @@ type TabStateMap = Rc<RefCell<HashMap<String, Rc<RefCell<TerminalState>>>>>;
 /// - Escape to revert to the original theme.
 /// - Close sidebar (X button or toggle) also reverts if no Enter was pressed.
 ///
-/// `daemon_client` is used to populate the "Paired Devices" sync section.
-/// Pass `None` if the daemon is unavailable.
+/// Shows Theme, Font Family, and Font Size controls only. Paired Devices
+/// is now in the full Settings view (opened via the hamburger menu).
 pub fn build_appearance_sidebar(
     shared_config: &SharedConfig,
     tab_states: &TabStateMap,
     window: &adw::ApplicationWindow,
-    daemon_client: Option<Arc<DaemonClient>>,
 ) -> gtk4::Revealer {
     let revealer = gtk4::Revealer::new();
     revealer.set_transition_type(gtk4::RevealerTransitionType::None);
@@ -67,7 +66,7 @@ pub fn build_appearance_sidebar(
     title_bar.set_margin_start(12);
     title_bar.set_margin_end(12);
 
-    let title_label = gtk4::Label::new(Some("Settings"));
+    let title_label = gtk4::Label::new(Some("Appearance"));
     title_label.add_css_class("title-3");
     title_label.set_halign(gtk4::Align::Start);
     title_label.set_hexpand(true);
@@ -110,10 +109,6 @@ pub fn build_appearance_sidebar(
         build_font_size_section(&current_config, shared_config, tab_states, window);
     content_box.append(&font_size_section);
 
-    // --- Sync / Paired Devices section ---
-    let sync_section = build_sync_section(daemon_client);
-    content_box.append(&sync_section);
-
     // Wrap content in a ScrolledWindow for long option lists.
     let scrolled_sidebar = gtk4::ScrolledWindow::new();
     scrolled_sidebar.set_child(Some(&content_box));
@@ -140,7 +135,7 @@ pub fn build_appearance_sidebar(
 // ---------------------------------------------------------------------------
 
 /// Build the Theme dropdown section (same pattern as Font Family).
-fn build_theme_section(
+pub fn build_theme_section(
     config: &Config,
     shared_config: &SharedConfig,
     tab_states: &TabStateMap,
@@ -226,7 +221,7 @@ fn build_theme_section(
 // ---------------------------------------------------------------------------
 
 /// Build the Font Family dropdown section.
-fn build_font_family_section(
+pub fn build_font_family_section(
     config: &Config,
     shared_config: &SharedConfig,
     tab_states: &TabStateMap,
@@ -315,7 +310,7 @@ fn build_font_family_section(
 const FONT_SIZES: &[u32] = &[8, 9, 10, 11, 12, 13, 14, 16, 18, 20, 24, 28, 32, 36, 48, 64, 72];
 
 /// Build the Font Size dropdown section.
-fn build_font_size_section(
+pub fn build_font_size_section(
     config: &Config,
     shared_config: &SharedConfig,
     tab_states: &TabStateMap,
@@ -610,7 +605,7 @@ fn show_qr_view(stack: &gtk4::Stack, dc: Arc<DaemonClient>) {
 /// Apply config changes to every terminal pane via `apply_config_change()`.
 ///
 /// This replicates the exact pattern used by `reload_config()` in `app.rs`.
-fn apply_to_all_panes(
+pub fn apply_to_all_panes(
     tab_states: &TabStateMap,
     window: &adw::ApplicationWindow,
     new_config: &Config,
@@ -635,7 +630,7 @@ fn apply_to_all_panes(
 }
 
 /// Save config to disk in the background (fire-and-forget via idle callback).
-fn save_in_background(config: Config) {
+pub fn save_in_background(config: Config) {
     gtk4::glib::idle_add_local_once(move || {
         if let Err(e) = save_config(&config) {
             tracing::warn!("Failed to save config: {e}");
@@ -682,7 +677,7 @@ fn find_drawing_area_by_name(
 }
 
 /// Create a section box with standard spacing and padding.
-fn make_section_box() -> gtk4::Box {
+pub fn make_section_box() -> gtk4::Box {
     let section = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
     section.set_margin_top(12);
     section.set_margin_start(12);
@@ -691,7 +686,7 @@ fn make_section_box() -> gtk4::Box {
 }
 
 /// Create a bold section label.
-fn make_section_label(text: &str) -> gtk4::Label {
+pub fn make_section_label(text: &str) -> gtk4::Label {
     let label = gtk4::Label::new(None);
     label.set_markup(&format!("<b>{text}</b>"));
     label.set_halign(gtk4::Align::Start);

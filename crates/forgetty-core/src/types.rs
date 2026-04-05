@@ -34,6 +34,13 @@ pub struct Rgba {
     pub a: u8,
 }
 
+impl Default for Rgba {
+    /// Returns black, fully opaque.
+    fn default() -> Self {
+        Self { r: 0, g: 0, b: 0, a: 255 }
+    }
+}
+
 impl Rgba {
     /// Creates a new RGBA color.
     pub fn new(r: u8, g: u8, b: u8, a: u8) -> Self {

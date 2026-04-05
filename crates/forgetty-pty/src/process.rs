@@ -218,12 +218,37 @@ impl Drop for PtyProcess {
 
 /// Detect the user's default shell.
 ///
-/// Fallback chain (Unix):
+/// Fallback chain (Unix/Linux/macOS):
 ///   1. `$SHELL` environment variable (if set and the path exists + is executable)
 ///   2. `/etc/passwd` entry via `getpwuid(getuid())` (if valid and path exists)
 ///   3. `/bin/sh` (absolute last resort)
+///
+/// Fallback chain (Android — Bionic libc, no `/etc/passwd`):
+///   1. `$SHELL` environment variable (if set and the path exists)
+///   2. `/system/bin/sh` (Android system shell)
 fn detect_shell() -> String {
-    #[cfg(unix)]
+    #[cfg(target_os = "android")]
+    {
+        // Android: Bionic libc does not provide a usable /etc/passwd.
+        // Try $SHELL first, then fall back to the Android system shell.
+        if let Ok(shell) = std::env::var("SHELL") {
+            if !shell.is_empty() {
+                let path = Path::new(&shell);
+                if path.exists() {
+                    debug!(shell = %shell, "using $SHELL");
+                    return shell;
+                }
+                warn!(
+                    shell = %shell,
+                    "$SHELL points to a nonexistent path, falling back to /system/bin/sh"
+                );
+            }
+        }
+        warn!("$SHELL not set on Android, falling back to /system/bin/sh");
+        "/system/bin/sh".to_string()
+    }
+
+    #[cfg(all(unix, not(target_os = "android")))]
     {
         // Step 1: Try $SHELL environment variable.
         if let Ok(shell) = std::env::var("SHELL") {
@@ -281,7 +306,9 @@ fn detect_shell() -> String {
 /// Returns `None` if the lookup fails or the shell field cannot be read.
 /// The `pw_shell` string is copied immediately -- the pointer from `getpwuid`
 /// is to a static buffer and must not be held across calls.
-#[cfg(unix)]
+///
+/// Not compiled on Android: Bionic libc does not expose a usable `/etc/passwd`.
+#[cfg(all(unix, not(target_os = "android")))]
 fn passwd_shell() -> Option<String> {
     use std::ffi::CStr;
 
@@ -445,7 +472,7 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "android")))]
     #[test]
     fn test_passwd_shell_returns_some() {
         // On a normal system, the current user should have a passwd entry.

@@ -303,7 +303,8 @@ pub fn create_terminal(
     )?;
 
     // Create terminal VT state
-    let mut terminal = forgetty_vt::Terminal::new(initial_rows, initial_cols);
+    let mut terminal =
+        forgetty_vt::Terminal::new(initial_rows, initial_cols, config.theme.ansi_colors);
 
     // Set default cursor to "blinking block" (DECSCUSR 1) so that
     // cursor_blinking() returns true before the shell sends any DECSCUSR.
@@ -1534,7 +1535,8 @@ pub fn create_terminal_for_pane(
     let initial_cols: usize = 240;
 
     // Create terminal VT state (no local PTY)
-    let mut terminal = forgetty_vt::Terminal::new(initial_rows, initial_cols);
+    let mut terminal =
+        forgetty_vt::Terminal::new(initial_rows, initial_cols, config.theme.ansi_colors);
     terminal.feed(b"\x1b[1 q");
 
     // Prime VT state with snapshot lines so the first frame shows content.
@@ -3023,6 +3025,9 @@ pub fn apply_config_change(state: &mut TerminalState, new_config: &Config, da: &
 
     // Always update theme -- it's cheap and the next draw picks it up.
     state.config.theme = new_config.theme.clone();
+    // Propagate the new ANSI palette to the VT so that palette color indices
+    // 0–15 resolve via the new theme on the next sync_screen (AC-07).
+    state.terminal.set_ansi_palette(new_config.theme.ansi_colors);
 
     // Update bell mode -- takes effect on next BEL event.
     state.config.bell_mode = new_config.bell_mode;
@@ -3497,8 +3502,7 @@ fn draw_terminal(
                 // Daemon mode: notify the daemon so the PTY gets the real size.
                 // The connect_resize handler skips until cell_measured is true, so
                 // this is the only place the initial size reaches the daemon PTY.
-                if let (Some(ref dc), Some(pane_id)) = (s.daemon_client.clone(), s.daemon_pane_id)
-                {
+                if let (Some(ref dc), Some(pane_id)) = (s.daemon_client.clone(), s.daemon_pane_id) {
                     let _ = dc.resize_pane(pane_id, new_rows as u16, new_cols as u16);
                 }
             }
@@ -3543,22 +3547,53 @@ fn draw_terminal(
     for row in 0..num_rows {
         let y = row as f64 * cell_h;
         let cells = screen.row(row);
+        let num = num_cols.min(cells.len());
 
-        for col in 0..num_cols.min(cells.len()) {
+        // --- Pass 1: backgrounds ---
+        //
+        // Group consecutive cells that share the same explicit background color
+        // into a single wide rectangle and draw it with ONE fill() call.
+        //
+        // Per-cell fill() creates a visible grid-line artifact: Cairo composites
+        // each rectangle independently, and at fractional cell widths the
+        // sub-pixel edges receive slightly different anti-aliasing coverage,
+        // leaving a faint 1-px seam between adjacent cells.  A single fill()
+        // over the merged rectangle makes those edges interior — no anti-aliasing
+        // applied, no seam.
+        {
+            let mut col = 0;
+            while col < num {
+                if let Color::Rgb(r, g, b) = cells[col].attrs.bg {
+                    let run_start = col;
+                    col += 1;
+                    while col < num {
+                        match cells[col].attrs.bg {
+                            Color::Rgb(rr, gg, bb) if rr == r && gg == g && bb == b => {
+                                col += 1;
+                            }
+                            _ => break,
+                        }
+                    }
+                    ctx.set_source_rgb(r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0);
+                    ctx.rectangle(
+                        run_start as f64 * cell_w,
+                        y,
+                        (col - run_start) as f64 * cell_w,
+                        cell_h,
+                    );
+                    ctx.fill().ok();
+                } else {
+                    col += 1;
+                }
+            }
+        }
+
+        // --- Pass 2: foreground (text, underline, strikethrough) ---
+        for col in 0..num {
             let x = col as f64 * cell_w;
             let cell = &cells[col];
 
-            // Draw cell background if non-default
-            match cell.attrs.bg {
-                Color::Rgb(r, g, b) => {
-                    ctx.set_source_rgb(r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0);
-                    ctx.rectangle(x, y, cell_w, cell_h);
-                    ctx.fill().ok();
-                }
-                Color::Default => {}
-            }
-
-            // Skip drawing empty/space cells for performance
+            // Skip empty/space cells — background already drawn in pass 1
             let grapheme = &cell.grapheme;
             if grapheme == " " || grapheme.is_empty() {
                 continue;

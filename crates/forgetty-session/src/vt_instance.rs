@@ -18,8 +18,14 @@ pub struct VtInstance {
 
 impl VtInstance {
     /// Create a new VT with the given initial dimensions.
+    ///
+    /// The session layer has no access to theme configuration, so a default
+    /// (all-black) palette is used here.  The GTK layer's `TerminalState` holds
+    /// the authoritative `Terminal` instance that receives the real theme palette
+    /// via `set_ansi_palette()`; the session-layer VT is only used for
+    /// snapshot/streaming purposes and does not call `sync_screen`.
     pub fn new(rows: usize, cols: usize) -> Self {
-        let mut terminal = Terminal::new(rows, cols);
+        let mut terminal = Terminal::new(rows, cols, [forgetty_vt::ANSI_PALETTE_BLACK; 16]);
         // Mirror the GTK terminal setup: prime cursor style with DECSCUSR 1
         // (blinking block) so cursor_blinking() returns true before the shell
         // sends its own DECSCUSR.

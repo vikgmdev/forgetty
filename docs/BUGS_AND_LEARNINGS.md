@@ -226,3 +226,86 @@ Also added `SessionManager::split_pane_with_ratio()` (and the underlying `replac
 ### Key insight
 
 After `create_tab()` creates `root_pane_id`, it is the anchor for the first leaf. Calling `split_pane_with_ratio(root_pane_id, direction, ratio, ...)` inserts `Split { first: Leaf(root_pane_id), second: Leaf(new_id) }` in the tree. Recursing into the first subtree can then further split `root_pane_id` inward — the split_pane lookup finds the leaf by ID regardless of tree depth, so nested splits compose correctly.
+
+---
+
+## BUG-005: Daemon PTY stays at 24×80 after first draw (T-076)
+
+**Platforms affected:** Linux (GTK4, daemon mode)
+**Severity:** Critical — every full-screen app and prompt using COLUMNS breaks on first launch
+**Status:** Fixed (T-076)
+
+### Symptoms
+
+- `tput cols` returns 80 in a freshly opened daemon-mode terminal, regardless of window width
+- zsh-autosuggestions render at the wrong column (far right of terminal)
+- nano, htop, and other full-screen apps render with display corruption
+
+### Root cause
+
+`draw_terminal` runs an initial cell-measurement block on the first frame (when `cell_measured` flips to `true`). This block resizes the local VT and calls `pty.resize()` for standalone mode — but never called `dc.resize_pane()` for daemon mode. The `connect_resize` callback skips until `cell_measured = true`, so there is no resize event triggered after the first draw. The daemon PTY stayed at its creation-time default of 24×80.
+
+### Fix
+
+Added `dc.resize_pane(pane_id, rows, cols)` immediately after the `pty.resize()` block inside the `if !*cell_measured.borrow()` guard in `draw_terminal` (`crates/forgetty-gtk/src/terminal.rs`).
+
+### Key insight
+
+Daemon mode has TWO resize paths: the `connect_resize` callback (correct, handles subsequent resizes) and the first-draw measurement block (was missing the daemon call). Always keep both paths in sync when adding new resize destinations.
+
+---
+
+## BUG-006: Per-cell Cairo fill() creates visible grid lines in backgrounds (T-076)
+
+**Platforms affected:** Linux (GTK4)
+**Severity:** Medium — inverse video, syntax highlighting, and 256-color blocks show visible 1px seams between cells
+**Status:** Fixed (T-076)
+
+### Symptoms
+
+- `printf '\e[7m   INVERSE TEXT   \e[0m\n'` shows each character cell as a slightly different shade — no uniform highlight
+- 256-color cube (`\e[48;5;Nm`) shows visible grid lines between same-colored adjacent cells
+- Any solid-background region (e.g. ncurses header bars) looks "textured" instead of solid
+
+### Root cause
+
+The cell drawing loop called `ctx.fill()` once per cell. Cairo composites each rectangle independently; at fractional cell widths the sub-pixel edges receive different anti-aliasing coverage, leaving a faint 1px seam between adjacent cells. The same artifact had already been documented and fixed for the selection overlay (which uses a single path + single `fill()`), but the cell background drawing still used per-cell fills.
+
+### Fix
+
+Split cell rendering into two passes in `draw_terminal`:
+
+1. **Background pass:** iterate cells with run-length encoding — group consecutive cells sharing the same `Color::Rgb(r, g, b)` into a single wide rectangle, drawn with ONE `fill()` call. Same-color runs have no interior edges for Cairo to anti-alias.
+2. **Foreground pass:** draw text, underline, strikethrough per cell as before.
+
+### Key insight
+
+A single `ctx.fill()` over a merged rectangle makes all interior edges invisible to Cairo's anti-aliasing. This is the same principle already documented for the selection overlay. Any solid-fill region spanning multiple cells must be drawn as ONE path + ONE fill to be seam-free.
+
+---
+
+## BUG-007: Theme ANSI palette ignored — libghostty-vt uses xterm defaults (T-076)
+
+**Platforms affected:** Linux (GTK4)
+**Severity:** Medium — themed terminals don't use the theme's custom ANSI colors
+**Status:** Fixed (T-076)
+
+### Symptoms
+
+- `printf '\e[41mRED\e[0m\n'` shows xterm's default dark red (`#800000`) instead of the theme's red
+- Applications using ANSI palette colors look inconsistent with the theme
+
+### Root cause
+
+`Terminal::new()` passed a null config pointer to `ghostty_terminal_new`, so libghostty-vt used its built-in xterm palette for color resolution. The theme's `ansi_colors[0..15]` were stored in the config but never passed to the VT layer. `sync_screen` queried the pre-resolved `FG_COLOR`/`BG_COLOR` FFI values which had already been resolved using libghostty-vt's internal palette.
+
+### Fix
+
+1. Added `ansi_palette: [forgetty_core::Rgba; 16]` field to `Terminal`.
+2. Changed `Terminal::new()` to accept the palette; GTK call sites pass `config.theme.ansi_colors`.
+3. Added `set_ansi_palette()` for runtime theme changes.
+4. Added `resolve_style_color()` helper that uses `GhosttyStyle.fg_color`/`bg_color` union fields (which carry the unresolved `Tag::Palette(index)` or `Tag::Rgb(r,g,b)`) instead of the pre-resolved FFI queries. Indices 0–15 use the theme palette; 16–231 use the 6×6×6 cube formula; 232–255 use the grayscale ramp.
+
+### Key insight
+
+`GhosttyStyle` exposes unresolved color tags (`None`, `Palette(u8)`, `Rgb`). Using `style.fg_color`/`style.bg_color` instead of the pre-resolved `FG_COLOR`/`BG_COLOR` FFI queries lets Forgetty own the palette-to-RGB mapping and apply the theme's colors. The pre-resolved queries are a convenience but bypass theme customization.

@@ -48,6 +48,27 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
     Ok(config)
 }
 
+/// Returns the current `config.toml` contents as a raw string.
+///
+/// Returns an empty string if the file does not exist yet.
+pub fn load_config_as_text() -> String {
+    let config_path = forgetty_core::platform::config_dir().join("config.toml");
+    std::fs::read_to_string(config_path).unwrap_or_default()
+}
+
+/// Parse a TOML string as `Config`, save it to disk, and return the parsed value.
+///
+/// Returns an error if the text is not valid TOML or does not conform to the
+/// `Config` schema. On success the config is atomically written to the default
+/// config path.
+pub fn parse_and_save_config(toml_text: &str) -> Result<Config> {
+    let config: Config = toml::from_str(toml_text).map_err(|e| {
+        forgetty_core::ForgettyError::Config(format!("Failed to parse config: {}", e))
+    })?;
+    save_config(&config)?;
+    Ok(config)
+}
+
 /// Saves the configuration to `~/.config/forgetty/config.toml`.
 ///
 /// Creates the config directory if it does not exist. Uses an atomic

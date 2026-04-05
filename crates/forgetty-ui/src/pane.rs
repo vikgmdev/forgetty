@@ -53,7 +53,7 @@ impl Pane {
         working_dir: Option<&Path>,
         proxy: EventLoopProxy<UserEvent>,
     ) -> Result<Self, String> {
-        let terminal = Terminal::new(rows, cols);
+        let terminal = Terminal::new(rows, cols, [forgetty_vt::ANSI_PALETTE_BLACK; 16]);
         let size =
             PtySize { rows: rows as u16, cols: cols as u16, pixel_width: 0, pixel_height: 0 };
 

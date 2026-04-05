@@ -566,7 +566,7 @@ mod tests {
         // Clean up from previous test runs.
         let _ = std::fs::remove_file(&sock_path);
 
-        let _server = SocketServer { socket_path: sock_path.clone() };
+        let _server = SocketServer { socket_path: sock_path.clone(), session_id: None };
 
         let listener = UnixListener::bind(&sock_path).unwrap();
         let sm = Arc::new(SessionManager::new());

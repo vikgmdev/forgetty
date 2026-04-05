@@ -756,7 +756,11 @@ impl Terminal {
                                 &mut bg_rgb as *mut ffi::GhosttyColorRgb as *mut c_void,
                             )
                         } == ffi::GHOSTTY_SUCCESS;
-                        if has_bg { Color::Rgb(bg_rgb.r, bg_rgb.g, bg_rgb.b) } else { Color::Default }
+                        if has_bg {
+                            Color::Rgb(bg_rgb.r, bg_rgb.g, bg_rgb.b)
+                        } else {
+                            Color::Default
+                        }
                     };
 
                     let attrs = CellAttributes { bg, ..CellAttributes::default() };
