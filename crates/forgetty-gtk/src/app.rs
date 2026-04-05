@@ -129,6 +129,9 @@ struct WorkspaceManagerInner {
     /// Last right-click position on the tab bar (x, y in tab_bar coordinates).
     /// Written by the GestureClick(button=3) Capture handler, read by setup-menu handlers.
     last_tab_click: (f64, f64),
+    /// Set to true by setup-menu handler after showing the menu.
+    /// Read by the bubble-phase fallback to avoid showing a second menu.
+    tab_menu_shown: bool,
 }
 
 /// CLI-derived launch parameters for this specific invocation.
@@ -867,6 +870,7 @@ fn build_ui(
         }],
         active_index: 0,
         last_tab_click: (0.0, 0.0),
+        tab_menu_shown: false,
     }));
 
     // Convenience aliases for the active workspace's state during initial setup.
@@ -891,32 +895,61 @@ fn build_ui(
     let command_palette = build_command_palette(&window, &workspace_manager);
     main_overlay.add_overlay(&command_palette);
 
-    // --- Tab bar right-click: capture click coordinates before setup-menu fires ---
-    // adw::TabView emits `setup-menu` when a tab is right-clicked; that signal
-    // gives us the page but not the coordinates.  We stash coordinates here
-    // (Capture phase, no claim) so the setup-menu handler can position the popover.
+    // --- Tab bar right-click (Capture phase, claimed) ---
+    //
+    // libadwaita 1.5 claims button-3 events on AdwTabButton WITHOUT emitting
+    // setup-menu when no menu-model is set on the TabView.  This means neither
+    // setup-menu nor bubble-phase controllers on the tab bar ever fire.
+    //
+    // Fix: capture and claim button-3 ourselves BEFORE libadwaita's target-phase
+    // gesture sees it.  We then resolve which tab was clicked by walking the
+    // widget tree via pick(), and show our custom context menu.
     {
         let wm_click = Rc::clone(&workspace_manager);
+        let tb_click = tab_bar.clone();
+        let win_click = window.clone();
+        let dc_click = daemon_client.clone();
+        let sc_click = Rc::clone(&shared_config);
         let gesture = gtk4::GestureClick::new();
         gesture.set_button(3);
         gesture.set_propagation_phase(gtk4::PropagationPhase::Capture);
-        gesture.connect_pressed(move |_gesture, _n, x, y| {
-            if let Ok(mut mgr) = wm_click.try_borrow_mut() {
-                mgr.last_tab_click = (x, y);
-            }
+        gesture.connect_pressed(move |gesture, _n, x, y| {
+            // Claim the event so libadwaita's tab button gesture never sees it.
+            gesture.set_state(gtk4::EventSequenceState::Claimed);
+            tracing::info!("tab-bar right-click capture (claimed): ({x},{y})");
+
+            // Find which page was right-clicked.
+            let page = tab_bar_find_page_at(&tb_click, x, y);
+            tracing::info!("tab-bar page at pos: {}", page.is_some());
+
+            let result = {
+                let Ok(mgr) = wm_click.try_borrow() else { return; };
+                let ws = &mgr.workspaces[mgr.active_index];
+                // Use the picked page, or fall back to the selected page.
+                let p = match page.or_else(|| ws.tab_view.selected_page()) {
+                    Some(p) => p,
+                    None => return,
+                };
+                Some((
+                    p,
+                    Rc::clone(&ws.tab_states),
+                    Rc::clone(&ws.focus_tracker),
+                    Rc::clone(&ws.custom_titles),
+                    Rc::clone(&ws.tab_colors),
+                    Rc::clone(&ws.tab_id_map),
+                ))
+            };
+            let Some((page, tab_states, focus_tracker, custom_titles, tab_colors, tab_id_map)) = result else { return; };
+
+            let Some(tv) = tb_click.view() else { return; };
+            show_tab_context_menu(
+                &tb_click, &tv, &page, x, y,
+                &tab_states, &focus_tracker, &custom_titles, &tab_colors, &tab_id_map,
+                &win_click, dc_click.clone(), &sc_click,
+            );
         });
         tab_bar.add_controller(gesture);
     }
-
-    // Wire tab right-click context menu for the initial workspace's tab view.
-    wire_tab_context_menu_signal(
-        &initial_tab_view,
-        &workspace_manager,
-        &tab_bar,
-        &window,
-        daemon_client.clone(),
-        &shared_config,
-    );
 
     // --- Workspace sidebar (left panel, pushes main_area right) ---
     // Built after workspace_manager is ready. The revealer is prepended to
@@ -5977,6 +6010,65 @@ fn toggle_command_palette(
 // Tab right-click context menu (T-M1-extra-009)
 // ---------------------------------------------------------------------------
 
+/// Find which `adw::TabPage` was right-clicked in the tab bar.
+///
+/// Uses `gtk4::Widget::pick()` to find the widget at (x, y), then walks up the
+/// widget tree to find an `AdwTabButton` (by GObject type name).  Counts the
+/// button's position among siblings of the same type to determine the page index.
+///
+/// Returns `None` if (x, y) is not over a tab button (e.g., over empty space
+/// or the new-tab button).
+fn tab_bar_find_page_at(
+    tab_bar: &adw::TabBar,
+    x: f64,
+    y: f64,
+) -> Option<adw::TabPage> {
+    let tv = tab_bar.view()?;
+    let n_pages = tv.n_pages();
+    if n_pages == 0 {
+        return None;
+    }
+
+    // Find the innermost widget at the click position.
+    let picked = tab_bar.pick(x, y, gtk4::PickFlags::DEFAULT)?;
+
+    // Walk up the widget tree looking for an AdwTabButton.
+    let tab_bar_widget = tab_bar.upcast_ref::<gtk4::Widget>();
+    let mut widget: gtk4::Widget = picked;
+    let tab_button = loop {
+        if widget.type_().name() == "AdwTabButton" {
+            break Some(widget);
+        }
+        let parent = widget.parent()?;
+        if &parent == tab_bar_widget {
+            break None; // reached tab_bar without finding a tab button
+        }
+        widget = parent;
+    };
+
+    let tab_button = tab_button?;
+
+    // Count the tab button's index among its AdwTabButton siblings (left → right).
+    let parent = tab_button.parent()?;
+    let mut tab_index: i32 = 0;
+    let mut child = parent.first_child();
+    while let Some(c) = child {
+        if c == tab_button {
+            break;
+        }
+        if c.type_().name() == "AdwTabButton" {
+            tab_index += 1;
+        }
+        child = c.next_sibling();
+    }
+
+    if tab_index < n_pages {
+        Some(tv.nth_page(tab_index))
+    } else {
+        None
+    }
+}
+
 /// Preset colors for the tab color picker (R, G, B as 0.0..1.0).
 const TAB_COLOR_PRESETS: &[(&str, (f32, f32, f32))] = &[
     ("Red",    (0.878, 0.286, 0.227)),
@@ -6012,14 +6104,23 @@ fn wire_tab_context_menu_signal(
     let sc = Rc::clone(shared_config);
 
     tab_view.connect_setup_menu(move |tv, maybe_page| {
-        let Some(page) = maybe_page else { return; };
+        tracing::info!("setup-menu: fired, page={}", maybe_page.is_some());
+        let Some(page) = maybe_page else {
+            tracing::info!("setup-menu: no page (right-click on empty space)");
+            return;
+        };
 
         // Read click position and the workspace state for this tab_view.
         let result = {
-            let Ok(mgr) = wm.try_borrow() else { return; };
+            let Ok(mgr) = wm.try_borrow() else {
+                tracing::warn!("setup-menu: workspace_manager borrow failed");
+                return;
+            };
             let (x, y) = mgr.last_tab_click;
+            tracing::info!("setup-menu: click pos ({x},{y}), {} workspaces", mgr.workspaces.len());
             // Find the workspace that owns this tab_view.
             let Some(ws) = mgr.workspaces.iter().find(|ws| ws.tab_view == *tv) else {
+                tracing::warn!("setup-menu: no workspace found for this tab_view");
                 return;
             };
             (
@@ -6033,6 +6134,11 @@ fn wire_tab_context_menu_signal(
         };
         let (x, y, tab_states, focus_tracker, custom_titles, tab_colors, tab_id_map) = result;
 
+        tracing::info!("setup-menu: showing context menu at ({x},{y})");
+        // Mark as handled so the bubble-phase fallback skips this click.
+        if let Ok(mut mgr) = wm.try_borrow_mut() {
+            mgr.tab_menu_shown = true;
+        }
         show_tab_context_menu(
             &tb, tv, page, x, y,
             &tab_states, &focus_tracker, &custom_titles, &tab_colors, &tab_id_map,
