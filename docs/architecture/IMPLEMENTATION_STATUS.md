@@ -55,7 +55,7 @@
 | Architecture Decisions (AD-001–AD-008) | 8 | 6 | 0 | 0 | 2 |
 | Daemon/Sync components | 14 | 13 | 0 | 0 | 2 |
 
-**Last updated by:** T-069 implementation (2026-04-04)
+**Last updated by:** T-M1-extra-007 (2026-04-05)
 
 ---
 

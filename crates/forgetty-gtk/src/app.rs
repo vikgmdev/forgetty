@@ -557,6 +557,41 @@ fn register_profile_actions(
     profiles.len()
 }
 
+/// Apply custom keybinding overrides from `config.keybindings` to the GTK app.
+///
+/// Iterates every entry in the `[keybindings]` table and calls
+/// `app.set_accels_for_action` with the user-defined accelerator string,
+/// overriding whatever default was registered at startup.  An empty-string
+/// value means "explicitly unbound" — we pass an empty slice so the default is
+/// removed (AC-21).
+///
+/// This helper is used in two places:
+/// 1. At startup, *after* all default `set_accels_for_action` calls (AC-20).
+/// 2. In the `ConfigWatcher` hot-reload closure (AC-22).
+/// 3. Directly in the keybindings editor after saving a change (AC-12).
+pub(crate) fn apply_keybinding_overrides(
+    app: &adw::Application,
+    keybindings: &std::collections::HashMap<String, String>,
+) {
+    use crate::settings_view::ACTION_DEFS;
+    for (config_key, accel) in keybindings {
+        // Look up the full GIO action name from the ACTION_DEFS inventory.
+        if let Some(def) = ACTION_DEFS.iter().find(|d| d.config_key == config_key.as_str()) {
+            if accel.is_empty() {
+                app.set_accels_for_action(def.action_name, &[]);
+            } else {
+                app.set_accels_for_action(def.action_name, &[accel.as_str()]);
+            }
+        } else {
+            // Unknown key — silently skip (forward-compat).
+            tracing::debug!(
+                "apply_keybinding_overrides: unknown config key {:?}, skipping",
+                config_key
+            );
+        }
+    }
+}
+
 /// Remove previously registered profile actions from the window and clear
 /// their keyboard accelerators. Call before re-registering on hot-reload.
 fn unregister_profile_actions(
@@ -1534,6 +1569,7 @@ fn build_ui(
         let win_sv = window.clone();
         let dc_sv = daemon_client.clone();
         let wm_sv = Rc::clone(&workspace_manager);
+        let app_sv = app.clone();
         let action = gio::SimpleAction::new("open-settings", None);
         action.connect_activate(move |_action, _param| {
             // Toggle: if settings is already open, close it.
@@ -1556,8 +1592,12 @@ fn build_ui(
                 win_back.set_title(Some("Forgetty"));
                 refocus_active_pane(&wm_back, &win_back);
             };
-            let sv =
-                crate::settings_view::build_settings_view(&shared_cfg_sv, dc_sv.clone(), on_back);
+            let sv = crate::settings_view::build_settings_view(
+                &shared_cfg_sv,
+                dc_sv.clone(),
+                app_sv.clone(),
+                on_back,
+            );
             stk.add_named(&sv, Some("settings"));
             stk.set_visible_child_name("settings");
             win_sv.set_title(Some("Settings — Forgetty"));
@@ -1758,6 +1798,14 @@ fn build_ui(
 
     app.set_accels_for_action("win.new-temp-window", &["<Control><Shift>n"]);
     app.set_accels_for_action("win.command-palette", &["<Control><Shift>p"]);
+
+    // --- Apply user keybinding overrides (AC-20) ---
+    // Must be called AFTER all default set_accels_for_action calls so user
+    // preferences override the defaults rather than being overwritten by them.
+    {
+        let kb = config.keybindings.clone();
+        apply_keybinding_overrides(app, &kb);
+    }
 
     // --- Terminal Inspector placeholder (greyed out) ---
     {
@@ -2050,6 +2098,10 @@ fn build_ui(
                     let new_popover = build_dropdown_popover(&new_config.profiles, &win);
                     dropdown_ref.set_popover(Some(&new_popover));
                 }
+
+                // Re-apply keybinding overrides (AC-22): external config edit may have
+                // changed [keybindings] — re-register all accels from the new config.
+                apply_keybinding_overrides(&app_ref, &new_config.keybindings);
             }
 
             // Apply changes to every pane in every workspace.
