@@ -6036,21 +6036,25 @@ fn tab_bar_find_page_at(
     // GtkScrolledWindow whose overflow clip prevents pick traversal.
     // Instead, walk the widget tree recursively and use compute_bounds() to
     // find which button contains the click position.
-    fn collect_tab_buttons(widget: &gtk4::Widget, out: &mut Vec<gtk4::Widget>) {
-        if widget.type_().name() == "AdwTabButton" {
+    fn collect_tab_buttons(widget: &gtk4::Widget, out: &mut Vec<gtk4::Widget>, depth: u32) {
+        let name = widget.type_().name();
+        if depth <= 4 {
+            tracing::debug!("{:indent$}{name}", "", indent = depth as usize * 2);
+        }
+        if name == "AdwTabButton" {
             out.push(widget.clone());
         }
         let mut child = widget.first_child();
         while let Some(c) = child {
-            collect_tab_buttons(&c, out);
+            collect_tab_buttons(&c, out, depth + 1);
             child = c.next_sibling();
         }
     }
 
     let mut buttons: Vec<gtk4::Widget> = Vec::new();
-    collect_tab_buttons(tab_bar_widget, &mut buttons);
+    collect_tab_buttons(tab_bar_widget, &mut buttons, 0);
 
-    tracing::info!("tab_bar_find_page_at: found {} AdwTabButton(s)", buttons.len());
+    tracing::debug!("tab_bar_find_page_at: found {} AdwTabButton(s)", buttons.len());
 
     for (idx, btn) in buttons.iter().enumerate() {
         if let Some(bounds) = btn.compute_bounds(tab_bar_widget) {
@@ -6058,7 +6062,6 @@ fn tab_bar_find_page_at(
             let by = bounds.y() as f64;
             let bw = bounds.width() as f64;
             let bh = bounds.height() as f64;
-            tracing::info!("  button[{idx}] bounds=({bx},{by},{bw}x{bh})");
             if x >= bx && x <= bx + bw && y >= by && y <= by + bh {
                 if (idx as i32) < n_pages {
                     return Some(tv.nth_page(idx as i32));
@@ -6171,20 +6174,31 @@ fn show_tab_context_menu(
     popover.set_autohide(true);
     popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
 
-    // Click-outside dismiss via focus tracking.
+    // Click-outside dismiss via focus tracking (deferred).
     //
     // On Wayland, autohide popup grabs are unreliable when the popover is
     // shown inside a button-press handler (button is still held, no valid
-    // release serial for the compositor's popup grab).  Use
-    // EventControllerFocus instead: when focus leaves the popover (user
-    // clicks on the terminal or anywhere else), popdown() is called.
+    // release serial for the compositor's popup grab).
+    //
+    // We use EventControllerFocus::leave instead, but we MUST connect it via
+    // idle_add_local_once rather than immediately.  If connected before popup()
+    // returns, GTK fires `leave` during the same event cycle as the button-press
+    // (because the press event processing briefly takes focus away from the
+    // popover as it initialises), closing the popover instantly.
+    // Deferring to the next idle cycle avoids this race.
     {
         let pop_fc = popover.clone();
-        let focus_ctrl = gtk4::EventControllerFocus::new();
-        focus_ctrl.connect_leave(move |_| {
-            pop_fc.popdown();
+        glib::idle_add_local_once(move || {
+            if !pop_fc.is_visible() {
+                return; // already dismissed
+            }
+            let pop_ref = pop_fc.clone();
+            let fc = gtk4::EventControllerFocus::new();
+            fc.connect_leave(move |_| {
+                pop_ref.popdown();
+            });
+            pop_fc.add_controller(fc);
         });
-        popover.add_controller(focus_ctrl);
     }
 
     // Re-focus the active terminal pane after the popover is dismissed.
