@@ -1073,6 +1073,28 @@ fn build_ui(
         });
     }
 
+    // --- Tab tear-off: drag a tab outside the tab bar to a new window ---
+    //
+    // adw::TabView emits `create-window` when the user drags a tab outside the
+    // tab bar area.  The handler must return a new TabView (must not return
+    // None — that causes a critical warning and the drag is cancelled).
+    //
+    // We open a minimal receiver window on the same adw::Application.  The
+    // dragged TabPage (with its terminal child widget and live PTY) is moved to
+    // the new window by libadwaita; no close-page signal fires on the source so
+    // our PTY-kill handler is not triggered.
+    //
+    // Limitations of the minimal window: no workspace sidebar, no keybindings,
+    // no daemon session persistence.  The terminal itself keeps working because
+    // the child widget (DrawingArea + PTY/daemon connection) travels with the
+    // page.
+    {
+        let app_ref = app.clone();
+        initial_tab_view.connect_create_window(move |_source_tv| {
+            Some(open_detached_tab_window(&app_ref))
+        });
+    }
+
     // --- New tab action (Ctrl+Shift+T) ---
     // When profiles are configured, uses the default profile (AC-9).
     {
@@ -6940,6 +6962,61 @@ fn wire_tab_view_handlers(
     }
 }
 
+/// Open a minimal window to receive a tab dragged out of the tab bar.
+///
+/// Called from the `create-window` signal handler on every `adw::TabView`.
+/// libadwaita moves the dragged `AdwTabPage` (including its child widget,
+/// PTY state, and all Rc'd terminal state) into the returned `TabView`.
+///
+/// The window is intentionally minimal — no workspace sidebar, no keyboard
+/// shortcuts beyond what GTK provides.  The terminal itself keeps working
+/// because the child widget (DrawingArea, TerminalState Rc, PTY timers)
+/// travels with the page unchanged.
+fn open_detached_tab_window(app: &adw::Application) -> adw::TabView {
+    let new_tv = adw::TabView::new();
+    new_tv.set_vexpand(true);
+    new_tv.set_hexpand(true);
+
+    let tab_bar = adw::TabBar::new();
+    tab_bar.set_view(Some(&new_tv));
+    tab_bar.set_autohide(true);
+
+    let content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    content.append(&tab_bar);
+    content.append(&new_tv);
+
+    let win = adw::ApplicationWindow::builder()
+        .application(app)
+        .title("Forgetty")
+        .default_width(DEFAULT_WIDTH)
+        .default_height(DEFAULT_HEIGHT)
+        .content(&content)
+        .build();
+
+    // Close the window when the last tab is closed.
+    {
+        let win_c = win.clone();
+        new_tv.connect_close_page(move |tv, page| {
+            // Don't kill PTY on close here — the tab arrived from another
+            // window whose state maps own the TerminalState.
+            if tv.n_pages() <= 1 {
+                win_c.close();
+            }
+            tv.close_page_finish(page, true);
+            glib::Propagation::Stop
+        });
+    }
+
+    // Allow further tears from this window.
+    {
+        let app_c = app.clone();
+        new_tv.connect_create_window(move |_| Some(open_detached_tab_window(&app_c)));
+    }
+
+    win.present();
+    new_tv
+}
+
 /// Switch to the workspace at `target_index`.
 ///
 /// Swaps the TabView in main_area and rebinds the TabBar.
@@ -7085,6 +7162,13 @@ fn create_and_switch_to_new_workspace(
 
     wire_tab_view_handlers(&new_tv, &new_tab_states, &new_focus_tracker, window);
     wire_tab_context_menu_signal(&new_tv, workspace_manager, tab_bar, window, daemon_client.clone(), shared_config);
+    // Allow tab tear-off from this workspace too.
+    {
+        let app_c = window.application()
+            .and_downcast::<adw::Application>()
+            .expect("window must be in an adw::Application");
+        new_tv.connect_create_window(move |_| Some(open_detached_tab_window(&app_c)));
+    }
 
     // Determine the workspace UUID and add the initial tab.
     // In daemon mode: create workspace + pane on the daemon and subscribe.
