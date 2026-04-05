@@ -37,9 +37,10 @@
 | `subscribe_layout` streaming | Daemon pushes layout events to connected clients | ✅ IMPLEMENTED | T-063, T-065 | LayoutEvent enum; background tokio task; GLib poll; idempotent handler. |
 | `get_layout` RPC | Returns full `SessionLayout` as JSON | ✅ IMPLEMENTED | T-062 | `get_layout` handler returns all workspaces/tabs/pane-trees. |
 | GTK as thin renderer | GTK connects to daemon socket; sends RPCs for all actions | ✅ IMPLEMENTED | T-051, T-064, T-065 | `ensure_daemon()` pattern. All tab/split/close actions go through RPCs. |
-| Cold-start restore | Daemon loads `{uuid}.json` on startup, recreates PTYs | ✅ IMPLEMENTED | T-064, T-067, T-068 | CWDs restore. All workspaces restored (T-067). UUID session file used (T-068). Split tree still flattened (known gap, separate follow-up). |
+| Cold-start restore | Daemon loads `{uuid}.json` on startup, recreates PTYs | ✅ IMPLEMENTED | T-064, T-067, T-068, BUG-002 | CWDs restore. All workspaces restored (T-067). UUID session file used (T-068). Split tree fully restored with original ratios (BUG-002 fix). |
 | UUID-based socket + session | Per-window isolation via `forgetty-{uuid}.sock` | ✅ IMPLEMENTED | T-068 | `socket_path_for(uuid)` in GTK; `--session-id` flag in daemon; UUID socket + session file paths. |
 | Multi-window restore on login | Enumerate `sessions/*.json`, open one window per file | ✅ IMPLEMENTED | T-068 | `forgetty --restore-all` enumerates `list_sessions()` and spawns one process per UUID. |
+| Split tree restore on cold-start | Pane splits and ratios survive daemon restart | ✅ IMPLEMENTED | BUG-002 fix | `restore_subtree()` + `split_pane_with_ratio()` reconstruct full pane trees with original ratios. |
 | totem-sync / iroh identity | Persistent Ed25519 keypair; QR payload generation | ✅ IMPLEMENTED | T-052 (partial) | `load_or_generate()` key management done. `QrPayload` struct done. `--show-pairing-qr` flag works. |
 | iroh endpoint + accept loop | Daemon listens for incoming Android iroh connections | ✅ IMPLEMENTED | T-052 (partial) | `SyncEndpoint::bind()` and `accept_loop()` implemented. No actual session streaming yet. |
 | Full terminal stream to Android | Raw PTY bytes over iroh QUIC to Android client | ⏸ ON HOLD | — | T-053 deferred. |

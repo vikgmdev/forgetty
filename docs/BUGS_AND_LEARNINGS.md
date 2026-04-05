@@ -194,3 +194,35 @@ The definitive pattern for Ctrl+C across all forgetty platforms:
 ```
 
 All three steps must happen together. Skipping any one breaks a class of processes.
+
+---
+
+## BUG-002: Split panes restored as flat tabs after daemon restart
+
+**Platforms affected:** Linux (GTK4)  
+**Severity:** High — splits are destroyed on every daemon restart  
+**Status:** Fixed (cold-start restore in `src/daemon.rs`)
+
+### Symptoms
+
+- Close Forgetty window (daemon restarts on next open)
+- Any tab that had panes split horizontally or vertically shows each pane as a separate top-level tab instead
+
+### Root cause
+
+Cold-start restore in `daemon.rs` called `collect_leaf_cwds()` which walked the saved `PaneTreeState` and returned only the leaf CWDs, discarding all `Split` nodes. It then called `create_tab()` once per leaf, producing N flat tabs.
+
+The `PaneTreeState` serialized to JSON correctly (direction, ratio, first/second preserved), but the restore logic never consumed the split structure.
+
+### Fix
+
+Replaced `collect_leaf_cwds` with two helpers:
+
+1. `first_leaf_cwd(tree)` — returns the CWD of the leftmost leaf to seed `create_tab()` for the tab root.
+2. `restore_subtree(sm, anchor_id, tree, size)` — recursively walks the saved tree; for each `Split` node calls `split_pane_with_ratio(anchor_id, direction, ratio, ...)` to create the second child pane, then recurses into both halves.
+
+Also added `SessionManager::split_pane_with_ratio()` (and the underlying `replace_leaf_with_ratio()`) so that saved split ratios are preserved instead of always defaulting to 0.5.
+
+### Key insight
+
+After `create_tab()` creates `root_pane_id`, it is the anchor for the first leaf. Calling `split_pane_with_ratio(root_pane_id, direction, ratio, ...)` inserts `Split { first: Leaf(root_pane_id), second: Leaf(new_id) }` in the tree. Recursing into the first subtree can then further split `root_pane_id` inward — the split_pane lookup finds the leaf by ID regardless of tree depth, so nested splits compose correctly.

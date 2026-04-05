@@ -313,6 +313,79 @@ impl SessionManager {
         Ok(new_pane_id)
     }
 
+    /// Like `split_pane` but preserves the saved split `ratio` instead of
+    /// defaulting to 0.5. Used by cold-start restore so that pane proportions
+    /// survive daemon restarts.
+    pub fn split_pane_with_ratio(
+        &self,
+        pane_id: PaneId,
+        direction: &str,
+        ratio: f32,
+        size: PtySize,
+        cwd: Option<PathBuf>,
+    ) -> Result<PaneId> {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+
+        if !inner.panes.contains_key(&pane_id) {
+            return Err(forgetty_core::ForgettyError::Pty(format!(
+                "split_pane_with_ratio: pane {pane_id} not found"
+            )));
+        }
+
+        let new_pane_id = PaneId::new();
+        let pty_bridge = PtyBridge::spawn(size, cwd.as_deref(), None, None, true)
+            .map_err(forgetty_core::ForgettyError::Pty)?;
+
+        let vt = VtInstance::new(size.rows as usize, size.cols as usize);
+        let initial_cwd = cwd.unwrap_or_else(home_dir_fallback);
+
+        let new_pane = PaneState {
+            id: new_pane_id,
+            pty_bridge,
+            vt,
+            cwd: initial_cwd,
+            title: String::new(),
+            rows: size.rows,
+            cols: size.cols,
+        };
+
+        inner.panes.insert(new_pane_id, new_pane);
+        inner.pane_order.push(new_pane_id);
+
+        let mut replaced = false;
+        let mut found_tab_id: Option<Uuid> = None;
+        'outer: for ws in inner.layout.workspaces.iter_mut() {
+            for tab in ws.tabs.iter_mut() {
+                if replace_leaf_with_ratio(&mut tab.pane_tree, pane_id, new_pane_id, direction, ratio) {
+                    replaced = true;
+                    found_tab_id = Some(tab.id);
+                    break 'outer;
+                }
+            }
+        }
+
+        if !replaced {
+            inner.panes.remove(&new_pane_id);
+            inner.pane_order.retain(|&p| p != new_pane_id);
+            return Err(forgetty_core::ForgettyError::Pty(format!(
+                "split_pane_with_ratio: pane {pane_id} not found in any tab tree"
+            )));
+        }
+
+        let _ = inner.event_tx.send(SessionEvent::PaneCreated { pane_id: new_pane_id });
+        if let Some(tab_id) = found_tab_id {
+            let _ = inner.event_tx.send(SessionEvent::PaneSplit {
+                tab_id,
+                parent_pane_id: pane_id,
+                new_pane_id,
+                direction: direction.to_string(),
+            });
+        }
+
+        debug!(%pane_id, %new_pane_id, direction, ratio, "split_pane_with_ratio: pane split");
+        Ok(new_pane_id)
+    }
+
     /// Close a tab by `tab_id`, killing all PTYs in its pane tree.
     ///
     /// Broadcasts `PaneClosed` for each killed pane.
@@ -810,11 +883,21 @@ fn replace_leaf(
     new_pane: PaneId,
     direction: &str,
 ) -> bool {
+    replace_leaf_with_ratio(tree, target, new_pane, direction, 0.5)
+}
+
+fn replace_leaf_with_ratio(
+    tree: &mut PaneTreeLayout,
+    target: PaneId,
+    new_pane: PaneId,
+    direction: &str,
+    ratio: f32,
+) -> bool {
     match tree {
         PaneTreeLayout::Leaf { pane_id } if *pane_id == target => {
             *tree = PaneTreeLayout::Split {
                 direction: direction.to_string(),
-                ratio: 0.5,
+                ratio,
                 first: Box::new(PaneTreeLayout::Leaf { pane_id: target }),
                 second: Box::new(PaneTreeLayout::Leaf { pane_id: new_pane }),
             };
@@ -822,10 +905,10 @@ fn replace_leaf(
         }
         PaneTreeLayout::Leaf { .. } => false,
         PaneTreeLayout::Split { first, second, .. } => {
-            if replace_leaf(first, target, new_pane, direction) {
+            if replace_leaf_with_ratio(first, target, new_pane, direction, ratio) {
                 true
             } else {
-                replace_leaf(second, target, new_pane, direction)
+                replace_leaf_with_ratio(second, target, new_pane, direction, ratio)
             }
         }
     }
@@ -1180,6 +1263,35 @@ mod tests {
 
         session.close_tab(tab_id).ok();
         let _ = pane_a; // suppress unused warning
+    }
+
+    /// split_pane_with_ratio preserves the saved ratio instead of defaulting to 0.5.
+    #[test]
+    fn test_split_pane_with_ratio() {
+        let session = SessionManager::new();
+        let size = test_size();
+
+        let (pane_a, tab_id) = session.create_tab(0, None, size).expect("create_tab");
+        let pane_b = session
+            .split_pane_with_ratio(pane_a, "horizontal", 0.3, size, None)
+            .expect("split_pane_with_ratio");
+
+        let layout = session.layout();
+        let tab = &layout.workspaces[0].tabs[0];
+        assert!(
+            matches!(
+                &tab.pane_tree,
+                PaneTreeLayout::Split { direction, ratio, first, second }
+                if direction == "horizontal"
+                && (*ratio - 0.3).abs() < 1e-6
+                && matches!(first.as_ref(), PaneTreeLayout::Leaf { pane_id } if *pane_id == pane_a)
+                && matches!(second.as_ref(), PaneTreeLayout::Leaf { pane_id } if *pane_id == pane_b)
+            ),
+            "pane_tree must be Split {{ horizontal, 0.3, Leaf(A), Leaf(B) }}"
+        );
+
+        assert!(session.pane_info(pane_b).is_some());
+        session.close_tab(tab_id).ok();
     }
 
     /// AC-7: close_tab removes a single-pane tab; pane_info returns None.

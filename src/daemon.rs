@@ -31,6 +31,7 @@ use tracing_subscriber::EnvFilter;
 
 use forgetty_config::{load_config, Config};
 use forgetty_pty::PtySize;
+use forgetty_core::PaneId;
 use forgetty_session::{SessionEvent, SessionManager};
 use forgetty_socket::SocketServer;
 use forgetty_sync::{
@@ -207,10 +208,9 @@ async fn main_async() -> anyhow::Result<()> {
     // already reflects the last-saved session. Failures are non-fatal — a fresh
     // start (empty layout) is acceptable if the file is absent or corrupt.
     //
-    // Split structure is not reconstructed here (T-064 scope): each leaf pane in
-    // the session file becomes a flat top-level tab in the daemon. The GTK client
-    // will still see individual pane tabs and display them correctly. Full split
-    // tree restore across daemon restarts is a future improvement.
+    // Split structure is fully reconstructed: each tab is created with its root pane
+    // via `create_tab`, then `split_pane_with_ratio` is called recursively to
+    // rebuild the split tree with the original ratios preserved.
     {
         let default_size = PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
         match forgetty_workspace::load_session_for(session_id) {
@@ -236,20 +236,20 @@ async fn main_async() -> anyhow::Result<()> {
                     }
                 }
 
-                // Now restore tabs for ALL workspaces.
+                // Now restore tabs for ALL workspaces, preserving split structure.
                 for (ws_idx, workspace) in state.workspaces.iter().enumerate() {
                     for tab in &workspace.tabs {
-                        // Collect leaf CWDs from this tab's pane tree.
-                        let leaf_cwds = collect_leaf_cwds(&tab.pane_tree);
-                        for cwd in leaf_cwds {
-                            let effective_cwd = if cwd.is_dir() { Some(cwd) } else { None };
-                            match session_manager.create_tab(ws_idx, effective_cwd, default_size) {
-                                Ok((pane_id, _tab_id)) => {
-                                    debug!("cold-start restore: created pane {pane_id} for workspace {ws_idx}");
-                                }
-                                Err(e) => {
-                                    warn!("cold-start restore: create_tab failed for workspace {ws_idx}: {e}");
-                                }
+                        // Create the root pane using the leftmost leaf's CWD.
+                        let root_cwd = first_leaf_cwd(&tab.pane_tree);
+                        let effective_root_cwd = if root_cwd.is_dir() { Some(root_cwd.to_path_buf()) } else { None };
+                        match session_manager.create_tab(ws_idx, effective_root_cwd, default_size) {
+                            Ok((root_pane_id, _tab_id)) => {
+                                debug!("cold-start restore: created root pane {root_pane_id} for workspace {ws_idx}");
+                                // Restore the full split tree rooted at this pane.
+                                restore_subtree(&session_manager, root_pane_id, &tab.pane_tree, default_size);
+                            }
+                            Err(e) => {
+                                warn!("cold-start restore: create_tab failed for workspace {ws_idx}: {e}");
                             }
                         }
                     }
@@ -438,17 +438,41 @@ fn save_session_from_layout(session_manager: &SessionManager, session_id: uuid::
     }
 }
 
-/// Walk a `PaneTreeState` recursively and collect all leaf CWDs.
+/// Return the CWD of the leftmost (first) leaf in a `PaneTreeState`.
 ///
-/// Used by cold-start restore to flatten the saved pane tree into individual
-/// tabs. Split structure is lost on cold-start; each leaf becomes a flat tab.
-fn collect_leaf_cwds(tree: &forgetty_workspace::PaneTreeState) -> Vec<std::path::PathBuf> {
+/// Used by cold-start restore to seed the initial `create_tab` call for a tab
+/// whose root node may be a `Split`.
+fn first_leaf_cwd(tree: &forgetty_workspace::PaneTreeState) -> &std::path::Path {
     match tree {
-        forgetty_workspace::PaneTreeState::Leaf { cwd, .. } => vec![cwd.clone()],
-        forgetty_workspace::PaneTreeState::Split { first, second, .. } => {
-            let mut cwds = collect_leaf_cwds(first);
-            cwds.extend(collect_leaf_cwds(second));
-            cwds
+        forgetty_workspace::PaneTreeState::Leaf { cwd, .. } => cwd,
+        forgetty_workspace::PaneTreeState::Split { first, .. } => first_leaf_cwd(first),
+    }
+}
+
+/// Recursively restore a saved pane sub-tree into the live session manager.
+///
+/// `anchor_id` is the live pane that corresponds to the root of `tree`. For
+/// `Split` nodes the function calls `split_pane_with_ratio` to place the
+/// second child, then recurses into both halves. Leaf nodes are no-ops because
+/// `anchor_id` is already the live pane for that position.
+fn restore_subtree(
+    session_manager: &forgetty_session::SessionManager,
+    anchor_id: PaneId,
+    tree: &forgetty_workspace::PaneTreeState,
+    size: forgetty_pty::PtySize,
+) {
+    if let forgetty_workspace::PaneTreeState::Split { direction, ratio, first, second } = tree {
+        let second_cwd = first_leaf_cwd(second);
+        let effective_cwd = if second_cwd.is_dir() { Some(second_cwd.to_path_buf()) } else { None };
+
+        match session_manager.split_pane_with_ratio(anchor_id, direction, *ratio, size, effective_cwd) {
+            Ok(second_pane_id) => {
+                restore_subtree(session_manager, anchor_id, first, size);
+                restore_subtree(session_manager, second_pane_id, second, size);
+            }
+            Err(e) => {
+                warn!("cold-start restore: split_pane_with_ratio failed: {e}");
+            }
         }
     }
 }
