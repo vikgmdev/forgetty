@@ -969,6 +969,97 @@ fn build_terminal_section(current_config: &Config, shared_config: &SharedConfig)
         &notif_dd,
     ));
 
+    // --- Interaction ---
+    page.append(&make_section_header("Interaction"));
+
+    // --- Warn on large paste ---
+    const PASTE_SIZE_DEFAULT: usize = 5120;
+    let paste_size_adj = gtk4::Adjustment::new(
+        current_config.paste_warn_size as f64,
+        0.0,
+        65536.0,
+        512.0,
+        512.0,
+        0.0,
+    );
+    let paste_size_spin = gtk4::SpinButton::new(Some(&paste_size_adj), 512.0, 0);
+    paste_size_spin.set_hexpand(false);
+    paste_size_spin.set_width_request(120);
+
+    let paste_size_reset_btn = gtk4::Button::with_label("Reset");
+    paste_size_reset_btn.add_css_class("flat");
+    paste_size_reset_btn.add_css_class("caption");
+    paste_size_reset_btn.set_tooltip_text(Some("Reset to default (5120 bytes)"));
+    paste_size_reset_btn.set_sensitive(current_config.paste_warn_size != PASTE_SIZE_DEFAULT);
+
+    {
+        let shared = Rc::clone(shared_config);
+        let reset_btn = paste_size_reset_btn.clone();
+        paste_size_spin.connect_value_changed(move |spin| {
+            let size = spin.value() as usize;
+            reset_btn.set_sensitive(size != PASTE_SIZE_DEFAULT);
+            let new_config = {
+                let Ok(cfg) = shared.try_borrow() else { return };
+                if cfg.paste_warn_size == size {
+                    return;
+                }
+                let mut updated = cfg.clone();
+                updated.paste_warn_size = size;
+                updated
+            };
+            if let Ok(mut cfg) = shared.try_borrow_mut() {
+                *cfg = new_config.clone();
+            }
+            save_in_background(new_config);
+        });
+    }
+    {
+        let spin = paste_size_spin.clone();
+        paste_size_reset_btn.connect_clicked(move |_| {
+            spin.set_value(PASTE_SIZE_DEFAULT as f64);
+        });
+    }
+
+    let paste_size_ctrl = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+    paste_size_ctrl.set_valign(gtk4::Align::Center);
+    paste_size_ctrl.append(&paste_size_reset_btn);
+    paste_size_ctrl.append(&paste_size_spin);
+
+    page.append(&make_setting_row(
+        "Large Paste Warning",
+        "Show a confirmation dialog when pasting more than this many bytes (0 to disable).",
+        &paste_size_ctrl,
+    ));
+
+    // --- Warn on newline paste ---
+    let paste_newline_check = gtk4::CheckButton::new();
+    paste_newline_check.set_hexpand(false);
+    paste_newline_check.set_active(current_config.paste_warn_newline);
+    {
+        let shared = Rc::clone(shared_config);
+        paste_newline_check.connect_toggled(move |check| {
+            let enabled = check.is_active();
+            let new_config = {
+                let Ok(cfg) = shared.try_borrow() else { return };
+                if cfg.paste_warn_newline == enabled {
+                    return;
+                }
+                let mut updated = cfg.clone();
+                updated.paste_warn_newline = enabled;
+                updated
+            };
+            if let Ok(mut cfg) = shared.try_borrow_mut() {
+                *cfg = new_config.clone();
+            }
+            save_in_background(new_config);
+        });
+    }
+    page.append(&make_setting_row(
+        "Newline Paste Warning",
+        "Show a confirmation dialog when pasting text that contains newlines.",
+        &paste_newline_check,
+    ));
+
     page
 }
 

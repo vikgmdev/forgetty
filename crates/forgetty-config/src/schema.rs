@@ -141,6 +141,16 @@ pub struct Config {
     /// If absent or does not match, the first profile in the list is used as default.
     /// If the list is empty, the existing auto-detect shell behavior is unchanged.
     pub default_profile: Option<String>,
+
+    /// Byte length threshold above which a paste warning dialog is shown.
+    /// Set to `0` to disable the size warning entirely.
+    /// Default: `5120` (5 KiB).
+    pub paste_warn_size: usize,
+
+    /// When `true`, a warning dialog is shown when clipboard text contains
+    /// newlines (`\n`), which could immediately execute commands in a shell.
+    /// Default: `true`.
+    pub paste_warn_newline: bool,
 }
 
 impl Default for Config {
@@ -163,9 +173,10 @@ impl Serialize for Config {
 
         // Count fields: font_family, font_size, theme/theme_name, shell?,
         // scrollback_lines, cursor_style, bell_mode, notification_mode, on_launch,
-        // keybindings?, profiles?, default_profile?
+        // paste_warn_size, paste_warn_newline, keybindings?, profiles?, default_profile?
         let mut len = 6; // font_family, font_size, theme, scrollback_lines, cursor_style, on_launch
         len += 2; // bell_mode, notification_mode
+        len += 2; // paste_warn_size, paste_warn_newline
         if self.shell.is_some() {
             len += 1;
         }
@@ -212,6 +223,9 @@ impl Serialize for Config {
         if let Some(ref dp) = self.default_profile {
             map.serialize_entry("default_profile", dp)?;
         }
+
+        map.serialize_entry("paste_warn_size", &self.paste_warn_size)?;
+        map.serialize_entry("paste_warn_newline", &self.paste_warn_newline)?;
 
         map.end()
     }
@@ -269,6 +283,12 @@ impl<'de> Deserialize<'de> for Config {
 
             #[serde(default)]
             default_profile: Option<String>,
+
+            #[serde(default = "default_paste_warn_size")]
+            paste_warn_size: usize,
+
+            #[serde(default = "default_paste_warn_newline")]
+            paste_warn_newline: bool,
         }
 
         let raw = RawConfig::deserialize(deserializer)?;
@@ -339,6 +359,8 @@ impl<'de> Deserialize<'de> for Config {
             on_launch,
             profiles,
             default_profile: raw.default_profile,
+            paste_warn_size: raw.paste_warn_size,
+            paste_warn_newline: raw.paste_warn_newline,
         })
     }
 }
@@ -353,4 +375,12 @@ fn default_font_size() -> f32 {
 
 fn default_scrollback_lines() -> usize {
     10_000
+}
+
+fn default_paste_warn_size() -> usize {
+    5120
+}
+
+fn default_paste_warn_newline() -> bool {
+    true
 }

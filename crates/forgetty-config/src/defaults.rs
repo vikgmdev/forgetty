@@ -29,5 +29,7 @@ pub fn default_config() -> Config {
         on_launch: OnLaunch::Restore,
         profiles: Vec::<ProfileConfig>::new(),
         default_profile: None,
+        paste_warn_size: 5120,
+        paste_warn_newline: true,
     }
 }

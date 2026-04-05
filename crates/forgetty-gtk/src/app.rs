@@ -1230,6 +1230,7 @@ fn build_ui(
         let wm_paste = Rc::clone(&workspace_manager);
         let window_paste = window.clone();
         let dc_paste = daemon_client.clone();
+        let cfg_paste = Rc::clone(&shared_config);
         let action = gio::SimpleAction::new("paste", None);
         action.connect_activate(move |_action, _param| {
             let (ts, ft) = {
@@ -1240,7 +1241,7 @@ fn build_ui(
                 let ws = &mgr.workspaces[mgr.active_index];
                 (Rc::clone(&ws.tab_states), Rc::clone(&ws.focus_tracker))
             };
-            paste_clipboard(&ts, &ft, &window_paste, dc_paste.clone());
+            paste_clipboard(&ts, &ft, &window_paste, dc_paste.clone(), Rc::clone(&cfg_paste));
         });
         window.add_action(&action);
     }
@@ -4802,16 +4803,49 @@ fn compute_window_title(state: &TerminalState) -> String {
 // Paste from clipboard
 // ---------------------------------------------------------------------------
 
+/// Write `text` to the focused pane's PTY or daemon without any checks.
+///
+/// This is the fast path used both when no warnings are triggered and from
+/// within the "Paste anyway" dialog callback.
+fn do_paste(
+    state_rc: Rc<RefCell<TerminalState>>,
+    text: String,
+    daemon_client: Option<Arc<DaemonClient>>,
+) {
+    // Route paste through daemon if available, else local PTY.
+    if let Some(ref dc) = daemon_client {
+        if let Ok(s) = state_rc.try_borrow() {
+            if let Some(pane_id) = s.daemon_pane_id {
+                let _ = dc.send_input(pane_id, text.as_bytes());
+                return;
+            }
+        }
+    }
+
+    let Ok(mut s) = state_rc.try_borrow_mut() else {
+        return;
+    };
+
+    if let Some(ref mut pty) = s.pty {
+        if let Err(e) = pty.write(text.as_bytes()) {
+            tracing::warn!("Failed to write paste to PTY: {e}");
+        }
+    }
+}
+
 /// Paste the system clipboard text into the focused pane's PTY.
 ///
 /// Reads the clipboard text asynchronously via `gdk::Clipboard::read_text_async()`,
-/// then writes the text bytes to the PTY. The `TerminalState` borrow is NOT held
-/// across the async boundary -- only acquired in the callback.
+/// then applies paste safety checks (size and newline) before writing to the PTY.
+/// The `TerminalState` borrow is NOT held across the async boundary -- only
+/// acquired in the callback (or in the dialog response handler).
+#[allow(deprecated)]
 fn paste_clipboard(
     tab_states: &TabStateMap,
     focus_tracker: &FocusTracker,
     window: &adw::ApplicationWindow,
     daemon_client: Option<Arc<DaemonClient>>,
+    shared_config: Rc<RefCell<Config>>,
 ) {
     let focused_name = {
         let Ok(name) = focus_tracker.try_borrow() else {
@@ -4836,6 +4870,7 @@ fn paste_clipboard(
     // Read clipboard text asynchronously
     let display = gtk4::prelude::WidgetExt::display(window);
     let clipboard = display.clipboard();
+    let window_for_cb = window.clone();
 
     // Clone state_rc and daemon_client for the async callback
     let state_for_cb = Rc::clone(&state_rc);
@@ -4843,7 +4878,7 @@ fn paste_clipboard(
     clipboard.read_text_async(gio::Cancellable::NONE, move |result| {
         let text = match result {
             Ok(Some(text)) => text.to_string(),
-            Ok(None) => return, // clipboard empty (AC-11)
+            Ok(None) => return, // clipboard empty
             Err(e) => {
                 tracing::debug!("Clipboard read failed: {e}");
                 return;
@@ -4854,25 +4889,89 @@ fn paste_clipboard(
             return;
         }
 
-        // Route paste through daemon if available, else local PTY.
-        if let Some(ref dc) = dc_paste {
-            if let Ok(s) = state_for_cb.try_borrow() {
-                if let Some(pane_id) = s.daemon_pane_id {
-                    let _ = dc.send_input(pane_id, text.as_bytes());
-                    return;
-                }
-            }
-        }
-
-        let Ok(mut s) = state_for_cb.try_borrow_mut() else {
-            return;
+        // Extract config values early and drop the borrow before any GTK call.
+        let (warn_size, warn_newline) = {
+            let cfg = shared_config.borrow();
+            (cfg.paste_warn_size, cfg.paste_warn_newline)
         };
 
-        if let Some(ref mut pty) = s.pty {
-            if let Err(e) = pty.write(text.as_bytes()) {
-                tracing::warn!("Failed to write paste to PTY: {e}");
-            }
+        let byte_len = text.len();
+        let size_triggered = warn_size > 0 && byte_len > warn_size;
+        let nl_triggered = warn_newline && text.contains('\n');
+
+        // Fast path: no warnings needed.
+        if !size_triggered && !nl_triggered {
+            do_paste(state_for_cb, text, dc_paste);
+            return;
         }
+
+        // --- Build the warning dialog ---
+        let (title, body) = if size_triggered {
+            let kib = byte_len as f64 / 1024.0;
+            let body = if nl_triggered {
+                format!(
+                    "Clipboard contents are {kib:.1} KiB ({byte_len} bytes) and contain newlines. \
+                     This may be accidental."
+                )
+            } else {
+                format!(
+                    "Clipboard contents are {kib:.1} KiB ({byte_len} bytes). \
+                     This may be accidental."
+                )
+            };
+            ("Large Paste", body)
+        } else {
+            (
+                "Paste Contains Newlines",
+                "Clipboard text contains newlines and may execute commands immediately."
+                    .to_string(),
+            )
+        };
+
+        let dialog =
+            adw::MessageDialog::new(Some(&window_for_cb), Some(title), Some(body.as_str()));
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("paste", "Paste anyway");
+        dialog.set_response_appearance("paste", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+
+        // Build the preview widget.
+        let preview_chars: String = text.chars().take(512).collect();
+        let preview_text = if text.chars().count() > 512 {
+            format!("{preview_chars}\u{2026}")
+        } else {
+            preview_chars
+        };
+        let preview_label = gtk4::Label::new(Some(&preview_text));
+        preview_label.add_css_class("monospace");
+        preview_label.set_wrap(true);
+        preview_label.set_wrap_mode(pango::WrapMode::WordChar);
+        preview_label.set_max_width_chars(72);
+        preview_label.set_xalign(0.0);
+
+        let scroll = gtk4::ScrolledWindow::new();
+        scroll.set_max_content_height(200);
+        scroll.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
+        scroll.set_propagate_natural_height(true);
+        scroll.set_child(Some(&preview_label));
+        dialog.set_extra_child(Some(&scroll));
+
+        // Clone for the response closure.
+        let state_for_dialog = Rc::clone(&state_for_cb);
+        let dc_for_dialog = dc_paste.clone();
+        let text_for_dialog = text.clone();
+        dialog.connect_response(None, move |_dialog, response| {
+            if response == "paste" {
+                do_paste(
+                    Rc::clone(&state_for_dialog),
+                    text_for_dialog.clone(),
+                    dc_for_dialog.clone(),
+                );
+            }
+        });
+
+        dialog.present();
     });
 }
 
