@@ -6029,44 +6029,45 @@ fn tab_bar_find_page_at(
         return None;
     }
 
-    // Find the innermost widget at the click position.
-    let picked = tab_bar.pick(x, y, gtk4::PickFlags::DEFAULT)?;
-
-    // Walk up the widget tree looking for an AdwTabButton.
     let tab_bar_widget = tab_bar.upcast_ref::<gtk4::Widget>();
-    let mut widget: gtk4::Widget = picked;
-    let tab_button = loop {
+
+    // Walk the entire tab bar widget tree to collect AdwTabButton widgets.
+    // We can't use pick() here because adw::TabBar wraps its buttons in a
+    // GtkScrolledWindow whose overflow clip prevents pick traversal.
+    // Instead, walk the widget tree recursively and use compute_bounds() to
+    // find which button contains the click position.
+    fn collect_tab_buttons(widget: &gtk4::Widget, out: &mut Vec<gtk4::Widget>) {
         if widget.type_().name() == "AdwTabButton" {
-            break Some(widget);
+            out.push(widget.clone());
         }
-        let parent = widget.parent()?;
-        if &parent == tab_bar_widget {
-            break None; // reached tab_bar without finding a tab button
+        let mut child = widget.first_child();
+        while let Some(c) = child {
+            collect_tab_buttons(&c, out);
+            child = c.next_sibling();
         }
-        widget = parent;
-    };
-
-    let tab_button = tab_button?;
-
-    // Count the tab button's index among its AdwTabButton siblings (left → right).
-    let parent = tab_button.parent()?;
-    let mut tab_index: i32 = 0;
-    let mut child = parent.first_child();
-    while let Some(c) = child {
-        if c == tab_button {
-            break;
-        }
-        if c.type_().name() == "AdwTabButton" {
-            tab_index += 1;
-        }
-        child = c.next_sibling();
     }
 
-    if tab_index < n_pages {
-        Some(tv.nth_page(tab_index))
-    } else {
-        None
+    let mut buttons: Vec<gtk4::Widget> = Vec::new();
+    collect_tab_buttons(tab_bar_widget, &mut buttons);
+
+    tracing::info!("tab_bar_find_page_at: found {} AdwTabButton(s)", buttons.len());
+
+    for (idx, btn) in buttons.iter().enumerate() {
+        if let Some(bounds) = btn.compute_bounds(tab_bar_widget) {
+            let bx = bounds.x() as f64;
+            let by = bounds.y() as f64;
+            let bw = bounds.width() as f64;
+            let bh = bounds.height() as f64;
+            tracing::info!("  button[{idx}] bounds=({bx},{by},{bw}x{bh})");
+            if x >= bx && x <= bx + bw && y >= by && y <= by + bh {
+                if (idx as i32) < n_pages {
+                    return Some(tv.nth_page(idx as i32));
+                }
+            }
+        }
     }
+
+    None
 }
 
 /// Preset colors for the tab color picker (R, G, B as 0.0..1.0).
