@@ -4,6 +4,20 @@
 //! then links the resulting shared library. After building, copies
 //! the .so and soname symlink to `target/<profile>/lib/` so the
 //! binary can find it via RUNPATH at runtime.
+//!
+//! # Android cross-compilation (AND-007)
+//!
+//! When `CARGO_CFG_TARGET_OS=android`, this script:
+//!   1. Passes `-Dtarget=<zig-android-triple>` to the Zig build so Ghostty's
+//!      build system uses the correct Android sysroot via its `android_ndk`
+//!      package (which reads `ANDROID_NDK_HOME` / `ANDROID_HOME` /
+//!      `ANDROID_SDK_ROOT` from the environment — set automatically by cargo-ndk).
+//!   2. Links against Android's bionic C++ runtime (`c++_shared`) instead of
+//!      the desktop GNU `stdc++`.
+//!   3. Skips the RUNPATH copy step (Android's dynamic linker does not use
+//!      RUNPATH; jniLibs packaging is handled by forgetty-android's build.rs).
+//!   4. Emits `cargo:LIB_DIR=<path>` so the dependent forgetty-android build.rs
+//!      can copy libghostty-vt.so into the APK's jniLibs directory.
 
 use std::env;
 use std::path::PathBuf;
@@ -12,6 +26,11 @@ use std::process::Command;
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let ghostty_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("ghostty");
+
+    // Read target OS/arch from cargo (these reflect the COMPILATION TARGET, not the host).
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let is_android = target_os == "android";
 
     // Check if the ghostty submodule exists
     if !ghostty_dir.join("build.zig").exists() {
@@ -27,17 +46,26 @@ fn main() {
     let zig = find_zig();
 
     let install_prefix = out_dir.join("ghostty-install");
+    let install_prefix_str = format!("{}", install_prefix.display());
 
-    // Build libghostty-vt as a shared library
-    let status = Command::new(&zig)
-        .current_dir(&ghostty_dir)
-        .args([
-            "build",
-            "-Demit-lib-vt=true",
-            "--release=fast",
-            "-p",
-            &format!("{}", install_prefix.display()),
-        ])
+    // Build libghostty-vt as a shared library.
+    // For Android, pass the Zig target triple so Ghostty's android_ndk build
+    // package sets up the correct bionic sysroot via ANDROID_NDK_HOME.
+    let mut cmd = Command::new(&zig);
+    cmd.current_dir(&ghostty_dir).args([
+        "build",
+        "-Demit-lib-vt=true",
+        "--release=fast",
+        "-p",
+        &install_prefix_str,
+    ]);
+
+    if is_android {
+        let zig_triple = android_zig_triple(&target_arch);
+        cmd.arg(format!("-Dtarget={zig_triple}"));
+    }
+
+    let status = cmd
         .status()
         .expect("Failed to run zig build. Is Zig installed? Get it from https://ziglang.org");
 
@@ -56,31 +84,45 @@ fn main() {
     // Library crate build.rs cannot propagate rustc-link-arg to the final binary.
 
     // Link system dependencies that libghostty-vt needs.
-    // The library uses simdutf (C++) for SIMD-optimized UTF-8 processing,
-    // so we need the C++ standard library.
-    #[cfg(target_os = "linux")]
-    {
+    // Use runtime target-OS detection (CARGO_CFG_TARGET_OS) rather than
+    // #[cfg(target_os)] which reflects the HOST OS, not the compilation target.
+    if is_android {
+        // Android bionic: libc and libm are always available as system libs.
+        // libc++_shared must be bundled in the APK (cargo-ndk handles this when
+        // ANDROID_NDK_HOME is set and c++_shared is found in the NDK sysroot).
         println!("cargo:rustc-link-lib=dylib=c");
         println!("cargo:rustc-link-lib=dylib=m");
-        println!("cargo:rustc-link-lib=dylib=stdc++");
+        println!("cargo:rustc-link-lib=dylib=c++_shared");
+    } else {
+        match target_os.as_str() {
+            "linux" => {
+                println!("cargo:rustc-link-lib=dylib=c");
+                println!("cargo:rustc-link-lib=dylib=m");
+                println!("cargo:rustc-link-lib=dylib=stdc++");
+            }
+            "macos" => {
+                println!("cargo:rustc-link-lib=framework=Foundation");
+                println!("cargo:rustc-link-lib=dylib=c++");
+            }
+            "windows" | _ => {
+                // Windows: MSVC links C++ runtime automatically.
+            }
+        }
     }
 
-    #[cfg(target_os = "macos")]
-    {
-        println!("cargo:rustc-link-lib=framework=Foundation");
-        println!("cargo:rustc-link-lib=dylib=c++");
+    // ── Post-build: copy .so to target/<profile>/lib/ (desktop only) ─────────
+    // On Android the dynamic linker resolves .so files from the APK's lib/<abi>/
+    // directory — RUNPATH is not used. The forgetty-android build.rs copies
+    // libghostty-vt.so into jniLibs using the LIB_DIR metadata below.
+    if !is_android {
+        #[cfg(unix)]
+        copy_so_to_target_lib(&out_dir, &lib_dir);
     }
 
-    #[cfg(target_os = "windows")]
-    {
-        // MSVC links C++ runtime automatically
-    }
-
-    // ── Post-build: copy .so to target/<profile>/lib/ ──────────────────
-    // This makes the .so available next to the binary so $ORIGIN/lib works
-    // for both `cargo run` and portable tarball deployment.
-    #[cfg(unix)]
-    copy_so_to_target_lib(&out_dir, &lib_dir);
+    // Emit the lib dir path as build metadata so forgetty-android's build.rs
+    // can pick it up via DEP_GHOSTTY_VT_LIB_DIR and copy libghostty-vt.so into
+    // the APK's jniLibs/<abi>/ directory.
+    println!("cargo:LIB_DIR={}", lib_dir.display());
 
     // Rerun if ghostty source changes
     println!("cargo:rerun-if-changed=ghostty/src");
@@ -90,6 +132,20 @@ fn main() {
     // Export the include path for bindgen or manual reference
     let include_dir = ghostty_dir.join("include");
     println!("cargo:include={}", include_dir.display());
+}
+
+/// Map a Rust target architecture name to the corresponding Zig Android target triple.
+///
+/// Zig uses `arm-linux-androideabi` for 32-bit ARM (not `armv7a`), matching the
+/// NDK triple used by `android_ndk.addPaths()` in Ghostty's build system.
+fn android_zig_triple(arch: &str) -> &'static str {
+    match arch {
+        "aarch64" => "aarch64-linux-android",
+        "arm" => "arm-linux-androideabi",
+        "x86_64" => "x86_64-linux-android",
+        "x86" => "x86-linux-android",
+        _ => panic!("Unsupported Android architecture for Zig cross-compile: {arch}"),
+    }
 }
 
 /// Copy the shared library and soname symlink to `target/<profile>/lib/`.

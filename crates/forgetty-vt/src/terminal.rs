@@ -61,6 +61,11 @@ pub struct Terminal {
     /// Terminal dimensions (tracked locally for convenience).
     rows: usize,
     cols: usize,
+    /// The 16-color ANSI palette from the active theme.
+    ///
+    /// Used by `sync_screen` to resolve `GhosttyStyleColorTag::Palette` indices
+    /// 0–15.  Indices 16–255 use the fixed xterm 256-color formula.
+    ansi_palette: [forgetty_core::Rgba; 16],
 }
 
 // Safety: Terminal is not Sync (UnsafeCell prevents that), and we only access
@@ -69,8 +74,12 @@ pub struct Terminal {
 unsafe impl Send for Terminal {}
 
 impl Terminal {
-    /// Create a new terminal with the given dimensions.
-    pub fn new(rows: usize, cols: usize) -> Self {
+    /// Create a new terminal with the given dimensions and ANSI palette.
+    ///
+    /// `ansi_palette` supplies the theme's 16-color ANSI palette used during
+    /// `sync_screen` to resolve palette color indices 0–15.  Indices 16–255
+    /// always use the standard xterm 256-color formula.
+    pub fn new(rows: usize, cols: usize, ansi_palette: [forgetty_core::Rgba; 16]) -> Self {
         let mut handle: ffi::GhosttyTerminal = std::ptr::null_mut();
         let opts = ffi::GhosttyTerminalOptions {
             cols: cols as u16,
@@ -181,7 +190,16 @@ impl Terminal {
             callback_state,
             rows,
             cols,
+            ansi_palette,
         }
+    }
+
+    /// Update the ANSI 16-color palette used for color resolution.
+    ///
+    /// Call this whenever the user changes theme so that subsequently drawn
+    /// cells pick up the new palette colors immediately.
+    pub fn set_ansi_palette(&mut self, palette: [forgetty_core::Rgba; 16]) {
+        self.ansi_palette = palette;
     }
 
     /// Perform a full terminal reset (RIS).
@@ -508,6 +526,55 @@ impl Terminal {
     // Private helpers
     // -----------------------------------------------------------------------
 
+    /// Resolve a `GhosttyStyleColor` to a concrete `GhosttyColorRgb`.
+    ///
+    /// Resolution rules:
+    /// - `Tag::None`    → `default_rgb` (the render state's global fg or bg default)
+    /// - `Tag::Rgb`     → `color.value.rgb` directly (unsafe union field, tag-guarded)
+    /// - `Tag::Palette` index 0–15   → `self.ansi_palette[index]`
+    /// - `Tag::Palette` index 16–231 → xterm 6×6×6 color cube formula
+    /// - `Tag::Palette` index 232–255 → xterm grayscale ramp formula
+    fn resolve_style_color(
+        &self,
+        color: ffi::GhosttyStyleColor,
+        default_rgb: ffi::GhosttyColorRgb,
+    ) -> ffi::GhosttyColorRgb {
+        match color.tag {
+            ffi::GhosttyStyleColorTag::None => default_rgb,
+            ffi::GhosttyStyleColorTag::Rgb => {
+                // Safety: tag is Rgb so the rgb union variant is active.
+                unsafe { color.value.rgb }
+            }
+            ffi::GhosttyStyleColorTag::Palette => {
+                // Safety: tag is Palette so the palette union variant is active.
+                let index = unsafe { color.value.palette } as usize;
+                if index < 16 {
+                    let p = self.ansi_palette[index];
+                    ffi::GhosttyColorRgb { r: p.r, g: p.g, b: p.b }
+                } else if index < 232 {
+                    // 6×6×6 color cube: indices 16–231.
+                    let i = index - 16;
+                    let cube_component = |v: usize| -> u8 {
+                        if v == 0 {
+                            0
+                        } else {
+                            (55 + v * 40) as u8
+                        }
+                    };
+                    ffi::GhosttyColorRgb {
+                        r: cube_component((i / 36) % 6),
+                        g: cube_component((i / 6) % 6),
+                        b: cube_component(i % 6),
+                    }
+                } else {
+                    // Grayscale ramp: indices 232–255.
+                    let v = (8 + (index - 232) * 10) as u8;
+                    ffi::GhosttyColorRgb { r: v, g: v, b: v }
+                }
+            }
+        }
+    }
+
     /// Synchronize the cached Screen from the libghostty-vt render state.
     ///
     /// This follows the exact same API call sequence as Ghostling's
@@ -644,20 +711,52 @@ impl Terminal {
                 }
 
                 if grapheme_len == 0 {
-                    // Empty cell — check for BG color (matches Ghostling line 684-698)
-                    let mut bg_rgb = ffi::GhosttyColorRgb::default();
-                    let has_bg = unsafe {
+                    // Empty cell — read style then BG_COLOR to resolve the
+                    // effective background with both palette-awareness (Bug C)
+                    // and inverse-video support (Bug B).
+                    //
+                    // libghostty-vt has two behaviours for inverse empty cells:
+                    //   (a) sets style.inverse=true + original bg in BG_COLOR
+                    //   (b) bakes the inverse: style.inverse=false + effective
+                    //       (already-swapped) color in BG_COLOR
+                    //
+                    // Resolution priority:
+                    //   1. style.inverse=true  → explicit fg as bg (case a).
+                    //   2. style.bg_color tag is Palette/Rgb → theme-aware
+                    //      resolution (explicit palette bg, Bug C).
+                    //   3. style.bg_color tag is None → fall back to BG_COLOR,
+                    //      which handles both "default bg" (has_bg=false →
+                    //      Color::Default) and baked-inverse (has_bg=true →
+                    //      Color::Rgb with the effective color, case b).
+                    let mut style = ffi::GhosttyStyle::init_sized();
+                    unsafe {
                         ffi::ghostty_render_state_row_cells_get(
                             self.row_cells,
-                            ffi::GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_BG_COLOR,
-                            &mut bg_rgb as *mut ffi::GhosttyColorRgb as *mut c_void,
-                        )
-                    } == ffi::GHOSTTY_SUCCESS;
+                            ffi::GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_STYLE,
+                            &mut style as *mut ffi::GhosttyStyle as *mut c_void,
+                        );
+                    }
 
-                    let bg = if has_bg {
-                        Color::Rgb(bg_rgb.r, bg_rgb.g, bg_rgb.b)
+                    let bg = if style.inverse {
+                        // Case (a): inverse not baked; use fg_color as bg.
+                        let resolved = self.resolve_style_color(style.fg_color, colors.foreground);
+                        Color::Rgb(resolved.r, resolved.g, resolved.b)
+                    } else if style.bg_color.tag != ffi::GhosttyStyleColorTag::None {
+                        // Explicit palette or RGB bg: resolve with theme awareness.
+                        let resolved = self.resolve_style_color(style.bg_color, colors.background);
+                        Color::Rgb(resolved.r, resolved.g, resolved.b)
                     } else {
-                        Color::Default
+                        // Default bg tag: fall back to BG_COLOR query so that
+                        // case (b) baked-inverse cells render correctly.
+                        let mut bg_rgb = ffi::GhosttyColorRgb::default();
+                        let has_bg = unsafe {
+                            ffi::ghostty_render_state_row_cells_get(
+                                self.row_cells,
+                                ffi::GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_BG_COLOR,
+                                &mut bg_rgb as *mut ffi::GhosttyColorRgb as *mut c_void,
+                            )
+                        } == ffi::GHOSTTY_SUCCESS;
+                        if has_bg { Color::Rgb(bg_rgb.r, bg_rgb.g, bg_rgb.b) } else { Color::Default }
                     };
 
                     let attrs = CellAttributes { bg, ..CellAttributes::default() };
@@ -686,27 +785,14 @@ impl Terminal {
                 }
                 let grapheme_str = if grapheme_buf.is_empty() { " " } else { &grapheme_buf };
 
-                // 7. Get resolved FG color (matches Ghostling line 723-725)
-                let mut fg_rgb = colors.foreground;
-                unsafe {
-                    ffi::ghostty_render_state_row_cells_get(
-                        self.row_cells,
-                        ffi::GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_FG_COLOR,
-                        &mut fg_rgb as *mut ffi::GhosttyColorRgb as *mut c_void,
-                    );
-                }
-
-                // 8. Get resolved BG color (matches Ghostling line 727-729)
-                let mut bg_rgb = colors.background;
-                let has_bg = unsafe {
-                    ffi::ghostty_render_state_row_cells_get(
-                        self.row_cells,
-                        ffi::GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_BG_COLOR,
-                        &mut bg_rgb as *mut ffi::GhosttyColorRgb as *mut c_void,
-                    )
-                } == ffi::GHOSTTY_SUCCESS;
-
-                // 9. Get style for boolean flags (matches Ghostling line 733-735)
+                // 7–9. Get style (boolean flags + unresolved color tags).
+                //
+                // Bug C: instead of querying the pre-resolved FG_COLOR / BG_COLOR
+                // values (which bypass the theme palette), we read the style's
+                // `fg_color` / `bg_color` union fields and resolve them ourselves
+                // via `resolve_style_color()`, which maps palette indices 0–15
+                // through `self.ansi_palette` and indices 16–255 through the fixed
+                // xterm 256-color formula.
                 let mut style = ffi::GhosttyStyle::init_sized();
                 unsafe {
                     ffi::ghostty_render_state_row_cells_get(
@@ -715,6 +801,18 @@ impl Terminal {
                         &mut style as *mut ffi::GhosttyStyle as *mut c_void,
                     );
                 }
+
+                let fg_rgb = self.resolve_style_color(style.fg_color, colors.foreground);
+
+                // `has_bg` is false when the bg color tag is None and there is no
+                // inverse, so the theme background color is used at render time
+                // (prevents painting default-bg cells black).
+                let (bg_rgb, has_bg) = if style.bg_color.tag == ffi::GhosttyStyleColorTag::None {
+                    (colors.background, false)
+                } else {
+                    let resolved = self.resolve_style_color(style.bg_color, colors.background);
+                    (resolved, true)
+                };
 
                 // 10. Handle inverse by swapping fg/bg (matches Ghostling line 738-743)
                 let (final_fg, final_bg, final_has_bg) =

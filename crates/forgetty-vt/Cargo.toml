@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 build = "build.rs"
+# Declares the native library this crate links against. Enables DEP_GHOSTTY_VT_*
+# metadata propagation to dependent build scripts (used by forgetty-android to
+# copy libghostty-vt.so into the APK's jniLibs directory).
+links = "ghostty_vt"
 
 [dependencies]
 forgetty-core = { path = "../forgetty-core" }

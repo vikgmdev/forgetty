@@ -7,7 +7,7 @@ This guide covers building Forgetty from source on all supported platforms.
 | Tool | Minimum Version | Purpose |
 |------|-----------------|---------|
 | Rust | 1.85+ | Core language toolchain |
-| Zig  | 0.13+ | Compiles libghostty-vt (C library) |
+| Zig  | 0.15.2+ | Compiles libghostty-vt (C/Zig library); also used for Android cross-compile |
 | Git  | 2.x | Clone with submodule support |
 
 ### Installing Rust
@@ -150,6 +150,48 @@ cargo build --release
 ```
 
 The binary is at `target\release\forgetty.exe`.
+
+## Android (cross-compiling forgetty-vt)
+
+`forgetty-vt` cross-compiles for Android via Zig. This is required by the
+`forgetty-android` companion app and produces `libghostty-vt.so` for each ABI.
+
+### Prerequisites
+
+In addition to Rust and Zig, you need:
+
+```sh
+# Android Rust targets
+rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
+
+# cargo-ndk (wraps cargo for Android cross-compilation)
+cargo install cargo-ndk
+```
+
+Android NDK must be installed. The build detects it automatically from:
+- `$ANDROID_NDK_HOME` — highest priority (direct NDK path)
+- `$ANDROID_HOME/ndk/<latest>` or `$ANDROID_SDK_ROOT/ndk/<latest>`
+- `~/Android/sdk/ndk/<latest>` (Linux default)
+
+### Build
+
+Run from the `forgetty-android` companion app's Rust directory:
+
+```sh
+cd ~/Forge/forgetty-android/rust
+
+# Single ABI (fastest for iteration)
+cargo ndk -t arm64-v8a build
+
+# All ABIs (required for APK)
+cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 build
+```
+
+Zig is invoked automatically by `build.rs` with `-Dtarget=aarch64-linux-android`
+(and equivalents for other ABIs). The resulting `libghostty-vt.so` is copied to
+`forgetty-android/app/src/main/jniLibs/<abi>/` for APK bundling.
+
+**Full cross-compilation design:** `docs/architecture/CROSS_COMPILE.md`
 
 ## Running Tests
 
