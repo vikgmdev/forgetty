@@ -94,6 +94,12 @@ type CustomTitles = Rc<RefCell<HashSet<String>>>;
 /// Keys are removed on tab close.
 type TabIdMap = Rc<RefCell<HashMap<String, uuid::Uuid>>>;
 
+/// Maps a tab page's identity key to a user-chosen RGBA color for the tab indicator dot.
+///
+/// Set via the right-click tab context menu → "Change Tab Color".
+/// Cleared when the user picks "None".
+type TabColorMap = Rc<RefCell<HashMap<String, gtk4::gdk::RGBA>>>;
+
 /// Per-workspace GTK state -- owns the TabView and associated state for one workspace.
 struct WorkspaceView {
     /// Unique ID matching the Workspace in the session file.
@@ -110,6 +116,8 @@ struct WorkspaceView {
     custom_titles: CustomTitles,
     /// Maps page identity key → daemon tab UUID (daemon mode only).
     tab_id_map: TabIdMap,
+    /// Per-tab color indicators (from right-click context menu).
+    tab_colors: TabColorMap,
 }
 
 /// Shared state tracking all workspaces and which is active.
@@ -118,6 +126,9 @@ type WorkspaceManager = Rc<RefCell<WorkspaceManagerInner>>;
 struct WorkspaceManagerInner {
     workspaces: Vec<WorkspaceView>,
     active_index: usize,
+    /// Last right-click position on the tab bar (x, y in tab_bar coordinates).
+    /// Written by the GestureClick(button=3) Capture handler, read by setup-menu handlers.
+    last_tab_click: (f64, f64),
 }
 
 /// CLI-derived launch parameters for this specific invocation.
@@ -841,6 +852,7 @@ fn build_ui(
     let initial_focus_tracker: FocusTracker = Rc::new(RefCell::new(String::new()));
     let initial_custom_titles: CustomTitles = Rc::new(RefCell::new(HashSet::new()));
     let initial_tab_id_map: TabIdMap = Rc::new(RefCell::new(HashMap::new()));
+    let initial_tab_colors: TabColorMap = Rc::new(RefCell::new(HashMap::new()));
 
     let workspace_manager: WorkspaceManager = Rc::new(RefCell::new(WorkspaceManagerInner {
         workspaces: vec![WorkspaceView {
@@ -851,8 +863,10 @@ fn build_ui(
             focus_tracker: Rc::clone(&initial_focus_tracker),
             custom_titles: Rc::clone(&initial_custom_titles),
             tab_id_map: Rc::clone(&initial_tab_id_map),
+            tab_colors: Rc::clone(&initial_tab_colors),
         }],
         active_index: 0,
+        last_tab_click: (0.0, 0.0),
     }));
 
     // Convenience aliases for the active workspace's state during initial setup.
@@ -876,6 +890,33 @@ fn build_ui(
     // --- Command palette overlay (built after workspace_manager is ready) ---
     let command_palette = build_command_palette(&window, &workspace_manager);
     main_overlay.add_overlay(&command_palette);
+
+    // --- Tab bar right-click: capture click coordinates before setup-menu fires ---
+    // adw::TabView emits `setup-menu` when a tab is right-clicked; that signal
+    // gives us the page but not the coordinates.  We stash coordinates here
+    // (Capture phase, no claim) so the setup-menu handler can position the popover.
+    {
+        let wm_click = Rc::clone(&workspace_manager);
+        let gesture = gtk4::GestureClick::new();
+        gesture.set_button(3);
+        gesture.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        gesture.connect_pressed(move |_gesture, _n, x, y| {
+            if let Ok(mut mgr) = wm_click.try_borrow_mut() {
+                mgr.last_tab_click = (x, y);
+            }
+        });
+        tab_bar.add_controller(gesture);
+    }
+
+    // Wire tab right-click context menu for the initial workspace's tab view.
+    wire_tab_context_menu_signal(
+        &initial_tab_view,
+        &workspace_manager,
+        &tab_bar,
+        &window,
+        daemon_client.clone(),
+        &shared_config,
+    );
 
     // --- Workspace sidebar (left panel, pushes main_area right) ---
     // Built after workspace_manager is ready. The revealer is prepended to
@@ -1840,6 +1881,25 @@ fn build_ui(
                 tracing::info!("get_layout: received layout from daemon");
                 restored =
                     build_widgets_from_layout(layout, dc, config, &workspace_manager, &window);
+                if restored {
+                    // Wire right-click context menus for all restored workspaces.
+                    let tab_views: Vec<adw::TabView> = workspace_manager
+                        .borrow()
+                        .workspaces
+                        .iter()
+                        .map(|ws| ws.tab_view.clone())
+                        .collect();
+                    for tv in tab_views {
+                        wire_tab_context_menu_signal(
+                            &tv,
+                            &workspace_manager,
+                            &tab_bar,
+                            &window,
+                            daemon_client.clone(),
+                            &shared_config,
+                        );
+                    }
+                }
             }
             Err(e) => {
                 tracing::warn!("get_layout RPC failed: {e} — will create a fresh tab");
@@ -1866,6 +1926,25 @@ fn build_ui(
                         &window,
                         None,
                     );
+                    if restored {
+                        // Wire right-click context menus for all restored workspaces.
+                        let tab_views: Vec<adw::TabView> = workspace_manager
+                            .borrow()
+                            .workspaces
+                            .iter()
+                            .map(|ws| ws.tab_view.clone())
+                            .collect();
+                        for tv in tab_views {
+                            wire_tab_context_menu_signal(
+                                &tv,
+                                &workspace_manager,
+                                &tab_bar,
+                                &window,
+                                None,
+                                &shared_config,
+                            );
+                        }
+                    }
                 }
             }
             Ok(None) => {
@@ -2746,6 +2825,7 @@ fn build_widgets_from_layout(
                 focus_tracker: new_focus_tracker,
                 custom_titles: new_custom_titles,
                 tab_id_map: new_tab_id_map,
+                tab_colors: Rc::new(RefCell::new(HashMap::new())),
             });
             tracing::info!(
                 "build_widgets_from_layout: added WorkspaceView {:?} at gtx_idx={}",
@@ -3017,6 +3097,7 @@ fn restore_all_workspaces(
             focus_tracker,
             custom_titles,
             tab_id_map: Rc::new(RefCell::new(HashMap::new())),
+            tab_colors: Rc::new(RefCell::new(HashMap::new())),
         });
     }
 
@@ -5893,6 +5974,730 @@ fn toggle_command_palette(
 }
 
 // ---------------------------------------------------------------------------
+// Tab right-click context menu (T-M1-extra-009)
+// ---------------------------------------------------------------------------
+
+/// Preset colors for the tab color picker (R, G, B as 0.0..1.0).
+const TAB_COLOR_PRESETS: &[(&str, (f32, f32, f32))] = &[
+    ("Red",    (0.878, 0.286, 0.227)),
+    ("Orange", (0.945, 0.561, 0.196)),
+    ("Yellow", (0.969, 0.773, 0.212)),
+    ("Green",  (0.353, 0.725, 0.404)),
+    ("Teal",   (0.188, 0.663, 0.596)),
+    ("Blue",   (0.224, 0.529, 0.894)),
+    ("Purple", (0.616, 0.373, 0.847)),
+    ("Pink",   (0.859, 0.365, 0.647)),
+];
+
+/// Wire the `setup-menu` signal on a tab view so that right-clicking any tab
+/// shows the custom context menu popover.
+///
+/// `setup-menu` is the official libadwaita signal for tab context menus.
+/// It fires after the user right-clicks a tab and provides the clicked page.
+/// We read the last click position from `WorkspaceManagerInner::last_tab_click`
+/// (stored by the Capture-phase GestureClick on the tab bar) to position the
+/// popover precisely.
+fn wire_tab_context_menu_signal(
+    tab_view: &adw::TabView,
+    workspace_manager: &WorkspaceManager,
+    tab_bar: &adw::TabBar,
+    window: &adw::ApplicationWindow,
+    daemon_client: Option<Arc<DaemonClient>>,
+    shared_config: &SharedConfig,
+) {
+    let wm = Rc::clone(workspace_manager);
+    let tb = tab_bar.clone();
+    let win = window.clone();
+    let dc = daemon_client;
+    let sc = Rc::clone(shared_config);
+
+    tab_view.connect_setup_menu(move |tv, maybe_page| {
+        let Some(page) = maybe_page else { return; };
+
+        // Read click position and the workspace state for this tab_view.
+        let result = {
+            let Ok(mgr) = wm.try_borrow() else { return; };
+            let (x, y) = mgr.last_tab_click;
+            // Find the workspace that owns this tab_view.
+            let Some(ws) = mgr.workspaces.iter().find(|ws| ws.tab_view == *tv) else {
+                return;
+            };
+            (
+                x, y,
+                Rc::clone(&ws.tab_states),
+                Rc::clone(&ws.focus_tracker),
+                Rc::clone(&ws.custom_titles),
+                Rc::clone(&ws.tab_colors),
+                Rc::clone(&ws.tab_id_map),
+            )
+        };
+        let (x, y, tab_states, focus_tracker, custom_titles, tab_colors, tab_id_map) = result;
+
+        show_tab_context_menu(
+            &tb, tv, page, x, y,
+            &tab_states, &focus_tracker, &custom_titles, &tab_colors, &tab_id_map,
+            &win, dc.clone(), &sc,
+        );
+    });
+}
+
+/// Show the tab right-click context menu positioned at (x, y) in tab_bar coordinates.
+#[allow(clippy::too_many_arguments)]
+fn show_tab_context_menu(
+    tab_bar: &adw::TabBar,
+    tab_view: &adw::TabView,
+    page: &adw::TabPage,
+    x: f64, y: f64,
+    tab_states: &TabStateMap,
+    focus_tracker: &FocusTracker,
+    custom_titles: &CustomTitles,
+    tab_colors: &TabColorMap,
+    tab_id_map: &TabIdMap,
+    window: &adw::ApplicationWindow,
+    daemon_client: Option<Arc<DaemonClient>>,
+    shared_config: &SharedConfig,
+) {
+    let popover = gtk4::Popover::new();
+    popover.set_parent(tab_bar);
+    popover.set_has_arrow(false);
+    popover.add_css_class("menu");
+    popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+
+    let menu_box = build_tab_context_menu_box(
+        &popover,
+        tab_view,
+        page,
+        tab_states,
+        focus_tracker,
+        custom_titles,
+        tab_colors,
+        tab_id_map,
+        window,
+        daemon_client,
+        shared_config,
+    );
+    popover.set_child(Some(&menu_box));
+    popover.popup();
+}
+
+/// Build the full 11-item tab context menu box.
+#[allow(clippy::too_many_arguments)]
+fn build_tab_context_menu_box(
+    popover: &gtk4::Popover,
+    tab_view: &adw::TabView,
+    page: &adw::TabPage,
+    tab_states: &TabStateMap,
+    focus_tracker: &FocusTracker,
+    custom_titles: &CustomTitles,
+    tab_colors: &TabColorMap,
+    tab_id_map: &TabIdMap,
+    window: &adw::ApplicationWindow,
+    daemon_client: Option<Arc<DaemonClient>>,
+    shared_config: &SharedConfig,
+) -> gtk4::Box {
+    let _ = tab_id_map; // used later if daemon move_tab is needed
+    let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    vbox.set_margin_top(4);
+    vbox.set_margin_bottom(4);
+
+    // 1. Change Tab Color
+    {
+        let color_btn = tab_menu_button_arrow("Change Tab Color");
+        let page_key = page_identity_key(page);
+        let tc = Rc::clone(tab_colors);
+        let page_c = page.clone();
+
+        // Color picker sub-popover
+        let color_sub = gtk4::Popover::new();
+        color_sub.set_has_arrow(true);
+        color_sub.add_css_class("menu");
+        color_sub.set_position(gtk4::PositionType::Right);
+
+        let sub_box = build_color_picker_box(&color_sub, &page_c, &page_key, &tc);
+        color_sub.set_child(Some(&sub_box));
+        color_sub.set_parent(&color_btn);
+
+        let pop_ref = popover.clone();
+        color_btn.connect_clicked(move |_| {
+            // Keep parent open; open submenu
+            color_sub.popup();
+            let _ = &pop_ref; // keep alive
+        });
+        vbox.append(&color_btn);
+    }
+
+    // 2. Rename Tab
+    {
+        let ct = Rc::clone(custom_titles);
+        let page_r = page.clone();
+        let win_r = window.clone();
+        let pop_r = popover.clone();
+        let btn = tab_menu_button("Rename Tab");
+        btn.connect_clicked(move |_| {
+            pop_r.popdown();
+            show_change_tab_title_dialog(&win_r, &page_r, &ct);
+        });
+        vbox.append(&btn);
+    }
+
+    // 3. Duplicate Tab
+    {
+        let tv_d = tab_view.clone();
+        let ts_d = Rc::clone(tab_states);
+        let ft_d = Rc::clone(focus_tracker);
+        let ct_d = Rc::clone(custom_titles);
+        let win_d = window.clone();
+        let dc_d = daemon_client.clone();
+        let sc_d = Rc::clone(shared_config);
+        let page_d = page.clone();
+        let pop_d = popover.clone();
+        let btn = tab_menu_button("Duplicate Tab");
+        btn.connect_clicked(move |_| {
+            pop_d.popdown();
+            duplicate_tab(&tv_d, &page_d, &ts_d, &ft_d, &ct_d, &win_d, dc_d.clone(), &sc_d);
+        });
+        vbox.append(&btn);
+    }
+
+    // 4. Split Pane (submenu)
+    {
+        let split_btn = tab_menu_button_arrow("Split Pane");
+
+        let split_sub = gtk4::Popover::new();
+        split_sub.set_has_arrow(true);
+        split_sub.add_css_class("menu");
+        split_sub.set_position(gtk4::PositionType::Right);
+
+        let sub_vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        sub_vbox.set_margin_top(4);
+        sub_vbox.set_margin_bottom(4);
+        let pop_ref = popover.clone();
+        for (label, action) in &[
+            ("Split Right", "win.split-right"),
+            ("Split Down",  "win.split-down"),
+            ("Split Left",  "win.split-left"),
+            ("Split Up",    "win.split-up"),
+        ] {
+            let b = tab_menu_action_button(label, action, &split_sub);
+            // Also close parent popover when sub-item selected
+            let pop_ref2 = pop_ref.clone();
+            b.connect_clicked(move |_| { pop_ref2.popdown(); });
+            sub_vbox.append(&b);
+        }
+        split_sub.set_child(Some(&sub_vbox));
+        split_sub.set_parent(&split_btn);
+
+        split_btn.connect_clicked(move |_| {
+            split_sub.popup();
+        });
+        vbox.append(&split_btn);
+    }
+
+    // 5. Move Tab (submenu)
+    {
+        let n_pages = tab_view.n_pages();
+        let pos = tab_view.page_position(page);
+        let at_start = pos == 0;
+        let at_end = pos == n_pages - 1;
+
+        let move_btn = tab_menu_button_arrow("Move Tab");
+
+        let move_sub = gtk4::Popover::new();
+        move_sub.set_has_arrow(true);
+        move_sub.add_css_class("menu");
+        move_sub.set_position(gtk4::PositionType::Right);
+
+        let sub_vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        sub_vbox.set_margin_top(4);
+        sub_vbox.set_margin_bottom(4);
+
+        // Move Left
+        {
+            let btn = tab_menu_button("Move Left");
+            btn.set_sensitive(!at_start);
+            let tv = tab_view.clone();
+            let pg = page.clone();
+            let sub = move_sub.clone();
+            let pop = popover.clone();
+            btn.connect_clicked(move |_| {
+                let new_pos = tv.page_position(&pg) - 1;
+                tv.reorder_page(&pg, new_pos);
+                sub.popdown();
+                pop.popdown();
+            });
+            sub_vbox.append(&btn);
+        }
+
+        // Move Right
+        {
+            let btn = tab_menu_button("Move Right");
+            btn.set_sensitive(!at_end);
+            let tv = tab_view.clone();
+            let pg = page.clone();
+            let sub = move_sub.clone();
+            let pop = popover.clone();
+            btn.connect_clicked(move |_| {
+                let new_pos = tv.page_position(&pg) + 1;
+                tv.reorder_page(&pg, new_pos);
+                sub.popdown();
+                pop.popdown();
+            });
+            sub_vbox.append(&btn);
+        }
+
+        // Move to New Window
+        {
+            let btn = tab_menu_button("Move to New Window");
+            let ts_w = Rc::clone(tab_states);
+            let pg_w = page.clone();
+            let tv_w = tab_view.clone();
+            let sub = move_sub.clone();
+            let pop = popover.clone();
+            btn.connect_clicked(move |_| {
+                sub.popdown();
+                pop.popdown();
+                move_tab_to_new_window(&tv_w, &pg_w, &ts_w);
+            });
+            sub_vbox.append(&btn);
+        }
+
+        move_sub.set_child(Some(&sub_vbox));
+        move_sub.set_parent(&move_btn);
+
+        move_btn.connect_clicked(move |_| {
+            move_sub.popup();
+        });
+        vbox.append(&move_btn);
+    }
+
+    // 6. Search
+    {
+        let pop_s = popover.clone();
+        let btn = tab_menu_shortcut_button("Search", "Ctrl+Shift+F", "win.search", &pop_s);
+        vbox.append(&btn);
+    }
+
+    // 7. Export Text (placeholder — wired in T-M1-extra-012)
+    {
+        let btn = tab_menu_button("Export Text");
+        btn.set_sensitive(false); // greyed out until T-M1-extra-012
+        vbox.append(&btn);
+    }
+
+    // Separator
+    let sep = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+    sep.set_margin_top(4);
+    sep.set_margin_bottom(4);
+    vbox.append(&sep);
+
+    // 8. Close Tabs to the Right
+    {
+        let n_pages = tab_view.n_pages();
+        let pos = tab_view.page_position(page);
+        let is_last = pos == n_pages - 1;
+
+        let btn = tab_menu_button("Close Tabs to the Right");
+        btn.set_sensitive(!is_last);
+        let tv = tab_view.clone();
+        let pg = page.clone();
+        let pop = popover.clone();
+        btn.connect_clicked(move |_| {
+            pop.popdown();
+            let pos = tv.page_position(&pg);
+            let n = tv.n_pages();
+            // Collect pages to close (right-to-left to avoid index drift).
+            // Collect right-to-left to avoid index drift as pages close.
+            let pages_to_close: Vec<adw::TabPage> =
+                ((pos + 1)..n).rev().map(|i| tv.nth_page(i)).collect();
+            for p in pages_to_close {
+                tv.close_page(&p);
+            }
+        });
+        vbox.append(&btn);
+    }
+
+    // 9. Close Other Tabs
+    {
+        let n_pages = tab_view.n_pages();
+        let btn = tab_menu_button("Close Other Tabs");
+        btn.set_sensitive(n_pages > 1);
+        let tv = tab_view.clone();
+        let pg = page.clone();
+        let pop = popover.clone();
+        btn.connect_clicked(move |_| {
+            pop.popdown();
+            let n = tv.n_pages();
+            let keep_pos = tv.page_position(&pg);
+            // Collect all pages except this one.
+            let pages_to_close: Vec<adw::TabPage> = (0..n)
+                .rev()
+                .filter(|&i| i != keep_pos)
+                .map(|i| tv.nth_page(i))
+                .collect();
+            for p in pages_to_close {
+                tv.close_page(&p);
+            }
+        });
+        vbox.append(&btn);
+    }
+
+    // 10. Close Tab
+    {
+        let tv = tab_view.clone();
+        let pg = page.clone();
+        let pop = popover.clone();
+        let btn = tab_menu_button("Close Tab");
+        btn.connect_clicked(move |_| {
+            pop.popdown();
+            tv.close_page(&pg);
+        });
+        vbox.append(&btn);
+    }
+
+    vbox
+}
+
+/// Build the color picker box for the "Change Tab Color" submenu.
+///
+/// Contains 8 preset color swatches in a horizontal grid row + a "Custom…" button
+/// and a "None" button that clears the color.
+fn build_color_picker_box(
+    sub_popover: &gtk4::Popover,
+    page: &adw::TabPage,
+    page_key: &str,
+    tab_colors: &TabColorMap,
+) -> gtk4::Box {
+    let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+    vbox.set_margin_top(6);
+    vbox.set_margin_bottom(6);
+    vbox.set_margin_start(6);
+    vbox.set_margin_end(6);
+
+    // Swatch row
+    let swatch_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+
+    for (name, (r, g, b)) in TAB_COLOR_PRESETS {
+        let rgba = gtk4::gdk::RGBA::new(*r, *g, *b, 1.0);
+        let btn = gtk4::Button::new();
+        btn.set_tooltip_text(Some(name));
+        btn.set_size_request(24, 24);
+        btn.set_has_frame(false);
+
+        // Draw the swatch as a colored circle drawing area.
+        let da = gtk4::DrawingArea::new();
+        da.set_size_request(18, 18);
+        let da_rgba = rgba;
+        da.set_draw_func(move |_, cr, _w, _h| {
+            cr.arc(9.0, 9.0, 8.0, 0.0, 2.0 * std::f64::consts::PI);
+            cr.set_source_rgba(
+                da_rgba.red() as f64,
+                da_rgba.green() as f64,
+                da_rgba.blue() as f64,
+                1.0,
+            );
+            let _ = cr.fill();
+        });
+        btn.set_child(Some(&da));
+
+        let tc = Rc::clone(tab_colors);
+        let pg = page.clone();
+        let pk = page_key.to_string();
+        let sub = sub_popover.clone();
+        btn.connect_clicked(move |_| {
+            apply_tab_color(&pg, &pk, Some(rgba), &tc);
+            sub.popdown();
+        });
+        swatch_box.append(&btn);
+    }
+    vbox.append(&swatch_box);
+
+    // "Custom…" button — opens gtk4::ColorDialog
+    {
+        let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        let custom_btn = gtk4::Button::with_label("Custom\u{2026}");
+        custom_btn.set_has_frame(false);
+        custom_btn.add_css_class("flat");
+        custom_btn.set_hexpand(true);
+        row.append(&custom_btn);
+
+        let tc = Rc::clone(tab_colors);
+        let pg = page.clone();
+        let pk = page_key.to_string();
+        let sub = sub_popover.clone();
+        custom_btn.connect_clicked(move |btn| {
+            let dialog = gtk4::ColorDialog::new();
+            dialog.set_with_alpha(false);
+            let tc2 = Rc::clone(&tc);
+            let pg2 = pg.clone();
+            let pk2 = pk.clone();
+            let sub2 = sub.clone();
+            // Find a window ancestor for the dialog.
+            let win = btn.root().and_downcast::<gtk4::Window>();
+            dialog.choose_rgba(
+                win.as_ref(),
+                None,
+                gtk4::gio::Cancellable::NONE,
+                move |result| {
+                    if let Ok(rgba) = result {
+                        apply_tab_color(&pg2, &pk2, Some(rgba), &tc2);
+                        sub2.popdown();
+                    }
+                },
+            );
+        });
+        vbox.append(&row);
+    }
+
+    // "None" button — clears the color
+    {
+        let none_btn = gtk4::Button::with_label("None");
+        none_btn.set_has_frame(false);
+        none_btn.add_css_class("flat");
+
+        let tc = Rc::clone(tab_colors);
+        let pg = page.clone();
+        let pk = page_key.to_string();
+        let sub = sub_popover.clone();
+        none_btn.connect_clicked(move |_| {
+            apply_tab_color(&pg, &pk, None, &tc);
+            sub.popdown();
+        });
+        vbox.append(&none_btn);
+    }
+
+    vbox
+}
+
+/// Apply (or clear) a color indicator on a tab page.
+///
+/// Sets or removes the `indicator_icon` on the page using a small colored circle
+/// rendered as a `gdk::MemoryTexture`.  Also updates the `tab_colors` map so the
+/// choice persists while the session is live.
+fn apply_tab_color(
+    page: &adw::TabPage,
+    page_key: &str,
+    color: Option<gtk4::gdk::RGBA>,
+    tab_colors: &TabColorMap,
+) {
+    match color {
+        Some(rgba) => {
+            let icon = make_tab_color_dot_icon(&rgba);
+            page.set_indicator_icon(Some(icon.upcast_ref::<gio::Icon>()));
+            if let Ok(mut tc) = tab_colors.try_borrow_mut() {
+                tc.insert(page_key.to_string(), rgba);
+            }
+        }
+        None => {
+            page.set_indicator_icon(gio::Icon::NONE);
+            if let Ok(mut tc) = tab_colors.try_borrow_mut() {
+                tc.remove(page_key);
+            }
+        }
+    }
+}
+
+/// Create a 12×12 colored circle as a `gdk::MemoryTexture` for use as a tab indicator.
+///
+/// `gdk::MemoryTexture` implements `gio::Icon` (GTK 4.2+), so it can be passed
+/// directly to `adw::TabPage::set_indicator_icon()`.
+fn make_tab_color_dot_icon(rgba: &gtk4::gdk::RGBA) -> gtk4::gdk::MemoryTexture {
+    let size: i32 = 12;
+    let r = (rgba.red() * 255.0) as u8;
+    let g = (rgba.green() * 255.0) as u8;
+    let b = (rgba.blue() * 255.0) as u8;
+    let center = size as f64 / 2.0;
+    let radius = center - 0.5;
+    let mut pixels: Vec<u8> = Vec::with_capacity((size * size * 4) as usize);
+    for row in 0..size {
+        for col in 0..size {
+            let dx = col as f64 + 0.5 - center;
+            let dy = row as f64 + 0.5 - center;
+            let dist = (dx * dx + dy * dy).sqrt();
+            if dist <= radius {
+                pixels.extend_from_slice(&[r, g, b, 255u8]);
+            } else {
+                pixels.extend_from_slice(&[0u8, 0u8, 0u8, 0u8]);
+            }
+        }
+    }
+    let bytes = glib::Bytes::from(&pixels);
+    gtk4::gdk::MemoryTexture::new(
+        size,
+        size,
+        gtk4::gdk::MemoryFormat::R8g8b8a8,
+        &bytes,
+        (size * 4) as usize,
+    )
+}
+
+/// Duplicate a tab — open a new tab at the same CWD as the source tab's focused pane.
+fn duplicate_tab(
+    tab_view: &adw::TabView,
+    page: &adw::TabPage,
+    tab_states: &TabStateMap,
+    focus_tracker: &FocusTracker,
+    custom_titles: &CustomTitles,
+    window: &adw::ApplicationWindow,
+    daemon_client: Option<Arc<DaemonClient>>,
+    shared_config: &SharedConfig,
+) {
+    // Read CWD from the first leaf pane in the source tab.
+    let cwd: Option<PathBuf> = {
+        let container = page.child();
+        let leaves = collect_leaf_drawing_areas(&container);
+        leaves.first().and_then(|da| {
+            let name = da.widget_name().to_string();
+            let ts = tab_states.borrow();
+            ts.get(&name).and_then(read_pane_cwd)
+        })
+    };
+
+    let Ok(cfg) = shared_config.try_borrow() else { return; };
+    let (cmd, cwd_buf) = if let Some(cwd_path) = cwd {
+        (None, Some(cwd_path))
+    } else {
+        resolve_default_profile_args(&cfg)
+    };
+
+    // tab_id_map: fresh map for the duplicate (daemon will assign a new tab_id).
+    let dup_tab_id_map: TabIdMap = Rc::new(RefCell::new(HashMap::new()));
+
+    add_new_tab(
+        tab_view,
+        &cfg,
+        tab_states,
+        focus_tracker,
+        custom_titles,
+        window,
+        cwd_buf.as_deref(),
+        cmd.as_deref(),
+        daemon_client,
+        &dup_tab_id_map,
+    );
+}
+
+/// Spawn a new forgetty window with the CWD of the source tab, then close the source tab.
+fn move_tab_to_new_window(
+    tab_view: &adw::TabView,
+    page: &adw::TabPage,
+    tab_states: &TabStateMap,
+) {
+    // Read CWD from the focused pane in the source tab.
+    let cwd: Option<PathBuf> = {
+        let container = page.child();
+        let leaves = collect_leaf_drawing_areas(&container);
+        leaves.first().and_then(|da| {
+            let name = da.widget_name().to_string();
+            let ts = tab_states.borrow();
+            ts.get(&name).and_then(read_pane_cwd)
+        })
+    };
+
+    // Find the forgetty binary.
+    let exe = std::env::current_exe().ok();
+    if let Some(exe_path) = exe {
+        let mut cmd = std::process::Command::new(&exe_path);
+        cmd.arg("--no-restore");
+        if let Some(cwd_path) = cwd {
+            cmd.arg("--working-directory").arg(cwd_path);
+        }
+        match cmd.spawn() {
+            Ok(child) => {
+                std::mem::forget(child);
+                // Close the source tab.
+                tab_view.close_page(page);
+            }
+            Err(e) => {
+                tracing::warn!("move_tab_to_new_window: failed to spawn new window: {e}");
+            }
+        }
+    } else {
+        tracing::warn!("move_tab_to_new_window: could not determine current exe path");
+    }
+}
+
+/// Create a plain flat menu button for the tab context menu.
+fn tab_menu_button(label: &str) -> gtk4::Button {
+    let lbl = gtk4::Label::new(Some(label));
+    lbl.set_halign(gtk4::Align::Start);
+    lbl.set_hexpand(true);
+    lbl.set_margin_start(8);
+    lbl.set_margin_end(8);
+
+    let btn = gtk4::Button::new();
+    btn.set_child(Some(&lbl));
+    btn.set_has_frame(false);
+    btn.add_css_class("flat");
+    btn
+}
+
+/// Create a flat menu button with a right-pointing arrow (▶) indicating a submenu.
+fn tab_menu_button_arrow(label: &str) -> gtk4::Button {
+    let hbox = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    let lbl = gtk4::Label::new(Some(label));
+    lbl.set_halign(gtk4::Align::Start);
+    lbl.set_hexpand(true);
+    lbl.set_margin_start(8);
+    hbox.append(&lbl);
+    let arrow = gtk4::Label::new(Some("▶"));
+    arrow.set_halign(gtk4::Align::End);
+    arrow.set_margin_end(8);
+    arrow.add_css_class("dim-label");
+    hbox.append(&arrow);
+
+    let btn = gtk4::Button::new();
+    btn.set_child(Some(&hbox));
+    btn.set_has_frame(false);
+    btn.add_css_class("flat");
+    btn
+}
+
+/// Create a flat menu button that activates a window action and dismisses the popover.
+fn tab_menu_action_button(label: &str, action_name: &str, popover: &gtk4::Popover) -> gtk4::Button {
+    let btn = tab_menu_button(label);
+    let action = action_name.to_string();
+    let pop = popover.clone();
+    btn.connect_clicked(move |widget| {
+        widget.activate_action(&action, None).ok();
+        pop.popdown();
+    });
+    btn
+}
+
+/// Create a flat menu button with a dimmed shortcut hint that activates an action.
+fn tab_menu_shortcut_button(
+    label: &str,
+    shortcut: &str,
+    action_name: &str,
+    popover: &gtk4::Popover,
+) -> gtk4::Button {
+    let hbox = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
+    let lbl = gtk4::Label::new(Some(label));
+    lbl.set_halign(gtk4::Align::Start);
+    lbl.set_hexpand(true);
+    lbl.set_margin_start(8);
+    hbox.append(&lbl);
+    let hint = gtk4::Label::new(Some(shortcut));
+    hint.set_halign(gtk4::Align::End);
+    hint.set_margin_end(8);
+    hint.add_css_class("dim-label");
+    hbox.append(&hint);
+
+    let btn = gtk4::Button::new();
+    btn.set_child(Some(&hbox));
+    btn.set_has_frame(false);
+    btn.add_css_class("flat");
+
+    let action = action_name.to_string();
+    let pop = popover.clone();
+    btn.connect_clicked(move |widget| {
+        widget.activate_action(&action, None).ok();
+        pop.popdown();
+    });
+    btn
+}
+
+// ---------------------------------------------------------------------------
 // Workspace management
 // ---------------------------------------------------------------------------
 
@@ -6084,7 +6889,7 @@ fn show_new_workspace_dialog(
         let config = cfg_ref.clone();
         drop(cfg_ref);
 
-        create_and_switch_to_new_workspace(&wm, &name, &config, &ma, &tb, &win, dc.clone());
+        create_and_switch_to_new_workspace(&wm, &name, &config, &ma, &tb, &win, dc.clone(), &cfg);
         refresh_workspace_sidebar(&lb, &wm);
     });
 
@@ -6100,6 +6905,7 @@ fn create_and_switch_to_new_workspace(
     tab_bar: &adw::TabBar,
     window: &adw::ApplicationWindow,
     daemon_client: Option<Arc<DaemonClient>>,
+    shared_config: &SharedConfig,
 ) {
     let new_tv = adw::TabView::new();
     new_tv.set_vexpand(true);
@@ -6109,8 +6915,10 @@ fn create_and_switch_to_new_workspace(
     let new_focus_tracker: FocusTracker = Rc::new(RefCell::new(String::new()));
     let new_custom_titles: CustomTitles = Rc::new(RefCell::new(HashSet::new()));
     let new_tab_id_map: TabIdMap = Rc::new(RefCell::new(HashMap::new()));
+    let new_tab_colors: TabColorMap = Rc::new(RefCell::new(HashMap::new()));
 
     wire_tab_view_handlers(&new_tv, &new_tab_states, &new_focus_tracker, window);
+    wire_tab_context_menu_signal(&new_tv, workspace_manager, tab_bar, window, daemon_client.clone(), shared_config);
 
     // Determine the workspace UUID and add the initial tab.
     // In daemon mode: create workspace + pane on the daemon and subscribe.
@@ -6237,6 +7045,7 @@ fn create_and_switch_to_new_workspace(
             focus_tracker: new_focus_tracker,
             custom_titles: new_custom_titles,
             tab_id_map: new_tab_id_map,
+            tab_colors: new_tab_colors,
         });
 
         let idx = mgr.workspaces.len() - 1;
@@ -6614,7 +7423,7 @@ fn refresh_workspace_sidebar(list_box: &gtk4::ListBox, workspace_manager: &Works
                 ws.tab_states
                     .borrow()
                     .get(&focused_name)
-                    .and_then(|state_rc| read_pane_cwd(state_rc))
+                    .and_then(read_pane_cwd)
             } else {
                 None
             };
