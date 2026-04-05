@@ -284,6 +284,128 @@ A single `ctx.fill()` over a merged rectangle makes all interior edges invisible
 
 ---
 
+## BUG-008: adw::TabView right-click menu never fires (libadwaita 1.5, Wayland)
+
+**Platforms affected:** Linux (GTK4 + libadwaita 1.5, Wayland compositor)
+**Severity:** High — tab context menu feature completely non-functional
+**Status:** Fixed (T-M1-extra-009 follow-up)
+
+### Symptoms
+
+- Right-clicking a tab shows nothing
+- `adw::TabView::connect_setup_menu` handler never fires
+- Capture-phase `GestureClick(button=3)` on `adw::TabBar` fires (coordinates logged), but bubble-phase and `setup-menu` do not fire
+
+### Root cause (triple failure)
+
+**Failure 1: libadwaita 1.5 claims button-3 without emitting `setup-menu`**
+
+`adw::TabView::setup-menu` is the official signal for tab right-click. In libadwaita 1.5 with no `menu-model` set on the `TabView`, the internal `AdwTabButton` still claims button-3 (to suppress the default GTK context menu), but does NOT call `adw_tab_view_setup_menu()`. The signal never fires. This silently breaks any implementation that relies on `setup-menu`.
+
+**Failure 2: `adw::TabBar::pick()` returns None**
+
+`adw::TabBar` wraps its tab buttons in a `GtkScrolledWindow` internally. `gtk4::Widget::pick()` does not traverse into `GtkScrolledWindow` contents (the overflow clip stops traversal). Any code that uses `tab_bar.pick(x, y)` to find the clicked tab button will always get `None`.
+
+**Failure 3: `AdwTabButton` type name mismatch**
+
+Walking the widget tree to find `AdwTabButton` by type name via `widget.type_().name() == "AdwTabButton"` returns zero results on libadwaita 1.5. The actual internal type used is different in this version.
+
+### Fix
+
+**Bypass libadwaita's gesture entirely**:
+
+Attach a `GestureClick(button=3, phase=Capture, Claimed)` on `adw::TabBar`. Claiming in Capture phase prevents libadwaita's `AdwTabButton` gesture from ever firing, so the double-claiming conflict never occurs.
+
+For finding the clicked tab: walk the tab bar widget tree collecting children by bounds (`compute_bounds()`), not by type name. Fall back to `tab_view.selected_page()` if the walk finds nothing (click on empty space, or single-tab hidden bar).
+
+```rust
+// In the Capture gesture pressed handler:
+gesture.set_state(gtk4::EventSequenceState::Claimed);
+let page = tab_bar_find_page_at(&tab_bar, x, y)
+    .or_else(|| tab_view.selected_page());
+```
+
+`tab_bar_find_page_at()` uses `compute_bounds()` per child widget relative to the tab bar — this works regardless of `GtkScrolledWindow` clipping.
+
+### Cross-platform notes
+
+- **Windows (WinUI/WinRT):** The TabView control also doesn't fire context-menu events by default. Wire `RightTapped` on individual tab items, not on the tab bar parent.
+- **Android:** libadwaita is not used. Long-press replaces right-click for context menus on tab-strip items.
+
+---
+
+## BUG-009: GTK4 Popover autohide fails on Wayland when shown inside button-press handler
+
+**Platforms affected:** Linux (GTK4, Wayland)
+**Severity:** Medium — click-outside doesn't dismiss popovers
+**Status:** Fixed (T-M1-extra-009 follow-up)
+
+### Symptoms
+
+- `gtk4::Popover` with `autohide=true` (the default) does not dismiss when the user clicks outside it on Wayland
+- On X11, the same code works correctly
+
+### Root cause
+
+On Wayland, popup autohide is implemented via a compositor input grab (`xdg_popup`). The compositor sets up the grab when the popup surface is created in response to a button event with a valid serial. When `popover.popup()` is called **inside a button-press handler** (while the button is still physically held), the button has not been released yet — the compositor rejects the grab setup. The popup appears but has no dismiss mechanism.
+
+This specifically affects the Forgetty tab context menu, which is shown in a `GestureClick::connect_pressed` callback (button still held).
+
+### Fix
+
+Use `EventControllerFocus::leave` on the popover instead of relying on autohide:
+
+```rust
+// WRONG: connect immediately — fires during same event cycle as button-press
+let fc = gtk4::EventControllerFocus::new();
+fc.connect_leave(move |_| popover.popdown());
+popover.add_controller(fc);
+
+// CORRECT: defer to next idle cycle so the button-press event fully completes
+let pop = popover.clone();
+glib::idle_add_local_once(move || {
+    if !pop.is_visible() { return; }
+    let p = pop.clone();
+    let fc = gtk4::EventControllerFocus::new();
+    fc.connect_leave(move |_| p.popdown());
+    pop.add_controller(fc);
+});
+```
+
+The `idle_add_local_once` deferral is critical. If the `EventControllerFocus` is wired before `popup()` returns, GTK fires `leave` during the same button-press event cycle (the popover briefly loses and regains focus as GTK initialises it), immediately closing the popup. Deferring to the next idle cycle lets the focus settle first.
+
+Also set `popover.set_autohide(true)` for Escape-key dismiss (which does work on Wayland).
+
+### Cross-platform notes
+
+- **X11 (Linux):** `autohide=true` works correctly because X11 input grabs are immediate.
+- **Windows (WinUI):** `Flyout` / `MenuFlyout` have their own dismiss logic; `LightDismissOverlayMode` handles this natively.
+- **macOS:** NSPopover `.transient` behavior handles click-outside.
+
+The `idle_add_local_once` pattern applies anywhere a GTK4 Wayland popup is shown from within an event handler (gesture pressed, key pressed, etc.).
+
+---
+
+## PATTERN: adw::TabView tear-off (drag tab to new window)
+
+libadwaita handles tab tear-off via `AdwTabView::create-window`. The handler must return `Some(new_tab_view)` — returning `None` causes a `CRITICAL` warning and cancels the drag.
+
+```rust
+tab_view.connect_create_window(move |_source_tv| {
+    Some(open_detached_tab_window(&app))
+});
+```
+
+Key facts:
+- `close-page` does NOT fire on the source when a tab is transferred via `create-window`. PTY processes are safe.
+- The `AdwTabPage` child widget (and all descendants including `DrawingArea`, PTY polling timers, Rc'd `TerminalState`) travels with the page unchanged — the terminal keeps working in the new window.
+- Wire `create-window` on every `TabView` in the app (initial workspace, each new workspace, and recursively on the detached window's `TabView`).
+- The detached window should itself wire `create-window` for further tears.
+
+The minimal receiver window needs: `adw::TabBar` + `adw::TabView` + `close-page` handler (close window when last tab is closed). Full keybindings, workspace sidebar, etc. are optional.
+
+---
+
 ## BUG-007: Theme ANSI palette ignored — libghostty-vt uses xterm defaults (T-076)
 
 **Platforms affected:** Linux (GTK4)
