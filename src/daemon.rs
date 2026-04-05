@@ -243,7 +243,12 @@ async fn main_async() -> anyhow::Result<()> {
                         let root_cwd = first_leaf_cwd(&tab.pane_tree);
                         let effective_root_cwd =
                             if root_cwd.is_dir() { Some(root_cwd.to_path_buf()) } else { None };
-                        match session_manager.create_tab(ws_idx, effective_root_cwd, default_size) {
+                        match session_manager.create_tab(
+                            ws_idx,
+                            effective_root_cwd,
+                            default_size,
+                            None,
+                        ) {
                             Ok((root_pane_id, _tab_id)) => {
                                 debug!("cold-start restore: created root pane {root_pane_id} for workspace {ws_idx}");
                                 // Restore the full split tree rooted at this pane.

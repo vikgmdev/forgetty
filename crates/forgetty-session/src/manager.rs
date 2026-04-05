@@ -179,12 +179,15 @@ impl SessionManager {
     /// The tab is appended at the end of the workspace's tab list.
     /// `active_tab` is NOT advanced — that is UI state owned by GTK (AD-008).
     ///
+    /// - `command` — explicit argv (e.g. from a profile); `None` → auto-detect shell.
+    ///
     /// Returns `Err` if `workspace_idx` is out of bounds.
     pub fn create_tab(
         &self,
         workspace_idx: usize,
         cwd: Option<PathBuf>,
         size: PtySize,
+        command: Option<Vec<String>>,
     ) -> Result<(PaneId, Uuid)> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -199,7 +202,9 @@ impl SessionManager {
         let pane_id = PaneId::new();
 
         // Spawn PTY first; insert into layout only if spawn succeeds (R-2).
-        let pty_bridge = PtyBridge::spawn(size, cwd.as_deref(), None, None, true)
+        // When a profile command is provided, pass it as the explicit argv.
+        // When absent, fall back to existing auto-detect (None, None, login=true).
+        let pty_bridge = PtyBridge::spawn(size, cwd.as_deref(), command.as_deref(), None, true)
             .map_err(forgetty_core::ForgettyError::Pty)?;
 
         let vt = VtInstance::new(size.rows as usize, size.cols as usize);
@@ -1102,7 +1107,7 @@ mod tests {
         let size = test_size();
 
         let (pane_id, tab_id) =
-            session.create_tab(0, None, size).expect("create_tab should succeed");
+            session.create_tab(0, None, size, None).expect("create_tab should succeed");
 
         let layout = session.layout();
         let tabs = &layout.workspaces[0].tabs;
@@ -1127,8 +1132,8 @@ mod tests {
         let session = SessionManager::new();
         let size = test_size();
 
-        let (_, tab1) = session.create_tab(0, None, size).expect("tab 1");
-        let (pane2, tab2) = session.create_tab(0, None, size).expect("tab 2");
+        let (_, tab1) = session.create_tab(0, None, size, None).expect("tab 1");
+        let (pane2, tab2) = session.create_tab(0, None, size, None).expect("tab 2");
 
         let layout = session.layout();
         let tabs = &layout.workspaces[0].tabs;
@@ -1150,7 +1155,7 @@ mod tests {
         let size = test_size();
 
         let before = session.list_panes().len();
-        let result = session.create_tab(99, None, size);
+        let result = session.create_tab(99, None, size, None);
         assert!(result.is_err(), "should return Err for workspace 99");
         assert_eq!(session.list_panes().len(), before, "no PTY should be spawned on failure");
 
@@ -1164,7 +1169,7 @@ mod tests {
         let session = SessionManager::new();
         let size = test_size();
 
-        let (pane_a, tab_id) = session.create_tab(0, None, size).expect("create_tab");
+        let (pane_a, tab_id) = session.create_tab(0, None, size, None).expect("create_tab");
         let pane_b = session.split_pane(pane_a, "horizontal", size, None).expect("split_pane");
 
         let layout = session.layout();
@@ -1193,7 +1198,7 @@ mod tests {
         let session = SessionManager::new();
         let size = test_size();
 
-        let (pane_a, tab_id) = session.create_tab(0, None, size).expect("create_tab");
+        let (pane_a, tab_id) = session.create_tab(0, None, size, None).expect("create_tab");
         let pane_b = session.split_pane(pane_a, "vertical", size, None).expect("split_pane");
 
         let layout = session.layout();
@@ -1217,7 +1222,7 @@ mod tests {
         let session = SessionManager::new();
         let size = test_size();
 
-        let (pane_a, tab_id) = session.create_tab(0, None, size).expect("create_tab");
+        let (pane_a, tab_id) = session.create_tab(0, None, size, None).expect("create_tab");
         let pane_b = session.split_pane(pane_a, "horizontal", size, None).expect("first split");
         // Now split pane_b (the right leaf).
         let pane_c = session.split_pane(pane_b, "horizontal", size, None).expect("second split");
@@ -1255,7 +1260,7 @@ mod tests {
         let session = SessionManager::new();
         let size = test_size();
 
-        let (pane_a, tab_id) = session.create_tab(0, None, size).expect("create_tab");
+        let (pane_a, tab_id) = session.create_tab(0, None, size, None).expect("create_tab");
         let unknown = PaneId::new(); // not in registry
         let before_count = session.list_panes().len();
 
@@ -1277,7 +1282,7 @@ mod tests {
         let session = SessionManager::new();
         let size = test_size();
 
-        let (pane_a, tab_id) = session.create_tab(0, None, size).expect("create_tab");
+        let (pane_a, tab_id) = session.create_tab(0, None, size, None).expect("create_tab");
         let pane_b = session
             .split_pane_with_ratio(pane_a, "horizontal", 0.3, size, None)
             .expect("split_pane_with_ratio");
@@ -1306,7 +1311,7 @@ mod tests {
         let session = SessionManager::new();
         let size = test_size();
 
-        let (pane_id, tab_id) = session.create_tab(0, None, size).expect("create_tab");
+        let (pane_id, tab_id) = session.create_tab(0, None, size, None).expect("create_tab");
         assert!(session.pane_info(pane_id).is_some());
 
         session.close_tab(tab_id).expect("close_tab should succeed");
@@ -1327,7 +1332,7 @@ mod tests {
         let session = SessionManager::new();
         let size = test_size();
 
-        let (pane_a, tab_id) = session.create_tab(0, None, size).expect("create_tab");
+        let (pane_a, tab_id) = session.create_tab(0, None, size, None).expect("create_tab");
         let pane_b = session.split_pane(pane_a, "horizontal", size, None).expect("split_pane");
 
         session.close_tab(tab_id).expect("close_tab should succeed");
@@ -1344,9 +1349,9 @@ mod tests {
         let session = SessionManager::new();
         let size = test_size();
 
-        let (_, tab0) = session.create_tab(0, None, size).expect("tab 0");
-        let (_, tab1) = session.create_tab(0, None, size).expect("tab 1");
-        let (_, tab2) = session.create_tab(0, None, size).expect("tab 2");
+        let (_, tab0) = session.create_tab(0, None, size, None).expect("tab 0");
+        let (_, tab1) = session.create_tab(0, None, size, None).expect("tab 1");
+        let (_, tab2) = session.create_tab(0, None, size, None).expect("tab 2");
 
         // Set active_tab to 2 (the last tab).
         session.set_active_tab(0, 2).expect("set_active_tab");
@@ -1384,9 +1389,9 @@ mod tests {
         let session = SessionManager::new();
         let size = test_size();
 
-        let (_, tab_a) = session.create_tab(0, None, size).expect("tab A");
-        let (_, tab_b) = session.create_tab(0, None, size).expect("tab B");
-        let (_, tab_c) = session.create_tab(0, None, size).expect("tab C");
+        let (_, tab_a) = session.create_tab(0, None, size, None).expect("tab A");
+        let (_, tab_b) = session.create_tab(0, None, size, None).expect("tab B");
+        let (_, tab_c) = session.create_tab(0, None, size, None).expect("tab C");
 
         // Tabs are [A, B, C]. Move C to index 0 → [C, A, B].
         session.move_tab(tab_c, 0).expect("move_tab");
@@ -1406,8 +1411,8 @@ mod tests {
         let session = SessionManager::new();
         let size = test_size();
 
-        let (_, tab_a) = session.create_tab(0, None, size).expect("tab A");
-        let (_, tab_b) = session.create_tab(0, None, size).expect("tab B");
+        let (_, tab_a) = session.create_tab(0, None, size, None).expect("tab A");
+        let (_, tab_b) = session.create_tab(0, None, size, None).expect("tab B");
 
         // Move tab_a to 9999 — should place it last (index 1).
         session.move_tab(tab_a, 9999).expect("move_tab clamped");
@@ -1439,9 +1444,9 @@ mod tests {
         let session = SessionManager::new();
         let size = test_size();
 
-        let (_, _tab0) = session.create_tab(0, None, size).expect("tab 0");
-        let (_, _tab1) = session.create_tab(0, None, size).expect("tab 1");
-        let (_, _tab2) = session.create_tab(0, None, size).expect("tab 2");
+        let (_, _tab0) = session.create_tab(0, None, size, None).expect("tab 0");
+        let (_, _tab1) = session.create_tab(0, None, size, None).expect("tab 1");
+        let (_, _tab2) = session.create_tab(0, None, size, None).expect("tab 2");
 
         session.set_active_tab(0, 2).expect("set_active_tab(0, 2)");
         assert_eq!(session.layout().workspaces[0].active_tab, 2);
@@ -1457,7 +1462,7 @@ mod tests {
         let session = SessionManager::new();
         let size = test_size();
 
-        let (_, tab0) = session.create_tab(0, None, size).expect("tab 0");
+        let (_, tab0) = session.create_tab(0, None, size, None).expect("tab 0");
 
         // tab index out of bounds (only 1 tab, index 999 is invalid)
         let err = session.set_active_tab(0, 999);
@@ -1497,7 +1502,7 @@ mod tests {
 
         // (c) create_tab on the new workspace succeeds
         let (pane_id, _tab_id) =
-            session.create_tab(ws_idx, None, size).expect("create_tab on new workspace");
+            session.create_tab(ws_idx, None, size, None).expect("create_tab on new workspace");
         assert!(session.pane_info(pane_id).is_some());
         assert_eq!(session.layout().workspaces[1].tabs.len(), 1);
 

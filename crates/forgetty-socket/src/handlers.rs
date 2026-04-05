@@ -175,7 +175,15 @@ fn handle_new_tab(request: &Request, sm: &SessionManager) -> Response {
         .map(PathBuf::from)
         .filter(|p| p.is_dir()); // silently ignore nonexistent dirs
 
-    match sm.create_tab(workspace_idx, cwd, size) {
+    // Optional profile command: an array of strings from the GTK client.
+    let command: Option<Vec<String>> = request
+        .params
+        .get("command")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .filter(|v: &Vec<String>| !v.is_empty());
+
+    match sm.create_tab(workspace_idx, cwd, size, command) {
         Ok((pane_id, tab_id)) => Response::success(
             request.id.clone(),
             serde_json::json!({
@@ -466,7 +474,7 @@ fn handle_create_workspace(request: &Request, sm: &SessionManager) -> Response {
 
     let default_size =
         PtySize { rows: DEFAULT_ROWS, cols: DEFAULT_COLS, pixel_width: 0, pixel_height: 0 };
-    match sm.create_tab(workspace_idx, None, default_size) {
+    match sm.create_tab(workspace_idx, None, default_size, None) {
         Ok((pane_id, tab_id)) => Response::success(
             request.id.clone(),
             serde_json::json!({

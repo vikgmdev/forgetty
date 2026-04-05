@@ -8,6 +8,26 @@ use std::collections::HashMap;
 
 use crate::theme::Theme;
 
+/// A named shell environment profile. Profiles appear in the new-tab dropdown
+/// and can be launched via Ctrl+Shift+1-9.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileConfig {
+    /// Display name shown in the dropdown (required).
+    pub name: String,
+
+    /// Shell/program to run (e.g. `"/usr/bin/zsh"` or `"ssh user@host"`).
+    /// An empty string is treated the same as absent (falls back to auto-detect).
+    pub command: String,
+
+    /// Starting directory. `~` expands to the user's home directory.
+    /// If absent or if the path does not exist, the home directory is used.
+    pub directory: Option<String>,
+
+    /// GTK icon name (e.g. `"terminal"`, `"folder"`, `"network-wired"`).
+    /// Falls back to `"terminal-symbolic"` when absent.
+    pub icon: Option<String>,
+}
+
 /// The bell mode -- how the terminal responds to BEL (0x07).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -111,6 +131,16 @@ pub struct Config {
     /// Behavior on bare launch (no flags). `Restore` (default) restores all
     /// saved sessions; `New` always opens a fresh window.
     pub on_launch: OnLaunch,
+
+    /// Named shell environment profiles. Each appears as a menu item in the
+    /// new-tab dropdown and can be launched with Ctrl+Shift+1-9.
+    pub profiles: Vec<ProfileConfig>,
+
+    /// Name of the default profile (must match a `profiles[].name`).
+    /// When set, the plain New Tab button and Ctrl+Shift+T use this profile.
+    /// If absent or does not match, the first profile in the list is used as default.
+    /// If the list is empty, the existing auto-detect shell behavior is unchanged.
+    pub default_profile: Option<String>,
 }
 
 impl Default for Config {
@@ -132,13 +162,20 @@ impl Serialize for Config {
         use serde::ser::SerializeMap;
 
         // Count fields: font_family, font_size, theme/theme_name, shell?,
-        // scrollback_lines, cursor_style, bell_mode, notification_mode, on_launch, keybindings?
+        // scrollback_lines, cursor_style, bell_mode, notification_mode, on_launch,
+        // keybindings?, profiles?, default_profile?
         let mut len = 6; // font_family, font_size, theme, scrollback_lines, cursor_style, on_launch
         len += 2; // bell_mode, notification_mode
         if self.shell.is_some() {
             len += 1;
         }
         if !self.keybindings.is_empty() {
+            len += 1;
+        }
+        if !self.profiles.is_empty() {
+            len += 1;
+        }
+        if self.default_profile.is_some() {
             len += 1;
         }
 
@@ -166,6 +203,14 @@ impl Serialize for Config {
 
         if !self.keybindings.is_empty() {
             map.serialize_entry("keybindings", &self.keybindings)?;
+        }
+
+        if !self.profiles.is_empty() {
+            map.serialize_entry("profiles", &self.profiles)?;
+        }
+
+        if let Some(ref dp) = self.default_profile {
+            map.serialize_entry("default_profile", dp)?;
         }
 
         map.end()
@@ -216,6 +261,14 @@ impl<'de> Deserialize<'de> for Config {
             /// the default with a warning rather than failing to load config.
             #[serde(default)]
             on_launch: Option<String>,
+
+            /// Named shell profiles. Entries with missing/empty name or command
+            /// are silently skipped (with a warning) during post-parse validation.
+            #[serde(default)]
+            profiles: Vec<ProfileConfig>,
+
+            #[serde(default)]
+            default_profile: Option<String>,
         }
 
         let raw = RawConfig::deserialize(deserializer)?;
@@ -252,6 +305,26 @@ impl<'de> Deserialize<'de> for Config {
             }
         };
 
+        // Filter out profiles with missing/empty name or command (AC-3, AC-22).
+        let profiles: Vec<ProfileConfig> = raw
+            .profiles
+            .into_iter()
+            .filter(|p| {
+                if p.name.is_empty() {
+                    tracing::warn!("Skipping profile with empty name");
+                    return false;
+                }
+                if p.command.is_empty() {
+                    tracing::warn!(
+                        "Skipping profile {:?} with empty command (falls back to auto-detect shell)",
+                        p.name
+                    );
+                    return false;
+                }
+                true
+            })
+            .collect();
+
         Ok(Config {
             font_family: raw.font_family,
             font_size: raw.font_size,
@@ -264,6 +337,8 @@ impl<'de> Deserialize<'de> for Config {
             notification_mode: raw.notification_mode,
             keybindings: raw.keybindings,
             on_launch,
+            profiles,
+            default_profile: raw.default_profile,
         })
     }
 }

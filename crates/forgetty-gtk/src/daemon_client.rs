@@ -242,6 +242,39 @@ impl DaemonClient {
         self.new_tab_with_cwd(None)
     }
 
+    /// Create a new tab using a shell profile. `command` is the pre-split argv
+    /// (e.g. `["ssh", "user@host"]`). `cwd` is the profile's starting directory,
+    /// already expanded and validated by the caller. Returns `(pane_id, tab_id)`.
+    pub fn new_tab_with_profile(
+        &self,
+        command: Option<Vec<String>>,
+        cwd: Option<&std::path::Path>,
+    ) -> Result<(PaneId, uuid::Uuid), DaemonError> {
+        let mut params = serde_json::json!({});
+        if let Some(ref cmd) = command {
+            params["command"] = serde_json::json!(cmd);
+        }
+        if let Some(p) = cwd {
+            params["cwd"] = serde_json::json!(p.to_string_lossy().as_ref());
+        }
+        let result = self.rpc("new_tab", params)?;
+        let pane_id_str = result
+            .get("pane_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| DaemonError("new_tab_with_profile: missing pane_id".into()))?;
+        let pane_uuid = uuid::Uuid::parse_str(pane_id_str)
+            .map_err(|e| DaemonError(format!("new_tab_with_profile: invalid pane_id UUID: {e}")))?;
+
+        let tab_id_str = result
+            .get("tab_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| DaemonError("new_tab_with_profile: missing tab_id".into()))?;
+        let tab_uuid = uuid::Uuid::parse_str(tab_id_str)
+            .map_err(|e| DaemonError(format!("new_tab_with_profile: invalid tab_id UUID: {e}")))?;
+
+        Ok((PaneId(pane_uuid), tab_uuid))
+    }
+
     /// Create a new named workspace on the daemon and return the initial pane info.
     ///
     /// The daemon creates the workspace and immediately spawns a default tab in it.

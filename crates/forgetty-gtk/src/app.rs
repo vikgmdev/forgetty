@@ -20,7 +20,7 @@ use std::path::PathBuf;
 
 use crate::daemon_client::{DaemonClient, LayoutEvent, LayoutInfo, PaneTreeNode};
 use crate::terminal::NotificationPayload;
-use forgetty_config::{load_config, Config, NotificationMode};
+use forgetty_config::{load_config, Config, NotificationMode, ProfileConfig};
 use forgetty_watcher::ConfigWatcher;
 use gtk4::gio;
 use gtk4::glib;
@@ -286,6 +286,292 @@ fn next_pane_id() -> String {
     format!("forgetty-pane-{}", COUNTER.fetch_add(1, Ordering::Relaxed))
 }
 
+/// Resolve the default profile's command and CWD from the config.
+///
+/// Returns `(command_argv, resolved_cwd)`. Both are `None` when no profiles
+/// are configured, which preserves existing auto-detect shell behavior.
+fn resolve_default_profile_args(cfg: &Config) -> (Option<Vec<String>>, Option<PathBuf>) {
+    if cfg.profiles.is_empty() {
+        return (None, None);
+    }
+    // Find the designated default profile, or fall back to the first profile.
+    let profile = if let Some(ref dp_name) = cfg.default_profile {
+        cfg.profiles.iter().find(|p| &p.name == dp_name).unwrap_or(&cfg.profiles[0])
+    } else {
+        &cfg.profiles[0]
+    };
+    let command: Option<Vec<String>> = if profile.command.is_empty() {
+        None
+    } else {
+        Some(profile.command.split_whitespace().map(String::from).collect())
+    };
+    let cwd = resolve_profile_dir(profile.directory.as_deref());
+    (command, cwd)
+}
+
+/// Build a manual `gtk4::Popover` for the pan-down dropdown button.
+///
+/// Uses real GTK4 widgets (Button + Image + Label) for profile rows so that
+/// icons are guaranteed to render. GTK4's `PopoverMenu` from a `gio::Menu`
+/// model does not display icons set via `gio::MenuItem::set_icon()` or the
+/// `G_MENU_ATTRIBUTE_ICON` attribute for regular vertical items; a manually
+/// constructed popover gives full control over icon display (AC-6).
+///
+/// Layout:
+///   Popover
+///   └── Box (vertical)
+///         [when profiles exist]
+///         ├── Label "Profiles" (section header, small/dim)
+///         ├── Button [Image icon + Label name]  ×N  (one per profile)
+///         └── Separator
+///         ├── Button [Label "New Tab"]  (win.new-tab)
+///         └── Separator
+///         ├── Button [Label "Split Up"]
+///         ├── Button [Label "Split Down"]
+///         ├── Button [Label "Split Left"]
+///         └── Button [Label "Split Right"]
+///
+/// Called at startup and on every hot-reload.
+fn build_dropdown_popover(
+    profiles: &[ProfileConfig],
+    window: &adw::ApplicationWindow,
+) -> gtk4::Popover {
+    let popover = gtk4::Popover::new();
+    let outer_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    outer_box.set_margin_top(6);
+    outer_box.set_margin_bottom(6);
+    outer_box.set_margin_start(6);
+    outer_box.set_margin_end(6);
+    outer_box.set_spacing(2);
+
+    // --- Profiles section (AC-6, AC-8) ---
+    if !profiles.is_empty() {
+        // Section header label (small / dimmed, like GNOME menus).
+        let header_label = gtk4::Label::new(Some("Profiles"));
+        header_label.set_halign(gtk4::Align::Start);
+        header_label.set_margin_start(6);
+        header_label.set_margin_top(2);
+        header_label.set_margin_bottom(2);
+        header_label.add_css_class("caption");
+        header_label.add_css_class("dim-label");
+        outer_box.append(&header_label);
+
+        for (i, profile) in profiles.iter().enumerate() {
+            let icon_name = profile.icon.as_deref().unwrap_or("terminal-symbolic");
+
+            // Row: horizontal Box with Image + Label.
+            let row_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+            row_box.set_margin_start(6);
+            row_box.set_margin_end(6);
+
+            let img = gtk4::Image::from_icon_name(icon_name);
+            img.set_icon_size(gtk4::IconSize::Normal);
+            row_box.append(&img);
+
+            let lbl = gtk4::Label::new(Some(&profile.name));
+            lbl.set_halign(gtk4::Align::Start);
+            lbl.set_hexpand(true);
+            row_box.append(&lbl);
+
+            let btn = gtk4::Button::new();
+            btn.set_child(Some(&row_box));
+            btn.set_has_frame(false);
+            btn.add_css_class("flat");
+            btn.set_action_name(Some(&format!("win.open-profile-{i}")));
+
+            // Clicking the button closes the popover.
+            let pop_ref = popover.clone();
+            btn.connect_clicked(move |_| {
+                pop_ref.popdown();
+            });
+
+            outer_box.append(&btn);
+        }
+
+        let sep1 = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+        sep1.set_margin_top(4);
+        sep1.set_margin_bottom(4);
+        outer_box.append(&sep1);
+    }
+
+    // --- New Tab item (always present) ---
+    {
+        let row_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        row_box.set_margin_start(6);
+        row_box.set_margin_end(6);
+
+        let lbl = gtk4::Label::new(Some("New Tab"));
+        lbl.set_halign(gtk4::Align::Start);
+        lbl.set_hexpand(true);
+        row_box.append(&lbl);
+
+        let accel_lbl = gtk4::Label::new(Some("Ctrl+Shift+T"));
+        accel_lbl.add_css_class("dim-label");
+        accel_lbl.add_css_class("caption");
+        row_box.append(&accel_lbl);
+
+        let btn = gtk4::Button::new();
+        btn.set_child(Some(&row_box));
+        btn.set_has_frame(false);
+        btn.add_css_class("flat");
+        btn.set_action_name(Some("win.new-tab"));
+
+        let pop_ref = popover.clone();
+        btn.connect_clicked(move |_| {
+            pop_ref.popdown();
+        });
+
+        outer_box.append(&btn);
+    }
+
+    // --- Split section ---
+    {
+        let sep2 = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+        sep2.set_margin_top(4);
+        sep2.set_margin_bottom(4);
+        outer_box.append(&sep2);
+
+        for (label, action, accel_hint) in [
+            ("Split Up", "win.split-up", None),
+            ("Split Down", "win.split-down", Some("Alt+Shift+−")),
+            ("Split Left", "win.split-left", None),
+            ("Split Right", "win.split-right", Some("Alt+Shift+=")),
+        ] {
+            let row_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+            row_box.set_margin_start(6);
+            row_box.set_margin_end(6);
+
+            let lbl = gtk4::Label::new(Some(label));
+            lbl.set_halign(gtk4::Align::Start);
+            lbl.set_hexpand(true);
+            row_box.append(&lbl);
+
+            if let Some(hint) = accel_hint {
+                let al = gtk4::Label::new(Some(hint));
+                al.add_css_class("dim-label");
+                al.add_css_class("caption");
+                row_box.append(&al);
+            }
+
+            let btn = gtk4::Button::new();
+            btn.set_child(Some(&row_box));
+            btn.set_has_frame(false);
+            btn.add_css_class("flat");
+            btn.set_action_name(Some(action));
+
+            let pop_ref = popover.clone();
+            btn.connect_clicked(move |_| {
+                pop_ref.popdown();
+            });
+
+            outer_box.append(&btn);
+        }
+    }
+
+    popover.set_child(Some(&outer_box));
+    popover.set_autohide(true);
+
+    // Keep the popover associated with the window so action dispatch works.
+    let _ = window;
+
+    popover
+}
+
+/// Resolve a profile's directory to an actual `PathBuf`, expanding `~` and
+/// validating existence. Falls back to the home directory on failure.
+fn resolve_profile_dir(directory: Option<&str>) -> Option<PathBuf> {
+    let raw = directory?;
+    let expanded = if raw == "~" || raw.starts_with("~/") {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+        if raw == "~" {
+            home
+        } else {
+            format!("{}{}", home, &raw[1..])
+        }
+    } else {
+        raw.to_string()
+    };
+    let pb = PathBuf::from(&expanded);
+    if pb.is_dir() {
+        Some(pb)
+    } else {
+        tracing::warn!("Profile directory {:?} does not exist, falling back to home dir", expanded);
+        None
+    }
+}
+
+/// Register `gio::SimpleAction`s for each profile on the window, wire
+/// Ctrl+Shift+1-9 accelerators, and connect each action to open a profile tab.
+///
+/// Returns the number of actions registered so the caller can unregister them
+/// on the next hot-reload cycle.
+fn register_profile_actions(
+    app: &adw::Application,
+    window: &adw::ApplicationWindow,
+    profiles: &[ProfileConfig],
+    shared_config: &SharedConfig,
+    workspace_manager: &WorkspaceManager,
+    daemon_client: &Option<Arc<DaemonClient>>,
+) -> usize {
+    for (i, profile) in profiles.iter().enumerate() {
+        let profile_clone = profile.clone();
+        let cfg_ref = Rc::clone(shared_config);
+        let wm_ref = Rc::clone(workspace_manager);
+        let dc_ref = daemon_client.clone();
+        let win_ref = window.clone();
+        let action = gio::SimpleAction::new(&format!("open-profile-{i}"), None);
+        action.connect_activate(move |_action, _param| {
+            let Ok(cfg) = cfg_ref.try_borrow() else { return };
+            let Ok(mgr) = wm_ref.try_borrow() else { return };
+            let ws = &mgr.workspaces[mgr.active_index];
+            let command: Option<Vec<String>> = if profile_clone.command.is_empty() {
+                None
+            } else {
+                Some(profile_clone.command.split_whitespace().map(String::from).collect())
+            };
+            let cwd = resolve_profile_dir(profile_clone.directory.as_deref());
+            add_new_tab(
+                &ws.tab_view,
+                &cfg,
+                &ws.tab_states,
+                &ws.focus_tracker,
+                &ws.custom_titles,
+                &win_ref,
+                cwd.as_deref(),
+                command.as_deref(),
+                dc_ref.clone(),
+                &ws.tab_id_map,
+            );
+        });
+        window.add_action(&action);
+
+        // Wire Ctrl+Shift+1-9 (only for first 9 profiles, AC-10, AC-11).
+        if i < 9 {
+            let digit = i + 1;
+            app.set_accels_for_action(
+                &format!("win.open-profile-{i}"),
+                &[&format!("<Control><Shift>{digit}")],
+            );
+        }
+    }
+    profiles.len()
+}
+
+/// Remove previously registered profile actions from the window and clear
+/// their keyboard accelerators. Call before re-registering on hot-reload.
+fn unregister_profile_actions(
+    app: &adw::Application,
+    window: &adw::ApplicationWindow,
+    count: usize,
+) {
+    for i in 0..count {
+        window.remove_action(&format!("open-profile-{i}"));
+        if i < 9 {
+            app.set_accels_for_action(&format!("win.open-profile-{i}"), &[]);
+        }
+    }
+}
+
 /// Build the main application window with tab bar and initial terminal tab.
 fn build_ui(
     app: &adw::Application,
@@ -422,26 +708,12 @@ fn build_ui(
     new_tab_button.set_action_name(Some("win.new-tab"));
     header.pack_start(&new_tab_button);
 
-    // --- Dropdown menu button (split actions + new tab) ---
-    let dropdown_menu = gio::Menu::new();
-    let new_tab_item = gio::MenuItem::new(Some("New Tab"), Some("win.new-tab"));
-    new_tab_item.set_attribute_value("accel", Some(&"<Control><Shift>t".to_variant()));
-    dropdown_menu.append_item(&new_tab_item);
-
-    let split_section = gio::Menu::new();
-    split_section.append(Some("Split Up"), Some("win.split-up"));
-    let sd = gio::MenuItem::new(Some("Split Down"), Some("win.split-down"));
-    sd.set_attribute_value("accel", Some(&"<Alt><Shift>minus".to_variant()));
-    split_section.append_item(&sd);
-    split_section.append(Some("Split Left"), Some("win.split-left"));
-    let sr = gio::MenuItem::new(Some("Split Right"), Some("win.split-right"));
-    sr.set_attribute_value("accel", Some(&"<Alt><Shift>equal".to_variant()));
-    split_section.append_item(&sr);
-    dropdown_menu.append_section(None, &split_section);
-
+    // --- Dropdown menu button (profiles + new tab + split actions) ---
+    // The popover is built after `window` is created (it needs a reference to the
+    // window so profile button actions dispatch correctly via the widget hierarchy).
+    // We set a placeholder here and replace it below with build_dropdown_popover().
     let dropdown_button = gtk4::MenuButton::new();
     dropdown_button.set_icon_name("pan-down-symbolic");
-    dropdown_button.set_menu_model(Some(&dropdown_menu));
     dropdown_button.set_tooltip_text(Some("Tab and Split Actions"));
     header.pack_start(&dropdown_button);
 
@@ -496,6 +768,17 @@ fn build_ui(
         .default_height(DEFAULT_HEIGHT)
         .content(&outer_stack)
         .build();
+
+    // --- Dropdown popover (Bug 1 fix: manual popover for icon support) ---
+    // Now that `window` exists, build the popover and attach it. The popover
+    // rows use flat buttons whose `action-name` properties dispatch via the
+    // window's action group, so the popover must be a descendant of (or
+    // associated with) the window for action lookup to work. Setting it on
+    // a `MenuButton` that is a child of the window header satisfies this.
+    {
+        let popover = build_dropdown_popover(&config.profiles, &window);
+        dropdown_button.set_popover(Some(&popover));
+    }
 
     // --- Workspace sidebar CSS ---
     // Applied globally via the display; uses Adwaita CSS tokens so it respects
@@ -682,6 +965,7 @@ fn build_ui(
     }
 
     // --- New tab action (Ctrl+Shift+T) ---
+    // When profiles are configured, uses the default profile (AC-9).
     {
         let config_action = Rc::clone(&shared_config);
         let wm_action = Rc::clone(&workspace_manager);
@@ -696,6 +980,8 @@ fn build_ui(
                 return;
             };
             let ws = &mgr.workspaces[mgr.active_index];
+            // Resolve default profile if any profiles are configured (AC-9).
+            let (cmd, cwd_buf) = resolve_default_profile_args(&cfg);
             add_new_tab(
                 &ws.tab_view,
                 &cfg,
@@ -703,8 +989,8 @@ fn build_ui(
                 &ws.focus_tracker,
                 &ws.custom_titles,
                 &win_action,
-                None,
-                None,
+                cwd_buf.as_deref(),
+                cmd.as_deref(),
                 dc_newtab.clone(),
                 &ws.tab_id_map,
             );
@@ -713,6 +999,83 @@ fn build_ui(
     }
 
     app.set_accels_for_action("win.new-tab", &["<Control><Shift>t"]);
+
+    // --- Profile actions (open-profile-N) and Ctrl+Shift+1-9 shortcuts ---
+    // Track registered profile count so hot-reload can unregister old actions.
+    let profile_action_count: Rc<Cell<usize>> = Rc::new(Cell::new(0));
+    {
+        let count = register_profile_actions(
+            app,
+            &window,
+            &config.profiles,
+            &shared_config,
+            &workspace_manager,
+            &daemon_client,
+        );
+        profile_action_count.set(count);
+    }
+
+    // --- Capture-phase window key controller for Ctrl+Shift+1-9 (Bug 2 fix) ---
+    //
+    // GTK4 accelerators registered via `app.set_accels_for_action()` fire AFTER
+    // widget-level event controllers. The VT pane's `EventControllerKey` on the
+    // focused `DrawingArea` processes Ctrl+Shift+digit first and encodes it as a
+    // kitty keyboard protocol sequence (";5u"), writing it to the PTY — the
+    // accelerator never fires.
+    //
+    // Fix: add an `EventControllerKey` at the `ApplicationWindow` level with
+    // `PropagationPhase::Capture`. GTK4 processes capture-phase controllers
+    // from the outermost widget inward, so a window-level capture controller
+    // runs before ANY child widget sees the event — including the focused
+    // DrawingArea. We intercept Ctrl+Shift+1-9 here, activate the corresponding
+    // `open-profile-N` action directly, and return `Propagation::Stop` so the
+    // event never reaches the VT key encoder.
+    {
+        let profile_count_capture = Rc::clone(&profile_action_count);
+        let window_capture = window.downgrade();
+        let cap_controller = gtk4::EventControllerKey::new();
+        cap_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        cap_controller.connect_key_pressed(move |_ctrl, keyval, _keycode, state| {
+            use gtk4::gdk::ModifierType;
+            // Check for exactly Ctrl+Shift (no Alt, no Super).
+            let is_ctrl_shift = state.contains(ModifierType::CONTROL_MASK)
+                && state.contains(ModifierType::SHIFT_MASK)
+                && !state.contains(ModifierType::ALT_MASK)
+                && !state.contains(ModifierType::SUPER_MASK);
+
+            if is_ctrl_shift {
+                let digit_idx: Option<usize> = match keyval {
+                    gtk4::gdk::Key::_1 => Some(0),
+                    gtk4::gdk::Key::_2 => Some(1),
+                    gtk4::gdk::Key::_3 => Some(2),
+                    gtk4::gdk::Key::_4 => Some(3),
+                    gtk4::gdk::Key::_5 => Some(4),
+                    gtk4::gdk::Key::_6 => Some(5),
+                    gtk4::gdk::Key::_7 => Some(6),
+                    gtk4::gdk::Key::_8 => Some(7),
+                    gtk4::gdk::Key::_9 => Some(8),
+                    _ => None,
+                };
+                if let Some(idx) = digit_idx {
+                    let count = profile_count_capture.get();
+                    if idx < count {
+                        if let Some(win) = window_capture.upgrade() {
+                            // Disambiguate: WidgetExt::activate_action fires the
+                            // action on the widget's action group (i.e. the window).
+                            let _ = gtk4::prelude::WidgetExt::activate_action(
+                                &win,
+                                &format!("open-profile-{idx}"),
+                                None,
+                            );
+                            return glib::Propagation::Stop;
+                        }
+                    }
+                }
+            }
+            glib::Propagation::Proceed
+        });
+        window.add_controller(cap_controller);
+    }
 
     // --- Split actions (all four directions use workspace manager) ---
     for (action_name, orientation, before, accels) in [
@@ -1628,10 +1991,15 @@ fn build_ui(
     // --- Config hot reload timer ---
     // Polls the config watcher every 500ms. On change, reloads config.toml
     // and applies diffs (font, theme, bell) to all existing panes in ALL workspaces.
+    // Also rebuilds the dropdown menu and re-registers profile actions (AC-16–AC-18).
     if let Some(mut config_watcher) = ConfigWatcher::new() {
         let shared_cfg = Rc::clone(&shared_config);
         let wm_reload = Rc::clone(&workspace_manager);
         let window_weak = window.downgrade();
+        let app_weak = app.downgrade();
+        let dropdown_ref = dropdown_button.clone();
+        let profile_count_ref = Rc::clone(&profile_action_count);
+        let dc_reload = daemon_client.clone();
 
         glib::timeout_add_local(Duration::from_millis(CONFIG_POLL_MS), move || {
             // Stop the timer if the window has been destroyed.
@@ -1657,6 +2025,31 @@ fn build_ui(
             // Update the shared config so new tabs/splits use the new values.
             if let Ok(mut cfg) = shared_cfg.try_borrow_mut() {
                 *cfg = new_config.clone();
+            }
+
+            // --- Rebuild dropdown and re-register profile actions (AC-16–AC-18) ---
+            if let Some(app_ref) = app_weak.upgrade() {
+                // Unregister old profile actions/accels before rebuilding.
+                let old_count = profile_count_ref.get();
+                unregister_profile_actions(&app_ref, &win, old_count);
+
+                // Register new profile actions.
+                let new_count = register_profile_actions(
+                    &app_ref,
+                    &win,
+                    &new_config.profiles,
+                    &shared_cfg,
+                    &wm_reload,
+                    &dc_reload,
+                );
+                profile_count_ref.set(new_count);
+
+                // Rebuild the dropdown popover (only when not open, AC risk-3).
+                // Use the manual popover builder so icons are preserved on hot-reload.
+                if !dropdown_ref.is_active() {
+                    let new_popover = build_dropdown_popover(&new_config.profiles, &win);
+                    dropdown_ref.set_popover(Some(&new_popover));
+                }
             }
 
             // Apply changes to every pane in every workspace.
@@ -2817,7 +3210,14 @@ fn add_new_tab(
 
     // --- Daemon mode: create pane via RPC and subscribe to output. ---
     if let Some(ref dc) = daemon_client {
-        match dc.new_tab() {
+        // Use profile-aware RPC when command or cwd are provided (AC-13, AC-14).
+        let rpc_result = if command.is_some() || working_dir.is_some() {
+            let cmd_vec = command.map(|c| c.to_vec());
+            dc.new_tab_with_profile(cmd_vec, working_dir)
+        } else {
+            dc.new_tab()
+        };
+        match rpc_result {
             Ok((pane_id, tab_id)) => {
                 let (mpsc_tx, mpsc_rx) = std::sync::mpsc::channel::<Vec<u8>>();
                 if let Err(e) = dc.subscribe_output(pane_id, mpsc_tx) {

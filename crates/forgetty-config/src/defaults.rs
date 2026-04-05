@@ -3,7 +3,7 @@
 //! Provides a sensible default configuration for users who have not yet
 //! created a configuration file.
 
-use crate::schema::{BellMode, Config, CursorStyle, NotificationMode, OnLaunch};
+use crate::schema::{BellMode, Config, CursorStyle, NotificationMode, OnLaunch, ProfileConfig};
 use std::collections::HashMap;
 
 /// Returns the default Forgetty configuration.
@@ -27,5 +27,7 @@ pub fn default_config() -> Config {
         notification_mode: NotificationMode::All,
         keybindings: HashMap::new(),
         on_launch: OnLaunch::Restore,
+        profiles: Vec::<ProfileConfig>::new(),
+        default_profile: None,
     }
 }
