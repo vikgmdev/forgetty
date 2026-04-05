@@ -24,6 +24,7 @@ use forgetty_config::{load_config, Config, NotificationMode};
 use forgetty_watcher::ConfigWatcher;
 use gtk4::gio;
 use gtk4::glib;
+use gtk4::pango;
 use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
@@ -340,8 +341,7 @@ fn build_ui(
     window_tab_section.append(Some("New Window"), Some("win.new-window"));
     let new_temp_window_item =
         gio::MenuItem::new(Some("New Temporary Window"), Some("win.new-temp-window"));
-    new_temp_window_item
-        .set_attribute_value("accel", Some(&"<Control><Shift>n".to_variant()));
+    new_temp_window_item.set_attribute_value("accel", Some(&"<Control><Shift>n".to_variant()));
     window_tab_section.append_item(&new_temp_window_item);
     window_tab_section.append(Some("Close Window"), Some("win.close-window"));
     window_tab_section
@@ -362,10 +362,10 @@ fn build_ui(
     workspace_section.append_item(&new_ws_item);
     workspace_section.append(Some("Rename Workspace\u{2026}"), Some("win.rename-workspace"));
     workspace_section.append(Some("Delete Workspace"), Some("win.delete-workspace"));
-    let ws_selector_item =
-        gio::MenuItem::new(Some("Workspace Selector"), Some("win.workspace-selector"));
-    ws_selector_item.set_attribute_value("accel", Some(&"<Control><Alt>w".to_variant()));
-    workspace_section.append_item(&ws_selector_item);
+    let ws_sidebar_item =
+        gio::MenuItem::new(Some("Toggle Workspace Sidebar"), Some("win.toggle-workspace-sidebar"));
+    ws_sidebar_item.set_attribute_value("accel", Some(&"<Control><Alt>b".to_variant()));
+    workspace_section.append_item(&ws_sidebar_item);
     menu.append_section(None, &workspace_section);
 
     // Section 4 -- Split submenu
@@ -465,11 +465,19 @@ fn build_ui(
     // The sidebar slides in from the right when the user clicks "Appearance".
     let main_area = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     main_area.set_vexpand(true);
+    main_area.set_hexpand(true);
     main_area.append(&initial_tab_view);
 
-    // Wrap main_area in an Overlay so the command palette can float on top.
+    // terminal_row wraps the workspace sidebar revealer (left) and main_area (right).
+    // This ensures the sidebar pushes main_area right rather than floating over it.
+    let terminal_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    terminal_row.set_vexpand(true);
+    terminal_row.set_hexpand(true);
+    terminal_row.append(&main_area);
+
+    // Wrap terminal_row in an Overlay so the command palette can float on top.
     let main_overlay = gtk4::Overlay::new();
-    main_overlay.set_child(Some(&main_area));
+    main_overlay.set_child(Some(&terminal_row));
     main_overlay.set_vexpand(true);
 
     let content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
@@ -484,6 +492,24 @@ fn build_ui(
         .default_height(DEFAULT_HEIGHT)
         .content(&content)
         .build();
+
+    // --- Workspace sidebar CSS ---
+    // Applied globally via the display; uses Adwaita CSS tokens so it respects
+    // both dark and light themes.
+    {
+        let css_provider = gtk4::CssProvider::new();
+        css_provider.load_from_string(
+            ".workspace-sidebar { border-right: 1px solid @borders; } \
+             .workspace-sidebar-active { border-left: 3px solid @accent_color; \
+             background-color: alpha(@accent_color, 0.08); } \
+             .workspace-sidebar .caption { font-size: 0.8em; }",
+        );
+        gtk4::style_context_add_provider_for_display(
+            &gtk4::gdk::Display::default().expect("Could not get default display"),
+            &css_provider,
+            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    }
 
     // --- Workspace Manager ---
     // Holds all workspaces with their per-workspace GTK state.
@@ -533,10 +559,12 @@ fn build_ui(
     let command_palette = build_command_palette(&window, &workspace_manager);
     main_overlay.add_overlay(&command_palette);
 
-    // --- Workspace selector overlay ---
-    let (workspace_selector, workspace_selector_lb) =
-        build_workspace_selector(&workspace_manager, &main_area, &tab_bar, &window);
-    main_overlay.add_overlay(&workspace_selector);
+    // --- Workspace sidebar (left panel, pushes main_area right) ---
+    // Built after workspace_manager is ready. The revealer is prepended to
+    // terminal_row so it physically displaces main_area rather than floating.
+    let (workspace_sidebar_revealer, workspace_sidebar_lb) =
+        build_workspace_sidebar(&workspace_manager, &main_area, &tab_bar, &window);
+    terminal_row.prepend(&workspace_sidebar_revealer);
 
     // Click-outside-to-close: a GestureClick on the overlay detects clicks
     // that land outside the palette card and closes it.
@@ -1170,6 +1198,7 @@ fn build_ui(
         let tab_bar_new = tab_bar.clone();
         let win_new = window.clone();
         let dc_new = daemon_client.clone();
+        let lb_new = workspace_sidebar_lb.clone();
         let action = gio::SimpleAction::new("new-workspace", None);
         action.connect_activate(move |_action, _param| {
             show_new_workspace_dialog(
@@ -1179,6 +1208,7 @@ fn build_ui(
                 &main_area_new,
                 &tab_bar_new,
                 dc_new.clone(),
+                lb_new.clone(),
             );
         });
         window.add_action(&action);
@@ -1203,6 +1233,7 @@ fn build_ui(
         let main_area_del = main_area.clone();
         let tab_bar_del = tab_bar.clone();
         let win_del = window.clone();
+        let lb_del = workspace_sidebar_lb.clone();
         let delete_action = gio::SimpleAction::new("delete-workspace", None);
         {
             // Disable if only one workspace
@@ -1212,35 +1243,36 @@ fn build_ui(
         }
         delete_action.connect_activate(move |_action, _param| {
             delete_current_workspace(&wm_delete, &main_area_del, &tab_bar_del, &win_del);
+            refresh_workspace_sidebar(&lb_del, &wm_delete);
         });
         window.add_action(&delete_action);
     }
 
-    // --- Switch Workspace by index (Ctrl+Alt+1 through 9) ---
+    // --- Switch Workspace by index (Alt+1 through 9) ---
     for i in 1..=9u32 {
         let wm_switch = Rc::clone(&workspace_manager);
         let main_area_sw = main_area.clone();
         let tab_bar_sw = tab_bar.clone();
         let win_sw = window.clone();
+        let lb_sw = workspace_sidebar_lb.clone();
         let action_name = format!("switch-workspace-{i}");
         let action = gio::SimpleAction::new(&action_name, None);
         action.connect_activate(move |_action, _param| {
             let target = (i - 1) as usize;
             switch_workspace(&wm_switch, target, &main_area_sw, &tab_bar_sw, &win_sw);
+            refresh_workspace_sidebar(&lb_sw, &wm_switch);
         });
         window.add_action(&action);
-        app.set_accels_for_action(
-            &format!("win.switch-workspace-{i}"),
-            &[&format!("<Control><Alt>{i}")],
-        );
+        app.set_accels_for_action(&format!("win.switch-workspace-{i}"), &[&format!("<Alt>{i}")]);
     }
 
-    // --- Previous Workspace (Ctrl+Alt+Left) ---
+    // --- Previous Workspace (Ctrl+Alt+Page_Up) ---
     {
         let wm_prev = Rc::clone(&workspace_manager);
         let main_area_prev = main_area.clone();
         let tab_bar_prev = tab_bar.clone();
         let win_prev = window.clone();
+        let lb_prev = workspace_sidebar_lb.clone();
         let action = gio::SimpleAction::new("prev-workspace", None);
         action.connect_activate(move |_action, _param| {
             let Ok(mgr) = wm_prev.try_borrow() else {
@@ -1253,18 +1285,20 @@ fn build_ui(
             let target = if mgr.active_index == 0 { count - 1 } else { mgr.active_index - 1 };
             drop(mgr);
             switch_workspace(&wm_prev, target, &main_area_prev, &tab_bar_prev, &win_prev);
+            refresh_workspace_sidebar(&lb_prev, &wm_prev);
         });
         window.add_action(&action);
     }
 
     app.set_accels_for_action("win.prev-workspace", &["<Control><Alt>Page_Up"]);
 
-    // --- Next Workspace (Ctrl+Alt+Right) ---
+    // --- Next Workspace (Ctrl+Alt+Page_Down) ---
     {
         let wm_next = Rc::clone(&workspace_manager);
         let main_area_next = main_area.clone();
         let tab_bar_next = tab_bar.clone();
         let win_next = window.clone();
+        let lb_next = workspace_sidebar_lb.clone();
         let action = gio::SimpleAction::new("next-workspace", None);
         action.connect_activate(move |_action, _param| {
             let Ok(mgr) = wm_next.try_borrow() else {
@@ -1277,32 +1311,31 @@ fn build_ui(
             let target = (mgr.active_index + 1) % count;
             drop(mgr);
             switch_workspace(&wm_next, target, &main_area_next, &tab_bar_next, &win_next);
+            refresh_workspace_sidebar(&lb_next, &wm_next);
         });
         window.add_action(&action);
     }
 
     app.set_accels_for_action("win.next-workspace", &["<Control><Alt>Page_Down"]);
 
-    // --- Workspace Selector overlay (Ctrl+Alt+W) ---
+    // --- Toggle Workspace Sidebar (Ctrl+Alt+B) ---
     {
-        let wm_selector = Rc::clone(&workspace_manager);
-        let selector_ref = workspace_selector.clone();
-        let lb_ref = workspace_selector_lb.clone();
-        let palette_ref_ws = command_palette.clone();
-        let wm_ws = Rc::clone(&workspace_manager);
-        let action = gio::SimpleAction::new("workspace-selector", None);
+        let sidebar_revealer_ref = workspace_sidebar_revealer.clone();
+        let lb_ref = workspace_sidebar_lb.clone();
+        let wm_sidebar = Rc::clone(&workspace_manager);
+        let action = gio::SimpleAction::new("toggle-workspace-sidebar", None);
         action.connect_activate(move |_action, _param| {
-            // Close command palette if open
-            if palette_ref_ws.is_visible() {
-                let ft = active_focus_tracker(&wm_ws);
-                close_command_palette(&palette_ref_ws, &ft);
+            let currently_revealed = sidebar_revealer_ref.reveals_child();
+            sidebar_revealer_ref.set_reveal_child(!currently_revealed);
+            if !currently_revealed {
+                // Sidebar just opened — refresh rows.
+                refresh_workspace_sidebar(&lb_ref, &wm_sidebar);
             }
-            toggle_workspace_selector(&selector_ref, &lb_ref, &wm_selector);
         });
         window.add_action(&action);
     }
 
-    app.set_accels_for_action("win.workspace-selector", &["<Control><Alt>w"]);
+    app.set_accels_for_action("win.toggle-workspace-sidebar", &["<Control><Alt>b"]);
 
     // --- Command Palette action (Ctrl+Shift+P) ---
     {
@@ -4476,10 +4509,10 @@ fn build_shortcuts_window() -> gtk4::ShortcutsWindow {
     // --- Workspaces ---
     let workspace_group = shortcut_group("Workspaces");
     workspace_group.add_shortcut(&shortcut("<Control><Alt>n", "New Workspace"));
-    workspace_group.add_shortcut(&shortcut("<Control><Alt>1", "Switch to Workspace 1\u{2013}9"));
+    workspace_group.add_shortcut(&shortcut("<Control><Alt>b", "Toggle Workspace Sidebar"));
+    workspace_group.add_shortcut(&shortcut("<Alt>1", "Switch to Workspace 1\u{2013}9"));
     workspace_group.add_shortcut(&shortcut("<Control><Alt>Page_Up", "Previous Workspace"));
     workspace_group.add_shortcut(&shortcut("<Control><Alt>Page_Down", "Next Workspace"));
-    workspace_group.add_shortcut(&shortcut("<Control><Alt>w", "Workspace Selector"));
     section.add_group(&workspace_group);
 
     // --- Navigation ---
@@ -4813,9 +4846,9 @@ fn command_registry() -> &'static [CommandEntry] {
             shortcut_label: "",
         },
         CommandEntry {
-            display_name: "Workspace Selector",
-            action_name: "win.workspace-selector",
-            shortcut_label: "Ctrl+Alt+W",
+            display_name: "Toggle Workspace Sidebar",
+            action_name: "win.toggle-workspace-sidebar",
+            shortcut_label: "Ctrl+Alt+B",
         },
         CommandEntry {
             display_name: "Previous Workspace",
@@ -5393,6 +5426,7 @@ fn show_new_workspace_dialog(
     main_area: &gtk4::Box,
     tab_bar: &adw::TabBar,
     daemon_client: Option<Arc<DaemonClient>>,
+    sidebar_lb: gtk4::ListBox,
 ) {
     let dialog = adw::MessageDialog::new(
         Some(window),
@@ -5421,6 +5455,7 @@ fn show_new_workspace_dialog(
     let tb = tab_bar.clone();
     let win = window.clone();
     let dc = daemon_client;
+    let lb = sidebar_lb;
     dialog.connect_response(None, move |dialog, response| {
         if response != "create" {
             dialog.close();
@@ -5440,6 +5475,7 @@ fn show_new_workspace_dialog(
         drop(cfg_ref);
 
         create_and_switch_to_new_workspace(&wm, &name, &config, &ma, &tb, &win, dc.clone());
+        refresh_workspace_sidebar(&lb, &wm);
     });
 
     dialog.present();
@@ -5856,182 +5892,159 @@ fn reload_config_all_workspaces(
 }
 
 // ---------------------------------------------------------------------------
-// Workspace selector overlay
+// Workspace sidebar (left panel)
 // ---------------------------------------------------------------------------
 
-/// Build the workspace selector overlay widget.
+/// Build the workspace sidebar revealer widget.
 ///
-/// Shows a card with a ListBox of workspace names. Active workspace is
-/// highlighted. Click or Enter switches, Escape closes.
-/// Returns (outer_container, list_box) so callers can pass the ListBox directly.
-fn build_workspace_selector(
+/// Returns `(revealer, list_box)`. The revealer is prepended to `terminal_row`
+/// so the sidebar physically pushes `main_area` to the right. The `ListBox` is
+/// returned so callers can call `refresh_workspace_sidebar()` to update it.
+fn build_workspace_sidebar(
     workspace_manager: &WorkspaceManager,
     main_area: &gtk4::Box,
     tab_bar: &adw::TabBar,
     window: &adw::ApplicationWindow,
-) -> (gtk4::Box, gtk4::ListBox) {
-    let outer = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-    outer.set_halign(gtk4::Align::Center);
-    outer.set_valign(gtk4::Align::Start);
-    outer.set_margin_top(60);
-    outer.set_hexpand(true);
-    outer.set_vexpand(true);
-    outer.set_width_request(300);
-    outer.set_visible(false);
-    outer.set_can_focus(false);
-    outer.add_css_class("card");
+) -> (gtk4::Revealer, gtk4::ListBox) {
+    let revealer = gtk4::Revealer::new();
+    revealer.set_transition_type(gtk4::RevealerTransitionType::SlideRight);
+    revealer.set_transition_duration(150);
+    revealer.set_reveal_child(false);
 
-    let title_label = gtk4::Label::new(Some("Workspaces"));
-    title_label.add_css_class("title-4");
-    title_label.set_margin_top(12);
-    title_label.set_margin_bottom(8);
-    outer.append(&title_label);
-
-    let separator = gtk4::Separator::new(gtk4::Orientation::Horizontal);
-    outer.append(&separator);
+    let sidebar_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    sidebar_box.set_width_request(220);
+    sidebar_box.set_vexpand(true);
+    sidebar_box.add_css_class("workspace-sidebar");
 
     let list_box = gtk4::ListBox::new();
     list_box.set_selection_mode(gtk4::SelectionMode::Single);
     list_box.add_css_class("navigation-sidebar");
-    list_box.set_focusable(true);
-    list_box.set_can_focus(true);
 
     let scrolled = gtk4::ScrolledWindow::new();
     scrolled.set_child(Some(&list_box));
     scrolled.set_vexpand(true);
-    scrolled.set_propagate_natural_height(true);
-    scrolled.set_max_content_height(400);
     scrolled.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
-    outer.append(&scrolled);
+    sidebar_box.append(&scrolled);
 
-    // Row activation (click or Enter)
+    revealer.set_child(Some(&sidebar_box));
+
+    // Row activation (click): switch workspace but keep sidebar open.
     {
-        let outer_ref = outer.clone();
         let wm = Rc::clone(workspace_manager);
         let ma = main_area.clone();
         let tb = tab_bar.clone();
         let win = window.clone();
+        let lb_ref = list_box.clone();
         list_box.connect_row_activated(move |_lb, row| {
             let target = row.index() as usize;
-            outer_ref.set_visible(false);
             switch_workspace(&wm, target, &ma, &tb, &win);
+            refresh_workspace_sidebar(&lb_ref, &wm);
         });
     }
 
-    // Keyboard handling on the list box
-    {
-        let outer_ref = outer.clone();
-        let wm = Rc::clone(workspace_manager);
-        let ma = main_area.clone();
-        let tb = tab_bar.clone();
-        let win = window.clone();
-        let lb = list_box.clone();
-        let key_controller = gtk4::EventControllerKey::new();
-        key_controller.connect_key_pressed(move |_ctrl, key, _code, _mods| {
-            match key {
-                gtk4::gdk::Key::Escape => {
-                    outer_ref.set_visible(false);
-                    // Restore focus to the active workspace's pane.
-                    if let Ok(mgr) = wm.try_borrow() {
-                        let ws = &mgr.workspaces[mgr.active_index];
-                        if let Some(page) = ws.tab_view.selected_page() {
-                            let container = page.child();
-                            let leaves = collect_leaf_drawing_areas(&container);
-                            if let Some(da) = leaves.first() {
-                                da.grab_focus();
-                            }
-                        }
-                    }
-                    glib::Propagation::Stop
-                }
-                gtk4::gdk::Key::Return | gtk4::gdk::Key::KP_Enter => {
-                    if let Some(row) = lb.selected_row() {
-                        let target = row.index() as usize;
-                        outer_ref.set_visible(false);
-                        switch_workspace(&wm, target, &ma, &tb, &win);
-                    }
-                    glib::Propagation::Stop
-                }
-                _ => glib::Propagation::Proceed,
-            }
-        });
-        list_box.add_controller(key_controller);
-    }
-
-    (outer, list_box)
+    (revealer, list_box)
 }
 
-/// Populate the workspace selector with current workspace names and show/hide it.
-fn toggle_workspace_selector(
-    selector: &gtk4::Box,
-    lb: &gtk4::ListBox,
-    workspace_manager: &WorkspaceManager,
-) {
-    if selector.is_visible() {
-        selector.set_visible(false);
-        // Restore focus to the active workspace.
-        if let Ok(mgr) = workspace_manager.try_borrow() {
-            let ws = &mgr.workspaces[mgr.active_index];
-            if let Some(page) = ws.tab_view.selected_page() {
-                let container = page.child();
-                let leaves = collect_leaf_drawing_areas(&container);
-                if let Some(da) = leaves.first() {
-                    da.grab_focus();
-                }
-            }
-        }
-        return;
-    }
-
-    // Rebuild the list contents from the current workspace manager state.
+/// Rebuild workspace rows in the sidebar `ListBox` from the current manager state.
+///
+/// Called after any workspace switch, creation, or deletion so the active-row
+/// highlight reflects the current state.
+fn refresh_workspace_sidebar(list_box: &gtk4::ListBox, workspace_manager: &WorkspaceManager) {
     let Ok(mgr) = workspace_manager.try_borrow() else {
         return;
     };
 
     // Remove all existing rows.
-    while let Some(row) = lb.row_at_index(0) {
-        lb.remove(&row);
+    while let Some(row) = list_box.row_at_index(0) {
+        list_box.remove(&row);
     }
 
     // Add a row for each workspace.
     for (i, ws) in mgr.workspaces.iter().enumerate() {
         let hbox = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-        hbox.set_margin_start(12);
-        hbox.set_margin_end(12);
-        hbox.set_margin_top(6);
-        hbox.set_margin_bottom(6);
+        hbox.set_margin_start(8);
+        hbox.set_margin_end(8);
+        hbox.set_margin_top(8);
+        hbox.set_margin_bottom(8);
 
-        let label = gtk4::Label::new(Some(&ws.name));
-        label.set_halign(gtk4::Align::Start);
-        label.set_hexpand(true);
+        // Number badge (1-indexed).
+        let number_label = gtk4::Label::new(Some(&format!("{}", i + 1)));
+        number_label.add_css_class("dim-label");
+        number_label.set_width_request(18);
+        number_label.set_halign(gtk4::Align::End);
+        hbox.append(&number_label);
+
+        // Workspace name.
+        let name_label = gtk4::Label::new(Some(&ws.name));
+        name_label.set_halign(gtk4::Align::Start);
+        name_label.set_hexpand(true);
+        name_label.set_ellipsize(pango::EllipsizeMode::End);
         if i == mgr.active_index {
-            label.add_css_class("heading");
+            name_label.add_css_class("heading");
         }
-        hbox.append(&label);
+        hbox.append(&name_label);
 
-        // Show position number
-        let pos_label = gtk4::Label::new(Some(&format!("{}", i + 1)));
-        pos_label.add_css_class("dim-label");
-        pos_label.set_halign(gtk4::Align::End);
-        hbox.append(&pos_label);
+        // Meta column: tab count + CWD.
+        let meta_vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+
+        // Tab count.
+        let n_tabs = ws.tab_view.n_pages();
+        let tab_count_str =
+            if n_tabs == 1 { String::from("1 tab") } else { format!("{n_tabs} tabs") };
+        let tab_count_label = gtk4::Label::new(Some(&tab_count_str));
+        tab_count_label.add_css_class("caption");
+        tab_count_label.add_css_class("dim-label");
+        tab_count_label.set_halign(gtk4::Align::End);
+        meta_vbox.append(&tab_count_label);
+
+        // Active pane CWD (tilde-collapsed).
+        let cwd_str = {
+            let focused_name = ws.focus_tracker.borrow().clone();
+            let cwd_path: Option<std::path::PathBuf> = if !focused_name.is_empty() {
+                ws.tab_states
+                    .borrow()
+                    .get(&focused_name)
+                    .and_then(|state_rc| read_pane_cwd(state_rc))
+            } else {
+                None
+            };
+
+            let raw = cwd_path.as_ref().and_then(|p| p.to_str()).unwrap_or("shell").to_string();
+
+            // Tilde-collapse using HOME env var.
+            if let Ok(home) = std::env::var("HOME") {
+                if raw.starts_with(&home) {
+                    format!("~{}", &raw[home.len()..])
+                } else {
+                    raw
+                }
+            } else {
+                raw
+            }
+        };
+
+        let cwd_label = gtk4::Label::new(Some(&cwd_str));
+        cwd_label.add_css_class("caption");
+        cwd_label.add_css_class("dim-label");
+        cwd_label.set_halign(gtk4::Align::End);
+        cwd_label.set_ellipsize(pango::EllipsizeMode::Start);
+        meta_vbox.append(&cwd_label);
+
+        hbox.append(&meta_vbox);
 
         let row = gtk4::ListBoxRow::new();
         row.set_child(Some(&hbox));
-        lb.append(&row);
+
+        // Highlight active workspace row.
+        if i == mgr.active_index {
+            row.add_css_class("workspace-sidebar-active");
+        }
+
+        list_box.append(&row);
     }
 
     // Select the active workspace row.
-    if let Some(row) = lb.row_at_index(mgr.active_index as i32) {
-        lb.select_row(Some(&row));
+    if let Some(row) = list_box.row_at_index(mgr.active_index as i32) {
+        list_box.select_row(Some(&row));
     }
-
-    drop(mgr);
-
-    selector.set_visible(true);
-
-    // Defer focus grab to next idle tick so GTK finishes overlay layout first.
-    let lb_focus = lb.clone();
-    glib::idle_add_local_once(move || {
-        lb_focus.grab_focus();
-    });
 }
