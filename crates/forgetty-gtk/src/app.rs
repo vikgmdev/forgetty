@@ -5069,7 +5069,7 @@ fn paste_clipboard(
         dialog.add_response("cancel", "Cancel");
         dialog.add_response("paste", "Paste anyway");
         dialog.set_response_appearance("paste", adw::ResponseAppearance::Suggested);
-        dialog.set_default_response(Some("cancel"));
+        dialog.set_default_response(Some("paste"));
         dialog.set_close_response("cancel");
 
         // Build the preview widget.
