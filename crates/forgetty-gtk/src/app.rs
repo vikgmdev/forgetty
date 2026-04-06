@@ -923,7 +923,9 @@ fn build_ui(
             tracing::debug!("tab-bar page at pos: {}", page.is_some());
 
             let result = {
-                let Ok(mgr) = wm_click.try_borrow() else { return; };
+                let Ok(mgr) = wm_click.try_borrow() else {
+                    return;
+                };
                 let ws = &mgr.workspaces[mgr.active_index];
                 // Use the picked page, or fall back to the selected page.
                 let p = match page.or_else(|| ws.tab_view.selected_page()) {
@@ -939,13 +941,29 @@ fn build_ui(
                     Rc::clone(&ws.tab_id_map),
                 ))
             };
-            let Some((page, tab_states, focus_tracker, custom_titles, tab_colors, tab_id_map)) = result else { return; };
+            let Some((page, tab_states, focus_tracker, custom_titles, tab_colors, tab_id_map)) =
+                result
+            else {
+                return;
+            };
 
-            let Some(tv) = tb_click.view() else { return; };
+            let Some(tv) = tb_click.view() else {
+                return;
+            };
             show_tab_context_menu(
-                &tb_click, &tv, &page, x, y,
-                &tab_states, &focus_tracker, &custom_titles, &tab_colors, &tab_id_map,
-                &win_click, dc_click.clone(), &sc_click,
+                &tb_click,
+                &tv,
+                &page,
+                x,
+                y,
+                &tab_states,
+                &focus_tracker,
+                &custom_titles,
+                &tab_colors,
+                &tab_id_map,
+                &win_click,
+                dc_click.clone(),
+                &sc_click,
             );
         });
         tab_bar.add_controller(gesture);
@@ -1090,9 +1108,8 @@ fn build_ui(
     // page.
     {
         let app_ref = app.clone();
-        initial_tab_view.connect_create_window(move |_source_tv| {
-            Some(open_detached_tab_window(&app_ref))
-        });
+        initial_tab_view
+            .connect_create_window(move |_source_tv| Some(open_detached_tab_window(&app_ref)));
     }
 
     // --- New tab action (Ctrl+Shift+T) ---
@@ -5011,12 +5028,51 @@ fn paste_clipboard(
     // Clone state_rc and daemon_client for the async callback
     let state_for_cb = Rc::clone(&state_rc);
     let dc_paste = daemon_client.clone();
+    let clipboard_for_texture = clipboard.clone();
     clipboard.read_text_async(gio::Cancellable::NONE, move |result| {
         let text = match result {
             Ok(Some(text)) => text.to_string(),
-            Ok(None) => return, // clipboard empty
+            Ok(None) => {
+                // No text on clipboard -- fall back to image/texture check.
+                let state_for_img = Rc::clone(&state_for_cb);
+                let dc_for_img = dc_paste.clone();
+                clipboard_for_texture.read_texture_async(
+                    gio::Cancellable::NONE,
+                    move |tex_result| {
+                        let texture = match tex_result {
+                            Ok(Some(tex)) => tex,
+                            Ok(None) => return, // clipboard truly empty
+                            Err(e) => {
+                                tracing::debug!("Clipboard texture read failed: {e}");
+                                return;
+                            }
+                        };
+                        paste_texture_to_path(texture, state_for_img, dc_for_img);
+                    },
+                );
+                return;
+            }
             Err(e) => {
-                tracing::debug!("Clipboard read failed: {e}");
+                // GTK returns an error (not Ok(None)) when the clipboard has
+                // no text content (e.g. image-only).  Fall back to the
+                // texture path in that case too.
+                tracing::debug!("Clipboard text read returned error (trying texture): {e}");
+                let state_for_img = Rc::clone(&state_for_cb);
+                let dc_for_img = dc_paste.clone();
+                clipboard_for_texture.read_texture_async(
+                    gio::Cancellable::NONE,
+                    move |tex_result| {
+                        let texture = match tex_result {
+                            Ok(Some(tex)) => tex,
+                            Ok(None) => return,
+                            Err(e2) => {
+                                tracing::debug!("Clipboard texture read also failed: {e2}");
+                                return;
+                            }
+                        };
+                        paste_texture_to_path(texture, state_for_img, dc_for_img);
+                    },
+                );
                 return;
             }
         };
@@ -5112,6 +5168,98 @@ fn paste_clipboard(
             btn.grab_focus();
         }
     });
+}
+
+/// Save a clipboard texture as a PNG to the cache dir and paste the path.
+fn paste_texture_to_path(
+    texture: gtk4::gdk::Texture,
+    state_rc: Rc<RefCell<TerminalState>>,
+    daemon_client: Option<Arc<DaemonClient>>,
+) {
+    let cache_dir = match dirs::cache_dir() {
+        Some(d) => d.join("forgetty").join("clipboard"),
+        None => {
+            tracing::warn!("Could not determine XDG cache directory; skipping image paste");
+            return;
+        }
+    };
+
+    if let Err(e) = std::fs::create_dir_all(&cache_dir) {
+        tracing::warn!("Failed to create clipboard cache dir {}: {e}", cache_dir.display());
+        return;
+    }
+
+    let now = std::time::SystemTime::now();
+    let secs = now.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    let timestamp = epoch_to_timestamp(secs);
+    let short_uuid = &uuid::Uuid::new_v4().to_string().replace('-', "")[..8];
+    let filename = format!("paste-{timestamp}-{short_uuid}.png");
+    let file_path = cache_dir.join(&filename);
+
+    if let Err(e) = texture.save_to_png(&file_path) {
+        tracing::warn!("Failed to save clipboard image to {}: {e}", file_path.display());
+        return;
+    }
+
+    let path_text = format!("{} ", file_path.to_string_lossy());
+    do_paste(state_rc, path_text, daemon_client);
+}
+
+/// Convert a Unix epoch timestamp (seconds) to a `YYYYMMDD-HHmmss` string.
+///
+/// Uses manual arithmetic (no chrono dependency). Leap-second precision is
+/// not required -- the timestamp is used only for unique filenames.
+fn epoch_to_timestamp(epoch_secs: u64) -> String {
+    // Days per month for non-leap and leap years.
+    const DAYS_NORMAL: [u64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    const DAYS_LEAP: [u64; 12] = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+    fn is_leap(y: u64) -> bool {
+        (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+    }
+
+    fn days_in_year(y: u64) -> u64 {
+        if is_leap(y) {
+            366
+        } else {
+            365
+        }
+    }
+
+    let secs_in_day: u64 = 86400;
+    let mut remaining = epoch_secs;
+
+    // Compute year.
+    let mut year: u64 = 1970;
+    loop {
+        let dy = days_in_year(year) * secs_in_day;
+        if remaining < dy {
+            break;
+        }
+        remaining -= dy;
+        year += 1;
+    }
+
+    // Compute month and day.
+    let months = if is_leap(year) { &DAYS_LEAP } else { &DAYS_NORMAL };
+    let mut month: u64 = 1;
+    let mut day_secs = remaining;
+    for &dm in months.iter() {
+        let ms = dm * secs_in_day;
+        if day_secs < ms {
+            break;
+        }
+        day_secs -= ms;
+        month += 1;
+    }
+    let day = day_secs / secs_in_day + 1;
+    let remainder = day_secs % secs_in_day;
+
+    let hour = remainder / 3600;
+    let minute = (remainder % 3600) / 60;
+    let second = remainder % 60;
+
+    format!("{year:04}{month:02}{day:02}-{hour:02}{minute:02}{second:02}")
 }
 
 // ---------------------------------------------------------------------------
@@ -6043,11 +6191,7 @@ fn toggle_command_palette(
 ///
 /// Returns `None` if (x, y) is not over a tab button (e.g., over empty space
 /// or the new-tab button).
-fn tab_bar_find_page_at(
-    tab_bar: &adw::TabBar,
-    x: f64,
-    y: f64,
-) -> Option<adw::TabPage> {
+fn tab_bar_find_page_at(tab_bar: &adw::TabBar, x: f64, y: f64) -> Option<adw::TabPage> {
     let tv = tab_bar.view()?;
     let n_pages = tv.n_pages();
     if n_pages == 0 {
@@ -6096,14 +6240,14 @@ fn tab_bar_find_page_at(
 
 /// Preset colors for the tab color picker (R, G, B as 0.0..1.0).
 const TAB_COLOR_PRESETS: &[(&str, (f32, f32, f32))] = &[
-    ("Red",    (0.878, 0.286, 0.227)),
+    ("Red", (0.878, 0.286, 0.227)),
     ("Orange", (0.945, 0.561, 0.196)),
     ("Yellow", (0.969, 0.773, 0.212)),
-    ("Green",  (0.353, 0.725, 0.404)),
-    ("Teal",   (0.188, 0.663, 0.596)),
-    ("Blue",   (0.224, 0.529, 0.894)),
+    ("Green", (0.353, 0.725, 0.404)),
+    ("Teal", (0.188, 0.663, 0.596)),
+    ("Blue", (0.224, 0.529, 0.894)),
     ("Purple", (0.616, 0.373, 0.847)),
-    ("Pink",   (0.859, 0.365, 0.647)),
+    ("Pink", (0.859, 0.365, 0.647)),
 ];
 
 /// Wire the `setup-menu` signal on a tab view so that right-clicking any tab
@@ -6149,7 +6293,8 @@ fn wire_tab_context_menu_signal(
                 return;
             };
             (
-                x, y,
+                x,
+                y,
                 Rc::clone(&ws.tab_states),
                 Rc::clone(&ws.focus_tracker),
                 Rc::clone(&ws.custom_titles),
@@ -6165,9 +6310,19 @@ fn wire_tab_context_menu_signal(
             mgr.tab_menu_shown = true;
         }
         show_tab_context_menu(
-            &tb, tv, page, x, y,
-            &tab_states, &focus_tracker, &custom_titles, &tab_colors, &tab_id_map,
-            &win, dc.clone(), &sc,
+            &tb,
+            tv,
+            page,
+            x,
+            y,
+            &tab_states,
+            &focus_tracker,
+            &custom_titles,
+            &tab_colors,
+            &tab_id_map,
+            &win,
+            dc.clone(),
+            &sc,
         );
     });
 }
@@ -6178,7 +6333,8 @@ fn show_tab_context_menu(
     tab_bar: &adw::TabBar,
     tab_view: &adw::TabView,
     page: &adw::TabPage,
-    x: f64, y: f64,
+    x: f64,
+    y: f64,
     tab_states: &TabStateMap,
     focus_tracker: &FocusTracker,
     custom_titles: &CustomTitles,
@@ -6361,14 +6517,16 @@ fn build_tab_context_menu_box(
         let pop_ref = popover.clone();
         for (label, action) in &[
             ("Split Right", "win.split-right"),
-            ("Split Down",  "win.split-down"),
-            ("Split Left",  "win.split-left"),
-            ("Split Up",    "win.split-up"),
+            ("Split Down", "win.split-down"),
+            ("Split Left", "win.split-left"),
+            ("Split Up", "win.split-up"),
         ] {
             let b = tab_menu_action_button(label, action, &split_sub);
             // Also close parent popover when sub-item selected
             let pop_ref2 = pop_ref.clone();
-            b.connect_clicked(move |_| { pop_ref2.popdown(); });
+            b.connect_clicked(move |_| {
+                pop_ref2.popdown();
+            });
             sub_vbox.append(&b);
         }
         split_sub.set_child(Some(&sub_vbox));
@@ -6516,11 +6674,8 @@ fn build_tab_context_menu_box(
             let n = tv.n_pages();
             let keep_pos = tv.page_position(&pg);
             // Collect all pages except this one.
-            let pages_to_close: Vec<adw::TabPage> = (0..n)
-                .rev()
-                .filter(|&i| i != keep_pos)
-                .map(|i| tv.nth_page(i))
-                .collect();
+            let pages_to_close: Vec<adw::TabPage> =
+                (0..n).rev().filter(|&i| i != keep_pos).map(|i| tv.nth_page(i)).collect();
             for p in pages_to_close {
                 tv.close_page(&p);
             }
@@ -6620,17 +6775,12 @@ fn build_color_picker_box(
             let sub2 = sub.clone();
             // Find a window ancestor for the dialog.
             let win = btn.root().and_downcast::<gtk4::Window>();
-            dialog.choose_rgba(
-                win.as_ref(),
-                None,
-                gtk4::gio::Cancellable::NONE,
-                move |result| {
-                    if let Ok(rgba) = result {
-                        apply_tab_color(&pg2, &pk2, Some(rgba), &tc2);
-                        sub2.popdown();
-                    }
-                },
-            );
+            dialog.choose_rgba(win.as_ref(), None, gtk4::gio::Cancellable::NONE, move |result| {
+                if let Ok(rgba) = result {
+                    apply_tab_color(&pg2, &pk2, Some(rgba), &tc2);
+                    sub2.popdown();
+                }
+            });
         });
         vbox.append(&row);
     }
@@ -6739,7 +6889,9 @@ fn duplicate_tab(
         })
     };
 
-    let Ok(cfg) = shared_config.try_borrow() else { return; };
+    let Ok(cfg) = shared_config.try_borrow() else {
+        return;
+    };
     let (cmd, cwd_buf) = if let Some(cwd_path) = cwd {
         (None, Some(cwd_path))
     } else {
@@ -6764,11 +6916,7 @@ fn duplicate_tab(
 }
 
 /// Spawn a new forgetty window with the CWD of the source tab, then close the source tab.
-fn move_tab_to_new_window(
-    tab_view: &adw::TabView,
-    page: &adw::TabPage,
-    tab_states: &TabStateMap,
-) {
+fn move_tab_to_new_window(tab_view: &adw::TabView, page: &adw::TabPage, tab_states: &TabStateMap) {
     // Read CWD from the focused pane in the source tab.
     let cwd: Option<PathBuf> = {
         let container = page.child();
@@ -7160,10 +7308,18 @@ fn create_and_switch_to_new_workspace(
     let new_tab_colors: TabColorMap = Rc::new(RefCell::new(HashMap::new()));
 
     wire_tab_view_handlers(&new_tv, &new_tab_states, &new_focus_tracker, window);
-    wire_tab_context_menu_signal(&new_tv, workspace_manager, tab_bar, window, daemon_client.clone(), shared_config);
+    wire_tab_context_menu_signal(
+        &new_tv,
+        workspace_manager,
+        tab_bar,
+        window,
+        daemon_client.clone(),
+        shared_config,
+    );
     // Allow tab tear-off from this workspace too.
     {
-        let app_c = window.application()
+        let app_c = window
+            .application()
             .and_downcast::<adw::Application>()
             .expect("window must be in an adw::Application");
         new_tv.connect_create_window(move |_| Some(open_detached_tab_window(&app_c)));
@@ -7669,10 +7825,7 @@ fn refresh_workspace_sidebar(list_box: &gtk4::ListBox, workspace_manager: &Works
         let cwd_str = {
             let focused_name = ws.focus_tracker.borrow().clone();
             let cwd_path: Option<std::path::PathBuf> = if !focused_name.is_empty() {
-                ws.tab_states
-                    .borrow()
-                    .get(&focused_name)
-                    .and_then(read_pane_cwd)
+                ws.tab_states.borrow().get(&focused_name).and_then(read_pane_cwd)
             } else {
                 None
             };

@@ -1593,6 +1593,7 @@ name = "forgetty-gtk"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "dirs",
  "forgetty-config",
  "forgetty-core",
  "forgetty-pty",
