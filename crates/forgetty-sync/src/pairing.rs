@@ -7,8 +7,8 @@
 //! 2. **Unknown + `allow_pairing == true`**: auto-accept, add to registry,
 //!    emit `DevicePaired`, close stream.
 //! 3. **Unknown + `allow_pairing == false`**: accept QUIC (iroh requires it to
-//!    send a rejection), send `{"error":"not_authorized"}` on a uni stream,
-//!    log the rejection, close.
+//!    send a rejection), send `{"v":1,"error":"not_authorized"}` on a bi stream
+//!    (bi, not uni — Android calls `accept_bi()`), log the rejection, close.
 //!
 //! T-052 scope: the QUIC stream is closed after the pairing handshake.
 //! No terminal streaming in T-052 — that is T-053.
@@ -146,12 +146,22 @@ async fn send_pairing_ack(conn: &Connection, _name: &str) {
     let _ = conn;
 }
 
-/// Send `{"error":"not_authorized"}` on a uni stream and close.
+/// Send `{"v":1,"error":"not_authorized"}` on a bi-directional stream.
+///
+/// Uses a bi-stream (not uni) so that clients calling `accept_bi()` can read
+/// the rejection reason. Waits up to 300 ms for the client to close its side
+/// before returning, ensuring the stream data is delivered before the caller
+/// closes the connection.
 async fn reject_connection(conn: &Connection) {
-    if let Ok(mut send) = conn.open_uni().await {
-        let msg = b"{\"error\":\"not_authorized\"}\n";
+    if let Ok((mut send, mut recv)) = conn.open_bi().await {
+        let msg = b"{\"v\":1,\"error\":\"not_authorized\"}\n";
         let _ = send.write_all(msg).await;
         let _ = send.finish();
+        // Wait for client to close its send-side (or timeout) so the rejection
+        // message is delivered before we close the connection.
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_millis(300), recv.read(&mut [0u8; 16]))
+                .await;
     }
 }
 
