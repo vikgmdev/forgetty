@@ -916,11 +916,11 @@ fn build_ui(
         gesture.connect_pressed(move |gesture, _n, x, y| {
             // Claim the event so libadwaita's tab button gesture never sees it.
             gesture.set_state(gtk4::EventSequenceState::Claimed);
-            tracing::info!("tab-bar right-click capture (claimed): ({x},{y})");
+            tracing::debug!("tab-bar right-click capture (claimed): ({x},{y})");
 
             // Find which page was right-clicked.
             let page = tab_bar_find_page_at(&tb_click, x, y);
-            tracing::info!("tab-bar page at pos: {}", page.is_some());
+            tracing::debug!("tab-bar page at pos: {}", page.is_some());
 
             let result = {
                 let Ok(mgr) = wm_click.try_borrow() else { return; };
@@ -6058,23 +6058,19 @@ fn tab_bar_find_page_at(
     // GtkScrolledWindow whose overflow clip prevents pick traversal.
     // Instead, walk the widget tree recursively and use compute_bounds() to
     // find which button contains the click position.
-    fn collect_tab_buttons(widget: &gtk4::Widget, out: &mut Vec<gtk4::Widget>, depth: u32) {
-        let name = widget.type_().name();
-        if depth <= 4 {
-            tracing::debug!("{:indent$}{name}", "", indent = depth as usize * 2);
-        }
-        if name == "AdwTabButton" {
+    fn collect_tab_buttons(widget: &gtk4::Widget, out: &mut Vec<gtk4::Widget>) {
+        if widget.type_().name() == "AdwTabButton" {
             out.push(widget.clone());
         }
         let mut child = widget.first_child();
         while let Some(c) = child {
-            collect_tab_buttons(&c, out, depth + 1);
+            collect_tab_buttons(&c, out);
             child = c.next_sibling();
         }
     }
 
     let mut buttons: Vec<gtk4::Widget> = Vec::new();
-    collect_tab_buttons(tab_bar_widget, &mut buttons, 0);
+    collect_tab_buttons(tab_bar_widget, &mut buttons);
 
     tracing::debug!("tab_bar_find_page_at: found {} AdwTabButton(s)", buttons.len());
 
@@ -6130,23 +6126,23 @@ fn wire_tab_context_menu_signal(
     let sc = Rc::clone(shared_config);
 
     tab_view.connect_setup_menu(move |tv, maybe_page| {
-        tracing::info!("setup-menu: fired, page={}", maybe_page.is_some());
+        tracing::debug!("setup-menu: fired, page={}", maybe_page.is_some());
         let Some(page) = maybe_page else {
-            tracing::info!("setup-menu: no page (right-click on empty space)");
+            tracing::debug!("setup-menu: no page (right-click on empty space)");
             return;
         };
 
         // Read click position and the workspace state for this tab_view.
         let result = {
             let Ok(mgr) = wm.try_borrow() else {
-                tracing::warn!("setup-menu: workspace_manager borrow failed");
+                tracing::debug!("setup-menu: workspace_manager borrow failed");
                 return;
             };
             let (x, y) = mgr.last_tab_click;
-            tracing::info!("setup-menu: click pos ({x},{y}), {} workspaces", mgr.workspaces.len());
+            tracing::debug!("setup-menu: click pos ({x},{y}), {} workspaces", mgr.workspaces.len());
             // Find the workspace that owns this tab_view.
             let Some(ws) = mgr.workspaces.iter().find(|ws| ws.tab_view == *tv) else {
-                tracing::warn!("setup-menu: no workspace found for this tab_view");
+                tracing::debug!("setup-menu: no workspace found for this tab_view");
                 return;
             };
             (
@@ -6160,7 +6156,7 @@ fn wire_tab_context_menu_signal(
         };
         let (x, y, tab_states, focus_tracker, custom_titles, tab_colors, tab_id_map) = result;
 
-        tracing::info!("setup-menu: showing context menu at ({x},{y})");
+        tracing::debug!("setup-menu: showing context menu at ({x},{y})");
         // Mark as handled so the bubble-phase fallback skips this click.
         if let Ok(mut mgr) = wm.try_borrow_mut() {
             mgr.tab_menu_shown = true;
