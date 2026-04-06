@@ -10,7 +10,7 @@
 
 **Please do not report security vulnerabilities through public GitHub issues.**
 
-Instead, please email security@forgetty.dev with:
+Instead, please use [GitHub Security Advisories](https://github.com/vikgmdev/forgetty/security/advisories/new) to report vulnerabilities privately. Include:
 
 - Description of the vulnerability
 - Steps to reproduce

@@ -147,7 +147,7 @@ Custom keybindings using GTK4 accelerator format.
 
 ```toml
 [keybindings]
-# Not yet applied at runtime — planned for the keybindings editor (T-037).
+# Custom keybindings are not yet supported. Planned for a future release.
 # Default shortcuts are listed in the README and viewable via F1 in-app.
 ```
 

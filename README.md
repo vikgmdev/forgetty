@@ -16,8 +16,13 @@
 </p>
 
 <p align="center">
-  [SCREENSHOT: Forgetty with multiple tabs, split panes, Catppuccin Mocha theme, showing code + terminal output]
+  <em>Screenshots coming soon — see <a href="CHANGELOG.md">CHANGELOG.md</a> for what's shipped.</em>
 </p>
+
+> **Warning**
+> Forgetty is under active development by a solo developer. It is **not stable**
+> — APIs, config format, and behavior may change between releases without notice.
+> Use it, break it, file issues — but don't rely on it for production workflows yet.
 
 Forgetty is a terminal emulator for Linux built on
 [Ghostty](https://ghostty.org/)'s VT engine ([libghostty-vt](https://github.com/ghostty-org/ghostty))
@@ -37,15 +42,11 @@ Subpixel antialiasing, Fontconfig font discovery, full IME support. Powered by
 libghostty-vt: SIMD-optimized VT parsing, Kitty keyboard protocol, Unicode
 grapheme clustering, text reflow. No compromises on terminal correctness.
 
-[SCREENSHOT: Side-by-side Forgetty vs Ghostty rendering the same content — identical text quality]
-
 ### Tabs and split panes
 
 Tabs with CWD-based titles that update automatically. Horizontal and vertical
 splits with independent shells. Navigate panes with `Alt+Arrow`. Each pane has
 its own scrollback, search state, zoom level, and cursor.
-
-[SCREENSHOT: Split panes with different content in each, tab bar visible]
 
 ### 486 color themes with live preview
 
@@ -54,8 +55,6 @@ from [iTerm2-Color-Schemes](https://github.com/mbadolato/iTerm2-Color-Schemes)
 are bundled, plus you can drop your own into `~/.config/forgetty/themes/`. Arrow
 keys cycle through themes with live preview on your actual terminal content —
 Enter to keep, Escape to revert.
-
-[SCREENSHOT: Theme browser sidebar open, showing color swatches and live preview]
 
 ### Session persistence
 
@@ -75,8 +74,6 @@ restarts just like sessions.
 count. Enter/Shift+Enter navigate forward and backward with wrap-around.
 Viewport auto-scrolls to center each match.
 
-[SCREENSHOT: Search bar with "N of M" match count, highlighted matches in terminal]
-
 ### AI-native integrations
 
 For developers working with AI coding agents daily:
@@ -87,10 +84,6 @@ For developers working with AI coding agents daily:
 - **Smart clipboard** — strips box-drawing characters, trailing whitespace, and
   normalizes line endings automatically. Copy from Claude Code or any TUI app
   and paste clean text.
-- **Embedded markdown/image viewer** — preview markdown files and images inline,
-  with a file watcher that auto-refreshes on save.
-- **Screenshot paste** — paste clipboard images directly into the terminal for
-  AI agents that accept them.
 - **Socket API** — JSON-RPC over Unix socket. Automate Forgetty from scripts,
   editors, or AI agents — create tabs, send input, read output, manage
   workspaces programmatically.
@@ -196,7 +189,7 @@ Or use the appearance sidebar (`Ctrl+,`) to change theme, font, and size with li
 ### Build
 
 ```sh
-git clone https://github.com/vikgmdev/forgetty.git
+git clone --recursive https://github.com/vikgmdev/forgetty.git
 cd forgetty
 cargo build --release
 cargo run --release
@@ -212,11 +205,25 @@ cargo test --workspace
 
 ## Architecture
 
+**Daemon-first design:** Each Forgetty window runs its own `forgetty-daemon`
+process that owns all PTYs and session state. The GTK window is a stateless
+renderer that communicates via JSON-RPC over a Unix socket. This means:
+
+- **Closing the window doesn't kill your processes** — the daemon keeps them alive
+- **Sessions persist** in `~/.local/share/forgetty/sessions/` and restore automatically on next launch
+- **Multi-window** — each window is fully independent with its own daemon, socket, and session file
+- **Future-proof** — Android, Windows, and web clients can connect to a desktop daemon as remote renderers
+
+**Thin shell + thick core:** The GTK4 platform shell is ~1,300 lines. The
+shared Rust core is ~10,000+ lines (~70% of the code) and is
+platform-independent. When we add Windows or Android, we write a new thin
+shell — the core stays the same.
+
 ```
 ┌──────────────────────────────────────────────────────┐
 │  Platform Shell (THIN — native per platform)          │
 │  Linux:   GTK4 + libadwaita (gtk4-rs)    ← current   │
-│  Windows: winit + DirectWrite            ← planned    │
+│  Windows: native shell                   ← planned    │
 │  Android: Jetpack Compose + Rust JNI     ← planned    │
 ├──────────────────────────────────────────────────────┤
 │  Shared Rust Core (THICK — platform-independent)      │
@@ -235,21 +242,17 @@ cargo test --workspace
 └──────────────────────────────────────────────────────┘
 ```
 
-**Design principle:** thin native shell per platform (~1,300 lines), thick
-shared Rust core (~10,000+ lines, ~70% of code). When we add Windows or
-Android, we write a new thin shell — the core stays the same.
+The decision to use GTK4 instead of wgpu came from learning (the hard way) that
+GPU-rendered text can never match native Linux quality — no subpixel
+antialiasing, no Fontconfig, no IME. Pivoting to GTK4 + Pango gave us rendering
+identical to Ghostty on day one.
+
+See `docs/architecture/ARCHITECTURE_DECISIONS.md` for the full design rationale.
 
 ## Roadmap
 
 **Next:** Windows + WSL support, Android companion app, cross-device sync,
 web version. See the roadmap in [CONTRIBUTING.md](CONTRIBUTING.md) for the full plan.
-
-## Architecture
-
-The architecture decision to use GTK4 instead of wgpu came from learning (the
-hard way) that GPU-rendered text can never match native Linux quality — no
-subpixel antialiasing, no Fontconfig, no IME. Pivoting to GTK4 + Pango gave us
-rendering identical to Ghostty on day one.
 
 ## Contributing
 
@@ -260,6 +263,34 @@ instructions, code style, and the crate map.
 
 [MIT](LICENSE) &copy; 2026 TotemLabsForge, LLC
 
+## The story
+
+Forgetty is built by one person — [Victor Garcia](https://github.com/vikgmdev),
+a self-taught engineer with 10+ years of experience across backend, blockchain,
+infrastructure, and security. No company, no funding, no team. Just a developer
+who got tired of losing his terminal layout every time he closed a window.
+
+The project started in early 2026, born from a simple frustration: every
+terminal emulator treats sessions as disposable. Close the window, lose your
+work. I wanted a terminal that *remembers* — tabs, splits, working directories,
+scroll position — all restored exactly where I left off. And I wanted it to feel
+native on Linux, not an Electron wrapper or a GPU experiment.
+
+I'd never written Rust before this project. I used
+[Claude Code](https://claude.ai/claude-code) as a force multiplier — an AI
+coding agent that let me move at 10x speed in a language I was learning as I
+built. The entire codebase, from the daemon architecture to the GTK4 renderer to
+the 486-theme browser, was built this way: one developer + one AI, shipping a
+feature-complete terminal in weeks instead of months.
+
+Forgetty is the terminal I wanted to exist. If you work with AI coding agents
+daily — running Claude Code, Copilot, or Cursor in split panes for hours — you
+need a terminal that's built for that workflow. That's what this is.
+
+No venture capital. No growth metrics. Just a tool that works.
+
+**Follow the journey:** [@vikgmdev](https://twitter.com/vikgmdev)
+
 ## Acknowledgments
 
 - **[Ghostty](https://ghostty.org/)** by [Mitchell Hashimoto](https://github.com/mitchellh)
@@ -268,7 +299,8 @@ instructions, code style, and the crate map.
 - **[iTerm2-Color-Schemes](https://github.com/mbadolato/iTerm2-Color-Schemes)**
   — 485 of our 486 bundled themes come from this collection.
 - **[Claude Code](https://claude.ai/claude-code)** by
-  [Anthropic](https://anthropic.com) — the AI coding agent that built Forgetty.
+  [Anthropic](https://anthropic.com) — the AI coding agent that made it possible
+  for a solo developer to build a full terminal emulator in Rust.
 - **GTK4, libadwaita, Pango, FreeType** — the GNOME platform that gives
   Forgetty its native rendering quality.
 - **The Rust ecosystem** — gtk4-rs, portable-pty, serde, toml, clap, and the

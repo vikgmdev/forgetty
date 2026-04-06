@@ -95,61 +95,12 @@ cargo build --release
 
 The binary is at `target/release/forgetty`.
 
-## macOS
+## macOS / Windows
 
-### System Dependencies
-
-Install Xcode command-line tools:
-
-```sh
-xcode-select --install
-```
-
-No additional libraries are needed; macOS provides the required frameworks
-(Metal, CoreText, AppKit) out of the box.
-
-### Build
-
-```sh
-git clone --recursive https://github.com/vikgmdev/forgetty.git
-cd forgetty
-cargo build --release
-```
-
-The binary is at `target/release/forgetty`.
-
-Both `x86_64-apple-darwin` and `aarch64-apple-darwin` (Apple Silicon) are
-supported. Cargo builds for the host architecture by default. To cross-compile:
-
-```sh
-rustup target add aarch64-apple-darwin
-cargo build --release --target aarch64-apple-darwin
-```
-
-## Windows
-
-### System Dependencies
-
-Install [Visual Studio Build Tools 2022](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
-with the "Desktop development with C++" workload.
-
-Zig can be installed via:
-
-```powershell
-winget install zig.zig
-```
-
-Or download directly from [ziglang.org/download](https://ziglang.org/download/).
-
-### Build
-
-```powershell
-git clone --recursive https://github.com/vikgmdev/forgetty.git
-cd forgetty
-cargo build --release
-```
-
-The binary is at `target\release\forgetty.exe`.
+> **Note:** Forgetty is developed and tested on Linux. macOS and Windows
+> platform shells are on the roadmap but are not currently supported. The shared
+> Rust core compiles cross-platform, but the GTK4 shell targets Linux only.
+> See `docs/PLATFORMS.md` for the full platform plan.
 
 ## Android (cross-compiling forgetty-vt)
 
@@ -245,8 +196,8 @@ The build will fail at the linking stage if system libraries are missing. The
 error message usually indicates which `-l` flag failed. Install the
 corresponding `-dev` / `-devel` package.
 
-### GPU driver issues
+### Display server
 
-Forgetty requires a GPU driver that supports at least one of: Vulkan, Metal,
-or DirectX 12. On Linux, ensure your Vulkan ICD is installed (e.g.,
-`mesa-vulkan-drivers` on Debian/Ubuntu).
+Forgetty uses GTK4 for rendering (CPU-based text via Pango/FreeType). No GPU
+drivers are required. Both Wayland and X11 are supported — GTK4 auto-detects
+the display server at runtime.

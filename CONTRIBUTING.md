@@ -70,7 +70,7 @@ forgetty/
 │   ├── forgetty-watcher/   # Filesystem watcher for config hot reload
 │   ├── forgetty-workspace/ # Session save/restore, workspace persistence
 │   ├── forgetty-socket/    # JSON-RPC 2.0 over Unix socket
-│   ├── forgetty-viewer/    # Embedded content viewer (markdown, images)
+│   ├── forgetty-viewer/    # Embedded content viewer (planned, not yet active)
 │   └── forgetty-renderer/  # Legacy wgpu renderer (inactive, pre-GTK4)
 ├── resources/themes/       # 486 bundled theme TOML files
 ├── assets/icons/           # App icon (SVG)
