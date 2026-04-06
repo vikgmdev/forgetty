@@ -5108,6 +5108,9 @@ fn paste_clipboard(
         });
 
         dialog.present();
+        if let Some(btn) = dialog.default_widget() {
+            btn.grab_focus();
+        }
     });
 }
 
