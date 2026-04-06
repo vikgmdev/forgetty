@@ -431,3 +431,50 @@ The minimal receiver window needs: `adw::TabBar` + `adw::TabView` + `close-page`
 ### Key insight
 
 `GhosttyStyle` exposes unresolved color tags (`None`, `Palette(u8)`, `Rgb`). Using `style.fg_color`/`style.bg_color` instead of the pre-resolved `FG_COLOR`/`BG_COLOR` FFI queries lets Forgetty own the palette-to-RGB mapping and apply the theme's colors. The pre-resolved queries are a convenience but bypass theme customization.
+
+---
+
+## BUG-010: Full-block foreground glyphs (█) show per-cell grid seams
+
+**Platforms affected:** Linux (GTK4)
+**Severity:** Medium — progress bars and solid-fill regions using U+2588 FULL BLOCK look "gridded" instead of solid
+**Status:** Fixed (T-M1-extra-009b)
+
+### Symptoms
+
+- `ollama pull` progress bars render as a grid of white squares rather than a solid white bar
+- Any TUI application that uses `█` for solid fills shows visible 1px seams at each cell boundary
+
+### Root cause
+
+BUG-006 fixed the background pass (Pass 1) with run-length merging for `Color::Rgb` cells. But `█` (U+2588 FULL BLOCK) is a **foreground** character — it goes through the Pass 2 glyph loop, which called `pangocairo::functions::show_layout()` once per cell. Pango antialiases each glyph independently; adjacent `█` glyphs each get their own sub-pixel rendering at their edges, leaving a faint 1px seam between cells.
+
+### Fix
+
+Converted the Pass 2 `for` loop in `draw_terminal` to a `while` loop with run-length encoding for `█` cells:
+
+```rust
+if grapheme == "█" {
+    let fg_val = cell.attrs.fg;
+    let dim = cell.attrs.dim;
+    let run_start = col;
+    col += 1;
+    while col < num {
+        let next = &cells[col];
+        if next.grapheme == "█" && next.attrs.fg == fg_val && next.attrs.dim == dim {
+            col += 1;
+        } else {
+            break;
+        }
+    }
+    // Draw the entire run as one rectangle — no interior edges, no seam.
+    ctx.set_source_rgb(...);
+    ctx.rectangle(run_start as f64 * cell_w, y, (col - run_start) as f64 * cell_w, cell_h);
+    ctx.fill().ok();
+    continue;
+}
+```
+
+### Key insight
+
+Same root cause and same fix as BUG-006: one `ctx.fill()` per run makes interior cell boundaries invisible to Cairo's anti-aliaser. The distinction is that BUG-006 fixed **background** colors (Pass 1) while this fixes **foreground full-block characters** (Pass 2). Any character that visually covers 100% of a cell should be drawn as a filled rectangle, not a glyph.

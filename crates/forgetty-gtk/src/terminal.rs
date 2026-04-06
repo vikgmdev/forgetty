@@ -3589,54 +3589,99 @@ fn draw_terminal(
         }
 
         // --- Pass 2: foreground (text, underline, strikethrough) ---
-        for col in 0..num {
-            let x = col as f64 * cell_w;
-            let cell = &cells[col];
+        //
+        // Full-block characters (█ U+2588) are merged into runs and drawn as
+        // filled rectangles — identical technique to Pass 1 — to avoid
+        // per-glyph sub-pixel anti-aliasing seams at cell boundaries.
+        {
+            let mut col = 0;
+            while col < num {
+                let cell = &cells[col];
+                let grapheme = &cell.grapheme;
 
-            // Skip empty/space cells — background already drawn in pass 1
-            let grapheme = &cell.grapheme;
-            if grapheme == " " || grapheme.is_empty() {
-                continue;
-            }
+                // Skip empty/space cells — background already drawn in pass 1
+                if grapheme == " " || grapheme.is_empty() {
+                    col += 1;
+                    continue;
+                }
 
-            // Compute foreground color
-            let (fr, fg_g, fb) = color_to_rgb(&cell.attrs.fg, &fg_color);
+                // Full-block character: merge consecutive same-color run into a
+                // single rectangle so Cairo treats shared edges as interior —
+                // no anti-aliasing applied, no seam.
+                if grapheme == "█" {
+                    let fg_val = cell.attrs.fg;
+                    let dim = cell.attrs.dim;
+                    let run_start = col;
+                    col += 1;
+                    while col < num {
+                        let next = &cells[col];
+                        if next.grapheme == "█"
+                            && next.attrs.fg == fg_val
+                            && next.attrs.dim == dim
+                        {
+                            col += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    let (fr, fg_g, fb) = color_to_rgb(&fg_val, &fg_color);
+                    let (fr, fg_g, fb) =
+                        if dim { (fr * 0.5, fg_g * 0.5, fb * 0.5) } else { (fr, fg_g, fb) };
+                    ctx.set_source_rgb(fr, fg_g, fb);
+                    ctx.rectangle(
+                        run_start as f64 * cell_w,
+                        y,
+                        (col - run_start) as f64 * cell_w,
+                        cell_h,
+                    );
+                    ctx.fill().ok();
+                    continue;
+                }
 
-            // Apply dim attribute (reduce intensity by 50%)
-            let (fr, fg_g, fb) =
-                if cell.attrs.dim { (fr * 0.5, fg_g * 0.5, fb * 0.5) } else { (fr, fg_g, fb) };
+                // Regular character: render as glyph
+                let x = col as f64 * cell_w;
 
-            ctx.set_source_rgb(fr, fg_g, fb);
+                // Compute foreground color
+                let (fr, fg_g, fb) = color_to_rgb(&cell.attrs.fg, &fg_color);
 
-            // Pick the pre-built font variant for this cell
-            let cell_font = match (cell.attrs.bold, cell.attrs.italic) {
-                (true, true) => &font_bold_italic,
-                (true, false) => &font_bold,
-                (false, true) => &font_italic,
-                (false, false) => &font_desc,
-            };
+                // Apply dim attribute (reduce intensity by 50%)
+                let (fr, fg_g, fb) =
+                    if cell.attrs.dim { (fr * 0.5, fg_g * 0.5, fb * 0.5) } else { (fr, fg_g, fb) };
 
-            layout.set_font_description(Some(cell_font));
-            layout.set_text(grapheme);
+                ctx.set_source_rgb(fr, fg_g, fb);
 
-            // Render text
-            ctx.move_to(x, y);
-            pangocairo::functions::show_layout(ctx, &layout);
+                // Pick the pre-built font variant for this cell
+                let cell_font = match (cell.attrs.bold, cell.attrs.italic) {
+                    (true, true) => &font_bold_italic,
+                    (true, false) => &font_bold,
+                    (false, true) => &font_italic,
+                    (false, false) => &font_desc,
+                };
 
-            // Underline
-            if cell.attrs.underline {
-                ctx.set_line_width(1.0);
-                ctx.move_to(x, y + cell_h - 1.0);
-                ctx.line_to(x + cell_w, y + cell_h - 1.0);
-                ctx.stroke().ok();
-            }
+                layout.set_font_description(Some(cell_font));
+                layout.set_text(grapheme);
 
-            // Strikethrough
-            if cell.attrs.strikethrough {
-                ctx.set_line_width(1.0);
-                ctx.move_to(x, y + cell_h / 2.0);
-                ctx.line_to(x + cell_w, y + cell_h / 2.0);
-                ctx.stroke().ok();
+                // Render text
+                ctx.move_to(x, y);
+                pangocairo::functions::show_layout(ctx, &layout);
+
+                // Underline
+                if cell.attrs.underline {
+                    ctx.set_line_width(1.0);
+                    ctx.move_to(x, y + cell_h - 1.0);
+                    ctx.line_to(x + cell_w, y + cell_h - 1.0);
+                    ctx.stroke().ok();
+                }
+
+                // Strikethrough
+                if cell.attrs.strikethrough {
+                    ctx.set_line_width(1.0);
+                    ctx.move_to(x, y + cell_h / 2.0);
+                    ctx.line_to(x + cell_w, y + cell_h / 2.0);
+                    ctx.stroke().ok();
+                }
+
+                col += 1;
             }
         }
     }
