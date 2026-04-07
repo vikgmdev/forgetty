@@ -115,9 +115,15 @@ pub mod methods {
     pub const CLOSE_PANE: &str = "close_pane";
     // Workspace management (T-067).
     pub const CREATE_WORKSPACE: &str = "create_workspace";
-    // Daemon lifecycle (T-070, T-072).
+    // Split ratio sync (B-002).
+    pub const UPDATE_SPLIT_RATIOS: &str = "update_split_ratios";
+    // Pinned sessions (B-002).
+    pub const SET_PINNED: &str = "set_pinned";
+    pub const GET_PINNED: &str = "get_pinned";
+    // Daemon lifecycle (T-070, T-072, B-002).
     pub const SHUTDOWN: &str = "shutdown"; // permanent close: exit immediately, no save
     pub const SHUTDOWN_SAVE: &str = "shutdown_save"; // normal close: save session then exit
+    pub const SHUTDOWN_CLEAN: &str = "shutdown_clean"; // browser close: save → trash → exit
 }
 
 #[cfg(test)]

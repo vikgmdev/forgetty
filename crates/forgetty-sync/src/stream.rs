@@ -347,11 +347,9 @@ pub async fn handle_stream_connection(
     if !is_authorized {
         warn!("stream: rejected unauthorized device {device_id}");
         if let Ok(mut send) = conn.open_uni().await {
-            let _ = write_msg(
-                &mut send,
-                &DaemonMsg::Error { message: "not_authorized".to_string() },
-            )
-            .await;
+            let _ =
+                write_msg(&mut send, &DaemonMsg::Error { message: "not_authorized".to_string() })
+                    .await;
             let _ = send.finish();
         }
         conn.close(1u8.into(), b"not-authorized");

@@ -494,6 +494,41 @@ async fn handle_streaming_connection(
             std::process::exit(0);
         }
 
+        if request.method == methods::SHUTDOWN_CLEAN {
+            // Browser-model close: save session, move to trash, then exit.
+            let resp = Response::success(request.id, serde_json::json!({ "ok": true }));
+            write_response(&mut writer, &resp).await?;
+            info!("Received shutdown_clean RPC — saving, trashing, and exiting");
+            let saved = crate::handlers::save_all_snapshots(&sm);
+            info!("shutdown_clean: saved {saved} VT snapshot(s)");
+            if let Some(sid) = session_id {
+                // Check if pinned — pinned sessions do NOT get trashed.
+                let is_pinned = sm.is_pinned();
+                if is_pinned {
+                    // Pinned: just save the session file (no trash).
+                    let state = sm.snapshot_to_workspace_state();
+                    match forgetty_workspace::save_session_for(sid, &state) {
+                        Ok(()) => info!("shutdown_clean: pinned session {sid} saved"),
+                        Err(e) => warn!("shutdown_clean: failed to save session: {e}"),
+                    }
+                } else {
+                    // Unpinned: save then move to trash.
+                    let state = sm.snapshot_to_workspace_state();
+                    match forgetty_workspace::save_session_for(sid, &state) {
+                        Ok(()) => {
+                            info!("shutdown_clean: session {sid} saved");
+                            match forgetty_workspace::trash_session_for(sid) {
+                                Ok(()) => info!("shutdown_clean: session {sid} moved to trash"),
+                                Err(e) => warn!("shutdown_clean: trash failed: {e}"),
+                            }
+                        }
+                        Err(e) => warn!("shutdown_clean: failed to save session: {e}"),
+                    }
+                }
+            }
+            std::process::exit(0);
+        }
+
         if request.method == methods::SHUTDOWN {
             // Acknowledge before exiting so the client doesn't see a broken pipe.
             let resp = Response::success(request.id, serde_json::json!({ "ok": true }));

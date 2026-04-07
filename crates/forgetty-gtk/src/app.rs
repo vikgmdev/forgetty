@@ -118,6 +118,10 @@ struct WorkspaceView {
     tab_id_map: TabIdMap,
     /// Per-tab color indicators (from right-click context menu).
     tab_colors: TabColorMap,
+    /// User-chosen accent color for this workspace's sidebar card (GTK-side only, not persisted).
+    color: Option<gtk4::gdk::RGBA>,
+    /// CSS provider for per-row color override (reused across sidebar refreshes).
+    color_css_provider: Option<gtk4::CssProvider>,
 }
 
 /// Shared state tracking all workspaces and which is active.
@@ -717,7 +721,14 @@ fn build_ui(
     split_section.append_submenu(Some("Split"), &split_submenu);
     menu.append_section(None, &split_section);
 
-    // Section 5 -- Terminal operations
+    // Section 5 -- Session management
+    let session_section = gio::Menu::new();
+    session_section.append(Some("Pin Session"), Some("win.toggle-pin-session"));
+    session_section
+        .append(Some("Restore Previous Session\u{2026}"), Some("win.restore-previous-session"));
+    menu.append_section(None, &session_section);
+
+    // Section 6 -- Terminal operations
     let terminal_section = gio::Menu::new();
     terminal_section.append(Some("Clear"), Some("win.clear"));
     terminal_section.append(Some("Reset"), Some("win.reset"));
@@ -867,6 +878,8 @@ fn build_ui(
             custom_titles: Rc::clone(&initial_custom_titles),
             tab_id_map: Rc::clone(&initial_tab_id_map),
             tab_colors: Rc::clone(&initial_tab_colors),
+            color: None,
+            color_css_provider: None,
         }],
         active_index: 0,
         last_tab_click: (0.0, 0.0),
@@ -972,8 +985,14 @@ fn build_ui(
     // --- Workspace sidebar (left panel, pushes main_area right) ---
     // Built after workspace_manager is ready. The revealer is prepended to
     // terminal_row so it physically displaces main_area rather than floating.
-    let (workspace_sidebar_revealer, workspace_sidebar_lb) =
-        build_workspace_sidebar(&workspace_manager, &main_area, &tab_bar, &window);
+    let (workspace_sidebar_revealer, workspace_sidebar_lb) = build_workspace_sidebar(
+        &workspace_manager,
+        &main_area,
+        &tab_bar,
+        &window,
+        &daemon_client,
+        &shared_config,
+    );
     terminal_row.prepend(&workspace_sidebar_revealer);
 
     // Click-outside-to-close: a GestureClick on the overlay detects clicks
@@ -1544,6 +1563,49 @@ fn build_ui(
         window.add_action(&action);
     }
 
+    // --- Pin Session toggle (B-002 Part 4) ---
+    // Pin icon in the header bar, updated by the action handler.
+    let pin_icon = gtk4::Image::from_icon_name("view-pin-symbolic");
+    pin_icon.set_visible(false);
+    pin_icon.set_tooltip_text(Some("Session is pinned"));
+    header.pack_end(&pin_icon);
+
+    {
+        let dc_pin = daemon_client.clone();
+        let pin_icon_toggle = pin_icon.clone();
+        let action = gio::SimpleAction::new("toggle-pin-session", None);
+        action.connect_activate(move |_action, _param| {
+            let Some(ref dc) = dc_pin else {
+                return;
+            };
+            let current = dc.get_pinned().unwrap_or(false);
+            let new_val = !current;
+            if let Err(e) = dc.set_pinned(new_val) {
+                tracing::warn!("toggle-pin-session: {e}");
+                return;
+            }
+            pin_icon_toggle.set_visible(new_val);
+        });
+        window.add_action(&action);
+    }
+
+    // Initialize pin icon from daemon state if connected.
+    if let Some(ref dc) = daemon_client {
+        if dc.get_pinned().unwrap_or(false) {
+            pin_icon.set_visible(true);
+        }
+    }
+
+    // --- Restore Previous Session dialog (B-002 Part 3) ---
+    {
+        let win_restore = window.clone();
+        let action = gio::SimpleAction::new("restore-previous-session", None);
+        action.connect_activate(move |_action, _param| {
+            show_restore_session_dialog(&win_restore);
+        });
+        window.add_action(&action);
+    }
+
     // --- Close Tab action (menu only) ---
     {
         let wm_close_tab = Rc::clone(&workspace_manager);
@@ -1739,9 +1801,23 @@ fn build_ui(
             if dc_quit.is_none() {
                 kill_all_workspace_ptys(&wm_quit, "Quit action");
             }
-            // Daemon mode: tell daemon to save and exit cleanly.
+            // Daemon mode: push split ratios then close.
             if let Some(ref dc) = dc_quit {
-                dc.shutdown_save();
+                if let Ok(mgr) = wm_quit.try_borrow() {
+                    let mut all_ratios = Vec::new();
+                    for ws in &mgr.workspaces {
+                        all_ratios.extend(collect_split_ratios(ws));
+                    }
+                    if !all_ratios.is_empty() {
+                        let _ = dc.update_split_ratios(&all_ratios);
+                    }
+                }
+                let is_pinned = dc.get_pinned().unwrap_or(false);
+                if is_pinned {
+                    dc.shutdown_save();
+                } else {
+                    dc.shutdown_clean();
+                }
             }
             app_quit.quit();
         });
@@ -1794,6 +1870,8 @@ fn build_ui(
         let tab_bar_del = tab_bar.clone();
         let win_del = window.clone();
         let lb_del = workspace_sidebar_lb.clone();
+        let dc_del = daemon_client.clone();
+        let sc_del = Rc::clone(&shared_config);
         let delete_action = gio::SimpleAction::new("delete-workspace", None);
         {
             // Disable if only one workspace
@@ -1803,7 +1881,15 @@ fn build_ui(
         }
         delete_action.connect_activate(move |_action, _param| {
             delete_current_workspace(&wm_delete, &main_area_del, &tab_bar_del, &win_del);
-            refresh_workspace_sidebar(&lb_del, &wm_delete);
+            refresh_workspace_sidebar(
+                &lb_del,
+                &wm_delete,
+                &main_area_del,
+                &tab_bar_del,
+                &win_del,
+                &dc_del,
+                &sc_del,
+            );
         });
         window.add_action(&delete_action);
     }
@@ -1815,12 +1901,22 @@ fn build_ui(
         let tab_bar_sw = tab_bar.clone();
         let win_sw = window.clone();
         let lb_sw = workspace_sidebar_lb.clone();
+        let dc_sw = daemon_client.clone();
+        let sc_sw = Rc::clone(&shared_config);
         let action_name = format!("switch-workspace-{i}");
         let action = gio::SimpleAction::new(&action_name, None);
         action.connect_activate(move |_action, _param| {
             let target = (i - 1) as usize;
             switch_workspace(&wm_switch, target, &main_area_sw, &tab_bar_sw, &win_sw);
-            refresh_workspace_sidebar(&lb_sw, &wm_switch);
+            refresh_workspace_sidebar(
+                &lb_sw,
+                &wm_switch,
+                &main_area_sw,
+                &tab_bar_sw,
+                &win_sw,
+                &dc_sw,
+                &sc_sw,
+            );
         });
         window.add_action(&action);
         app.set_accels_for_action(&format!("win.switch-workspace-{i}"), &[&format!("<Alt>{i}")]);
@@ -1833,6 +1929,8 @@ fn build_ui(
         let tab_bar_prev = tab_bar.clone();
         let win_prev = window.clone();
         let lb_prev = workspace_sidebar_lb.clone();
+        let dc_prev = daemon_client.clone();
+        let sc_prev = Rc::clone(&shared_config);
         let action = gio::SimpleAction::new("prev-workspace", None);
         action.connect_activate(move |_action, _param| {
             let Ok(mgr) = wm_prev.try_borrow() else {
@@ -1845,7 +1943,15 @@ fn build_ui(
             let target = if mgr.active_index == 0 { count - 1 } else { mgr.active_index - 1 };
             drop(mgr);
             switch_workspace(&wm_prev, target, &main_area_prev, &tab_bar_prev, &win_prev);
-            refresh_workspace_sidebar(&lb_prev, &wm_prev);
+            refresh_workspace_sidebar(
+                &lb_prev,
+                &wm_prev,
+                &main_area_prev,
+                &tab_bar_prev,
+                &win_prev,
+                &dc_prev,
+                &sc_prev,
+            );
         });
         window.add_action(&action);
     }
@@ -1859,6 +1965,8 @@ fn build_ui(
         let tab_bar_next = tab_bar.clone();
         let win_next = window.clone();
         let lb_next = workspace_sidebar_lb.clone();
+        let dc_next = daemon_client.clone();
+        let sc_next = Rc::clone(&shared_config);
         let action = gio::SimpleAction::new("next-workspace", None);
         action.connect_activate(move |_action, _param| {
             let Ok(mgr) = wm_next.try_borrow() else {
@@ -1871,7 +1979,15 @@ fn build_ui(
             let target = (mgr.active_index + 1) % count;
             drop(mgr);
             switch_workspace(&wm_next, target, &main_area_next, &tab_bar_next, &win_next);
-            refresh_workspace_sidebar(&lb_next, &wm_next);
+            refresh_workspace_sidebar(
+                &lb_next,
+                &wm_next,
+                &main_area_next,
+                &tab_bar_next,
+                &win_next,
+                &dc_next,
+                &sc_next,
+            );
         });
         window.add_action(&action);
     }
@@ -1883,13 +1999,26 @@ fn build_ui(
         let sidebar_revealer_ref = workspace_sidebar_revealer.clone();
         let lb_ref = workspace_sidebar_lb.clone();
         let wm_sidebar = Rc::clone(&workspace_manager);
+        let ma_sidebar = main_area.clone();
+        let tb_sidebar = tab_bar.clone();
+        let win_sidebar = window.clone();
+        let dc_sidebar = daemon_client.clone();
+        let sc_sidebar = Rc::clone(&shared_config);
         let action = gio::SimpleAction::new("toggle-workspace-sidebar", None);
         action.connect_activate(move |_action, _param| {
             let currently_revealed = sidebar_revealer_ref.reveals_child();
             sidebar_revealer_ref.set_reveal_child(!currently_revealed);
             if !currently_revealed {
                 // Sidebar just opened — refresh rows.
-                refresh_workspace_sidebar(&lb_ref, &wm_sidebar);
+                refresh_workspace_sidebar(
+                    &lb_ref,
+                    &wm_sidebar,
+                    &ma_sidebar,
+                    &tb_sidebar,
+                    &win_sidebar,
+                    &dc_sidebar,
+                    &sc_sidebar,
+                );
             }
         });
         window.add_action(&action);
@@ -2071,10 +2200,27 @@ fn build_ui(
                 // Self-contained mode only: also kill PTYs.
                 kill_all_workspace_ptys(&wm_close, "Window close request");
             }
-            // Daemon mode: tell the daemon to save and exit so it doesn't
-            // linger as an orphan process after the GTK window closes.
+            // Daemon mode: push split ratios then tell daemon to close.
             if let Some(ref dc) = dc_window_close {
-                dc.shutdown_save();
+                // Push actual widget-measured split ratios to daemon before save.
+                if let Ok(mgr) = wm_close.try_borrow() {
+                    let mut all_ratios = Vec::new();
+                    for ws in &mgr.workspaces {
+                        all_ratios.extend(collect_split_ratios(ws));
+                    }
+                    if !all_ratios.is_empty() {
+                        let _ = dc.update_split_ratios(&all_ratios);
+                    }
+                }
+                // Pinned sessions save-and-stay; unpinned sessions trash.
+                let is_pinned = dc.get_pinned().unwrap_or(false);
+                if is_pinned {
+                    dc.shutdown_save();
+                } else {
+                    dc.shutdown_clean();
+                    // Send undo-close notification (Linux only).
+                    send_undo_close_notification(session_id);
+                }
             }
             glib::Propagation::Proceed
         });
@@ -2105,9 +2251,23 @@ fn build_ui(
                     // Self-contained mode only: also kill PTYs.
                     kill_all_workspace_ptys(&wm_signal, name);
                 }
-                // Daemon mode: tell daemon to save and exit cleanly.
+                // Daemon mode: push split ratios then close.
                 if let Some(ref dc) = dc_signal {
-                    dc.shutdown_save();
+                    if let Ok(mgr) = wm_signal.try_borrow() {
+                        let mut all_ratios = Vec::new();
+                        for ws in &mgr.workspaces {
+                            all_ratios.extend(collect_split_ratios(ws));
+                        }
+                        if !all_ratios.is_empty() {
+                            let _ = dc.update_split_ratios(&all_ratios);
+                        }
+                    }
+                    let is_pinned = dc.get_pinned().unwrap_or(false);
+                    if is_pinned {
+                        dc.shutdown_save();
+                    } else {
+                        dc.shutdown_clean();
+                    }
                 }
                 app_signal.quit();
                 glib::ControlFlow::Break
@@ -2290,6 +2450,70 @@ fn build_ui(
 // ---------------------------------------------------------------------------
 
 /// Return $HOME or "/" as a fallback directory.
+/// Send a desktop notification after a session is trashed.
+///
+/// Includes an "Undo" action. If the user clicks it within 30 seconds,
+/// a new `forgetty --restore-session` process is spawned.
+///
+/// The notification is sent before the GTK process exits. The undo action
+/// handler runs in a forked child process because `NotificationHandle` is
+/// not `Send` and the GTK main loop is shutting down.
+#[cfg(target_os = "linux")]
+fn send_undo_close_notification(session_id: uuid::Uuid) {
+    let current_exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("send_undo_close_notification: cannot find exe: {e}");
+            return;
+        }
+    };
+
+    // Fork a short-lived child process to own the notification handle.
+    // The child waits for the action click or 30s timeout, then exits.
+    // Using fork() avoids the Send constraint on NotificationHandle.
+    unsafe {
+        let pid = libc::fork();
+        if pid == 0 {
+            // Child process: show notification and wait for action.
+            use notify_rust::Notification;
+
+            let result = Notification::new()
+                .summary("Session closed")
+                .body("Terminal session moved to trash.")
+                .icon("utilities-terminal")
+                .action("undo", "Undo")
+                .timeout(notify_rust::Timeout::Milliseconds(30_000))
+                .show();
+
+            match result {
+                Ok(handle) => {
+                    handle.wait_for_action(|action| {
+                        if action == "undo" || action == "__closed" {
+                            if action == "undo" {
+                                let _ = std::process::Command::new(&current_exe)
+                                    .arg("--restore-session")
+                                    .arg(session_id.to_string())
+                                    .spawn();
+                            }
+                        }
+                    });
+                }
+                Err(_) => {}
+            }
+            // Exit the forked child cleanly.
+            libc::_exit(0);
+        } else if pid < 0 {
+            tracing::warn!("send_undo_close_notification: fork() failed");
+        }
+        // Parent continues to exit normally. Child is orphaned (reparented to init).
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn send_undo_close_notification(_session_id: uuid::Uuid) {
+    // Desktop notifications not implemented for non-Linux platforms.
+}
+
 fn home_dir_fallback() -> PathBuf {
     std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/"))
 }
@@ -2422,6 +2646,88 @@ fn snapshot_pane_tree(widget: &gtk4::Widget, tab_states: &TabStateMap) -> Option
     None
 }
 
+/// Walk all Paned widgets in the workspace and collect `(PaneId, ratio)` pairs.
+///
+/// For each `Paned`, the ratio is `position / total_size`. The `PaneId` is the
+/// daemon pane ID of the leftmost leaf in the Paned's start child, which matches
+/// the convention used by `update_ratio_for_pane` in `SessionManager`.
+fn collect_split_ratios(ws: &WorkspaceView) -> Vec<(forgetty_core::PaneId, f32)> {
+    let mut ratios = Vec::new();
+    let n_pages = ws.tab_view.n_pages();
+    for i in 0..n_pages {
+        let page = ws.tab_view.nth_page(i);
+        let container = page.child();
+        collect_ratios_from_widget(&container, &ws.tab_states, &mut ratios);
+    }
+    ratios
+}
+
+/// Recursively collect split ratios from a widget subtree.
+fn collect_ratios_from_widget(
+    widget: &gtk4::Widget,
+    tab_states: &TabStateMap,
+    out: &mut Vec<(forgetty_core::PaneId, f32)>,
+) {
+    if let Some(paned) = widget.downcast_ref::<gtk4::Paned>() {
+        let size = match paned.orientation() {
+            gtk4::Orientation::Horizontal => paned.width(),
+            _ => paned.height(),
+        };
+        let pos = paned.position();
+        let ratio = if size > 0 { pos as f32 / size as f32 } else { 0.5 };
+
+        // Find the leftmost leaf's daemon pane ID in the start child.
+        if let Some(start) = paned.start_child() {
+            if let Some(pane_id) = leftmost_daemon_pane_id(&start, tab_states) {
+                out.push((pane_id, ratio));
+            }
+            collect_ratios_from_widget(&start, tab_states, out);
+        }
+        if let Some(end) = paned.end_child() {
+            collect_ratios_from_widget(&end, tab_states, out);
+        }
+        return;
+    }
+
+    if let Some(bx) = widget.downcast_ref::<gtk4::Box>() {
+        let mut child = bx.first_child();
+        while let Some(c) = child {
+            collect_ratios_from_widget(&c, tab_states, out);
+            child = c.next_sibling();
+        }
+    }
+}
+
+/// Find the daemon PaneId of the leftmost leaf DrawingArea in a widget subtree.
+fn leftmost_daemon_pane_id(
+    widget: &gtk4::Widget,
+    tab_states: &TabStateMap,
+) -> Option<forgetty_core::PaneId> {
+    if let Some(da) = widget.downcast_ref::<gtk4::DrawingArea>() {
+        let name = da.widget_name().to_string();
+        return tab_states
+            .try_borrow()
+            .ok()
+            .and_then(|states| states.get(&name).cloned())
+            .and_then(|rc| rc.try_borrow().ok().and_then(|s| s.daemon_pane_id));
+    }
+    if let Some(paned) = widget.downcast_ref::<gtk4::Paned>() {
+        if let Some(start) = paned.start_child() {
+            return leftmost_daemon_pane_id(&start, tab_states);
+        }
+    }
+    if let Some(bx) = widget.downcast_ref::<gtk4::Box>() {
+        let mut child = bx.first_child();
+        while let Some(c) = child {
+            if let Some(id) = leftmost_daemon_pane_id(&c, tab_states) {
+                return Some(id);
+            }
+            child = c.next_sibling();
+        }
+    }
+    None
+}
+
 /// Snapshot a single workspace's layout for session persistence.
 fn snapshot_single_workspace(ws: &WorkspaceView) -> Workspace {
     let n_pages = ws.tab_view.n_pages();
@@ -2464,6 +2770,7 @@ fn snapshot_all_workspaces(
         active_workspace: mgr.active_index,
         window_width: Some(window.width()),
         window_height: Some(window.height()),
+        pinned: false,
     }
 }
 
@@ -2734,7 +3041,7 @@ fn build_widgets_from_layout(
             active_ws_info.name
         );
 
-        let (mut created, tab_view_clone) = {
+        let (created, tab_view_clone) = {
             let Ok(mgr) = workspace_manager.try_borrow() else {
                 tracing::warn!("build_widgets_from_layout: failed to borrow workspace_manager");
                 return false;
@@ -2898,6 +3205,8 @@ fn build_widgets_from_layout(
                 custom_titles: new_custom_titles,
                 tab_id_map: new_tab_id_map,
                 tab_colors: Rc::new(RefCell::new(HashMap::new())),
+                color: None,
+                color_css_provider: None,
             });
             tracing::info!(
                 "build_widgets_from_layout: added WorkspaceView {:?} at gtx_idx={}",
@@ -3170,6 +3479,8 @@ fn restore_all_workspaces(
             custom_titles,
             tab_id_map: Rc::new(RefCell::new(HashMap::new())),
             tab_colors: Rc::new(RefCell::new(HashMap::new())),
+            color: None,
+            color_css_provider: None,
         });
     }
 
@@ -7221,6 +7532,113 @@ fn switch_workspace(
     update_window_title_with_workspace(ws_count, &ws_name, workspace_manager, window);
 }
 
+/// Show the "Restore Previous Session" dialog listing trashed sessions.
+///
+/// The dialog contains a listbox with one row per trashed session, showing
+/// workspace names, tab count, and close timestamp. Selecting a row restores
+/// the session from trash and spawns a new window.
+#[allow(deprecated)]
+fn show_restore_session_dialog(window: &adw::ApplicationWindow) {
+    let trashed = forgetty_workspace::list_trashed_sessions_with_info();
+    if trashed.is_empty() {
+        // Show a simple message dialog instead.
+        let dialog = gtk4::MessageDialog::new(
+            Some(window),
+            gtk4::DialogFlags::MODAL | gtk4::DialogFlags::DESTROY_WITH_PARENT,
+            gtk4::MessageType::Info,
+            gtk4::ButtonsType::Ok,
+            "No recently closed sessions found.",
+        );
+        dialog.connect_response(|d, _| d.close());
+        dialog.present();
+        return;
+    }
+
+    let dialog = gtk4::Dialog::with_buttons(
+        Some("Restore Previous Session"),
+        Some(window),
+        gtk4::DialogFlags::MODAL | gtk4::DialogFlags::DESTROY_WITH_PARENT,
+        &[("Cancel", gtk4::ResponseType::Cancel)],
+    );
+    dialog.set_default_width(450);
+    dialog.set_default_height(350);
+
+    let content = dialog.content_area();
+    let scrolled = gtk4::ScrolledWindow::new();
+    scrolled.set_vexpand(true);
+    scrolled.set_hexpand(true);
+    scrolled.set_min_content_height(200);
+
+    let listbox = gtk4::ListBox::new();
+    listbox.set_selection_mode(gtk4::SelectionMode::Single);
+    listbox.add_css_class("boxed-list");
+
+    let session_ids: Rc<Vec<uuid::Uuid>> = Rc::new(trashed.iter().map(|t| t.session_id).collect());
+
+    for info in &trashed {
+        let row = adw::ActionRow::builder().title(&info.workspace_names.join(", ")).build();
+
+        let tabs_label = format!("{} tab(s)", info.tab_count);
+        let time_str = info
+            .closed_at
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| {
+                let secs = d.as_secs();
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .map(|n| n.as_secs())
+                    .unwrap_or(0);
+                let diff = now.saturating_sub(secs);
+                if diff < 60 {
+                    "just now".to_string()
+                } else if diff < 3600 {
+                    format!("{} min ago", diff / 60)
+                } else if diff < 86400 {
+                    format!("{} hr ago", diff / 3600)
+                } else {
+                    format!("{} day(s) ago", diff / 86400)
+                }
+            })
+            .unwrap_or_else(|_| "unknown".to_string());
+
+        row.set_subtitle(&format!("{tabs_label} -- closed {time_str}"));
+        listbox.append(&row);
+    }
+
+    scrolled.set_child(Some(&listbox));
+    content.append(&scrolled);
+
+    let session_ids_activate = Rc::clone(&session_ids);
+    let dialog_weak = dialog.downgrade();
+    listbox.connect_row_activated(move |_lb, row| {
+        let idx = row.index() as usize;
+        if let Some(&sid) = session_ids_activate.get(idx) {
+            tracing::info!("Restoring trashed session {sid}");
+            // Spawn a new process with --restore-session.
+            if let Ok(exe) = std::env::current_exe() {
+                match std::process::Command::new(&exe)
+                    .arg("--restore-session")
+                    .arg(sid.to_string())
+                    .spawn()
+                {
+                    Ok(child) => {
+                        std::mem::forget(child);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to spawn restore: {e}");
+                    }
+                }
+            }
+            if let Some(d) = dialog_weak.upgrade() {
+                d.close();
+            }
+        }
+    });
+
+    dialog.connect_response(|d, _| d.close());
+    dialog.present();
+}
+
 /// Show the "New Workspace" dialog. On confirm, creates a new WorkspaceView
 /// and switches to it.
 #[allow(deprecated)]
@@ -7280,7 +7698,7 @@ fn show_new_workspace_dialog(
         drop(cfg_ref);
 
         create_and_switch_to_new_workspace(&wm, &name, &config, &ma, &tb, &win, dc.clone(), &cfg);
-        refresh_workspace_sidebar(&lb, &wm);
+        refresh_workspace_sidebar(&lb, &wm, &ma, &tb, &win, &dc, &cfg);
     });
 
     dialog.present();
@@ -7451,6 +7869,8 @@ fn create_and_switch_to_new_workspace(
             custom_titles: new_custom_titles,
             tab_id_map: new_tab_id_map,
             tab_colors: new_tab_colors,
+            color: None,
+            color_css_provider: None,
         });
 
         let idx = mgr.workspaces.len() - 1;
@@ -7729,6 +8149,8 @@ fn build_workspace_sidebar(
     main_area: &gtk4::Box,
     tab_bar: &adw::TabBar,
     window: &adw::ApplicationWindow,
+    daemon_client: &Option<Arc<DaemonClient>>,
+    shared_config: &SharedConfig,
 ) -> (gtk4::Revealer, gtk4::ListBox) {
     let revealer = gtk4::Revealer::new();
     revealer.set_transition_type(gtk4::RevealerTransitionType::SlideRight);
@@ -7759,10 +8181,12 @@ fn build_workspace_sidebar(
         let tb = tab_bar.clone();
         let win = window.clone();
         let lb_ref = list_box.clone();
+        let dc_ref = daemon_client.clone();
+        let sc_ref = Rc::clone(shared_config);
         list_box.connect_row_activated(move |_lb, row| {
             let target = row.index() as usize;
             switch_workspace(&wm, target, &ma, &tb, &win);
-            refresh_workspace_sidebar(&lb_ref, &wm);
+            refresh_workspace_sidebar(&lb_ref, &wm, &ma, &tb, &win, &dc_ref, &sc_ref);
         });
     }
 
@@ -7773,7 +8197,19 @@ fn build_workspace_sidebar(
 ///
 /// Called after any workspace switch, creation, or deletion so the active-row
 /// highlight reflects the current state.
-fn refresh_workspace_sidebar(list_box: &gtk4::ListBox, workspace_manager: &WorkspaceManager) {
+///
+/// The extra parameters (`main_area`, `tab_bar`, `window`, `daemon_client`, `shared_config`)
+/// are needed to build the right-click context menu gesture on each row.
+#[allow(clippy::too_many_arguments)]
+fn refresh_workspace_sidebar(
+    list_box: &gtk4::ListBox,
+    workspace_manager: &WorkspaceManager,
+    main_area: &gtk4::Box,
+    tab_bar: &adw::TabBar,
+    window: &adw::ApplicationWindow,
+    daemon_client: &Option<Arc<DaemonClient>>,
+    shared_config: &SharedConfig,
+) {
     let Ok(mgr) = workspace_manager.try_borrow() else {
         return;
     };
@@ -7861,6 +8297,53 @@ fn refresh_workspace_sidebar(list_box: &gtk4::ListBox, workspace_manager: &Works
             row.add_css_class("workspace-sidebar-active");
         }
 
+        // Per-row color CSS override (AC-7, AC-8).
+        if ws.color.is_some() {
+            // Apply the CSS class that targets this workspace's UUID.
+            let class_name = format!("workspace-color-{}", ws.id.simple());
+            row.add_css_class(&class_name);
+            // The CSS provider was loaded when the color was first applied
+            // (in apply_workspace_color). We only need to ensure the class
+            // is present here; the provider is added once at the display level.
+        }
+        // else: No custom color — rows are rebuilt each time, so no stale classes accumulate.
+
+        // Right-click context menu gesture (button 3, capture phase, claimed).
+        // Using Capture phase to intercept before the row activation gesture.
+        {
+            let wm_ctx = Rc::clone(workspace_manager);
+            let lb_ctx = list_box.clone();
+            let ma_ctx = main_area.clone();
+            let tb_ctx = tab_bar.clone();
+            let win_ctx = window.clone();
+            let dc_ctx = daemon_client.clone();
+            let sc_ctx = Rc::clone(shared_config);
+            let row_ref = row.clone();
+            let workspace_idx = i;
+
+            let gesture = gtk4::GestureClick::new();
+            gesture.set_button(3);
+            gesture.set_propagation_phase(gtk4::PropagationPhase::Capture);
+            gesture.connect_pressed(move |gesture, _n, x, y| {
+                // Claim the event so the ListBox row activation never fires.
+                gesture.set_state(gtk4::EventSequenceState::Claimed);
+                show_workspace_context_menu(
+                    &row_ref,
+                    workspace_idx,
+                    x,
+                    y,
+                    &wm_ctx,
+                    &ma_ctx,
+                    &tb_ctx,
+                    &win_ctx,
+                    &dc_ctx,
+                    &sc_ctx,
+                    &lb_ctx,
+                );
+            });
+            row.add_controller(gesture);
+        }
+
         list_box.append(&row);
     }
 
@@ -7868,4 +8351,972 @@ fn refresh_workspace_sidebar(list_box: &gtk4::ListBox, workspace_manager: &Works
     if let Some(row) = list_box.row_at_index(mgr.active_index as i32) {
         list_box.select_row(Some(&row));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Workspace right-click context menu (T-M1-extra-013)
+// ---------------------------------------------------------------------------
+
+/// Show the workspace right-click context menu positioned at (x, y) on the row.
+///
+/// Mirrors `show_tab_context_menu` in structure: creates a popover, wires
+/// focus-restore via `connect_closed`, uses `idle_add_local_once` for the
+/// Wayland-safe click-outside dismiss (BUG-009 pattern).
+#[allow(clippy::too_many_arguments)]
+fn show_workspace_context_menu(
+    row: &gtk4::ListBoxRow,
+    workspace_idx: usize,
+    x: f64,
+    y: f64,
+    wm: &WorkspaceManager,
+    main_area: &gtk4::Box,
+    tab_bar: &adw::TabBar,
+    window: &adw::ApplicationWindow,
+    daemon_client: &Option<Arc<DaemonClient>>,
+    shared_config: &SharedConfig,
+    sidebar_lb: &gtk4::ListBox,
+) {
+    let popover = gtk4::Popover::new();
+    popover.set_parent(row);
+    popover.set_has_arrow(false);
+    popover.add_css_class("menu");
+    popover.set_autohide(true);
+    popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+
+    // Click-outside dismiss via focus tracking (deferred — BUG-009 Wayland fix).
+    {
+        let pop_fc = popover.clone();
+        glib::idle_add_local_once(move || {
+            if !pop_fc.is_visible() {
+                return;
+            }
+            let pop_ref = pop_fc.clone();
+            let fc = gtk4::EventControllerFocus::new();
+            fc.connect_leave(move |_| {
+                pop_ref.popdown();
+            });
+            pop_fc.add_controller(fc);
+        });
+    }
+
+    // Re-focus the active terminal pane after the popover is dismissed.
+    {
+        let wm_c = Rc::clone(wm);
+        let win_c = window.clone();
+        popover.connect_closed(move |_| {
+            let focused_name = active_focus_tracker(&wm_c).borrow().clone();
+            if !focused_name.is_empty() {
+                if let Some(da) = find_drawing_area_by_name(&win_c, &focused_name) {
+                    da.grab_focus();
+                    return;
+                }
+            }
+            // Fallback: focus the first tracked pane in the active workspace.
+            let Ok(mgr) = wm_c.try_borrow() else { return };
+            let ws = &mgr.workspaces[mgr.active_index];
+            let keys: Vec<String> = ws.tab_states.borrow().keys().cloned().collect();
+            drop(mgr);
+            for k in &keys {
+                if let Some(da) = find_drawing_area_by_name(&win_c, k) {
+                    da.grab_focus();
+                    break;
+                }
+            }
+        });
+    }
+
+    let menu_box = build_workspace_context_menu_box(
+        workspace_idx,
+        wm,
+        main_area,
+        tab_bar,
+        window,
+        daemon_client,
+        shared_config,
+        sidebar_lb,
+        &popover,
+    );
+    popover.set_child(Some(&menu_box));
+    popover.popup();
+}
+
+/// Build the 8-item workspace context menu box.
+///
+/// Items (in order):
+/// 1. Change Workspace Color  (▶ submenu)
+/// 2. Rename Workspace
+/// 3. --- separator ---
+/// 4. Duplicate Workspace
+/// 5. Move Up
+/// 6. Move Down
+/// 7. --- separator ---
+/// 8. Delete Workspace
+#[allow(clippy::too_many_arguments)]
+fn build_workspace_context_menu_box(
+    workspace_idx: usize,
+    wm: &WorkspaceManager,
+    main_area: &gtk4::Box,
+    tab_bar: &adw::TabBar,
+    window: &adw::ApplicationWindow,
+    daemon_client: &Option<Arc<DaemonClient>>,
+    shared_config: &SharedConfig,
+    sidebar_lb: &gtk4::ListBox,
+    popover: &gtk4::Popover,
+) -> gtk4::Box {
+    let n_workspaces = wm.try_borrow().map(|m| m.workspaces.len()).unwrap_or(1);
+
+    let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    vbox.set_margin_top(4);
+    vbox.set_margin_bottom(4);
+
+    // 1. Change Workspace Color (submenu)
+    {
+        let color_btn = tab_menu_button_arrow("Change Workspace Color");
+
+        let color_sub = gtk4::Popover::new();
+        color_sub.set_has_arrow(true);
+        color_sub.add_css_class("menu");
+        color_sub.set_position(gtk4::PositionType::Right);
+
+        let wm_c = Rc::clone(wm);
+        let lb_c = sidebar_lb.clone();
+        let win_c = window.clone();
+        let sub_box = build_workspace_color_picker_box(workspace_idx, &wm_c, &lb_c, &win_c);
+        color_sub.set_child(Some(&sub_box));
+        color_sub.set_parent(&color_btn);
+
+        let pop_ref = popover.clone();
+        color_btn.connect_clicked(move |_| {
+            color_sub.popup();
+            let _ = &pop_ref; // keep alive
+        });
+        vbox.append(&color_btn);
+    }
+
+    // 2. Rename Workspace
+    {
+        let wm_r = Rc::clone(wm);
+        let win_r = window.clone();
+        let lb_r = sidebar_lb.clone();
+        let pop_r = popover.clone();
+        let btn = tab_menu_button("Rename Workspace");
+        btn.connect_clicked(move |_| {
+            pop_r.popdown();
+            show_rename_workspace_dialog_for(&win_r, &wm_r, workspace_idx, &lb_r);
+        });
+        vbox.append(&btn);
+    }
+
+    // --- separator ---
+    let sep1 = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+    sep1.set_margin_top(4);
+    sep1.set_margin_bottom(4);
+    vbox.append(&sep1);
+
+    // 4. Duplicate Workspace
+    {
+        let wm_d = Rc::clone(wm);
+        let ma_d = main_area.clone();
+        let tb_d = tab_bar.clone();
+        let win_d = window.clone();
+        let dc_d = daemon_client.clone();
+        let sc_d = Rc::clone(shared_config);
+        let lb_d = sidebar_lb.clone();
+        let pop_d = popover.clone();
+        let btn = tab_menu_button("Duplicate Workspace");
+        btn.connect_clicked(move |_| {
+            pop_d.popdown();
+            duplicate_workspace(workspace_idx, &wm_d, &ma_d, &tb_d, &win_d, &dc_d, &sc_d, &lb_d);
+        });
+        vbox.append(&btn);
+    }
+
+    // 5. Move Up
+    {
+        let wm_u = Rc::clone(wm);
+        let lb_u = sidebar_lb.clone();
+        let ma_u = main_area.clone();
+        let tb_u = tab_bar.clone();
+        let win_u = window.clone();
+        let dc_u = daemon_client.clone();
+        let sc_u = Rc::clone(shared_config);
+        let pop_u = popover.clone();
+        let btn = tab_menu_button("Move Up");
+        btn.set_sensitive(workspace_idx > 0);
+        btn.connect_clicked(move |_| {
+            pop_u.popdown();
+            move_workspace_up(workspace_idx, &wm_u, &lb_u, &ma_u, &tb_u, &win_u, &dc_u, &sc_u);
+        });
+        vbox.append(&btn);
+    }
+
+    // 6. Move Down
+    {
+        let wm_dn = Rc::clone(wm);
+        let lb_dn = sidebar_lb.clone();
+        let ma_dn = main_area.clone();
+        let tb_dn = tab_bar.clone();
+        let win_dn = window.clone();
+        let dc_dn = daemon_client.clone();
+        let sc_dn = Rc::clone(shared_config);
+        let pop_dn = popover.clone();
+        let btn = tab_menu_button("Move Down");
+        btn.set_sensitive(workspace_idx + 1 < n_workspaces);
+        btn.connect_clicked(move |_| {
+            pop_dn.popdown();
+            move_workspace_down(
+                workspace_idx,
+                &wm_dn,
+                &lb_dn,
+                &ma_dn,
+                &tb_dn,
+                &win_dn,
+                &dc_dn,
+                &sc_dn,
+            );
+        });
+        vbox.append(&btn);
+    }
+
+    // --- separator ---
+    let sep2 = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+    sep2.set_margin_top(4);
+    sep2.set_margin_bottom(4);
+    vbox.append(&sep2);
+
+    // 8. Delete Workspace
+    {
+        let wm_del = Rc::clone(wm);
+        let ma_del = main_area.clone();
+        let tb_del = tab_bar.clone();
+        let win_del = window.clone();
+        let lb_del = sidebar_lb.clone();
+        let pop_del = popover.clone();
+        let dc_del = daemon_client.clone();
+        let sc_del = Rc::clone(shared_config);
+        let btn = tab_menu_button("Delete Workspace");
+        btn.set_sensitive(n_workspaces > 1);
+        btn.connect_clicked(move |_| {
+            pop_del.popdown();
+            delete_workspace_at_index(
+                workspace_idx,
+                &wm_del,
+                &ma_del,
+                &tb_del,
+                &win_del,
+                &lb_del,
+                &dc_del,
+                &sc_del,
+            );
+        });
+        vbox.append(&btn);
+    }
+
+    vbox
+}
+
+/// Build the color picker box for the "Change Workspace Color" submenu.
+///
+/// Reuses `TAB_COLOR_PRESETS`. Swatch clicks call `apply_workspace_color`.
+fn build_workspace_color_picker_box(
+    workspace_idx: usize,
+    wm: &WorkspaceManager,
+    sidebar_lb: &gtk4::ListBox,
+    window: &adw::ApplicationWindow,
+) -> gtk4::Box {
+    let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+    vbox.set_margin_top(6);
+    vbox.set_margin_bottom(6);
+    vbox.set_margin_start(6);
+    vbox.set_margin_end(6);
+
+    // Swatch row
+    let swatch_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+
+    for (name, (r, g, b)) in TAB_COLOR_PRESETS {
+        let rgba = gtk4::gdk::RGBA::new(*r, *g, *b, 1.0);
+        let btn = gtk4::Button::new();
+        btn.set_tooltip_text(Some(name));
+        btn.set_size_request(24, 24);
+        btn.set_has_frame(false);
+
+        let da = gtk4::DrawingArea::new();
+        da.set_size_request(18, 18);
+        let da_rgba = rgba;
+        da.set_draw_func(move |_, cr, _w, _h| {
+            cr.arc(9.0, 9.0, 8.0, 0.0, 2.0 * std::f64::consts::PI);
+            cr.set_source_rgba(
+                da_rgba.red() as f64,
+                da_rgba.green() as f64,
+                da_rgba.blue() as f64,
+                1.0,
+            );
+            let _ = cr.fill();
+        });
+        btn.set_child(Some(&da));
+
+        let wm_c = Rc::clone(wm);
+        let lb_c = sidebar_lb.clone();
+        btn.connect_clicked(move |_| {
+            apply_workspace_color(&wm_c, workspace_idx, Some(rgba), &lb_c);
+        });
+        swatch_box.append(&btn);
+    }
+    vbox.append(&swatch_box);
+
+    // "Custom…" button — opens gtk4::ColorDialog
+    {
+        let custom_btn = gtk4::Button::with_label("Custom\u{2026}");
+        custom_btn.set_has_frame(false);
+        custom_btn.add_css_class("flat");
+
+        let wm_c = Rc::clone(wm);
+        let lb_c = sidebar_lb.clone();
+        let win_c = window.clone();
+        custom_btn.connect_clicked(move |btn| {
+            let dialog = gtk4::ColorDialog::new();
+            dialog.set_with_alpha(false);
+            let wm2 = Rc::clone(&wm_c);
+            let lb2 = lb_c.clone();
+            let win = btn
+                .root()
+                .and_downcast::<gtk4::Window>()
+                .or_else(|| Some(win_c.clone().upcast::<gtk4::Window>()));
+            dialog.choose_rgba(win.as_ref(), None, gtk4::gio::Cancellable::NONE, move |result| {
+                if let Ok(rgba) = result {
+                    apply_workspace_color(&wm2, workspace_idx, Some(rgba), &lb2);
+                }
+            });
+        });
+        vbox.append(&custom_btn);
+    }
+
+    // "None" button — clears the color
+    {
+        let none_btn = gtk4::Button::with_label("None");
+        none_btn.set_has_frame(false);
+        none_btn.add_css_class("flat");
+
+        let wm_n = Rc::clone(wm);
+        let lb_n = sidebar_lb.clone();
+        none_btn.connect_clicked(move |_| {
+            apply_workspace_color(&wm_n, workspace_idx, None, &lb_n);
+        });
+        vbox.append(&none_btn);
+    }
+
+    vbox
+}
+
+/// Apply (or clear) a custom color on a workspace sidebar row.
+///
+/// Sets `mgr.workspaces[idx].color` and installs a per-workspace CSS provider
+/// that overrides the left-border color on the `.workspace-color-{uuid}` class.
+/// Then calls `refresh_workspace_sidebar` (via a direct ListBox rebuild) to
+/// apply the class to the newly-rebuilt row.
+///
+/// The CSS provider is stored in `WorkspaceView.color_css_provider` so it is
+/// only registered with the display once (on first color assignment).
+fn apply_workspace_color(
+    wm: &WorkspaceManager,
+    idx: usize,
+    color: Option<gtk4::gdk::RGBA>,
+    lb: &gtk4::ListBox,
+) {
+    let Ok(mut mgr) = wm.try_borrow_mut() else { return };
+    if idx >= mgr.workspaces.len() {
+        return;
+    }
+
+    mgr.workspaces[idx].color = color;
+
+    if let Some(ref rgba) = color {
+        let ws_id = mgr.workspaces[idx].id;
+        let class_name = format!("workspace-color-{}", ws_id.simple());
+
+        // Build CSS: a 4 px solid left border in the chosen color.
+        let r = (rgba.red() * 255.0) as u8;
+        let g = (rgba.green() * 255.0) as u8;
+        let b = (rgba.blue() * 255.0) as u8;
+        let a = rgba.alpha();
+        let css = format!(".{class_name} {{ border-left: 4px solid rgba({r},{g},{b},{a}); }}");
+
+        // Get-or-create the per-workspace CSS provider.
+        if mgr.workspaces[idx].color_css_provider.is_none() {
+            let provider = gtk4::CssProvider::new();
+            // Register once with the display.
+            gtk4::style_context_add_provider_for_display(
+                &gtk4::gdk::Display::default().expect("no display"),
+                &provider,
+                gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+            );
+            mgr.workspaces[idx].color_css_provider = Some(provider);
+        }
+
+        if let Some(ref provider) = mgr.workspaces[idx].color_css_provider {
+            provider.load_from_string(&css);
+        }
+    }
+    // If color is None, the provider stays registered but with its previous
+    // CSS. We clear it by loading empty CSS so the class has no effect.
+    else if let Some(ref provider) = mgr.workspaces[idx].color_css_provider {
+        provider.load_from_string("");
+    }
+
+    // Rebuild the sidebar row (needs only the ListBox, which already rebuilds).
+    // We can't call refresh_workspace_sidebar here because we hold borrow_mut.
+    // Instead, schedule a refresh on the next idle cycle.
+    drop(mgr);
+
+    // Re-borrow immutably to call refresh (the borrow_mut is dropped).
+    // We can't call refresh_workspace_sidebar because we don't have main_area/tab_bar/etc.
+    // here — apply_workspace_color only has the lb. We do a minimal rebuild:
+    // remove all rows and re-add them from the current state.
+    // The row-gesture-wiring part of refresh_workspace_sidebar is skipped here
+    // because gestures will be re-attached on next full refresh_workspace_sidebar call.
+    // For now: rebuild rows without gestures (gesture-less rebuild is AC-10 compatible).
+    let wm_idle = Rc::clone(wm);
+    let lb_idle = lb.clone();
+    glib::idle_add_local_once(move || {
+        rebuild_sidebar_rows_for_color(&lb_idle, &wm_idle);
+    });
+}
+
+/// Minimal sidebar row rebuild used after a color change.
+///
+/// Rebuilds only the row CSS classes (color overrides) without re-attaching
+/// all the gesture controllers (those are only wired during full
+/// `refresh_workspace_sidebar` calls). This is sufficient for AC-10.
+fn rebuild_sidebar_rows_for_color(lb: &gtk4::ListBox, wm: &WorkspaceManager) {
+    let Ok(mgr) = wm.try_borrow() else { return };
+
+    // Walk the rows and reapply color CSS classes based on current state.
+    for (i, ws) in mgr.workspaces.iter().enumerate() {
+        let Some(row) = lb.row_at_index(i as i32) else { continue };
+        let class_name = format!("workspace-color-{}", ws.id.simple());
+        if ws.color.is_some() {
+            row.add_css_class(&class_name);
+        } else {
+            row.remove_css_class(&class_name);
+        }
+    }
+}
+
+/// Show the "Rename Workspace" dialog targeted at `target_idx` rather than the active workspace.
+///
+/// Updates `mgr.workspaces[target_idx].name`. Only updates the window title if
+/// `target_idx == active_index` (AC-14, AC-15).
+#[allow(deprecated)]
+fn show_rename_workspace_dialog_for(
+    window: &adw::ApplicationWindow,
+    wm: &WorkspaceManager,
+    target_idx: usize,
+    sidebar_lb: &gtk4::ListBox,
+) {
+    let current_name = {
+        let Ok(mgr) = wm.try_borrow() else { return };
+        if target_idx >= mgr.workspaces.len() {
+            return;
+        }
+        mgr.workspaces[target_idx].name.clone()
+    };
+
+    let dialog = adw::MessageDialog::new(
+        Some(window),
+        Some("Rename Workspace"),
+        Some("Enter a new name for this workspace."),
+    );
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("rename", "Rename");
+    dialog.set_response_appearance("rename", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("rename"));
+    dialog.set_close_response("cancel");
+
+    let entry = gtk4::Entry::new();
+    entry.set_placeholder_text(Some("Workspace name"));
+    entry.set_text(&current_name);
+    entry.select_region(0, -1);
+    dialog.set_extra_child(Some(&entry));
+
+    let dialog_for_enter = dialog.clone();
+    entry.connect_activate(move |_entry| {
+        dialog_for_enter.response("rename");
+    });
+
+    let wm_r = Rc::clone(wm);
+    let win_r = window.clone();
+    let lb_r = sidebar_lb.clone();
+    dialog.connect_response(None, move |dialog, response| {
+        if response != "rename" {
+            dialog.close();
+            return;
+        }
+        let new_name = entry.text().to_string().trim().to_string();
+        if new_name.is_empty() {
+            return;
+        }
+
+        dialog.close();
+
+        let (ws_count, is_active) = {
+            let Ok(mut mgr) = wm_r.try_borrow_mut() else { return };
+            if target_idx >= mgr.workspaces.len() {
+                return;
+            }
+            mgr.workspaces[target_idx].name = new_name.clone();
+            let is_active = target_idx == mgr.active_index;
+            (mgr.workspaces.len(), is_active)
+        };
+
+        // Update window title only if the renamed workspace is the active one (AC-14, AC-15).
+        if is_active {
+            update_window_title_with_workspace(ws_count, &new_name, &wm_r, &win_r);
+        }
+
+        // Rebuild sidebar rows: minimal rebuild (no gestures, color only).
+        rebuild_sidebar_rows_for_color(&lb_r, &wm_r);
+
+        // Update the row label in place by rebuilding all row labels.
+        // Since the row widgets are inside the lb, we need a different approach:
+        // walk the list_box rows and update the name_label text.
+        // The rows were built in refresh_workspace_sidebar; the name label is
+        // the second child of the hbox (index 1, after the number label).
+        let Ok(mgr) = wm_r.try_borrow() else { return };
+        for (i, ws) in mgr.workspaces.iter().enumerate() {
+            let Some(row) = lb_r.row_at_index(i as i32) else { continue };
+            // Find the first Box child of the row, then the second Label inside it.
+            if let Some(hbox) = row.child().and_then(|c| c.downcast::<gtk4::Box>().ok()) {
+                // Walk children of hbox: number_label, name_label, meta_vbox
+                let mut child = hbox.first_child();
+                let mut child_idx = 0;
+                while let Some(c) = child {
+                    if child_idx == 1 {
+                        if let Some(lbl) = c.downcast_ref::<gtk4::Label>() {
+                            lbl.set_text(&ws.name);
+                        }
+                        break;
+                    }
+                    child = c.next_sibling();
+                    child_idx += 1;
+                }
+            }
+        }
+    });
+
+    dialog.present();
+}
+
+/// Duplicate a workspace: create a new WorkspaceView with the same tab CWDs,
+/// insert it immediately after the source, and switch to it.
+#[allow(clippy::too_many_arguments)]
+fn duplicate_workspace(
+    workspace_idx: usize,
+    wm: &WorkspaceManager,
+    main_area: &gtk4::Box,
+    tab_bar: &adw::TabBar,
+    window: &adw::ApplicationWindow,
+    daemon_client: &Option<Arc<DaemonClient>>,
+    shared_config: &SharedConfig,
+    sidebar_lb: &gtk4::ListBox,
+) {
+    // Collect source CWDs and name while holding a borrow.
+    let (source_name, cwds, cfg) = {
+        let Ok(mgr) = wm.try_borrow() else { return };
+        if workspace_idx >= mgr.workspaces.len() {
+            return;
+        }
+        let ws = &mgr.workspaces[workspace_idx];
+        let n = ws.tab_view.n_pages();
+        let mut cwds: Vec<Option<std::path::PathBuf>> = Vec::new();
+        for i in 0..n {
+            let page = ws.tab_view.nth_page(i);
+            let container = page.child();
+            let leaves = collect_leaf_drawing_areas(&container);
+            let cwd = leaves.first().and_then(|da| {
+                let name = da.widget_name().to_string();
+                ws.tab_states.borrow().get(&name).and_then(read_pane_cwd)
+            });
+            cwds.push(cwd);
+        }
+        let source_name = ws.name.clone();
+        drop(mgr);
+        let Ok(cfg_borrow) = shared_config.try_borrow() else { return };
+        let cfg = cfg_borrow.clone();
+        (source_name, cwds, cfg)
+    };
+
+    let dup_name = format!("{source_name} (copy)");
+
+    // Build the new TabView and WorkspaceView.
+    let new_tv = adw::TabView::new();
+    new_tv.set_vexpand(true);
+    new_tv.set_hexpand(true);
+
+    let new_tab_states: TabStateMap = Rc::new(RefCell::new(HashMap::new()));
+    let new_focus_tracker: FocusTracker = Rc::new(RefCell::new(String::new()));
+    let new_custom_titles: CustomTitles = Rc::new(RefCell::new(HashSet::new()));
+    let new_tab_id_map: TabIdMap = Rc::new(RefCell::new(HashMap::new()));
+    let new_tab_colors: TabColorMap = Rc::new(RefCell::new(HashMap::new()));
+
+    wire_tab_view_handlers(&new_tv, &new_tab_states, &new_focus_tracker, window);
+    wire_tab_context_menu_signal(
+        &new_tv,
+        wm,
+        tab_bar,
+        window,
+        daemon_client.clone(),
+        shared_config,
+    );
+    {
+        let app_c = window
+            .application()
+            .and_downcast::<adw::Application>()
+            .expect("window must be in an adw::Application");
+        new_tv.connect_create_window(move |_| Some(open_detached_tab_window(&app_c)));
+    }
+
+    // Add one tab per source CWD.
+    for cwd_opt in &cwds {
+        add_new_tab(
+            &new_tv,
+            &cfg,
+            &new_tab_states,
+            &new_focus_tracker,
+            &new_custom_titles,
+            window,
+            cwd_opt.as_deref(),
+            None,
+            daemon_client.clone(),
+            &new_tab_id_map,
+        );
+    }
+
+    // If no tabs were added (source had 0 pages), add one default tab.
+    if new_tv.n_pages() == 0 {
+        add_new_tab(
+            &new_tv,
+            &cfg,
+            &new_tab_states,
+            &new_focus_tracker,
+            &new_custom_titles,
+            window,
+            None,
+            None,
+            daemon_client.clone(),
+            &new_tab_id_map,
+        );
+    }
+
+    let new_ws = WorkspaceView {
+        id: uuid::Uuid::new_v4(),
+        name: dup_name,
+        tab_view: new_tv.clone(),
+        tab_states: new_tab_states,
+        focus_tracker: new_focus_tracker,
+        custom_titles: new_custom_titles,
+        tab_id_map: new_tab_id_map,
+        tab_colors: new_tab_colors,
+        color: None,
+        color_css_provider: None,
+    };
+
+    // Insert the new workspace and switch to it.
+    let new_idx = {
+        let Ok(mut mgr) = wm.try_borrow_mut() else { return };
+
+        let insert_at = workspace_idx + 1;
+
+        // Adjust active_index for indices that shift due to insertion.
+        if mgr.active_index >= insert_at {
+            mgr.active_index += 1;
+        }
+
+        mgr.workspaces.insert(insert_at, new_ws);
+
+        // Remove the current active TabView from main_area.
+        let old_tv = mgr.workspaces[mgr.active_index].tab_view.clone();
+        let mut child = main_area.first_child();
+        while let Some(c) = child {
+            if c == *old_tv.upcast_ref::<gtk4::Widget>() {
+                main_area.remove(&c);
+                break;
+            }
+            child = c.next_sibling();
+        }
+
+        // Set the duplicate as the new active workspace.
+        mgr.active_index = insert_at;
+        main_area.prepend(&new_tv);
+        tab_bar.set_view(Some(&new_tv));
+
+        // Focus the first leaf.
+        if let Some(page) = new_tv.selected_page() {
+            let container = page.child();
+            let leaves = collect_leaf_drawing_areas(&container);
+            if let Some(da) = leaves.first() {
+                da.grab_focus();
+            }
+        }
+
+        let ws_count = mgr.workspaces.len();
+        let ws_name = mgr.workspaces[insert_at].name.clone();
+        drop(mgr);
+        update_delete_workspace_action(wm, window);
+        let wm_borrow = wm;
+        update_window_title_with_workspace(ws_count, &ws_name, wm_borrow, window);
+        insert_at
+    };
+
+    let _ = new_idx;
+
+    refresh_workspace_sidebar(
+        sidebar_lb,
+        wm,
+        main_area,
+        tab_bar,
+        window,
+        daemon_client,
+        shared_config,
+    );
+}
+
+/// Swap the workspace at `workspace_idx` with the one above it (idx - 1).
+///
+/// Updates `active_index` to follow the moved element (AC-22).
+#[allow(clippy::too_many_arguments)]
+fn move_workspace_up(
+    workspace_idx: usize,
+    wm: &WorkspaceManager,
+    sidebar_lb: &gtk4::ListBox,
+    main_area: &gtk4::Box,
+    tab_bar: &adw::TabBar,
+    window: &adw::ApplicationWindow,
+    daemon_client: &Option<Arc<DaemonClient>>,
+    shared_config: &SharedConfig,
+) {
+    if workspace_idx == 0 {
+        return; // Already at the top.
+    }
+    let Ok(mut mgr) = wm.try_borrow_mut() else { return };
+    if workspace_idx >= mgr.workspaces.len() {
+        return;
+    }
+
+    mgr.workspaces.swap(workspace_idx, workspace_idx - 1);
+
+    // Update active_index to follow the moved element.
+    if mgr.active_index == workspace_idx {
+        mgr.active_index = workspace_idx - 1;
+    } else if mgr.active_index == workspace_idx - 1 {
+        mgr.active_index = workspace_idx;
+    }
+
+    drop(mgr);
+    refresh_workspace_sidebar(
+        sidebar_lb,
+        wm,
+        main_area,
+        tab_bar,
+        window,
+        daemon_client,
+        shared_config,
+    );
+}
+
+/// Swap the workspace at `workspace_idx` with the one below it (idx + 1).
+///
+/// Updates `active_index` to follow the moved element (AC-26).
+#[allow(clippy::too_many_arguments)]
+fn move_workspace_down(
+    workspace_idx: usize,
+    wm: &WorkspaceManager,
+    sidebar_lb: &gtk4::ListBox,
+    main_area: &gtk4::Box,
+    tab_bar: &adw::TabBar,
+    window: &adw::ApplicationWindow,
+    daemon_client: &Option<Arc<DaemonClient>>,
+    shared_config: &SharedConfig,
+) {
+    let Ok(mut mgr) = wm.try_borrow_mut() else { return };
+    if workspace_idx + 1 >= mgr.workspaces.len() {
+        return;
+    }
+
+    mgr.workspaces.swap(workspace_idx, workspace_idx + 1);
+
+    // Update active_index to follow the moved element.
+    if mgr.active_index == workspace_idx {
+        mgr.active_index = workspace_idx + 1;
+    } else if mgr.active_index == workspace_idx + 1 {
+        mgr.active_index = workspace_idx;
+    }
+
+    drop(mgr);
+    refresh_workspace_sidebar(
+        sidebar_lb,
+        wm,
+        main_area,
+        tab_bar,
+        window,
+        daemon_client,
+        shared_config,
+    );
+}
+
+/// Delete the workspace at `target_idx`.
+///
+/// Shows a confirmation `adw::MessageDialog` when the workspace has more than 1 tab (AC-31).
+/// On confirmation: kills PTYs, removes the WorkspaceView, updates active_index,
+/// swaps the TabView, and refreshes the sidebar.
+#[allow(deprecated)]
+#[allow(clippy::too_many_arguments)]
+fn delete_workspace_at_index(
+    target_idx: usize,
+    wm: &WorkspaceManager,
+    main_area: &gtk4::Box,
+    tab_bar: &adw::TabBar,
+    window: &adw::ApplicationWindow,
+    sidebar_lb: &gtk4::ListBox,
+    daemon_client: &Option<Arc<DaemonClient>>,
+    shared_config: &SharedConfig,
+) {
+    let (n_workspaces, n_pages) = {
+        let Ok(mgr) = wm.try_borrow() else { return };
+        if target_idx >= mgr.workspaces.len() {
+            return;
+        }
+        (mgr.workspaces.len(), mgr.workspaces[target_idx].tab_view.n_pages())
+    };
+
+    if n_workspaces <= 1 {
+        return; // Cannot delete the last workspace (AC-29).
+    }
+
+    if n_pages <= 1 {
+        // Single tab: delete immediately without dialog (AC-30).
+        do_delete_workspace_at_index(
+            target_idx,
+            wm,
+            main_area,
+            tab_bar,
+            window,
+            sidebar_lb,
+            daemon_client,
+            shared_config,
+        );
+    } else {
+        // Multiple tabs: show confirmation dialog (AC-31).
+        let body =
+            format!("This workspace has {n_pages} tabs. Closing it will kill all running shells.");
+        let dialog = adw::MessageDialog::new(Some(window), Some("Delete Workspace?"), Some(&body));
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("delete", "Delete");
+        dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+
+        let wm_d = Rc::clone(wm);
+        let ma_d = main_area.clone();
+        let tb_d = tab_bar.clone();
+        let win_d = window.clone();
+        let lb_d = sidebar_lb.clone();
+        let dc_d = daemon_client.clone();
+        let sc_d = Rc::clone(shared_config);
+        dialog.connect_response(None, move |dialog, response| {
+            dialog.close();
+            if response == "delete" {
+                do_delete_workspace_at_index(
+                    target_idx, &wm_d, &ma_d, &tb_d, &win_d, &lb_d, &dc_d, &sc_d,
+                );
+            }
+        });
+        dialog.present();
+    }
+}
+
+/// Internal: perform the actual workspace deletion after confirmation.
+#[allow(clippy::too_many_arguments)]
+fn do_delete_workspace_at_index(
+    target_idx: usize,
+    wm: &WorkspaceManager,
+    main_area: &gtk4::Box,
+    tab_bar: &adw::TabBar,
+    window: &adw::ApplicationWindow,
+    sidebar_lb: &gtk4::ListBox,
+    daemon_client: &Option<Arc<DaemonClient>>,
+    shared_config: &SharedConfig,
+) {
+    let Ok(mut mgr) = wm.try_borrow_mut() else { return };
+    if target_idx >= mgr.workspaces.len() || mgr.workspaces.len() <= 1 {
+        return;
+    }
+
+    let ws = &mgr.workspaces[target_idx];
+
+    // Kill all PTYs in the workspace.
+    kill_all_ptys(&ws.tab_states, "Delete workspace (context menu)");
+
+    // Remove the TabView from main_area if it is currently visible.
+    let old_tv = ws.tab_view.clone();
+    let is_active = target_idx == mgr.active_index;
+    let mut child = main_area.first_child();
+    while let Some(c) = child {
+        if c == *old_tv.upcast_ref::<gtk4::Widget>() {
+            main_area.remove(&c);
+            break;
+        }
+        child = c.next_sibling();
+    }
+
+    // Remove the workspace.
+    mgr.workspaces.remove(target_idx);
+
+    // Choose new active_index (AC-32): prefer the workspace that now occupies
+    // the deleted index, or len-1 if the deleted workspace was last.
+    let new_active = if mgr.active_index > target_idx {
+        // Active was after the deleted; shift down.
+        mgr.active_index - 1
+    } else if mgr.active_index == target_idx {
+        // Active was the deleted one; pick the workspace now at that position.
+        target_idx.min(mgr.workspaces.len() - 1)
+    } else {
+        // Active was before the deleted; unchanged.
+        mgr.active_index
+    };
+    mgr.active_index = new_active;
+
+    // If the deleted workspace was visible, swap in the new active TabView.
+    if is_active || mgr.workspaces.get(new_active).is_some() {
+        let new_tv = mgr.workspaces[new_active].tab_view.clone();
+        // Only insert if not already parented.
+        if new_tv.parent().is_none() {
+            main_area.prepend(&new_tv);
+        }
+        tab_bar.set_view(Some(&new_tv));
+
+        // Focus the first leaf of the new active workspace (AC-33).
+        if let Some(page) = new_tv.selected_page() {
+            let container = page.child();
+            let leaves = collect_leaf_drawing_areas(&container);
+            if let Some(da) = leaves.first() {
+                da.grab_focus();
+            }
+        }
+    }
+
+    let ws_count = mgr.workspaces.len();
+    let ws_name = mgr.workspaces[new_active].name.clone();
+    drop(mgr);
+
+    update_delete_workspace_action(wm, window);
+    update_window_title_with_workspace(ws_count, &ws_name, wm, window);
+    refresh_workspace_sidebar(
+        sidebar_lb,
+        wm,
+        main_area,
+        tab_bar,
+        window,
+        daemon_client,
+        shared_config,
+    );
 }

@@ -50,6 +50,9 @@ struct SessionManagerInner {
     /// Daemon-owned layout: workspaces → tabs → pane trees (AD-002, AD-007).
     /// Mutated by `create_pane` and `close_pane`; exposed via `layout()`.
     layout: SessionLayout,
+    /// Whether this session is pinned. Pinned sessions are not trashed on
+    /// normal close — they stay in `sessions/` and restore on next launch.
+    pinned: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -75,6 +78,7 @@ impl SessionManager {
                 pane_order: Vec::new(),
                 event_tx,
                 layout: SessionLayout::new_default(),
+                pinned: false,
             })),
         }
     }
@@ -142,6 +146,58 @@ impl SessionManager {
 
         debug!(%id, rows = size.rows, cols = size.cols, "session pane created");
         Ok(id)
+    }
+
+    // -----------------------------------------------------------------------
+    // Split ratio + CWD updates (B-002)
+    // -----------------------------------------------------------------------
+
+    /// Update split ratios in the daemon's layout tree.
+    ///
+    /// Each entry is `(pane_id, ratio)` where `pane_id` identifies the **first**
+    /// child of a `Split` node. The walk finds the `Split` whose `first` subtree
+    /// contains that pane as its leftmost leaf and updates the `ratio` field.
+    ///
+    /// This is called by GTK's close handler to push the actual widget-measured
+    /// ratios before the session is saved, ensuring split proportions survive
+    /// daemon restarts.
+    pub fn update_split_ratios(&self, updates: &[(PaneId, f32)]) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        for &(pane_id, ratio) in updates {
+            let clamped = ratio.clamp(0.05, 0.95);
+            for ws in inner.layout.workspaces.iter_mut() {
+                for tab in ws.tabs.iter_mut() {
+                    if update_ratio_for_pane(&mut tab.pane_tree, pane_id, clamped) {
+                        debug!(%pane_id, ratio = clamped, "update_split_ratios: ratio updated");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Override the cached CWD for a pane.
+    ///
+    /// Used by cold-start restore so the daemon's internal CWD matches the
+    /// saved session file even before the drain loop has run.
+    pub fn set_pane_cwd(&self, id: PaneId, cwd: PathBuf) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pane) = inner.panes.get_mut(&id) {
+            pane.cwd = cwd;
+        }
+    }
+
+    /// Mark this session as pinned. Pinned sessions survive normal close
+    /// (session file stays in `sessions/` instead of moving to `trash/`).
+    pub fn set_pinned(&self, pinned: bool) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.pinned = pinned;
+        debug!(pinned, "set_pinned");
+    }
+
+    /// Return whether this session is pinned.
+    pub fn is_pinned(&self) -> bool {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.pinned
     }
 
     // -----------------------------------------------------------------------
@@ -819,6 +875,7 @@ impl SessionManager {
             active_workspace: inner.layout.active_workspace,
             window_width: None,
             window_height: None,
+            pinned: inner.pinned,
         }
     }
 
@@ -922,6 +979,35 @@ fn replace_leaf_with_ratio(
                 replace_leaf_with_ratio(second, target, new_pane, direction, ratio)
             }
         }
+    }
+}
+
+/// Walk a `PaneTreeLayout` tree looking for a `Split` whose **first** subtree
+/// contains `target` as its leftmost leaf. When found, update that Split's
+/// `ratio` and return `true`.
+fn update_ratio_for_pane(tree: &mut PaneTreeLayout, target: PaneId, new_ratio: f32) -> bool {
+    match tree {
+        PaneTreeLayout::Leaf { .. } => false,
+        PaneTreeLayout::Split { ratio, first, second, .. } => {
+            // Check if the leftmost leaf of `first` is the target.
+            if leftmost_leaf_id(first) == Some(target) {
+                *ratio = new_ratio;
+                return true;
+            }
+            // Recurse into both subtrees.
+            if update_ratio_for_pane(first, target, new_ratio) {
+                return true;
+            }
+            update_ratio_for_pane(second, target, new_ratio)
+        }
+    }
+}
+
+/// Return the `PaneId` of the leftmost leaf in a `PaneTreeLayout`.
+fn leftmost_leaf_id(tree: &PaneTreeLayout) -> Option<PaneId> {
+    match tree {
+        PaneTreeLayout::Leaf { pane_id } => Some(*pane_id),
+        PaneTreeLayout::Split { first, .. } => leftmost_leaf_id(first),
     }
 }
 

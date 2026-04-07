@@ -3615,9 +3615,7 @@ fn draw_terminal(
                     col += 1;
                     while col < num {
                         let next = &cells[col];
-                        if next.grapheme == "█"
-                            && next.attrs.fg == fg_val
-                            && next.attrs.dim == dim
+                        if next.grapheme == "█" && next.attrs.fg == fg_val && next.attrs.dim == dim
                         {
                             col += 1;
                         } else {

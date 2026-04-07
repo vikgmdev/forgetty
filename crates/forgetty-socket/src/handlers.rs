@@ -56,6 +56,10 @@ pub fn dispatch(
         methods::PRESEED_SNAPSHOT => handle_preseed_snapshot(request, &sm),
         methods::CLOSE_PANE => handle_close_pane(request, &sm),
         methods::CREATE_WORKSPACE => handle_create_workspace(request, &sm),
+        // Split ratio + pinned session methods (B-002).
+        methods::UPDATE_SPLIT_RATIOS => handle_update_split_ratios(request, &sm),
+        methods::SET_PINNED => handle_set_pinned(request, &sm),
+        methods::GET_PINNED => handle_get_pinned(request, &sm),
         // Sync / pairing methods — require sync_endpoint.
         methods::LIST_DEVICES => handle_list_devices(request, sync_endpoint.as_deref()),
         methods::REVOKE_DEVICE => handle_revoke_device(request, sync_endpoint.as_deref()),
@@ -490,6 +494,59 @@ fn handle_create_workspace(request: &Request, sm: &SessionManager) -> Response {
             format!("create_workspace: create_tab failed: {e}"),
         ),
     }
+}
+
+fn handle_update_split_ratios(request: &Request, sm: &SessionManager) -> Response {
+    let ratios = match request.params.get("ratios").and_then(|v| v.as_array()) {
+        Some(arr) => arr,
+        None => {
+            return Response::error(
+                request.id.clone(),
+                protocol::INVALID_PARAMS,
+                "missing param: ratios (array of {pane_id, ratio})".to_string(),
+            )
+        }
+    };
+
+    let mut updates = Vec::new();
+    for entry in ratios {
+        let pane_id_str = match entry.get("pane_id").and_then(|v| v.as_str()) {
+            Some(s) => s,
+            None => continue,
+        };
+        let uuid = match Uuid::parse_str(pane_id_str) {
+            Ok(u) => u,
+            Err(_) => continue,
+        };
+        let ratio = match entry.get("ratio").and_then(|v| v.as_f64()) {
+            Some(r) => r as f32,
+            None => continue,
+        };
+        updates.push((PaneId(uuid), ratio));
+    }
+
+    sm.update_split_ratios(&updates);
+    Response::success(request.id.clone(), serde_json::json!({ "ok": true }))
+}
+
+fn handle_set_pinned(request: &Request, sm: &SessionManager) -> Response {
+    let pinned = match request.params.get("pinned").and_then(|v| v.as_bool()) {
+        Some(b) => b,
+        None => {
+            return Response::error(
+                request.id.clone(),
+                protocol::INVALID_PARAMS,
+                "missing param: pinned (bool)".to_string(),
+            )
+        }
+    };
+    sm.set_pinned(pinned);
+    Response::success(request.id.clone(), serde_json::json!({ "ok": true }))
+}
+
+fn handle_get_pinned(request: &Request, sm: &SessionManager) -> Response {
+    let pinned = sm.is_pinned();
+    Response::success(request.id.clone(), serde_json::json!({ "pinned": pinned }))
 }
 
 fn handle_split_pane(request: &Request, sm: &SessionManager) -> Response {

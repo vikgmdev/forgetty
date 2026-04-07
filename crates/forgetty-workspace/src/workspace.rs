@@ -24,6 +24,11 @@ pub struct WorkspaceState {
     /// Saved window height (pixels). `None` means use default.
     #[serde(default)]
     pub window_height: Option<i32>,
+    /// Whether this session is pinned. Pinned sessions survive normal close
+    /// (they stay in `sessions/` and auto-restore on next launch).
+    /// Old session files without this field default to `false`.
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 /// A single workspace — a named group of tabs rooted in one or more directories.
@@ -90,6 +95,7 @@ impl WorkspaceState {
             active_workspace: 0,
             window_width: None,
             window_height: None,
+            pinned: false,
         }
     }
 }

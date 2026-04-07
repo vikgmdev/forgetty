@@ -101,6 +101,7 @@ where
         active_workspace: layout.active_workspace,
         window_width: layout.window_width,
         window_height: layout.window_height,
+        pinned: false,
     }
 }
 

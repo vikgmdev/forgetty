@@ -73,8 +73,30 @@ fn main() {
         }
     });
 
+    // --restore-session <UUID>: move the trashed session back and launch it.
+    if let Some(restore_uuid) = args.restore_session {
+        match forgetty_workspace::restore_from_trash(restore_uuid) {
+            Ok(()) => {
+                tracing::info!("--restore-session: restored {restore_uuid} from trash");
+            }
+            Err(e) => {
+                tracing::warn!("--restore-session: failed to restore {restore_uuid}: {e}");
+                // Fall through to launch the session anyway — if the file is already
+                // in sessions/ (e.g. race with another restore), this still works.
+            }
+        }
+        let launch_opts = LaunchOptions { session_id: Some(restore_uuid), ..Default::default() };
+        if let Err(e) = forgetty_gtk::app::run(config, launch_opts) {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     // --restore-all: enumerate saved sessions and spawn one forgetty process per UUID.
     if args.restore_all {
+        // Auto-purge old trashed sessions before restoring.
+        forgetty_workspace::purge_old_trash(config.session_trash_days);
         let sessions = forgetty_workspace::list_sessions();
         if sessions.is_empty() {
             tracing::info!("--restore-all: no saved sessions found");
@@ -127,6 +149,8 @@ fn main() {
         && args.execute.is_empty();
 
     if is_bare_launch && config.on_launch == OnLaunch::Restore {
+        // Auto-purge old trashed sessions on bare launch.
+        forgetty_workspace::purge_old_trash(config.session_trash_days);
         let sessions = forgetty_workspace::list_sessions();
         if !sessions.is_empty() {
             // Filter out sessions that are already open in a live window before

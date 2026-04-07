@@ -217,10 +217,16 @@ async fn main_async() -> anyhow::Result<()> {
             Ok(Some(state)) if !state.workspaces.is_empty() => {
                 let total: usize = state.workspaces.iter().map(|ws| ws.tabs.len()).sum();
                 info!(
-                    "cold-start restore: found {} workspace(s), {} tab(s) total",
+                    "cold-start restore: found {} workspace(s), {} tab(s) total, pinned={}",
                     state.workspaces.len(),
-                    total
+                    total,
+                    state.pinned,
                 );
+
+                // Restore pinned state.
+                if state.pinned {
+                    session_manager.set_pinned(true);
+                }
 
                 // Ensure the daemon has enough workspace slots for all saved workspaces.
                 // SessionLayout::new_default() creates workspace[0]; create the rest.
@@ -472,23 +478,34 @@ fn restore_subtree(
     tree: &forgetty_workspace::PaneTreeState,
     size: forgetty_pty::PtySize,
 ) {
-    if let forgetty_workspace::PaneTreeState::Split { direction, ratio, first, second } = tree {
-        let second_cwd = first_leaf_cwd(second);
-        let effective_cwd = if second_cwd.is_dir() { Some(second_cwd.to_path_buf()) } else { None };
-
-        match session_manager.split_pane_with_ratio(
-            anchor_id,
-            direction,
-            *ratio,
-            size,
-            effective_cwd,
-        ) {
-            Ok(second_pane_id) => {
-                restore_subtree(session_manager, anchor_id, first, size);
-                restore_subtree(session_manager, second_pane_id, second, size);
+    match tree {
+        forgetty_workspace::PaneTreeState::Leaf { cwd, .. } => {
+            // Explicitly set the anchor pane's cached CWD to the saved value
+            // so that snapshot_to_workspace_state returns the correct CWD even
+            // before the drain loop has refreshed it from /proc/{pid}/cwd.
+            if cwd.is_dir() {
+                session_manager.set_pane_cwd(anchor_id, cwd.clone());
             }
-            Err(e) => {
-                warn!("cold-start restore: split_pane_with_ratio failed: {e}");
+        }
+        forgetty_workspace::PaneTreeState::Split { direction, ratio, first, second } => {
+            let second_cwd = first_leaf_cwd(second);
+            let effective_cwd =
+                if second_cwd.is_dir() { Some(second_cwd.to_path_buf()) } else { None };
+
+            match session_manager.split_pane_with_ratio(
+                anchor_id,
+                direction,
+                *ratio,
+                size,
+                effective_cwd,
+            ) {
+                Ok(second_pane_id) => {
+                    restore_subtree(session_manager, anchor_id, first, size);
+                    restore_subtree(session_manager, second_pane_id, second, size);
+                }
+                Err(e) => {
+                    warn!("cold-start restore: split_pane_with_ratio failed: {e}");
+                }
             }
         }
     }

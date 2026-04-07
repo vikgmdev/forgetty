@@ -553,6 +553,45 @@ impl DaemonClient {
         Ok(())
     }
 
+    /// Push updated split ratios to the daemon's layout tree.
+    ///
+    /// Each entry is `(pane_id, ratio)`. Called by GTK's close handler so the
+    /// daemon saves the actual widget-measured ratios, not stale creation-time
+    /// values.
+    pub fn update_split_ratios(&self, ratios: &[(PaneId, f32)]) -> Result<(), DaemonError> {
+        let entries: Vec<serde_json::Value> = ratios
+            .iter()
+            .map(|(pid, r)| {
+                serde_json::json!({
+                    "pane_id": pid.to_string(),
+                    "ratio": *r,
+                })
+            })
+            .collect();
+        self.rpc("update_split_ratios", serde_json::json!({ "ratios": entries }))?;
+        Ok(())
+    }
+
+    /// Set the pinned state of this session.
+    pub fn set_pinned(&self, pinned: bool) -> Result<(), DaemonError> {
+        self.rpc("set_pinned", serde_json::json!({ "pinned": pinned }))?;
+        Ok(())
+    }
+
+    /// Get the pinned state of this session.
+    pub fn get_pinned(&self) -> Result<bool, DaemonError> {
+        let result = self.rpc("get_pinned", serde_json::json!({}))?;
+        Ok(result.get("pinned").and_then(|v| v.as_bool()).unwrap_or(false))
+    }
+
+    /// Request the daemon to save, move session to trash, then exit.
+    ///
+    /// Used for browser-model close: the session is recoverable from trash
+    /// but will not auto-restore on next launch.
+    pub fn shutdown_clean(&self) {
+        let _ = self.rpc("shutdown_clean", serde_json::json!({}));
+    }
+
     /// Request the daemon to save its session file and exit.
     ///
     /// Used on every normal GTK window close (X button, Ctrl+Shift+Q, SIGTERM).

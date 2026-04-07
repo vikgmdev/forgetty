@@ -126,6 +126,160 @@ fn load_from_path(path: &std::path::Path) -> io::Result<Option<WorkspaceState>> 
 }
 
 // ---------------------------------------------------------------------------
+// Session trash (B-002: browser-model lifecycle)
+// ---------------------------------------------------------------------------
+
+/// Return the path to the trash directory for closed sessions.
+///
+/// Typically `~/.local/share/forgetty/sessions/trash/`.
+pub fn trash_dir() -> PathBuf {
+    data_dir().join("sessions").join("trash")
+}
+
+/// Move a session file from `sessions/{uuid}.json` to `sessions/trash/{uuid}.json`.
+///
+/// Creates the trash directory if needed. Uses `rename()` for atomicity (same
+/// filesystem). Falls back to copy+delete if rename fails (unusual XDG_DATA_HOME).
+pub fn trash_session_for(session_id: uuid::Uuid) -> io::Result<()> {
+    let src = session_path_for(session_id);
+    if !src.exists() {
+        return Ok(());
+    }
+    let dest_dir = trash_dir();
+    fs::create_dir_all(&dest_dir)?;
+    let dest = dest_dir.join(format!("{session_id}.json"));
+    if let Err(_) = fs::rename(&src, &dest) {
+        // Cross-device fallback: copy then remove.
+        fs::copy(&src, &dest)?;
+        fs::remove_file(&src)?;
+    }
+    Ok(())
+}
+
+/// Restore a session from trash: move from `sessions/trash/{uuid}.json` back to
+/// `sessions/{uuid}.json`.
+pub fn restore_from_trash(session_id: uuid::Uuid) -> io::Result<()> {
+    let src = trash_dir().join(format!("{session_id}.json"));
+    if !src.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("trash file not found: {}", src.display()),
+        ));
+    }
+    let dest = session_path_for(session_id);
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if let Err(_) = fs::rename(&src, &dest) {
+        fs::copy(&src, &dest)?;
+        fs::remove_file(&src)?;
+    }
+    Ok(())
+}
+
+/// Delete the session file permanently (no trash copy).
+pub fn delete_session_for(session_id: uuid::Uuid) -> io::Result<()> {
+    let path = session_path_for(session_id);
+    if path.exists() {
+        fs::remove_file(&path)?;
+    }
+    Ok(())
+}
+
+/// List all trashed session UUIDs.
+pub fn list_trashed_sessions() -> Vec<uuid::Uuid> {
+    let base = trash_dir();
+    fs::read_dir(&base)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let s = name.to_string_lossy();
+            let stem = s.strip_suffix(".json")?;
+            uuid::Uuid::parse_str(stem).ok()
+        })
+        .collect()
+}
+
+/// Metadata about a trashed session (for the restore dialog).
+#[derive(Debug, Clone)]
+pub struct TrashedSessionInfo {
+    pub session_id: uuid::Uuid,
+    pub workspace_names: Vec<String>,
+    pub tab_count: usize,
+    pub closed_at: std::time::SystemTime,
+}
+
+/// List trashed sessions with metadata for the restore dialog.
+pub fn list_trashed_sessions_with_info() -> Vec<TrashedSessionInfo> {
+    let base = trash_dir();
+    let mut infos = Vec::new();
+    let entries = match fs::read_dir(&base) {
+        Ok(e) => e,
+        Err(_) => return infos,
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let s = name.to_string_lossy().to_string();
+        let stem = match s.strip_suffix(".json") {
+            Some(s) => s,
+            None => continue,
+        };
+        let session_id = match uuid::Uuid::parse_str(stem) {
+            Ok(u) => u,
+            Err(_) => continue,
+        };
+        let metadata = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let closed_at = metadata.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+
+        // Try to parse the file for workspace names and tab count.
+        let (workspace_names, tab_count) = match load_from_path(&entry.path()) {
+            Ok(Some(state)) => {
+                let names: Vec<String> =
+                    state.workspaces.iter().map(|ws| ws.name.clone()).collect();
+                let tabs: usize = state.workspaces.iter().map(|ws| ws.tabs.len()).sum();
+                (names, tabs)
+            }
+            _ => (vec!["Unknown".to_string()], 0),
+        };
+
+        infos.push(TrashedSessionInfo { session_id, workspace_names, tab_count, closed_at });
+    }
+    // Sort by most recently closed first.
+    infos.sort_by(|a, b| b.closed_at.cmp(&a.closed_at));
+    infos
+}
+
+/// Purge trashed sessions older than `max_days` days.
+///
+/// `max_days == 0` disables purging (trash kept forever).
+pub fn purge_old_trash(max_days: u32) {
+    if max_days == 0 {
+        return;
+    }
+    let base = trash_dir();
+    let entries = match fs::read_dir(&base) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let cutoff =
+        std::time::SystemTime::now() - std::time::Duration::from_secs(max_days as u64 * 86400);
+    for entry in entries.flatten() {
+        if let Ok(metadata) = entry.metadata() {
+            let modified = metadata.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            if modified < cutoff {
+                let _ = fs::remove_file(entry.path());
+                tracing::info!("purge_old_trash: deleted {}", entry.path().display());
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // VT snapshot persistence (T-058)
 // ---------------------------------------------------------------------------
 
@@ -232,6 +386,7 @@ mod tests {
             active_workspace: 0,
             window_width: Some(960),
             window_height: Some(640),
+            pinned: false,
         }
     }
 
@@ -373,6 +528,7 @@ mod tests {
             active_workspace: 1,
             window_width: Some(1200),
             window_height: Some(800),
+            pinned: false,
         };
 
         let json = serde_json::to_string_pretty(&state).unwrap();
@@ -419,6 +575,7 @@ mod tests {
             active_workspace: 0,
             window_width: None,
             window_height: None,
+            pinned: false,
         };
 
         let json = serde_json::to_string_pretty(&state).unwrap();

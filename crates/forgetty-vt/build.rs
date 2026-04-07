@@ -73,6 +73,21 @@ fn main() {
         panic!("zig build failed with exit code: {:?}", status.code());
     }
 
+    // Android: patch libghostty-vt.so soname from libghostty-vt.so.0 → libghostty-vt.so.
+    //
+    // Zig uses Linux versioned-soname convention (libghostty-vt.so.0) even when
+    // targeting Android. Android's dynamic linker resolves NEEDED by *filename*,
+    // not soname, so it looks for a file literally named "libghostty-vt.so.0" —
+    // which doesn't exist in the APK (only "libghostty-vt.so" is packaged).
+    //
+    // Patching the soname here (before Rust links against the library) ensures
+    // that libforgetty_android.so bakes in NEEDED=libghostty-vt.so, which the
+    // Android linker resolves correctly from jniLibs.
+    if is_android {
+        let lib_dir_early = install_prefix.join("lib");
+        patch_android_soname(&lib_dir_early);
+    }
+
     // Tell cargo where to find the library.
     // Use the shared library (.so) because it bundles simdutf and all dependencies.
     // The static library has undefined simdutf symbols that aren't separately available.
@@ -248,6 +263,82 @@ fn find_target_profile_dir(out_dir: &std::path::Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Patch libghostty-vt.so soname from `libghostty-vt.so.0` to `libghostty-vt.so` for Android.
+///
+/// Zig sets a Linux-style versioned soname even when cross-compiling for Android.
+/// Android's dynamic linker resolves NEEDED entries by filename, so the library file
+/// must be named exactly what NEEDED says. Since we package only `libghostty-vt.so`
+/// (not `libghostty-vt.so.0`) in jniLibs, the soname must match.
+///
+/// Tries patchelf first. Falls back to a direct binary patch (safe: replaces a known
+/// fixed-length null-terminated string in .dynstr with a shorter one + null padding).
+fn patch_android_soname(lib_dir: &std::path::Path) {
+    use std::fs;
+
+    let so_path = lib_dir.join("libghostty-vt.so");
+    if !so_path.exists() {
+        println!("cargo:warning=patch_android_soname: {} not found, skipping", so_path.display());
+        return;
+    }
+
+    // Try patchelf first.
+    let patchelf_ok = Command::new("patchelf")
+        .args(["--set-soname", "libghostty-vt.so"])
+        .arg(&so_path)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    if patchelf_ok {
+        println!(
+            "cargo:warning=Patched libghostty-vt.so soname → libghostty-vt.so (Android, patchelf)"
+        );
+        return;
+    }
+
+    // Fallback: binary patch. Safe because:
+    // - "libghostty-vt.so.0\0" (20 bytes) → "libghostty-vt.so\0\0\0\0" (20 bytes)
+    // - Extra nulls are inert in .dynstr (empty string entries).
+    // - We only patch the first occurrence; it's always in .dynstr.
+    let mut data = match fs::read(&so_path) {
+        Ok(d) => d,
+        Err(e) => {
+            println!(
+                "cargo:warning=patch_android_soname: failed to read {}: {e}",
+                so_path.display()
+            );
+            return;
+        }
+    };
+
+    // "libghostty-vt.so.0\0" = 18 chars + null = 19 bytes
+    // "libghostty-vt.so\0\0\0" = 16 chars + null + 2 padding = 19 bytes
+    let old: &[u8] = b"libghostty-vt.so.0\0";
+    let new: &[u8] = b"libghostty-vt.so\0\0\0";
+    debug_assert_eq!(old.len(), new.len());
+
+    if let Some(pos) = data.windows(old.len()).position(|w| w == old) {
+        data[pos..pos + old.len()].copy_from_slice(new);
+        match fs::write(&so_path, &data) {
+            Ok(()) => println!(
+                "cargo:warning=Patched libghostty-vt.so soname → libghostty-vt.so (Android, binary patch)"
+            ),
+            Err(e) => println!(
+                "cargo:warning=patch_android_soname: write failed: {e}. \
+                 Install patchelf for a reliable fix: apt install patchelf"
+            ),
+        }
+    } else {
+        println!(
+            "cargo:warning=patch_android_soname: soname string not found in {}. \
+             Already patched, or Zig changed its output format. \
+             Verify with: readelf -d {} | grep SONAME",
+            so_path.display(),
+            so_path.display()
+        );
+    }
 }
 
 /// Find the Zig compiler binary.

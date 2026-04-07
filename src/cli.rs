@@ -40,4 +40,11 @@ pub struct Args {
     /// normally but no session file is written on close.
     #[arg(long)]
     pub temp: bool,
+
+    /// Restore a specific trashed session by UUID.
+    ///
+    /// Moves the session file from `sessions/trash/` back to `sessions/`,
+    /// then launches the session. Used by the undo-close notification action.
+    #[arg(long)]
+    pub restore_session: Option<uuid::Uuid>,
 }

@@ -151,6 +151,10 @@ pub struct Config {
     /// newlines (`\n`), which could immediately execute commands in a shell.
     /// Default: `true`.
     pub paste_warn_newline: bool,
+
+    /// Number of days to keep trashed sessions before auto-purge.
+    /// `0` disables purging (trash kept forever). Default: `7`.
+    pub session_trash_days: u32,
 }
 
 impl Default for Config {
@@ -227,6 +231,10 @@ impl Serialize for Config {
         map.serialize_entry("paste_warn_size", &self.paste_warn_size)?;
         map.serialize_entry("paste_warn_newline", &self.paste_warn_newline)?;
 
+        if self.session_trash_days != 7 {
+            map.serialize_entry("session_trash_days", &self.session_trash_days)?;
+        }
+
         map.end()
     }
 }
@@ -289,6 +297,9 @@ impl<'de> Deserialize<'de> for Config {
 
             #[serde(default = "default_paste_warn_newline")]
             paste_warn_newline: bool,
+
+            #[serde(default = "default_session_trash_days")]
+            session_trash_days: u32,
         }
 
         let raw = RawConfig::deserialize(deserializer)?;
@@ -361,6 +372,7 @@ impl<'de> Deserialize<'de> for Config {
             default_profile: raw.default_profile,
             paste_warn_size: raw.paste_warn_size,
             paste_warn_newline: raw.paste_warn_newline,
+            session_trash_days: raw.session_trash_days,
         })
     }
 }
@@ -383,4 +395,8 @@ fn default_paste_warn_size() -> usize {
 
 fn default_paste_warn_newline() -> bool {
     true
+}
+
+fn default_session_trash_days() -> u32 {
+    7
 }

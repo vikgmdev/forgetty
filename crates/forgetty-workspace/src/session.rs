@@ -53,3 +53,37 @@ pub fn load_session_for(session_id: uuid::Uuid) -> std::io::Result<Option<Worksp
 pub fn list_sessions() -> Vec<uuid::Uuid> {
     persistence::list_sessions()
 }
+
+// ---------------------------------------------------------------------------
+// Session trash functions (B-002)
+// ---------------------------------------------------------------------------
+
+/// Move a session file to trash (browser-model close).
+pub fn trash_session_for(session_id: uuid::Uuid) -> std::io::Result<()> {
+    persistence::trash_session_for(session_id)
+}
+
+/// Restore a session from trash back to the active sessions directory.
+pub fn restore_from_trash(session_id: uuid::Uuid) -> std::io::Result<()> {
+    persistence::restore_from_trash(session_id)
+}
+
+/// Delete a session file permanently (no trash copy).
+pub fn delete_session_for(session_id: uuid::Uuid) -> std::io::Result<()> {
+    persistence::delete_session_for(session_id)
+}
+
+/// List all trashed session UUIDs.
+pub fn list_trashed_sessions() -> Vec<uuid::Uuid> {
+    persistence::list_trashed_sessions()
+}
+
+/// List trashed sessions with metadata.
+pub fn list_trashed_sessions_with_info() -> Vec<persistence::TrashedSessionInfo> {
+    persistence::list_trashed_sessions_with_info()
+}
+
+/// Purge trashed sessions older than `max_days` days.
+pub fn purge_old_trash(max_days: u32) {
+    persistence::purge_old_trash(max_days)
+}
