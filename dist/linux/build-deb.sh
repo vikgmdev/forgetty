@@ -26,11 +26,18 @@ error() { printf "${RED}[!]${RESET} %s\n" "$1" >&2; }
 
 # ── Pre-flight checks ──────────────────────────────────────────────
 BINARY="$PROJECT_ROOT/target/release/forgetty"
+DAEMON_BINARY="$PROJECT_ROOT/target/release/forgetty-daemon"
 SO_FILE="$PROJECT_ROOT/target/release/lib/libghostty-vt.so.0.1.0"
 
 if [ ! -f "$BINARY" ]; then
     error "Release binary not found: $BINARY"
     error "Run 'cargo build --release' first."
+    exit 1
+fi
+
+if [ ! -f "$DAEMON_BINARY" ]; then
+    error "Daemon binary not found: $DAEMON_BINARY"
+    error "Run 'cargo build --release --bin forgetty-daemon' first."
     exit 1
 fi
 
@@ -73,8 +80,11 @@ mkdir -p "$STAGING/usr/share/man/man1"
 mkdir -p "$STAGING/usr/share/doc/forgetty"
 
 # ── Copy files ──────────────────────────────────────────────────────
-info "Copying binary"
+info "Copying GTK binary"
 install -Dm755 "$BINARY" "$STAGING/usr/bin/forgetty"
+
+info "Copying daemon binary"
+install -Dm755 "$DAEMON_BINARY" "$STAGING/usr/bin/forgetty-daemon"
 
 info "Copying shared library"
 install -Dm755 "$SO_FILE" "$STAGING/usr/lib/forgetty/libghostty-vt.so.0.1.0"
