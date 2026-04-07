@@ -4633,6 +4633,7 @@ fn copy_selection(
     let (_, orig_offset, _) = s.terminal.scrollbar_state();
 
     let mut lines: Vec<String> = Vec::new();
+    let mut wrap_flags: Vec<bool> = Vec::new();
     let mut cursor = sr; // absolute row we need to read next
 
     while cursor <= er {
@@ -4679,7 +4680,36 @@ fn copy_selection(
             for col in col_start..=col_end.min(cells.len().saturating_sub(1)) {
                 line.push_str(&cells[col].grapheme);
             }
+
+            // Soft-wrap detection: use the real wrap flag from libghostty-vt
+            // when available (works for command output). For shell input (typed
+            // commands), the shell manages wrapping via escape sequences and the
+            // terminal never sets the wrap flag — fall back to a heuristic:
+            // if the row's content fills most of the terminal width, treat it
+            // as soft-wrapped.
+            let is_wrapped = if screen.is_row_wrapped(screen_row) {
+                true
+            } else if abs_row < er && num_cols > 10 {
+                // Heuristic: count trailing space cells. Shell-wrapped lines
+                // fill nearly the full row, breaking at word boundaries (leaving
+                // a few trailing spaces). Hard-newline lines typically have much
+                // more trailing whitespace.
+                let mut trailing_spaces = 0usize;
+                for c in cells.iter().rev() {
+                    if c.grapheme == " " {
+                        trailing_spaces += 1;
+                    } else {
+                        break;
+                    }
+                }
+                // Row is "nearly full" if content occupies > 80% of the width
+                trailing_spaces < num_cols / 5
+            } else {
+                false // last selected row is never wrapped
+            };
+
             lines.push(line);
+            wrap_flags.push(is_wrapped);
         }
 
         cursor = page_end + 1;
@@ -4692,7 +4722,31 @@ fn copy_selection(
         s.terminal.scroll_viewport_delta(restore);
     }
 
-    let raw_text = lines.join("\n");
+    // Join lines, skipping `\n` between soft-wrapped rows.
+    // When joining wrapped rows: trim trailing whitespace from the wrapped row
+    // AND trim leading whitespace from the continuation row (shell line editors
+    // add indentation on continuation lines that isn't part of the text).
+    let mut raw_text = String::new();
+    for (i, line) in lines.iter().enumerate() {
+        // If the previous row was wrapped, this is a continuation — strip
+        // the shell's continuation indent (leading whitespace).
+        let text: &str = if i > 0 && wrap_flags[i - 1] { line.trim_start() } else { line };
+
+        if wrap_flags[i] {
+            // This row continues on the next — trim trailing padding but
+            // preserve one space as word separator if the original had any.
+            let trimmed = text.trim_end();
+            raw_text.push_str(trimmed);
+            if text.len() > trimmed.len() {
+                raw_text.push(' ');
+            }
+        } else {
+            raw_text.push_str(text);
+            if i + 1 < lines.len() {
+                raw_text.push('\n');
+            }
+        }
+    }
 
     if raw_text.is_empty() {
         return;

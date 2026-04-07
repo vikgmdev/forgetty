@@ -80,13 +80,23 @@ pub struct Screen {
     row_generations: Vec<u64>,
     /// Global generation counter.
     generation: u64,
+    /// Per-row soft-wrap flag. `true` means the row's content continues on
+    /// the next row (no hard newline at the end).
+    row_wraps: Vec<bool>,
 }
 
 impl Screen {
     /// Create a new screen with the given dimensions, filled with blank cells.
     pub fn new(rows: usize, cols: usize) -> Self {
         let cells = (0..rows).map(|_| (0..cols).map(|_| Cell::default()).collect()).collect();
-        Self { cells, rows, cols, row_generations: vec![0; rows], generation: 0 }
+        Self {
+            cells,
+            rows,
+            cols,
+            row_generations: vec![0; rows],
+            generation: 0,
+            row_wraps: vec![false; rows],
+        }
     }
 
     /// Get a cell at (row, col).
@@ -125,6 +135,7 @@ impl Screen {
         // Add or remove rows
         self.cells.resize_with(rows, || (0..cols).map(|_| Cell::default()).collect());
         self.row_generations.resize(rows, 0);
+        self.row_wraps.resize(rows, false);
         self.rows = rows;
         self.cols = cols;
         self.generation += 1;
@@ -138,6 +149,19 @@ impl Screen {
     /// Get the current generation counter.
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Returns `true` if the given row is soft-wrapped (its content
+    /// continues on the next row without a hard newline).
+    pub fn is_row_wrapped(&self, row: usize) -> bool {
+        self.row_wraps.get(row).copied().unwrap_or(false)
+    }
+
+    /// Set the soft-wrap flag for a row.
+    pub(crate) fn set_row_wrap(&mut self, row: usize, wrapped: bool) {
+        if row < self.row_wraps.len() {
+            self.row_wraps[row] = wrapped;
+        }
     }
 
     /// Replace the entire grid from an externally-built cell matrix.
@@ -203,6 +227,7 @@ impl Screen {
             self.cells.truncate(rows);
         }
         self.row_generations.resize(rows, 0);
+        self.row_wraps.resize(rows, false);
         self.rows = rows;
         self.cols = cols;
     }

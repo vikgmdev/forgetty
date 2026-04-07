@@ -226,6 +226,7 @@ pub const GHOSTTY_RENDER_STATE_OPTION_DIRTY: i32 = 0;
 
 // Row data types
 pub const GHOSTTY_RENDER_STATE_ROW_DATA_DIRTY: i32 = 1;
+pub const GHOSTTY_RENDER_STATE_ROW_DATA_RAW: i32 = 2;
 pub const GHOSTTY_RENDER_STATE_ROW_DATA_CELLS: i32 = 3;
 
 // Row option

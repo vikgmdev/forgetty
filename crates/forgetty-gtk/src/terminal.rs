@@ -30,6 +30,7 @@ use gtk4::pango;
 use gtk4::prelude::*;
 use gtk4::{glib, DrawingArea};
 
+use crate::code_block::{self, CodeBlock};
 use crate::daemon_client::DaemonClient;
 use crate::input::{GhosttyInput, ScrollAction};
 use crate::pty_bridge;
@@ -158,6 +159,17 @@ pub struct TerminalState {
     /// Wired by `app.rs` to handle tab badge updates and desktop notifications.
     /// `None` until the caller registers it via `set_on_notify()`.
     pub on_notify: Option<Rc<dyn Fn(NotificationPayload)>>,
+    /// Currently hovered code block (if any) for overlay rendering and copy button.
+    pub hovered_code_block: Option<CodeBlock>,
+    /// All code blocks detected in the current viewport.
+    pub detected_code_blocks: Vec<CodeBlock>,
+    /// Screen generation when code blocks were last scanned.
+    pub code_blocks_generation: u64,
+    /// Deadline for showing checkmark icon after a successful copy.
+    pub copy_confirmed_until: Option<Instant>,
+    /// Last cell checked for code block hover (row, col). Avoids re-scanning
+    /// on sub-pixel motion within the same cell.
+    pub last_hover_block_cell: (usize, usize),
     /// For daemon-backed panes: the remote pane ID in the daemon.
     pub daemon_pane_id: Option<forgetty_core::PaneId>,
     /// For daemon-backed panes: handle for routing write-pty responses.
@@ -347,6 +359,11 @@ pub fn create_terminal(
         notification_ring: false,
         last_notification: Instant::now() - Duration::from_secs(10),
         on_notify,
+        hovered_code_block: None,
+        detected_code_blocks: Vec::new(),
+        code_blocks_generation: u64::MAX, // force re-scan on first motion
+        copy_confirmed_until: None,
+        last_hover_block_cell: (usize::MAX, usize::MAX),
         daemon_pane_id: None,
         daemon_client: None,
         daemon_cwd: None,
@@ -851,6 +868,36 @@ pub fn create_terminal(
                     return;
                 };
 
+                // --- Code block copy button click (T-032) ---
+                // Check before selection logic so the click is consumed.
+                if button == 1 && n_press == 1 {
+                    if let Some(ref block) = s.hovered_code_block {
+                        let cell_w = s.cell_width;
+                        let cell_h = s.cell_height;
+                        let scale = da_click.scale_factor() as f64;
+                        let btn_size = (24.0 * scale).max(24.0);
+                        let btn_x = (block.right_col as f64 + 1.0) * cell_w - btn_size;
+                        let btn_y = block.top_row as f64 * cell_h;
+                        if x >= btn_x
+                            && x <= btn_x + btn_size
+                            && y >= btn_y
+                            && y <= btn_y + btn_size
+                        {
+                            let screen = s.terminal.screen();
+                            let content = code_block::extract_content(screen, block);
+                            if !content.is_empty() {
+                                let display = da_click.display();
+                                display.clipboard().set_text(&content);
+                                s.copy_confirmed_until =
+                                    Some(Instant::now() + Duration::from_millis(1500));
+                                drop(s);
+                                da_click.queue_draw();
+                            }
+                            return;
+                        }
+                    }
+                }
+
                 let mouse_tracking = s.terminal.is_mouse_tracking();
 
                 // Shift+Click overrides mouse tracking (AC-15): force selection
@@ -1133,16 +1180,47 @@ pub fn create_terminal(
                 s.last_hover_cell = (screen_row, col);
                 let screen = s.terminal.screen();
                 let new_hover = detect_url_at(screen, screen_row, col);
-                let changed = s.hover_url != new_hover;
-                if changed {
+                let url_changed = s.hover_url != new_hover;
+                if url_changed {
                     let want_pointer = new_hover.is_some();
                     s.hover_url = new_hover;
-                    drop(s);
                     if want_pointer {
                         da_motion.set_cursor_from_name(Some("pointer"));
                     } else {
                         da_motion.set_cursor_from_name(Some("text"));
                     }
+                }
+
+                // --- Code block hover detection (T-032) ---
+                let mut block_changed = false;
+                let mt = s.terminal.is_mouse_tracking();
+                let alt = s.terminal.is_alternate_screen();
+                if !mt && !alt {
+                    let gen = s.terminal.screen().generation();
+                    if gen != s.code_blocks_generation {
+                        let screen = s.terminal.screen();
+                        s.detected_code_blocks = code_block::detect_code_blocks(screen);
+                        s.code_blocks_generation = gen;
+                    }
+                    if s.last_hover_block_cell != (screen_row, col) {
+                        s.last_hover_block_cell = (screen_row, col);
+                        let new_block = s
+                            .detected_code_blocks
+                            .iter()
+                            .find(|b| b.contains(screen_row, col))
+                            .cloned();
+                        if s.hovered_code_block != new_block {
+                            s.hovered_code_block = new_block;
+                            block_changed = true;
+                        }
+                    }
+                } else if s.hovered_code_block.is_some() {
+                    s.hovered_code_block = None;
+                    block_changed = true;
+                }
+
+                if url_changed || block_changed {
+                    drop(s);
                     da_motion.queue_draw();
                 }
             });
@@ -1156,8 +1234,16 @@ pub fn create_terminal(
                 let Ok(mut s) = state.try_borrow_mut() else {
                     return;
                 };
-                if s.hover_url.is_some() {
+                let had_url = s.hover_url.is_some();
+                let had_block = s.hovered_code_block.is_some();
+                if had_url {
                     s.hover_url = None;
+                }
+                if had_block {
+                    s.hovered_code_block = None;
+                    s.last_hover_block_cell = (usize::MAX, usize::MAX);
+                }
+                if had_url || had_block {
                     drop(s);
                     da_leave.set_cursor_from_name(Some("text"));
                     da_leave.queue_draw();
@@ -1225,6 +1311,8 @@ pub fn create_terminal(
                 // Clear stale hover state after scroll (content under cursor shifted)
                 s.hover_url = None;
                 s.last_hover_cell = (usize::MAX, usize::MAX);
+                s.hovered_code_block = None;
+                s.last_hover_block_cell = (usize::MAX, usize::MAX);
 
                 drop(s);
                 da_scroll.set_cursor_from_name(Some("text"));
@@ -1612,6 +1700,11 @@ pub fn create_terminal_for_pane(
         notification_ring: false,
         last_notification: Instant::now() - Duration::from_secs(10),
         on_notify,
+        hovered_code_block: None,
+        detected_code_blocks: Vec::new(),
+        code_blocks_generation: u64::MAX, // force re-scan on first motion
+        copy_confirmed_until: None,
+        last_hover_block_cell: (usize::MAX, usize::MAX),
         daemon_pane_id: Some(pane_id),
         daemon_client: Some(daemon_client),
         daemon_cwd: cwd,
@@ -2037,6 +2130,35 @@ pub fn create_terminal_for_pane(
                     }
                 }
 
+                // --- Code block copy button click (T-032) ---
+                if button == 1 && n_press == 1 {
+                    if let Some(ref block) = s.hovered_code_block {
+                        let cell_w = s.cell_width;
+                        let cell_h = s.cell_height;
+                        let scale = da_click.scale_factor() as f64;
+                        let btn_size = (24.0 * scale).max(24.0);
+                        let btn_x = (block.right_col as f64 + 1.0) * cell_w - btn_size;
+                        let btn_y = block.top_row as f64 * cell_h;
+                        if x >= btn_x
+                            && x <= btn_x + btn_size
+                            && y >= btn_y
+                            && y <= btn_y + btn_size
+                        {
+                            let screen = s.terminal.screen();
+                            let content = code_block::extract_content(screen, block);
+                            if !content.is_empty() {
+                                let display = da_click.display();
+                                display.clipboard().set_text(&content);
+                                s.copy_confirmed_until =
+                                    Some(Instant::now() + Duration::from_millis(1500));
+                                drop(s);
+                                da_click.queue_draw();
+                            }
+                            return;
+                        }
+                    }
+                }
+
                 if button != 1 {
                     return;
                 }
@@ -2278,16 +2400,45 @@ pub fn create_terminal_for_pane(
                 s.last_hover_cell = (screen_row, col);
                 let screen = s.terminal.screen();
                 let new_hover = detect_url_at(screen, screen_row, col);
-                let changed = s.hover_url != new_hover;
-                if changed {
+                let url_changed = s.hover_url != new_hover;
+                if url_changed {
                     let want_pointer = new_hover.is_some();
                     s.hover_url = new_hover;
-                    drop(s);
                     if want_pointer {
                         da_motion.set_cursor_from_name(Some("pointer"));
                     } else {
                         da_motion.set_cursor_from_name(Some("text"));
                     }
+                }
+
+                // --- Code block hover detection (T-032) ---
+                let mut block_changed = false;
+                if !s.terminal.is_mouse_tracking() && !s.terminal.is_alternate_screen() {
+                    let gen = s.terminal.screen().generation();
+                    if gen != s.code_blocks_generation {
+                        let screen = s.terminal.screen();
+                        s.detected_code_blocks = code_block::detect_code_blocks(screen);
+                        s.code_blocks_generation = gen;
+                    }
+                    if s.last_hover_block_cell != (screen_row, col) {
+                        s.last_hover_block_cell = (screen_row, col);
+                        let new_block = s
+                            .detected_code_blocks
+                            .iter()
+                            .find(|b| b.contains(screen_row, col))
+                            .cloned();
+                        if s.hovered_code_block != new_block {
+                            s.hovered_code_block = new_block;
+                            block_changed = true;
+                        }
+                    }
+                } else if s.hovered_code_block.is_some() {
+                    s.hovered_code_block = None;
+                    block_changed = true;
+                }
+
+                if url_changed || block_changed {
+                    drop(s);
                     da_motion.queue_draw();
                 }
             });
@@ -2300,8 +2451,16 @@ pub fn create_terminal_for_pane(
                 let Ok(mut s) = state.try_borrow_mut() else {
                     return;
                 };
-                if s.hover_url.is_some() {
+                let had_url = s.hover_url.is_some();
+                let had_block = s.hovered_code_block.is_some();
+                if had_url {
                     s.hover_url = None;
+                }
+                if had_block {
+                    s.hovered_code_block = None;
+                    s.last_hover_block_cell = (usize::MAX, usize::MAX);
+                }
+                if had_url || had_block {
                     drop(s);
                     da_leave.set_cursor_from_name(Some("text"));
                     da_leave.queue_draw();
@@ -2362,6 +2521,8 @@ pub fn create_terminal_for_pane(
 
                 s.hover_url = None;
                 s.last_hover_cell = (usize::MAX, usize::MAX);
+                s.hovered_code_block = None;
+                s.last_hover_block_cell = (usize::MAX, usize::MAX);
 
                 drop(s);
                 da_scroll.set_cursor_from_name(Some("text"));
@@ -3455,6 +3616,10 @@ fn draw_terminal(
     // Clone hover URL state for rendering
     let hover_url = s.hover_url.clone();
 
+    // Clone code block hover state for rendering
+    let hovered_code_block = s.hovered_code_block.clone();
+    let copy_confirmed_until = s.copy_confirmed_until;
+
     // Filter all_matches to the current viewport for drawing.
     // The full scrollback scan (all_matches) is done once when the query
     // changes.  Here we just recompute the viewport-relative subset so
@@ -3906,4 +4071,141 @@ fn draw_terminal(
         ctx.rectangle(1.5, 1.5, width as f64 - 3.0, height as f64 - 3.0);
         ctx.stroke().ok();
     }
+
+    // 10. Code block hover overlay + copy button (T-032).
+    //
+    // When the mouse hovers over a detected code block (box-drawing bordered
+    // region), draw a subtle highlight on the border cells and a copy button
+    // in the top-right corner. Clicking the button copies the inner content.
+    if let Some(ref block) = hovered_code_block {
+        // 10a. Subtle highlight on border cells.
+        // Determine overlay color based on theme brightness:
+        // dark themes get a white wash, light themes get a dark wash.
+        let bg_luma =
+            bg_color.r as f64 * 0.299 + bg_color.g as f64 * 0.587 + bg_color.b as f64 * 0.114;
+        let is_dark_theme = bg_luma < 128.0;
+        if is_dark_theme {
+            ctx.set_source_rgba(1.0, 1.0, 1.0, 0.08);
+        } else {
+            ctx.set_source_rgba(0.0, 0.0, 0.0, 0.06);
+        }
+
+        // Top border row
+        if block.top_row < num_rows {
+            let bx = block.left_col as f64 * cell_w;
+            let by = block.top_row as f64 * cell_h;
+            let bw = (block.right_col - block.left_col + 1) as f64 * cell_w;
+            ctx.rectangle(bx, by, bw, cell_h);
+            ctx.fill().ok();
+        }
+        // Bottom border row
+        if block.bottom_row < num_rows {
+            let bx = block.left_col as f64 * cell_w;
+            let by = block.bottom_row as f64 * cell_h;
+            let bw = (block.right_col - block.left_col + 1) as f64 * cell_w;
+            ctx.rectangle(bx, by, bw, cell_h);
+            ctx.fill().ok();
+        }
+        // Left border column (excluding corners already drawn)
+        for row in (block.top_row + 1)..block.bottom_row {
+            if row < num_rows {
+                ctx.rectangle(block.left_col as f64 * cell_w, row as f64 * cell_h, cell_w, cell_h);
+                ctx.fill().ok();
+            }
+        }
+        // Right border column (excluding corners already drawn)
+        for row in (block.top_row + 1)..block.bottom_row {
+            if row < num_rows {
+                ctx.rectangle(block.right_col as f64 * cell_w, row as f64 * cell_h, cell_w, cell_h);
+                ctx.fill().ok();
+            }
+        }
+
+        // 10b. Copy button in the top-right corner of the block.
+        let scale = da.scale_factor() as f64;
+        let btn_size = (24.0 * scale).max(24.0);
+        let btn_x = (block.right_col as f64 + 1.0) * cell_w - btn_size;
+        let btn_y = block.top_row as f64 * cell_h;
+
+        // Button background: rounded rectangle
+        let btn_radius = 4.0;
+        draw_rounded_rect(ctx, btn_x, btn_y, btn_size, btn_size, btn_radius);
+        if is_dark_theme {
+            ctx.set_source_rgba(0.0, 0.0, 0.0, 0.6);
+        } else {
+            ctx.set_source_rgba(1.0, 1.0, 1.0, 0.7);
+        }
+        ctx.fill().ok();
+
+        // Button icon: clipboard (copy) icon or checkmark (after successful copy)
+        let show_checkmark =
+            copy_confirmed_until.map(|deadline| Instant::now() < deadline).unwrap_or(false);
+
+        if !show_checkmark {
+            // Clear the confirmed state if the deadline has passed
+            if copy_confirmed_until.is_some() {
+                s.copy_confirmed_until = None;
+            }
+        }
+
+        let icon_color = if is_dark_theme { (1.0, 1.0, 1.0, 0.9) } else { (0.0, 0.0, 0.0, 0.8) };
+        ctx.set_source_rgba(icon_color.0, icon_color.1, icon_color.2, icon_color.3);
+
+        if show_checkmark {
+            // Draw a checkmark icon
+            let cx = btn_x + btn_size * 0.5;
+            let cy = btn_y + btn_size * 0.5;
+            let s_icon = btn_size * 0.3;
+            ctx.set_line_width(2.0);
+            ctx.move_to(cx - s_icon * 0.6, cy);
+            ctx.line_to(cx - s_icon * 0.1, cy + s_icon * 0.5);
+            ctx.line_to(cx + s_icon * 0.7, cy - s_icon * 0.4);
+            ctx.stroke().ok();
+        } else {
+            // Draw a clipboard/copy icon (two overlapping rectangles)
+            let pad = btn_size * 0.22;
+            let icon_w = btn_size - pad * 2.0;
+            let icon_h = btn_size - pad * 2.0;
+            let offset = icon_w * 0.2;
+
+            // Back rectangle (slightly offset)
+            ctx.set_line_width(1.5);
+            ctx.rectangle(btn_x + pad + offset, btn_y + pad, icon_w - offset, icon_h - offset);
+            ctx.stroke().ok();
+
+            // Front rectangle (overlapping)
+            // Fill with button background so it looks like it's in front
+            draw_rounded_rect(
+                ctx,
+                btn_x + pad,
+                btn_y + pad + offset,
+                icon_w - offset,
+                icon_h - offset,
+                1.5,
+            );
+            if is_dark_theme {
+                ctx.set_source_rgba(0.0, 0.0, 0.0, 0.6);
+            } else {
+                ctx.set_source_rgba(1.0, 1.0, 1.0, 0.7);
+            }
+            ctx.fill().ok();
+
+            // Front rectangle stroke
+            ctx.set_source_rgba(icon_color.0, icon_color.1, icon_color.2, icon_color.3);
+            ctx.set_line_width(1.5);
+            ctx.rectangle(btn_x + pad, btn_y + pad + offset, icon_w - offset, icon_h - offset);
+            ctx.stroke().ok();
+        }
+    }
+}
+
+/// Draw a rounded rectangle path (does not fill or stroke).
+fn draw_rounded_rect(ctx: &cairo::Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
+    let r = r.min(w / 2.0).min(h / 2.0);
+    ctx.new_path();
+    ctx.arc(x + w - r, y + r, r, -std::f64::consts::FRAC_PI_2, 0.0);
+    ctx.arc(x + w - r, y + h - r, r, 0.0, std::f64::consts::FRAC_PI_2);
+    ctx.arc(x + r, y + h - r, r, std::f64::consts::FRAC_PI_2, std::f64::consts::PI);
+    ctx.arc(x + r, y + r, r, std::f64::consts::PI, 3.0 * std::f64::consts::FRAC_PI_2);
+    ctx.close_path();
 }

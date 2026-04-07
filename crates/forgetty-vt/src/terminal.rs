@@ -850,7 +850,20 @@ impl Terminal {
                 col_idx += 1;
             }
 
-            // 11. Clear per-row dirty flag immediately (matches Ghostling line 770-772)
+            // 11. Extract the raw row to get the soft-wrap flag.
+            // Row is a packed struct(u64): bits 0-31 = cells offset, bit 32 = wrap.
+            let mut raw_row: u64 = 0;
+            let _rc = unsafe {
+                ffi::ghostty_render_state_row_get(
+                    self.row_iter,
+                    ffi::GHOSTTY_RENDER_STATE_ROW_DATA_RAW,
+                    &mut raw_row as *mut u64 as *mut c_void,
+                )
+            };
+            let is_wrapped = (raw_row >> 32) & 1 != 0;
+            cache.screen.set_row_wrap(row_idx, is_wrapped);
+
+            // 12. Clear per-row dirty flag immediately (matches Ghostling line 770-772)
             let clean: bool = false;
             unsafe {
                 ffi::ghostty_render_state_row_set(
