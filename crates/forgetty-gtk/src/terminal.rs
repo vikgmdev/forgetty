@@ -672,6 +672,11 @@ pub fn create_terminal(
                             // to SIGINT automatically.
                             send_sigint_to_fg_pgrp(pty);
                         }
+                        // Scroll back to bottom so the user sees the shell prompt
+                        // after interrupting a process from scrollback position.
+                        s.terminal.scroll_viewport_bottom();
+                        let (_, off, _) = s.terminal.scrollbar_state();
+                        s.viewport_offset = off;
                         s.cursor_blink_visible = true;
                         s.last_blink_toggle = Instant::now();
                         // Suppress the shell's BEL response (zsh beeps on SIGINT).
@@ -703,6 +708,11 @@ pub fn create_terminal(
                             tracing::warn!("Failed to write to PTY: {e}");
                         }
                     }
+                    // Scroll back to bottom on any keypress so typing / Ctrl+L
+                    // always brings the viewport back from scrollback position.
+                    s.terminal.scroll_viewport_bottom();
+                    let (_, off, _) = s.terminal.scrollbar_state();
+                    s.viewport_offset = off;
                     // Reset cursor blink on keypress: make cursor solid and
                     // restart the blink countdown (AC-2).
                     s.cursor_blink_visible = true;
@@ -1966,6 +1976,11 @@ pub fn create_terminal_for_pane(
                         {
                             let _ = dc.send_sigint(pid);
                         }
+                        // Scroll back to bottom so the user sees the shell prompt
+                        // after interrupting a process from scrollback position.
+                        s.terminal.scroll_viewport_bottom();
+                        let (_, off, _) = s.terminal.scrollbar_state();
+                        s.viewport_offset = off;
                         s.cursor_blink_visible = true;
                         s.last_blink_toggle = Instant::now();
                         s.suppress_bell_until = Some(Instant::now() + Duration::from_millis(300));
@@ -1992,6 +2007,11 @@ pub fn create_terminal_for_pane(
                     if let (Some(ref dc), Some(pid)) = (s.daemon_client.clone(), s.daemon_pane_id) {
                         let _ = dc.send_input(pid, &bytes);
                     }
+                    // Scroll back to bottom on any keypress so typing / Ctrl+L
+                    // always brings the viewport back from scrollback position.
+                    s.terminal.scroll_viewport_bottom();
+                    let (_, off, _) = s.terminal.scrollbar_state();
+                    s.viewport_offset = off;
                     s.cursor_blink_visible = true;
                     s.last_blink_toggle = Instant::now();
                     da_for_key.queue_draw();

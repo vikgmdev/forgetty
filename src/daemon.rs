@@ -301,13 +301,22 @@ async fn main_async() -> anyhow::Result<()> {
     // Background drain loop: polls all live panes every 20ms (50 Hz).
     // This drives the session-side VT (for get_screen) and fires
     // SessionEvent::PtyOutput on the broadcast channel (for subscribe_output).
+    // Also detects natural shell exit (user typed `exit`) and broadcasts
+    // PaneClosed so subscribe_output clients can close the pane.
     {
         let sm = Arc::clone(&session_manager);
         tokio::spawn(async move {
             loop {
                 let pane_ids = sm.list_panes();
                 for id in pane_ids {
-                    let _ = sm.drain_output(id);
+                    if let Ok(result) = sm.drain_output(id) {
+                        if result.pty_exited {
+                            // Shell exited naturally — remove from registry and
+                            // broadcast PaneClosed so subscribe_output clients
+                            // detect the exit and close the pane on the GTK side.
+                            let _ = sm.close_pane(id);
+                        }
+                    }
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }

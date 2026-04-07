@@ -5332,11 +5332,23 @@ fn do_paste(
 ) {
     // Route paste through daemon if available, else local PTY.
     if let Some(ref dc) = daemon_client {
-        if let Ok(s) = state_rc.try_borrow() {
-            if let Some(pane_id) = s.daemon_pane_id {
-                let _ = dc.send_input(pane_id, text.as_bytes());
+        // Extract pane_id under an immutable borrow, then drop it so we can
+        // take a mutable borrow below for the scroll-to-bottom update.
+        let pane_id = {
+            let Ok(s) = state_rc.try_borrow() else {
                 return;
+            };
+            s.daemon_pane_id
+        };
+        if let Some(pid) = pane_id {
+            let _ = dc.send_input(pid, text.as_bytes());
+            // Scroll to bottom so pasted content is visible immediately.
+            if let Ok(mut s) = state_rc.try_borrow_mut() {
+                s.terminal.scroll_viewport_bottom();
+                let (_, off, _) = s.terminal.scrollbar_state();
+                s.viewport_offset = off;
             }
+            return;
         }
     }
 
@@ -5349,6 +5361,10 @@ fn do_paste(
             tracing::warn!("Failed to write paste to PTY: {e}");
         }
     }
+    // Scroll to bottom so pasted content is visible immediately.
+    s.terminal.scroll_viewport_bottom();
+    let (_, off, _) = s.terminal.scrollbar_state();
+    s.viewport_offset = off;
 }
 
 /// Paste the system clipboard text into the focused pane's PTY.

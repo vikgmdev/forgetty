@@ -842,7 +842,11 @@ impl SessionManager {
     /// has no GTK window. GTK will overwrite these fields with real dimensions
     /// on the next GTK save (dual-write, T-061 → T-065).
     pub fn snapshot_to_workspace_state(&self) -> WorkspaceState {
-        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        // Refresh all pane CWDs from /proc before serialising so that idle
+        // panes (which the drain loop hasn't polled recently) save their actual
+        // working directory, not a stale home-dir value.
+        refresh_pane_cwds(&mut inner.panes);
 
         let workspaces: Vec<forgetty_workspace::Workspace> = inner
             .layout
@@ -1022,12 +1026,27 @@ fn collect_pane_ids(tree: &PaneTreeLayout, out: &mut Vec<PaneId>) {
     }
 }
 
+/// Read `/proc/{pid}/cwd` for every live pane and update the cached CWD.
+/// Called at the start of each snapshot so that idle panes (not polled by
+/// the drain loop since last output) still save their current directory.
+/// Failures (dead process, no /proc entry) are silently ignored and the
+/// existing cached value is kept.
+fn refresh_pane_cwds(panes: &mut HashMap<PaneId, PaneState>) {
+    for pane in panes.values_mut() {
+        if let Some(pid) = pane.pty_bridge.pty.pid() {
+            if let Ok(cwd) = std::fs::read_link(format!("/proc/{pid}/cwd")) {
+                pane.cwd = cwd;
+            }
+        }
+    }
+}
+
 /// Recursively convert a `PaneTreeLayout` (daemon live tree) into a
 /// `forgetty_workspace::PaneTreeState` (serialisable format).
 ///
-/// CWD is read from `panes` using the cached value set by the drain loop.
-/// If the pane is not in the map (edge case: pane closed mid-save), the home
-/// directory fallback is used.
+/// CWD is read from `panes` using the cached value (refreshed by
+/// `refresh_pane_cwds` before this is called). If the pane is not in the
+/// map (edge case: pane closed mid-save), the home directory fallback is used.
 fn convert_pane_tree_layout(
     tree: &PaneTreeLayout,
     panes: &HashMap<PaneId, PaneState>,
