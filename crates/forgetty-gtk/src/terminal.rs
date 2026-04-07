@@ -112,6 +112,11 @@ pub struct TerminalState {
     /// adjustment, to suppress the `value-changed` signal handler and prevent
     /// a feedback loop (terminal -> adjustment -> scroll -> terminal -> ...).
     pub updating_scrollbar: bool,
+    /// True when the user has explicitly scrolled up (away from bottom).
+    /// Auto-scroll to bottom is suppressed while this is set.
+    /// Cleared when the user scrolls back to the exact bottom, sends input,
+    /// or the viewport is programmatically snapped to bottom.
+    pub scroll_lock: bool,
     /// Cached viewport offset from the 16ms scrollbar timer.
     /// Used by mouse handlers to avoid expensive FFI calls on every event.
     pub viewport_offset: u64,
@@ -342,6 +347,7 @@ pub fn create_terminal(
         drag_origin: None,
         suppress_selection_clear_ticks: 0,
         updating_scrollbar: false,
+        scroll_lock: false,
         viewport_offset: 0,
         search: SearchState::default(),
         font_size: config.font_size,
@@ -409,12 +415,9 @@ pub fn create_terminal(
                 return glib::ControlFlow::Continue;
             };
 
-            // Check if viewport is at the bottom BEFORE draining new data.
-            // If the user has manually scrolled up, we should NOT force them
-            // back to the bottom when new output arrives.
-            let (total, offset, len) = s.terminal.scrollbar_state();
-            s.viewport_offset = offset; // keep cache fresh
-            let was_at_bottom = total <= len || offset + len >= total;
+            // Refresh the cached viewport offset.
+            let (_, offset, _) = s.terminal.scrollbar_state();
+            s.viewport_offset = offset;
 
             let DrainResult { had_data, pty_exited, notification: osc_notification, .. } =
                 s.drain_pty_output();
@@ -501,26 +504,18 @@ pub fn create_terminal(
                 s.last_pty_data = Instant::now();
                 s.malloc_trimmed = false;
 
-                // Only auto-scroll to bottom when the user was already at
-                // the bottom. This lets users browse scrollback history
-                // during rapid continuous output (e.g., `while true; do date; done`).
-                if was_at_bottom {
+                // Auto-scroll to bottom unless the user has explicitly scrolled up
+                // (scroll_lock is set). This lets users freeze their view during
+                // rapid output (e.g., `while true; do date; done`).
+                if !s.scroll_lock {
                     s.terminal.scroll_viewport_bottom();
                     let (_, off, _) = s.terminal.scrollbar_state();
                     s.viewport_offset = off;
                 }
 
-                // Clear selection on new output to avoid stale highlights
-                // pointing to cells that no longer contain the selected text (AC-17).
-                // Skip clearing if a resize just happened — the shell redraws on
-                // SIGWINCH but the selected text hasn't actually moved (AC-16).
-                if s.suppress_selection_clear_ticks > 0 {
-                    s.suppress_selection_clear_ticks -= 1;
-                } else if s.selection.is_some() {
-                    s.selection = None;
-                    s.selecting = false;
-                    s.word_anchor = None;
-                }
+                // Selection is NOT cleared on output — that makes selection
+                // impossible during active programs (Claude Code, apt, top, etc.).
+                // Selection is cleared on keypress instead (see key handler below).
 
                 // Invalidate stale search matches when terminal content changes.
                 // Match positions are stored as absolute rows which become wrong
@@ -677,6 +672,7 @@ pub fn create_terminal(
                         s.terminal.scroll_viewport_bottom();
                         let (_, off, _) = s.terminal.scrollbar_state();
                         s.viewport_offset = off;
+                        s.scroll_lock = false;
                         s.cursor_blink_visible = true;
                         s.last_blink_toggle = Instant::now();
                         // Suppress the shell's BEL response (zsh beeps on SIGINT).
@@ -713,6 +709,12 @@ pub fn create_terminal(
                     s.terminal.scroll_viewport_bottom();
                     let (_, off, _) = s.terminal.scrollbar_state();
                     s.viewport_offset = off;
+                    s.scroll_lock = false; // resume auto-scroll now that user is typing
+                    // Clear any active selection — user is typing, selection is stale.
+                    s.selection = None;
+                    s.selecting = false;
+                    s.word_anchor = None;
+                    s.drag_origin = None;
                     // Reset cursor blink on keypress: make cursor solid and
                     // restart the blink countdown (AC-2).
                     s.cursor_blink_visible = true;
@@ -1313,8 +1315,11 @@ pub fn create_terminal(
                     }
                     ScrollAction::ScrollViewport(delta) => {
                         s.terminal.scroll_viewport_delta(delta);
-                        let (_, off, _) = s.terminal.scrollbar_state();
+                        let (total, off, len) = s.terminal.scrollbar_state();
                         s.viewport_offset = off;
+                        // Lock/unlock auto-scroll based on whether the user
+                        // is now at the bottom or scrolled above it.
+                        s.scroll_lock = !(total <= len || off + len >= total);
                     }
                 }
 
@@ -1693,6 +1698,7 @@ pub fn create_terminal_for_pane(
         drag_origin: None,
         suppress_selection_clear_ticks: 0,
         updating_scrollbar: false,
+        scroll_lock: false,
         viewport_offset: 0,
         search: SearchState::default(),
         font_size: config.font_size,
@@ -1754,9 +1760,8 @@ pub fn create_terminal_for_pane(
                 return glib::ControlFlow::Continue;
             };
 
-            let (total, offset, len) = s.terminal.scrollbar_state();
+            let (_, offset, _) = s.terminal.scrollbar_state();
             s.viewport_offset = offset;
-            let was_at_bottom = total <= len || offset + len >= total;
 
             let DrainResult { had_data, pty_exited, notification: osc_notification, .. } =
                 s.drain_pty_output();
@@ -1830,19 +1835,13 @@ pub fn create_terminal_for_pane(
                 s.last_pty_data = Instant::now();
                 s.malloc_trimmed = false;
 
-                if was_at_bottom {
+                if !s.scroll_lock {
                     s.terminal.scroll_viewport_bottom();
                     let (_, off, _) = s.terminal.scrollbar_state();
                     s.viewport_offset = off;
                 }
 
-                if s.suppress_selection_clear_ticks > 0 {
-                    s.suppress_selection_clear_ticks -= 1;
-                } else if s.selection.is_some() {
-                    s.selection = None;
-                    s.selecting = false;
-                    s.word_anchor = None;
-                }
+                // Selection is NOT cleared on output — cleared on keypress instead.
 
                 if s.search.active && !s.search.all_matches.is_empty() {
                     s.search.all_matches.clear();
@@ -1981,6 +1980,7 @@ pub fn create_terminal_for_pane(
                         s.terminal.scroll_viewport_bottom();
                         let (_, off, _) = s.terminal.scrollbar_state();
                         s.viewport_offset = off;
+                        s.scroll_lock = false;
                         s.cursor_blink_visible = true;
                         s.last_blink_toggle = Instant::now();
                         s.suppress_bell_until = Some(Instant::now() + Duration::from_millis(300));
@@ -2012,6 +2012,12 @@ pub fn create_terminal_for_pane(
                     s.terminal.scroll_viewport_bottom();
                     let (_, off, _) = s.terminal.scrollbar_state();
                     s.viewport_offset = off;
+                    s.scroll_lock = false; // resume auto-scroll now that user is typing
+                    // Clear any active selection — user is typing, selection is stale.
+                    s.selection = None;
+                    s.selecting = false;
+                    s.word_anchor = None;
+                    s.drag_origin = None;
                     s.cursor_blink_visible = true;
                     s.last_blink_toggle = Instant::now();
                     da_for_key.queue_draw();
@@ -2534,8 +2540,9 @@ pub fn create_terminal_for_pane(
                     }
                     ScrollAction::ScrollViewport(delta) => {
                         s.terminal.scroll_viewport_delta(delta);
-                        let (_, off, _) = s.terminal.scrollbar_state();
+                        let (total, off, len) = s.terminal.scrollbar_state();
                         s.viewport_offset = off;
+                        s.scroll_lock = !(total <= len || off + len >= total);
                     }
                 }
 

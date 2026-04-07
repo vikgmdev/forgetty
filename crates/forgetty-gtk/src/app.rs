@@ -4098,8 +4098,16 @@ fn split_pane(
         });
     }
 
-    // Give focus to the new pane
-    new_da.grab_focus();
+    // Give focus to the new pane.
+    // Deferred via idle_add_local_once so the widget is fully realized and
+    // mapped before grab_focus() fires — synchronous grab_focus() on an
+    // unmapped widget silently fails, leaving focus on the old pane.
+    let new_da_weak = new_da.downgrade();
+    glib::idle_add_local_once(move || {
+        if let Some(da) = new_da_weak.upgrade() {
+            da.grab_focus();
+        }
+    });
 }
 
 /// Detect which slot of a parent Paned holds a child.
