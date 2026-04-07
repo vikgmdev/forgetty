@@ -1431,6 +1431,30 @@ fn build_ui(
     app.set_accels_for_action("win.focus-pane-up", &["<Alt>Up"]);
     app.set_accels_for_action("win.focus-pane-down", &["<Alt>Down"]);
 
+    // --- Pane resize actions (Ctrl+Alt+Arrow) ---
+    for (name, direction) in [
+        ("resize-pane-left", Direction::Left),
+        ("resize-pane-right", Direction::Right),
+        ("resize-pane-up", Direction::Up),
+        ("resize-pane-down", Direction::Down),
+    ] {
+        let wm_resize = Rc::clone(&workspace_manager);
+        let action = gio::SimpleAction::new(name, None);
+        action.connect_activate(move |_action, _param| {
+            let Ok(mgr) = wm_resize.try_borrow() else {
+                return;
+            };
+            let ws = &mgr.workspaces[mgr.active_index];
+            resize_pane(&ws.tab_view, &ws.focus_tracker, direction);
+        });
+        window.add_action(&action);
+    }
+
+    app.set_accels_for_action("win.resize-pane-left", &["<Alt><Shift>Left"]);
+    app.set_accels_for_action("win.resize-pane-right", &["<Alt><Shift>Right"]);
+    app.set_accels_for_action("win.resize-pane-up", &["<Alt><Shift>Up"]);
+    app.set_accels_for_action("win.resize-pane-down", &["<Alt><Shift>Down"]);
+
     // --- Zoom actions (all three use workspace manager) ---
     for (action_name, dir, accels) in [
         ("zoom-in", ZoomDirection::In, vec!["<Control>equal", "<Control>plus"]),
@@ -4443,6 +4467,104 @@ fn ranges_overlap(a_start: f32, a_end: f32, b_start: f32, b_end: f32) -> bool {
     a_start < b_end && b_start < a_end
 }
 
+/// Move the correct Paned divider to grow the focused pane in the given direction.
+///
+/// The key insight: a Paned has one divider position. Increasing it grows the
+/// `start_child`; decreasing it grows the `end_child`. So to grow the focused
+/// pane in a given direction we must find a Paned where:
+///
+/// - Grow right / grow down → focused pane's sub-tree is the `start_child`.
+///   Increasing position pushes the divider outward, making start side bigger.
+/// - Grow left / grow up   → focused pane's sub-tree is the `end_child`.
+///   Decreasing position pushes the divider outward, making end side bigger.
+///
+/// If the nearest Paned of the right orientation has us in the wrong slot, we
+/// keep walking up until we find one where we're on the correct side. This
+/// handles three-pane layouts: the middle pane's "resize right" finds a Paned
+/// where the middle sub-tree is on the start side (i.e., the right wall), not
+/// the left wall.
+///
+/// Widget tree from DA to its Paned: DA → hbox (DA+scrollbar) → vbox (search+hbox) → Paned
+fn resize_pane(tab_view: &adw::TabView, focus_tracker: &FocusTracker, direction: Direction) {
+    let focused_name = {
+        let Ok(name) = focus_tracker.try_borrow() else {
+            return;
+        };
+        name.clone()
+    };
+    if focused_name.is_empty() {
+        return;
+    }
+
+    let Some(page) = tab_view.selected_page() else {
+        return;
+    };
+    let Some(container) = pane_container(&page) else {
+        return;
+    };
+    let Some(root_content) = container_content(&container) else {
+        return;
+    };
+
+    let leaves = collect_leaf_drawing_areas(&root_content);
+    let Some(focused_da) = leaves.iter().find(|da| da.widget_name().as_str() == focused_name) else {
+        return;
+    };
+
+    let target_orientation = match direction {
+        Direction::Left | Direction::Right => gtk4::Orientation::Horizontal,
+        Direction::Up | Direction::Down => gtk4::Orientation::Vertical,
+    };
+
+    // Grow right/down → focused pane must be in the start_child slot (increasing position expands it).
+    // Grow left/up   → focused pane must be in the end_child slot (decreasing position expands it).
+    let want_start_slot = matches!(direction, Direction::Right | Direction::Down);
+
+    const STEP: i32 = 20;
+    let delta = if want_start_slot { STEP } else { -STEP };
+
+    // Pass 1: slot-aware walk.
+    // Find the first Paned of matching orientation where the focused sub-tree is
+    // in the correct slot. This ensures the middle pane of a 3-split finds the
+    // right divider for each direction instead of always using the nearest one.
+    let mut nearest_paned: Option<gtk4::Paned> = None;
+    let mut widget: gtk4::Widget = focused_da.clone().into();
+    let mut found: Option<gtk4::Paned> = None;
+    loop {
+        let Some(parent) = widget.parent() else {
+            break;
+        };
+        if let Some(paned) = parent.downcast_ref::<gtk4::Paned>() {
+            if paned.orientation() == target_orientation {
+                if nearest_paned.is_none() {
+                    nearest_paned = Some(paned.clone());
+                }
+                // `widget` is a direct child of `paned`.
+                let in_start = paned.start_child().as_ref() == Some(&widget);
+                if in_start == want_start_slot {
+                    found = Some(paned.clone());
+                    break;
+                }
+            }
+        }
+        widget = parent;
+    }
+
+    // Pass 2: fallback to nearest Paned when no correctly-slotted one exists.
+    // Covers the 2-pane case: the left pane pressing Alt+Shift+Left has no
+    // end-side ancestor, so we just move the one available divider.
+    let target_paned = found.or(nearest_paned);
+
+    if let Some(paned) = target_paned {
+        let max = match target_orientation {
+            gtk4::Orientation::Horizontal => paned.width(),
+            _ => paned.height(),
+        };
+        let new_pos = (paned.position() + delta).clamp(0, max);
+        paned.set_position(new_pos);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Search in terminal
 // ---------------------------------------------------------------------------
@@ -5747,6 +5869,10 @@ fn build_shortcuts_window() -> gtk4::ShortcutsWindow {
     panes_group.add_shortcut(&shortcut("<Alt>Right", "Focus Pane Right"));
     panes_group.add_shortcut(&shortcut("<Alt>Up", "Focus Pane Up"));
     panes_group.add_shortcut(&shortcut("<Alt>Down", "Focus Pane Down"));
+    panes_group.add_shortcut(&shortcut("<Alt><Shift>Left", "Resize Pane Left"));
+    panes_group.add_shortcut(&shortcut("<Alt><Shift>Right", "Resize Pane Right"));
+    panes_group.add_shortcut(&shortcut("<Alt><Shift>Up", "Resize Pane Up"));
+    panes_group.add_shortcut(&shortcut("<Alt><Shift>Down", "Resize Pane Down"));
     section.add_group(&panes_group);
 
     // --- Clipboard ---
@@ -6167,6 +6293,26 @@ fn command_registry() -> &'static [CommandEntry] {
             display_name: "Focus Pane Down",
             action_name: "win.focus-pane-down",
             shortcut_label: "Alt+Down",
+        },
+        CommandEntry {
+            display_name: "Resize Pane Left",
+            action_name: "win.resize-pane-left",
+            shortcut_label: "Alt+Shift+Left",
+        },
+        CommandEntry {
+            display_name: "Resize Pane Right",
+            action_name: "win.resize-pane-right",
+            shortcut_label: "Alt+Shift+Right",
+        },
+        CommandEntry {
+            display_name: "Resize Pane Up",
+            action_name: "win.resize-pane-up",
+            shortcut_label: "Alt+Shift+Up",
+        },
+        CommandEntry {
+            display_name: "Resize Pane Down",
+            action_name: "win.resize-pane-down",
+            shortcut_label: "Alt+Shift+Down",
         },
         CommandEntry {
             display_name: "Find in Terminal",

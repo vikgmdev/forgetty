@@ -704,6 +704,8 @@ pub fn create_terminal(
                             tracing::warn!("Failed to write to PTY: {e}");
                         }
                     }
+                    let was_scroll_locked = s.scroll_lock;
+                    let had_selection = s.selection.is_some();
                     // Scroll back to bottom on any keypress so typing / Ctrl+L
                     // always brings the viewport back from scrollback position.
                     s.terminal.scroll_viewport_bottom();
@@ -719,7 +721,14 @@ pub fn create_terminal(
                     // restart the blink countdown (AC-2).
                     s.cursor_blink_visible = true;
                     s.last_blink_toggle = Instant::now();
-                    da_for_key.queue_draw();
+                    // Only redraw immediately if visible state changed (viewport scrolled or
+                    // selection cleared). In the common case (already at bottom, no selection),
+                    // skip the intermediate frame — the PTY echo arrives within ~8ms and the
+                    // drain timer redraws with the cursor already at its new position, preventing
+                    // the two-frame cursor stutter that looks like "vibrating".
+                    if was_scroll_locked || had_selection {
+                        da_for_key.queue_draw();
+                    }
                     return glib::Propagation::Stop;
                 }
                 glib::Propagation::Proceed
@@ -2007,6 +2016,8 @@ pub fn create_terminal_for_pane(
                     if let (Some(ref dc), Some(pid)) = (s.daemon_client.clone(), s.daemon_pane_id) {
                         let _ = dc.send_input(pid, &bytes);
                     }
+                    let was_scroll_locked = s.scroll_lock;
+                    let had_selection = s.selection.is_some();
                     // Scroll back to bottom on any keypress so typing / Ctrl+L
                     // always brings the viewport back from scrollback position.
                     s.terminal.scroll_viewport_bottom();
@@ -2020,7 +2031,10 @@ pub fn create_terminal_for_pane(
                     s.drag_origin = None;
                     s.cursor_blink_visible = true;
                     s.last_blink_toggle = Instant::now();
-                    da_for_key.queue_draw();
+                    // Only redraw immediately if visible state changed — same logic as inline mode.
+                    if was_scroll_locked || had_selection {
+                        da_for_key.queue_draw();
+                    }
                     return glib::Propagation::Stop;
                 }
                 glib::Propagation::Proceed
