@@ -1,12 +1,18 @@
-# Forgetty — Daemon + Android Sync Architecture
+# Forgetty — Daemon + Android Sync Architecture (historical)
 
-> **Decided:** 2026-04-01 after full architecture review.
-> **Status:** Approved. Implementation starts with T-048.
-> **This doc supersedes** the earlier "GTK owns everything" model.
+> **⚠️ SUPERSEDED — read `ARCHITECTURE.md` first.**
 >
-> **IMPORTANT — Read `ARCHITECTURE_DECISIONS.md` first.** That file contains decisions made after this doc was written (2026-04-03) that override the following statements in this doc:
-> - "Multiple GTK windows → Both attach to same daemon simultaneously" → **WRONG.** Each window has its own daemon (AD-001).
-> - Android pairing: see AD-004 and AD-005 for the full ownership and pairing rules.
+> This doc describes the M4-era (2026-04-01) daemon-first model. Parts of it
+> are still correct (daemon owns PTYs, clients connect to it, iroh for Android).
+> Parts of it are no longer correct under the 2026-04-13 architecture lock-down.
+>
+> **Specifically outdated in this doc:**
+> - The diagram shows `VtInstances` inside the daemon — under AD-007, the daemon has no VT parser.
+> - The "GTK is a thin renderer" framing is superseded by AD-008 — clients own terminal semantics, including the VT parser.
+> - "Multiple GTK windows attach to the same daemon simultaneously" — superseded by AD-001 (one daemon per window) in 2026-04-03.
+>
+> This file is preserved for historical context. For the current architecture,
+> always read `ARCHITECTURE.md` and `ARCHITECTURE_DECISIONS.md` first.
 
 ---
 
