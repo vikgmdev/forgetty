@@ -2909,11 +2909,13 @@ fn build_widget_from_pane_tree(
     match node {
         PaneTreeNode::Leaf { pane_id } => {
             // pane_id is a live daemon pane — subscribe directly, no lookup needed.
-            let (mpsc_tx, mpsc_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-            if let Err(e) = dc.subscribe_output(*pane_id, mpsc_tx) {
-                tracing::warn!("subscribe_output failed for pane {pane_id}: {e}");
-                return None;
-            }
+            let channel = match dc.subscribe_output(*pane_id) {
+                Ok(ch) => ch,
+                Err(e) => {
+                    tracing::warn!("subscribe_output failed for pane {pane_id}: {e}");
+                    return None;
+                }
+            };
 
             let snapshot = dc.get_screen(*pane_id).ok();
             let on_exit = make_on_exit_callback(tab_view, tab_states, window, Some(Arc::clone(dc)));
@@ -2923,7 +2925,7 @@ fn build_widget_from_pane_tree(
                 config,
                 *pane_id,
                 Arc::clone(dc),
-                mpsc_rx,
+                channel,
                 snapshot.as_ref(),
                 None, // CWD not needed — daemon pane's PTY is already running
                 Some(on_exit),
@@ -3760,16 +3762,19 @@ fn add_new_tab(
         };
         match rpc_result {
             Ok((pane_id, tab_id)) => {
-                let (mpsc_tx, mpsc_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-                if let Err(e) = dc.subscribe_output(pane_id, mpsc_tx) {
-                    tracing::warn!("subscribe_output failed for new pane {pane_id}: {e}");
-                }
+                let channel = match dc.subscribe_output(pane_id) {
+                    Ok(ch) => ch,
+                    Err(e) => {
+                        tracing::warn!("subscribe_output failed for new pane {pane_id}: {e}");
+                        return;
+                    }
+                };
                 let snapshot = dc.get_screen(pane_id).ok();
                 match terminal::create_terminal_for_pane(
                     config,
                     pane_id,
                     Arc::clone(dc),
-                    mpsc_rx,
+                    channel,
                     snapshot.as_ref(),
                     None,
                     Some(on_exit),
@@ -3991,16 +3996,21 @@ fn split_pane(
         match focused_daemon_pane_id {
             Some(parent_pane_id) => match dc.split_pane(parent_pane_id, direction_str) {
                 Ok(new_pane_id) => {
-                    let (mpsc_tx, mpsc_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-                    if let Err(e) = dc.subscribe_output(new_pane_id, mpsc_tx) {
-                        tracing::warn!("subscribe_output failed for split pane {new_pane_id}: {e}");
-                    }
+                    let channel = match dc.subscribe_output(new_pane_id) {
+                        Ok(ch) => ch,
+                        Err(e) => {
+                            tracing::warn!(
+                                "subscribe_output failed for split pane {new_pane_id}: {e}"
+                            );
+                            return;
+                        }
+                    };
                     let snapshot = dc.get_screen(new_pane_id).ok();
                     terminal::create_terminal_for_pane(
                         config,
                         new_pane_id,
                         Arc::clone(dc),
-                        mpsc_rx,
+                        channel,
                         snapshot.as_ref(),
                         None,
                         Some(on_exit),
@@ -4507,7 +4517,8 @@ fn resize_pane(tab_view: &adw::TabView, focus_tracker: &FocusTracker, direction:
     };
 
     let leaves = collect_leaf_drawing_areas(&root_content);
-    let Some(focused_da) = leaves.iter().find(|da| da.widget_name().as_str() == focused_name) else {
+    let Some(focused_da) = leaves.iter().find(|da| da.widget_name().as_str() == focused_name)
+    else {
         return;
     };
 
@@ -7973,10 +7984,15 @@ fn create_and_switch_to_new_workspace(
     let workspace_id = if let Some(ref dc) = daemon_client {
         match dc.create_workspace(name) {
             Ok((ws_id, _ws_idx, pane_id, tab_id)) => {
-                let (mpsc_tx, mpsc_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-                if let Err(e) = dc.subscribe_output(pane_id, mpsc_tx) {
-                    tracing::warn!("subscribe_output failed for new workspace pane {pane_id}: {e}");
-                }
+                let channel = match dc.subscribe_output(pane_id) {
+                    Ok(ch) => ch,
+                    Err(e) => {
+                        tracing::warn!(
+                            "subscribe_output failed for new workspace pane {pane_id}: {e}"
+                        );
+                        return;
+                    }
+                };
                 let snapshot = dc.get_screen(pane_id).ok();
                 let on_exit =
                     make_on_exit_callback(&new_tv, &new_tab_states, window, Some(Arc::clone(dc)));
@@ -7985,7 +8001,7 @@ fn create_and_switch_to_new_workspace(
                     config,
                     pane_id,
                     Arc::clone(dc),
-                    mpsc_rx,
+                    channel,
                     snapshot.as_ref(),
                     None,
                     Some(on_exit),

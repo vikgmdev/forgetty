@@ -6,14 +6,16 @@
 //!
 //! Synchronous RPC methods use `runtime.block_on()` — tiny request/response
 //! pairs that complete in microseconds on loopback. `subscribe_output` is
-//! fully async: a background tokio task delivers bytes to the terminal poll
-//! timer via a `std::sync::mpsc::channel`.
+//! fully async: a background tokio task delivers bytes to the GTK thread via a
+//! `glib::MainContext::channel` — event-driven, zero polling overhead.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
+
+use std::os::unix::io::AsRawFd as _;
 
 use base64::Engine as _;
 use serde_json::Value;
@@ -101,10 +103,36 @@ impl std::fmt::Display for DaemonError {
 
 impl std::error::Error for DaemonError {}
 
+/// Messages delivered from the daemon output stream to the GTK thread.
+///
+/// Sent through a `std::sync::mpsc` channel; a Linux pipe provides the
+/// wake signal so `glib::unix_fd_add_local` can deliver them without polling.
+#[derive(Debug)]
+pub enum DaemonOutputMessage {
+    /// Raw PTY bytes from the daemon — feed directly to the VT parser.
+    Data(Vec<u8>),
+    /// The output stream has ended (pane exited or connection lost).
+    /// The GTK source should schedule `on_exit` and return `Break`.
+    StreamEnded,
+}
+
+/// The GTK-side handle for a daemon output subscription.
+///
+/// Contains the `mpsc` receiver for data messages and the read end of a
+/// Linux pipe that becomes readable whenever the tokio task sends a message.
+/// Wire to the GTK main loop via `glib::unix_fd_add_local` on `wake_read_fd`.
+pub struct DaemonOutputChannel {
+    /// Data receiver — drain with `try_recv()` inside the fd source callback.
+    pub rx: std::sync::mpsc::Receiver<DaemonOutputMessage>,
+    /// Read end of the wake pipe (O_NONBLOCK | O_CLOEXEC).
+    /// Readable when messages are queued in `rx`. The GTK source holds this.
+    pub wake_read_fd: std::os::unix::io::OwnedFd,
+}
+
 /// A client that speaks JSON-RPC 2.0 over a Unix domain socket to
 /// `forgetty-daemon`. All synchronous calls are tiny request-response pairs.
 /// The `subscribe_output` call spawns a background tokio task that delivers
-/// bytes to the terminal poll timer via an mpsc channel.
+/// bytes to the GTK thread via a `glib::MainContext::channel`.
 pub struct DaemonClient {
     socket_path: std::path::PathBuf,
     /// Background tokio runtime for async socket I/O in subscribe_output.
@@ -613,24 +641,39 @@ impl DaemonClient {
 
     /// Open a `subscribe_output` stream for a pane.
     ///
-    /// Spawns a background tokio task that reads output notifications from the
-    /// daemon and delivers decoded bytes to the terminal poll timer via the
-    /// provided mpsc sender. When the receiver is dropped (pane closed), the
-    /// task exits cleanly.
-    pub fn subscribe_output(
-        &self,
-        pane_id: PaneId,
-        tx: std::sync::mpsc::Sender<Vec<u8>>,
-    ) -> Result<(), DaemonError> {
+    /// Creates a `std::sync::mpsc` channel + a Linux wake pipe, spawns a
+    /// background tokio task that reads daemon output and delivers it via the
+    /// channel, and returns the GTK-side handle (`DaemonOutputChannel`).
+    ///
+    /// Connect the returned channel to the GTK main loop via
+    /// `glib::unix_fd_add_local` on `wake_read_fd` — the pipe becomes readable
+    /// whenever a message is queued, so the callback fires with zero polling.
+    pub fn subscribe_output(&self, pane_id: PaneId) -> Result<DaemonOutputChannel, DaemonError> {
+        use std::os::unix::io::FromRawFd as _;
+
+        // Create a non-blocking, close-on-exec pipe for wake signaling.
+        let mut pipe_fds: [libc::c_int; 2] = [-1, -1];
+        let ret = unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) };
+        if ret != 0 {
+            return Err(DaemonError(format!(
+                "subscribe_output: pipe2 failed: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        // SAFETY: pipe2 returned 0, so both fds are valid and newly owned.
+        let wake_read_fd = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(pipe_fds[0]) };
+        let wake_write_fd = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(pipe_fds[1]) };
+
+        let (tx, rx) = std::sync::mpsc::channel::<DaemonOutputMessage>();
         let socket_path = self.socket_path.clone();
 
         self.runtime.spawn(async move {
-            if let Err(e) = subscribe_output_task(socket_path, pane_id, tx).await {
+            if let Err(e) = subscribe_output_task(socket_path, pane_id, tx, wake_write_fd).await {
                 warn!("subscribe_output task error for pane {pane_id}: {e}");
             }
         });
 
-        Ok(())
+        Ok(DaemonOutputChannel { rx, wake_read_fd })
     }
 
     /// Open a `subscribe_layout` stream.
@@ -715,21 +758,53 @@ fn parse_pane_tree(v: &Value) -> Result<PaneTreeNode, DaemonError> {
     Err(DaemonError(format!("parse_pane_tree: unrecognized shape: {v}")))
 }
 
+/// Write one wake byte to the pipe's write end (non-blocking).
+///
+/// Used after each `tx.send()` to signal the GTK `unix_fd_add_local` source
+/// that a message is available. The write is fire-and-forget: EAGAIN means the
+/// pipe is "full" (many wakeups already queued), which is also fine — one
+/// callback invocation will drain all queued messages.
+fn wake_glib(wake_write_fd: &std::os::unix::io::OwnedFd) {
+    let _ = unsafe { libc::write(wake_write_fd.as_raw_fd(), b"\x01".as_ptr() as _, 1) };
+}
+
 /// Background tokio task that drives the `subscribe_output` streaming connection.
 ///
-/// Opens a persistent Unix socket, sends the `subscribe_output` RPC, reads the
-/// initial `{"ok":true}` acknowledgment, then reads notification lines
-/// indefinitely, decoding base64 PTY bytes and forwarding them to the terminal
-/// poll timer via the mpsc sender.
+/// Wraps `subscribe_output_inner` so that `DaemonOutputMessage::StreamEnded` is
+/// always delivered to the GTK thread (and the wake pipe is signaled), even when
+/// the inner task returns early via `?` (connection error, parse failure, etc.).
+/// `wake_write_fd` is dropped at the end of this function, closing the pipe write
+/// end and allowing the GTK fd source to detect teardown.
 async fn subscribe_output_task(
     socket_path: std::path::PathBuf,
     pane_id: PaneId,
-    tx: std::sync::mpsc::Sender<Vec<u8>>,
+    tx: std::sync::mpsc::Sender<DaemonOutputMessage>,
+    wake_write_fd: std::os::unix::io::OwnedFd,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let result = subscribe_output_inner(&socket_path, pane_id, &tx, &wake_write_fd).await;
+    // Always notify the GTK fd source that the stream has ended.
+    let _ = tx.send(DaemonOutputMessage::StreamEnded);
+    wake_glib(&wake_write_fd);
+    // `wake_write_fd` drops here, closing the pipe write end.
+    result
+}
+
+/// Inner implementation for `subscribe_output_task`.
+///
+/// Opens a persistent Unix socket, sends the `subscribe_output` RPC, reads the
+/// initial `{"ok":true}` acknowledgment, then reads notification lines
+/// indefinitely, base64-decoding PTY bytes and forwarding them to the GTK thread
+/// via the mpsc sender + wake pipe.
+async fn subscribe_output_inner(
+    socket_path: &std::path::Path,
+    pane_id: PaneId,
+    tx: &std::sync::mpsc::Sender<DaemonOutputMessage>,
+    wake_write_fd: &std::os::unix::io::OwnedFd,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
 
-    let stream = UnixStream::connect(&socket_path).await?;
+    let stream = UnixStream::connect(socket_path).await?;
     let (reader, mut writer) = stream.into_split();
 
     // Send subscribe_output request.
@@ -789,12 +864,13 @@ async fn subscribe_output_task(
             continue;
         }
 
-        // Deliver to the terminal poll timer via mpsc channel.
+        // Deliver to the GTK thread via the mpsc channel + wake the GLib fd source.
         // If the receiver is gone (pane closed), stop the task.
-        if tx.send(bytes).is_err() {
+        if tx.send(DaemonOutputMessage::Data(bytes)).is_err() {
             debug!("subscribe_output: mpsc receiver dropped, stopping task for {pane_id}");
             break;
         }
+        wake_glib(wake_write_fd);
     }
 
     debug!("subscribe_output: stream ended for pane {pane_id}");

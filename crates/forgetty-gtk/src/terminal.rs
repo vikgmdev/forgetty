@@ -31,7 +31,7 @@ use gtk4::prelude::*;
 use gtk4::{glib, DrawingArea};
 
 use crate::code_block::{self, CodeBlock};
-use crate::daemon_client::DaemonClient;
+use crate::daemon_client::{DaemonClient, DaemonOutputMessage};
 use crate::input::{GhosttyInput, ScrollAction};
 use crate::pty_bridge;
 
@@ -88,7 +88,9 @@ pub struct TerminalState {
     pub terminal: forgetty_vt::Terminal,
     /// Local PTY process. `None` for daemon-backed panes.
     pub pty: Option<forgetty_pty::PtyProcess>,
-    pub pty_rx: mpsc::Receiver<Vec<u8>>,
+    /// Local-PTY output channel. `None` for daemon-backed panes (those receive
+    /// output via the event-driven glib channel — see `create_terminal_for_pane`).
+    pub pty_rx: Option<mpsc::Receiver<Vec<u8>>>,
     pub input: GhosttyInput,
     pub config: Config,
     pub cell_width: f64,
@@ -192,6 +194,17 @@ impl TerminalState {
     /// concurrently.  Any remaining data stays in the channel and will
     /// be picked up on the next 8ms cycle.
     fn drain_pty_output(&mut self) -> DrainResult {
+        // Daemon-backed panes receive output via the event-driven glib channel;
+        // this method is only used by the local-PTY poll timer.
+        let Some(rx) = self.pty_rx.as_mut() else {
+            return DrainResult {
+                had_data: false,
+                pty_exited: false,
+                notification: None,
+                raw_bytes: Vec::new(),
+            };
+        };
+
         const MAX_DRAIN_BYTES: usize = 128 * 1024; // 128 KB per tick
         let mut had_data = false;
         let mut disconnected = false;
@@ -201,7 +214,7 @@ impl TerminalState {
             if bytes_drained >= MAX_DRAIN_BYTES {
                 break; // yield back to the GTK main loop
             }
-            match self.pty_rx.try_recv() {
+            match rx.try_recv() {
                 Ok(data) => {
                     bytes_drained += data.len();
                     had_data = true;
@@ -334,7 +347,7 @@ pub fn create_terminal(
     let state = Rc::new(RefCell::new(TerminalState {
         terminal,
         pty: Some(pty),
-        pty_rx,
+        pty_rx: Some(pty_rx),
         input,
         config: config.clone(),
         cell_width: 8.0,
@@ -444,7 +457,7 @@ pub fn create_terminal(
                     }
                     // Suppress the shell's BEL response that follows a Ctrl+C press
                     // (zsh beeps on SIGINT, which would show an unwanted visual flash).
-                    if s.suppress_bell_until.map_or(false, |t| now < t) {
+                    if s.suppress_bell_until.is_some_and(|t| now < t) {
                         s.suppress_bell_until = None;
                         continue;
                     }
@@ -712,7 +725,7 @@ pub fn create_terminal(
                     let (_, off, _) = s.terminal.scrollbar_state();
                     s.viewport_offset = off;
                     s.scroll_lock = false; // resume auto-scroll now that user is typing
-                    // Clear any active selection — user is typing, selection is stale.
+                                           // Clear any active selection — user is typing, selection is stale.
                     s.selection = None;
                     s.selecting = false;
                     s.word_anchor = None;
@@ -1632,12 +1645,17 @@ pub fn create_terminal_for_pane(
     config: &Config,
     pane_id: forgetty_core::PaneId,
     daemon_client: Arc<DaemonClient>,
-    daemon_rx: mpsc::Receiver<Vec<u8>>,
+    daemon_channel: crate::daemon_client::DaemonOutputChannel,
     snapshot: Option<&crate::daemon_client::ScreenSnapshot>,
     cwd: Option<PathBuf>,
     on_exit: Option<Rc<dyn Fn(String)>>,
     on_notify: Option<Rc<dyn Fn(NotificationPayload)>>,
 ) -> Result<(gtk4::Box, DrawingArea, Rc<RefCell<TerminalState>>), String> {
+    use std::os::unix::io::AsRawFd as _;
+    // Destructure the daemon output channel: mpsc receiver + wake pipe read end.
+    let crate::daemon_client::DaemonOutputChannel { rx: daemon_rx, wake_read_fd } = daemon_channel;
+    let wake_read_raw = wake_read_fd.as_raw_fd();
+
     // Over-estimate rows so the first-draw resize is always a SHRINK.
     // libghostty-vt shrinks by trimming trailing blank rows from the BOTTOM;
     // snapshot content is placed at row 1 (top) so the blank rows sit below
@@ -1694,7 +1712,7 @@ pub fn create_terminal_for_pane(
     let state = Rc::new(RefCell::new(TerminalState {
         terminal,
         pty: None,
-        pty_rx: daemon_rx,
+        pty_rx: None,
         input,
         config: config.clone(),
         cell_width: 8.0,
@@ -1755,198 +1773,254 @@ pub fn create_terminal_for_pane(
         });
     }
 
-    // --- Poll daemon output with a GLib timeout (8ms ~ 120Hz) ---
+    // --- Event-driven daemon output (pipe + mpsc, zero polling) ---
+    //
+    // Replaces the 8 ms `timeout_add_local` poll.  The tokio `subscribe_output`
+    // task writes one wake byte to the write end of an OS pipe after each send;
+    // `glib::unix_fd_add_local` fires this callback from the GLib main loop only
+    // when the read end becomes readable — no periodic wakeup.
+    // (AD-009: no polling on the hot path).
     {
         let state = Rc::clone(&state);
         let da_weak = drawing_area.downgrade();
         let on_exit = on_exit.map(|cb| Rc::new(std::cell::Cell::new(Some(cb))));
-        glib::timeout_add_local(Duration::from_millis(8), move || {
+        glib::unix_fd_add_local(wake_read_raw, glib::IOCondition::IN, move |fd, _| {
+            // Captures wake_read_fd for RAII (keeps pipe read end open).
+            debug_assert_eq!(fd, wake_read_fd.as_raw_fd());
+            // Drain wake bytes (one per DaemonOutputMessage sent by the tokio task).
+            let mut drain_buf = [0u8; 256];
+            let _ = unsafe { libc::read(fd, drain_buf.as_mut_ptr() as _, 256) };
+
             let Some(da) = da_weak.upgrade() else {
                 return glib::ControlFlow::Break;
             };
 
+            while let Ok(msg) = daemon_rx.try_recv() {
+                match msg {
+                    DaemonOutputMessage::StreamEnded => {
+                        // Same logic as the old `pty_exited` branch: if the daemon is
+                        // still alive, schedule on_exit (pane shell exited naturally).
+                        // If the daemon itself died, keep the pane open to preserve session.
+                        let daemon_alive = {
+                            let Ok(s) = state.try_borrow() else {
+                                return glib::ControlFlow::Break;
+                            };
+                            s.daemon_client
+                                .as_ref()
+                                .map(|dc| dc.list_tabs().is_ok())
+                                .unwrap_or(true)
+                        };
+
+                        if daemon_alive {
+                            tracing::debug!(
+                                "Daemon pane {:?} exited (daemon alive), scheduling close",
+                                da.widget_name()
+                            );
+                            if let Some(ref exit_cell) = on_exit {
+                                if let Some(cb) = exit_cell.take() {
+                                    let pane_name = da.widget_name().to_string();
+                                    glib::idle_add_local_once(move || {
+                                        cb(pane_name);
+                                    });
+                                }
+                            }
+                        } else {
+                            tracing::info!(
+                                "Daemon died — keeping pane {:?} open to preserve session",
+                                da.widget_name()
+                            );
+                        }
+                        return glib::ControlFlow::Break;
+                    }
+
+                    DaemonOutputMessage::Data(data) => {
+                        let Ok(mut s) = state.try_borrow_mut() else {
+                            continue;
+                        };
+
+                        let (_, offset, _) = s.terminal.scrollbar_state();
+                        s.viewport_offset = offset;
+
+                        // Scan for OSC notification sequences BEFORE feeding to VT parser.
+                        let osc_notification = scan_osc_notification(&data);
+
+                        s.terminal.feed(&data);
+                        s.last_pty_data = Instant::now();
+                        s.malloc_trimmed = false;
+
+                        // Drain write-PTY responses (DA responses, mode queries, etc.)
+                        let responses = s.terminal.drain_write_pty();
+                        for chunk in responses {
+                            if let Some(ref dc) = s.daemon_client {
+                                if let Some(pane_id) = s.daemon_pane_id {
+                                    let _ = dc.send_input(pane_id, &chunk);
+                                }
+                            }
+                        }
+
+                        // Detect alternate screen → primary screen transitions (e.g. htop exit).
+                        let is_alt = s.terminal.is_alternate_screen();
+                        if s.was_alternate_screen && !is_alt {
+                            s.terminal.feed(b"\x1b[1 q");
+                        }
+                        s.was_alternate_screen = is_alt;
+
+                        let events = s.terminal.drain_events();
+                        let mut bell_notify_payload: Option<NotificationPayload> = None;
+                        let mut bell_flash_scheduled = false;
+                        for event in events {
+                            if let TerminalEvent::Bell = event {
+                                let now = Instant::now();
+                                if now.duration_since(s.last_bell) < Duration::from_millis(200) {
+                                    continue;
+                                }
+                                if s.suppress_bell_until.is_some_and(|t| now < t) {
+                                    s.suppress_bell_until = None;
+                                    continue;
+                                }
+                                s.last_bell = now;
+
+                                match s.config.bell_mode {
+                                    BellMode::Visual => {
+                                        s.bell_flash_until =
+                                            Some(Instant::now() + Duration::from_millis(150));
+                                        bell_flash_scheduled = true;
+                                    }
+                                    BellMode::Audio => {
+                                        da.error_bell();
+                                    }
+                                    BellMode::Both => {
+                                        s.bell_flash_until =
+                                            Some(Instant::now() + Duration::from_millis(150));
+                                        bell_flash_scheduled = true;
+                                        da.error_bell();
+                                    }
+                                    BellMode::None => {}
+                                }
+
+                                if !da.has_focus()
+                                    && s.config.notification_mode != NotificationMode::None
+                                {
+                                    s.notification_ring = true;
+                                    bell_notify_payload = Some(NotificationPayload {
+                                        title: String::new(),
+                                        body: String::new(),
+                                        pane_name: da.widget_name().to_string(),
+                                        source: None,
+                                    });
+                                }
+                            }
+                        }
+
+                        let osc_notify_payload = if let Some(mut payload) = osc_notification {
+                            if !da.has_focus()
+                                && s.config.notification_mode != NotificationMode::None
+                            {
+                                s.notification_ring = true;
+                                payload.pane_name = da.widget_name().to_string();
+                                Some(payload)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
+                        let on_notify_cb = s.on_notify.clone();
+                        let last_notif = s.last_notification;
+                        let can_send_desktop = last_notif.elapsed() >= Duration::from_secs(2);
+                        if can_send_desktop
+                            && (bell_notify_payload.is_some() || osc_notify_payload.is_some())
+                        {
+                            s.last_notification = Instant::now();
+                        }
+
+                        if !s.scroll_lock {
+                            s.terminal.scroll_viewport_bottom();
+                            let (_, off, _) = s.terminal.scrollbar_state();
+                            s.viewport_offset = off;
+                        }
+
+                        // Selection is NOT cleared on output — cleared on keypress instead.
+
+                        if s.search.active && !s.search.all_matches.is_empty() {
+                            s.search.all_matches.clear();
+                            s.search.matches.clear();
+                            s.search.current_index = 0;
+                            s.search.current_viewport_index = None;
+                        }
+
+                        drop(s);
+                        da.queue_draw();
+
+                        // If a visual bell flash was triggered, schedule a clear redraw
+                        // after the 150 ms flash window so the overlay disappears promptly
+                        // rather than waiting for the next 600 ms blink tick.
+                        if bell_flash_scheduled {
+                            let da_bell = da.clone();
+                            glib::timeout_add_local_once(Duration::from_millis(200), move || {
+                                da_bell.queue_draw();
+                            });
+                        }
+
+                        if let Some(payload) = bell_notify_payload {
+                            if let Some(ref cb) = on_notify_cb {
+                                cb(payload);
+                            }
+                        }
+                        if let Some(payload) = osc_notify_payload {
+                            if let Some(ref cb) = on_notify_cb {
+                                let mut p = payload;
+                                if !can_send_desktop {
+                                    p.source = None;
+                                }
+                                cb(p);
+                            }
+                        }
+                    }
+                } // end match msg
+            } // end while let
+
+            glib::ControlFlow::Continue
+        });
+    }
+
+    // --- Cursor blink, bell-flash expiry, and malloc_trim (low-frequency timer) ---
+    //
+    // Cursor blink no longer piggybacks on the output-poll timer. A dedicated
+    // 600 ms timer toggles the blink state and redraws.  This matches the
+    // actual state-change frequency of the old 8 ms timer (which checked
+    // `duration_since(last_blink_toggle) >= 600ms` every tick) while firing
+    // 74× less often.
+    {
+        let state = Rc::clone(&state);
+        let da_weak = drawing_area.downgrade();
+        glib::timeout_add_local(Duration::from_millis(600), move || {
+            let Some(da) = da_weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
             let Ok(mut s) = state.try_borrow_mut() else {
                 return glib::ControlFlow::Continue;
             };
 
-            let (_, offset, _) = s.terminal.scrollbar_state();
-            s.viewport_offset = offset;
+            // Toggle cursor blink phase.
+            s.cursor_blink_visible = !s.cursor_blink_visible;
+            s.last_blink_toggle = Instant::now();
 
-            let DrainResult { had_data, pty_exited, notification: osc_notification, .. } =
-                s.drain_pty_output();
-
-            let is_alt = s.terminal.is_alternate_screen();
-            if s.was_alternate_screen && !is_alt {
-                s.terminal.feed(b"\x1b[1 q");
-            }
-            s.was_alternate_screen = is_alt;
-
-            let events = s.terminal.drain_events();
-            let mut bell_notify_payload: Option<NotificationPayload> = None;
-            for event in events {
-                if let TerminalEvent::Bell = event {
-                    let now = Instant::now();
-                    if now.duration_since(s.last_bell) < Duration::from_millis(200) {
-                        continue;
-                    }
-                    if s.suppress_bell_until.map_or(false, |t| now < t) {
-                        s.suppress_bell_until = None;
-                        continue;
-                    }
-                    s.last_bell = now;
-
-                    match s.config.bell_mode {
-                        BellMode::Visual => {
-                            s.bell_flash_until = Some(Instant::now() + Duration::from_millis(150));
-                        }
-                        BellMode::Audio => {
-                            da.error_bell();
-                        }
-                        BellMode::Both => {
-                            s.bell_flash_until = Some(Instant::now() + Duration::from_millis(150));
-                            da.error_bell();
-                        }
-                        BellMode::None => {}
-                    }
-
-                    if !da.has_focus() && s.config.notification_mode != NotificationMode::None {
-                        s.notification_ring = true;
-                        bell_notify_payload = Some(NotificationPayload {
-                            title: String::new(),
-                            body: String::new(),
-                            pane_name: da.widget_name().to_string(),
-                            source: None,
-                        });
-                    }
+            // Return freed heap memory to the OS after 5 s of no PTY data.
+            #[cfg(target_os = "linux")]
+            if !s.malloc_trimmed
+                && Instant::now().duration_since(s.last_pty_data) >= Duration::from_secs(5)
+            {
+                s.malloc_trimmed = true;
+                unsafe {
+                    libc::malloc_trim(0);
                 }
+                tracing::debug!("malloc_trim(0) called after 5s idle (daemon pane)");
             }
 
-            let osc_notify_payload = if let Some(mut payload) = osc_notification {
-                if !da.has_focus() && s.config.notification_mode != NotificationMode::None {
-                    s.notification_ring = true;
-                    payload.pane_name = da.widget_name().to_string();
-                    Some(payload)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            let on_notify_cb = s.on_notify.clone();
-            let last_notif = s.last_notification;
-            let can_send_desktop = last_notif.elapsed() >= Duration::from_secs(2);
-            if can_send_desktop && (bell_notify_payload.is_some() || osc_notify_payload.is_some()) {
-                s.last_notification = Instant::now();
-            }
-
-            if had_data {
-                s.last_pty_data = Instant::now();
-                s.malloc_trimmed = false;
-
-                if !s.scroll_lock {
-                    s.terminal.scroll_viewport_bottom();
-                    let (_, off, _) = s.terminal.scrollbar_state();
-                    s.viewport_offset = off;
-                }
-
-                // Selection is NOT cleared on output — cleared on keypress instead.
-
-                if s.search.active && !s.search.all_matches.is_empty() {
-                    s.search.all_matches.clear();
-                    s.search.matches.clear();
-                    s.search.current_index = 0;
-                    s.search.current_viewport_index = None;
-                }
-
-                let now = Instant::now();
-                if now.duration_since(s.last_blink_toggle) >= Duration::from_millis(600) {
-                    s.cursor_blink_visible = !s.cursor_blink_visible;
-                    s.last_blink_toggle = now;
-                }
-
-                drop(s);
-                da.queue_draw();
-            } else {
-                let now = Instant::now();
-                let needs_redraw =
-                    if now.duration_since(s.last_blink_toggle) >= Duration::from_millis(600) {
-                        s.cursor_blink_visible = !s.cursor_blink_visible;
-                        s.last_blink_toggle = now;
-                        true
-                    } else {
-                        false
-                    };
-
-                #[cfg(target_os = "linux")]
-                if !s.malloc_trimmed
-                    && now.duration_since(s.last_pty_data) >= Duration::from_secs(5)
-                {
-                    s.malloc_trimmed = true;
-                    unsafe {
-                        libc::malloc_trim(0);
-                    }
-                    tracing::debug!("malloc_trim(0) called after 5s idle (daemon pane)");
-                }
-
-                let bell_active = s.bell_flash_until.is_some();
-                let ring_changed = bell_notify_payload.is_some() || osc_notify_payload.is_some();
-                if needs_redraw || bell_active || ring_changed {
-                    drop(s);
-                    da.queue_draw();
-                } else {
-                    drop(s);
-                }
-            }
-
-            if let Some(payload) = bell_notify_payload {
-                if let Some(ref cb) = on_notify_cb {
-                    cb(payload);
-                }
-            }
-            if let Some(payload) = osc_notify_payload {
-                if let Some(ref cb) = on_notify_cb {
-                    let mut p = payload;
-                    if !can_send_desktop {
-                        p.source = None;
-                    }
-                    cb(p);
-                }
-            }
-
-            if pty_exited {
-                // Check if the daemon is still alive. If it died (bulk disconnect),
-                // do NOT fire on_exit — the cascade would close all tabs and corrupt
-                // the session file before save_all_workspaces runs.
-                let daemon_alive = {
-                    let Ok(s) = state.try_borrow() else {
-                        return glib::ControlFlow::Break;
-                    };
-                    s.daemon_client.as_ref().map(|dc| dc.list_tabs().is_ok()).unwrap_or(true)
-                    // No daemon_client = self-contained mode → treat as alive
-                };
-
-                if daemon_alive {
-                    tracing::debug!(
-                        "Daemon pane {:?} exited (daemon alive), scheduling close",
-                        da.widget_name()
-                    );
-                    if let Some(ref exit_cell) = on_exit {
-                        if let Some(cb) = exit_cell.take() {
-                            let pane_name = da.widget_name().to_string();
-                            glib::idle_add_local_once(move || {
-                                cb(pane_name);
-                            });
-                        }
-                    }
-                } else {
-                    tracing::info!(
-                        "Daemon died — keeping pane {:?} open to preserve session",
-                        da.widget_name()
-                    );
-                }
-                return glib::ControlFlow::Break;
-            }
+            drop(s);
+            da.queue_draw();
 
             glib::ControlFlow::Continue
         });
@@ -2024,7 +2098,7 @@ pub fn create_terminal_for_pane(
                     let (_, off, _) = s.terminal.scrollbar_state();
                     s.viewport_offset = off;
                     s.scroll_lock = false; // resume auto-scroll now that user is typing
-                    // Clear any active selection — user is typing, selection is stale.
+                                           // Clear any active selection — user is typing, selection is stale.
                     s.selection = None;
                     s.selecting = false;
                     s.word_anchor = None;
