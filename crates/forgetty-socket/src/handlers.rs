@@ -1171,8 +1171,8 @@ mod tests {
         assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
     }
 
-    #[test]
-    fn dispatch_focus_tab_real_tab_succeeds() {
+    #[tokio::test]
+    async fn dispatch_focus_tab_real_tab_succeeds() {
         let sm = make_sm();
         // Create a tab via new_tab RPC.
         let new_req = Request {
@@ -1216,8 +1216,8 @@ mod tests {
         assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
     }
 
-    #[test]
-    fn dispatch_split_pane_invalid_direction_returns_invalid_params() {
+    #[tokio::test]
+    async fn dispatch_split_pane_invalid_direction_returns_invalid_params() {
         let sm = make_sm();
         // Create a real pane first.
         let new_req = Request {
@@ -1306,8 +1306,8 @@ mod tests {
         assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
     }
 
-    #[test]
-    fn send_input_invalid_base64_returns_invalid_params() {
+    #[tokio::test]
+    async fn send_input_invalid_base64_returns_invalid_params() {
         let sm = make_sm();
         // Create a real pane so pane_id validation passes.
         let size = PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
@@ -1390,8 +1390,8 @@ mod tests {
         assert_eq!(workspaces[0]["tabs"].as_array().unwrap().len(), 0);
     }
 
-    #[test]
-    fn dispatch_new_tab_returns_tab_id_and_pane_id() {
+    #[tokio::test]
+    async fn dispatch_new_tab_returns_tab_id_and_pane_id() {
         let sm = make_sm();
         let req = Request {
             jsonrpc: "2.0".to_string(),

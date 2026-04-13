@@ -119,8 +119,8 @@ fn main() {
                 println!("cargo:rustc-link-lib=framework=Foundation");
                 println!("cargo:rustc-link-lib=dylib=c++");
             }
-            "windows" | _ => {
-                // Windows: MSVC links C++ runtime automatically.
+            _ => {
+                // Windows and others: MSVC links C++ runtime automatically.
             }
         }
     }

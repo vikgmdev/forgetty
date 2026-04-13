@@ -148,7 +148,7 @@ pub fn trash_session_for(session_id: uuid::Uuid) -> io::Result<()> {
     let dest_dir = trash_dir();
     fs::create_dir_all(&dest_dir)?;
     let dest = dest_dir.join(format!("{session_id}.json"));
-    if let Err(_) = fs::rename(&src, &dest) {
+    if fs::rename(&src, &dest).is_err() {
         // Cross-device fallback: copy then remove.
         fs::copy(&src, &dest)?;
         fs::remove_file(&src)?;
@@ -170,7 +170,7 @@ pub fn restore_from_trash(session_id: uuid::Uuid) -> io::Result<()> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
-    if let Err(_) = fs::rename(&src, &dest) {
+    if fs::rename(&src, &dest).is_err() {
         fs::copy(&src, &dest)?;
         fs::remove_file(&src)?;
     }

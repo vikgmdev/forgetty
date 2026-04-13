@@ -2,25 +2,30 @@
 //!
 //! Mirrors the pattern in `forgetty-gtk/src/pty_bridge.rs` but lives in the
 //! platform-agnostic session crate. The reader thread runs independently and
-//! sends `Vec<u8>` chunks to the session manager via an mpsc channel.
+//! sends `Vec<u8>` chunks to the session manager via a tokio unbounded channel.
 
 use std::io::Read as IoRead;
 use std::path::Path;
-use std::sync::mpsc;
 use std::thread;
 
 use forgetty_pty::{PtyProcess, PtySize};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tracing::{debug, warn};
 
 /// PTY-owning bridge with a background reader thread.
 ///
 /// Owns the `PtyProcess` (for writing and resizing on the caller's thread) and
-/// the `mpsc::Receiver<Vec<u8>>` that delivers output from the reader thread.
+/// the `tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>` that delivers output from
+/// the reader thread. The receiver is stored as `Option` so callers can `take()`
+/// it exactly once to hand ownership to a dedicated drain task (V2-001).
 pub struct PtyBridge {
     /// The live PTY process (writing and resizing happen here).
     pub pty: PtyProcess,
     /// Receiver end of the output channel from the reader thread.
-    pub pty_rx: mpsc::Receiver<Vec<u8>>,
+    ///
+    /// `Some` on construction; taken to `None` by `SessionManager::take_pane_output_rx`
+    /// when the per-pane drain task is spawned.
+    pub pty_rx: Option<UnboundedReceiver<Vec<u8>>>,
 }
 
 impl PtyBridge {
@@ -60,7 +65,7 @@ impl PtyBridge {
             .take_reader()
             .ok_or_else(|| "PTY reader should be available on fresh PtyProcess".to_string())?;
 
-        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let (tx, rx) = unbounded_channel::<Vec<u8>>();
 
         thread::Builder::new()
             .name("session-pty-reader".to_string())
@@ -69,12 +74,12 @@ impl PtyBridge {
             })
             .map_err(|e| format!("failed to spawn PTY reader thread: {e}"))?;
 
-        Ok(Self { pty, pty_rx: rx })
+        Ok(Self { pty, pty_rx: Some(rx) })
     }
 }
 
 /// Background thread that reads from the PTY and sends data via the channel.
-fn pty_reader_thread(mut reader: Box<dyn IoRead + Send>, tx: mpsc::Sender<Vec<u8>>) {
+fn pty_reader_thread(mut reader: Box<dyn IoRead + Send>, tx: UnboundedSender<Vec<u8>>) {
     let mut buf = [0u8; 65536];
     loop {
         match reader.read(&mut buf) {

@@ -115,8 +115,8 @@ mod tests {
     /// AC-8: Exercises the full create → close → create sequence against a real
     /// `SessionManager` with real PTYs. Verifies that `layout()` reflects each
     /// mutation in the correct order.
-    #[test]
-    fn test_layout_create_close_sequence() {
+    #[tokio::test]
+    async fn test_layout_create_close_sequence() {
         let session = SessionManager::new();
         let size = PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
 

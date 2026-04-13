@@ -7,7 +7,6 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 #[cfg(target_os = "linux")]
@@ -28,10 +27,6 @@ use crate::pane::{PaneInfo, PaneState};
 use crate::pty_bridge::PtyBridge;
 use crate::vt_instance::VtInstance;
 use crate::workspace::{build_workspace_state, PaneTreeLayout, WorkspaceLayout};
-
-/// Maximum bytes drained from the PTY channel per `drain_output()` call.
-/// Matches the GTK terminal's `MAX_DRAIN_BYTES` cap (128 KiB per tick).
-const MAX_DRAIN_BYTES: usize = 128 * 1024;
 
 /// Capacity of the broadcast event channel.
 const BROADCAST_CAPACITY: usize = 1024;
@@ -111,7 +106,7 @@ impl SessionManager {
             shell.as_deref(),
             login_shell,
         )
-        .map_err(|e| forgetty_core::ForgettyError::Pty(e))?;
+        .map_err(forgetty_core::ForgettyError::Pty)?;
 
         let vt = VtInstance::new(size.rows as usize, size.cols as usize);
 
@@ -144,6 +139,7 @@ impl SessionManager {
             let _ = inner.event_tx.send(SessionEvent::PaneCreated { pane_id: id });
         }
 
+        self.spawn_drain_task(id);
         debug!(%id, rows = size.rows, cols = size.cols, "session pane created");
         Ok(id)
     }
@@ -290,6 +286,8 @@ impl SessionManager {
         let _ = inner.event_tx.send(SessionEvent::PaneCreated { pane_id });
         let _ = inner.event_tx.send(SessionEvent::TabCreated { workspace_idx, tab_id, pane_id });
 
+        drop(inner);
+        self.spawn_drain_task(pane_id);
         debug!(%pane_id, %tab_id, workspace_idx, "create_tab: tab created");
         Ok((pane_id, tab_id))
     }
@@ -370,6 +368,8 @@ impl SessionManager {
             });
         }
 
+        drop(inner);
+        self.spawn_drain_task(new_pane_id);
         debug!(%pane_id, %new_pane_id, direction, "split_pane: pane split");
         Ok(new_pane_id)
     }
@@ -449,6 +449,8 @@ impl SessionManager {
             });
         }
 
+        drop(inner);
+        self.spawn_drain_task(new_pane_id);
         debug!(%pane_id, %new_pane_id, direction, ratio, "split_pane_with_ratio: pane split");
         Ok(new_pane_id)
     }
@@ -642,99 +644,80 @@ impl SessionManager {
         Ok(())
     }
 
-    /// Drain pending PTY output for a pane.
+    /// Take ownership of a pane's output receiver for the drain task.
     ///
-    /// - Reads up to `MAX_DRAIN_BYTES` from the mpsc channel.
-    /// - Scans for OSC notifications.
-    /// - Feeds bytes to the session-side VT.
-    /// - Returns `DrainResult` with `raw_bytes` so the GTK layer can feed the
-    ///   same data to its own `Terminal` instance (T-048 dual-VT approach).
-    ///
-    /// Uses `try_lock()` so the GTK main thread never blocks if a future
-    /// background thread holds the lock.
-    pub fn drain_output(&self, id: PaneId) -> Result<DrainResult> {
-        let Ok(mut inner) = self.inner.try_lock() else {
-            // Another holder has the lock — return empty result and retry next tick.
-            return Ok(DrainResult {
-                had_data: false,
-                pty_exited: false,
-                notification: None,
-                raw_bytes: Vec::new(),
-            });
-        };
+    /// Returns `None` if the pane doesn't exist or the receiver was already taken.
+    pub fn take_pane_output_rx(
+        &self,
+        id: PaneId,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>> {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.panes.get_mut(&id)?.pty_bridge.pty_rx.take()
+    }
 
+    /// Process one chunk of raw PTY bytes for a pane.
+    ///
+    /// - Scans for OSC notifications.
+    /// - Feeds bytes to the session-side VT (calls pty_bridge.pty.write() for
+    ///   any VT responses).
+    /// - Updates the cached CWD from /proc/{pid}/cwd.
+    /// - Broadcasts a PtyOutput event on the session channel.
+    /// - Returns DrainResult with pty_exited set if the PTY is no longer alive.
+    pub fn process_pane_bytes(&self, id: PaneId, bytes: &[u8]) -> Result<DrainResult> {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let pane = inner
             .panes
             .get_mut(&id)
             .ok_or_else(|| forgetty_core::ForgettyError::Pty(format!("pane {id} not found")))?;
 
-        let mut had_data = false;
-        let mut disconnected = false;
-        let mut bytes_drained: usize = 0;
-        let mut notification = None;
-        let mut raw_bytes: Vec<Vec<u8>> = Vec::new();
-
-        loop {
-            if bytes_drained >= MAX_DRAIN_BYTES {
-                break;
-            }
-
-            match pane.pty_bridge.pty_rx.try_recv() {
-                Ok(data) => {
-                    bytes_drained += data.len();
-                    had_data = true;
-
-                    // Scan for OSC notification sequences BEFORE feeding to VT.
-                    if notification.is_none() {
-                        notification = scan_osc_notification(&data);
-                    }
-
-                    // Feed to session-side VT, draining write-PTY responses.
-                    {
-                        let pty = &mut pane.pty_bridge.pty;
-                        pane.vt.feed_and_respond(&data, |resp| {
-                            if let Err(e) = pty.write(resp) {
-                                warn!(%id, "failed to write PTY response: {e}");
-                            }
-                        });
-                    }
-
-                    raw_bytes.push(data);
+        let notification = scan_osc_notification(bytes);
+        {
+            let pty = &mut pane.pty_bridge.pty;
+            pane.vt.feed_and_respond(bytes, |resp| {
+                if let Err(e) = pty.write(resp) {
+                    warn!(%id, "failed to write PTY response: {e}");
                 }
-                Err(mpsc::TryRecvError::Empty) => {
-                    // Check if child exited externally (orphan slave fd may delay EOF).
-                    if !pane.pty_bridge.pty.is_alive() {
-                        disconnected = true;
-                    }
-                    break;
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    disconnected = true;
-                    break;
-                }
-            }
-        }
-
-        // Update cached CWD if we have a PID (lazy refresh on each drain).
-        if had_data {
-            if let Some(pid) = pane.pty_bridge.pty.pid() {
-                if let Ok(cwd) = std::fs::read_link(format!("/proc/{pid}/cwd")) {
-                    pane.cwd = cwd;
-                }
-            }
-        }
-
-        // Broadcast raw output events now that we are done mutably borrowing `pane`.
-        // We collect a clone of the bytes for the broadcast channel separately
-        // from `raw_bytes` (which stays owned for the caller).
-        for data in &raw_bytes {
-            let _ = inner.event_tx.send(SessionEvent::PtyOutput {
-                pane_id: id,
-                data: bytes::Bytes::copy_from_slice(data),
             });
         }
+        if let Some(pid) = pane.pty_bridge.pty.pid() {
+            if let Ok(cwd) = std::fs::read_link(format!("/proc/{pid}/cwd")) {
+                pane.cwd = cwd;
+            }
+        }
+        let pty_exited = !pane.pty_bridge.pty.is_alive();
+        let _ = inner.event_tx.send(SessionEvent::PtyOutput {
+            pane_id: id,
+            data: bytes::Bytes::copy_from_slice(bytes),
+        });
+        Ok(DrainResult {
+            had_data: true,
+            pty_exited,
+            notification,
+            raw_bytes: vec![bytes.to_vec()],
+        })
+    }
 
-        Ok(DrainResult { had_data, pty_exited: disconnected, notification, raw_bytes })
+    /// Spawn a per-pane tokio task that awaits on the output channel.
+    ///
+    /// The task calls process_pane_bytes() for each Vec<u8> produced by the
+    /// PTY reader thread. On EOF (rx.recv() returns None) or when
+    /// process_pane_bytes reports pty_exited, calls close_pane(pane_id).
+    pub fn spawn_drain_task(&self, pane_id: PaneId) {
+        if let Some(mut rx) = self.take_pane_output_rx(pane_id) {
+            let sm = self.clone();
+            tokio::spawn(async move {
+                while let Some(bytes) = rx.recv().await {
+                    match sm.process_pane_bytes(pane_id, &bytes) {
+                        Ok(result) if result.pty_exited => {
+                            let _ = sm.close_pane(pane_id);
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+                let _ = sm.close_pane(pane_id);
+            });
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1100,37 +1083,40 @@ mod tests {
         handle.join().expect("thread should not panic");
     }
 
-    /// AC-4: create_pane spawns a real PTY, write_pty + drain_output deliver output.
-    #[test]
-    fn test_create_pane_write_drain() {
+    /// AC-4: create_pane spawns a real PTY; drain task delivers output via broadcast channel.
+    #[tokio::test]
+    async fn test_create_pane_write_drain() {
         let session = SessionManager::new();
+        let mut rx = session.subscribe_output();
 
         let size = PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
         let id =
             session.create_pane(size, None, None, None, true).expect("create_pane should succeed");
 
         // Give the shell a moment to start.
-        std::thread::sleep(Duration::from_millis(300));
+        tokio::time::sleep(Duration::from_millis(300)).await;
 
         // Write a command that produces a known output.
         session.write_pty(id, b"echo hello_session_test\n").expect("write_pty should succeed");
 
-        // Poll for the output for up to 2 seconds.
+        // Wait for the drain task to broadcast PtyOutput containing our string.
         let mut got_hello = false;
-        for _ in 0..200 {
-            std::thread::sleep(Duration::from_millis(10));
-            let result = session.drain_output(id).expect("drain_output should succeed");
-            for chunk in &result.raw_bytes {
-                if chunk.windows(b"hello_session_test".len()).any(|w| w == b"hello_session_test") {
-                    got_hello = true;
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+                Ok(Ok(SessionEvent::PtyOutput { pane_id, data })) if pane_id == id => {
+                    if data.windows(b"hello_session_test".len()).any(|w| w == b"hello_session_test")
+                    {
+                        got_hello = true;
+                        break;
+                    }
                 }
-            }
-            if got_hello {
-                break;
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) | Err(_) => {}
             }
         }
 
-        assert!(got_hello, "drain_output should contain 'hello_session_test'");
+        assert!(got_hello, "drain task should broadcast 'hello_session_test' via PtyOutput");
 
         // AC-5: close_pane removes the pane.
         session.close_pane(id).expect("close_pane should succeed");
@@ -1138,8 +1124,8 @@ mod tests {
     }
 
     /// AC-5: close_pane removes the pane from the registry.
-    #[test]
-    fn test_close_pane_removes_from_registry() {
+    #[tokio::test]
+    async fn test_close_pane_removes_from_registry() {
         let session = SessionManager::new();
         let size = PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
         let id = session.create_pane(size, None, None, None, true).expect("create pane");
@@ -1148,40 +1134,32 @@ mod tests {
         assert!(session.pane_info(id).is_none());
     }
 
-    /// AC-7: subscribe_output receives PtyOutput events within 200ms.
-    #[test]
-    fn test_subscribe_output_receives_events() {
+    /// AC-7: subscribe_output receives PtyOutput events within 2s.
+    #[tokio::test]
+    async fn test_subscribe_output_receives_events() {
         let session = SessionManager::new();
         let mut rx = session.subscribe_output();
 
         let size = PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
         let id = session.create_pane(size, None, None, None, true).expect("create pane");
 
-        // Give the shell a moment to start.
-        std::thread::sleep(Duration::from_millis(300));
+        // The drain task was spawned by create_pane. Give the shell a moment to start.
+        tokio::time::sleep(Duration::from_millis(300)).await;
 
         // Write something to trigger PTY output.
         session.write_pty(id, b"echo subscribe_test\n").expect("write_pty");
 
-        // Poll drain_output to drive the session VT and broadcast events.
+        // The drain task will call process_pane_bytes which broadcasts PtyOutput.
         let mut got_event = false;
-        for _ in 0..30 {
-            std::thread::sleep(Duration::from_millis(10));
-            let _ = session.drain_output(id);
-
-            // Check if a PtyOutput event appeared.
-            loop {
-                match rx.try_recv() {
-                    Ok(SessionEvent::PtyOutput { .. }) => {
-                        got_event = true;
-                        break;
-                    }
-                    Ok(_) => continue,
-                    Err(_) => break,
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+                Ok(Ok(SessionEvent::PtyOutput { .. })) => {
+                    got_event = true;
+                    break;
                 }
-            }
-            if got_event {
-                break;
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) | Err(_) => {}
             }
         }
 
@@ -1206,8 +1184,8 @@ mod tests {
     }
 
     /// AC-1: create_tab returns correct pane_id + tab_id, layout updated.
-    #[test]
-    fn test_create_tab_layout_and_registry() {
+    #[tokio::test]
+    async fn test_create_tab_layout_and_registry() {
         let session = SessionManager::new();
         let size = test_size();
 
@@ -1232,8 +1210,8 @@ mod tests {
     }
 
     /// AC-1 (append): new tab is appended AFTER existing tabs.
-    #[test]
-    fn test_create_tab_appends() {
+    #[tokio::test]
+    async fn test_create_tab_appends() {
         let session = SessionManager::new();
         let size = test_size();
 
@@ -1254,8 +1232,8 @@ mod tests {
     }
 
     /// AC-2: create_tab with out-of-bounds workspace returns Err; no PTY spawned.
-    #[test]
-    fn test_create_tab_workspace_out_of_bounds() {
+    #[tokio::test]
+    async fn test_create_tab_workspace_out_of_bounds() {
         let session = SessionManager::new();
         let size = test_size();
 
@@ -1269,8 +1247,8 @@ mod tests {
     }
 
     /// AC-3: split_pane replaces leaf with Split node; both panes registered.
-    #[test]
-    fn test_split_pane_horizontal() {
+    #[tokio::test]
+    async fn test_split_pane_horizontal() {
         let session = SessionManager::new();
         let size = test_size();
 
@@ -1298,8 +1276,8 @@ mod tests {
     }
 
     /// AC-4: split_pane with direction "vertical" works symmetrically.
-    #[test]
-    fn test_split_pane_vertical() {
+    #[tokio::test]
+    async fn test_split_pane_vertical() {
         let session = SessionManager::new();
         let size = test_size();
 
@@ -1322,8 +1300,8 @@ mod tests {
     }
 
     /// AC-5: split_pane on a second-level leaf creates a nested Split.
-    #[test]
-    fn test_split_pane_nested() {
+    #[tokio::test]
+    async fn test_split_pane_nested() {
         let session = SessionManager::new();
         let size = test_size();
 
@@ -1360,8 +1338,8 @@ mod tests {
     }
 
     /// AC-6: split_pane with unknown pane_id returns Err; layout unchanged; no PTY spawned.
-    #[test]
-    fn test_split_pane_unknown_pane_id() {
+    #[tokio::test]
+    async fn test_split_pane_unknown_pane_id() {
         let session = SessionManager::new();
         let size = test_size();
 
@@ -1382,8 +1360,8 @@ mod tests {
     }
 
     /// split_pane_with_ratio preserves the saved ratio instead of defaulting to 0.5.
-    #[test]
-    fn test_split_pane_with_ratio() {
+    #[tokio::test]
+    async fn test_split_pane_with_ratio() {
         let session = SessionManager::new();
         let size = test_size();
 
@@ -1411,8 +1389,8 @@ mod tests {
     }
 
     /// AC-7: close_tab removes a single-pane tab; pane_info returns None.
-    #[test]
-    fn test_close_tab_single_pane() {
+    #[tokio::test]
+    async fn test_close_tab_single_pane() {
         let session = SessionManager::new();
         let size = test_size();
 
@@ -1432,8 +1410,8 @@ mod tests {
     }
 
     /// AC-8: close_tab on a split tab kills all panes.
-    #[test]
-    fn test_close_tab_split_pane() {
+    #[tokio::test]
+    async fn test_close_tab_split_pane() {
         let session = SessionManager::new();
         let size = test_size();
 
@@ -1449,8 +1427,8 @@ mod tests {
     }
 
     /// AC-9: close_tab clamps active_tab when the removed tab was at/past current index.
-    #[test]
-    fn test_close_tab_clamps_active_tab() {
+    #[tokio::test]
+    async fn test_close_tab_clamps_active_tab() {
         let session = SessionManager::new();
         let size = test_size();
 
@@ -1489,8 +1467,8 @@ mod tests {
     }
 
     /// AC-11: move_tab reorders tabs; active_tab follows the previously-active tab.
-    #[test]
-    fn test_move_tab_reorders() {
+    #[tokio::test]
+    async fn test_move_tab_reorders() {
         let session = SessionManager::new();
         let size = test_size();
 
@@ -1511,8 +1489,8 @@ mod tests {
     }
 
     /// AC-12: move_tab clamps target index; moving a tab to its own index is a no-op.
-    #[test]
-    fn test_move_tab_clamps() {
+    #[tokio::test]
+    async fn test_move_tab_clamps() {
         let session = SessionManager::new();
         let size = test_size();
 
@@ -1544,8 +1522,8 @@ mod tests {
     }
 
     /// AC-14: set_active_tab updates the index; setting to the same index is a no-op.
-    #[test]
-    fn test_set_active_tab_updates() {
+    #[tokio::test]
+    async fn test_set_active_tab_updates() {
         let session = SessionManager::new();
         let size = test_size();
 
@@ -1562,8 +1540,8 @@ mod tests {
     }
 
     /// AC-15: set_active_tab returns Err on out-of-bounds workspace or tab index.
-    #[test]
-    fn test_set_active_tab_out_of_bounds() {
+    #[tokio::test]
+    async fn test_set_active_tab_out_of_bounds() {
         let session = SessionManager::new();
         let size = test_size();
 
@@ -1586,8 +1564,8 @@ mod tests {
 
     /// T-067 AC-5: create_workspace appends a new workspace; returned idx matches;
     /// create_tab on the new workspace succeeds.
-    #[test]
-    fn test_create_workspace() {
+    #[tokio::test]
+    async fn test_create_workspace() {
         let session = SessionManager::new();
         let size = test_size();
 

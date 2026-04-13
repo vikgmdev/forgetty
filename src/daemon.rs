@@ -298,30 +298,10 @@ async fn main_async() -> anyhow::Result<()> {
 
     info!("forgetty-daemon started, socket at {}", socket_path.display());
 
-    // Background drain loop: polls all live panes every 20ms (50 Hz).
-    // This drives the session-side VT (for get_screen) and fires
-    // SessionEvent::PtyOutput on the broadcast channel (for subscribe_output).
-    // Also detects natural shell exit (user typed `exit`) and broadcasts
-    // PaneClosed so subscribe_output clients can close the pane.
-    {
-        let sm = Arc::clone(&session_manager);
-        tokio::spawn(async move {
-            loop {
-                let pane_ids = sm.list_panes();
-                for id in pane_ids {
-                    if let Ok(result) = sm.drain_output(id) {
-                        if result.pty_exited {
-                            // Shell exited naturally — remove from registry and
-                            // broadcast PaneClosed so subscribe_output clients
-                            // detect the exit and close the pane on the GTK side.
-                            let _ = sm.close_pane(id);
-                        }
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        });
-    }
+    // Per-pane drain tasks are spawned by the SessionManager automatically
+    // when each pane is created (via spawn_drain_task inside create_pane /
+    // create_tab / split_pane / split_pane_with_ratio). No shared polling loop
+    // needed here — each pane wakes its drain task only when PTY bytes arrive.
 
     // Dirty-flag: set to true when a layout mutation event (PaneCreated /
     // PaneClosed) is observed. Shared between the watcher task and the

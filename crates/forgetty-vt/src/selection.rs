@@ -103,9 +103,10 @@ impl Selection {
                     let col_start = if row == sr { sc } else { 0 };
                     let col_end = if row == er { ec.min(num_cols - 1) } else { num_cols - 1 };
 
+                    let end = col_end.min(cells.len().saturating_sub(1));
                     let mut line = String::new();
-                    for col in col_start..=col_end.min(cells.len().saturating_sub(1)) {
-                        line.push_str(&cells[col].grapheme);
+                    for cell in &cells[col_start..=end] {
+                        line.push_str(&cell.grapheme);
                     }
                     lines.push(line);
                 }
@@ -114,8 +115,8 @@ impl Selection {
                 for row in sr..=er.min(num_rows - 1) {
                     let cells = screen.row(row);
                     let mut line = String::new();
-                    for col in 0..num_cols.min(cells.len()) {
-                        line.push_str(&cells[col].grapheme);
+                    for cell in &cells[..num_cols.min(cells.len())] {
+                        line.push_str(&cell.grapheme);
                     }
                     lines.push(line);
                 }
@@ -125,9 +126,10 @@ impl Selection {
                 let max_col = sc.max(ec).min(num_cols - 1);
                 for row in sr..=er.min(num_rows - 1) {
                     let cells = screen.row(row);
+                    let end = max_col.min(cells.len().saturating_sub(1));
                     let mut line = String::new();
-                    for col in min_col..=max_col.min(cells.len().saturating_sub(1)) {
-                        line.push_str(&cells[col].grapheme);
+                    for cell in &cells[min_col..=end] {
+                        line.push_str(&cell.grapheme);
                     }
                     lines.push(line);
                 }

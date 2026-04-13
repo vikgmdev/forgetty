@@ -150,6 +150,7 @@ impl BackgroundRenderer {
     }
 
     /// Update the instance buffer with current screen background colors, with a y offset.
+    #[allow(clippy::too_many_arguments)]
     pub fn update_with_offset(
         &mut self,
         device: &wgpu::Device,
