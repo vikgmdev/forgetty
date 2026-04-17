@@ -22,7 +22,7 @@
 | **AD-009** | No polling on the hot path | ✅ Implemented | 20 ms daemon drain loop removed by V2-001. 8 ms GLib timer on GTK output poll removed by V2-002. Hot path is fully event-driven. |
 | **AD-010** | Raw PTY bytes in length-prefixed binary frames | ✅ Implemented | V2-003 (2026-04-17). `subscribe_output` now streams `[u32 BE length][payload]` frames with a 4 MiB cap, matching the `forgetty-sync` Android wire. Byte-perfect 10 MiB round-trip verified. |
 | **AD-011** | Daemon always runs; no local-PTY fallback | ✅ Implemented | V2-004 (2026-04-17). Second `create_terminal()` deleted. `TerminalState.pty`/`pty_rx` fields removed. `forgetty-pty` dep dropped from `forgetty-gtk`. `ensure_daemon()` now exits 1 on failure (no silent fallback). `--temp` mode preserved as scope boundary. |
-| **AD-012** | Daemon survives window close | ❌ Not implemented | `shutdown_clean` RPC kills the daemon on window close. **V2-005 adds `disconnect` and changes the close handler.** |
+| **AD-012** | Daemon survives window close | ✅ Implemented | V2-005 (2026-04-17). New `disconnect` JSON-RPC added; GTK X-button, Ctrl+Shift+Q, and SIGTERM/SIGHUP/SIGINT signal handlers now call `disconnect` instead of `shutdown_clean`/`shutdown_save`. Daemon persists state (session JSON + v0.1 VT snapshots) and drops the connection without exiting. Hamburger "Close Window Permanently" still wired to `shutdown()` as the explicit-kill path. |
 | **AD-013** | Persistence = byte log, not cell snapshot | ❌ Not implemented | Current persistence is `snapshots/{uuid}.bin` VT-state binary. **V2-007 replaces with `logs/{pane_uuid}.log` byte log.** |
 | **AD-014** | Client-side color resolution | ❌ Not implemented | Colors resolved in daemon VT layer at parse time. **V2-009 moves resolution to client render time.** |
 | **AD-015** | `forgetty-sync` has no terminal deps | ❌ Not implemented | `forgetty-sync` currently depends on `forgetty-session`. **V2-011 decouples.** |
@@ -51,7 +51,7 @@
 | 8 ms GLib timer on GTK PTY output poll | ✅ Removed | V2-002 |
 | base64 + JSON encoding of PTY bytes on `subscribe_output` | ✅ Removed | V2-003 |
 | Second `create_terminal()` in GTK (local-PTY path) | ✅ Removed | V2-004 |
-| `shutdown_clean` on window close | ❌ To remove (keep for "close permanently" action) | V2-005 |
+| `shutdown_clean` on window close | ✅ Removed (V2-005) — window close now calls `disconnect`. `shutdown` preserved for "Close Window Permanently"; `shutdown_clean`/`shutdown_save` wrappers kept in `daemon_client.rs` but no longer called from GTK close paths. | V2-005 |
 | Daemon OSC 9 notification parsing | ❌ To remove (moves to client) | V2-006 |
 | `snapshots/{uuid}.bin` VT binary snapshots | ❌ To remove | V2-007 |
 | `VtInstance` in `PaneState` (daemon-side) | ❌ To remove | V2-008 |
@@ -66,6 +66,6 @@
 
 | Category | Total | ✅ Done | 🟡 Partial | ❌ Missing |
 |----------|-------|---------|-----------|-----------|
-| Architectural decisions (AD-001…AD-015) | 15 | 8 | 2 | 5 |
+| Architectural decisions (AD-001…AD-015) | 15 | 9 | 2 | 4 |
 
 Target: all ❌ → ✅ by the end of the V2 backlog (V2-001 through V2-012).
