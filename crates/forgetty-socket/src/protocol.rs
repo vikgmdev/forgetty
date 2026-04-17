@@ -125,6 +125,9 @@ pub mod methods {
     pub const SHUTDOWN_SAVE: &str = "shutdown_save"; // normal close: save session then exit
     pub const SHUTDOWN_CLEAN: &str = "shutdown_clean"; // browser close: save → trash → exit
     pub const DISCONNECT: &str = "disconnect"; // V2-005 / AD-012: daemon survives window close
+
+    // V2-006 (AD-007/AD-008): client → daemon OSC notification log.
+    pub const NOTIFY: &str = "notify";
 }
 
 #[cfg(test)]

@@ -649,6 +649,30 @@ impl DaemonClient {
         let _ = self.rpc("disconnect", serde_json::json!({}));
     }
 
+    /// Log a detected OSC 9/99/777 notification on the daemon side (V2-006).
+    ///
+    /// The GTK client has already presented the notification locally; this RPC
+    /// is a best-effort advisory log for audit, MCP observability, and future
+    /// multi-client fanout. Errors are ignored if the daemon is unreachable —
+    /// same semantics as `disconnect()` / `shutdown_save()` / `shutdown_clean()`.
+    ///
+    /// Called from the GTK main thread like the other sibling RPCs; the
+    /// underlying `rpc()` helper uses a blocking `UnixStream` with a 500 ms
+    /// `read_timeout` which is acceptable for a cold-path one-shot.  The caller
+    /// rate-limits via the 2-second `can_send_desktop` gate (see `terminal.rs`),
+    /// so a misbehaving tool cannot flood the daemon.
+    pub fn notify(&self, pane_id: PaneId, title: &str, body: &str, source: &str) {
+        let _ = self.rpc(
+            "notify",
+            serde_json::json!({
+                "pane_id": pane_id.to_string(),
+                "title": title,
+                "body": body,
+                "source": source,
+            }),
+        );
+    }
+
     /// Open a `subscribe_output` stream for a pane.
     ///
     /// Creates a `std::sync::mpsc` channel + a Linux wake pipe, spawns a

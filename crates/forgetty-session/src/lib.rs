@@ -11,7 +11,7 @@
 //! - [`pane`] — `PaneState` (private) + `PaneInfo` (public)
 //! - [`pty_bridge`] — `PtyBridge` (owns `PtyProcess` + reader thread)
 //! - [`vt_instance`] — `VtInstance` (thin wrapper over `forgetty_vt::Terminal`)
-//! - [`events`] — `SessionEvent`, `NotificationPayload`, `NotificationSource`
+//! - [`events`] — `SessionEvent`
 //! - [`drain_result`] — `DrainResult`
 //! - [`workspace`] — `WorkspaceLayout` types and `build_workspace_state()`
 
@@ -26,7 +26,7 @@ pub mod workspace;
 
 // Convenient top-level re-exports for downstream crates.
 pub use drain_result::DrainResult;
-pub use events::{NotificationPayload, NotificationSource, SessionEvent};
+pub use events::SessionEvent;
 pub use layout::{SessionLayout, SessionTab, SessionWorkspace};
 pub use manager::SessionManager;
 pub use pane::{PaneInfo, PaneState};

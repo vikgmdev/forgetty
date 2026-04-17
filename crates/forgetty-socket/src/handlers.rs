@@ -53,6 +53,7 @@ pub fn dispatch(
         methods::GET_PANE_INFO => handle_get_pane_info(request, &sm),
         methods::RESIZE_PANE => handle_resize_pane(request, &sm),
         methods::SEND_SIGINT => handle_send_sigint(request, &sm),
+        methods::NOTIFY => handle_notify(request, &sm),
         methods::PRESEED_SNAPSHOT => handle_preseed_snapshot(request, &sm),
         methods::CLOSE_PANE => handle_close_pane(request, &sm),
         methods::CREATE_WORKSPACE => handle_create_workspace(request, &sm),
@@ -962,6 +963,41 @@ fn handle_send_sigint(request: &Request, sm: &SessionManager) -> Response {
             format!("failed to send SIGINT: {e}"),
         ),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Client-side OSC notification log (V2-006)
+// ---------------------------------------------------------------------------
+
+/// Handle the `notify` RPC — a client → daemon advisory log entry.
+///
+/// The GTK client has already detected an OSC 9/99/777 notification locally
+/// and presented it (tab badge, desktop notification, click-to-focus). This
+/// RPC is fire-and-forget from the client's perspective: it exists so the
+/// daemon can log the event for audit, planned MCP observability, and as a
+/// seam for future cross-device fanout (per SPEC §10 follow-up).
+///
+/// The handler is intentionally minimal: validate params, log, return `ok`.
+/// It does **not** modify session state, emit broadcast events, or touch
+/// `SyncEndpoint` (AD-015 preserved).
+fn handle_notify(request: &Request, sm: &SessionManager) -> Response {
+    let pane_id = match require_pane_id(request, sm) {
+        Ok(id) => id,
+        Err(e) => return e,
+    };
+
+    // `body` is accepted in params but intentionally not logged —
+    // it can be long; keep log lines bounded.
+    let title = request.params.get("title").and_then(|v| v.as_str()).unwrap_or("");
+    let source = request.params.get("source").and_then(|v| v.as_str()).unwrap_or("");
+
+    tracing::info!(
+        target: "forgetty_socket::notify",
+        pane = %pane_id, source, title,
+        "OSC notification reported by client"
+    );
+
+    Response::success(request.id.clone(), serde_json::json!({ "ok": true }))
 }
 
 // ---------------------------------------------------------------------------

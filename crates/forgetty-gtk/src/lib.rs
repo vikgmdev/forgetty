@@ -29,6 +29,7 @@ pub mod clipboard;
 pub mod code_block;
 pub mod daemon_client;
 pub mod input;
+pub mod osc_notification;
 pub mod preferences;
 pub mod settings_view;
 pub mod terminal;

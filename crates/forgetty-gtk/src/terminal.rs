@@ -17,10 +17,10 @@ use libc;
 
 use forgetty_config::{BellMode, Config, CursorStyle, NotificationMode};
 use forgetty_core::Rgba;
-// NotificationPayload, NotificationSource, and scan_osc_notification live in
-// forgetty-session (platform-agnostic types moved there in T-048).
-use forgetty_session::events::scan_osc_notification;
-pub use forgetty_session::{NotificationPayload, NotificationSource};
+// OSC 9/99/777 notification detection is client-owned (AD-007/AD-008).
+// V2-006 moved the scanner from `forgetty-session` into this crate.
+use crate::osc_notification::scan_osc_notification;
+pub use crate::osc_notification::{NotificationPayload, NotificationSource};
 use forgetty_vt::screen::Color;
 use forgetty_vt::selection::{Selection, SelectionMode};
 use forgetty_vt::TerminalEvent;
@@ -503,6 +503,18 @@ pub fn create_terminal(
                             s.last_notification = Instant::now();
                         }
 
+                        // V2-006: capture daemon handles so we can fire the advisory
+                        // `notify` RPC after `drop(s)` below.  Kept in scope across
+                        // the drop via a clone of the Arc.
+                        let notify_rpc_handles = if can_send_desktop {
+                            match (s.daemon_client.clone(), s.daemon_pane_id) {
+                                (Some(dc), Some(pid)) => Some((dc, pid)),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+
                         if !s.scroll_lock {
                             s.terminal.scroll_viewport_bottom();
                             let (_, off, _) = s.terminal.scrollbar_state();
@@ -537,6 +549,22 @@ pub fn create_terminal(
                             }
                         }
                         if let Some(payload) = osc_notify_payload {
+                            // V2-006: advisory log RPC for daemon-side observability.
+                            // Fire BEFORE the callback consumes `payload`, and only
+                            // when `source` is set (BEL notifications are source=None
+                            // and skip the RPC per SPEC AC-18).  Rate-limited by the
+                            // same 2-second `can_send_desktop` gate so a misbehaving
+                            // tool cannot flood the daemon log.
+                            if let (Some(src), Some((ref dc, pid))) =
+                                (payload.source, notify_rpc_handles.as_ref())
+                            {
+                                let src_str = match src {
+                                    NotificationSource::Osc9 => "Osc9",
+                                    NotificationSource::Osc99 => "Osc99",
+                                    NotificationSource::Osc777 => "Osc777",
+                                };
+                                dc.notify(*pid, &payload.title, &payload.body, src_str);
+                            }
                             if let Some(ref cb) = on_notify_cb {
                                 let mut p = payload;
                                 if !can_send_desktop {

@@ -20,7 +20,7 @@ pub struct PaneState {
     pub vt: VtInstance,
     /// Last known working directory (updated lazily from `/proc/{pid}/cwd`).
     pub cwd: PathBuf,
-    /// Last known title (from OSC 0/2 or CWD basename fallback).
+    /// Last known title (reported by the client, or CWD basename fallback).
     pub title: String,
     /// Current PTY rows.
     pub rows: u16,

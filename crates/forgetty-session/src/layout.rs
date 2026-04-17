@@ -48,7 +48,8 @@ pub struct SessionWorkspace {
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionTab {
     pub id: Uuid,
-    /// Tab title, populated from OSC sequences in T-060+. Empty until then.
+    /// Tab title (populated client-side from title escape sequences).
+    /// Empty until the client reports one.
     pub title: String,
     pub pane_tree: PaneTreeLayout,
 }

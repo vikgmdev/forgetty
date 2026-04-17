@@ -21,7 +21,7 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::drain_result::DrainResult;
-use crate::events::{scan_osc_notification, SessionEvent};
+use crate::events::SessionEvent;
 use crate::layout::{SessionLayout, SessionTab};
 use crate::pane::{PaneInfo, PaneState};
 use crate::pty_bridge::PtyBridge;
@@ -657,7 +657,6 @@ impl SessionManager {
 
     /// Process one chunk of raw PTY bytes for a pane.
     ///
-    /// - Scans for OSC notifications.
     /// - Feeds bytes to the session-side VT (calls pty_bridge.pty.write() for
     ///   any VT responses).
     /// - Updates the cached CWD from /proc/{pid}/cwd.
@@ -670,7 +669,6 @@ impl SessionManager {
             .get_mut(&id)
             .ok_or_else(|| forgetty_core::ForgettyError::Pty(format!("pane {id} not found")))?;
 
-        let notification = scan_osc_notification(bytes);
         {
             let pty = &mut pane.pty_bridge.pty;
             pane.vt.feed_and_respond(bytes, |resp| {
@@ -689,12 +687,7 @@ impl SessionManager {
             pane_id: id,
             data: bytes::Bytes::copy_from_slice(bytes),
         });
-        Ok(DrainResult {
-            had_data: true,
-            pty_exited,
-            notification,
-            raw_bytes: vec![bytes.to_vec()],
-        })
+        Ok(DrainResult { had_data: true, pty_exited, raw_bytes: vec![bytes.to_vec()] })
     }
 
     /// Spawn a per-pane tokio task that awaits on the output channel.
