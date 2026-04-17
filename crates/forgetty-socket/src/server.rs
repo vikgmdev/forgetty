@@ -7,7 +7,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use base64::Engine as _;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tracing::{debug, error, info, warn};
@@ -16,6 +15,7 @@ use forgetty_session::{SessionEvent, SessionManager};
 use forgetty_sync::SyncEndpoint;
 use forgetty_workspace;
 
+use crate::framing::write_frame;
 use crate::handlers;
 use crate::protocol::{methods, Request, Response};
 
@@ -111,8 +111,9 @@ impl SocketServer {
     ///
     /// For `subscribe_output` requests, the server validates the pane,
     /// subscribes to the broadcast channel, sends an initial `{"ok":true}`
-    /// response, and then streams JSON notifications until the pane closes
-    /// or the client disconnects.
+    /// response, and then streams length-prefixed binary frames of raw PTY
+    /// bytes until the pane closes or the client disconnects (AD-010). The
+    /// framing is `[u32 BE length][payload]`; see `crate::framing`.
     ///
     /// All other methods are dispatched synchronously via `handlers::dispatch`.
     ///
@@ -208,8 +209,10 @@ where
 /// Handle a single client connection with streaming support.
 ///
 /// For `subscribe_output`: validates the pane, subscribes, sends `{"ok":true}`,
-/// then streams `output` notifications until the pane closes or the client
-/// disconnects.
+/// then streams `[u32 BE length][raw PTY bytes]` binary frames until the
+/// pane closes or the client disconnects. After the ack is written, the
+/// server stops reading from the client half of this connection; any bytes
+/// the client writes are dropped unread (V2-003 SPEC §4.4).
 ///
 /// For all other methods: delegates synchronously to `handlers::dispatch`.
 async fn handle_streaming_connection(
@@ -283,40 +286,39 @@ async fn handle_streaming_connection(
             // round-trip.
             let mut rx = sm.subscribe_output();
 
-            // Send the initial acknowledgment.
+            // Send the initial acknowledgment (last line-mode JSON response
+            // on this connection).
             let ack = Response::success(request.id.clone(), serde_json::json!({ "ok": true }));
             write_response(&mut writer, &ack).await?;
 
-            // Stream output notifications until the pane closes or the
-            // write fails (client disconnected).
+            // The server is now in binary output mode for this connection.
+            // Drop the line reader — after the ack, the client half is not
+            // read again (V2-003 SPEC §4.3 / §4.4).
+            drop(lines);
+
+            // Stream `[u32 BE length][payload]` binary frames of raw PTY
+            // bytes until the pane closes, the broadcast channel closes,
+            // or the writer fails (client disconnected).
             loop {
                 match rx.recv().await {
                     Ok(SessionEvent::PtyOutput { pane_id: evt_id, data }) => {
                         if evt_id != pane_id {
                             continue;
                         }
-                        let encoded = base64::engine::general_purpose::STANDARD.encode(&data[..]);
-                        let notification = serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "method": "output",
-                            "params": {
-                                "pane_id": pane_id.to_string(),
-                                "data": encoded,
-                            }
-                        });
-                        let mut out = serde_json::to_string(&notification)
-                            .unwrap_or_else(|_| "{}".to_string());
-                        out.push('\n');
-                        if writer.write_all(out.as_bytes()).await.is_err() {
-                            break;
+                        if data.is_empty() {
+                            // Avoid sending zero-length frames (SPEC §4.2).
+                            continue;
                         }
-                        if writer.flush().await.is_err() {
+                        if let Err(e) = write_frame(&mut writer, &data).await {
+                            debug!("subscribe_output: write_frame failed for {pane_id}: {e}");
                             break;
                         }
                     }
                     Ok(SessionEvent::PaneClosed { pane_id: closed_id }) => {
                         if closed_id == pane_id {
-                            // Pane exited — end the stream.
+                            // Pane exited — end the stream. Dropping
+                            // `writer` at function exit closes the
+                            // write half, signaling EOF to the client.
                             break;
                         }
                     }

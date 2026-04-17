@@ -5,6 +5,10 @@
 //! input processing, pane/tab layout, clipboard integration, and
 //! system notifications.
 
+// Crate slated for deletion in V2-012; suppressing clippy 1.94.0 nits rather
+// than invest in cleanup for dead code.
+#![allow(clippy::new_without_default, clippy::not_unsafe_ptr_arg_deref, clippy::too_many_arguments)]
+
 pub mod app;
 pub mod clipboard;
 pub mod ghostty_input;

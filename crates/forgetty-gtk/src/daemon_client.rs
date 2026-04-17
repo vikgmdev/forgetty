@@ -792,17 +792,22 @@ async fn subscribe_output_task(
 /// Inner implementation for `subscribe_output_task`.
 ///
 /// Opens a persistent Unix socket, sends the `subscribe_output` RPC, reads the
-/// initial `{"ok":true}` acknowledgment, then reads notification lines
-/// indefinitely, base64-decoding PTY bytes and forwarding them to the GTK thread
-/// via the mpsc sender + wake pipe.
+/// initial `{"ok":true}` acknowledgment, then switches to binary frame mode
+/// (`[u32 BE length][raw PTY bytes]`, AD-010) and forwards each frame's
+/// payload verbatim to the GTK thread via the mpsc sender + wake pipe.
 async fn subscribe_output_inner(
     socket_path: &std::path::Path,
     pane_id: PaneId,
     tx: &std::sync::mpsc::Sender<DaemonOutputMessage>,
     wake_write_fd: &std::os::unix::io::OwnedFd,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
+
+    // Local copy of the server-side cap (duplication is accepted per V2-003
+    // SPEC §4.1 — keeps `forgetty-gtk` from pulling in `forgetty-socket` just
+    // for a single constant).
+    const MAX_FRAME_SIZE: usize = 4 * 1024 * 1024;
 
     let stream = UnixStream::connect(socket_path).await?;
     let (reader, mut writer) = stream.into_split();
@@ -819,13 +824,14 @@ async fn subscribe_output_inner(
     writer.write_all(req_line.as_bytes()).await?;
     writer.flush().await?;
 
-    let mut lines = BufReader::new(reader).lines();
-
-    // Read the initial acknowledgment line {"jsonrpc":"2.0","result":{"ok":true},"id":1}.
-    let Some(ack_line) = lines.next_line().await? else {
+    // Read the initial acknowledgment line using a BufReader.
+    // {"jsonrpc":"2.0","result":{"ok":true},"id":1}
+    let mut buf_reader = BufReader::new(reader);
+    let mut ack_line = String::new();
+    if buf_reader.read_line(&mut ack_line).await? == 0 {
         debug!("subscribe_output: server closed connection before ack for pane {pane_id}");
         return Ok(());
-    };
+    }
     let ack: Value = serde_json::from_str(ack_line.trim())?;
     if ack.get("error").is_some() {
         return Err(format!("subscribe_output rejected: {ack}").into());
@@ -833,40 +839,43 @@ async fn subscribe_output_inner(
 
     debug!("subscribe_output: streaming started for pane {pane_id}");
 
-    // Read notification lines indefinitely.
-    while let Some(line) = lines.next_line().await? {
-        let line = line.trim();
-        if line.is_empty() {
+    // Switch to binary frame mode. From this point forward, the socket
+    // bytes are `[u32 BE length][payload]` frames of raw PTY bytes (AD-010).
+    // There is no codepath back to JSON parsing on this connection.
+    loop {
+        let mut len_buf = [0u8; 4];
+        match buf_reader.read_exact(&mut len_buf).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                // Clean EOF — daemon closed the stream (pane exited, etc.).
+                break;
+            }
+            Err(e) => return Err(e.into()),
+        }
+        let len = u32::from_be_bytes(len_buf) as usize;
+
+        if len > MAX_FRAME_SIZE {
+            return Err(format!(
+                "subscribe_output: frame length {len} exceeds MAX_FRAME_SIZE {MAX_FRAME_SIZE}"
+            )
+            .into());
+        }
+
+        if len == 0 {
+            // Tolerate zero-length frames per SPEC §4.2.
             continue;
         }
 
-        let notification: Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(e) => {
-                warn!("subscribe_output: failed to parse notification: {e}");
-                continue;
-            }
-        };
-
-        // Notification format: {"jsonrpc":"2.0","method":"output","params":{"pane_id":"...","data":"<b64>"}}
-        let Some(params) = notification.get("params") else { continue };
-        let Some(data_b64) = params.get("data").and_then(|v| v.as_str()) else { continue };
-
-        let bytes = match base64::engine::general_purpose::STANDARD.decode(data_b64) {
-            Ok(b) => b,
-            Err(e) => {
-                warn!("subscribe_output: base64 decode error: {e}");
-                continue;
-            }
-        };
-
-        if bytes.is_empty() {
-            continue;
+        // Allocate a fresh Vec per frame — ownership passes to the mpsc
+        // channel, so there is no buffer reuse opportunity here.
+        let mut payload = vec![0u8; len];
+        match buf_reader.read_exact(&mut payload).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e.into()),
         }
 
-        // Deliver to the GTK thread via the mpsc channel + wake the GLib fd source.
-        // If the receiver is gone (pane closed), stop the task.
-        if tx.send(DaemonOutputMessage::Data(bytes)).is_err() {
+        if tx.send(DaemonOutputMessage::Data(payload)).is_err() {
             debug!("subscribe_output: mpsc receiver dropped, stopping task for {pane_id}");
             break;
         }

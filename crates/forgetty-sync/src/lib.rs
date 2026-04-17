@@ -3,6 +3,10 @@
 //! This crate has no GTK dependency. It exposes a clean async API that the
 //! daemon binary uses. GTK learns about pairing events only through the
 //! Unix-socket JSON-RPC methods that `forgetty-socket` exposes.
+
+// Pre-existing lints surfaced by clippy 1.94.0; Android wire is frozen per
+// V2-003 SPEC §7, so cleanup waits on a separate P-xxx chore.
+#![allow(clippy::implicit_saturating_sub, clippy::manual_is_multiple_of, clippy::while_let_loop)]
 //!
 //! # API deviation from spec
 //!
