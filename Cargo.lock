@@ -1596,7 +1596,6 @@ dependencies = [
  "dirs",
  "forgetty-config",
  "forgetty-core",
- "forgetty-pty",
  "forgetty-session",
  "forgetty-vt",
  "forgetty-watcher",

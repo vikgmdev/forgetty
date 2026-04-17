@@ -30,6 +30,5 @@ pub mod code_block;
 pub mod daemon_client;
 pub mod input;
 pub mod preferences;
-pub mod pty_bridge;
 pub mod settings_view;
 pub mod terminal;

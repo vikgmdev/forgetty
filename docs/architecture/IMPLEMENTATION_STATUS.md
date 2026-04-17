@@ -21,7 +21,7 @@
 | **AD-008** | Clients own terminal semantics | 🟡 Partial | GTK already has its own VT parser (dual-parse with daemon). **V2-008 makes it the only one.** Android already has its own VT parser via JNI (compliant). |
 | **AD-009** | No polling on the hot path | ✅ Implemented | 20 ms daemon drain loop removed by V2-001. 8 ms GLib timer on GTK output poll removed by V2-002. Hot path is fully event-driven. |
 | **AD-010** | Raw PTY bytes in length-prefixed binary frames | ✅ Implemented | V2-003 (2026-04-17). `subscribe_output` now streams `[u32 BE length][payload]` frames with a 4 MiB cap, matching the `forgetty-sync` Android wire. Byte-perfect 10 MiB round-trip verified. |
-| **AD-011** | Daemon always runs; no local-PTY fallback | ❌ Not implemented | GTK currently has a second `create_terminal()` path for local-PTY mode. **V2-004 deletes it.** |
+| **AD-011** | Daemon always runs; no local-PTY fallback | ✅ Implemented | V2-004 (2026-04-17). Second `create_terminal()` deleted. `TerminalState.pty`/`pty_rx` fields removed. `forgetty-pty` dep dropped from `forgetty-gtk`. `ensure_daemon()` now exits 1 on failure (no silent fallback). `--temp` mode preserved as scope boundary. |
 | **AD-012** | Daemon survives window close | ❌ Not implemented | `shutdown_clean` RPC kills the daemon on window close. **V2-005 adds `disconnect` and changes the close handler.** |
 | **AD-013** | Persistence = byte log, not cell snapshot | ❌ Not implemented | Current persistence is `snapshots/{uuid}.bin` VT-state binary. **V2-007 replaces with `logs/{pane_uuid}.log` byte log.** |
 | **AD-014** | Client-side color resolution | ❌ Not implemented | Colors resolved in daemon VT layer at parse time. **V2-009 moves resolution to client render time.** |
@@ -50,7 +50,7 @@
 | 20 ms drain loop (`tokio::time::sleep` in `daemon.rs`) | ✅ Removed | V2-001 |
 | 8 ms GLib timer on GTK PTY output poll | ✅ Removed | V2-002 |
 | base64 + JSON encoding of PTY bytes on `subscribe_output` | ✅ Removed | V2-003 |
-| Second `create_terminal()` in GTK (local-PTY path) | ❌ To remove | V2-004 |
+| Second `create_terminal()` in GTK (local-PTY path) | ✅ Removed | V2-004 |
 | `shutdown_clean` on window close | ❌ To remove (keep for "close permanently" action) | V2-005 |
 | Daemon OSC 9 notification parsing | ❌ To remove (moves to client) | V2-006 |
 | `snapshots/{uuid}.bin` VT binary snapshots | ❌ To remove | V2-007 |
@@ -66,6 +66,6 @@
 
 | Category | Total | ✅ Done | 🟡 Partial | ❌ Missing |
 |----------|-------|---------|-----------|-----------|
-| Architectural decisions (AD-001…AD-015) | 15 | 7 | 2 | 6 |
+| Architectural decisions (AD-001…AD-015) | 15 | 8 | 2 | 5 |
 
 Target: all ❌ → ✅ by the end of the V2 backlog (V2-001 through V2-012).

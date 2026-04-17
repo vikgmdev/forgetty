@@ -7,9 +7,9 @@
 //! Pango for text layout.
 
 use std::cell::RefCell;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::{mpsc, Arc};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
@@ -17,10 +17,10 @@ use libc;
 
 use forgetty_config::{BellMode, Config, CursorStyle, NotificationMode};
 use forgetty_core::Rgba;
-// NotificationPayload, NotificationSource, DrainResult, scan_osc_notification
-// live in forgetty-session (platform-agnostic types moved there in T-048).
+// NotificationPayload, NotificationSource, and scan_osc_notification live in
+// forgetty-session (platform-agnostic types moved there in T-048).
 use forgetty_session::events::scan_osc_notification;
-pub use forgetty_session::{DrainResult, NotificationPayload, NotificationSource};
+pub use forgetty_session::{NotificationPayload, NotificationSource};
 use forgetty_vt::screen::Color;
 use forgetty_vt::selection::{Selection, SelectionMode};
 use forgetty_vt::TerminalEvent;
@@ -33,7 +33,6 @@ use gtk4::{glib, DrawingArea};
 use crate::code_block::{self, CodeBlock};
 use crate::daemon_client::{DaemonClient, DaemonOutputMessage};
 use crate::input::{GhosttyInput, ScrollAction};
-use crate::pty_bridge;
 
 /// Search state for in-terminal text search (Ctrl+Shift+F).
 ///
@@ -86,11 +85,6 @@ struct HoverUrl {
 /// All access happens on the GTK main thread via `Rc<RefCell<>>`.
 pub struct TerminalState {
     pub terminal: forgetty_vt::Terminal,
-    /// Local PTY process. `None` for daemon-backed panes.
-    pub pty: Option<forgetty_pty::PtyProcess>,
-    /// Local-PTY output channel. `None` for daemon-backed panes (those receive
-    /// output via the event-driven glib channel — see `create_terminal_for_pane`).
-    pub pty_rx: Option<mpsc::Receiver<Vec<u8>>>,
     pub input: GhosttyInput,
     pub config: Config,
     pub cell_width: f64,
@@ -186,87 +180,6 @@ pub struct TerminalState {
     pub daemon_cwd: Option<PathBuf>,
 }
 
-impl TerminalState {
-    /// Drain pending PTY output from the channel and feed it to the
-    /// terminal VT parser.  Caps the amount of data processed per tick
-    /// to `MAX_DRAIN_BYTES` so the GTK main thread stays responsive for
-    /// input events — especially when multiple panes stream output
-    /// concurrently.  Any remaining data stays in the channel and will
-    /// be picked up on the next 8ms cycle.
-    fn drain_pty_output(&mut self) -> DrainResult {
-        // Daemon-backed panes receive output via the event-driven glib channel;
-        // this method is only used by the local-PTY poll timer.
-        let Some(rx) = self.pty_rx.as_mut() else {
-            return DrainResult {
-                had_data: false,
-                pty_exited: false,
-                notification: None,
-                raw_bytes: Vec::new(),
-            };
-        };
-
-        const MAX_DRAIN_BYTES: usize = 128 * 1024; // 128 KB per tick
-        let mut had_data = false;
-        let mut disconnected = false;
-        let mut bytes_drained: usize = 0;
-        let mut notification: Option<NotificationPayload> = None;
-        loop {
-            if bytes_drained >= MAX_DRAIN_BYTES {
-                break; // yield back to the GTK main loop
-            }
-            match rx.try_recv() {
-                Ok(data) => {
-                    bytes_drained += data.len();
-                    had_data = true;
-
-                    // Scan for OSC notification sequences BEFORE feeding to VT parser.
-                    // We only capture the first notification per tick to keep it simple.
-                    if notification.is_none() {
-                        notification = scan_osc_notification(&data);
-                    }
-
-                    self.terminal.feed(&data);
-
-                    // Drain write-PTY responses (DA responses, mode queries, etc.)
-                    let responses = self.terminal.drain_write_pty();
-                    for chunk in responses {
-                        if let Some(ref dc) = self.daemon_client {
-                            if let Some(pane_id) = self.daemon_pane_id {
-                                let _ = dc.send_input(pane_id, &chunk);
-                            }
-                        } else if let Some(ref mut pty) = self.pty {
-                            if let Err(e) = pty.write(&chunk) {
-                                tracing::warn!("Failed to write PTY response: {e}");
-                            }
-                        }
-                    }
-                }
-                Err(mpsc::TryRecvError::Empty) => {
-                    // Channel is empty but the child process may have been
-                    // killed externally. In that case orphan children can
-                    // keep the PTY slave fd open, so the reader thread never
-                    // gets EOF.  Detect this by checking the child status.
-                    if self.daemon_pane_id.is_none() {
-                        if let Some(ref mut pty) = self.pty {
-                            if !pty.is_alive() {
-                                disconnected = true;
-                            }
-                        }
-                    }
-                    break;
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    disconnected = true;
-                    break;
-                }
-            }
-        }
-        // raw_bytes is not used by the GTK drain path (it feeds directly to
-        // self.terminal above). It exists in DrainResult for session consumers.
-        DrainResult { had_data, pty_exited: disconnected, notification, raw_bytes: Vec::new() }
-    }
-}
-
 /// Measure the cell dimensions for a monospace font using Pango.
 fn measure_cell(pango_ctx: &pango::Context, font_desc: &pango::FontDescription) -> (f64, f64) {
     let layout = pango::Layout::new(pango_ctx);
@@ -287,1361 +200,18 @@ fn font_description_with_size(config: &Config, size: f32) -> pango::FontDescript
     desc
 }
 
-/// Create the terminal widget and wire up PTY I/O, rendering, input,
-/// scrollbar, and resize handling.
-///
-/// Returns `(hbox, drawing_area, state)` where:
-/// - `hbox` is a horizontal `gtk::Box` containing the DrawingArea and a
-///   vertical scrollbar on the right edge.
-/// - `drawing_area` is the inner `DrawingArea` (needed for `grab_focus()`,
-///   widget naming, and focus tracking).
-/// - `state` is the shared `TerminalState` wrapped in `Rc<RefCell<>>`.
-///
-/// `on_exit` is an optional callback invoked (once) when the PTY channel
-/// disconnects (shell exited). The callback receives the DrawingArea's
-/// widget name so the caller can close the correct pane.
-///
-/// `on_notify` is an optional callback invoked when a notification fires
-/// (OSC 9/99/777 or BEL on an unfocused pane). Wired by `app.rs`.
-///
-/// `working_dir` and `command` are CLI launch overrides for the initial pane.
-/// Pass `None` for both when creating tabs/splits (they use defaults).
-pub fn create_terminal(
-    config: &Config,
-    on_exit: Option<Rc<dyn Fn(String)>>,
-    on_notify: Option<Rc<dyn Fn(NotificationPayload)>>,
-    working_dir: Option<&Path>,
-    command: Option<&[String]>,
-) -> Result<(gtk4::Box, DrawingArea, Rc<RefCell<TerminalState>>), String> {
-    // Start with a generous over-estimate so the first-draw resize is always
-    // a SHRINK (not a GROW).  libghostty-vt grows by adding blank rows at the
-    // TOP (cursor maintains distance from bottom), which produces a large blank
-    // area above the shell prompt.  Shrinking drops blank rows from the BOTTOM,
-    // leaving content at the top of the screen.  These values comfortably cover
-    // any realistic monitor+font combination (<80 rows, <240 cols).
-    let initial_rows: usize = 80;
-    let initial_cols: usize = 240;
-
-    // Spawn PTY bridge
-    let shell = config.shell.as_deref();
-    let (pty, pty_rx) = pty_bridge::spawn_pty_bridge(
-        initial_rows as u16,
-        initial_cols as u16,
-        shell,
-        working_dir,
-        command,
-    )?;
-
-    // Create terminal VT state
-    let mut terminal =
-        forgetty_vt::Terminal::new(initial_rows, initial_cols, config.theme.ansi_colors);
-
-    // Set default cursor to "blinking block" (DECSCUSR 1) so that
-    // cursor_blinking() returns true before the shell sends any DECSCUSR.
-    // Without this, the render state defaults cursor_blinking to false and
-    // the cursor wouldn't blink until an app explicitly requests it.
-    terminal.feed(b"\x1b[1 q");
-
-    let input = GhosttyInput::new();
-
-    let state = Rc::new(RefCell::new(TerminalState {
-        terminal,
-        pty: Some(pty),
-        pty_rx: Some(pty_rx),
-        input,
-        config: config.clone(),
-        cell_width: 8.0,
-        cell_height: 16.0,
-        cols: initial_cols,
-        rows: initial_rows,
-        selection: None,
-        selecting: false,
-        word_anchor: None,
-        drag_origin: None,
-        suppress_selection_clear_ticks: 0,
-        updating_scrollbar: false,
-        scroll_lock: false,
-        viewport_offset: 0,
-        search: SearchState::default(),
-        font_size: config.font_size,
-        default_font_size: config.font_size,
-        hover_url: None,
-        last_hover_cell: (usize::MAX, usize::MAX),
-        cursor_blink_visible: true,
-        last_blink_toggle: Instant::now(),
-        was_alternate_screen: false,
-        bell_flash_until: None,
-        last_bell: Instant::now() - Duration::from_secs(1),
-        suppress_bell_until: None,
-        last_pty_data: Instant::now(),
-        malloc_trimmed: false,
-        notification_ring: false,
-        last_notification: Instant::now() - Duration::from_secs(10),
-        on_notify,
-        hovered_code_block: None,
-        detected_code_blocks: Vec::new(),
-        code_blocks_generation: u64::MAX, // force re-scan on first motion
-        copy_confirmed_until: None,
-        last_hover_block_cell: (usize::MAX, usize::MAX),
-        daemon_pane_id: None,
-        daemon_client: None,
-        daemon_cwd: None,
-    }));
-
-    // Create DrawingArea
-    let drawing_area = DrawingArea::new();
-    drawing_area.set_hexpand(true);
-    drawing_area.set_vexpand(true);
-    drawing_area.set_focusable(true);
-    drawing_area.set_can_focus(true);
-    drawing_area.set_cursor_from_name(Some("text"));
-
-    // Track whether cell dimensions have been measured from an actual Pango context
-    let cell_measured = Rc::new(RefCell::new(false));
-
-    // --- Draw callback ---
-    {
-        let state = Rc::clone(&state);
-        let cell_measured = Rc::clone(&cell_measured);
-        drawing_area.set_draw_func(move |da, ctx, width, height| {
-            draw_terminal(da, ctx, width, height, &state, &cell_measured);
-        });
-    }
-
-    // --- Poll PTY data with a GLib timeout (8ms ~ 120Hz) ---
-    // Uses a weak reference to the DrawingArea so the timer stops automatically
-    // when the tab is closed and the widget is destroyed.
-    {
-        let state = Rc::clone(&state);
-        let da_weak = drawing_area.downgrade();
-        // Wrap on_exit in Rc so it can be moved into the closure and called once.
-        let on_exit = on_exit.map(|cb| Rc::new(std::cell::Cell::new(Some(cb))));
-        glib::timeout_add_local(Duration::from_millis(8), move || {
-            // Stop the timer if the DrawingArea has been destroyed (tab closed)
-            let Some(da) = da_weak.upgrade() else {
-                return glib::ControlFlow::Break;
-            };
-
-            let Ok(mut s) = state.try_borrow_mut() else {
-                // Another callback holds the borrow -- skip this tick.
-                // The PTY data will be picked up on the next 8ms cycle.
-                return glib::ControlFlow::Continue;
-            };
-
-            // Refresh the cached viewport offset.
-            let (_, offset, _) = s.terminal.scrollbar_state();
-            s.viewport_offset = offset;
-
-            let DrainResult { had_data, pty_exited, notification: osc_notification, .. } =
-                s.drain_pty_output();
-
-            // Detect alternate screen → primary screen transitions (e.g., htop exit).
-            // Re-feed DECSCUSR 1 (blinking block) to restore our blink default,
-            // since the alternate screen exit may reset cursor_blinking to false.
-            let is_alt = s.terminal.is_alternate_screen();
-            if s.was_alternate_screen && !is_alt {
-                s.terminal.feed(b"\x1b[1 q");
-            }
-            s.was_alternate_screen = is_alt;
-
-            // Drain terminal events (bell, title changes) so they don't
-            // accumulate unboundedly in the event buffer.
-            let events = s.terminal.drain_events();
-            let mut bell_notify_payload: Option<NotificationPayload> = None;
-            for event in events {
-                if let TerminalEvent::Bell = event {
-                    let now = Instant::now();
-                    // Rate limit: suppress bells within 200ms of the last one.
-                    if now.duration_since(s.last_bell) < Duration::from_millis(200) {
-                        continue;
-                    }
-                    // Suppress the shell's BEL response that follows a Ctrl+C press
-                    // (zsh beeps on SIGINT, which would show an unwanted visual flash).
-                    if s.suppress_bell_until.is_some_and(|t| now < t) {
-                        s.suppress_bell_until = None;
-                        continue;
-                    }
-                    s.last_bell = now;
-
-                    match s.config.bell_mode {
-                        BellMode::Visual => {
-                            s.bell_flash_until = Some(Instant::now() + Duration::from_millis(150));
-                        }
-                        BellMode::Audio => {
-                            da.error_bell();
-                        }
-                        BellMode::Both => {
-                            s.bell_flash_until = Some(Instant::now() + Duration::from_millis(150));
-                            da.error_bell();
-                        }
-                        BellMode::None => {}
-                    }
-
-                    // BEL triggers ring + badge but NOT a desktop notification.
-                    // Only fire if the pane is not currently focused.
-                    if !da.has_focus() && s.config.notification_mode != NotificationMode::None {
-                        s.notification_ring = true;
-                        bell_notify_payload = Some(NotificationPayload {
-                            title: String::new(),
-                            body: String::new(),
-                            pane_name: da.widget_name().to_string(),
-                            source: None, // BEL has no source
-                        });
-                    }
-                }
-            }
-
-            // Handle OSC notification detected during drain.
-            let osc_notify_payload = if let Some(mut payload) = osc_notification {
-                if !da.has_focus() && s.config.notification_mode != NotificationMode::None {
-                    s.notification_ring = true;
-                    payload.pane_name = da.widget_name().to_string();
-                    Some(payload)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            // Clone on_notify Rc and rate-limit state before dropping the borrow.
-            let on_notify_cb = s.on_notify.clone();
-            let last_notif = s.last_notification;
-            let can_send_desktop = last_notif.elapsed() >= Duration::from_secs(2);
-            if can_send_desktop && (bell_notify_payload.is_some() || osc_notify_payload.is_some()) {
-                s.last_notification = Instant::now();
-            }
-
-            if had_data {
-                // Track when we last received PTY data for idle detection (T-028).
-                s.last_pty_data = Instant::now();
-                s.malloc_trimmed = false;
-
-                // Auto-scroll to bottom unless the user has explicitly scrolled up
-                // (scroll_lock is set). This lets users freeze their view during
-                // rapid output (e.g., `while true; do date; done`).
-                if !s.scroll_lock {
-                    s.terminal.scroll_viewport_bottom();
-                    let (_, off, _) = s.terminal.scrollbar_state();
-                    s.viewport_offset = off;
-                }
-
-                // Selection is NOT cleared on output — that makes selection
-                // impossible during active programs (Claude Code, apt, top, etc.).
-                // Selection is cleared on keypress instead (see key handler below).
-
-                // Invalidate stale search matches when terminal content changes.
-                // Match positions are stored as absolute rows which become wrong
-                // after Ctrl+L (clear) or any output that shifts scrollback.
-                // Without this, ghost highlight rectangles persist over empty cells.
-                if s.search.active && !s.search.all_matches.is_empty() {
-                    s.search.all_matches.clear();
-                    s.search.matches.clear();
-                    s.search.current_index = 0;
-                    s.search.current_viewport_index = None;
-                }
-
-                // Advance blink phase if needed (data path already triggers redraw)
-                let now = Instant::now();
-                if now.duration_since(s.last_blink_toggle) >= Duration::from_millis(600) {
-                    s.cursor_blink_visible = !s.cursor_blink_visible;
-                    s.last_blink_toggle = now;
-                }
-
-                drop(s);
-                da.queue_draw();
-            } else {
-                // No PTY data this tick — check cursor blink timer.
-                // Toggle blink phase every 600ms when the terminal requests blinking.
-                // Only trigger a redraw when the phase actually changes.
-                let now = Instant::now();
-                let needs_redraw =
-                    if now.duration_since(s.last_blink_toggle) >= Duration::from_millis(600) {
-                        s.cursor_blink_visible = !s.cursor_blink_visible;
-                        s.last_blink_toggle = now;
-                        true
-                    } else {
-                        false
-                    };
-
-                // T-028: After 5 seconds of no PTY data, call malloc_trim(0) to
-                // return freed heap pages to the OS. The glibc allocator retains
-                // freed memory by default, which causes the 39% post-settle RSS
-                // bloat found in T-027 benchmarking. This is called once per idle
-                // transition, not repeatedly.
-                #[cfg(target_os = "linux")]
-                if !s.malloc_trimmed
-                    && now.duration_since(s.last_pty_data) >= Duration::from_secs(5)
-                {
-                    s.malloc_trimmed = true;
-                    // Safety: malloc_trim is thread-safe and returns 1 if memory
-                    // was actually released, 0 otherwise. Called on the GTK main
-                    // thread during a confirmed idle period.
-                    unsafe {
-                        libc::malloc_trim(0);
-                    }
-                    tracing::debug!("malloc_trim(0) called after 5s idle");
-                }
-
-                // Also redraw while the bell flash overlay is active.
-                let bell_active = s.bell_flash_until.is_some();
-                // Also redraw when the notification ring state changed.
-                let ring_changed = bell_notify_payload.is_some() || osc_notify_payload.is_some();
-                if needs_redraw || bell_active || ring_changed {
-                    drop(s);
-                    da.queue_draw();
-                }
-            }
-
-            // Fire notification callbacks outside the TerminalState borrow.
-            // BEL: ring + badge but NO desktop notification.
-            if let Some(payload) = bell_notify_payload {
-                if let Some(ref cb) = on_notify_cb {
-                    cb(payload);
-                }
-            }
-            // OSC: ring + badge + desktop notification (subject to rate limiting).
-            if let Some(payload) = osc_notify_payload {
-                if let Some(ref cb) = on_notify_cb {
-                    // Mark whether the desktop notification is rate-limited.
-                    // We already updated last_notification above if can_send_desktop.
-                    let mut p = payload;
-                    if !can_send_desktop {
-                        // Suppress desktop notification by clearing source
-                        // (on_notify callback checks source == None to skip it).
-                        p.source = None;
-                    }
-                    cb(p);
-                }
-            }
-
-            // PTY channel disconnected -- shell process has exited.
-            // Schedule the pane close asynchronously via idle callback to avoid
-            // reentrancy issues with the timer that detected the exit.
-            if pty_exited {
-                tracing::debug!("PTY exited for pane {:?}, scheduling close", da.widget_name());
-                if let Some(ref exit_cell) = on_exit {
-                    if let Some(cb) = exit_cell.take() {
-                        let pane_name = da.widget_name().to_string();
-                        glib::idle_add_local_once(move || {
-                            cb(pane_name);
-                        });
-                    }
-                }
-                return glib::ControlFlow::Break;
-            }
-
-            glib::ControlFlow::Continue
-        });
-    }
-
-    // --- Keyboard input (via ghostty key encoder) ---
-    {
-        let key_controller = gtk4::EventControllerKey::new();
-
-        // key-pressed handler (fires for both initial press and repeat)
-        {
-            let state = Rc::clone(&state);
-            let da_for_key = drawing_area.clone();
-            key_controller.connect_key_pressed(move |_controller, keyval, keycode, modifier| {
-                // Let app-level shortcuts pass through to GTK accelerators.
-                // Without this, the ghostty encoder would consume Alt+Shift+= etc.
-                // and return Stop, preventing the accelerator from firing.
-                if is_app_shortcut(keyval, modifier) {
-                    return glib::Propagation::Proceed;
-                }
-
-                let Ok(mut s) = state.try_borrow_mut() else {
-                    // Borrow held elsewhere -- drop this key event.
-                    return glib::Propagation::Proceed;
-                };
-
-                // Ctrl+C: copy if selection exists, otherwise send SIGINT (0x03) directly.
-                // We bypass the ghostty encoder for both cases — the encoder may return None
-                // for Ctrl+C in some keyboard protocol modes, causing Propagation::Proceed
-                // which triggers the GTK system bell and the T-014 visual flash.
-                let ctrl_only = modifier
-                    & (gdk::ModifierType::CONTROL_MASK
-                        | gdk::ModifierType::SHIFT_MASK
-                        | gdk::ModifierType::ALT_MASK)
-                    == gdk::ModifierType::CONTROL_MASK;
-                if ctrl_only && (keyval == gdk::Key::c || keyval == gdk::Key::C) {
-                    if s.selection.is_some() {
-                        drop(s);
-                        da_for_key.activate_action("win.copy", None).ok();
-                    } else {
-                        // Write 0x03 for PTY echo + cooked-mode line discipline.
-                        if let Some(ref mut pty) = s.pty {
-                            pty.write(&[0x03]).ok();
-                            // Also send SIGINT directly to the PTY's actual foreground
-                            // process group via tcgetpgrp on the master PTY fd. This is
-                            // necessary when a child has disabled ISIG (e.g. Node.js /
-                            // pm2), preventing the line discipline from converting 0x03
-                            // to SIGINT automatically.
-                            send_sigint_to_fg_pgrp(pty);
-                        }
-                        // Scroll back to bottom so the user sees the shell prompt
-                        // after interrupting a process from scrollback position.
-                        s.terminal.scroll_viewport_bottom();
-                        let (_, off, _) = s.terminal.scrollbar_state();
-                        s.viewport_offset = off;
-                        s.scroll_lock = false;
-                        s.cursor_blink_visible = true;
-                        s.last_blink_toggle = Instant::now();
-                        // Suppress the shell's BEL response (zsh beeps on SIGINT).
-                        s.suppress_bell_until = Some(Instant::now() + Duration::from_millis(300));
-                    }
-                    return glib::Propagation::Stop;
-                }
-
-                // Escape clears selection when mouse tracking is off (AC-19).
-                // When mouse tracking is on (e.g., vim), Escape should go to the app.
-                if keyval == gdk::Key::Escape
-                    && s.selection.is_some()
-                    && !s.terminal.is_mouse_tracking()
-                {
-                    s.selection = None;
-                    s.selecting = false;
-                    s.word_anchor = None;
-                    drop(s);
-                    da_for_key.queue_draw();
-                    return glib::Propagation::Stop;
-                }
-
-                let terminal_handle = s.terminal.raw_handle();
-                if let Some(bytes) =
-                    s.input.encode_key_press(keyval, keycode, modifier, terminal_handle)
-                {
-                    if let Some(ref mut pty) = s.pty {
-                        if let Err(e) = pty.write(&bytes) {
-                            tracing::warn!("Failed to write to PTY: {e}");
-                        }
-                    }
-                    let was_scroll_locked = s.scroll_lock;
-                    let had_selection = s.selection.is_some();
-                    // Scroll back to bottom on any keypress so typing / Ctrl+L
-                    // always brings the viewport back from scrollback position.
-                    s.terminal.scroll_viewport_bottom();
-                    let (_, off, _) = s.terminal.scrollbar_state();
-                    s.viewport_offset = off;
-                    s.scroll_lock = false; // resume auto-scroll now that user is typing
-                                           // Clear any active selection — user is typing, selection is stale.
-                    s.selection = None;
-                    s.selecting = false;
-                    s.word_anchor = None;
-                    s.drag_origin = None;
-                    // Reset cursor blink on keypress: make cursor solid and
-                    // restart the blink countdown (AC-2).
-                    s.cursor_blink_visible = true;
-                    s.last_blink_toggle = Instant::now();
-                    // Only redraw immediately if visible state changed (viewport scrolled or
-                    // selection cleared). In the common case (already at bottom, no selection),
-                    // skip the intermediate frame — the PTY echo arrives within ~8ms and the
-                    // drain timer redraws with the cursor already at its new position, preventing
-                    // the two-frame cursor stutter that looks like "vibrating".
-                    if was_scroll_locked || had_selection {
-                        da_for_key.queue_draw();
-                    }
-                    return glib::Propagation::Stop;
-                }
-                glib::Propagation::Proceed
-            });
-        }
-
-        // key-released handler (needed for Kitty keyboard protocol release events)
-        {
-            let state = Rc::clone(&state);
-            let da_for_release = drawing_area.clone();
-            key_controller.connect_key_released(move |_controller, keyval, keycode, modifier| {
-                let Ok(mut s) = state.try_borrow_mut() else {
-                    // Borrow held elsewhere -- drop this release event.
-                    return;
-                };
-                let terminal_handle = s.terminal.raw_handle();
-                if let Some(bytes) =
-                    s.input.encode_key_release(keyval, keycode, modifier, terminal_handle)
-                {
-                    if let Some(ref mut pty) = s.pty {
-                        if let Err(e) = pty.write(&bytes) {
-                            tracing::warn!("Failed to write to PTY: {e}");
-                        }
-                    }
-                    da_for_release.queue_draw();
-                }
-            });
-        }
-
-        drawing_area.add_controller(key_controller);
-    }
-
-    // --- Focus controller (for DECSET 1004 focus reporting) ---
-    {
-        let focus_controller = gtk4::EventControllerFocus::new();
-
-        // Focus gained
-        {
-            let state = Rc::clone(&state);
-            let da_focus = drawing_area.clone();
-            focus_controller.connect_enter(move |_controller| {
-                let Ok(mut s) = state.try_borrow_mut() else {
-                    return;
-                };
-                if s.terminal.is_focus_reporting() {
-                    if let Some(bytes) = GhosttyInput::encode_focus(true) {
-                        if let Some(ref mut pty) = s.pty {
-                            if let Err(e) = pty.write(&bytes) {
-                                tracing::warn!("Failed to write focus-in to PTY: {e}");
-                            }
-                        }
-                        da_focus.queue_draw();
-                    }
-                }
-            });
-        }
-
-        // Focus lost
-        {
-            let state = Rc::clone(&state);
-            let da_focus = drawing_area.clone();
-            focus_controller.connect_leave(move |_controller| {
-                let Ok(mut s) = state.try_borrow_mut() else {
-                    return;
-                };
-                if s.terminal.is_focus_reporting() {
-                    if let Some(bytes) = GhosttyInput::encode_focus(false) {
-                        if let Some(ref mut pty) = s.pty {
-                            if let Err(e) = pty.write(&bytes) {
-                                tracing::warn!("Failed to write focus-out to PTY: {e}");
-                            }
-                        }
-                        da_focus.queue_draw();
-                    }
-                }
-            });
-        }
-
-        drawing_area.add_controller(focus_controller);
-    }
-
-    // --- Mouse click controller (GestureClick for button press/release) ---
-    {
-        let gesture = gtk4::GestureClick::new();
-        // Respond to all buttons (default is button 1 only).
-        gesture.set_button(0);
-
-        // Button pressed
-        {
-            let state = Rc::clone(&state);
-            let da_click = drawing_area.clone();
-            gesture.connect_pressed(move |gesture, n_press, x, y| {
-                // Clicking on a pane should focus it (for split pane navigation).
-                da_click.grab_focus();
-
-                let button = gesture.current_button();
-                let modifier = gesture.current_event_state();
-
-                // --- Right-click context menu (AC-1, AC-9, AC-22) ---
-                // Button 3 always opens the context menu, even when mouse
-                // tracking is active (matches Ghostty behavior).
-                // IMPORTANT: do NOT clear the selection on right-click (AC-9).
-                if button == 3 {
-                    let Ok(s) = state.try_borrow() else {
-                        return;
-                    };
-
-                    // Detect URL at the click position for conditional menu item
-                    let (screen_row, col) =
-                        pixel_to_cell(x, y, s.cell_width, s.cell_height, s.cols, s.rows);
-                    let screen = s.terminal.screen();
-                    let hover = detect_url_at(screen, screen_row, col);
-                    let url_str = hover.map(|h| h.url);
-                    let has_selection = s.selection.is_some();
-                    drop(s);
-
-                    // Find the Popover attached to this DrawingArea
-                    if let Some(popover) = find_context_popover(&da_click) {
-                        // Build button box fresh (handles dynamic URL + copy sensitivity)
-                        let menu_box =
-                            build_context_menu_box(&popover, url_str.as_deref(), has_selection);
-                        popover.set_child(Some(&menu_box));
-                        popover
-                            .set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-                        popover.popup();
-                    }
-
-                    return;
-                }
-
-                // --- Ctrl+Click to open URL (AC-7, AC-8) ---
-                // Intercept before selection logic. Only when mouse tracking is
-                // NOT active (AC-18) and Ctrl is held without Shift.
-                if button == 1
-                    && modifier.contains(gdk::ModifierType::CONTROL_MASK)
-                    && !modifier.contains(gdk::ModifierType::SHIFT_MASK)
-                {
-                    let Ok(s) = state.try_borrow() else {
-                        return;
-                    };
-                    let mouse_tracking = s.terminal.is_mouse_tracking();
-                    if !mouse_tracking {
-                        let (screen_row, col) =
-                            pixel_to_cell(x, y, s.cell_width, s.cell_height, s.cols, s.rows);
-                        let screen = s.terminal.screen();
-                        let hover = detect_url_at(screen, screen_row, col);
-                        drop(s);
-                        if let Some(hu) = hover {
-                            crate::app::open_url_in_browser(&hu.url);
-                            return;
-                        }
-                    }
-                    // If mouse tracking is active or no URL found, fall through
-                }
-
-                let Ok(mut s) = state.try_borrow_mut() else {
-                    // Borrow held elsewhere -- drop this click event.
-                    return;
-                };
-
-                // --- Code block copy button click (T-032) ---
-                // Check before selection logic so the click is consumed.
-                if button == 1 && n_press == 1 {
-                    if let Some(ref block) = s.hovered_code_block {
-                        let cell_w = s.cell_width;
-                        let cell_h = s.cell_height;
-                        let scale = da_click.scale_factor() as f64;
-                        let btn_size = (24.0 * scale).max(24.0);
-                        let btn_x = (block.right_col as f64 + 1.0) * cell_w - btn_size;
-                        let btn_y = block.top_row as f64 * cell_h;
-                        if x >= btn_x
-                            && x <= btn_x + btn_size
-                            && y >= btn_y
-                            && y <= btn_y + btn_size
-                        {
-                            let screen = s.terminal.screen();
-                            let content = code_block::extract_content(screen, block);
-                            if !content.is_empty() {
-                                let display = da_click.display();
-                                display.clipboard().set_text(&content);
-                                s.copy_confirmed_until =
-                                    Some(Instant::now() + Duration::from_millis(1500));
-                                drop(s);
-                                da_click.queue_draw();
-                            }
-                            return;
-                        }
-                    }
-                }
-
-                let mouse_tracking = s.terminal.is_mouse_tracking();
-
-                // Shift+Click overrides mouse tracking (AC-15): force selection
-                // mode even when an app has mouse tracking enabled.
-                let shift_held = modifier.contains(gdk::ModifierType::SHIFT_MASK);
-                let use_selection = !mouse_tracking || shift_held;
-
-                if button == 1 && use_selection {
-                    // Handle text selection instead of forwarding to app
-                    let (screen_row, col) =
-                        pixel_to_cell(x, y, s.cell_width, s.cell_height, s.cols, s.rows);
-
-                    // Use cached viewport offset (updated by 16ms timer) to
-                    // avoid expensive FFI calls on every mouse event.
-                    let vp_offset = s.viewport_offset;
-                    let abs_row = screen_row + vp_offset as usize;
-
-                    match n_press {
-                        1 => {
-                            // Shift+Click extends existing selection to clicked position
-                            if shift_held {
-                                if let Some(ref mut sel) = s.selection {
-                                    sel.update(abs_row, col);
-                                    s.selecting = false;
-                                    drop(s);
-                                    da_click.queue_draw();
-                                    return;
-                                }
-                            }
-
-                            // Single click: defer selection creation until motion is
-                            // detected.  This avoids a visible flicker where the
-                            // selection overlay renders for one frame on a plain click.
-                            s.selection = None; // clear any previous selection (AC-3)
-                            s.selecting = true;
-                            s.word_anchor = None;
-                            s.drag_origin = Some((abs_row, col));
-                        }
-                        2 => {
-                            // Double-click: select word under cursor.
-                            // Word boundaries are found on the viewport screen (screen_row),
-                            // but stored as absolute coordinates.
-                            let screen = s.terminal.screen();
-                            let (word_start, word_end) =
-                                find_word_boundaries(screen, screen_row, col);
-                            let mut sel = Selection::new(abs_row, word_start, SelectionMode::Word);
-                            sel.update(abs_row, word_end);
-                            s.selection = Some(sel);
-                            s.selecting = true;
-                            s.word_anchor = Some((word_start, word_end));
-                        }
-                        3 => {
-                            // Triple-click: select entire line.
-                            let screen = s.terminal.screen();
-                            let last_col = last_non_whitespace_col(screen, screen_row);
-                            let mut sel = Selection::new(abs_row, 0, SelectionMode::Line);
-                            sel.update(abs_row, last_col);
-                            s.selection = Some(sel);
-                            s.selecting = false; // Line selection is immediate
-                            s.word_anchor = None;
-                        }
-                        _ => {}
-                    }
-
-                    drop(s);
-                    da_click.queue_draw();
-                    return;
-                }
-
-                // Forward to mouse encoder (mouse tracking active)
-                let terminal_handle = s.terminal.raw_handle();
-                let screen_size =
-                    ((s.cols as f64 * s.cell_width) as u32, (s.rows as f64 * s.cell_height) as u32);
-                let cell_size = (s.cell_width as u32, s.cell_height as u32);
-
-                if let Some(bytes) = s.input.encode_mouse_button(
-                    button,
-                    true,
-                    (x, y),
-                    modifier,
-                    terminal_handle,
-                    screen_size,
-                    cell_size,
-                ) {
-                    if let Some(ref mut pty) = s.pty {
-                        if let Err(e) = pty.write(&bytes) {
-                            tracing::warn!("Failed to write mouse press to PTY: {e}");
-                        }
-                    }
-                    da_click.queue_draw();
-                }
-            });
-        }
-
-        // Button released
-        {
-            let state = Rc::clone(&state);
-            let da_release = drawing_area.clone();
-            gesture.connect_released(move |gesture, _n_press, x, y| {
-                let button = gesture.current_button();
-                let modifier = gesture.current_event_state();
-                let Ok(mut s) = state.try_borrow_mut() else {
-                    // Borrow held elsewhere -- drop this release event.
-                    return;
-                };
-
-                // If we were selecting with button 1, finalize the selection
-                if button == 1 && s.selecting {
-                    s.selecting = false;
-                    s.word_anchor = None;
-                    s.drag_origin = None;
-
-                    // If no selection was created (click without drag), nothing to clear
-                    // visually — the pressed handler already cleared any previous selection.
-                    // If a selection exists but is empty, also clear it.
-                    if let Some(ref sel) = s.selection {
-                        if sel.is_empty() && sel.mode == SelectionMode::Normal {
-                            s.selection = None;
-                        }
-                    }
-
-                    drop(s);
-                    da_release.queue_draw();
-                    return;
-                }
-
-                // Forward release to mouse encoder
-                let terminal_handle = s.terminal.raw_handle();
-                let screen_size =
-                    ((s.cols as f64 * s.cell_width) as u32, (s.rows as f64 * s.cell_height) as u32);
-                let cell_size = (s.cell_width as u32, s.cell_height as u32);
-
-                if let Some(bytes) = s.input.encode_mouse_button(
-                    button,
-                    false,
-                    (x, y),
-                    modifier,
-                    terminal_handle,
-                    screen_size,
-                    cell_size,
-                ) {
-                    if let Some(ref mut pty) = s.pty {
-                        if let Err(e) = pty.write(&bytes) {
-                            tracing::warn!("Failed to write mouse release to PTY: {e}");
-                        }
-                    }
-                    da_release.queue_draw();
-                }
-            });
-        }
-
-        drawing_area.add_controller(gesture);
-    }
-
-    // --- Mouse motion controller ---
-    {
-        let motion_controller = gtk4::EventControllerMotion::new();
-
-        {
-            let state = Rc::clone(&state);
-            let da_motion = drawing_area.clone();
-            motion_controller.connect_motion(move |controller, x, y| {
-                let modifier = controller.current_event_state();
-                let Ok(mut s) = state.try_borrow_mut() else {
-                    // Borrow held elsewhere -- drop this motion event.
-                    return;
-                };
-
-                // If we are actively dragging a selection, update the endpoint
-                if s.selecting {
-                    // Auto-scroll when dragging past viewport edges
-                    let viewport_height = s.rows as f64 * s.cell_height;
-                    if y < 0.0 {
-                        // Dragging above the top edge — scroll up
-                        s.terminal.scroll_viewport_delta(-3);
-                        let (_, off, _) = s.terminal.scrollbar_state();
-                        s.viewport_offset = off;
-                    } else if y > viewport_height {
-                        // Dragging below the bottom edge — scroll down
-                        s.terminal.scroll_viewport_delta(3);
-                        let (_, off, _) = s.terminal.scrollbar_state();
-                        s.viewport_offset = off;
-                    }
-
-                    let (screen_row, col) =
-                        pixel_to_cell(x, y, s.cell_width, s.cell_height, s.cols, s.rows);
-
-                    // Use cached viewport offset (updated by 16ms timer)
-                    let vp_offset = s.viewport_offset;
-                    let abs_row = screen_row + vp_offset as usize;
-
-                    // Deferred creation: if no Selection exists yet (single-click
-                    // path), create it now that actual drag motion is detected.
-                    // drag_origin already stores absolute rows.
-                    if s.selection.is_none() {
-                        if let Some((origin_row, origin_col)) = s.drag_origin.take() {
-                            s.selection =
-                                Some(Selection::new(origin_row, origin_col, SelectionMode::Normal));
-                        }
-                    }
-
-                    // Read the selection mode and word anchor before mutably borrowing selection
-                    let sel_mode = s.selection.as_ref().map(|sel| sel.mode);
-                    let word_anchor = s.word_anchor;
-                    let anchor_row = s.selection.as_ref().map(|sel| sel.start.0);
-
-                    // For word mode, compute word boundaries using screen-relative row
-                    // (since find_word_boundaries works on the viewport screen), but
-                    // store the result as absolute rows.
-                    let word_bounds = if sel_mode == Some(SelectionMode::Word) {
-                        let screen = s.terminal.screen();
-                        Some(find_word_boundaries(screen, screen_row, col))
-                    } else {
-                        None
-                    };
-
-                    if let Some(ref mut sel) = s.selection {
-                        match sel.mode {
-                            SelectionMode::Word => {
-                                let (drag_word_start, drag_word_end) =
-                                    word_bounds.unwrap_or((col, col));
-
-                                if let (Some((anchor_start, anchor_end)), Some(a_row)) =
-                                    (word_anchor, anchor_row)
-                                {
-                                    if abs_row < a_row
-                                        || (abs_row == a_row && drag_word_start < anchor_start)
-                                    {
-                                        // Dragging before the anchor word
-                                        sel.start = (a_row, anchor_end);
-                                        sel.end = (abs_row, drag_word_start);
-                                    } else {
-                                        // Dragging after the anchor word
-                                        sel.start = (a_row, anchor_start);
-                                        sel.end = (abs_row, drag_word_end);
-                                    }
-                                } else {
-                                    sel.update(abs_row, drag_word_end);
-                                }
-                            }
-                            _ => {
-                                // Normal mode: character-by-character
-                                sel.update(abs_row, col);
-                            }
-                        }
-                    }
-
-                    drop(s);
-                    da_motion.queue_draw();
-                    return;
-                }
-
-                // Forward motion to mouse encoder if not selecting
-                let terminal_handle = s.terminal.raw_handle();
-                let screen_size =
-                    ((s.cols as f64 * s.cell_width) as u32, (s.rows as f64 * s.cell_height) as u32);
-                let cell_size = (s.cell_width as u32, s.cell_height as u32);
-
-                if let Some(bytes) = s.input.encode_mouse_motion(
-                    (x, y),
-                    modifier,
-                    terminal_handle,
-                    screen_size,
-                    cell_size,
-                ) {
-                    if let Some(ref mut pty) = s.pty {
-                        if let Err(e) = pty.write(&bytes) {
-                            tracing::warn!("Failed to write mouse motion to PTY: {e}");
-                        }
-                    }
-                    da_motion.queue_draw();
-                }
-
-                // --- Hover URL detection (AC-1, AC-2, AC-3) ---
-                let (screen_row, col) =
-                    pixel_to_cell(x, y, s.cell_width, s.cell_height, s.cols, s.rows);
-                if s.last_hover_cell == (screen_row, col) {
-                    return;
-                }
-                s.last_hover_cell = (screen_row, col);
-                let screen = s.terminal.screen();
-                let new_hover = detect_url_at(screen, screen_row, col);
-                let url_changed = s.hover_url != new_hover;
-                if url_changed {
-                    let want_pointer = new_hover.is_some();
-                    s.hover_url = new_hover;
-                    if want_pointer {
-                        da_motion.set_cursor_from_name(Some("pointer"));
-                    } else {
-                        da_motion.set_cursor_from_name(Some("text"));
-                    }
-                }
-
-                // --- Code block hover detection (T-032) ---
-                let mut block_changed = false;
-                let mt = s.terminal.is_mouse_tracking();
-                let alt = s.terminal.is_alternate_screen();
-                if !mt && !alt {
-                    let gen = s.terminal.screen().generation();
-                    if gen != s.code_blocks_generation {
-                        let screen = s.terminal.screen();
-                        s.detected_code_blocks = code_block::detect_code_blocks(screen);
-                        s.code_blocks_generation = gen;
-                    }
-                    if s.last_hover_block_cell != (screen_row, col) {
-                        s.last_hover_block_cell = (screen_row, col);
-                        let new_block = s
-                            .detected_code_blocks
-                            .iter()
-                            .find(|b| b.contains(screen_row, col))
-                            .cloned();
-                        if s.hovered_code_block != new_block {
-                            s.hovered_code_block = new_block;
-                            block_changed = true;
-                        }
-                    }
-                } else if s.hovered_code_block.is_some() {
-                    s.hovered_code_block = None;
-                    block_changed = true;
-                }
-
-                if url_changed || block_changed {
-                    drop(s);
-                    da_motion.queue_draw();
-                }
-            });
-        }
-
-        // Clear hover state when the mouse leaves the DrawingArea (AC-3, AC-19)
-        {
-            let state = Rc::clone(&state);
-            let da_leave = drawing_area.clone();
-            motion_controller.connect_leave(move |_controller| {
-                let Ok(mut s) = state.try_borrow_mut() else {
-                    return;
-                };
-                let had_url = s.hover_url.is_some();
-                let had_block = s.hovered_code_block.is_some();
-                if had_url {
-                    s.hover_url = None;
-                }
-                if had_block {
-                    s.hovered_code_block = None;
-                    s.last_hover_block_cell = (usize::MAX, usize::MAX);
-                }
-                if had_url || had_block {
-                    drop(s);
-                    da_leave.set_cursor_from_name(Some("text"));
-                    da_leave.queue_draw();
-                }
-            });
-        }
-
-        drawing_area.add_controller(motion_controller);
-    }
-
-    // --- Scroll controller ---
-    {
-        let scroll_controller = gtk4::EventControllerScroll::new(
-            gtk4::EventControllerScrollFlags::VERTICAL | gtk4::EventControllerScrollFlags::DISCRETE,
-        );
-
-        {
-            let state = Rc::clone(&state);
-            let da_scroll = drawing_area.clone();
-            scroll_controller.connect_scroll(move |controller, _dx, dy| {
-                let modifier = controller.current_event_state();
-                let Ok(mut s) = state.try_borrow_mut() else {
-                    // Borrow held elsewhere -- drop this scroll event.
-                    return glib::Propagation::Proceed;
-                };
-
-                let terminal_handle = s.terminal.raw_handle();
-                let mouse_tracking = s.terminal.is_mouse_tracking();
-                let screen_size =
-                    ((s.cols as f64 * s.cell_width) as u32, (s.rows as f64 * s.cell_height) as u32);
-                let cell_size = (s.cell_width as u32, s.cell_height as u32);
-
-                // Get mouse position from the last event on the controller.
-                // EventControllerScroll doesn't directly provide position, so we
-                // use (0,0) as fallback -- the scroll button/position is rarely
-                // critical for applications, and the cell is determined by the
-                // encoder's last known position.
-                let position = (0.0, 0.0);
-
-                let action = s.input.encode_scroll(
-                    dy,
-                    position,
-                    modifier,
-                    terminal_handle,
-                    mouse_tracking,
-                    screen_size,
-                    cell_size,
-                );
-
-                match action {
-                    ScrollAction::WriteBytes(bytes) => {
-                        if let Some(ref mut pty) = s.pty {
-                            if let Err(e) = pty.write(&bytes) {
-                                tracing::warn!("Failed to write scroll to PTY: {e}");
-                            }
-                        }
-                    }
-                    ScrollAction::ScrollViewport(delta) => {
-                        s.terminal.scroll_viewport_delta(delta);
-                        let (total, off, len) = s.terminal.scrollbar_state();
-                        s.viewport_offset = off;
-                        // Lock/unlock auto-scroll based on whether the user
-                        // is now at the bottom or scrolled above it.
-                        s.scroll_lock = !(total <= len || off + len >= total);
-                    }
-                }
-
-                // Clear stale hover state after scroll (content under cursor shifted)
-                s.hover_url = None;
-                s.last_hover_cell = (usize::MAX, usize::MAX);
-                s.hovered_code_block = None;
-                s.last_hover_block_cell = (usize::MAX, usize::MAX);
-
-                drop(s);
-                da_scroll.set_cursor_from_name(Some("text"));
-                da_scroll.queue_draw();
-                glib::Propagation::Stop
-            });
-        }
-
-        drawing_area.add_controller(scroll_controller);
-    }
-
-    // --- Resize handler ---
-    {
-        let state = Rc::clone(&state);
-        let cell_measured_resize = Rc::clone(&cell_measured);
-        drawing_area.connect_resize(move |da, width, height| {
-            if !*cell_measured_resize.borrow() {
-                return;
-            }
-
-            let Ok(s) = state.try_borrow() else {
-                // Borrow held elsewhere -- skip this resize; the next
-                // resize or draw will recalculate.
-                return;
-            };
-            let (cw, ch) = (s.cell_width, s.cell_height);
-            drop(s);
-
-            if cw < 1.0 || ch < 1.0 {
-                return;
-            }
-
-            let new_cols = ((width as f64) / cw).max(1.0) as usize;
-            let new_rows = ((height as f64) / ch).max(1.0) as usize;
-
-            let Ok(mut s) = state.try_borrow_mut() else {
-                return;
-            };
-            if new_cols != s.cols || new_rows != s.rows {
-                s.cols = new_cols;
-                s.rows = new_rows;
-                s.terminal.resize(new_rows, new_cols);
-                // Refresh cached viewport offset immediately so the draw
-                // callback uses the correct value (avoids 1-row selection drift).
-                let (_, off, _) = s.terminal.scrollbar_state();
-                s.viewport_offset = off;
-                // Shell will redraw on SIGWINCH — suppress selection clearing
-                // so the selection survives the resize (AC-16).
-                // 12 ticks × 8ms = ~100ms grace period covers drag-resize bursts.
-                s.suppress_selection_clear_ticks = 12;
-                if let Some(ref mut pty) = s.pty {
-                    if let Err(e) = pty.resize(forgetty_pty::PtySize {
-                        rows: new_rows as u16,
-                        cols: new_cols as u16,
-                        pixel_width: width as u16,
-                        pixel_height: height as u16,
-                    }) {
-                        tracing::warn!("Failed to resize PTY: {e}");
-                    }
-                }
-                drop(s);
-                da.queue_draw();
-            }
-        });
-    }
-
-    // --- Scrollbar (GTK native vertical scrollbar + Adjustment) ---
-    let adjustment = gtk4::Adjustment::new(
-        0.0,  // value (current position)
-        0.0,  // lower bound
-        0.0,  // upper bound (total rows -- updated per frame)
-        1.0,  // step increment (1 row)
-        24.0, // page increment (visible rows, updated per frame)
-        24.0, // page size (visible rows, updated per frame)
-    );
-    let scrollbar = gtk4::Scrollbar::new(gtk4::Orientation::Vertical, Some(&adjustment));
-    scrollbar.set_visible(false); // hidden until there is scrollback
-
-    // Wire adjustment value-changed -> scroll the terminal viewport
-    {
-        let state = Rc::clone(&state);
-        let da_scroll = drawing_area.clone();
-        adjustment.connect_value_changed(move |adj| {
-            let Ok(mut s) = state.try_borrow_mut() else {
-                return;
-            };
-            // Skip if we are programmatically updating the adjustment
-            if s.updating_scrollbar {
-                return;
-            }
-            let new_offset = adj.value() as i64;
-            let (_total, current_offset, _len) = s.terminal.scrollbar_state();
-            let delta = new_offset - current_offset as i64;
-            if delta != 0 {
-                s.terminal.scroll_viewport_delta(delta as isize);
-                s.viewport_offset = new_offset as u64;
-                drop(s);
-                da_scroll.queue_draw();
-            }
-        });
-    }
-
-    // --- Scrollbar update timer (syncs terminal state -> adjustment) ---
-    // Runs alongside the existing 8ms PTY poll timer. We piggyback on a
-    // separate 16ms timer (~60Hz) to avoid querying scrollbar_state() too
-    // frequently (the ghostty docs note it can be expensive).
-    {
-        let state = Rc::clone(&state);
-        let adj = adjustment.clone();
-        let sb_widget = scrollbar.clone();
-        let da_weak = drawing_area.downgrade();
-        glib::timeout_add_local(Duration::from_millis(16), move || {
-            let Some(_da) = da_weak.upgrade() else {
-                return glib::ControlFlow::Break;
-            };
-            let Ok(mut s) = state.try_borrow_mut() else {
-                return glib::ControlFlow::Continue;
-            };
-            let (total, offset, len) = s.terminal.scrollbar_state();
-
-            // Cache viewport offset for mouse handlers (avoids FFI calls per event)
-            s.viewport_offset = offset;
-
-            // Update scrollbar visibility: hide when no scrollback
-            let has_scrollback = total > len;
-            sb_widget.set_visible(has_scrollback);
-
-            if has_scrollback {
-                // Set guard to prevent feedback loop
-                s.updating_scrollbar = true;
-                adj.set_lower(0.0);
-                adj.set_upper(total as f64);
-                adj.set_page_size(len as f64);
-                adj.set_page_increment(len as f64);
-                adj.set_value(offset as f64);
-                s.updating_scrollbar = false;
-            }
-
-            glib::ControlFlow::Continue
-        });
-    }
-
-    // Package DrawingArea + Scrollbar into a horizontal Box
-    let hbox = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-    hbox.set_hexpand(true);
-    hbox.set_vexpand(true);
-    hbox.append(&drawing_area);
-    hbox.append(&scrollbar);
-
-    // --- Search bar (Ctrl+Shift+F) ---
-    // A gtk::SearchBar containing a gtk::SearchEntry, placed above the terminal
-    // content in a vertical container. Hidden by default; revealed on action.
-    let search_entry = gtk4::SearchEntry::new();
-    search_entry.set_hexpand(true);
-    search_entry.set_placeholder_text(Some("Search..."));
-
-    let match_label = gtk4::Label::new(Some(""));
-    match_label.add_css_class("dim-label");
-
-    let search_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
-    search_box.append(&search_entry);
-    search_box.append(&match_label);
-    search_box.set_margin_start(6);
-    search_box.set_margin_end(6);
-
-    let search_bar = gtk4::SearchBar::new();
-    search_bar.set_child(Some(&search_box));
-    search_bar.connect_entry(&search_entry);
-    search_bar.set_show_close_button(false);
-    // SearchBar starts hidden (search_mode = false)
-    search_bar.set_search_mode(false);
-
-    // --- Wire search-changed signal (recompute matches as user types) ---
-    {
-        let state = Rc::clone(&state);
-        let da_search = drawing_area.clone();
-        let ml = match_label.clone();
-        search_entry.connect_search_changed(move |entry| {
-            let query = entry.text().to_string();
-            let Ok(mut s) = state.try_borrow_mut() else {
-                return;
-            };
-            s.search.query = query.to_lowercase();
-            recompute_all_search_matches(&mut s);
-            update_match_label(&s.search, &ml);
-            drop(s);
-            da_search.queue_draw();
-        });
-    }
-
-    // --- Wire Enter (activate) for next-match navigation ---
-    {
-        let state = Rc::clone(&state);
-        let da_nav = drawing_area.clone();
-        let ml = match_label.clone();
-        search_entry.connect_activate(move |_entry| {
-            let Ok(mut s) = state.try_borrow_mut() else {
-                return;
-            };
-            if s.search.query.is_empty() {
-                return;
-            }
-            navigate_search_forward(&mut s);
-            update_match_label(&s.search, &ml);
-            drop(s);
-            da_nav.queue_draw();
-        });
-    }
-
-    // --- Wire Shift+Enter for previous-match and Escape for close ---
-    {
-        let key_controller = gtk4::EventControllerKey::new();
-        let state = Rc::clone(&state);
-        let da_key = drawing_area.clone();
-        let ml = match_label.clone();
-        let sb = search_bar.clone();
-        key_controller.connect_key_pressed(move |_ctrl, keyval, _keycode, modifier| {
-            // Shift+Enter: navigate to previous match
-            if keyval == gdk::Key::Return && modifier.contains(gdk::ModifierType::SHIFT_MASK) {
-                let Ok(mut s) = state.try_borrow_mut() else {
-                    return glib::Propagation::Stop;
-                };
-                if s.search.query.is_empty() {
-                    return glib::Propagation::Stop;
-                }
-                navigate_search_backward(&mut s);
-                update_match_label(&s.search, &ml);
-                drop(s);
-                da_key.queue_draw();
-                return glib::Propagation::Stop;
-            }
-
-            // Escape: close search bar, clear highlights, return focus to terminal
-            if keyval == gdk::Key::Escape {
-                let Ok(mut s) = state.try_borrow_mut() else {
-                    return glib::Propagation::Stop;
-                };
-                s.search.active = false;
-                s.search.query.clear();
-                s.search.all_matches.clear();
-                s.search.matches.clear();
-                s.search.current_index = 0;
-                drop(s);
-                sb.set_search_mode(false);
-                da_key.grab_focus();
-                da_key.queue_draw();
-                return glib::Propagation::Stop;
-            }
-
-            glib::Propagation::Proceed
-        });
-        search_entry.add_controller(key_controller);
-    }
-
-    // --- Vertical container: SearchBar on top, HBox (DrawingArea + Scrollbar) below ---
-    let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-    vbox.set_hexpand(true);
-    vbox.set_vexpand(true);
-    vbox.append(&search_bar);
-    vbox.append(&hbox);
-
-    // Store search bar reference for the win.search action to toggle
-    // We use widget name as a lookup key -- the action in app.rs will
-    // find the SearchBar by walking the widget tree.
-    search_bar.set_widget_name("forgetty-search-bar");
-
-    // --- Context menu (right-click Popover with manual buttons) ---
-    // Use a plain Popover (not PopoverMenu) to avoid GTK4's internal
-    // ScrolledWindow that constrains height and adds a scrollbar.
-    let context_popover = gtk4::Popover::new();
-    context_popover.set_parent(&drawing_area);
-    context_popover.set_has_arrow(false);
-    context_popover.set_halign(gtk4::Align::Start);
-    context_popover.add_css_class("menu");
-    context_popover.set_widget_name("forgetty-context-menu");
-
-    Ok((vbox, drawing_area, state))
-}
-
 /// Create a daemon-backed terminal widget for an existing daemon pane.
 ///
-/// Like `create_terminal()` but connects to a remote pane managed by
-/// `forgetty-daemon` rather than spawning a local PTY. PTY I/O goes through
+/// Connects to a remote pane managed by `forgetty-daemon`. PTY I/O goes through
 /// the daemon's JSON-RPC API (`send_input` / `subscribe_output`).
 ///
-/// `daemon_rx` is the receiver end of an mpsc channel whose sender was passed
-/// to `DaemonClient::subscribe_output()`. The 8ms poll timer reads bytes from
-/// this channel instead of a local PTY reader thread.
+/// `daemon_channel` carries the mpsc receiver for decoded output frames plus
+/// the wake-pipe read fd used by `glib::unix_fd_add_local` to trigger the
+/// GLib handler on new data (no polling — see AD-009).
 ///
 /// `snapshot` is an optional initial screen state fed to the VT parser to
 /// make the first rendered frame show content rather than a blank terminal.
-pub fn create_terminal_for_pane(
+pub fn create_terminal(
     config: &Config,
     pane_id: forgetty_core::PaneId,
     daemon_client: Arc<DaemonClient>,
@@ -1711,8 +281,6 @@ pub fn create_terminal_for_pane(
 
     let state = Rc::new(RefCell::new(TerminalState {
         terminal,
-        pty: None,
-        pty_rx: None,
         input,
         config: config.clone(),
         cell_width: 8.0,
@@ -2788,6 +1356,70 @@ pub fn create_terminal_for_pane(
         });
     }
 
+    // --- Wire Enter (activate) for next-match navigation ---
+    {
+        let state = Rc::clone(&state);
+        let da_nav = drawing_area.clone();
+        let ml = match_label.clone();
+        search_entry.connect_activate(move |_entry| {
+            let Ok(mut s) = state.try_borrow_mut() else {
+                return;
+            };
+            if s.search.query.is_empty() {
+                return;
+            }
+            navigate_search_forward(&mut s);
+            update_match_label(&s.search, &ml);
+            drop(s);
+            da_nav.queue_draw();
+        });
+    }
+
+    // --- Wire Shift+Enter for previous-match and Escape for close ---
+    {
+        let key_controller = gtk4::EventControllerKey::new();
+        let state = Rc::clone(&state);
+        let da_key = drawing_area.clone();
+        let ml = match_label.clone();
+        let sb = search_bar.clone();
+        key_controller.connect_key_pressed(move |_ctrl, keyval, _keycode, modifier| {
+            // Shift+Enter: navigate to previous match
+            if keyval == gdk::Key::Return && modifier.contains(gdk::ModifierType::SHIFT_MASK) {
+                let Ok(mut s) = state.try_borrow_mut() else {
+                    return glib::Propagation::Stop;
+                };
+                if s.search.query.is_empty() {
+                    return glib::Propagation::Stop;
+                }
+                navigate_search_backward(&mut s);
+                update_match_label(&s.search, &ml);
+                drop(s);
+                da_key.queue_draw();
+                return glib::Propagation::Stop;
+            }
+
+            // Escape: close search bar, clear highlights, return focus to terminal
+            if keyval == gdk::Key::Escape {
+                let Ok(mut s) = state.try_borrow_mut() else {
+                    return glib::Propagation::Stop;
+                };
+                s.search.active = false;
+                s.search.query.clear();
+                s.search.all_matches.clear();
+                s.search.matches.clear();
+                s.search.current_index = 0;
+                drop(s);
+                sb.set_search_mode(false);
+                da_key.grab_focus();
+                da_key.queue_draw();
+                return glib::Propagation::Stop;
+            }
+
+            glib::Propagation::Proceed
+        });
+        search_entry.add_controller(key_controller);
+    }
+
     search_bar.set_widget_name("forgetty-search-bar");
 
     // --- Context menu ---
@@ -2823,27 +1455,6 @@ fn color_to_rgb(color: &Color, default: &Rgba) -> (f64, f64, f64) {
 /// Check if a key combination is an app-level shortcut that should NOT be
 /// consumed by the terminal's key encoder. These shortcuts must propagate
 /// to GTK accelerators (defined in app.rs) instead.
-/// Send SIGINT to the PTY's actual foreground process group.
-///
-/// Writing 0x03 to the PTY master is not enough when the child has put the
-/// slave into raw mode (ISIG disabled). We call `tcgetpgrp` via the master
-/// PTY fd (already held by `pty`) to get the current foreground process group,
-/// then `kill(-pgid, SIGINT)`. This correctly handles grandchild processes
-/// (Node.js, pm2, etc.) that are in their own process group.
-fn send_sigint_to_fg_pgrp(pty: &forgetty_pty::PtyProcess) {
-    #[cfg(target_os = "linux")]
-    {
-        if let Some(pgid) = pty.foreground_pgrp() {
-            let my_pid = std::process::id() as libc::pid_t;
-            if pgid > 0 && pgid != my_pid {
-                unsafe { libc::kill(-(pgid as libc::c_int), libc::SIGINT) };
-            }
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    let _ = pty;
-}
-
 fn is_app_shortcut(keyval: gdk::Key, modifier: gdk::ModifierType) -> bool {
     // Mask to only the modifier bits we care about (ignore NumLock, etc.)
     let mods = modifier
@@ -3247,9 +1858,10 @@ pub fn toggle_search(da: &DrawingArea, state: &Rc<RefCell<TerminalState>>) {
 /// Recalculate cell dimensions and grid size after a font size change.
 ///
 /// Called after modifying `state.font_size`. Measures the new cell size
-/// via Pango, updates `cell_width`/`cell_height`, recalculates
-/// cols/rows from the current widget pixel size, and resizes both the
-/// VT terminal and the PTY.
+/// via Pango, updates `cell_width`/`cell_height`, recalculates cols/rows
+/// from the current widget pixel size, and resizes the VT terminal.
+/// The daemon PTY is resized via `dc.resize_pane` from the `connect_resize`
+/// handler in `create_terminal`.
 pub fn apply_font_zoom(state: &mut TerminalState, da: &DrawingArea) {
     let font_desc = font_description_with_size(&state.config, state.font_size);
     let pango_ctx = da.pango_context();
@@ -3269,14 +1881,6 @@ pub fn apply_font_zoom(state: &mut TerminalState, da: &DrawingArea) {
     state.rows = new_rows;
     state.terminal.resize(new_rows, new_cols);
     state.suppress_selection_clear_ticks = 12;
-    if let Some(ref mut pty) = state.pty {
-        let _ = pty.resize(forgetty_pty::PtySize {
-            rows: new_rows as u16,
-            cols: new_cols as u16,
-            pixel_width: width as u16,
-            pixel_height: height as u16,
-        });
-    }
 
     // Recompute search highlights so they render at the new cell dimensions.
     if !state.search.query.is_empty() {
@@ -3769,17 +2373,7 @@ fn draw_terminal(
                 s.cols = new_cols;
                 s.rows = new_rows;
                 s.terminal.resize(new_rows, new_cols);
-                if let Some(ref mut pty) = s.pty {
-                    if let Err(e) = pty.resize(forgetty_pty::PtySize {
-                        rows: new_rows as u16,
-                        cols: new_cols as u16,
-                        pixel_width: width as u16,
-                        pixel_height: height as u16,
-                    }) {
-                        tracing::warn!("Failed to resize PTY on initial measure: {e}");
-                    }
-                }
-                // Daemon mode: notify the daemon so the PTY gets the real size.
+                // Notify the daemon so the PTY gets the real size.
                 // The connect_resize handler skips until cell_measured is true, so
                 // this is the only place the initial size reaches the daemon PTY.
                 if let (Some(ref dc), Some(pane_id)) = (s.daemon_client.clone(), s.daemon_pane_id) {
