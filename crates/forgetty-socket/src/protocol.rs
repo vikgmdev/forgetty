@@ -120,10 +120,11 @@ pub mod methods {
     // Pinned sessions (B-002).
     pub const SET_PINNED: &str = "set_pinned";
     pub const GET_PINNED: &str = "get_pinned";
-    // Daemon lifecycle (T-070, T-072, B-002).
+    // Daemon lifecycle (T-070, T-072, B-002, V2-005).
     pub const SHUTDOWN: &str = "shutdown"; // permanent close: exit immediately, no save
     pub const SHUTDOWN_SAVE: &str = "shutdown_save"; // normal close: save session then exit
     pub const SHUTDOWN_CLEAN: &str = "shutdown_clean"; // browser close: save → trash → exit
+    pub const DISCONNECT: &str = "disconnect"; // V2-005 / AD-012: daemon survives window close
 }
 
 #[cfg(test)]

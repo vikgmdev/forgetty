@@ -531,6 +531,30 @@ async fn handle_streaming_connection(
             std::process::exit(0);
         }
 
+        if request.method == methods::DISCONNECT {
+            // V2-005 (AD-012): daemon survives window close.
+            //
+            // Acknowledge before saving so the client unblocks immediately.
+            let resp = Response::success(request.id, serde_json::json!({ "ok": true }));
+            write_response(&mut writer, &resp).await?;
+            info!("Received disconnect RPC — saving session, daemon continues running");
+            // Flush v0.1 VT snapshots (replaced by V2-007 byte logs later).
+            let saved = crate::handlers::save_all_snapshots(&sm);
+            info!("disconnect: saved {saved} VT snapshot(s)");
+            // Flush the session layout so reconnecting GTK clients can restore state.
+            if let Some(sid) = session_id {
+                let state = sm.snapshot_to_workspace_state();
+                match forgetty_workspace::save_session_for(sid, &state) {
+                    Ok(()) => info!("disconnect: session {sid} saved"),
+                    Err(e) => warn!("disconnect: failed to save session: {e}"),
+                }
+            }
+            // Connection ends here. The UnixListener loop in run_with_streaming
+            // continues accepting new connections. PTY processes and panes remain
+            // alive. AD-012.
+            return Ok(());
+        }
+
         if request.method == methods::SHUTDOWN {
             // Acknowledge before exiting so the client doesn't see a broken pipe.
             let resp = Response::success(request.id, serde_json::json!({ "ok": true }));

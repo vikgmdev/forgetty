@@ -1798,7 +1798,8 @@ fn build_ui(
     }
 
     // --- Quit action (Ctrl+Shift+Q) ---
-    // In daemon mode: do NOT kill daemon PTYs — sessions survive the quit.
+    // In daemon mode: do NOT kill daemon PTYs — sessions survive the quit
+    // (V2-005 / AD-012). The daemon stays running; relaunching reconnects.
     // In --temp mode (dc is None): nothing to save; the session is ephemeral by design.
     {
         let app_quit = app.clone();
@@ -1806,7 +1807,7 @@ fn build_ui(
         let dc_quit = daemon_client.clone();
         let action = gio::SimpleAction::new("quit", None);
         action.connect_activate(move |_action, _param| {
-            // Daemon mode: push split ratios then close.
+            // Daemon mode: push split ratios then disconnect.
             // --temp mode (dc is None): nothing to save or clean up — just quit.
             if let Some(ref dc) = dc_quit {
                 if let Ok(mgr) = wm_quit.try_borrow() {
@@ -1818,12 +1819,8 @@ fn build_ui(
                         let _ = dc.update_split_ratios(&all_ratios);
                     }
                 }
-                let is_pinned = dc.get_pinned().unwrap_or(false);
-                if is_pinned {
-                    dc.shutdown_save();
-                } else {
-                    dc.shutdown_clean();
-                }
+                // V2-005 / AD-012: disconnect keeps the daemon alive.
+                dc.disconnect();
             }
             app_quit.quit();
         });
@@ -2147,7 +2144,11 @@ fn build_ui(
     // --- Window close request handler ---
     // Fires when the user clicks the CSD X button, when window.close() is
     // called programmatically, or when the window manager requests a close.
-    // Daemon mode: push split ratios then ask the daemon to shut down.
+    // Daemon mode: push split ratios then disconnect — the daemon keeps the
+    // session alive so a subsequent `forgetty` launch reconnects seamlessly
+    // (V2-005 / AD-012). Pinned vs. unpinned no longer gates the close path
+    // because the session always survives; "Close Window Permanently" remains
+    // the explicit-shutdown path.
     // --temp mode (dc is None): nothing to persist — just proceed with the close.
     {
         let wm_close = Rc::clone(&workspace_manager);
@@ -2164,15 +2165,9 @@ fn build_ui(
                         let _ = dc.update_split_ratios(&all_ratios);
                     }
                 }
-                // Pinned sessions save-and-stay; unpinned sessions trash.
-                let is_pinned = dc.get_pinned().unwrap_or(false);
-                if is_pinned {
-                    dc.shutdown_save();
-                } else {
-                    dc.shutdown_clean();
-                    // Send undo-close notification (Linux only).
-                    send_undo_close_notification(session_id);
-                }
+                // V2-005 / AD-012: disconnect keeps the daemon alive.
+                // Relaunching reconnects seamlessly.
+                dc.disconnect();
             }
             glib::Propagation::Proceed
         });
@@ -2183,7 +2178,10 @@ fn build_ui(
     // GLib source callbacks on the main thread, avoiding async-signal-safety
     // issues. Must be registered before window.present() so signals arriving
     // immediately after startup are caught.
-    // Daemon mode: do NOT kill daemon PTYs on signal; just tell the daemon to close.
+    // Daemon mode: disconnect only — the daemon keeps running so the session
+    // survives a logout SIGTERM or a pkill on this GTK process (V2-005 /
+    // AD-012). Explicit daemon shutdown happens via the hamburger
+    // "Close Window Permanently" action or by signalling the daemon directly.
     // --temp mode (dc is None): nothing to persist — just quit.
     {
         let signals: &[(i32, &str)] =
@@ -2204,12 +2202,8 @@ fn build_ui(
                             let _ = dc.update_split_ratios(&all_ratios);
                         }
                     }
-                    let is_pinned = dc.get_pinned().unwrap_or(false);
-                    if is_pinned {
-                        dc.shutdown_save();
-                    } else {
-                        dc.shutdown_clean();
-                    }
+                    // V2-005 / AD-012: disconnect keeps the daemon alive.
+                    dc.disconnect();
                 }
                 app_signal.quit();
                 glib::ControlFlow::Break
@@ -2382,7 +2376,12 @@ fn build_ui(
 /// The notification is sent before the GTK process exits. The undo action
 /// handler runs in a forked child process because `NotificationHandle` is
 /// not `Send` and the GTK main loop is shutting down.
+///
+/// Currently unused after V2-005: window-close no longer trashes the session
+/// (AD-012). Kept for a future follow-up that may reintroduce the toast on
+/// an explicit trash flow.
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 fn send_undo_close_notification(session_id: uuid::Uuid) {
     let current_exe = match std::env::current_exe() {
         Ok(p) => p,
@@ -2434,6 +2433,7 @@ fn send_undo_close_notification(session_id: uuid::Uuid) {
 }
 
 #[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
 fn send_undo_close_notification(_session_id: uuid::Uuid) {
     // Desktop notifications not implemented for non-Linux platforms.
 }

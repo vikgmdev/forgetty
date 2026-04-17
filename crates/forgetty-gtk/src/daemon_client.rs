@@ -639,6 +639,16 @@ impl DaemonClient {
         let _ = self.rpc("shutdown", serde_json::json!({}));
     }
 
+    /// Disconnect the GTK client: save the session and close this connection,
+    /// but the daemon keeps running (V2-005 / AD-012). PTY processes and
+    /// session state survive the GTK window close. A subsequent `forgetty`
+    /// launch reconnects to the live daemon.
+    ///
+    /// Best-effort: errors are ignored if the daemon is unreachable.
+    pub fn disconnect(&self) {
+        let _ = self.rpc("disconnect", serde_json::json!({}));
+    }
+
     /// Open a `subscribe_output` stream for a pane.
     ///
     /// Creates a `std::sync::mpsc` channel + a Linux wake pipe, spawns a
