@@ -24,7 +24,7 @@
 | **AD-011** | Daemon always runs; no local-PTY fallback | ✅ Implemented | V2-004 (2026-04-17). Second `create_terminal()` deleted. `TerminalState.pty`/`pty_rx` fields removed. `forgetty-pty` dep dropped from `forgetty-gtk`. `ensure_daemon()` now exits 1 on failure (no silent fallback). `--temp` mode preserved as scope boundary. |
 | **AD-012** | Daemon survives window close | ✅ Implemented | V2-005 (2026-04-17). New `disconnect` JSON-RPC added; GTK X-button, Ctrl+Shift+Q, and SIGTERM/SIGHUP/SIGINT signal handlers now call `disconnect` instead of `shutdown_clean`/`shutdown_save`. Daemon persists state (session JSON + v0.1 VT snapshots) and drops the connection without exiting. Hamburger "Close Window Permanently" still wired to `shutdown()` as the explicit-kill path. |
 | **AD-013** | Persistence = byte log, not cell snapshot | ✅ Implemented | V2-007 (2026-04-19). Append-only `~/.local/share/forgetty/logs/{pane_uuid}.log` replaces VT-state binary snapshots. In-memory ring (1 MiB default) + on-disk log (10 MiB cap, rotate-newest-half). Subscribe path does atomic subscribe+snapshot via `SessionManager::subscribe_with_snapshot` — client VT parser rebuilds state from replay bytes naturally, no cell-snapshot format. Cross-daemon orphan safety via `all_persisted_pane_ids()` union across all session JSONs (AD-001-aware). Daemon startup sync-saves session on every layout mutation to close the prune-race window. Seven fix cycles documented in ``. |
-| **AD-014** | Client-side color resolution | ❌ Not implemented | Colors resolved in daemon VT layer at parse time. **V2-009 moves resolution to client render time.** |
+| **AD-014** | Client-side color resolution | ✅ Implemented | V2-009 satisfied-by-construction, confirmed 2026-04-19. libghostty-vt stores cell colors as typed tags (`GhosttyStyleColor { tag: Palette\|Rgb\|None, ... }`), and the Rust-side `Terminal::sync_screen` resolves palette indices 0–15 via `self.ansi_palette[index]` on every frame read. `Terminal::set_ansi_palette` swaps the palette field; next `da.queue_draw()` re-resolves everything libghostty-vt currently surfaces (visible + scrollback accessed via viewport-scroll API). V2-007 byte-log replay populates libghostty-vt's tag state on restore, so recovered panes get retroactive theming too. Truecolor cells (`\x1b[38;2;r;g;b m`) correctly retain explicit RGB. No code change required; the BACKLOG-proposed "re-parse the byte log" alternative was defensive against a storage model libghostty-vt doesn't use. See ``. |
 | **AD-015** | `forgetty-sync` has no terminal deps | ❌ Not implemented | `forgetty-sync` currently depends on `forgetty-session`. **V2-011 decouples.** |
 
 ---
@@ -66,6 +66,6 @@
 
 | Category | Total | ✅ Done | 🟡 Partial | ❌ Missing |
 |----------|-------|---------|-----------|-----------|
-| Architectural decisions (AD-001…AD-015) | 15 | 12 | 1 | 2 |
+| Architectural decisions (AD-001…AD-015) | 15 | 13 | 1 | 1 |
 
 Target: all ❌ → ✅ by the end of the V2 backlog (V2-001 through V2-012).
