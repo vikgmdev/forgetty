@@ -209,14 +209,14 @@ fn font_description_with_size(config: &Config, size: f32) -> pango::FontDescript
 /// the wake-pipe read fd used by `glib::unix_fd_add_local` to trigger the
 /// GLib handler on new data (no polling — see AD-009).
 ///
-/// `snapshot` is an optional initial screen state fed to the VT parser to
-/// make the first rendered frame show content rather than a blank terminal.
+/// Initial screen content is populated by the daemon's byte-log replay
+/// (V2-007 / AD-013): `subscribe_output` delivers the recent PTY bytes as its
+/// first frames, which the VT parser below feeds itself.
 pub fn create_terminal(
     config: &Config,
     pane_id: forgetty_core::PaneId,
     daemon_client: Arc<DaemonClient>,
     daemon_channel: crate::daemon_client::DaemonOutputChannel,
-    snapshot: Option<&crate::daemon_client::ScreenSnapshot>,
     cwd: Option<PathBuf>,
     on_exit: Option<Rc<dyn Fn(String)>>,
     on_notify: Option<Rc<dyn Fn(NotificationPayload)>>,
@@ -228,8 +228,8 @@ pub fn create_terminal(
 
     // Over-estimate rows so the first-draw resize is always a SHRINK.
     // libghostty-vt shrinks by trimming trailing blank rows from the BOTTOM;
-    // snapshot content is placed at row 1 (top) so the blank rows sit below
-    // it and get trimmed cleanly on the first resize.
+    // byte-log replay writes content from the top, so the blank rows sit
+    // below it and get trimmed cleanly on the first resize.
     // 80 rows covers any realistic monitor+font combination.
     let initial_rows: usize = 80;
     let initial_cols: usize = 240;
@@ -238,44 +238,6 @@ pub fn create_terminal(
     let mut terminal =
         forgetty_vt::Terminal::new(initial_rows, initial_cols, config.theme.ansi_colors);
     terminal.feed(b"\x1b[1 q");
-
-    // Prime VT state with snapshot lines so the first frame shows content.
-    if let Some(snap) = snapshot {
-        // Strip leading blank rows.  Blank rows from the daemon are serialized as
-        // "" (empty string): handle_get_screen only emits bytes up to the last
-        // non-default cell, so an all-blank row produces zero bytes.
-        let first_content = snap
-            .lines
-            .iter()
-            .position(|l| !l.is_empty())
-            .unwrap_or(snap.lines.len().saturating_sub(1)); // keep at least cursor row
-        let effective_lines = &snap.lines[first_content..];
-        let effective_cursor_row = snap.cursor_row.saturating_sub(first_content);
-
-        // Place content at the TOP of the oversized initial VT (row 1).
-        //
-        // libghostty-vt (PageList::resizeWithoutReflow) shrinks by calling
-        // trimTrailingBlankRows(), which removes blank rows from the BOTTOM of
-        // the active area — NOT the top.  Placing content at row 1 means the
-        // trailing blank rows sit below it; the first-draw resize trims them
-        // cleanly and content stays visible at the top.
-        //
-        // The prior strategy (place at bottom, start_row = initial_rows - snap_rows + 1)
-        // was wrong: with content at the bottom there are no trailing blank rows,
-        // nothing gets trimmed, and blank rows above the content are pushed into
-        // the visible window instead of history.
-        let start_row = 1_usize; // 1-indexed; content always at top
-        for (i, line) in effective_lines.iter().enumerate() {
-            let row = start_row + i;
-            // Explicit CUP per row avoids accidental scrolling at the boundary.
-            terminal.feed(format!("\x1b[{row};1H").as_bytes());
-            terminal.feed(line.as_bytes());
-        }
-        // Restore cursor to its position within the effective content slice.
-        let cur_row = start_row + effective_cursor_row; // absolute 1-indexed row in oversized VT
-        let cur_col = snap.cursor_col + 1;
-        terminal.feed(format!("\x1b[{cur_row};{cur_col}H").as_bytes());
-    }
 
     let input = GhosttyInput::new();
 

@@ -9,8 +9,8 @@ pub mod session;
 pub mod workspace;
 
 pub use persistence::{
-    all_persisted_pane_ids, delete_vt_snapshot, load_vt_snapshot, logs_dir, pane_log_path,
-    prune_orphan_logs, save_vt_snapshot, snapshot_path, TrashedSessionInfo,
+    all_persisted_pane_ids, delete_vt_snapshot, logs_dir, pane_log_path, prune_orphan_logs,
+    snapshot_path, TrashedSessionInfo,
 };
 pub use project::{find_project_root, project_name, ProjectType};
 pub use session::{

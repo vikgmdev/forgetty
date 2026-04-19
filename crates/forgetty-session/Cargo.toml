@@ -8,7 +8,6 @@ description = "Platform-agnostic session manager for Forgetty terminal panes"
 [dependencies]
 forgetty-core = { path = "../forgetty-core" }
 forgetty-pty = { path = "../forgetty-pty" }
-forgetty-vt = { path = "../forgetty-vt" }
 forgetty-workspace = { path = "../forgetty-workspace" }
 tokio = { workspace = true }
 serde = { workspace = true }

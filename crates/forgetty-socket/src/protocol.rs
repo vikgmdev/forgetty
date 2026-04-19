@@ -95,7 +95,6 @@ pub mod methods {
     pub const FOCUS_TAB: &str = "focus_tab";
     pub const SPLIT_PANE: &str = "split_pane";
     pub const SEND_INPUT: &str = "send_input";
-    pub const GET_SCREEN: &str = "get_screen";
     pub const GET_PANE_INFO: &str = "get_pane_info";
     pub const SUBSCRIBE_OUTPUT: &str = "subscribe_output";
     pub const SUBSCRIBE_LAYOUT: &str = "subscribe_layout";
@@ -106,8 +105,6 @@ pub mod methods {
     pub const REVOKE_DEVICE: &str = "revoke_device";
     pub const GET_PAIRING_INFO: &str = "get_pairing_info";
     pub const ENABLE_PAIRING: &str = "enable_pairing";
-    // VT snapshot methods (T-058).
-    pub const PRESEED_SNAPSHOT: &str = "preseed_snapshot";
     // Layout query + mutation methods (T-062).
     pub const GET_LAYOUT: &str = "get_layout";
     pub const MOVE_TAB: &str = "move_tab";

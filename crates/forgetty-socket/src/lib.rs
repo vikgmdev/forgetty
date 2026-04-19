@@ -16,6 +16,5 @@ pub mod protocol;
 pub mod server;
 
 pub use handlers::dispatch;
-pub use handlers::save_all_snapshots;
 pub use protocol::{Request, Response};
 pub use server::SocketServer;

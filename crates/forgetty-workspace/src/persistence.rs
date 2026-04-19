@@ -284,66 +284,22 @@ pub fn purge_old_trash(max_days: u32) {
 // VT snapshot persistence (T-058)
 // ---------------------------------------------------------------------------
 
-/// Return the path to the VT snapshot file for a given pane UUID.
+/// Return the path to the legacy VT snapshot file for a given pane UUID.
 ///
 /// Typically `~/.local/share/forgetty/sessions/snapshots/<uuid>.json`.
+///
+/// Kept alongside [`delete_vt_snapshot`] so long-running installs that have
+/// stale snapshot files from earlier versions can still clean them up when a
+/// pane is closed. The daemon no longer writes snapshots — byte-log
+/// persistence (V2-007 / AD-013) replaces them.
 pub fn snapshot_path(pane_id: uuid::Uuid) -> PathBuf {
     data_dir().join("sessions").join("snapshots").join(format!("{pane_id}.json"))
 }
 
-/// Persist a VT screen snapshot for a pane.
+/// Delete the legacy VT snapshot for a pane. Silent if the file does not exist.
 ///
-/// Uses atomic write (write to `.tmp`, then `rename()`) to avoid corrupt
-/// files if the process is killed mid-write.
-pub fn save_vt_snapshot(
-    pane_id: uuid::Uuid,
-    lines: &[String],
-    cursor_row: usize,
-    cursor_col: usize,
-) -> io::Result<()> {
-    let path = snapshot_path(pane_id);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let json = serde_json::to_string(&serde_json::json!({
-        "lines": lines,
-        "cursor": { "row": cursor_row, "col": cursor_col },
-    }))
-    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-    let tmp_path = path.with_extension("json.tmp");
-    fs::write(&tmp_path, &json)?;
-    if let Err(e) = fs::rename(&tmp_path, &path) {
-        tracing::warn!("VT snapshot atomic rename failed ({e}), falling back to direct write");
-        fs::write(&path, &json)?;
-    }
-    Ok(())
-}
-
-/// Load a VT screen snapshot for a pane.
-///
-/// Returns `None` if the file does not exist or JSON parsing fails.
-pub fn load_vt_snapshot(pane_id: uuid::Uuid) -> Option<(Vec<String>, usize, usize)> {
-    let path = snapshot_path(pane_id);
-    let contents = fs::read_to_string(&path).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&contents).ok()?;
-
-    let lines: Vec<String> = value
-        .get("lines")
-        .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect())
-        .unwrap_or_default();
-
-    let cursor = value.get("cursor");
-    let cursor_row =
-        cursor.and_then(|c| c.get("row")).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-    let cursor_col =
-        cursor.and_then(|c| c.get("col")).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-
-    Some((lines, cursor_row, cursor_col))
-}
-
-/// Delete the VT snapshot for a pane. Silent if the file does not exist.
+/// Retained for backwards compatibility: when a pane closes we still clean up
+/// any pre-V2-008 snapshot file that might exist on disk from older installs.
 pub fn delete_vt_snapshot(pane_id: uuid::Uuid) {
     let path = snapshot_path(pane_id);
     if path.exists() {

@@ -24,14 +24,6 @@ use tracing::{debug, warn};
 
 use forgetty_core::PaneId;
 
-/// A snapshot of a single pane's current screen state (plain text, no color).
-#[derive(Debug, Clone)]
-pub struct ScreenSnapshot {
-    pub lines: Vec<String>,
-    pub cursor_row: usize,
-    pub cursor_col: usize,
-}
-
 /// Metadata about a pane returned by `list_tabs`.
 #[derive(Debug, Clone)]
 pub struct PaneInfo {
@@ -477,46 +469,6 @@ impl DaemonClient {
     pub fn send_sigint(&self, pane_id: PaneId) -> Result<(), DaemonError> {
         self.rpc("send_sigint", serde_json::json!({ "pane_id": pane_id.to_string() }))?;
         Ok(())
-    }
-
-    /// Get the current viewport snapshot (plain text, no color) for initial render.
-    pub fn get_screen(&self, pane_id: PaneId) -> Result<ScreenSnapshot, DaemonError> {
-        let result =
-            self.rpc("get_screen", serde_json::json!({ "pane_id": pane_id.to_string() }))?;
-
-        let lines_val = result
-            .get("lines")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| DaemonError("get_screen: missing lines".into()))?;
-        let lines: Vec<String> =
-            lines_val.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect();
-
-        let cursor = result.get("cursor");
-        let cursor_row =
-            cursor.and_then(|c| c.get("row")).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        let cursor_col =
-            cursor.and_then(|c| c.get("col")).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-
-        Ok(ScreenSnapshot { lines, cursor_row, cursor_col })
-    }
-
-    /// Pre-seed a new pane's VT buffer with the saved snapshot from an old pane.
-    ///
-    /// Returns `Ok(true)` if the snapshot was found and applied, `Ok(false)`
-    /// if no snapshot existed (pane opens blank).
-    pub fn preseed_snapshot(
-        &self,
-        new_pane_id: PaneId,
-        old_uuid: uuid::Uuid,
-    ) -> Result<bool, DaemonError> {
-        let result = self.rpc(
-            "preseed_snapshot",
-            serde_json::json!({
-                "pane_id": new_pane_id.to_string(),
-                "snapshot_id": old_uuid.to_string(),
-            }),
-        )?;
-        Ok(result.get("seeded").and_then(|v| v.as_bool()).unwrap_or(false))
     }
 
     // -----------------------------------------------------------------------

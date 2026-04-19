@@ -1,5 +1,9 @@
-//! `SessionManager` — the platform-agnostic owner of all PTY processes and
-//! VT instances.
+//! `SessionManager` — the platform-agnostic owner of all PTY processes.
+//!
+//! Per AD-007 the daemon is a byte pipe: it spawns/owns PTYs, tees raw output
+//! into per-pane `ByteLog` rings for replay, and broadcasts those bytes over
+//! the session event channel. It does not parse VT sequences — clients own
+//! all terminal semantics (AD-008).
 //!
 //! `SessionManager` is `Clone + Send + Sync`. Cloning it gives a second handle
 //! to the same internal state (backed by `Arc<Mutex<>>`). All public methods
@@ -26,7 +30,6 @@ use crate::events::SessionEvent;
 use crate::layout::{SessionLayout, SessionTab};
 use crate::pane::{PaneInfo, PaneState};
 use crate::pty_bridge::PtyBridge;
-use crate::vt_instance::VtInstance;
 use crate::workspace::{build_workspace_state, PaneTreeLayout, WorkspaceLayout};
 
 /// Capacity of the broadcast event channel.
@@ -66,8 +69,9 @@ struct SessionManagerInner {
 
 /// Platform-agnostic session manager.
 ///
-/// Owns all PTY processes and session-side VT instances. Compiles with zero
-/// GTK dependencies. Clone to share ownership across threads or callbacks.
+/// Owns all PTY processes and per-pane byte logs (AD-007 / AD-013). Compiles
+/// with zero GTK dependencies — clients own all VT state (AD-008). Clone to
+/// share ownership across threads or callbacks.
 #[derive(Clone)]
 pub struct SessionManager {
     inner: Arc<Mutex<SessionManagerInner>>,
@@ -133,14 +137,11 @@ impl SessionManager {
         )
         .map_err(forgetty_core::ForgettyError::Pty)?;
 
-        let vt = VtInstance::new(size.rows as usize, size.cols as usize);
-
         let initial_cwd = cwd.unwrap_or_else(home_dir_fallback);
 
         let pane = PaneState {
             id,
             pty_bridge,
-            vt,
             cwd: initial_cwd,
             title: String::new(),
             rows: size.rows,
@@ -284,13 +285,11 @@ impl SessionManager {
         let pty_bridge = PtyBridge::spawn(size, cwd.as_deref(), command.as_deref(), None, true)
             .map_err(forgetty_core::ForgettyError::Pty)?;
 
-        let vt = VtInstance::new(size.rows as usize, size.cols as usize);
         let initial_cwd = cwd.unwrap_or_else(home_dir_fallback);
 
         let pane = PaneState {
             id: pane_id,
             pty_bridge,
-            vt,
             cwd: initial_cwd,
             title: String::new(),
             rows: size.rows,
@@ -344,13 +343,11 @@ impl SessionManager {
         let pty_bridge = PtyBridge::spawn(size, cwd.as_deref(), None, None, true)
             .map_err(forgetty_core::ForgettyError::Pty)?;
 
-        let vt = VtInstance::new(size.rows as usize, size.cols as usize);
         let initial_cwd = cwd.unwrap_or_else(home_dir_fallback);
 
         let new_pane = PaneState {
             id: new_pane_id,
             pty_bridge,
-            vt,
             cwd: initial_cwd,
             title: String::new(),
             rows: size.rows,
@@ -422,13 +419,11 @@ impl SessionManager {
         let pty_bridge = PtyBridge::spawn(size, cwd.as_deref(), None, None, true)
             .map_err(forgetty_core::ForgettyError::Pty)?;
 
-        let vt = VtInstance::new(size.rows as usize, size.cols as usize);
         let initial_cwd = cwd.unwrap_or_else(home_dir_fallback);
 
         let new_pane = PaneState {
             id: new_pane_id,
             pty_bridge,
-            vt,
             cwd: initial_cwd,
             title: String::new(),
             rows: size.rows,
@@ -661,7 +656,12 @@ impl SessionManager {
         pane.pty_bridge.pty.write(data)
     }
 
-    /// Resize a pane's PTY and VT to new dimensions.
+    /// Resize a pane's PTY to new dimensions.
+    ///
+    /// The daemon no longer owns a VT (AD-007) — clients resize their own
+    /// parsers in response to the next `PtyOutput` (or ahead of it, via local
+    /// UI state). The PTY resize ioctl propagates the new size to the child
+    /// process, which will emit appropriate redraws on SIGWINCH.
     pub fn resize_pane(&self, id: PaneId, size: PtySize) -> Result<()> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let pane = inner
@@ -669,7 +669,6 @@ impl SessionManager {
             .get_mut(&id)
             .ok_or_else(|| forgetty_core::ForgettyError::Pty(format!("pane {id} not found")))?;
         pane.pty_bridge.pty.resize(size)?;
-        pane.vt.resize(size.rows as usize, size.cols as usize);
         pane.rows = size.rows;
         pane.cols = size.cols;
         Ok(())
@@ -688,13 +687,15 @@ impl SessionManager {
 
     /// Process one chunk of raw PTY bytes for a pane.
     ///
-    /// - Feeds bytes to the session-side VT (calls pty_bridge.pty.write() for
-    ///   any VT responses).
-    /// - Updates the cached CWD from /proc/{pid}/cwd.
+    /// - Updates the cached CWD from `/proc/{pid}/cwd`.
     /// - **Tees the raw bytes into the per-pane `ByteLog` ring BEFORE broadcast**
     ///   (V2-007 AC-13 ordering invariant — see `BUILDER_NOTES.md`).
-    /// - Broadcasts a PtyOutput event on the session channel.
-    /// - Returns DrainResult with pty_exited set if the PTY is no longer alive.
+    /// - Broadcasts a `PtyOutput` event on the session channel.
+    /// - Returns `DrainResult` with `pty_exited` set if the PTY is no longer alive.
+    ///
+    /// Per AD-007 the daemon does not parse VT sequences — any VT responses
+    /// (DSR, device-status, etc.) are produced by the client's parser and
+    /// written back via `write_pty`.
     pub fn process_pane_bytes(&self, id: PaneId, bytes: &[u8]) -> Result<DrainResult> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let pane = inner
@@ -702,14 +703,6 @@ impl SessionManager {
             .get_mut(&id)
             .ok_or_else(|| forgetty_core::ForgettyError::Pty(format!("pane {id} not found")))?;
 
-        {
-            let pty = &mut pane.pty_bridge.pty;
-            pane.vt.feed_and_respond(bytes, |resp| {
-                if let Err(e) = pty.write(resp) {
-                    warn!(%id, "failed to write PTY response: {e}");
-                }
-            });
-        }
         if let Some(pid) = pane.pty_bridge.pty.pid() {
             if let Ok(cwd) = std::fs::read_link(format!("/proc/{pid}/cwd")) {
                 pane.cwd = cwd;
@@ -735,7 +728,7 @@ impl SessionManager {
             pane_id: id,
             data: bytes::Bytes::copy_from_slice(bytes),
         });
-        Ok(DrainResult { had_data: true, pty_exited, raw_bytes: vec![bytes.to_vec()] })
+        Ok(DrainResult { pty_exited })
     }
 
     // -----------------------------------------------------------------------
@@ -836,36 +829,6 @@ impl SessionManager {
                 let _ = sm.close_pane(pane_id);
             });
         }
-    }
-
-    // -----------------------------------------------------------------------
-    // VT access
-    // -----------------------------------------------------------------------
-
-    /// Read-only access to a pane's session-side VT.
-    pub fn with_vt<F, R>(&self, id: PaneId, f: F) -> Result<R>
-    where
-        F: FnOnce(&forgetty_vt::Terminal) -> R,
-    {
-        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let pane = inner
-            .panes
-            .get(&id)
-            .ok_or_else(|| forgetty_core::ForgettyError::Pty(format!("pane {id} not found")))?;
-        Ok(f(&pane.vt.terminal))
-    }
-
-    /// Mutable access to a pane's session-side VT.
-    pub fn with_vt_mut<F, R>(&self, id: PaneId, f: F) -> Result<R>
-    where
-        F: FnOnce(&mut forgetty_vt::Terminal) -> R,
-    {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let pane = inner
-            .panes
-            .get_mut(&id)
-            .ok_or_else(|| forgetty_core::ForgettyError::Pty(format!("pane {id} not found")))?;
-        Ok(f(&mut pane.vt.terminal))
     }
 
     // -----------------------------------------------------------------------

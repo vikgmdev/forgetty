@@ -5,11 +5,17 @@
 //! 1. Android connects with ALPN `forgetty/stream/1`.
 //! 2. Daemon verifies device is in the authorized registry.
 //! 3. Android opens a bidirectional stream and sends `ClientMsg::Subscribe { pane_id }`.
-//! 4. Daemon sends `DaemonMsg::FullSnapshot` (current viewport text + cursor).
+//! 4. Daemon sends `DaemonMsg::FullSnapshot` as a reset sentinel (V2-008:
+//!    `rows = 0, cols = 0, lines = []`; any `FullSnapshot` is a VT reset
+//!    marker per the Android protocol), then streams the pane's byte-log ring
+//!    (V2-007) as `DaemonMsg::PtyBytes` frames so the client VT can rebuild
+//!    state from raw bytes.
 //! 5. Daemon forwards every `SessionEvent::PtyOutput` for that pane as `DaemonMsg::PtyBytes`.
-//! 6. If the broadcast channel reports `RecvError::Lagged`, daemon sends a fresh snapshot
-//!    (backpressure recovery — no disconnect).
-//! 7. Android can request scrollback via `ClientMsg::RequestScrollback`.
+//! 6. If the broadcast channel reports `RecvError::Lagged`, daemon sends a fresh sentinel
+//!    `FullSnapshot` plus ring replay (backpressure recovery — no disconnect).
+//! 7. Android can request scrollback via `ClientMsg::RequestScrollback` (V2-008:
+//!    returns an empty `ScrollbackPage` until a future scrollback-over-iroh
+//!    task lands; live streaming covers the 99% use case).
 //! 8. `PaneGone` is sent when the pane closes.
 //!
 //! # Frame format
@@ -38,8 +44,10 @@ use crate::registry::DeviceRegistry;
 /// Maximum allowed MessagePack frame size (4 MiB).
 const MAX_FRAME_SIZE: usize = 4 * 1024 * 1024;
 
-/// Maximum scrollback lines returned per `RequestScrollback`.
-const MAX_SCROLLBACK_PAGE: usize = 500;
+/// Chunk size for byte-log replay `PtyBytes` frames. Well under `MAX_FRAME_SIZE`
+/// so a single replay chunk always fits, with plenty of MessagePack envelope
+/// headroom.
+const REPLAY_CHUNK_SIZE: usize = 1024 * 1024; // 1 MiB
 
 // ---------------------------------------------------------------------------
 // Message types
@@ -171,99 +179,57 @@ async fn read_msg(recv: &mut RecvStream) -> Option<ClientMsg> {
 }
 
 // ---------------------------------------------------------------------------
-// Snapshot builder
+// Snapshot / replay builders
 // ---------------------------------------------------------------------------
 
-/// Build a `DaemonMsg::FullSnapshot` from the current VT viewport state.
+/// Build a degenerate `DaemonMsg::FullSnapshot` reset-sentinel (V2-008).
 ///
-/// Returns `DaemonMsg::Error` if the pane is not found (caller should send
-/// the error and close).
-fn build_snapshot(sm: &SessionManager, pane_id: PaneId) -> DaemonMsg {
-    let result = sm.with_vt(pane_id, |terminal| {
-        let screen = terminal.screen();
-        let rows = screen.rows();
-        let cols = screen.cols();
-
-        let lines: Vec<String> = (0..rows)
-            .map(|r| {
-                let row = screen.row(r);
-                let mut line = String::with_capacity(cols);
-                for cell in row.iter().take(cols) {
-                    line.push_str(&cell.grapheme);
-                }
-                // Trim trailing spaces then pad back to exactly `cols` chars.
-                let trimmed_len = line.trim_end_matches(' ').len();
-                line.truncate(trimmed_len);
-                while line.chars().count() < cols {
-                    line.push(' ');
-                }
-                line
-            })
-            .collect();
-
-        let (cursor_row, cursor_col) = terminal.cursor();
-        (rows as u16, cols as u16, lines, cursor_row, cursor_col)
-    });
-
-    match result {
-        Ok((rows, cols, lines, cursor_row, cursor_col)) => DaemonMsg::FullSnapshot {
-            pane_id: pane_id.to_string(),
-            rows,
-            cols,
-            lines,
-            cursor_row,
-            cursor_col,
-        },
-        Err(e) => DaemonMsg::Error { message: format!("failed to read VT: {e}") },
+/// The Android protocol treats any `FullSnapshot` as "clear the screen; live
+/// bytes follow". Since AD-007 forbids VT state in the daemon, the daemon
+/// emits a zero-filled sentinel instead of a text snapshot and follows it
+/// with the byte-log ring contents as `PtyBytes` frames (handled by the
+/// caller). This preserves the wire schema byte-for-byte.
+fn build_snapshot(pane_id: PaneId) -> DaemonMsg {
+    DaemonMsg::FullSnapshot {
+        pane_id: pane_id.to_string(),
+        rows: 0,
+        cols: 0,
+        lines: Vec::new(),
+        cursor_row: 0,
+        cursor_col: 0,
     }
 }
 
-/// Build a `DaemonMsg::ScrollbackPage` for the given pane.
-fn build_scrollback_page(
-    sm: &SessionManager,
+/// Build a degenerate `DaemonMsg::ScrollbackPage` (V2-008).
+///
+/// The daemon no longer parses VT cells, so it has no per-line scrollback to
+/// return. An empty page is valid per the Android protocol doc ("Max 500
+/// lines per request" plus the standard short-page termination convention).
+/// Live streaming via byte-log replay (`handle_subscribe_stream`) covers the
+/// 99% use case; explicit scrollback-over-iroh is deferred to a future task.
+fn build_scrollback_page(pane_id: PaneId, from_row: i32) -> DaemonMsg {
+    DaemonMsg::ScrollbackPage { pane_id: pane_id.to_string(), from_row, lines: Vec::new() }
+}
+
+/// Send a reset-sentinel `FullSnapshot` followed by the byte-log ring as
+/// `PtyBytes` frames. Used on initial subscribe and on broadcast lag recovery.
+///
+/// Returns `false` if any write fails (caller should exit the streaming loop).
+async fn send_sentinel_and_replay(
+    send: &mut SendStream,
     pane_id: PaneId,
-    from_row: i32,
-    count: u32,
-) -> DaemonMsg {
-    let clamped_count = (count as usize).min(MAX_SCROLLBACK_PAGE);
-
-    let result = sm.with_vt(pane_id, |terminal| {
-        let sb = terminal.scrollback();
-        let len = sb.len();
-        if len == 0 {
-            return Vec::new();
-        }
-        let start = if from_row < 0 {
-            // Negative: offset from the newest scrollback line.
-            let offset = (-from_row) as usize;
-            if offset >= len {
-                0
-            } else {
-                len - offset
-            }
-        } else {
-            (from_row as usize).min(len.saturating_sub(1))
-        };
-        let end = (start + clamped_count).min(len);
-
-        sb[start..end]
-            .iter()
-            .map(|row| {
-                let mut line = String::new();
-                for cell in row {
-                    line.push_str(&cell.grapheme);
-                }
-                let trimmed = line.trim_end_matches(' ').len();
-                line.truncate(trimmed);
-                line
-            })
-            .collect()
-    });
-
-    match result {
-        Ok(lines) => DaemonMsg::ScrollbackPage { pane_id: pane_id.to_string(), from_row, lines },
-        Err(e) => DaemonMsg::Error { message: format!("failed to read scrollback: {e}") },
+    replay_bytes: &[u8],
+) -> bool {
+    if !write_msg(send, &build_snapshot(pane_id)).await {
+        return false;
     }
+    for chunk in replay_bytes.chunks(REPLAY_CHUNK_SIZE) {
+        let msg = DaemonMsg::PtyBytes { pane_id: pane_id.to_string(), data: chunk.to_vec() };
+        if !write_msg(send, &msg).await {
+            return false;
+        }
+    }
+    true
 }
 
 /// Recursively collect all pane IDs reachable from a `PaneTreeLayout`.
@@ -449,14 +415,15 @@ async fn handle_subscribe_stream(
 
     info!("stream: device {device_id} subscribed to pane {pane_id}");
 
-    // --- Send initial FullSnapshot ---
-    let snapshot = build_snapshot(&sm, pane_id);
-    if !write_msg(&mut send, &snapshot).await {
+    // `subscribe_with_snapshot` returns the broadcast receiver and the
+    // current byte-log ring contents under a single lock, so no bytes are
+    // duplicated or missed across the "send snapshot" / "start forwarding
+    // live events" boundary. The Android client rebuilds screen state by
+    // feeding the replay bytes into its own VT parser (AD-007 / AD-008).
+    let (mut session_rx, replay_bytes, _hwm) = sm.subscribe_with_snapshot(pane_id);
+    if !send_sentinel_and_replay(&mut send, pane_id, &replay_bytes).await {
         return;
     }
-
-    // --- Subscribe to session events ---
-    let mut session_rx: broadcast::Receiver<SessionEvent> = sm.subscribe_output();
 
     // --- Spawn reader task for incoming client messages ---
     let (client_tx, mut client_rx) = tokio::sync::mpsc::channel::<ClientMsg>(16);
@@ -486,11 +453,11 @@ async fn handle_subscribe_stream(
                         info!("stream: device {device_id} unsubscribed from pane {pane_id}");
                         break;
                     }
-                    Some(ClientMsg::RequestScrollback { pane_id: pid_str, from_row, count }) => {
+                    Some(ClientMsg::RequestScrollback { pane_id: pid_str, from_row, count: _ }) => {
                         let req_pid = Uuid::parse_str(&pid_str)
                             .map(PaneId)
                             .unwrap_or(pane_id);
-                        let page = build_scrollback_page(&sm, req_pid, from_row, count);
+                        let page = build_scrollback_page(req_pid, from_row);
                         if !write_msg(&mut send, &page).await {
                             break;
                         }
@@ -530,9 +497,14 @@ async fn handle_subscribe_stream(
                         break;
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        warn!("stream: device {device_id} lagged by {n} events, sending snapshot");
-                        let snapshot = build_snapshot(&sm, pane_id);
-                        if !write_msg(&mut send, &snapshot).await {
+                        warn!("stream: device {device_id} lagged by {n} events, resending sentinel + ring");
+                        // Re-acquire ring snapshot atomically; discard the
+                        // fresh receiver since `session_rx` is already past
+                        // the lag point (`broadcast::Receiver::recv` advances
+                        // past dropped slots).
+                        let (_new_rx, replay_bytes, _hwm) =
+                            sm.subscribe_with_snapshot(pane_id);
+                        if !send_sentinel_and_replay(&mut send, pane_id, &replay_bytes).await {
                             break;
                         }
                     }

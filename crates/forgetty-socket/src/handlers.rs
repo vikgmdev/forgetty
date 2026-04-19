@@ -15,7 +15,6 @@ use forgetty_session::layout::{SessionLayout, SessionTab};
 use forgetty_session::workspace::PaneTreeLayout;
 use forgetty_session::SessionManager;
 use forgetty_sync::SyncEndpoint;
-use forgetty_vt::{Cell, CellAttributes, Color};
 use uuid::Uuid;
 
 use crate::protocol::{self, methods, Request, Response};
@@ -49,12 +48,10 @@ pub fn dispatch(
         methods::SPLIT_PANE => handle_split_pane(request, &sm),
         methods::MOVE_TAB => handle_move_tab(request, &sm),
         methods::SEND_INPUT => handle_send_input(request, &sm),
-        methods::GET_SCREEN => handle_get_screen(request, &sm),
         methods::GET_PANE_INFO => handle_get_pane_info(request, &sm),
         methods::RESIZE_PANE => handle_resize_pane(request, &sm),
         methods::SEND_SIGINT => handle_send_sigint(request, &sm),
         methods::NOTIFY => handle_notify(request, &sm),
-        methods::PRESEED_SNAPSHOT => handle_preseed_snapshot(request, &sm),
         methods::CLOSE_PANE => handle_close_pane(request, &sm),
         methods::CREATE_WORKSPACE => handle_create_workspace(request, &sm),
         // Split ratio + pinned session methods (B-002).
@@ -218,28 +215,8 @@ fn handle_close_tab(request: &Request, sm: &SessionManager) -> Response {
             }
         };
 
-        // Collect pane IDs from this tab BEFORE closing, for snapshot cleanup.
-        let pane_ids_to_clean: Vec<PaneId> = {
-            let layout = sm.layout();
-            let mut ids = Vec::new();
-            'outer: for ws in &layout.workspaces {
-                for tab in &ws.tabs {
-                    if tab.id == tab_uuid {
-                        collect_all_pane_ids(&tab.pane_tree, &mut ids);
-                        break 'outer;
-                    }
-                }
-            }
-            ids
-        };
-
         match sm.close_tab(tab_uuid) {
-            Ok(()) => {
-                for pid in pane_ids_to_clean {
-                    forgetty_workspace::delete_vt_snapshot(pid.0);
-                }
-                Response::success(request.id.clone(), serde_json::json!({ "ok": true }))
-            }
+            Ok(()) => Response::success(request.id.clone(), serde_json::json!({ "ok": true })),
             Err(e) => Response::error(
                 request.id.clone(),
                 protocol::INTERNAL_ERROR,
@@ -272,29 +249,11 @@ fn handle_close_tab(request: &Request, sm: &SessionManager) -> Response {
         // Try to find the tab that owns this pane.
         let layout = sm.layout();
         if let Some(tab_uuid) = find_tab_for_pane(&layout, pane_id) {
-            // Collect all pane IDs in the tab for snapshot cleanup.
-            let pane_ids_to_clean: Vec<PaneId> = {
-                let mut ids = Vec::new();
-                'outer: for ws in &layout.workspaces {
-                    for tab in &ws.tabs {
-                        if tab.id == tab_uuid {
-                            collect_all_pane_ids(&tab.pane_tree, &mut ids);
-                            break 'outer;
-                        }
-                    }
-                }
-                ids
-            };
             // Drop layout before calling close_tab (no reentry).
             drop(layout);
 
             match sm.close_tab(tab_uuid) {
-                Ok(()) => {
-                    for pid in pane_ids_to_clean {
-                        forgetty_workspace::delete_vt_snapshot(pid.0);
-                    }
-                    Response::success(request.id.clone(), serde_json::json!({ "ok": true }))
-                }
+                Ok(()) => Response::success(request.id.clone(), serde_json::json!({ "ok": true })),
                 Err(e) => Response::error(
                     request.id.clone(),
                     protocol::INTERNAL_ERROR,
@@ -305,10 +264,7 @@ fn handle_close_tab(request: &Request, sm: &SessionManager) -> Response {
             // Pane exists in registry but not in any tab tree — legacy fallback.
             drop(layout);
             match sm.close_pane(pane_id) {
-                Ok(()) => {
-                    forgetty_workspace::delete_vt_snapshot(pane_id.0);
-                    Response::success(request.id.clone(), serde_json::json!({ "ok": true }))
-                }
+                Ok(()) => Response::success(request.id.clone(), serde_json::json!({ "ok": true })),
                 Err(e) => Response::error(
                     request.id.clone(),
                     protocol::INTERNAL_ERROR,
@@ -413,38 +369,18 @@ fn handle_close_pane(request: &Request, sm: &SessionManager) -> Response {
     if is_sole_in_tab {
         // Close the entire tab that owns this pane.
         match tab_uuid {
-            Some(tid) => {
-                let pane_ids_to_clean: Vec<PaneId> = {
-                    let layout = sm.layout();
-                    let mut ids = Vec::new();
-                    for ws in &layout.workspaces {
-                        for tab in &ws.tabs {
-                            if tab.id == tid {
-                                collect_all_pane_ids(&tab.pane_tree, &mut ids);
-                            }
-                        }
-                    }
-                    ids
-                };
-                match sm.close_tab(tid) {
-                    Ok(()) => {
-                        for pid in pane_ids_to_clean {
-                            forgetty_workspace::delete_vt_snapshot(pid.0);
-                        }
-                        Response::success(request.id.clone(), serde_json::json!({ "ok": true }))
-                    }
-                    Err(e) => Response::error(
-                        request.id.clone(),
-                        protocol::INTERNAL_ERROR,
-                        format!("close_pane (via close_tab) failed: {e}"),
-                    ),
-                }
-            }
+            Some(tid) => match sm.close_tab(tid) {
+                Ok(()) => Response::success(request.id.clone(), serde_json::json!({ "ok": true })),
+                Err(e) => Response::error(
+                    request.id.clone(),
+                    protocol::INTERNAL_ERROR,
+                    format!("close_pane (via close_tab) failed: {e}"),
+                ),
+            },
             None => {
                 // Pane in registry but not in any tab tree — legacy fallback.
                 match sm.close_pane(pane_id) {
                     Ok(()) => {
-                        forgetty_workspace::delete_vt_snapshot(pane_id.0);
                         Response::success(request.id.clone(), serde_json::json!({ "ok": true }))
                     }
                     Err(e) => Response::error(
@@ -458,10 +394,7 @@ fn handle_close_pane(request: &Request, sm: &SessionManager) -> Response {
     } else {
         // Pane is part of a split — kill only this pane.
         match sm.close_pane(pane_id) {
-            Ok(()) => {
-                forgetty_workspace::delete_vt_snapshot(pane_id.0);
-                Response::success(request.id.clone(), serde_json::json!({ "ok": true }))
-            }
+            Ok(()) => Response::success(request.id.clone(), serde_json::json!({ "ok": true })),
             Err(e) => Response::error(
                 request.id.clone(),
                 protocol::INTERNAL_ERROR,
@@ -730,149 +663,6 @@ fn handle_send_input(request: &Request, sm: &SessionManager) -> Response {
     }
 }
 
-/// Serialize a single terminal row to an ANSI-escaped string.
-///
-/// Trailing blank cells with default attributes are omitted to keep payloads
-/// small. Any open SGR sequence is closed at the end of each line so that
-/// rows don't bleed into each other when replayed into the VT.
-fn serialize_row_ansi(row: &[Cell]) -> String {
-    // Find the last cell with non-default content so we can stop
-    // emitting escape codes after it (trailing blank cells are
-    // skipped to keep snapshot payloads small).
-    let content_end = row
-        .iter()
-        .rposition(|c| c.grapheme != " " || c.attrs != CellAttributes::default())
-        .map(|i| i + 1)
-        .unwrap_or(0);
-
-    let mut line = String::new();
-    let mut prev_fg = Color::Default;
-    let mut prev_bg = Color::Default;
-    let mut prev_bold = false;
-    let mut prev_italic = false;
-    let mut prev_underline = false;
-    let mut prev_strike = false;
-    let mut prev_inverse = false;
-    let mut prev_dim = false;
-    let mut emitted_escape = false;
-
-    for cell in row.iter().take(content_end) {
-        let a = &cell.attrs;
-        let changed = a.fg != prev_fg
-            || a.bg != prev_bg
-            || a.bold != prev_bold
-            || a.italic != prev_italic
-            || a.underline != prev_underline
-            || a.strikethrough != prev_strike
-            || a.inverse != prev_inverse
-            || a.dim != prev_dim;
-
-        if changed {
-            // Reset then re-emit all non-default attributes.
-            line.push_str("\x1b[0m");
-            if a.bold {
-                line.push_str("\x1b[1m");
-            }
-            if a.dim {
-                line.push_str("\x1b[2m");
-            }
-            if a.italic {
-                line.push_str("\x1b[3m");
-            }
-            if a.underline {
-                line.push_str("\x1b[4m");
-            }
-            if a.inverse {
-                line.push_str("\x1b[7m");
-            }
-            if a.strikethrough {
-                line.push_str("\x1b[9m");
-            }
-            if let Color::Rgb(r, g, b) = a.fg {
-                line.push_str(&format!("\x1b[38;2;{r};{g};{b}m"));
-            }
-            if let Color::Rgb(r, g, b) = a.bg {
-                line.push_str(&format!("\x1b[48;2;{r};{g};{b}m"));
-            }
-            prev_fg = a.fg;
-            prev_bg = a.bg;
-            prev_bold = a.bold;
-            prev_italic = a.italic;
-            prev_underline = a.underline;
-            prev_strike = a.strikethrough;
-            prev_inverse = a.inverse;
-            prev_dim = a.dim;
-            emitted_escape = true;
-        }
-
-        line.push_str(&cell.grapheme);
-    }
-
-    // Terminate any open SGR sequence so lines don't bleed into
-    // each other when the snapshot is replayed into the VT.
-    if emitted_escape {
-        line.push_str("\x1b[0m");
-    }
-
-    line
-}
-
-/// Save VT snapshots for all live panes to disk.
-///
-/// Called by the daemon on SIGTERM/SIGINT before killing PTY processes.
-/// Returns the number of snapshots successfully written.
-pub fn save_all_snapshots(sm: &SessionManager) -> usize {
-    let pane_ids = sm.list_panes();
-    let mut saved = 0usize;
-    for id in &pane_ids {
-        let result = sm.with_vt(*id, |terminal| {
-            let screen = terminal.screen();
-            let rows = screen.rows();
-            let lines: Vec<String> = (0..rows).map(|r| serialize_row_ansi(screen.row(r))).collect();
-            let (cur_row, cur_col) = terminal.cursor();
-            (lines, cur_row, cur_col)
-        });
-        if let Ok((lines, cur_row, cur_col)) = result {
-            if forgetty_workspace::save_vt_snapshot(id.0, &lines, cur_row, cur_col).is_ok() {
-                saved += 1;
-            }
-        }
-    }
-    saved
-}
-
-fn handle_get_screen(request: &Request, sm: &SessionManager) -> Response {
-    let id = match require_pane_id(request, sm) {
-        Ok(id) => id,
-        Err(e) => return e,
-    };
-
-    // with_vt holds the mutex for the duration of the closure but does NOT
-    // cross any await point (synchronous handler), so this is safe per R-1.
-    let result = sm.with_vt(id, |terminal| {
-        let screen = terminal.screen();
-        let rows = screen.rows();
-        let lines: Vec<String> = (0..rows).map(|r| serialize_row_ansi(screen.row(r))).collect();
-        let (cur_row, cur_col) = terminal.cursor();
-        (lines, cur_row, cur_col)
-    });
-
-    match result {
-        Ok((lines, cur_row, cur_col)) => Response::success(
-            request.id.clone(),
-            serde_json::json!({
-                "lines": lines,
-                "cursor": { "row": cur_row, "col": cur_col },
-            }),
-        ),
-        Err(e) => Response::error(
-            request.id.clone(),
-            protocol::INTERNAL_ERROR,
-            format!("failed to read VT screen: {e}"),
-        ),
-    }
-}
-
 fn handle_get_pane_info(request: &Request, sm: &SessionManager) -> Response {
     let id = match require_pane_id(request, sm) {
         Ok(id) => id,
@@ -998,54 +788,6 @@ fn handle_notify(request: &Request, sm: &SessionManager) -> Response {
     );
 
     Response::success(request.id.clone(), serde_json::json!({ "ok": true }))
-}
-
-// ---------------------------------------------------------------------------
-// VT snapshot handler (T-058)
-// ---------------------------------------------------------------------------
-
-fn handle_preseed_snapshot(request: &Request, sm: &SessionManager) -> Response {
-    // params: { "pane_id": "<new live pane>", "snapshot_id": "<old saved pane>" }
-    let new_pane_id = match require_pane_id(request, sm) {
-        Ok(id) => id,
-        Err(e) => return e,
-    };
-
-    let snapshot_uuid = match request
-        .params
-        .get("snapshot_id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "missing param: snapshot_id".to_string())
-        .and_then(|s| Uuid::parse_str(s).map_err(|e| format!("invalid snapshot_id UUID: {e}")))
-    {
-        Ok(u) => u,
-        Err(msg) => {
-            return Response::error(request.id.clone(), protocol::INVALID_PARAMS, msg);
-        }
-    };
-
-    let Some((lines, cur_row, cur_col)) = forgetty_workspace::load_vt_snapshot(snapshot_uuid)
-    else {
-        return Response::success(
-            request.id.clone(),
-            serde_json::json!({ "ok": true, "seeded": false }),
-        );
-    };
-
-    let mut payload: Vec<u8> = Vec::new();
-    payload.extend_from_slice(b"\x1b[2J\x1b[H"); // clear + home
-    for (i, line) in lines.iter().enumerate() {
-        payload.extend_from_slice(format!("\x1b[{};1H{}", i + 1, line).as_bytes());
-    }
-    payload.extend_from_slice(format!("\x1b[{};{}H", cur_row + 1, cur_col + 1).as_bytes());
-
-    match sm.with_vt_mut(new_pane_id, |t| t.feed(&payload)) {
-        Ok(()) => {
-            forgetty_workspace::delete_vt_snapshot(snapshot_uuid);
-            Response::success(request.id.clone(), serde_json::json!({ "ok": true, "seeded": true }))
-        }
-        Err(e) => Response::error(request.id.clone(), protocol::INTERNAL_ERROR, e.to_string()),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1360,20 +1102,6 @@ mod tests {
         assert_eq!(resp.error.as_ref().unwrap().code, protocol::INVALID_PARAMS);
 
         sm.close_pane(id).ok();
-    }
-
-    #[test]
-    fn get_screen_nonexistent_pane_returns_invalid_params() {
-        let sm = make_sm();
-        let req = Request {
-            jsonrpc: "2.0".to_string(),
-            method: "get_screen".to_string(),
-            params: serde_json::json!({ "pane_id": "00000000-0000-0000-0000-000000000000" }),
-            id: Some(serde_json::json!(1)),
-        };
-        let resp = dispatch(&req, sm, None);
-        assert!(resp.error.is_some());
-        assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
     }
 
     #[test]

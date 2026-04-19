@@ -2692,9 +2692,7 @@ fn build_widget_from_pane_tree(
             };
 
             // V2-007: byte-log replay in subscribe_output populates the VT.
-            // No snapshot preseed needed — the daemon's `get_screen` RPC is
-            // retired (handler body preserved until V2-008 deletes it).
-            let snapshot: Option<crate::daemon_client::ScreenSnapshot> = None;
+            // The daemon's `get_screen` RPC was retired in V2-008.
             let on_exit = make_on_exit_callback(tab_view, tab_states, window, Some(Arc::clone(dc)));
             let on_notify = make_on_notify_callback(tab_view, tab_states, window);
 
@@ -2703,7 +2701,6 @@ fn build_widget_from_pane_tree(
                 *pane_id,
                 Arc::clone(dc),
                 channel,
-                snapshot.as_ref(),
                 None, // CWD not needed — daemon pane's PTY is already running
                 Some(on_exit),
                 Some(on_notify),
@@ -3259,13 +3256,11 @@ fn add_new_tab(
                 }
             };
             // V2-007: byte-log replay populates the VT via subscribe_output.
-            let snapshot: Option<crate::daemon_client::ScreenSnapshot> = None;
             match terminal::create_terminal(
                 config,
                 pane_id,
                 Arc::clone(dc),
                 channel,
-                snapshot.as_ref(),
                 None,
                 Some(on_exit),
                 Some(on_notify),
@@ -3473,13 +3468,11 @@ fn split_pane(
         }
     };
     // V2-007: byte-log replay populates the VT via subscribe_output.
-    let snapshot: Option<crate::daemon_client::ScreenSnapshot> = None;
     let new_pane_result = terminal::create_terminal(
         config,
         daemon_new_pane_id,
         Arc::clone(dc),
         channel,
-        snapshot.as_ref(),
         None,
         Some(on_exit),
         Some(on_notify),
@@ -7367,7 +7360,6 @@ fn create_and_switch_to_new_workspace(
                     }
                 };
                 // V2-007: byte-log replay populates the VT via subscribe_output.
-                let snapshot: Option<crate::daemon_client::ScreenSnapshot> = None;
                 let on_exit =
                     make_on_exit_callback(&new_tv, &new_tab_states, window, Some(Arc::clone(dc)));
                 let on_notify = make_on_notify_callback(&new_tv, &new_tab_states, window);
@@ -7376,7 +7368,6 @@ fn create_and_switch_to_new_workspace(
                     pane_id,
                     Arc::clone(dc),
                     channel,
-                    snapshot.as_ref(),
                     None,
                     Some(on_exit),
                     Some(on_notify),
