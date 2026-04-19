@@ -186,7 +186,7 @@ Idle CPU target: ~0% (no timers firing when nothing is happening).
 - **Pairing:** out-of-band QR scan. Daemon opens a 60-second pairing window on demand; during that window it accepts one inbound pair handshake. Outside that window, connections from unknown devices get `not_authorized` and are dropped.
 - **Authorization:** per-connection lookup against `authorized_devices.json`. Revoking a device cuts all its live streams immediately.
 - **Transport encryption:** iroh QUIC (TLS 1.3 under the hood). End-to-end between paired devices, no relay servers can decrypt traffic.
-- **Local socket:** Unix socket in `$XDG_RUNTIME_DIR` (user-only directory). Mode 0600. Any local process running as the user can connect — this is intentional (socat, scripts, agents).
+- **Local socket:** Unix socket in `$XDG_RUNTIME_DIR`. Access control comes from the directory (`$XDG_RUNTIME_DIR` is mode `0700` — user-only traversal), not from the socket file's own mode, which is umask-dependent (the daemon does not `chmod` it). Any local process running as the user can connect — intentional (socat, scripts, agents). Fallback path `/tmp/forgetty-*.sock` (used only when `$XDG_RUNTIME_DIR` is unset) is weaker: `/tmp` is `1777`, so other local users could connect.
 - **Byte log on disk:** mode 0600. Contains raw PTY output, which may include secrets (passwords, tokens). Respect the same rotation/retention policy as shell history.
 - **Input size limits:** every frame has a 4 MiB cap. Line-mode RPCs have a line-length cap. Malformed frames close the connection.
 
