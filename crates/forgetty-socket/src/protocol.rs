@@ -126,6 +126,14 @@ pub mod methods {
     pub const SHUTDOWN_CLEAN: &str = "shutdown_clean"; // browser close: save → trash → exit
     pub const DISCONNECT: &str = "disconnect"; // V2-005 / AD-012: daemon survives window close
 
+    // V2-007 fix cycle 2: "is a GUI attached to this daemon?" probe used by
+    // restore logic in the launcher to distinguish "daemon running but
+    // orphaned (AD-012)" from "daemon running AND a window is currently
+    // displaying it". Takes no params; returns `{"attached": bool}`. The
+    // handler excludes the caller's own connection from the count, so a
+    // lone probe sees `attached: false`.
+    pub const IS_ATTACHED: &str = "is_attached";
+
     // V2-006 (AD-007/AD-008): client → daemon OSC notification log.
     pub const NOTIFY: &str = "notify";
 }

@@ -5,9 +5,10 @@
 //! handled in its own task, reading line-delimited JSON requests.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tracing::{debug, error, info, warn};
 
@@ -18,6 +19,36 @@ use forgetty_workspace;
 use crate::framing::write_frame;
 use crate::handlers;
 use crate::protocol::{methods, Request, Response};
+
+/// RAII guard that increments a connection counter on construction and
+/// decrements it on drop. Used by `run_with_streaming` so the `is_attached`
+/// RPC can report whether any *other* client is currently holding a socket.
+///
+/// Correctness (V2-007 fix cycle 2): the counter is an `Arc<AtomicUsize>`
+/// shared between the server accept loop and every spawned connection task.
+/// `Relaxed` ordering is sufficient — reads of the counter inside
+/// `is_attached` are a best-effort snapshot; they do not synchronise with
+/// any other memory. Each `ConnGuard` bumps the counter on `new` and
+/// decrements it in `Drop`, even if the task panics (so orphaned entries
+/// cannot accumulate).
+struct ConnGuard {
+    counter: Arc<AtomicUsize>,
+}
+
+impl ConnGuard {
+    fn new(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self { counter }
+    }
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        // `fetch_sub` with Relaxed: ordering is not required because the
+        // counter is only ever read for a best-effort snapshot.
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 /// The Forgetty JSON-RPC socket server.
 pub struct SocketServer {
@@ -128,15 +159,22 @@ impl SocketServer {
         info!("Socket server listening on {:?}", self.socket_path);
 
         let session_id = self.session_id;
+        // Shared live-connection counter, used by `is_attached` to tell
+        // "daemon orphaned after V2-005 disconnect" from "daemon actively
+        // serving a GUI". One counter per server; incremented per spawned
+        // connection task via ConnGuard.
+        let conn_counter: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
         loop {
             match listener.accept().await {
                 Ok((stream, _addr)) => {
                     debug!("Accepted socket connection");
                     let sm = Arc::clone(&sm);
                     let se = sync_endpoint.as_ref().map(Arc::clone);
+                    let counter = Arc::clone(&conn_counter);
                     tokio::spawn(async move {
+                        let _guard = ConnGuard::new(Arc::clone(&counter));
                         if let Err(e) =
-                            handle_streaming_connection(stream, sm, se, session_id).await
+                            handle_streaming_connection(stream, sm, se, session_id, counter).await
                         {
                             warn!("Connection error: {e}");
                         }
@@ -220,12 +258,28 @@ async fn handle_streaming_connection(
     sm: Arc<SessionManager>,
     sync_endpoint: Option<Arc<SyncEndpoint>>,
     session_id: Option<uuid::Uuid>,
+    conn_counter: Arc<AtomicUsize>,
 ) -> std::io::Result<()> {
     let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
+    // V2-007 fix cycle 3: hold `BufReader<OwnedReadHalf>` as a reusable
+    // binding rather than collapsing it to a `Lines` adapter. This lets us
+    // switch from line-mode `read_line` (control RPCs) to raw `read()` for
+    // EOF detection once we enter a streaming arm (subscribe_output /
+    // subscribe_layout). Before the fix, `Lines` consumed the reader and
+    // the streaming loop awaited only the broadcast receiver — so an idle
+    // pane whose GUI closed left the handler blocked forever, leaking the
+    // ConnGuard counter and breaking V2-007 AC-18 under AD-012.
+    let mut reader = BufReader::new(reader);
+    let mut line_buf = String::new();
 
-    while let Some(line) = lines.next_line().await? {
-        let line = line.trim().to_string();
+    loop {
+        line_buf.clear();
+        let n = reader.read_line(&mut line_buf).await?;
+        if n == 0 {
+            // Orderly EOF on the client read half.
+            break;
+        }
+        let line = line_buf.trim().to_string();
         if line.is_empty() {
             continue;
         }
@@ -281,10 +335,32 @@ async fn handle_streaming_connection(
                 return Ok(());
             }
 
-            // Subscribe to the broadcast channel before sending the initial
-            // response so we don't miss any events that arrive during the
-            // round-trip.
-            let mut rx = sm.subscribe_output();
+            // ---------------------------------------------------------------
+            // V2-007 AC-13 + fix cycle 6: zero-gap, zero-overlap replay handover.
+            //
+            // 1. Atomically subscribe AND snapshot under a single lock. The
+            //    `SessionManager::subscribe_with_snapshot` contract guarantees
+            //    the new receiver will not deliver any event whose bytes are
+            //    already in `replay_bytes` — the overlap between replay and
+            //    the live broadcast stream is provably zero bytes. See the
+            //    doc comment on `subscribe_with_snapshot` and V2-007
+            //    BUILDER_NOTES §"Fix cycle 6" for the proof.
+            // 2. Send ack.
+            // 3. Emit replay as a single binary frame (ring ≤ 1 MiB, well
+            //    under V2-003's 4 MiB frame cap).
+            // 4. Live loop — every `PtyOutput` for this pane is forwarded
+            //    verbatim. No cursor, no skip arithmetic.
+            //
+            // Cycle-1 history: the original code used separate
+            // `subscribe_output()` + `get_ring_snapshot()` calls with a
+            // byte-counting cursor that compared against `replay_len`. That
+            // logic was wrong in the idle-pane reattach case: the actual
+            // overlap can be less than `replay_len`, so the cursor silently
+            // skipped live output until it "caught up." The fix is to
+            // eliminate the overlap at its source, which makes the cursor
+            // unnecessary. See V2-007 BUILDER_NOTES §"Fix cycle 6".
+            // ---------------------------------------------------------------
+            let (mut rx, replay_bytes, _replay_hwm) = sm.subscribe_with_snapshot(pane_id);
 
             // Send the initial acknowledgment (last line-mode JSON response
             // on this connection).
@@ -292,45 +368,87 @@ async fn handle_streaming_connection(
             write_response(&mut writer, &ack).await?;
 
             // The server is now in binary output mode for this connection.
-            // Drop the line reader — after the ack, the client half is not
-            // read again (V2-003 SPEC §4.3 / §4.4).
-            drop(lines);
+            // We keep `reader` alive — V2-003 SPEC §4.4 says the client does
+            // not send further data on this connection, but we still need to
+            // notice if the client closes the socket (V2-007 fix cycle 3 /
+            // AD-012). Without EOF detection, an idle-pane subscribe_output
+            // loop would block forever on `rx.recv()` after the GUI closes,
+            // leaking the ConnGuard counter and breaking `is_attached`.
 
-            // Stream `[u32 BE length][payload]` binary frames of raw PTY
-            // bytes until the pane closes, the broadcast channel closes,
-            // or the writer fails (client disconnected).
+            // Emit replay as a single frame if non-empty.
+            if !replay_bytes.is_empty() {
+                if let Err(e) = write_frame(&mut writer, &replay_bytes).await {
+                    debug!("subscribe_output: replay write_frame failed for {pane_id}: {e}");
+                    return Ok(());
+                }
+            }
+
+            // Live loop. Forward every PtyOutput for this pane verbatim —
+            // `subscribe_with_snapshot` guarantees zero overlap with the
+            // already-emitted replay frame.
+            //
+            // V2-007 fix cycle 3: `tokio::select!` between the broadcast
+            // receiver and a raw read on the client half. Both arms are
+            // cancel-safe:
+            //   - `broadcast::Receiver::recv` is cancel-safe (tokio docs).
+            //   - `AsyncRead::read` into a stack buffer is cancel-safe.
+            // AD-009 preserved: no timer, no polling — both arms are
+            // event-driven awaits. AD-012 preserved: the daemon still
+            // outlives the GUI; we just detect the client's socket close
+            // and release the ConnGuard promptly.
+            let mut eof_buf = [0u8; 1];
             loop {
-                match rx.recv().await {
-                    Ok(SessionEvent::PtyOutput { pane_id: evt_id, data }) => {
-                        if evt_id != pane_id {
-                            continue;
-                        }
-                        if data.is_empty() {
-                            // Avoid sending zero-length frames (SPEC §4.2).
-                            continue;
-                        }
-                        if let Err(e) = write_frame(&mut writer, &data).await {
-                            debug!("subscribe_output: write_frame failed for {pane_id}: {e}");
-                            break;
+                tokio::select! {
+                    recv_result = rx.recv() => {
+                        match recv_result {
+                            Ok(SessionEvent::PtyOutput { pane_id: evt_id, data }) => {
+                                if evt_id != pane_id {
+                                    continue;
+                                }
+                                if data.is_empty() {
+                                    // Avoid sending zero-length frames (SPEC §4.2).
+                                    continue;
+                                }
+                                if let Err(e) = write_frame(&mut writer, &data).await {
+                                    debug!(
+                                        "subscribe_output: write_frame failed for {pane_id}: {e}"
+                                    );
+                                    break;
+                                }
+                            }
+                            Ok(SessionEvent::PaneClosed { pane_id: closed_id }) => {
+                                if closed_id == pane_id {
+                                    // Pane exited — end the stream. Dropping
+                                    // `writer` at function exit closes the
+                                    // write half, signaling EOF to the client.
+                                    break;
+                                }
+                            }
+                            Ok(_) => {
+                                // Other events (PaneCreated, Notification) are not
+                                // forwarded to subscribe_output clients.
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                // Consumer fell behind; continue from here.
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                // Channel shut down (daemon exiting).
+                                break;
+                            }
                         }
                     }
-                    Ok(SessionEvent::PaneClosed { pane_id: closed_id }) => {
-                        if closed_id == pane_id {
-                            // Pane exited — end the stream. Dropping
-                            // `writer` at function exit closes the
-                            // write half, signaling EOF to the client.
-                            break;
-                        }
-                    }
-                    Ok(_) => {
-                        // Other events (PaneCreated, Notification) are not
-                        // forwarded to subscribe_output clients.
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        // Consumer fell behind; continue from here.
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        // Channel shut down (daemon exiting).
+                    read_result = reader.read(&mut eof_buf) => {
+                        // V2-003 §4.4: the client does not send on this
+                        // connection after the ack. Any outcome here means
+                        // the connection is done:
+                        //   - Ok(0)  → orderly EOF (peer closed).
+                        //   - Ok(n)  → unexpected bytes — protocol violation;
+                        //              we drop them and close.
+                        //   - Err(_) → I/O error — treat as close.
+                        debug!(
+                            "subscribe_output: client read half closed for {pane_id} (res={:?})",
+                            read_result
+                        );
                         break;
                     }
                 }
@@ -352,121 +470,142 @@ async fn handle_streaming_connection(
 
             // Stream layout notifications until the daemon shuts down or the
             // client disconnects.
+            //
+            // V2-007 fix cycle 3: same shape as subscribe_output — `tokio::select!`
+            // between the broadcast receiver and a raw read on the client half,
+            // so idle layout subscribers don't leak the ConnGuard counter when
+            // their GUI closes. Both arms cancel-safe; AD-009 (no polling) and
+            // AD-012 (daemon survives window close) preserved.
+            let mut eof_buf = [0u8; 1];
             loop {
-                match rx.recv().await {
-                    Ok(SessionEvent::TabCreated { workspace_idx, tab_id, pane_id }) => {
-                        let notification = serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "method": "tab_created",
-                            "params": {
-                                "workspace_idx": workspace_idx,
-                                "tab_id": tab_id.to_string(),
-                                "pane_id": pane_id.to_string(),
+                tokio::select! {
+                    recv_result = rx.recv() => {
+                        match recv_result {
+                            Ok(SessionEvent::TabCreated { workspace_idx, tab_id, pane_id }) => {
+                                let notification = serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "tab_created",
+                                    "params": {
+                                        "workspace_idx": workspace_idx,
+                                        "tab_id": tab_id.to_string(),
+                                        "pane_id": pane_id.to_string(),
+                                    }
+                                });
+                                let mut out = serde_json::to_string(&notification)
+                                    .unwrap_or_else(|_| "{}".to_string());
+                                out.push('\n');
+                                if writer.write_all(out.as_bytes()).await.is_err() {
+                                    break;
+                                }
+                                if writer.flush().await.is_err() {
+                                    break;
+                                }
                             }
-                        });
-                        let mut out = serde_json::to_string(&notification)
-                            .unwrap_or_else(|_| "{}".to_string());
-                        out.push('\n');
-                        if writer.write_all(out.as_bytes()).await.is_err() {
-                            break;
-                        }
-                        if writer.flush().await.is_err() {
-                            break;
-                        }
-                    }
-                    Ok(SessionEvent::TabClosed { workspace_idx, tab_id }) => {
-                        let notification = serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "method": "tab_closed",
-                            "params": {
-                                "workspace_idx": workspace_idx,
-                                "tab_id": tab_id.to_string(),
+                            Ok(SessionEvent::TabClosed { workspace_idx, tab_id }) => {
+                                let notification = serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "tab_closed",
+                                    "params": {
+                                        "workspace_idx": workspace_idx,
+                                        "tab_id": tab_id.to_string(),
+                                    }
+                                });
+                                let mut out = serde_json::to_string(&notification)
+                                    .unwrap_or_else(|_| "{}".to_string());
+                                out.push('\n');
+                                if writer.write_all(out.as_bytes()).await.is_err() {
+                                    break;
+                                }
+                                if writer.flush().await.is_err() {
+                                    break;
+                                }
                             }
-                        });
-                        let mut out = serde_json::to_string(&notification)
-                            .unwrap_or_else(|_| "{}".to_string());
-                        out.push('\n');
-                        if writer.write_all(out.as_bytes()).await.is_err() {
-                            break;
-                        }
-                        if writer.flush().await.is_err() {
-                            break;
-                        }
-                    }
-                    Ok(SessionEvent::PaneSplit {
-                        tab_id,
-                        parent_pane_id,
-                        new_pane_id,
-                        direction,
-                    }) => {
-                        let notification = serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "method": "pane_split",
-                            "params": {
-                                "tab_id": tab_id.to_string(),
-                                "parent_pane_id": parent_pane_id.to_string(),
-                                "new_pane_id": new_pane_id.to_string(),
-                                "direction": direction,
+                            Ok(SessionEvent::PaneSplit {
+                                tab_id,
+                                parent_pane_id,
+                                new_pane_id,
+                                direction,
+                            }) => {
+                                let notification = serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "pane_split",
+                                    "params": {
+                                        "tab_id": tab_id.to_string(),
+                                        "parent_pane_id": parent_pane_id.to_string(),
+                                        "new_pane_id": new_pane_id.to_string(),
+                                        "direction": direction,
+                                    }
+                                });
+                                let mut out = serde_json::to_string(&notification)
+                                    .unwrap_or_else(|_| "{}".to_string());
+                                out.push('\n');
+                                if writer.write_all(out.as_bytes()).await.is_err() {
+                                    break;
+                                }
+                                if writer.flush().await.is_err() {
+                                    break;
+                                }
                             }
-                        });
-                        let mut out = serde_json::to_string(&notification)
-                            .unwrap_or_else(|_| "{}".to_string());
-                        out.push('\n');
-                        if writer.write_all(out.as_bytes()).await.is_err() {
-                            break;
-                        }
-                        if writer.flush().await.is_err() {
-                            break;
-                        }
-                    }
-                    Ok(SessionEvent::TabMoved { workspace_idx, tab_id, new_index }) => {
-                        let notification = serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "method": "tab_moved",
-                            "params": {
-                                "workspace_idx": workspace_idx,
-                                "tab_id": tab_id.to_string(),
-                                "new_index": new_index,
+                            Ok(SessionEvent::TabMoved { workspace_idx, tab_id, new_index }) => {
+                                let notification = serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "tab_moved",
+                                    "params": {
+                                        "workspace_idx": workspace_idx,
+                                        "tab_id": tab_id.to_string(),
+                                        "new_index": new_index,
+                                    }
+                                });
+                                let mut out = serde_json::to_string(&notification)
+                                    .unwrap_or_else(|_| "{}".to_string());
+                                out.push('\n');
+                                if writer.write_all(out.as_bytes()).await.is_err() {
+                                    break;
+                                }
+                                if writer.flush().await.is_err() {
+                                    break;
+                                }
                             }
-                        });
-                        let mut out = serde_json::to_string(&notification)
-                            .unwrap_or_else(|_| "{}".to_string());
-                        out.push('\n');
-                        if writer.write_all(out.as_bytes()).await.is_err() {
-                            break;
-                        }
-                        if writer.flush().await.is_err() {
-                            break;
-                        }
-                    }
-                    Ok(SessionEvent::ActiveTabChanged { workspace_idx, tab_idx }) => {
-                        let notification = serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "method": "active_tab_changed",
-                            "params": {
-                                "workspace_idx": workspace_idx,
-                                "tab_idx": tab_idx,
+                            Ok(SessionEvent::ActiveTabChanged { workspace_idx, tab_idx }) => {
+                                let notification = serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "active_tab_changed",
+                                    "params": {
+                                        "workspace_idx": workspace_idx,
+                                        "tab_idx": tab_idx,
+                                    }
+                                });
+                                let mut out = serde_json::to_string(&notification)
+                                    .unwrap_or_else(|_| "{}".to_string());
+                                out.push('\n');
+                                if writer.write_all(out.as_bytes()).await.is_err() {
+                                    break;
+                                }
+                                if writer.flush().await.is_err() {
+                                    break;
+                                }
                             }
-                        });
-                        let mut out = serde_json::to_string(&notification)
-                            .unwrap_or_else(|_| "{}".to_string());
-                        out.push('\n');
-                        if writer.write_all(out.as_bytes()).await.is_err() {
-                            break;
+                            Ok(_) => {
+                                // Output events (PtyOutput, PaneCreated, PaneClosed,
+                                // Notification) are not forwarded to subscribe_layout clients.
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                // Consumer fell behind; continue from here.
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                // Channel shut down (daemon exiting).
+                                break;
+                            }
                         }
-                        if writer.flush().await.is_err() {
-                            break;
-                        }
                     }
-                    Ok(_) => {
-                        // Output events (PtyOutput, PaneCreated, PaneClosed,
-                        // Notification) are not forwarded to subscribe_layout clients.
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        // Consumer fell behind; continue from here.
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        // Channel shut down (daemon exiting).
+                    read_result = reader.read(&mut eof_buf) => {
+                        // The layout stream is server-to-client only. Any
+                        // read activity here — EOF, unexpected bytes, or
+                        // error — signals the connection is done.
+                        debug!(
+                            "subscribe_layout: client read half closed (res={:?})",
+                            read_result
+                        );
                         break;
                     }
                 }
@@ -482,9 +621,9 @@ async fn handle_streaming_connection(
             let resp = Response::success(request.id, serde_json::json!({ "ok": true }));
             write_response(&mut writer, &resp).await?;
             info!("Received shutdown_save RPC — saving session and exiting");
-            // Save VT snapshots for all live panes (used by cold-start preseed).
-            let saved = crate::handlers::save_all_snapshots(&sm);
-            info!("shutdown_save: saved {saved} VT snapshot(s)");
+            // Flush byte-log ring to disk (V2-007 / AD-013).
+            sm.flush_all_byte_logs().await;
+            info!("shutdown_save: byte logs flushed");
             // Save the session layout so restore-by-default can bring it back.
             if let Some(sid) = session_id {
                 let state = sm.snapshot_to_workspace_state();
@@ -501,8 +640,9 @@ async fn handle_streaming_connection(
             let resp = Response::success(request.id, serde_json::json!({ "ok": true }));
             write_response(&mut writer, &resp).await?;
             info!("Received shutdown_clean RPC — saving, trashing, and exiting");
-            let saved = crate::handlers::save_all_snapshots(&sm);
-            info!("shutdown_clean: saved {saved} VT snapshot(s)");
+            // Flush byte-log ring to disk (V2-007 / AD-013).
+            sm.flush_all_byte_logs().await;
+            info!("shutdown_clean: byte logs flushed");
             if let Some(sid) = session_id {
                 // Check if pinned — pinned sessions do NOT get trashed.
                 let is_pinned = sm.is_pinned();
@@ -538,9 +678,9 @@ async fn handle_streaming_connection(
             let resp = Response::success(request.id, serde_json::json!({ "ok": true }));
             write_response(&mut writer, &resp).await?;
             info!("Received disconnect RPC — saving session, daemon continues running");
-            // Flush v0.1 VT snapshots (replaced by V2-007 byte logs later).
-            let saved = crate::handlers::save_all_snapshots(&sm);
-            info!("disconnect: saved {saved} VT snapshot(s)");
+            // Flush byte-log ring to disk (V2-007 / AD-013).
+            sm.flush_all_byte_logs().await;
+            info!("disconnect: byte logs flushed");
             // Flush the session layout so reconnecting GTK clients can restore state.
             if let Some(sid) = session_id {
                 let state = sm.snapshot_to_workspace_state();
@@ -561,6 +701,28 @@ async fn handle_streaming_connection(
             write_response(&mut writer, &resp).await?;
             info!("Received shutdown RPC — exiting daemon");
             std::process::exit(0);
+        }
+
+        if request.method == methods::IS_ATTACHED {
+            // V2-007 fix cycle 2: answer "is any OTHER local client attached?"
+            //
+            // `conn_counter` is incremented by the accept loop's ConnGuard
+            // before this task runs, so it includes the caller's own
+            // connection. A count > 1 therefore means at least one other
+            // connection is live. A lone probe sees count == 1 and reports
+            // `attached: false`; a GUI-held session sees count > 1 and
+            // reports `attached: true`.
+            //
+            // iroh peer connections are NOT counted — they don't go through
+            // this Unix-socket accept loop. Android/QUIC clients are a
+            // different seat (AD-004/AD-005) and do not block local-GUI
+            // reattach.
+            let total = conn_counter.load(Ordering::Relaxed);
+            let attached = total > 1;
+            let resp =
+                Response::success(request.id.clone(), serde_json::json!({ "attached": attached }));
+            write_response(&mut writer, &resp).await?;
+            continue;
         }
 
         let response =

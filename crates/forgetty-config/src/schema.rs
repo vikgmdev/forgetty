@@ -155,6 +155,16 @@ pub struct Config {
     /// Number of days to keep trashed sessions before auto-purge.
     /// `0` disables purging (trash kept forever). Default: `7`.
     pub session_trash_days: u32,
+
+    /// Per-pane in-memory byte-log ring buffer size, in KiB.
+    /// Used for replay on `subscribe_output` (V2-007 / AD-013).
+    /// Default: `1024` (1 MiB). `0` disables ring buffering (no replay).
+    pub byte_log_ring_kb: u32,
+
+    /// Per-pane on-disk byte-log cap, in MiB. The appender keeps newest
+    /// `byte_log_max_mb / 2` on rotation (V2-007 / AD-013). Default: `10`.
+    /// `0` disables disk appending (warm-restart replay only covers the ring).
+    pub byte_log_max_mb: u32,
 }
 
 impl Default for Config {
@@ -235,6 +245,15 @@ impl Serialize for Config {
             map.serialize_entry("session_trash_days", &self.session_trash_days)?;
         }
 
+        // Byte-log tuning (V2-007). Only write when non-default to keep
+        // config.toml clean for the common case.
+        if self.byte_log_ring_kb != 1024 {
+            map.serialize_entry("byte_log_ring_kb", &self.byte_log_ring_kb)?;
+        }
+        if self.byte_log_max_mb != 10 {
+            map.serialize_entry("byte_log_max_mb", &self.byte_log_max_mb)?;
+        }
+
         map.end()
     }
 }
@@ -300,6 +319,12 @@ impl<'de> Deserialize<'de> for Config {
 
             #[serde(default = "default_session_trash_days")]
             session_trash_days: u32,
+
+            #[serde(default = "default_byte_log_ring_kb")]
+            byte_log_ring_kb: u32,
+
+            #[serde(default = "default_byte_log_max_mb")]
+            byte_log_max_mb: u32,
         }
 
         let raw = RawConfig::deserialize(deserializer)?;
@@ -373,6 +398,8 @@ impl<'de> Deserialize<'de> for Config {
             paste_warn_size: raw.paste_warn_size,
             paste_warn_newline: raw.paste_warn_newline,
             session_trash_days: raw.session_trash_days,
+            byte_log_ring_kb: raw.byte_log_ring_kb,
+            byte_log_max_mb: raw.byte_log_max_mb,
         })
     }
 }
@@ -399,4 +426,12 @@ fn default_paste_warn_newline() -> bool {
 
 fn default_session_trash_days() -> u32 {
     7
+}
+
+fn default_byte_log_ring_kb() -> u32 {
+    1024
+}
+
+fn default_byte_log_max_mb() -> u32 {
+    10
 }

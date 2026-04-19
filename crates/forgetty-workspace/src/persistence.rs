@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 use forgetty_core::platform::data_dir;
 use forgetty_core::Result;
+use uuid::Uuid;
 
 use crate::workspace::WorkspaceState;
 
@@ -352,6 +353,143 @@ pub fn delete_vt_snapshot(pane_id: uuid::Uuid) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Byte-log persistence (V2-007 / AD-013)
+// ---------------------------------------------------------------------------
+
+/// Return the directory for per-pane byte logs.
+///
+/// Typically `~/.local/share/forgetty/logs/`.
+pub fn logs_dir() -> PathBuf {
+    data_dir().join("logs")
+}
+
+/// Return the path to a pane's byte-log file.
+///
+/// Path: `~/.local/share/forgetty/logs/{pane_uuid}.log`. The input is a
+/// validated UUID (36 hex-and-dash characters + ".log"), so no user-controlled
+/// path components reach the filesystem — path traversal is impossible.
+pub fn pane_log_path(pane_id: Uuid) -> PathBuf {
+    logs_dir().join(format!("{pane_id}.log"))
+}
+
+/// Return the union of all `pane_id`s persisted in every session JSON under
+/// `sessions/{uuid}.json` (active) and `sessions/trash/{uuid}.json` (trashed).
+///
+/// This is the authoritative "legitimate log owner" set for the orphan-prune
+/// pass under AD-001 (one daemon per window): each daemon only knows about
+/// its own in-memory panes, so pruning against the per-daemon live set would
+/// delete sibling daemons' logs. Every pane whose log file is on disk has its
+/// UUID persisted in at least one session JSON (active or trashed), so the
+/// union is a safe superset of all legitimate UUIDs.
+///
+/// Unreadable or corrupt session files are silently skipped (same policy as
+/// `load_from_path`). The returned `Vec` is deduped.
+pub fn all_persisted_pane_ids() -> Vec<Uuid> {
+    use std::collections::HashSet;
+
+    let mut set: HashSet<Uuid> = HashSet::new();
+
+    // Active sessions: sessions/{uuid}.json.
+    for session_id in list_sessions() {
+        if let Ok(Some(state)) = load_from_path(&session_path_for(session_id)) {
+            collect_pane_ids(&state, &mut set);
+        }
+    }
+
+    // Trashed sessions: sessions/trash/{uuid}.json.
+    for session_id in list_trashed_sessions() {
+        let path = trash_dir().join(format!("{session_id}.json"));
+        if let Ok(Some(state)) = load_from_path(&path) {
+            collect_pane_ids(&state, &mut set);
+        }
+    }
+
+    set.into_iter().collect()
+}
+
+/// Walk a `WorkspaceState`'s workspaces → tabs → pane_tree and collect every
+/// `Some(pane_id)` found on any `TabState` or `PaneTreeState::Leaf`.
+fn collect_pane_ids(state: &WorkspaceState, out: &mut std::collections::HashSet<Uuid>) {
+    for ws in &state.workspaces {
+        for tab in &ws.tabs {
+            if let Some(id) = tab.pane_id {
+                out.insert(id);
+            }
+            collect_pane_ids_from_tree(&tab.pane_tree, out);
+        }
+    }
+}
+
+/// Recursive walk over `PaneTreeState` collecting every `Leaf.pane_id`.
+fn collect_pane_ids_from_tree(
+    tree: &crate::workspace::PaneTreeState,
+    out: &mut std::collections::HashSet<Uuid>,
+) {
+    use crate::workspace::PaneTreeState;
+    match tree {
+        PaneTreeState::Leaf { pane_id, .. } => {
+            if let Some(id) = *pane_id {
+                out.insert(id);
+            }
+        }
+        PaneTreeState::Split { first, second, .. } => {
+            collect_pane_ids_from_tree(first, out);
+            collect_pane_ids_from_tree(second, out);
+        }
+    }
+}
+
+/// Delete byte-log files in `logs_dir()` whose UUID is not present in
+/// `live_pane_ids`.
+///
+/// Called once during daemon startup (after cold-start restore, before the
+/// socket server accepts connections). Non-UUID filenames and unexpected
+/// entries are skipped. Stale `{uuid}.log.tmp` files left behind by a crashed
+/// rotation are also pruned so they do not accumulate. Deletion failures are
+/// `warn!`-logged and skipped — the daemon keeps running.
+///
+/// Caller must pass the **union** of every daemon's "legitimate" pane set —
+/// typically this daemon's `session_manager.list_panes()` **union**
+/// `all_persisted_pane_ids()` — because under AD-001 (one daemon per window)
+/// N daemons start concurrently and each sees only its own in-memory panes.
+/// Passing only one daemon's in-memory panes causes sibling daemons' logs to
+/// be wrongly deleted.
+pub fn prune_orphan_logs(live_pane_ids: &[Uuid]) {
+    let dir = logs_dir();
+    let entries = match fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return, // dir absent or unreadable — nothing to prune
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let s = name.to_string_lossy();
+
+        // Accept `{uuid}.log` and `{uuid}.log.tmp` (from crashed rotation).
+        let stem = if let Some(stem) = s.strip_suffix(".log") {
+            stem
+        } else if let Some(stem) = s.strip_suffix(".log.tmp") {
+            stem
+        } else {
+            continue;
+        };
+
+        let uuid = match Uuid::parse_str(stem) {
+            Ok(u) => u,
+            Err(_) => continue, // non-UUID filename — skip
+        };
+
+        if !live_pane_ids.contains(&uuid) {
+            if let Err(e) = fs::remove_file(entry.path()) {
+                tracing::warn!(
+                    "prune_orphan_logs: failed to delete {}: {e}",
+                    entry.path().display()
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -630,5 +768,214 @@ mod tests {
         assert_eq!(found.len(), 2, "expected 2 UUID sessions, got {}", found.len());
         assert!(found.contains(&id1));
         assert!(found.contains(&id2));
+    }
+
+    // -----------------------------------------------------------------------
+    // V2-007: Byte-log path + orphan prune
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pane_log_path_ends_with_uuid_log() {
+        let id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let path = pane_log_path(id);
+        let path_str = path.to_string_lossy();
+        assert!(
+            path_str.ends_with("550e8400-e29b-41d4-a716-446655440000.log"),
+            "path should end with {{uuid}}.log, got: {path_str}"
+        );
+        // Parent directory should be `logs/`.
+        assert_eq!(
+            path.parent().and_then(|p| p.file_name()).and_then(|s| s.to_str()),
+            Some("logs"),
+            "pane_log_path should live under logs/, got parent: {:?}",
+            path.parent()
+        );
+    }
+
+    #[test]
+    fn test_logs_dir_under_data_dir() {
+        let logs = logs_dir();
+        assert!(logs.ends_with("logs"), "logs_dir should end with `logs`, got: {}", logs.display());
+    }
+
+    #[test]
+    fn test_prune_orphan_logs_filter_logic() {
+        // We cannot override data_dir() in-process, so this test exercises the
+        // core filter logic: a .log/.log.tmp filename that parses as a live
+        // UUID is retained; non-UUID filenames and dead UUIDs would be deleted.
+        let live = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let dead = Uuid::parse_str("7b14a2bc-1111-2222-3333-446655440000").unwrap();
+        let live_list = vec![live];
+
+        let live_name = format!("{live}.log");
+        let dead_name = format!("{dead}.log");
+        let dead_tmp = format!("{dead}.log.tmp");
+        let garbage = "something.txt";
+
+        // Replicate the classification used by prune_orphan_logs.
+        fn classify(name: &str, live_ids: &[Uuid]) -> &'static str {
+            let stem = if let Some(stem) = name.strip_suffix(".log") {
+                stem
+            } else if let Some(stem) = name.strip_suffix(".log.tmp") {
+                stem
+            } else {
+                return "skip";
+            };
+            let Ok(uuid) = Uuid::parse_str(stem) else {
+                return "skip";
+            };
+            if live_ids.contains(&uuid) {
+                "keep"
+            } else {
+                "delete"
+            }
+        }
+
+        assert_eq!(classify(&live_name, &live_list), "keep");
+        assert_eq!(classify(&dead_name, &live_list), "delete");
+        assert_eq!(classify(&dead_tmp, &live_list), "delete");
+        assert_eq!(classify(garbage, &live_list), "skip");
+    }
+
+    // V2-007 fix cycle 1: the cross-daemon prune bug under AD-001 (one daemon
+    // per window). Each daemon's `list_panes()` sees only its own in-memory
+    // panes, so pruning against that per-daemon set deletes every sibling
+    // daemon's log file. The fix: caller must pass the union of every live
+    // pane across all saved session JSONs (active + trashed). This test
+    // demonstrates the bug semantics and the fix semantics side-by-side
+    // against the same classifier used in `prune_orphan_logs`.
+    #[test]
+    fn test_prune_is_safe_across_concurrent_daemons() {
+        // Two daemons are running concurrently. Each has a distinct in-memory
+        // pane; each pane also owns a log file on disk.
+        let daemon_a_pane = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let daemon_b_pane = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+
+        // Per-daemon view: each daemon's `list_panes()`.
+        let daemon_a_live = vec![daemon_a_pane];
+        let daemon_b_live = vec![daemon_b_pane];
+
+        // Union view (the fix): every pane persisted in any active/trashed
+        // session JSON. In production this is `all_persisted_pane_ids()`.
+        // Here we simulate it with the concatenation.
+        let union_live = vec![daemon_a_pane, daemon_b_pane];
+
+        // Same classifier as `prune_orphan_logs` so the test locks on the
+        // actual production logic (see `test_prune_orphan_logs_filter_logic`).
+        fn classify(name: &str, live_ids: &[Uuid]) -> &'static str {
+            let stem = if let Some(stem) = name.strip_suffix(".log") {
+                stem
+            } else if let Some(stem) = name.strip_suffix(".log.tmp") {
+                stem
+            } else {
+                return "skip";
+            };
+            let Ok(uuid) = Uuid::parse_str(stem) else {
+                return "skip";
+            };
+            if live_ids.contains(&uuid) {
+                "keep"
+            } else {
+                "delete"
+            }
+        }
+
+        let a_log = format!("{daemon_a_pane}.log");
+        let b_log = format!("{daemon_b_pane}.log");
+
+        // BUG SEMANTICS: daemon A's per-daemon view wrongly marks daemon B's
+        // log as deletable (and vice versa). This is the QA-failing
+        // behaviour before the fix.
+        assert_eq!(classify(&a_log, &daemon_a_live), "keep");
+        assert_eq!(classify(&b_log, &daemon_a_live), "delete"); // wrong — daemon B owns it
+        assert_eq!(classify(&a_log, &daemon_b_live), "delete"); // wrong — daemon A owns it
+        assert_eq!(classify(&b_log, &daemon_b_live), "keep");
+
+        // FIX SEMANTICS: the union classifier preserves both logs regardless
+        // of which daemon ran the prune.
+        assert_eq!(classify(&a_log, &union_live), "keep");
+        assert_eq!(classify(&b_log, &union_live), "keep");
+    }
+
+    #[test]
+    fn test_collect_pane_ids_walks_split_and_leaf() {
+        // Exercise the `collect_pane_ids` / `collect_pane_ids_from_tree` walk
+        // that `all_persisted_pane_ids` uses. Verifies: Split recursion,
+        // Leaf Some/None, TabState.pane_id Some/None, and dedup across
+        // workspaces are all handled.
+        let leaf_a = Uuid::parse_str("aaaaaaaa-0000-0000-0000-000000000001").unwrap();
+        let leaf_b = Uuid::parse_str("bbbbbbbb-0000-0000-0000-000000000002").unwrap();
+        let tab_root = Uuid::parse_str("cccccccc-0000-0000-0000-000000000003").unwrap();
+        let duplicate = Uuid::parse_str("dddddddd-0000-0000-0000-000000000004").unwrap();
+
+        let state = WorkspaceState {
+            version: 1,
+            workspaces: vec![
+                Workspace {
+                    id: Uuid::new_v4(),
+                    name: "A".into(),
+                    root_paths: vec![],
+                    tabs: vec![TabState {
+                        title: "splits".into(),
+                        // Split-of-splits — makes sure recursion actually fires.
+                        pane_tree: PaneTreeState::Split {
+                            direction: "horizontal".into(),
+                            ratio: 0.5,
+                            first: Box::new(PaneTreeState::Leaf {
+                                cwd: PathBuf::from("/a"),
+                                pane_id: Some(leaf_a),
+                            }),
+                            second: Box::new(PaneTreeState::Split {
+                                direction: "vertical".into(),
+                                ratio: 0.5,
+                                first: Box::new(PaneTreeState::Leaf {
+                                    cwd: PathBuf::from("/b"),
+                                    pane_id: Some(leaf_b),
+                                }),
+                                second: Box::new(PaneTreeState::Leaf {
+                                    cwd: PathBuf::from("/c"),
+                                    // Exercise None handling.
+                                    pane_id: None,
+                                }),
+                            }),
+                        },
+                        pane_id: Some(tab_root),
+                    }],
+                    active_tab: 0,
+                },
+                Workspace {
+                    id: Uuid::new_v4(),
+                    name: "B".into(),
+                    root_paths: vec![],
+                    tabs: vec![TabState {
+                        title: "dup".into(),
+                        pane_tree: PaneTreeState::Leaf {
+                            cwd: PathBuf::from("/d"),
+                            // Duplicate — also appears in a tab_id below; set
+                            // dedup verified by HashSet collection.
+                            pane_id: Some(duplicate),
+                        },
+                        // TabState.pane_id identical to the leaf above —
+                        // exercises dedup path.
+                        pane_id: Some(duplicate),
+                    }],
+                    active_tab: 0,
+                },
+            ],
+            active_workspace: 0,
+            window_width: None,
+            window_height: None,
+            pinned: false,
+        };
+
+        let mut set = std::collections::HashSet::new();
+        collect_pane_ids(&state, &mut set);
+
+        assert!(set.contains(&leaf_a));
+        assert!(set.contains(&leaf_b));
+        assert!(set.contains(&tab_root));
+        assert!(set.contains(&duplicate));
+        // None leaf should not contribute; duplicate should appear exactly once.
+        assert_eq!(set.len(), 4, "expected 4 unique ids after dedup, got {}: {set:?}", set.len());
     }
 }

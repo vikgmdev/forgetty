@@ -2213,7 +2213,13 @@ fn build_ui(
 
     window.present();
 
-    // Grab focus on the active workspace's selected tab's first DrawingArea
+    // Grab focus on the active workspace's selected tab's first DrawingArea.
+    // Uses `focus_when_mapped` because on the session-restore path the
+    // top-level window (and therefore the DrawingArea) is not yet mapped
+    // here — `grab_focus()` on an unmapped widget silently fails. V2-007
+    // fix cycle 4 deferred via `idle_add_local_once`, but that tick can
+    // fire pre-map on restore; fix cycle 5 switches to GTK's `map` signal
+    // (see `focus_when_mapped` doc).
     {
         let Ok(mgr) = workspace_manager.try_borrow() else {
             return;
@@ -2223,7 +2229,7 @@ fn build_ui(
             let container = page.child();
             let leaves = collect_leaf_drawing_areas(&container);
             if let Some(da) = leaves.first() {
-                da.grab_focus();
+                focus_when_mapped(da);
             }
         }
     }
@@ -2685,7 +2691,10 @@ fn build_widget_from_pane_tree(
                 }
             };
 
-            let snapshot = dc.get_screen(*pane_id).ok();
+            // V2-007: byte-log replay in subscribe_output populates the VT.
+            // No snapshot preseed needed — the daemon's `get_screen` RPC is
+            // retired (handler body preserved until V2-008 deletes it).
+            let snapshot: Option<crate::daemon_client::ScreenSnapshot> = None;
             let on_exit = make_on_exit_callback(tab_view, tab_states, window, Some(Arc::clone(dc)));
             let on_notify = make_on_notify_callback(tab_view, tab_states, window);
 
@@ -2885,10 +2894,17 @@ fn build_widgets_from_layout(
             false
         } else {
             // Select the active tab and focus its first DrawingArea.
+            // `set_selected_page` runs synchronously on the already-realized
+            // TabView. The focus grab uses `focus_when_mapped` because on
+            // the restore path the newly-built DrawingArea is not yet
+            // mapped — `grab_focus()` on an unmapped widget silently fails.
+            // V2-007 fix cycle 4 deferred via `idle_add_local_once`, but
+            // that tick can fire pre-map; fix cycle 5 uses the GTK `map`
+            // signal (see `focus_when_mapped` doc).
             let active_tab_idx = active_ws_info.active_tab.min(created.len().saturating_sub(1));
             let (ref active_page, ref active_da) = created[active_tab_idx];
             tab_view_clone.set_selected_page(active_page);
-            active_da.grab_focus();
+            focus_when_mapped(active_da);
 
             // Sync workspace[0]'s id/name with the daemon's active workspace.
             if let Ok(mut mgr) = workspace_manager.try_borrow_mut() {
@@ -3242,7 +3258,8 @@ fn add_new_tab(
                     return;
                 }
             };
-            let snapshot = dc.get_screen(pane_id).ok();
+            // V2-007: byte-log replay populates the VT via subscribe_output.
+            let snapshot: Option<crate::daemon_client::ScreenSnapshot> = None;
             match terminal::create_terminal(
                 config,
                 pane_id,
@@ -3320,6 +3337,43 @@ fn set_container_content(container: &gtk4::Box, new_content: &impl IsA<gtk4::Wid
         container.remove(&child);
     }
     container.append(new_content);
+}
+
+/// Grant keyboard focus to `da` as soon as it is mapped (visible).
+///
+/// `grab_focus()` on an unmapped widget silently no-ops. Earlier fix cycles
+/// (V2-007 cycle 4) deferred the call via `glib::idle_add_local_once`, but on
+/// the session-restore path the idle tick can fire *before* the top-level
+/// window — and therefore the DrawingArea — is ever mapped, so the grab still
+/// fails silently. V2-007 fix cycle 5 switches to the GTK `map` signal, which
+/// is guaranteed to fire exactly when the widget becomes visible.
+///
+/// Behaviour:
+///
+/// - If `da` is already mapped (fresh-pane / split-pane sites, whose parent
+///   window is already on-screen), focus is granted synchronously. No signal
+///   handler is registered.
+/// - Otherwise, a one-shot `connect_map` handler is installed. When the
+///   widget's `map` signal fires, the handler grabs focus and then disconnects
+///   itself so later unmap/remap cycles do not re-steal focus.
+///
+/// Thread-safety: GTK widgets are not `Send`; this helper must be invoked
+/// from the GTK main thread and uses `Rc<RefCell<...>>` for the
+/// self-disconnect handle (safe because GTK callbacks run single-threaded).
+fn focus_when_mapped(da: &gtk4::DrawingArea) {
+    if da.is_mapped() {
+        da.grab_focus();
+        return;
+    }
+    let handler_id_cell: Rc<RefCell<Option<glib::SignalHandlerId>>> = Rc::new(RefCell::new(None));
+    let cell_for_closure = Rc::clone(&handler_id_cell);
+    let handler_id = da.connect_map(move |widget| {
+        widget.grab_focus();
+        if let Some(id) = cell_for_closure.borrow_mut().take() {
+            widget.disconnect(id);
+        }
+    });
+    *handler_id_cell.borrow_mut() = Some(handler_id);
 }
 
 // ---------------------------------------------------------------------------
@@ -3418,7 +3472,8 @@ fn split_pane(
             return;
         }
     };
-    let snapshot = dc.get_screen(daemon_new_pane_id).ok();
+    // V2-007: byte-log replay populates the VT via subscribe_output.
+    let snapshot: Option<crate::daemon_client::ScreenSnapshot> = None;
     let new_pane_result = terminal::create_terminal(
         config,
         daemon_new_pane_id,
@@ -3529,15 +3584,12 @@ fn split_pane(
     }
 
     // Give focus to the new pane.
-    // Deferred via idle_add_local_once so the widget is fully realized and
-    // mapped before grab_focus() fires — synchronous grab_focus() on an
-    // unmapped widget silently fails, leaving focus on the old pane.
-    let new_da_weak = new_da.downgrade();
-    glib::idle_add_local_once(move || {
-        if let Some(da) = new_da_weak.upgrade() {
-            da.grab_focus();
-        }
-    });
+    // `focus_when_mapped` handles the "widget may not yet be mapped" case:
+    // fresh split-pane insertion happens inside an already-mapped window,
+    // so in practice this takes the synchronous-grab branch. V2-007 fix
+    // cycle 5 unified the three deferred-focus sites (two restore-path,
+    // this one) behind the shared helper.
+    focus_when_mapped(&new_da);
 }
 
 /// Detect which slot of a parent Paned holds a child.
@@ -7314,7 +7366,8 @@ fn create_and_switch_to_new_workspace(
                         return;
                     }
                 };
-                let snapshot = dc.get_screen(pane_id).ok();
+                // V2-007: byte-log replay populates the VT via subscribe_output.
+                let snapshot: Option<crate::daemon_client::ScreenSnapshot> = None;
                 let on_exit =
                     make_on_exit_callback(&new_tv, &new_tab_states, window, Some(Arc::clone(dc)));
                 let on_notify = make_on_notify_callback(&new_tv, &new_tab_states, window);

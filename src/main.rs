@@ -19,14 +19,60 @@ fn daemon_socket_path(session_id: uuid::Uuid) -> std::path::PathBuf {
     }
 }
 
-/// Return `true` if a daemon for this session UUID is currently running and
-/// accepting connections.
+/// Return `true` if a daemon for this session is currently serving a GUI
+/// window (i.e. another `forgetty` client is already attached to it).
 ///
-/// Used by restore logic to skip sessions that are already open in another
-/// window, preventing two GTK clients from connecting to the same daemon.
-fn is_session_live(session_id: uuid::Uuid) -> bool {
+/// Used by restore logic to skip sessions that are already displayed in
+/// another window. Returns `false` if:
+///   - the daemon is not running at all (socket connect fails), OR
+///   - the daemon is running but no GUI is attached (AD-012 orphaned
+///     daemon after V2-005 `disconnect`).
+///
+/// The distinction matters because AD-012 makes daemons survive window
+/// close. Before the V2-007 fix cycle 2, this function tested only socket
+/// liveness, which silently broke the restore path after a window was
+/// closed with X: the socket was still connectable (daemon alive) but
+/// no GUI was attached, so the session was wrongly skipped and a fresh
+/// daemon was spawned — orphaning the one holding the user's state.
+///
+/// Implementation: open a probe connection, issue the `is_attached`
+/// JSON-RPC method, parse the boolean result. The daemon's handler
+/// excludes our probe connection from its count, so we correctly see
+/// `false` when we're the only client.
+fn is_session_in_use(session_id: uuid::Uuid) -> bool {
+    use std::io::{BufRead, BufReader, Write};
+    use std::time::Duration;
+
     let path = daemon_socket_path(session_id);
-    std::os::unix::net::UnixStream::connect(&path).is_ok()
+    let mut stream = match std::os::unix::net::UnixStream::connect(&path) {
+        Ok(s) => s,
+        // Daemon not running → no one to attach to, not in use.
+        Err(_) => return false,
+    };
+
+    // Short timeouts — this is a local blocking probe on the main thread
+    // before GTK starts. The daemon is either responsive within
+    // microseconds on loopback or it's wedged (treat as not-in-use and
+    // let the normal launch path decide).
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+
+    let req = br#"{"jsonrpc":"2.0","method":"is_attached","id":1}"#;
+    if stream.write_all(req).is_err() || stream.write_all(b"\n").is_err() {
+        return false;
+    }
+
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    if reader.read_line(&mut line).is_err() || line.is_empty() {
+        return false;
+    }
+
+    let parsed: serde_json::Value = match serde_json::from_str(line.trim()) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    parsed.get("result").and_then(|r| r.get("attached")).and_then(|b| b.as_bool()).unwrap_or(false)
 }
 
 fn main() {
@@ -110,12 +156,14 @@ fn main() {
                 }
             };
             for session_uuid in sessions {
-                // Skip sessions whose daemon socket is still live — that session
+                // Skip sessions that already have a GUI attached — that session
                 // is already open in another window. Spawning a second window
                 // would connect two GTK clients to the same single-tenant daemon
-                // (violates AD-001/AD-006).
-                if is_session_live(session_uuid) {
-                    tracing::info!("--restore-all: skipping {session_uuid} — session already open");
+                // (violates AD-001/AD-006). A daemon that's running but
+                // orphaned (AD-012: survived a window close) is NOT skipped —
+                // the whole point of restore is to re-attach to it.
+                if is_session_in_use(session_uuid) {
+                    tracing::info!("--restore-all: skipping {session_uuid} — GUI already attached");
                     continue;
                 }
                 match std::process::Command::new(&current_exe)
@@ -153,15 +201,16 @@ fn main() {
         forgetty_workspace::purge_old_trash(config.session_trash_days);
         let sessions = forgetty_workspace::list_sessions();
         if !sessions.is_empty() {
-            // Filter out sessions that are already open in a live window before
-            // deciding whether to restore. A session whose daemon socket is
-            // connectable is already displayed — no second window needed.
+            // Filter out sessions that already have a GUI attached before
+            // deciding whether to restore. A session whose daemon is running
+            // but has no GUI attached (AD-012: survived window close) is
+            // eligible for restore — that's the point.
             let to_restore: Vec<_> = sessions
                 .into_iter()
                 .filter(|&uuid| {
-                    if is_session_live(uuid) {
+                    if is_session_in_use(uuid) {
                         tracing::info!(
-                            "restore-by-default: skipping {uuid} — session already open"
+                            "restore-by-default: skipping {uuid} — GUI already attached"
                         );
                         false
                     } else {
@@ -198,8 +247,11 @@ fn main() {
                 }
                 return;
             }
-            // All sessions were live (already open) — fall through to a fresh window.
-            tracing::info!("restore-by-default: all sessions already open, opening fresh window");
+            // Every saved session already has a GUI attached — fall through
+            // to a fresh window rather than double-opening.
+            tracing::info!(
+                "restore-by-default: all sessions already have GUIs attached, opening fresh window"
+            );
         } else {
             // No saved sessions — fall through to open a fresh window.
             tracing::info!("restore-by-default: no saved sessions, opening fresh window");

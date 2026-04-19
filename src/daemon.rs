@@ -188,7 +188,7 @@ async fn main_async() -> anyhow::Result<()> {
         })
     });
 
-    let _config: Config = match load_config(config_path.as_deref()) {
+    let config: Config = match load_config(config_path.as_deref()) {
         Ok(c) => c,
         Err(e) => {
             warn!("Failed to load config, using defaults: {e}");
@@ -200,6 +200,9 @@ async fn main_async() -> anyhow::Result<()> {
 
     // Create the platform-agnostic session manager.
     let session_manager = Arc::new(SessionManager::new());
+
+    // V2-007: thread byte-log config values from TOML into SessionManager.
+    session_manager.set_byte_log_config(config.byte_log_ring_kb, config.byte_log_max_mb);
 
     // Cold-start restore: reload the UUID-named session file into the live SessionLayout.
     //
@@ -284,6 +287,40 @@ async fn main_async() -> anyhow::Result<()> {
         }
     }
 
+    // V2-007 AC-10: prune orphan byte-log files (UUID not matching any live pane).
+    // Runs AFTER cold-start restore so restored panes' logs are recognised as live,
+    // and BEFORE the socket server accepts connections so there is no race.
+    //
+    // V2-007 fix cycle 1: under AD-001 (one daemon per window) N daemons start
+    // concurrently and each only knows about its *own* in-memory panes. Pruning
+    // against just this daemon's `list_panes()` would delete every sibling
+    // daemon's log file. Instead we pass the **union** of (a) this daemon's
+    // freshly-restored in-memory panes (whose UUIDs may not yet be in any
+    // saved JSON if a save has not happened since restore) and (b) every
+    // pane persisted in any active-or-trashed session JSON on disk. Every
+    // legitimate log on disk is in (b) or was just created by (a); the union
+    // is therefore a safe superset of all legitimate UUIDs.
+    {
+        let in_memory: Vec<uuid::Uuid> =
+            session_manager.list_panes().into_iter().map(|id| id.0).collect();
+        let persisted: Vec<uuid::Uuid> = forgetty_workspace::all_persisted_pane_ids();
+
+        let mut live_ids: Vec<uuid::Uuid> =
+            Vec::with_capacity(in_memory.len().saturating_add(persisted.len()));
+        live_ids.extend(in_memory.iter().copied());
+        live_ids.extend(persisted.iter().copied());
+        live_ids.sort();
+        live_ids.dedup();
+
+        forgetty_workspace::prune_orphan_logs(&live_ids);
+        debug!(
+            "prune_orphan_logs: checked against {} union pane(s) ({} in-memory, {} persisted)",
+            live_ids.len(),
+            in_memory.len(),
+            persisted.len(),
+        );
+    }
+
     // Resolve the socket path: UUID-based by default, override with --socket-path.
     let socket_path = args.socket_path.unwrap_or_else(|| {
         if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
@@ -308,8 +345,15 @@ async fn main_async() -> anyhow::Result<()> {
     // debounce-save task.
     let dirty_flag = Arc::new(AtomicBool::new(false));
 
-    // Layout-event watcher task: subscribes to the broadcast channel and sets
-    // the dirty flag on PaneCreated / PaneClosed events.
+    // Layout-event watcher task: on layout mutations, save immediately AND
+    // set the dirty flag so the debounce task continues to coalesce any
+    // follow-up changes within its 5-second window. The immediate save is
+    // required to close the multi-daemon startup race (V2-007 fix cycle 7)
+    // where a sibling daemon's `prune_orphan_logs` runs before the 5-second
+    // debounce fires and wrongly deletes the just-created pane's log file
+    // (AD-001 × AD-013 interaction). Layout mutations are rare (user-driven
+    // open/close/split), so the extra JSON serialize + atomic write per event
+    // is cheap (<1 ms on typical WorkspaceState sizes).
     {
         let sm = Arc::clone(&session_manager);
         let dirty = Arc::clone(&dirty_flag);
@@ -325,6 +369,12 @@ async fn main_async() -> anyhow::Result<()> {
                     | Ok(SessionEvent::TabMoved { .. })
                     | Ok(SessionEvent::ActiveTabChanged { .. })
                     | Ok(SessionEvent::WorkspaceCreated { .. }) => {
+                        // Save immediately so sibling daemons' prune passes
+                        // see this pane's UUID in the persisted-union (V2-007
+                        // fix cycle 7). Leave the dirty flag set as well so
+                        // the debounce task coalesces any rapid follow-up
+                        // changes within its window (belt-and-suspenders).
+                        save_session_from_layout(&sm, session_id);
                         dirty.store(true, Ordering::Relaxed);
                     }
                     Ok(_) => {}
@@ -419,8 +469,10 @@ async fn main_async() -> anyhow::Result<()> {
 
     info!("forgetty-daemon shutting down");
     sync_endpoint.close().await;
-    let saved = forgetty_socket::save_all_snapshots(&session_manager);
-    info!("Saved VT snapshots for {saved} pane(s)");
+    // V2-007 / AD-013: flush per-pane byte-log ring to disk so reconnecting
+    // clients (and next cold-start) see up-to-date scrollback.
+    session_manager.flush_all_byte_logs().await;
+    info!("byte logs flushed");
     save_session_from_layout(&session_manager, session_id);
     session_manager.kill_all();
 

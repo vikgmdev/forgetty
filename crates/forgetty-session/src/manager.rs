@@ -20,6 +20,7 @@ use tracing::{debug, warn};
 
 use uuid::Uuid;
 
+use crate::byte_log::ByteLog;
 use crate::drain_result::DrainResult;
 use crate::events::SessionEvent;
 use crate::layout::{SessionLayout, SessionTab};
@@ -48,6 +49,15 @@ struct SessionManagerInner {
     /// Whether this session is pinned. Pinned sessions are not trashed on
     /// normal close — they stay in `sessions/` and restore on next launch.
     pinned: bool,
+    /// Per-pane byte logs (V2-007 / AD-013). Populated in `spawn_drain_task`
+    /// after PTY spawn; removed in `close_pane`/`close_tab` (drop closes the
+    /// disk appender channel, ending its task).
+    byte_logs: HashMap<PaneId, ByteLog>,
+    /// Byte-log ring capacity in KiB. Set once by `daemon.rs` via
+    /// `set_byte_log_config`. Default 1024 KiB = 1 MiB.
+    byte_log_ring_kb: u32,
+    /// Byte-log on-disk cap in MiB. Default 10 MiB.
+    byte_log_max_mb: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -74,8 +84,23 @@ impl SessionManager {
                 event_tx,
                 layout: SessionLayout::new_default(),
                 pinned: false,
+                byte_logs: HashMap::new(),
+                // Defaults match `forgetty_config::defaults::default_config`.
+                byte_log_ring_kb: 1024,
+                byte_log_max_mb: 10,
             })),
         }
+    }
+
+    /// Configure byte-log sizes for subsequently-created panes (V2-007).
+    ///
+    /// Called once by `daemon.rs` after constructing `SessionManager`. Existing
+    /// panes' logs are not resized retroactively.
+    pub fn set_byte_log_config(&self, ring_kb: u32, max_mb: u32) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.byte_log_ring_kb = ring_kb;
+        inner.byte_log_max_mb = max_mb;
+        debug!(ring_kb, max_mb, "set_byte_log_config");
     }
 
     // -----------------------------------------------------------------------
@@ -492,6 +517,8 @@ impl SessionManager {
         // Kill each pane and broadcast PaneClosed.
         for pid in pane_ids {
             inner.pane_order.retain(|&p| p != pid);
+            // V2-007: drop per-pane byte log (closes disk appender channel).
+            inner.byte_logs.remove(&pid);
             if let Some(mut pane) = inner.panes.remove(&pid) {
                 if let Err(e) = pane.pty_bridge.pty.kill() {
                     warn!(%pid, "close_tab: failed to kill PTY: {e}");
@@ -587,10 +614,14 @@ impl SessionManager {
 
     /// Kill a pane's PTY and remove it from the registry.
     ///
-    /// After this call, `pane_info(id)` returns `None`.
+    /// After this call, `pane_info(id)` returns `None`. The pane's `ByteLog`
+    /// (V2-007) is also dropped here — its disk appender channel closes,
+    /// ending the appender task.
     pub fn close_pane(&self, id: PaneId) -> Result<()> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(mut pane) = inner.panes.remove(&id) {
+            // V2-007: drop byte log (disk appender task exits on channel close).
+            inner.byte_logs.remove(&id);
             inner.pane_order.retain(|&p| p != id);
             // Remove the matching single-leaf tab from the default workspace.
             // Only leaf tabs are removed here; split trees are handled by T-060+.
@@ -660,6 +691,8 @@ impl SessionManager {
     /// - Feeds bytes to the session-side VT (calls pty_bridge.pty.write() for
     ///   any VT responses).
     /// - Updates the cached CWD from /proc/{pid}/cwd.
+    /// - **Tees the raw bytes into the per-pane `ByteLog` ring BEFORE broadcast**
+    ///   (V2-007 AC-13 ordering invariant — see `BUILDER_NOTES.md`).
     /// - Broadcasts a PtyOutput event on the session channel.
     /// - Returns DrainResult with pty_exited set if the PTY is no longer alive.
     pub fn process_pane_bytes(&self, id: PaneId, bytes: &[u8]) -> Result<DrainResult> {
@@ -683,6 +716,21 @@ impl SessionManager {
             }
         }
         let pty_exited = !pane.pty_bridge.pty.is_alive();
+
+        // V2-007 AC-13: ring write BEFORE broadcast, both under the same
+        // `inner` mutex guard. This is the ordering invariant that makes
+        // `subscribe_with_snapshot` correct (V2-007 fix cycle 6): because
+        // this critical section is atomic w.r.t. any other mutator of
+        // `inner`, a subscriber that takes the event receiver and the ring
+        // snapshot under the same lock cannot observe a partial state. Any
+        // PtyOutput event the subscriber's receiver will deliver must come
+        // from a `process_pane_bytes` call that happens strictly AFTER the
+        // snapshot — its bytes are not in the snapshot, and no duplicate or
+        // wrongly-skipped live bytes are possible.
+        if let Some(log) = inner.byte_logs.get_mut(&id) {
+            log.append(bytes);
+        }
+
         let _ = inner.event_tx.send(SessionEvent::PtyOutput {
             pane_id: id,
             data: bytes::Bytes::copy_from_slice(bytes),
@@ -690,12 +738,89 @@ impl SessionManager {
         Ok(DrainResult { had_data: true, pty_exited, raw_bytes: vec![bytes.to_vec()] })
     }
 
+    // -----------------------------------------------------------------------
+    // Byte-log lifecycle (V2-007 / AD-013)
+    // -----------------------------------------------------------------------
+
+    /// Create and register a `ByteLog` for a pane. Called from `spawn_drain_task`
+    /// before the drain loop begins so the first byte through `process_pane_bytes`
+    /// sees a populated `byte_logs` map.
+    ///
+    /// If the log file already exists (cold-start scenario), its tail is
+    /// pre-loaded into the ring for AC-17 replay.
+    ///
+    /// Failures are logged — the pane still functions, but replay will be empty.
+    pub fn create_byte_log_for(&self, pane_id: PaneId) {
+        let (ring_kb, max_mb) = {
+            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            (inner.byte_log_ring_kb, inner.byte_log_max_mb)
+        };
+        let ring_bytes = (ring_kb as usize).saturating_mul(1024);
+        let max_bytes = (max_mb as u64).saturating_mul(1024 * 1024);
+        match ByteLog::new(pane_id.0, ring_bytes, max_bytes) {
+            Ok(log) => {
+                let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                inner.byte_logs.insert(pane_id, log);
+                debug!(%pane_id, "create_byte_log_for: registered");
+            }
+            Err(e) => {
+                warn!(%pane_id, "create_byte_log_for: ByteLog::new failed: {e}");
+            }
+        }
+    }
+
+    /// Return a snapshot of the pane's ring buffer plus the replay cursor
+    /// high-water mark (total bytes written to ring since construction).
+    ///
+    /// Returns `None` if the pane has no byte log.
+    pub fn get_ring_snapshot(&self, pane_id: PaneId) -> Option<(bytes::Bytes, u64)> {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.byte_logs.get_mut(&pane_id).map(|log| log.ring_snapshot())
+    }
+
+    /// Flush every pane's on-disk log buffer.
+    ///
+    /// Called from disconnect / shutdown handlers. Waits for each pane's
+    /// disk appender to drain its channel up to the flush marker.
+    pub async fn flush_all_byte_logs(&self) {
+        // Collect owning flush futures under the lock, then await OUTSIDE.
+        // `ByteLog::make_flush_future` clones the mpsc Sender so the returned
+        // future does not borrow from `inner`, making it safe to store after
+        // the lock guard is dropped.
+        let flush_futures: Vec<(PaneId, _)> = {
+            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            inner.byte_logs.iter().map(|(id, log)| (*id, log.make_flush_future())).collect()
+        };
+        // Await sequentially — N is small (panes per session); simpler than
+        // join_all and avoids pulling in the futures crate.
+        for (id, fut) in flush_futures {
+            if let Err(e) = fut.await {
+                warn!(%id, "flush_all_byte_logs: flush failed: {e}");
+            }
+        }
+    }
+
+    /// Drop the pane's `ByteLog`, closing its disk appender channel and ending
+    /// the appender task.
+    pub fn close_pane_byte_log(&self, pane_id: PaneId) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.byte_logs.remove(&pane_id).is_some() {
+            debug!(%pane_id, "close_pane_byte_log: log dropped");
+        }
+    }
+
     /// Spawn a per-pane tokio task that awaits on the output channel.
     ///
     /// The task calls process_pane_bytes() for each Vec<u8> produced by the
     /// PTY reader thread. On EOF (rx.recv() returns None) or when
     /// process_pane_bytes reports pty_exited, calls close_pane(pane_id).
+    ///
+    /// Also creates the pane's `ByteLog` (V2-007) before the drain loop begins
+    /// so the first byte through `process_pane_bytes` hits a ready ring.
     pub fn spawn_drain_task(&self, pane_id: PaneId) {
+        // V2-007: create the byte log first so process_pane_bytes can tee into it.
+        self.create_byte_log_for(pane_id);
+
         if let Some(mut rx) = self.take_pane_output_rx(pane_id) {
             let sm = self.clone();
             tokio::spawn(async move {
@@ -791,6 +916,43 @@ impl SessionManager {
     pub fn subscribe_output(&self) -> broadcast::Receiver<SessionEvent> {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.event_tx.subscribe()
+    }
+
+    /// Atomically subscribe to the session event stream AND take a snapshot of
+    /// the pane's byte-log ring under a single lock acquisition.
+    ///
+    /// Returns `(receiver, replay_bytes, hwm)`. The receiver will *not* deliver
+    /// any event that is already represented in `replay_bytes` — all future
+    /// `PtyOutput` events for this pane arrive strictly after the snapshot's
+    /// high-water mark. Callers can therefore stream `replay_bytes` first, then
+    /// forward every received event verbatim, with no cursor/skip logic.
+    ///
+    /// If the pane has no byte log yet (e.g., freshly created,
+    /// `create_byte_log_for` not yet called), `replay_bytes` is empty and
+    /// `hwm` is 0.
+    ///
+    /// # Correctness (V2-007 fix cycle 6)
+    ///
+    /// Both `event_tx.subscribe()` and `byte_logs[pane].ring_snapshot()`
+    /// execute under the same `inner` mutex guard. Because
+    /// `process_pane_bytes` also acquires the same lock before appending to
+    /// the ring and sending to `event_tx`, any `process_pane_bytes` call runs
+    /// either entirely before this method (and its bytes are in
+    /// `replay_bytes`) or entirely after (and its events are delivered to the
+    /// new receiver). No overlap is possible; no cursor/skip is needed on the
+    /// consumer side.
+    pub fn subscribe_with_snapshot(
+        &self,
+        pane_id: PaneId,
+    ) -> (broadcast::Receiver<SessionEvent>, bytes::Bytes, u64) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let rx = inner.event_tx.subscribe();
+        let (replay_bytes, hwm) = inner
+            .byte_logs
+            .get_mut(&pane_id)
+            .map(|log| log.ring_snapshot())
+            .unwrap_or_else(|| (bytes::Bytes::new(), 0));
+        (rx, replay_bytes, hwm)
     }
 
     // -----------------------------------------------------------------------
@@ -1581,6 +1743,116 @@ mod tests {
             session.create_tab(ws_idx, None, size, None).expect("create_tab on new workspace");
         assert!(session.pane_info(pane_id).is_some());
         assert_eq!(session.layout().workspaces[1].tabs.len(), 1);
+
+        session.close_pane(pane_id).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // V2-007 fix cycle 6: subscribe_with_snapshot must not cause wrong-skip
+    // of live bytes on idle-pane reattach.
+    // -----------------------------------------------------------------------
+
+    /// Regression guard for V2-007 fix cycle 6.
+    ///
+    /// Prior to cycle 6, `subscribe_output` took the receiver and the ring
+    /// snapshot in two separate lock acquisitions, then used a byte cursor
+    /// to skip the first `replay_len` bytes of the live broadcast — which
+    /// wrongly discarded post-snapshot output whenever the actual overlap
+    /// was less than `replay_len` (the common idle-pane reattach case).
+    ///
+    /// With `subscribe_with_snapshot`, both operations execute under the
+    /// same lock as `process_pane_bytes`. Bytes written *before* the call
+    /// land in `replay_bytes`; bytes written *after* the call must arrive
+    /// on the receiver AND must not duplicate anything in the snapshot.
+    ///
+    /// This test writes a pre-snapshot payload, takes the snapshot, writes
+    /// a post-snapshot payload, and asserts:
+    ///   (a) the snapshot contains the pre-snapshot payload,
+    ///   (b) the receiver delivers *exactly* the post-snapshot payload
+    ///       (no pre-snapshot re-delivery, no wrongful skip).
+    #[tokio::test]
+    async fn test_subscribe_with_snapshot_no_wrong_skip() {
+        let session = SessionManager::new();
+        let size = PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
+        let pane_id =
+            session.create_pane(size, None, None, None, true).expect("create_pane should succeed");
+
+        // Let the shell's own startup settle so its output is associated
+        // with the pre-snapshot window (if any). We don't rely on the
+        // shell's output — we only need the byte log to exist.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Pre-snapshot payload: inject bytes directly via the manager's
+        // process_pane_bytes entry point. This bypasses the real PTY drain
+        // task but still exercises the same ring-write-before-broadcast
+        // path used in production.
+        let pre = b"PRE_SNAPSHOT_PAYLOAD_XYZ";
+        session.process_pane_bytes(pane_id, pre).expect("process_pane_bytes (pre)");
+
+        // Give the broadcast a moment (even though it's synchronous, this
+        // is defensive against scheduler quirks).
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Atomic subscribe + snapshot.
+        let (mut rx, replay_bytes, hwm) = session.subscribe_with_snapshot(pane_id);
+
+        // (a) Snapshot must cover the pre-snapshot payload.
+        assert!(
+            replay_bytes.windows(pre.len()).any(|w| w == pre),
+            "snapshot must contain pre-snapshot payload; got {} bytes, hwm={hwm}",
+            replay_bytes.len()
+        );
+        // hwm is monotonically ≥ replay_bytes.len() (equal when the ring
+        // hasn't rotated yet).
+        assert!(hwm >= replay_bytes.len() as u64);
+
+        // Post-snapshot payload: these bytes are written strictly AFTER
+        // the snapshot. They must NOT appear in `replay_bytes`; they MUST
+        // arrive on `rx`.
+        let post = b"POST_SNAPSHOT_UNIQUE_MARKER_123";
+        assert!(
+            !replay_bytes.windows(post.len()).any(|w| w == post),
+            "post-snapshot payload must not be in snapshot (test setup sanity)"
+        );
+        session.process_pane_bytes(pane_id, post).expect("process_pane_bytes (post)");
+
+        // Drain events until we see the post marker. We must NOT see the
+        // pre marker on this receiver — `rx` was subscribed under the same
+        // lock as the snapshot, so pre-snapshot events (from the earlier
+        // process_pane_bytes call) are NOT in the broadcast queue for this
+        // receiver.
+        //
+        // Cycle-1's cursor logic would have skipped `replay_len` bytes of
+        // *any* live output here — including every byte of `post`, if
+        // `replay_len > post.len()`. A test failure would manifest as the
+        // deadline expiring without seeing `post`.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut saw_post = false;
+        let mut saw_pre_on_rx = false;
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+                Ok(Ok(SessionEvent::PtyOutput { pane_id: evt_id, data })) if evt_id == pane_id => {
+                    if data.windows(post.len()).any(|w| w == post) {
+                        saw_post = true;
+                        break;
+                    }
+                    if data.windows(pre.len()).any(|w| w == pre) {
+                        saw_pre_on_rx = true;
+                    }
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) | Err(_) => {}
+            }
+        }
+
+        assert!(
+            !saw_pre_on_rx,
+            "receiver must not re-deliver pre-snapshot payload (would imply overlap)"
+        );
+        assert!(
+            saw_post,
+            "receiver must deliver post-snapshot payload — the cycle-1 cursor would have skipped it"
+        );
 
         session.close_pane(pane_id).ok();
     }
