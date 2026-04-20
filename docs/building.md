@@ -151,7 +151,7 @@ Zig is invoked automatically by `build.rs` with `-Dtarget=aarch64-linux-android`
 cargo test --workspace
 
 # A specific crate
-cargo test -p forgetty-renderer
+cargo test -p forgetty-vt
 
 # With output visible
 cargo test --workspace -- --nocapture

@@ -1,9 +1,7 @@
 //! High-level terminal state machine.
 //!
 //! Wraps a libghostty-vt terminal handle and provides a safe, ergonomic Rust
-//! interface for feeding input data and querying terminal state. The public
-//! API matches the original `vte`-based implementation so that downstream
-//! crates (forgetty-renderer, forgetty-ui) continue to compile unchanged.
+//! interface for feeding input data and querying terminal state.
 
 use std::cell::UnsafeCell;
 use std::os::raw::c_void;

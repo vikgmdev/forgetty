@@ -58,7 +58,7 @@
 | `get_screen` RPC (daemon has no screen to return) | ✅ Removed (V2-008, 2026-04-19) — METHOD_NOT_FOUND live-verified. | V2-008 |
 | `preseed_snapshot` RPC | ✅ Removed (V2-008, 2026-04-19) — METHOD_NOT_FOUND live-verified. | V2-008 |
 | `forgetty-vt` dependency in `forgetty-session` | ✅ Removed (V2-008, 2026-04-19) — also removed from `forgetty-socket`. `cargo tree -p forgetty-session \| grep -c forgetty-vt` → 0. | V2-008 |
-| `forgetty-renderer`, `forgetty-ui`, `forgetty-viewer` crates | ❌ To remove (unused) | V2-012 |
+| `forgetty-renderer`, `forgetty-ui`, `forgetty-viewer` crates | ✅ Removed (V2-012, 2026-04-20) | V2-012 |
 
 ---
 

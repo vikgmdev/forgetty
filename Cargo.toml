@@ -4,11 +4,8 @@ members = [
     "crates/forgetty-core",
     "crates/forgetty-vt",
     "crates/forgetty-pty",
-    "crates/forgetty-renderer",
-    "crates/forgetty-ui",
     "crates/forgetty-gtk",
     "crates/forgetty-config",
-    "crates/forgetty-viewer",
     "crates/forgetty-watcher",
     "crates/forgetty-workspace",
     "crates/forgetty-socket",
@@ -25,12 +22,6 @@ homepage = "https://forgetty.dev"
 description = "The AI-first agentic terminal emulator"
 
 [workspace.dependencies]
-wgpu = "23"
-winit = "0.30"
-glyphon = "0.7"
-cosmic-text = "0.12"
-wry = "0.48"
-pulldown-cmark = "0.12"
 notify = "7"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -45,8 +36,6 @@ arboard = "3"
 uuid = { version = "1", features = ["v4", "serde"] }
 dirs = "6"
 git2 = "0.19"
-bytemuck = { version = "1", features = ["derive"] }
-pollster = "0.4"
 gtk4 = { version = "0.9", features = ["v4_14"] }
 libadwaita = { version = "0.7", features = ["v1_4"] }
 gdk-pixbuf = "0.20"

@@ -8,9 +8,6 @@
 //! - Modifier side bits, CapsLock/NumLock reporting
 //! - Numpad disambiguation
 //! - All mouse tracking modes and formats (X10, SGR, URxvt, SGR-Pixels)
-//!
-//! Adapted from `crates/forgetty-ui/src/ghostty_input.rs` (winit backend) to
-//! work with GTK4/GDK key events and mouse event controllers.
 
 use std::collections::HashSet;
 use std::os::raw::c_void;

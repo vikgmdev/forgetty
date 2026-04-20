@@ -10,7 +10,7 @@ cargo test --workspace
 cargo test -p forgetty-vt
 
 # Run a specific test by name
-cargo test -p forgetty-renderer test_glyph_cache_eviction
+cargo test -p forgetty-socket round_trip_64k
 
 # Show stdout/stderr from tests
 cargo test --workspace -- --nocapture
@@ -61,9 +61,6 @@ let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
 - **VT parser** — Correctness of escape sequence handling. Verify cursor
   movement, styling, scrolling, and edge cases (malformed sequences, very
   long lines).
-- **Renderer** — Glyph atlas allocation, damage tracking, cell-to-vertex
-  conversion. GPU rendering is hard to unit test; focus on the data pipeline
-  before the draw call.
 - **Config** — Loading, defaults, validation, and error messages for invalid
   config.
 - **PTY** — Process spawning, I/O routing, resize handling.
@@ -87,5 +84,5 @@ Performance-critical code (VT parsing, rendering) should have benchmarks in
 `benches/`. We use Criterion for benchmarking:
 
 ```sh
-cargo bench -p forgetty-renderer
+cargo bench -p forgetty-vt
 ```

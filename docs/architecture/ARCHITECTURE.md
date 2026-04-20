@@ -230,7 +230,7 @@ These concepts have been considered and rejected. Do not reintroduce without exp
 | procfs fd sharing for PTY input | Keystroke path is already sub-millisecond; optimization at the wrong bottleneck. |
 | Dual-mode (local PTY fallback in GTK) | Doubles the code path in GTK for every feature. The fallback silently degrades the platform into a single-process terminal. |
 | GSK render nodes / custom wgpu renderer | Premature. Cairo+Pango is adequate. Revisit after the protocol is stable. |
-| Dead crates in the workspace (`forgetty-renderer`, `forgetty-ui`, `forgetty-viewer`) | Unused code that slows compilation and confuses the tech stack. |
+| Dead crates in the workspace (`forgetty-renderer`, `forgetty-ui`, `forgetty-viewer`) (deleted 2026-04-20 by V2-012) | Unused code that slowed compilation and confused the tech stack. |
 
 ---
 

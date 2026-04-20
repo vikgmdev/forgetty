@@ -52,9 +52,6 @@ cargo publish -p forgetty-core
 cargo publish -p forgetty-config
 cargo publish -p forgetty-vt
 cargo publish -p forgetty-pty
-cargo publish -p forgetty-renderer
-cargo publish -p forgetty-ui
-cargo publish -p forgetty-viewer
 cargo publish -p forgetty-watcher
 cargo publish -p forgetty-workspace
 cargo publish -p forgetty-socket
