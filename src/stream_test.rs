@@ -42,12 +42,11 @@ use clap::Parser;
 use iroh::{endpoint::presets, Endpoint, EndpointAddr, SecretKey};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use forgetty_sync::stream::{ClientMsg, DaemonMsg};
+use forgetty_daemon::iroh_terminal::{ClientMsg, DaemonMsg, FORGETTY_STREAM_ALPN};
+use forgetty_sync::FORGETTY_PAIRING_ALPN;
 
-const FORGETTY_STREAM_ALPN: &[u8] = b"forgetty/stream/1";
-const FORGETTY_PAIRING_ALPN: &[u8] = b"forgetty/pair/1";
-
-/// Maximum frame size accepted from the daemon (must match stream.rs constant).
+/// Maximum frame size accepted from the daemon (must match the
+/// `MAX_FRAME_SIZE` constant in `forgetty_daemon::iroh_terminal`).
 const MAX_FRAME_SIZE: usize = 4 * 1024 * 1024;
 
 #[derive(Parser, Debug)]
@@ -125,20 +124,7 @@ async fn run() -> anyhow::Result<()> {
         eprintln!("stream-test: paired ok, now connecting for streaming");
     }
 
-    // Determine pane_id.
-    let pane_id = if args.list_panes {
-        eprintln!("stream-test: --list-panes not yet implemented via iroh (use socket API)");
-        return Ok(());
-    } else {
-        match args.pane_id {
-            Some(p) => p,
-            None => {
-                anyhow::bail!("--pane-id <uuid> is required (or use --list-panes)");
-            }
-        }
-    };
-
-    // Connect with the stream ALPN.
+    // Connect with the stream ALPN (shared by --list-panes and --pane-id).
     let addr = EndpointAddr::from(endpoint_id);
     eprintln!("stream-test: connecting to {} with ALPN forgetty/stream/1 ...", args.dial);
     let conn = ep
@@ -151,14 +137,26 @@ async fn run() -> anyhow::Result<()> {
     let (mut send, mut recv) =
         conn.open_bi().await.map_err(|e| anyhow::anyhow!("open_bi failed: {e}"))?;
 
-    // Send Subscribe message.
-    let subscribe = ClientMsg::Subscribe { pane_id: pane_id.clone() };
-    let payload = rmp_serde::to_vec_named(&subscribe)?;
-    let len = (payload.len() as u32).to_be_bytes();
-    send.write_all(&len).await?;
-    send.write_all(&payload).await?;
-    send.flush().await?;
-    eprintln!("stream-test: sent Subscribe {{ pane_id: {} }}", pane_id);
+    // Dispatch on --list-panes vs --pane-id.
+    if args.list_panes {
+        let payload = rmp_serde::to_vec_named(&ClientMsg::ListPanes)?;
+        let len = (payload.len() as u32).to_be_bytes();
+        send.write_all(&len).await?;
+        send.write_all(&payload).await?;
+        send.flush().await?;
+        eprintln!("stream-test: sent ListPanes");
+    } else {
+        let pid = args
+            .pane_id
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("--pane-id <uuid> is required (or use --list-panes)"))?;
+        let payload = rmp_serde::to_vec_named(&ClientMsg::Subscribe { pane_id: pid.clone() })?;
+        let len = (payload.len() as u32).to_be_bytes();
+        send.write_all(&len).await?;
+        send.write_all(&payload).await?;
+        send.flush().await?;
+        eprintln!("stream-test: sent Subscribe {{ pane_id: {} }}", pid);
+    }
 
     // Read messages from daemon.
     let mut total_pty_bytes: usize = 0;
@@ -232,6 +230,17 @@ async fn run() -> anyhow::Result<()> {
             DaemonMsg::PaneGone { pane_id } => {
                 eprintln!("stream-test: PaneGone for pane {}", pane_id);
                 println!("PASS: PaneGone received");
+                break;
+            }
+            DaemonMsg::PaneList { panes } => {
+                eprintln!("stream-test: PaneList: {} panes", panes.len());
+                for (i, p) in panes.iter().enumerate() {
+                    eprintln!(
+                        "  pane {:2}: id={} title={:?} cwd={:?} active={}",
+                        i, p.id, p.title, p.cwd, p.is_active
+                    );
+                }
+                println!("PASS: PaneList received ({} panes)", panes.len());
                 break;
             }
             DaemonMsg::Error { message } => {

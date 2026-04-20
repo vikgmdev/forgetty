@@ -38,6 +38,8 @@ use forgetty_sync::{
     identity::load_or_generate, qr::qr_to_ascii, registry::DeviceRegistry, SyncEndpoint,
 };
 
+use forgetty_daemon::iroh_terminal::{handle_terminal_stream, FORGETTY_STREAM_ALPN};
+
 // ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
@@ -417,24 +419,37 @@ async fn main_async() -> anyhow::Result<()> {
         });
     }
 
-    // Load identity and bind iroh endpoint.
+    // Load identity and bind iroh endpoint (V2-011 / AD-015).
+    //
+    // `forgetty-sync` owns only the pairing ALPN. The terminal streaming ALPN
+    // is registered here with a closure that forwards to the terminal-side
+    // handler in `forgetty_daemon::iroh_terminal`, keeping all terminal-
+    // specific behaviour out of the transport crate.
     let secret_key = load_or_generate()?;
-    let sync_endpoint = match SyncEndpoint::bind(
-        secret_key,
-        args.allow_pairing,
-        Arc::clone(&session_manager),
-    )
-    .await
+    let sm_for_alpn = Arc::clone(&session_manager);
+    let sync_endpoint = match SyncEndpoint::builder(secret_key)
+        .allow_pairing(args.allow_pairing)
+        .register_alpn(
+            FORGETTY_STREAM_ALPN,
+            Arc::new(move |conn, registry| {
+                let sm = Arc::clone(&sm_for_alpn);
+                tokio::spawn(async move {
+                    handle_terminal_stream(conn, sm, registry).await;
+                });
+            }),
+        )
+        .build()
+        .await
     {
         Ok(ep) => {
-            info!("totem-sync: iroh endpoint bound, node_id={}", ep.node_id());
+            info!(
+                "totem-sync: iroh endpoint bound, node_id={}, alpns=[forgetty/pair/1, forgetty/stream/1]",
+                ep.node_id()
+            );
             Arc::new(ep)
         }
         Err(e) => {
             warn!("totem-sync: failed to bind iroh endpoint: {e}");
-            // Non-fatal: daemon continues without sync capability.
-            // Wrap in a short early return here would require restructuring; instead
-            // we pass None to the socket server below.
             return Err(anyhow::anyhow!("iroh bind failed: {e}"));
         }
     };

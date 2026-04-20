@@ -22,9 +22,10 @@ pub mod identity;
 pub mod pairing;
 pub mod qr;
 pub mod registry;
-pub mod stream;
 
-pub use endpoint::{SyncEndpoint, SyncEvent};
+pub use endpoint::{
+    AlpnHandler, SyncEndpoint, SyncEndpointBuilder, SyncEvent, FORGETTY_PAIRING_ALPN,
+};
 pub use identity::load_or_generate;
 pub use qr::QrPayload;
 pub use registry::{DeviceEntry, DeviceRegistry};

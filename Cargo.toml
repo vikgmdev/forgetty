@@ -65,6 +65,10 @@ description.workspace = true
 build = "build.rs"
 default-run = "forgetty"
 
+[lib]
+name = "forgetty_daemon"
+path = "src/lib.rs"
+
 [[bin]]
 name = "forgetty"
 path = "src/main.rs"
@@ -106,4 +110,5 @@ iroh = { workspace = true }
 rand = { workspace = true }
 uuid = { workspace = true }
 rmp-serde = "1"
+serde = { workspace = true }
 serde_bytes = "0.11"

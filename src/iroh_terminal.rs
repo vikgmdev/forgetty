@@ -1,5 +1,12 @@
 //! Terminal streaming protocol over iroh QUIC (`forgetty/stream/1` ALPN).
 //!
+//! This module is the terminal-specific consumer of `forgetty-sync`. It owns
+//! the wire protocol (`ClientMsg` / `DaemonMsg`), the frame codec, the
+//! byte-log replay loop, and the authorization gate. `forgetty-sync` knows
+//! nothing about these concerns — it only accepts iroh connections and
+//! dispatches by ALPN to handlers registered by the daemon binary (V2-011 /
+//! AD-015).
+//!
 //! # Protocol overview
 //!
 //! 1. Android connects with ALPN `forgetty/stream/1`.
@@ -29,17 +36,22 @@ use std::sync::{Arc, Mutex};
 
 use forgetty_core::PaneId;
 use forgetty_session::{PaneTreeLayout, SessionEvent, SessionManager};
+use forgetty_sync::registry::DeviceRegistry;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::registry::DeviceRegistry;
-
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
+
+/// ALPN identifier for Forgetty's terminal streaming protocol.
+///
+/// Owned by the terminal-side consumer under AD-015: `forgetty-sync` no
+/// longer declares terminal-specific ALPNs.
+pub const FORGETTY_STREAM_ALPN: &[u8] = b"forgetty/stream/1";
 
 /// Maximum allowed MessagePack frame size (4 MiB).
 const MAX_FRAME_SIZE: usize = 4 * 1024 * 1024;
@@ -296,7 +308,7 @@ fn build_pane_list(sm: &SessionManager) -> Vec<WirePaneInfo> {
 /// Multiple streams can be open simultaneously on the same QUIC connection,
 /// enabling Android to call `ListPanes` without interrupting an active
 /// subscribe stream.
-pub async fn handle_stream_connection(
+pub async fn handle_terminal_stream(
     conn: Connection,
     sm: Arc<SessionManager>,
     registry: Arc<Mutex<DeviceRegistry>>,
@@ -333,9 +345,7 @@ pub async fn handle_stream_connection(
                 break;
             }
         };
-        let sm2 = sm.clone();
-        let dev = device_id.clone();
-        tokio::spawn(handle_single_stream(send, recv, sm2, dev));
+        tokio::spawn(handle_single_stream(send, recv, Arc::clone(&sm), device_id.clone()));
     }
 
     conn.close(0u8.into(), b"done");
@@ -428,14 +438,9 @@ async fn handle_subscribe_stream(
     // --- Spawn reader task for incoming client messages ---
     let (client_tx, mut client_rx) = tokio::sync::mpsc::channel::<ClientMsg>(16);
     tokio::spawn(async move {
-        loop {
-            match read_msg(&mut recv).await {
-                Some(msg) => {
-                    if client_tx.send(msg).await.is_err() {
-                        break;
-                    }
-                }
-                None => break,
+        while let Some(msg) = read_msg(&mut recv).await {
+            if client_tx.send(msg).await.is_err() {
+                break;
             }
         }
     });
