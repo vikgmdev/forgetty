@@ -36,8 +36,7 @@ crates/forgetty-vt/ghostty-out/
 # Package artifacts
 *.deb
 
-
-# Claude Code session logs and ad-hoc workspace artifacts
+# Session logs and ad-hoc workspace artifacts
 *.jsonl
 session-viewer.html
 cleanup.sh

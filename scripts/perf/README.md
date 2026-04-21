@@ -3,7 +3,7 @@
 This directory ships with two complementary tools that together lock the v0.2
 performance baseline for Forgetty's daemon hot path. Per V2-013 (SPEC §1) and
 `docs/architecture/ARCHITECTURE.md` §"Performance contract", every release cycle
-must run these and record real numbers in the review.
+must run these and record real numbers.
 
 | Tool | Scope | Lives at | Output |
 | --- | --- | --- | --- |
@@ -54,7 +54,7 @@ been exhausted and `openpty()` (or the subsequent `dup`) panics with
 
 This is a workaround. The underlying issue — `SessionManager` clones held by
 spawned drain tasks for slightly longer than the benchmark's per-iteration
-guard — is tracked separately (see `` "drain-task Arc cycle"). Once
+guard — is tracked separately. Once
 that lands, the `ulimit` bump is no longer required and this section will be
 removed.
 
