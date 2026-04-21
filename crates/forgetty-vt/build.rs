@@ -343,9 +343,12 @@ fn patch_android_soname(lib_dir: &std::path::Path) {
 
 /// Find the Zig compiler binary.
 fn find_zig() -> String {
-    // Check common locations
+    let home = std::env::var("HOME").unwrap_or_default();
+    let user_local_zig = format!("{home}/.local/zig/zig");
+    let user_local_bin_zig = format!("{home}/.local/bin/zig");
+
     for candidate in
-        &["zig", "/usr/local/bin/zig", "zig", "zig"]
+        ["zig", "/usr/local/bin/zig", user_local_zig.as_str(), user_local_bin_zig.as_str()]
     {
         if Command::new(candidate)
             .arg("version")

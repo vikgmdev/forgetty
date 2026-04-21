@@ -26,7 +26,7 @@ out of scope for both (SPEC §5, AC-3).
 cargo --version
 
 # Both binaries built in release mode with the qa-tools feature
-cd ${FORGETTY_REPO_ROOT}
+cd "$FORGETTY_REPO_ROOT"   # wherever you cloned this repo
 cargo build --release --features qa-tools
 
 # Tools used by the typometer shell script
@@ -79,7 +79,7 @@ shells. PTY processes are deterministic (`cat`) so output timing is stable.
 ### Running it
 
 ```bash
-cd ${FORGETTY_REPO_ROOT}
+cd "$FORGETTY_REPO_ROOT"   # wherever you cloned this repo
 
 # Default suite (idle, load_10, send_input, cold_start)
 cargo bench --bench daemon_hotpath
