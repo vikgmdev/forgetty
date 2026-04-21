@@ -19,10 +19,9 @@
   <em>Screenshots coming soon — see <a href="CHANGELOG.md">CHANGELOG.md</a> for what's shipped.</em>
 </p>
 
-> **Warning**
-> Forgetty is under active development by a solo developer. It is **not stable**
-> — APIs, config format, and behavior may change between releases without notice.
-> Use it, break it, file issues — but don't rely on it for production workflows yet.
+> ⚠️ **Active development — pre-release.** Forgetty v0.1.0-beta is the first
+> public preview. Expect breaking changes, rough edges, and missing features.
+> Not recommended for production use. Bug reports very welcome.
 
 Forgetty is a terminal emulator for Linux built on
 [Ghostty](https://ghostty.org/)'s VT engine ([libghostty-vt](https://github.com/ghostty-org/ghostty))
