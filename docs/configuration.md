@@ -196,7 +196,7 @@ Forgetty sets these on every spawned shell:
 | `TERM` | `xterm-256color` | Terminal type for 256-color support |
 | `COLORTERM` | `truecolor` | Indicates 24-bit true color support |
 | `TERM_PROGRAM` | `forgetty` | Terminal program identifier |
-| `TERM_PROGRAM_VERSION` | `0.1.0` | Version from build time |
+| `TERM_PROGRAM_VERSION` | `0.1.0-beta` | Version from build time |
 
 ## CLI flags
 

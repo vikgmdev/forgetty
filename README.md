@@ -122,7 +122,7 @@ For developers working with AI coding agents daily:
 
 ```sh
 # Download from GitHub Releases
-sudo dpkg -i forgetty_0.1.0_amd64.deb
+sudo dpkg -i forgetty_0.1.0-beta_amd64.deb
 ```
 
 ### Install script (any Linux)
