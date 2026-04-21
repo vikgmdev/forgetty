@@ -27,8 +27,12 @@ tarpaulin-report.html
 lcov.info
 .claude/
 
+# Brainstorm session cache (Superpowers visual companion)
+.superpowers/
+
 # Ghostty build artifacts
 crates/forgetty-vt/ghostty-out/
 
 # Package artifacts
 *.deb
+

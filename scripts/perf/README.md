@@ -3,7 +3,7 @@
 This directory ships with two complementary tools that together lock the v0.2
 performance baseline for Forgetty's daemon hot path. Per V2-013 (SPEC §1) and
 `docs/architecture/ARCHITECTURE.md` §"Performance contract", every release cycle
-must run these and paste real numbers into `/{V2-NNN}/QA_REPORT.md`.
+must run these and record real numbers in the review.
 
 | Tool | Scope | Lives at | Output |
 | --- | --- | --- | --- |
@@ -192,8 +192,7 @@ respawns `forgetty-stream-test` which dials the daemon over iroh QUIC --
 
 ## 3. Updating the baselines
 
-Baselines live in `docs/benchmarks/`. They are committed (unlike most files
-under `/`). Regenerate **only when the change is intentional**:
+Baselines live in `docs/benchmarks/` and are committed. Regenerate **only when the change is intentional**:
 
 ```bash
 # Re-run the bench, capture numbers manually, edit baseline.json
@@ -255,5 +254,4 @@ Do not commit the injected sleep.
 
 Out of scope for V2-013. The harness ships with manual gates only. Wiring
 `cargo bench` and `typometer.sh` into CI is a separately-scoped follow-up.
-Until that lands, the gate is human discipline at QA time -- see
-`` Phase 3 instructions.
+Until that lands, the gate is human discipline at QA time.

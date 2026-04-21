@@ -990,8 +990,8 @@ impl SessionManager {
 
     /// Send SIGINT to the foreground process group of a pane.
     ///
-    /// This is the daemon-side implementation of the Ctrl+C signal path described
-    /// in . It does two things:
+    /// This is the daemon-side implementation of the Ctrl+C signal path.
+    /// It does two things:
     /// 1. The caller (handle_send_sigint) already wrote 0x03 via write_pty.
     /// 2. This method calls kill(-pgid, SIGINT) via tcgetpgrp on the master PTY fd.
     ///    This is necessary when the child has disabled ISIG (e.g. Node.js, pm2).
