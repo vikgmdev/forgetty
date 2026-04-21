@@ -204,40 +204,47 @@ cargo test --workspace
 
 ## Architecture
 
-**Daemon-first design:** Each Forgetty window runs its own `forgetty-daemon`
-process that owns all PTYs and session state. The GTK window is a stateless
-renderer that communicates via JSON-RPC over a Unix socket. This means:
+**The daemon is a byte pipe. The client is a terminal.** Each Forgetty window
+runs its own `forgetty-daemon` process that owns PTY processes, session
+persistence, and networking. The GTK client owns the terminal engine — VT
+parsing, screen buffer, scrollback, search, selection, rendering. They
+communicate over a Unix socket: JSON-RPC for control (create tab, resize,
+subscribe), length-prefixed binary frames for the raw PTY byte stream.
 
 - **Closing the window doesn't kill your processes** — the daemon keeps them alive
 - **Sessions persist** in `~/.local/share/forgetty/sessions/` and restore automatically on next launch
 - **Multi-window** — each window is fully independent with its own daemon, socket, and session file
-- **Future-proof** — Android, Windows, and web clients can connect to a desktop daemon as remote renderers
+- **Cross-device** — the daemon accepts remote clients over iroh QUIC, so an Android phone or a second machine can attach to a desktop daemon as a full renderer (pairing required)
 
-**Thin shell + thick core:** The GTK4 platform shell is ~1,300 lines. The
-shared Rust core is ~10,000+ lines (~70% of the code) and is
-platform-independent. When we add Windows or Android, we write a new thin
-shell — the core stays the same.
+**Portable core, native UI.** The shared Rust crates (VT engine bindings,
+core types, config, transport) are platform-independent. Porting to Windows
+or Android means writing a native UI layer that consumes those crates — not
+reimplementing the terminal.
 
 ```
 ┌──────────────────────────────────────────────────────┐
-│  Platform Shell (THIN — native per platform)          │
+│  Client (terminal engine + native UI)                │
 │  Linux:   GTK4 + libadwaita (gtk4-rs)    ← current   │
 │  Windows: native shell                   ← planned    │
 │  Android: Jetpack Compose + Rust JNI     ← planned    │
 ├──────────────────────────────────────────────────────┤
-│  Shared Rust Core (THICK — platform-independent)      │
-│  forgetty-vt        libghostty-vt FFI bindings        │
-│  forgetty-pty       PTY management (portable-pty)     │
-│  forgetty-config    Config, 486 themes, defaults      │
-│  forgetty-core      Shared types, errors              │
-│  forgetty-workspace Session + workspace persistence   │
-│  forgetty-watcher   Config file hot reload            │
-│  forgetty-socket    JSON-RPC API                      │
-│  forgetty-clipboard Smart copy pipeline               │
+│  Shared Rust crates (portable)                       │
+│  forgetty-vt        libghostty-vt FFI (VT parsing)   │
+│  forgetty-core      Shared types, errors             │
+│  forgetty-config    Config, 486 themes, defaults     │
+│  forgetty-watcher   Config file hot reload           │
+├──────────────────────────────────────────────────────┤
+│  Daemon (headless — process + transport)             │
+│  forgetty-session   PTY processes + byte-log store   │
+│  forgetty-pty       PTY spawn (portable-pty)         │
+│  forgetty-workspace Session + workspace JSON         │
+│  forgetty-socket    Unix socket: JSON-RPC + frames   │
+│  forgetty-sync      iroh QUIC P2P transport          │
 ├──────────────────────────────────────────────────────┤
 │  libghostty-vt.so (Zig, C API — Ghostty project)     │
-│  SIMD VT parser, Kitty protocol, Unicode graphemes,   │
-│  scrollback, text reflow — proven by millions of users │
+│  SIMD VT parser, Kitty protocol, Unicode graphemes,  │
+│  scrollback, text reflow — proven by millions of     │
+│  users via Ghostty                                   │
 └──────────────────────────────────────────────────────┘
 ```
 
