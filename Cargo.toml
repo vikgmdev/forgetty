@@ -79,6 +79,21 @@ required-features = ["qa-tools"]
 [features]
 qa-tools = []
 
+[dev-dependencies]
+# V2-013: Criterion micro-benchmark suite for the daemon hot path.
+# Bench-only — never compiled into release binaries (R-3 in V2-013 SPEC).
+criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+tokio = { workspace = true }
+forgetty-core = { path = "crates/forgetty-core" }
+forgetty-pty = { path = "crates/forgetty-pty" }
+forgetty-session = { path = "crates/forgetty-session" }
+bytes = "1"
+
+[[bench]]
+# V2-013: in-process daemon hot-path micro-bench (PTY → broadcast subscriber).
+name = "daemon_hotpath"
+harness = false
+
 [dependencies]
 forgetty-core = { path = "crates/forgetty-core" }
 forgetty-config = { path = "crates/forgetty-config" }

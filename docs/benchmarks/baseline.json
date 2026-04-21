@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "timestamp": "2026-04-20T23:03:12Z",
+  "git_sha": "68fda67",
+  "hostname": "totemlabs-lap",
+  "machine_class": "vick-dev-linux",
+  "benchmarks": [
+    {
+      "name": "pty_to_subscriber_idle",
+      "p50_us": 15,
+      "p95_us": 17,
+      "p99_us": 17,
+      "unit": "microseconds",
+      "notes": "Daemon-internal portion of the PTY->pixel budget. SPEC AC-12 ceiling is 500 us; measured value is ~33x under budget."
+    },
+    {
+      "name": "pty_to_subscriber_load_10",
+      "p50_us": 110,
+      "p95_us": 140,
+      "p99_us": 155,
+      "unit": "microseconds",
+      "notes": "Target pane latency with 9 sibling panes emitting noise concurrently. Default-suite group (AC-6)."
+    },
+    {
+      "name": "send_input_latency",
+      "p50_us": 1,
+      "p95_us": 2,
+      "p99_us": 2,
+      "unit": "microseconds",
+      "notes": "SessionManager::write_pty call latency only (no echo wait). Sub-microsecond mutex acquire + PTY fd write."
+    },
+    {
+      "name": "daemon_cold_start",
+      "p50_us": 17383,
+      "p95_us": 17846,
+      "p99_us": 18212,
+      "unit": "microseconds",
+      "notes": "SessionManager::new() + first create_tab(cat). Excludes socket bind (AC-8). SPEC ceiling 500 ms; measured ~17 ms."
+    }
+  ]
+}

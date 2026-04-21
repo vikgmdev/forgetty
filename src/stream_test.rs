@@ -84,6 +84,14 @@ struct Args {
     /// then connect for streaming. Useful when the identity hasn't been paired yet.
     #[arg(long)]
     pair_first: bool,
+
+    /// In non-stress mode, exit after this many `PtyBytes` messages have been
+    /// observed. Default 5 preserves the historical "PASS: received N PtyBytes
+    /// messages" smoke-test behavior. The typometer (`scripts/perf/typometer.sh`)
+    /// passes `--max-msgs 1` because its `--prepare` hook only causes one byte
+    /// of PTY local-echo per hyperfine iteration; waiting for 5 would hang.
+    #[arg(long, default_value_t = 5)]
+    max_msgs: usize,
 }
 
 fn main() {
@@ -213,8 +221,9 @@ async fn run() -> anyhow::Result<()> {
                     println!("PASS: first PtyBytes received ({} bytes)", data.len());
                 }
 
-                // In non-stress mode, exit after receiving first PtyBytes batch.
-                if !args.stress && msg_count >= 5 {
+                // In non-stress mode, exit after receiving the configured
+                // number of PtyBytes messages (default 5; typometer passes 1).
+                if !args.stress && msg_count >= args.max_msgs {
                     println!("PASS: received {} PtyBytes messages", msg_count);
                     break;
                 }

@@ -1,0 +1,37 @@
+# Typometer baseline — first real measurement after V2-013 ships.
+#
+# How to update: re-run `./scripts/perf/typometer.sh` and append a new block
+# below. Do NOT delete prior blocks (they are the regression reference).
+
+machine_class: vick-dev-linux
+hostname:      totemlabs-lap
+timestamp:     2026-04-21T03:29:11Z
+git_sha:       68fda67
+hyperfine_runs: 100
+typometer p50: 2316.49 ms
+typometer p95: 3411.50 ms
+typometer p99: 3422.98 ms
+
+# Notes on this measurement:
+#
+# - hyperfine mean: 2.404 s ± 0.286 s; range [2.215 s, 3.426 s] over 100 runs.
+# - Each iteration spawns `forgetty-stream-test`, which dials the daemon over
+#   iroh QUIC, completes stream auth, sends Subscribe, receives FullSnapshot,
+#   and exits on first PtyBytes (--max-msgs 1). Per-iteration time is dominated
+#   by iroh dial / process spawn / endpoint bind — the actual byte path
+#   (PTY echo -> ByteLog tee -> broadcast -> framing -> iroh send) is in the
+#   microsecond regime and contributes negligibly to this number.
+# - The daemon log emitted: "Relay server reports problem: Another endpoint
+#   connected with the same endpoint id." This is expected here: every
+#   hyperfine iteration uses the same `pair-test.key`, so when iterations
+#   overlap during teardown, the iroh relay sees two connections claiming the
+#   same endpoint. Iroh recovers ("connection is healthy and has recovered")
+#   but may fall back to relay-routed traffic for some iterations, which
+#   inflates the tail (p95 / p99 jump from p50's ~2.3 s to ~3.4 s).
+# - SPEC §4.5 estimated 200-400 ms of iroh dial overhead. The relay collision
+#   pushes the observed value to ~2.3 s. If sub-second typometer p50 ever
+#   matters, the fix is per-iteration unique identities (allocate a fresh
+#   key per hyperfine iteration). Out of V2-013 scope.
+# - The typometer's job is to lock the number in so future regressions are
+#   detectable, not to be a specific latency budget. The Criterion bench is
+#   the precise tool; the typometer is the coarse end-to-end check.

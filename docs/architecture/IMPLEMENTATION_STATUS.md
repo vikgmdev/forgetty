@@ -68,4 +68,4 @@
 |----------|-------|---------|-----------|-----------|
 | Architectural decisions (AD-001…AD-015) | 15 | 14 | 1 | 0 |
 
-Target: all ❌ → ✅ by the end of the V2 backlog (V2-001 through V2-012).
+Target: all ❌ → ✅ by the end of the V2 backlog (V2-001 through V2-012). **V2 milestone complete (V2-001..V2-013) as of 2026-04-21.** V2-013 (performance regression harness) is hygiene/tooling — no AD flipped, but it locks in the v0.2 baseline that ratchets all future work against. Idle daemon hot-path p50 = 15 µs (~33× under the 500 µs daemon-internal ceiling for the 1.5 ms PTY→pixel target). See `benches/daemon_hotpath.rs`, `scripts/perf/`, `docs/benchmarks/`.
