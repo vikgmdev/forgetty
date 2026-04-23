@@ -251,6 +251,49 @@ impl SessionManager {
         (id, idx)
     }
 
+    /// Rename an existing workspace. Emits `WorkspaceRenamed` on actual change
+    /// (FIX-001).
+    ///
+    /// Behaviour:
+    /// - Returns `Err` if `workspace_idx` is out of bounds (same error style
+    ///   as `create_tab`).
+    /// - Returns `Ok(())` with no event if the new name equals the current
+    ///   name (idempotence — AC-9).
+    /// - Otherwise mutates `inner.layout.workspaces[workspace_idx].name` and
+    ///   broadcasts a `SessionEvent::WorkspaceRenamed` event.
+    ///
+    /// The name is stored verbatim — no trimming, no validation, no length
+    /// cap. The GTK dialog already trims and rejects empty strings (AC-7);
+    /// the wire frame cap (4 MiB, AD-010) bounds pathological inputs.
+    pub fn rename_workspace(&self, workspace_idx: usize, new_name: &str) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+
+        if workspace_idx >= inner.layout.workspaces.len() {
+            return Err(forgetty_core::ForgettyError::Pty(format!(
+                "workspace index {workspace_idx} out of bounds (len={})",
+                inner.layout.workspaces.len()
+            )));
+        }
+
+        // Idempotence: no-op (and no event) if the name is unchanged.
+        if inner.layout.workspaces[workspace_idx].name == new_name {
+            return Ok(());
+        }
+
+        inner.layout.workspaces[workspace_idx].name = new_name.to_string();
+        let workspace_id = inner.layout.workspaces[workspace_idx].id;
+        let _ = inner.event_tx.send(SessionEvent::WorkspaceRenamed {
+            workspace_idx,
+            workspace_id,
+            name: new_name.to_string(),
+        });
+        debug!(
+            new_name,
+            workspace_idx, %workspace_id, "rename_workspace: workspace renamed"
+        );
+        Ok(())
+    }
+
     /// Create a new tab in the given workspace, spawn a PTY for it, and return
     /// `(pane_id, tab_id)`.
     ///
@@ -1708,6 +1751,90 @@ mod tests {
         assert_eq!(session.layout().workspaces[1].tabs.len(), 1);
 
         session.close_pane(pane_id).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX-001 unit tests — rename_workspace
+    // -----------------------------------------------------------------------
+
+    /// FIX-001 / SPEC §5.4: rename_workspace updates the stored name.
+    #[test]
+    fn test_rename_workspace_updates_name() {
+        let session = SessionManager::new();
+        assert_eq!(session.layout().workspaces[0].name, "Default");
+
+        session.rename_workspace(0, "Custom").expect("rename should succeed");
+        assert_eq!(
+            session.layout().workspaces[0].name,
+            "Custom",
+            "layout must reflect the new name"
+        );
+    }
+
+    /// FIX-001 / SPEC §5.4: out-of-bounds workspace_idx returns Err without panic.
+    #[test]
+    fn test_rename_workspace_out_of_bounds_errors() {
+        let session = SessionManager::new();
+        // Default session has exactly one workspace (index 0), so index 5 is out of bounds.
+        let result = session.rename_workspace(5, "Nope");
+        assert!(result.is_err(), "rename with out-of-range idx must return Err");
+        // And the existing workspace name must be untouched.
+        assert_eq!(session.layout().workspaces[0].name, "Default");
+    }
+
+    /// FIX-001 / SPEC §5.4: rename emits a WorkspaceRenamed event with correct fields.
+    #[tokio::test]
+    async fn test_rename_workspace_emits_event() {
+        let session = SessionManager::new();
+        let mut rx = session.subscribe_output();
+        let original_id = session.layout().workspaces[0].id;
+
+        session.rename_workspace(0, "Renamed").expect("rename should succeed");
+
+        // Drain events until we see the WorkspaceRenamed variant (a deadline
+        // keeps the test bounded even if something goes wrong upstream).
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let mut got_event = false;
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+                Ok(Ok(SessionEvent::WorkspaceRenamed { workspace_idx, workspace_id, name })) => {
+                    assert_eq!(workspace_idx, 0);
+                    assert_eq!(workspace_id, original_id);
+                    assert_eq!(name, "Renamed");
+                    got_event = true;
+                    break;
+                }
+                Ok(Ok(_)) => {} // ignore unrelated events
+                Ok(Err(_)) | Err(_) => {}
+            }
+        }
+        assert!(got_event, "WorkspaceRenamed event must be broadcast on rename");
+    }
+
+    /// FIX-001 / SPEC §5.4: renaming to the current name is a no-op (no event).
+    #[tokio::test]
+    async fn test_rename_workspace_idempotent() {
+        let session = SessionManager::new();
+        // Subscribe BEFORE the no-op call so we'd see an event if one were emitted.
+        let mut rx = session.subscribe_output();
+
+        // Call rename with the same name the workspace already has ("Default").
+        session.rename_workspace(0, "Default").expect("rename idempotent call should succeed");
+
+        // Drain briefly; no WorkspaceRenamed event must arrive.
+        let deadline = std::time::Instant::now() + Duration::from_millis(200);
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+                Ok(Ok(SessionEvent::WorkspaceRenamed { .. })) => {
+                    panic!("no-op rename must not emit WorkspaceRenamed");
+                }
+                Ok(Ok(_)) => {} // ignore unrelated events
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+
+        // Name is still "Default" — no accidental mutation.
+        assert_eq!(session.layout().workspaces[0].name, "Default");
     }
 
     // -----------------------------------------------------------------------
