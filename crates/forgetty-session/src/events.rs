@@ -15,6 +15,7 @@ use uuid::Uuid;
 ///
 /// As of T-063 this channel also carries layout mutation events
 /// (`TabCreated`, `TabClosed`, `PaneSplit`, `TabMoved`, `ActiveTabChanged`).
+/// T-067 added `WorkspaceCreated`; FIX-001 added `WorkspaceRenamed`.
 /// Subscribers that only care about one class of event should filter in the
 /// receive loop.
 #[derive(Debug, Clone)]
@@ -51,8 +52,13 @@ pub enum SessionEvent {
     ActiveTabChanged { workspace_idx: usize, tab_idx: usize },
 
     // -----------------------------------------------------------------------
-    // Workspace mutation events (T-067)
+    // Workspace mutation events (T-067, FIX-001)
     // -----------------------------------------------------------------------
     /// A new workspace was created.
     WorkspaceCreated { workspace_idx: usize, workspace_id: Uuid, name: String },
+
+    /// A workspace was renamed. Carries the index, id, and new name so
+    /// subscribers can update their local copy without re-fetching the full
+    /// layout. Emitted only when the name actually changed (idempotence).
+    WorkspaceRenamed { workspace_idx: usize, workspace_id: Uuid, name: String },
 }
