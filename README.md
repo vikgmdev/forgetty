@@ -196,6 +196,24 @@ cargo run --release
 
 The release binary is at `target/release/forgetty`.
 
+### Run the dev build safely (sandbox)
+
+If you have Forgetty already installed (via `.deb` or `install.sh`) and want
+to test your local changes without touching your daily-driver state, use
+`./launch-dev.sh`. It runs `target/release/forgetty` inside an XDG-isolated
+sandbox at `/tmp/forgetty-dev/` — separate sessions, byte logs, identity
+key, and socket. Your installed daemon's state under `~/.local/share/forgetty/`
+is untouched.
+
+```sh
+./launch-dev.sh             # normal launch in the sandbox
+./launch-dev.sh --stop      # cleanly stop dev daemons (production untouched)
+./launch-dev.sh --fresh     # stop + wipe sandbox + relaunch
+./launch-dev.sh --clean     # stop + wipe sandbox + exit
+```
+
+`socat` is required for `--stop` (Debian/Ubuntu: `sudo apt install socat`).
+
 ### Running tests
 
 ```sh
