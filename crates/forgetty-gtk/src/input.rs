@@ -45,6 +45,12 @@ pub struct GhosttyInput {
 // Safety: The FFI handles are exclusively owned and not shared.
 unsafe impl Send for GhosttyInput {}
 
+impl Default for GhosttyInput {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GhosttyInput {
     /// Create a new GhosttyInput with all encoder/event handles allocated.
     pub fn new() -> Self {

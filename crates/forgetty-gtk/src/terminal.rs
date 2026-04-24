@@ -38,7 +38,7 @@ use crate::input::{GhosttyInput, ScrollAction};
 ///
 /// Tracks the current query, all match positions across the entire scrollback,
 /// and the index of the currently focused match for navigation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SearchState {
     /// Whether search mode is active (search bar visible).
     pub active: bool,
@@ -56,19 +56,6 @@ pub struct SearchState {
     /// currently focused match (`current_index` in `all_matches`), or `None`
     /// if the focused match is not in the current viewport.
     pub current_viewport_index: Option<usize>,
-}
-
-impl Default for SearchState {
-    fn default() -> Self {
-        Self {
-            active: false,
-            query: String::new(),
-            all_matches: Vec::new(),
-            matches: Vec::new(),
-            current_index: 0,
-            current_viewport_index: None,
-        }
-    }
 }
 
 /// A URL detected under the mouse cursor, with its screen position.
@@ -1670,9 +1657,9 @@ fn detect_url_at(screen: &forgetty_vt::Screen, screen_row: usize, col: usize) ->
     // Build the line text and track byte-to-col and col-to-byte mappings
     let mut line = String::new();
     let mut col_to_byte_start: Vec<usize> = Vec::with_capacity(num_cols);
-    for c in 0..num_cols {
+    for cell in cells.iter().take(num_cols) {
         col_to_byte_start.push(line.len());
-        let g = &cells[c].grapheme;
+        let g = &cell.grapheme;
         if g.is_empty() {
             line.push(' ');
         } else {
@@ -2024,8 +2011,8 @@ fn collect_matches_from_viewport(
         // in the lowercased string to column index.
         let mut line_lower = String::new();
         let mut byte_to_col: Vec<usize> = Vec::new();
-        for col in 0..num_cols.min(cells.len()) {
-            let g = &cells[col].grapheme;
+        for (col, cell) in cells.iter().enumerate().take(num_cols.min(cells.len())) {
+            let g = &cell.grapheme;
             let start_byte = line_lower.len();
             if g.is_empty() {
                 line_lower.push(' ');
@@ -2141,9 +2128,7 @@ fn recompute_all_search_matches(s: &mut TerminalState) {
     s.search.all_matches = all;
 
     // Clamp current_index to valid range.
-    if s.search.all_matches.is_empty() {
-        s.search.current_index = 0;
-    } else if s.search.current_index >= s.search.all_matches.len() {
+    if s.search.all_matches.is_empty() || s.search.current_index >= s.search.all_matches.len() {
         s.search.current_index = 0;
     }
 
@@ -2206,6 +2191,8 @@ fn update_match_label(search: &SearchState, label: &gtk4::Label) {
 ///
 /// Reads the absolute row from `all_matches[current_index]` and scrolls the
 /// viewport so that row is roughly at 1/3 from the top of the screen.
+// Why: viewport_rows > 0 is caller-enforced; saturating-sub semantics would hide the invariant.
+#[allow(clippy::implicit_saturating_sub)]
 fn scroll_to_current_match(s: &mut TerminalState) {
     if s.search.all_matches.is_empty() {
         return;

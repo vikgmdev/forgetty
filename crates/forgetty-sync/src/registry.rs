@@ -149,7 +149,7 @@ fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
         if days < dy {
             break;
         }
-        days -= dy;
+        days = days.saturating_sub(dy);
         y += 1;
     }
     let months = if is_leap(y) {
@@ -162,12 +162,12 @@ fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
         if days < *dm {
             break;
         }
-        days -= dm;
+        days = days.saturating_sub(*dm);
         m += 1;
     }
     (y, m, days + 1)
 }
 
 fn is_leap(y: u64) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
+    (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
 }
