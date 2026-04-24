@@ -382,7 +382,9 @@ async fn main_async() -> anyhow::Result<()> {
                     | Ok(SessionEvent::TabMoved { .. })
                     | Ok(SessionEvent::ActiveTabChanged { .. })
                     | Ok(SessionEvent::ActiveWorkspaceChanged { .. })
-                    | Ok(SessionEvent::WorkspaceCreated { .. }) => {
+                    | Ok(SessionEvent::WorkspaceCreated { .. })
+                    | Ok(SessionEvent::WorkspaceRenamed { .. })
+                    | Ok(SessionEvent::WorkspaceDeleted { .. }) => {
                         // Save immediately so sibling daemons' prune passes
                         // see this pane's UUID in the persisted-union (V2-007
                         // fix cycle 7). Leave the dirty flag set as well so

@@ -2769,6 +2769,67 @@ fn handle_layout_event(
                 }
             }
         }
+        LayoutEvent::WorkspaceDeleted { workspace_idx, workspace_id } => {
+            // FIX-003: daemon confirms a workspace was deleted. If GTK already
+            // applied the mutation locally (the common case — we issued the
+            // RPC ourselves from `do_delete_workspace_at_index`), match-on-id
+            // finds no local workspace and the arm is a no-op. Otherwise
+            // (external client, e.g. future paired Android delete), reconcile
+            // by removing the workspace from the local manager if it still
+            // exists. Match on `workspace_id` rather than `workspace_idx` to
+            // remain robust against concurrent local renames/creates shifting
+            // indices. In v0.1.0-beta no external client sends
+            // `delete_workspace`, so this arm is effectively dead code kept
+            // for symmetry with the `WorkspaceRenamed` arm.
+            let still_here = {
+                let Ok(mgr) = workspace_manager.try_borrow() else { return };
+                mgr.workspaces.iter().position(|w| w.id == workspace_id)
+            };
+            let Some(local_idx) = still_here else {
+                tracing::debug!(
+                    "subscribe_layout: WorkspaceDeleted ws={workspace_idx} id={workspace_id} already absent locally (our own RPC)"
+                );
+                return;
+            };
+
+            let Ok(mut mgr) = workspace_manager.try_borrow_mut() else { return };
+            if local_idx >= mgr.workspaces.len() {
+                return;
+            }
+            mgr.workspaces.remove(local_idx);
+
+            // Clamp active_index if needed. `active_index > local_idx` already
+            // implies `active_index > 0` (usize ≥ 0), so the decrement is safe
+            // without an extra > 0 guard.
+            let new_len = mgr.workspaces.len();
+            if mgr.active_index > local_idx {
+                mgr.active_index -= 1;
+            } else if mgr.active_index >= new_len && new_len > 0 {
+                mgr.active_index = new_len - 1;
+            }
+
+            // Remove the sidebar row for the deleted workspace.
+            if let Some(row) = sidebar_lb.row_at_index(local_idx as i32) {
+                sidebar_lb.remove(&row);
+            }
+
+            tracing::info!(
+                "subscribe_layout: external WorkspaceDeleted ws={workspace_idx} id={workspace_id} — removed from local state"
+            );
+            drop(mgr);
+
+            // Refresh window title with the new active workspace name.
+            let (ws_count, ws_name) = {
+                let Ok(mgr) = workspace_manager.try_borrow() else { return };
+                let name = mgr
+                    .workspaces
+                    .get(mgr.active_index)
+                    .map(|w| w.name.clone())
+                    .unwrap_or_default();
+                (mgr.workspaces.len(), name)
+            };
+            update_window_title_with_workspace(ws_count, &ws_name, workspace_manager, window);
+        }
     }
 }
 
@@ -3944,7 +4005,15 @@ fn close_pane_by_name(
         }
 
         if tab_view.n_pages() <= 1 {
-            window.close();
+            // FIX-003 AC-9: only close the window when this TabView is still
+            // attached to the main widget tree. During workspace delete the
+            // deleted workspace's TabView is removed from `main_area` before
+            // the daemon-initiated on_exit callback runs — skipping
+            // `window.close()` in that case prevents the window from
+            // disappearing when the user deletes the active workspace.
+            if tab_view.parent().is_some() {
+                window.close();
+            }
         } else {
             tab_view.close_page(&page);
         }
@@ -7699,7 +7768,16 @@ fn create_and_switch_to_new_workspace(
                         new_tab_id_map.borrow_mut().insert(page_key, tab_id);
                         page.set_title("shell");
                         new_tv.set_selected_page(&page);
-                        drawing_area.grab_focus();
+                        // FIX-003 bonus: the new workspace's TabView is added
+                        // to `main_area` later in this function. At this
+                        // point the DrawingArea is not yet mapped, so a plain
+                        // `grab_focus()` silently no-ops and default focus-
+                        // chain traversal lands on the AdwTabBar's "+" button
+                        // instead of the new pane. `focus_when_mapped` arms a
+                        // one-shot `connect_map` grab so focus lands on the
+                        // DA once it's actually mapped (same helper used by
+                        // FIX-002 and V2-007 restore).
+                        focus_when_mapped(&drawing_area);
                         register_title_timer(
                             &page,
                             &new_tv,
@@ -9175,6 +9253,16 @@ fn delete_workspace_at_index(
 }
 
 /// Internal: perform the actual workspace deletion after confirmation.
+///
+/// FIX-003: the daemon's `delete_workspace` RPC is the single source of truth
+/// for workspace existence (AD-002 / AD-007). We issue the RPC FIRST; only on
+/// success do we apply the local widget/state mutation. On RPC failure we log
+/// a warning and skip the local mutation — the subsequent `subscribe_layout`
+/// event (or next refresh) will bring GTK back in sync with daemon truth
+/// (AC-12).
+///
+/// In `--temp` mode (no daemon_client) we skip the RPC and fall back to
+/// closing panes locally via `close_workspace_panes`.
 #[allow(clippy::too_many_arguments)]
 fn do_delete_workspace_at_index(
     target_idx: usize,
@@ -9186,6 +9274,29 @@ fn do_delete_workspace_at_index(
     daemon_client: &Option<Arc<DaemonClient>>,
     shared_config: &SharedConfig,
 ) {
+    // TOCTOU-safe bounds check before issuing the RPC — another client
+    // (e.g. paired Android) could have shrunk the workspace list between
+    // dialog open and confirm. Mirrors FIX-001's rename flow.
+    {
+        let Ok(mgr) = wm.try_borrow() else { return };
+        if target_idx >= mgr.workspaces.len() || mgr.workspaces.len() <= 1 {
+            return;
+        }
+    }
+
+    // FIX-003: daemon is authoritative. Call RPC before any local widget
+    // mutation. In --temp mode (no daemon_client) fall back to the per-pane
+    // close loop below.
+    if let Some(dc) = daemon_client.as_ref() {
+        if let Err(e) = dc.delete_workspace(target_idx) {
+            tracing::warn!(
+                target_idx,
+                "delete_workspace RPC failed: {e} — skipping local mutation"
+            );
+            return;
+        }
+    }
+
     let Ok(mut mgr) = wm.try_borrow_mut() else { return };
     if target_idx >= mgr.workspaces.len() || mgr.workspaces.len() <= 1 {
         return;
@@ -9193,8 +9304,12 @@ fn do_delete_workspace_at_index(
 
     let ws = &mgr.workspaces[target_idx];
 
-    // Ask the daemon to close every pane in the workspace (or just drop in --temp).
-    close_workspace_panes(&ws.tab_states, daemon_client.as_ref().map(|a| a.as_ref()));
+    // --temp mode only: daemon RPC didn't fire, so we still need to tear down
+    // the in-process pane registry locally. In daemon mode the daemon already
+    // killed the panes + unlinked byte logs as part of the RPC.
+    if daemon_client.is_none() {
+        close_workspace_panes(&ws.tab_states, None);
+    }
 
     // Remove the TabView from main_area if it is currently visible.
     let old_tv = ws.tab_view.clone();

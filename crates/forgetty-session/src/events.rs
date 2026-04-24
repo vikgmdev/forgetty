@@ -68,4 +68,12 @@ pub enum SessionEvent {
     /// subscribers can update their local copy without re-fetching the full
     /// layout. Emitted only when the name actually changed (idempotence).
     WorkspaceRenamed { workspace_idx: usize, workspace_id: Uuid, name: String },
+
+    /// A workspace was deleted (FIX-003). Carries the index valid at emission
+    /// time (may be stale if another client shifted indices concurrently) and
+    /// the stable workspace id — subscribers should match on `workspace_id`
+    /// for idempotency. Emitted AFTER all per-pane `PaneClosed` events for the
+    /// deleted workspace's panes, so subscribers unwind pane state before
+    /// dropping the workspace row.
+    WorkspaceDeleted { workspace_idx: usize, workspace_id: Uuid },
 }

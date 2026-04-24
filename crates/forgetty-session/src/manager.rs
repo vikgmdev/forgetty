@@ -294,6 +294,104 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Delete an existing workspace (FIX-003). Removes the `SessionWorkspace`
+    /// entry from the layout, kills all its panes (PTY + byte log + on-disk
+    /// log unlink), emits a `PaneClosed` event per pane followed by a single
+    /// `WorkspaceDeleted` event, and clamps `active_workspace` to remain valid.
+    ///
+    /// Invariants:
+    /// - **Bounds check.** Returns `Err` if `workspace_idx` is out of range.
+    /// - **Last-workspace protection.** Returns `Err` if this would leave zero
+    ///   workspaces — UX policy per FIX-003 AC-3. The message is greppable
+    ///   (`"delete_workspace: cannot delete last remaining workspace"`).
+    /// - **Byte-log unlink.** For every pane in the target workspace, the
+    ///   on-disk byte log (V2-007 / AD-013) is removed via `pane_log_path`.
+    ///   `NotFound` errors are silent; other I/O errors are logged.
+    /// - **Active-workspace clamp.** If `active_workspace > idx`, it is
+    ///   decremented; if `active_workspace == idx`, it clamps to `len - 1`.
+    ///
+    /// Event ordering: every per-pane `PaneClosed` event is emitted BEFORE
+    /// the single `WorkspaceDeleted` event, so `subscribe_output` consumers
+    /// see panes disappear first and `subscribe_layout` consumers see the
+    /// workspace row disappear afterwards.
+    pub fn delete_workspace(&self, workspace_idx: usize) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+
+        if workspace_idx >= inner.layout.workspaces.len() {
+            return Err(forgetty_core::ForgettyError::Pty(format!(
+                "workspace index {workspace_idx} out of bounds (len={})",
+                inner.layout.workspaces.len()
+            )));
+        }
+
+        if inner.layout.workspaces.len() <= 1 {
+            return Err(forgetty_core::ForgettyError::Pty(
+                "delete_workspace: cannot delete last remaining workspace".to_string(),
+            ));
+        }
+
+        // Capture id + name BEFORE mutation so the event / log carry identity.
+        let workspace_id = inner.layout.workspaces[workspace_idx].id;
+        let workspace_name = inner.layout.workspaces[workspace_idx].name.clone();
+
+        // Collect all pane ids across every tab of the target workspace.
+        let mut pane_ids: Vec<PaneId> = Vec::new();
+        for tab in &inner.layout.workspaces[workspace_idx].tabs {
+            collect_pane_ids(&tab.pane_tree, &mut pane_ids);
+        }
+
+        // Kill each pane: drop byte log (closes disk appender channel),
+        // remove from registry + order, kill PTY, unlink log file, emit
+        // `PaneClosed`. Same shape as `close_tab`.
+        for pid in &pane_ids {
+            inner.pane_order.retain(|&p| p != *pid);
+            inner.byte_logs.remove(pid);
+            if let Some(mut pane) = inner.panes.remove(pid) {
+                if let Err(e) = pane.pty_bridge.pty.kill() {
+                    warn!(%pid, "delete_workspace: failed to kill PTY: {e}");
+                }
+            }
+            // Unlink on-disk byte log (V2-007). Failures other than NotFound
+            // are non-fatal — the next daemon cold-start's `prune_orphan_logs`
+            // will clean up. Direct `remove_file` (no `exists()` pre-check)
+            // avoids the classic TOCTOU race.
+            let log_path = forgetty_workspace::pane_log_path(pid.0);
+            match std::fs::remove_file(&log_path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    warn!(%pid, path = ?log_path, "delete_workspace: unlink log failed: {e}");
+                }
+            }
+            let _ = inner.event_tx.send(SessionEvent::PaneClosed { pane_id: *pid });
+        }
+
+        // Remove the workspace.
+        inner.layout.workspaces.remove(workspace_idx);
+
+        // Clamp `active_workspace` so the same logical workspace (or the
+        // adjacent one when the active was the removed one) stays active.
+        let new_len = inner.layout.workspaces.len();
+        if inner.layout.active_workspace > workspace_idx {
+            inner.layout.active_workspace -= 1;
+        } else if inner.layout.active_workspace >= new_len && new_len > 0 {
+            inner.layout.active_workspace = new_len - 1;
+        }
+
+        // Emit the lifecycle event LAST so subscribers unwind pane state
+        // before dropping the workspace row.
+        let _ = inner.event_tx.send(SessionEvent::WorkspaceDeleted { workspace_idx, workspace_id });
+
+        tracing::info!(
+            %workspace_id,
+            workspace_idx,
+            name = %workspace_name,
+            panes = pane_ids.len(),
+            "delete_workspace: workspace deleted"
+        );
+        Ok(())
+    }
+
     /// Create a new tab in the given workspace, spawn a PTY for it, and return
     /// `(pane_id, tab_id)`.
     ///
@@ -690,19 +788,24 @@ impl SessionManager {
             // V2-007: drop byte log (disk appender task exits on channel close).
             inner.byte_logs.remove(&id);
             inner.pane_order.retain(|&p| p != id);
-            // Remove the matching single-leaf tab from the default workspace.
-            // Only leaf tabs are removed here; split trees are handled by T-060+.
+            // Remove the matching single-leaf tab from whichever workspace
+            // owns this pane. Previously this only scanned `workspaces.first_mut()`
+            // which silently ignored pane-close requests targeting non-Default
+            // workspaces (FIX-003 side-fix). Each pane lives in at most one
+            // workspace, so `break` after first match is correct.
             // NOTE: do NOT call self.layout() from inside this lock — that deadlocks.
-            if let Some(ws) = inner.layout.workspaces.first_mut() {
+            for ws in inner.layout.workspaces.iter_mut() {
                 let before = ws.tabs.len();
                 ws.tabs.retain(
                     |t| !matches!(&t.pane_tree, PaneTreeLayout::Leaf { pane_id } if *pane_id == id),
                 );
-                let removed = before != ws.tabs.len();
-                // Clamp active_tab when the removed tab was at or past the current index.
-                // Guard against the empty-tabs case (saturating_sub(1) = usize::MAX).
-                if removed && ws.active_tab >= ws.tabs.len() && !ws.tabs.is_empty() {
-                    ws.active_tab = ws.tabs.len() - 1;
+                if before != ws.tabs.len() {
+                    // Clamp active_tab when the removed tab was at or past the current index.
+                    // Guard against the empty-tabs case (saturating_sub(1) = usize::MAX).
+                    if ws.active_tab >= ws.tabs.len() && !ws.tabs.is_empty() {
+                        ws.active_tab = ws.tabs.len() - 1;
+                    }
+                    break;
                 }
             }
             if let Err(e) = pane.pty_bridge.pty.kill() {
@@ -2022,5 +2125,144 @@ mod tests {
         );
 
         session.close_pane(pane_id).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX-003 unit tests — delete_workspace
+    // -----------------------------------------------------------------------
+
+    /// FIX-003 / SPEC §5.1: delete_workspace removes the entry from the layout.
+    #[test]
+    fn test_delete_workspace_removes_entry() {
+        let session = SessionManager::new();
+        let (_ws_id, ws_idx) = session.create_workspace("ToDelete");
+        assert_eq!(session.layout().workspaces.len(), 2);
+
+        session.delete_workspace(ws_idx).expect("delete should succeed");
+
+        assert_eq!(session.layout().workspaces.len(), 1);
+        assert_eq!(session.layout().workspaces[0].name, "Default");
+    }
+
+    /// FIX-003 / SPEC §4 AC-3: deleting the last workspace is rejected.
+    #[test]
+    fn test_delete_workspace_last_workspace_rejected() {
+        let session = SessionManager::new();
+        assert_eq!(session.layout().workspaces.len(), 1);
+
+        let err = session.delete_workspace(0).expect_err("last workspace must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("last remaining workspace"),
+            "error message must mention 'last remaining workspace'; got: {msg}"
+        );
+        assert_eq!(session.layout().workspaces.len(), 1);
+    }
+
+    /// FIX-003 / SPEC §4 AC-10: out-of-bounds workspace_idx returns Err.
+    #[test]
+    fn test_delete_workspace_out_of_bounds_errors() {
+        let session = SessionManager::new();
+        session.create_workspace("Second");
+        let result = session.delete_workspace(99);
+        assert!(result.is_err(), "delete with out-of-range idx must return Err");
+        assert_eq!(session.layout().workspaces.len(), 2);
+    }
+
+    /// FIX-003 / SPEC §5.1: every pane in the deleted workspace is killed and
+    /// unregistered.
+    #[tokio::test]
+    async fn test_delete_workspace_kills_panes() {
+        let session = SessionManager::new();
+        let size = test_size();
+
+        let (_, ws_idx) = session.create_workspace("Scratch");
+        let (pane_a, _) = session.create_tab(ws_idx, None, size, None).expect("tab A");
+        let (pane_b, _) = session.create_tab(ws_idx, None, size, None).expect("tab B");
+
+        assert!(session.pane_info(pane_a).is_some());
+        assert!(session.pane_info(pane_b).is_some());
+
+        session.delete_workspace(ws_idx).expect("delete should succeed");
+
+        assert!(session.pane_info(pane_a).is_none(), "pane A must be gone after workspace delete");
+        assert!(session.pane_info(pane_b).is_none(), "pane B must be gone after workspace delete");
+        assert_eq!(session.layout().workspaces.len(), 1);
+    }
+
+    /// FIX-003 / SPEC §5.1: per-pane PaneClosed events are emitted BEFORE the
+    /// single WorkspaceDeleted event.
+    #[tokio::test]
+    async fn test_delete_workspace_emits_event() {
+        let session = SessionManager::new();
+        let size = test_size();
+
+        let (ws_id, ws_idx) = session.create_workspace("DeleteMe");
+        let (_pane, _tab) = session.create_tab(ws_idx, None, size, None).expect("tab");
+
+        // Subscribe AFTER setup so we only see the delete-lifecycle events.
+        let mut rx = session.subscribe_output();
+
+        session.delete_workspace(ws_idx).expect("delete should succeed");
+
+        // Drain events looking for (a) at least one PaneClosed, then
+        // (b) exactly one WorkspaceDeleted matching our ids. Order matters:
+        // PaneClosed must arrive before WorkspaceDeleted.
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let mut saw_pane_closed = false;
+        let mut saw_workspace_deleted = false;
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+                Ok(Ok(SessionEvent::PaneClosed { .. })) => {
+                    saw_pane_closed = true;
+                }
+                Ok(Ok(SessionEvent::WorkspaceDeleted { workspace_idx, workspace_id })) => {
+                    assert_eq!(workspace_idx, ws_idx);
+                    assert_eq!(workspace_id, ws_id);
+                    assert!(
+                        saw_pane_closed,
+                        "WorkspaceDeleted must arrive AFTER PaneClosed events"
+                    );
+                    saw_workspace_deleted = true;
+                    break;
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) | Err(_) => {}
+            }
+        }
+        assert!(saw_workspace_deleted, "WorkspaceDeleted event must be broadcast on delete");
+    }
+
+    /// FIX-003 / SPEC §5.1 #6: active_workspace is clamped when the deleted
+    /// workspace is at or before the active index.
+    #[test]
+    fn test_delete_workspace_clamps_active_workspace() {
+        let session = SessionManager::new();
+        session.create_workspace("A");
+        session.create_workspace("B");
+        // Layout is now [Default, A, B]. Use set_active_workspace to move
+        // active to index 2 (B).
+        session.set_active_workspace(2).expect("set active");
+        assert_eq!(session.layout().active_workspace, 2);
+
+        // Delete the middle workspace (A at idx 1). active_workspace was 2 >
+        // deleted_idx 1 so it should decrement to 1.
+        session.delete_workspace(1).expect("delete A");
+        assert_eq!(session.layout().workspaces.len(), 2);
+        assert_eq!(
+            session.layout().active_workspace,
+            1,
+            "active_workspace should decrement when a workspace before it is removed"
+        );
+
+        // Now delete idx 1 (which was B, now at idx 1) while active. Should
+        // clamp to idx 0.
+        session.delete_workspace(1).expect("delete B");
+        assert_eq!(session.layout().workspaces.len(), 1);
+        assert_eq!(
+            session.layout().active_workspace,
+            0,
+            "active_workspace should clamp to len-1 when the active workspace is removed"
+        );
     }
 }
