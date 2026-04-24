@@ -2905,48 +2905,66 @@ fn build_widget_from_pane_tree(
             paned.set_start_child(Some(&first_widget));
             paned.set_end_child(Some(&second_widget));
 
-            // Apply the saved split ratio once the Paned has a real size.
+            // Apply the saved split ratio the first time the Paned is mapped
+            // AND has a usable size.
             //
-            // Earlier code used `glib::idle_add_local_once` to set the
-            // position, but nested Paneds don't finish their layout pass by
-            // the next idle tick — the child Paneds still report
-            // `width()/height() == 0`, `set_position((size * ratio) as i32)`
-            // evaluates to 0, and GTK clamps to the handle minimum. That
-            // visually collapsed every nested split to ~50/50 on restore
-            // (session-restore bug 3). The fix uses a bounded retry
-            // (`glib::idle_add_local` returning `ControlFlow::Continue`
-            // until the widget has a usable size), capped at
-            // `MAX_RETRIES` to avoid pathological loops if the Paned is
-            // never given a non-zero size. This is off the PTY hot path
-            // and scoped per-Paned to the restore path only (AD-009 ok).
+            // Earlier iterations used `glib::idle_add_local_once` / a bounded
+            // idle-retry scheduled at build time, but both had the same flaw:
+            // for splits on INACTIVE tabs, the Paned's widget subtree never
+            // gets mapped or allocated during the retry window, so
+            // `width()/height()` reads as 0 for every retry and the loop
+            // exhausts. When the user later switches to that tab, the Paned
+            // finally gets a real allocation but no retry is pending — the
+            // divider sticks to GTK's default position and the top pane is
+            // visually collapsed (the inactive-tab edge case Vick hit on
+            // 2026-04-24 QA with a vertical split at ratio=0.05 on a
+            // background tab).
+            //
+            // The fix hooks `connect_map`: every time the Paned is mapped
+            // (first show, and subsequent show-after-tab-switch), we schedule
+            // an idle retry that walks until the widget reports a usable size.
+            // Once applied, `applied` latches true and subsequent `map` firings
+            // no-op. Uses the same latch pattern as FIX-002.
             let saved_ratio = (*ratio).clamp(0.05, 0.95);
-            let paned_weak = paned.downgrade();
-            let retries_left = Rc::new(Cell::new(RESTORE_RATIO_MAX_RETRIES));
-            glib::idle_add_local(move || {
-                let Some(paned) = paned_weak.upgrade() else {
-                    return glib::ControlFlow::Break;
-                };
-                let size = match paned.orientation() {
-                    gtk4::Orientation::Horizontal => paned.width(),
-                    _ => paned.height(),
-                };
-                if size > 1 {
-                    let target = ((size as f32) * saved_ratio) as i32;
-                    if target > 0 {
-                        paned.set_position(target);
+            let applied = Rc::new(Cell::new(false));
+            let applied_for_map = applied.clone();
+            paned.connect_map(move |p| {
+                if applied_for_map.get() {
+                    return;
+                }
+                let paned_weak = p.downgrade();
+                let applied_for_idle = applied_for_map.clone();
+                let retries_left = Rc::new(Cell::new(RESTORE_RATIO_MAX_RETRIES));
+                glib::idle_add_local(move || {
+                    if applied_for_idle.get() {
+                        return glib::ControlFlow::Break;
                     }
-                    return glib::ControlFlow::Break;
-                }
-                let remaining = retries_left.get();
-                if remaining == 0 {
-                    tracing::debug!(
-                        "session-restore: split ratio {:.3} not applied — Paned never got a usable size",
-                        saved_ratio
-                    );
-                    return glib::ControlFlow::Break;
-                }
-                retries_left.set(remaining - 1);
-                glib::ControlFlow::Continue
+                    let Some(paned) = paned_weak.upgrade() else {
+                        return glib::ControlFlow::Break;
+                    };
+                    let size = match paned.orientation() {
+                        gtk4::Orientation::Horizontal => paned.width(),
+                        _ => paned.height(),
+                    };
+                    if size > 1 {
+                        let target = ((size as f32) * saved_ratio) as i32;
+                        if target > 0 {
+                            paned.set_position(target);
+                        }
+                        applied_for_idle.set(true);
+                        return glib::ControlFlow::Break;
+                    }
+                    let remaining = retries_left.get();
+                    if remaining == 0 {
+                        tracing::debug!(
+                            "session-restore: split ratio {:.3} not applied after map — Paned reported usable size too slowly",
+                            saved_ratio
+                        );
+                        return glib::ControlFlow::Break;
+                    }
+                    retries_left.set(remaining - 1);
+                    glib::ControlFlow::Continue
+                });
             });
 
             Some((paned.upcast::<gtk4::Widget>(), first_da))

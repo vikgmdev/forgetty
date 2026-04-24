@@ -251,7 +251,7 @@ pub fn list_trashed_sessions_with_info() -> Vec<TrashedSessionInfo> {
         infos.push(TrashedSessionInfo { session_id, workspace_names, tab_count, closed_at });
     }
     // Sort by most recently closed first.
-    infos.sort_by(|a, b| b.closed_at.cmp(&a.closed_at));
+    infos.sort_by_key(|i| std::cmp::Reverse(i.closed_at));
     infos
 }
 
