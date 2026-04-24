@@ -28,7 +28,7 @@ use crate::byte_log::ByteLog;
 use crate::drain_result::DrainResult;
 use crate::events::SessionEvent;
 use crate::layout::{SessionLayout, SessionTab};
-use crate::pane::{PaneInfo, PaneState};
+use crate::pane::{DuplicatedTab, PaneInfo, PaneState};
 use crate::pty_bridge::PtyBridge;
 use crate::workspace::{build_workspace_state, PaneTreeLayout, WorkspaceLayout};
 
@@ -390,6 +390,213 @@ impl SessionManager {
             "delete_workspace: workspace deleted"
         );
         Ok(())
+    }
+
+    /// Duplicate an existing workspace (FIX-007). Creates a new
+    /// `SessionWorkspace` at `source_workspace_idx + 1` with the same tab
+    /// count as the source, each tab backed by a fresh PTY whose initial
+    /// `cwd` is inherited from the corresponding source tab's leftmost-leaf
+    /// `PaneState.cwd`. The source workspace is never mutated — its tabs,
+    /// pane UUIDs, PTYs, and byte logs remain untouched.
+    ///
+    /// Semantics:
+    /// - **Bounds check.** Returns `Err` if `source_workspace_idx` is out of
+    ///   range. Same error style as `create_tab` / `delete_workspace`.
+    /// - **Name.** If `new_name` is `None`, derives `"<source> (copy)"`;
+    ///   otherwise uses the caller-provided name verbatim (no trimming).
+    /// - **Atomicity (AC-9).** All-or-nothing PTY spawn. If any per-tab
+    ///   `PtyBridge::spawn` fails, every already-spawned PTY is killed,
+    ///   `inner.panes` + `inner.pane_order` are NOT mutated, no
+    ///   `SessionWorkspace` is inserted, and the underlying `PtyError` is
+    ///   returned to the caller. Byte logs and drain tasks only come online
+    ///   after the commit phase, so failure leaves zero partial state on disk.
+    /// - **Split trees are NOT copied.** Each duplicate tab starts as a
+    ///   single `PaneTreeLayout::Leaf`. Split-tree duplication is an
+    ///   explicit non-goal (SPEC §3.3).
+    /// - **Active workspace clamp.** If `active_workspace > source_idx`, it
+    ///   is shifted by +1 to preserve identity across the insert. If
+    ///   `active_workspace == source_idx`, it is left unchanged (the source
+    ///   stays active; GTK decides whether to switch focus via a separate
+    ///   `set_active_workspace` RPC).
+    ///
+    /// Event fanout (in order):
+    /// 1. `WorkspaceCreated { workspace_idx: insert_at, workspace_id, name }`
+    /// 2. For each duplicate tab (source order):
+    ///    `PaneCreated { pane_id }` followed by
+    ///    `TabCreated { workspace_idx: insert_at, tab_id, pane_id }`.
+    ///
+    /// No new `SessionEvent` variant is introduced — this mirrors
+    /// `create_workspace` + `create_tab`, so subscribers (FIX-001-confirmed
+    /// `WorkspaceCreated` fan-out, FIX-003-confirmed `TabCreated` fan-out,
+    /// `daemon.rs` immediate-save trigger) pick up the duplicate for free.
+    ///
+    /// Returns `(new_workspace_id, insert_at, duplicated_tabs)` where
+    /// `duplicated_tabs.len()` equals the source's tab count.
+    pub fn duplicate_workspace(
+        &self,
+        source_workspace_idx: usize,
+        new_name: Option<&str>,
+        default_size: PtySize,
+    ) -> Result<(Uuid, usize, Vec<DuplicatedTab>)> {
+        // Phase 1 — snapshot from the source under the lock, then RELEASE it
+        // before the long-running PTY spawns in Phase 2. This is NOT a single
+        // critical section; Phase 3 re-acquires the lock and defensively
+        // clamps `insert_at` to the current workspace count (a concurrent
+        // mutator may have shrunk the layout in between). The snapshot of
+        // source name / CWDs is accepted as stale-tolerant per AD-007 —
+        // the daemon-side identity of the duplicate is fixed at Phase 1.
+        let (dup_name, insert_at, cwds): (String, usize, Vec<Option<PathBuf>>) = {
+            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+
+            if source_workspace_idx >= inner.layout.workspaces.len() {
+                return Err(forgetty_core::ForgettyError::Pty(format!(
+                    "duplicate_workspace: workspace index {source_workspace_idx} out of bounds (len={})",
+                    inner.layout.workspaces.len()
+                )));
+            }
+
+            let source = &inner.layout.workspaces[source_workspace_idx];
+            let dup_name = match new_name {
+                Some(n) => n.to_string(),
+                None => format!("{} (copy)", source.name),
+            };
+
+            // Per-tab leftmost-leaf CWDs. Missing pane (shouldn't happen, but
+            // handled for robustness) or None cwd → `home_dir_fallback` later.
+            let cwds: Vec<Option<PathBuf>> = source
+                .tabs
+                .iter()
+                .map(|tab| {
+                    leftmost_leaf_id(&tab.pane_tree)
+                        .and_then(|pid| inner.panes.get(&pid).map(|p| p.cwd.clone()))
+                })
+                .collect();
+
+            (dup_name, source_workspace_idx + 1, cwds)
+        };
+
+        // Phase 2 — spawn PTYs OUTSIDE the mutex. PtyBridge::spawn may
+        // fork/exec which is slow; holding the session mutex across that
+        // would block every other RPC. If any spawn fails, kill the already-
+        // spawned bridges and return — no `inner` mutation has happened yet,
+        // so there is nothing to roll back beyond the PTY kills.
+        let mut spawned: Vec<(PaneId, PtyBridge, PathBuf)> = Vec::with_capacity(cwds.len());
+        for cwd_opt in &cwds {
+            let pane_id = PaneId::new();
+            match PtyBridge::spawn(default_size, cwd_opt.as_deref(), None, None, true) {
+                Ok(bridge) => {
+                    let initial_cwd = cwd_opt.clone().unwrap_or_else(home_dir_fallback);
+                    spawned.push((pane_id, bridge, initial_cwd));
+                }
+                Err(e) => {
+                    let failed_tab = spawned.len() + 1;
+                    // Roll back every successfully-spawned bridge.
+                    for (_, mut bridge, _) in spawned {
+                        if let Err(kill_err) = bridge.pty.kill() {
+                            warn!("duplicate_workspace: rollback kill failed: {kill_err}");
+                        }
+                    }
+                    return Err(forgetty_core::ForgettyError::Pty(format!(
+                        "duplicate_workspace: PTY spawn failed on tab {} of {}: {e}",
+                        failed_tab,
+                        cwds.len()
+                    )));
+                }
+            }
+        }
+
+        // Phase 3 — commit: insert panes + workspace + fan out events under
+        // the mutex in a single critical section.
+        let new_ws_id = Uuid::new_v4();
+        let mut dup_tabs: Vec<DuplicatedTab> = Vec::with_capacity(spawned.len());
+
+        let committed_idx = {
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+
+            // Re-check bounds — another mutator could have changed the layout
+            // between phase 1 and phase 3. `insert_at` was computed from
+            // `source_idx + 1`; if the layout shrank it may now equal or
+            // exceed `workspaces.len()`. Clamp to the end (append) rather
+            // than error — the source still exists (guard below) and pushing
+            // past the end is safer than failing a user-visible action.
+            // NOTE: `Vec::insert` requires `idx <= len` — clamp defensively.
+            let clamped_insert = insert_at.min(inner.layout.workspaces.len());
+
+            let mut new_tabs: Vec<SessionTab> = Vec::with_capacity(spawned.len());
+            for (pane_id, bridge, initial_cwd) in spawned {
+                let pane = PaneState {
+                    id: pane_id,
+                    pty_bridge: bridge,
+                    cwd: initial_cwd,
+                    title: String::new(),
+                    rows: default_size.rows,
+                    cols: default_size.cols,
+                };
+                inner.panes.insert(pane_id, pane);
+                inner.pane_order.push(pane_id);
+
+                let tab_id = Uuid::new_v4();
+                new_tabs.push(SessionTab {
+                    id: tab_id,
+                    title: String::new(),
+                    pane_tree: PaneTreeLayout::Leaf { pane_id },
+                });
+                dup_tabs.push(DuplicatedTab { tab_id, pane_id });
+            }
+
+            let new_workspace = crate::layout::SessionWorkspace {
+                id: new_ws_id,
+                name: dup_name.clone(),
+                tabs: new_tabs,
+                active_tab: 0,
+            };
+
+            inner.layout.workspaces.insert(clamped_insert, new_workspace);
+
+            // Shift active_workspace if the insertion point is at or before
+            // the currently-active workspace — keeps the same logical
+            // workspace focused across the insert. If active == source_idx
+            // the source stays active (clamped_insert > source_idx so this
+            // branch does not fire for the source itself).
+            if inner.layout.active_workspace >= clamped_insert {
+                inner.layout.active_workspace += 1;
+            }
+
+            // Fan out events. Order per SPEC §5.1.7: WorkspaceCreated first,
+            // then per tab (PaneCreated, TabCreated).
+            let _ = inner.event_tx.send(SessionEvent::WorkspaceCreated {
+                workspace_idx: clamped_insert,
+                workspace_id: new_ws_id,
+                name: dup_name.clone(),
+            });
+            for dt in &dup_tabs {
+                let _ = inner.event_tx.send(SessionEvent::PaneCreated { pane_id: dt.pane_id });
+                let _ = inner.event_tx.send(SessionEvent::TabCreated {
+                    workspace_idx: clamped_insert,
+                    tab_id: dt.tab_id,
+                    pane_id: dt.pane_id,
+                });
+            }
+
+            tracing::info!(
+                source_workspace_idx,
+                workspace_idx = clamped_insert,
+                %new_ws_id,
+                name = %dup_name,
+                tabs = dup_tabs.len(),
+                "duplicate_workspace: workspace duplicated"
+            );
+            clamped_insert
+        };
+
+        // Phase 4 — spawn drain tasks AFTER releasing the mutex (same
+        // pattern as `create_tab`). Each task also creates the per-pane
+        // byte log (V2-007 / AD-013).
+        for dt in &dup_tabs {
+            self.spawn_drain_task(dt.pane_id);
+        }
+
+        Ok((new_ws_id, committed_idx, dup_tabs))
     }
 
     /// Create a new tab in the given workspace, spawn a PTY for it, and return
@@ -2264,5 +2471,298 @@ mod tests {
             0,
             "active_workspace should clamp to len-1 when the active workspace is removed"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX-007 unit tests — duplicate_workspace
+    // -----------------------------------------------------------------------
+
+    /// FIX-007 / SPEC §4 AC-1 (partial): basic duplicate with 2 tabs
+    /// produces a new workspace with 2 fresh-UUID tabs.
+    #[tokio::test]
+    async fn test_duplicate_workspace_basic_two_tabs() {
+        let session = SessionManager::new();
+        let size = test_size();
+
+        // Source: workspace at idx 0 with 2 tabs.
+        let (_src_pane_a, _src_tab_a) = session.create_tab(0, None, size, None).expect("tab A");
+        let (_src_pane_b, _src_tab_b) = session.create_tab(0, None, size, None).expect("tab B");
+
+        let initial_count = session.layout().workspaces.len();
+        let (_new_ws_id, new_idx, dup_tabs) =
+            session.duplicate_workspace(0, None, size).expect("duplicate");
+
+        // Invariants.
+        let layout = session.layout();
+        assert_eq!(layout.workspaces.len(), initial_count + 1, "one new workspace");
+        assert_eq!(new_idx, 1, "duplicate inserted at source_idx + 1");
+        assert_eq!(dup_tabs.len(), 2, "duplicate has same tab count as source");
+        assert_eq!(layout.workspaces[new_idx].tabs.len(), 2);
+        assert_eq!(layout.workspaces[new_idx].name, "Default (copy)");
+
+        // Each duplicate tab's pane_id must be live in the registry.
+        for dt in &dup_tabs {
+            assert!(
+                session.pane_info(dt.pane_id).is_some(),
+                "duplicate pane {} must be in registry",
+                dt.pane_id
+            );
+        }
+
+        // Source and duplicate tab IDs must not overlap.
+        let src_tab_ids: Vec<Uuid> = layout.workspaces[0].tabs.iter().map(|t| t.id).collect();
+        for dt in &dup_tabs {
+            assert!(
+                !src_tab_ids.contains(&dt.tab_id),
+                "duplicate tab_id {} leaked from source",
+                dt.tab_id
+            );
+        }
+    }
+
+    /// FIX-007 / SPEC §4 AC-2: source workspace is byte-unchanged after duplicate.
+    #[tokio::test]
+    async fn test_duplicate_workspace_preserves_source() {
+        let session = SessionManager::new();
+        let size = test_size();
+
+        let (_, src_tab_a) = session.create_tab(0, None, size, None).expect("tab A");
+        let (_, src_tab_b) = session.create_tab(0, None, size, None).expect("tab B");
+
+        // Snapshot source tab ids + pane ids + tab count BEFORE duplicate.
+        let before = session.layout();
+        let src_ws = &before.workspaces[0];
+        let src_tab_ids_before: Vec<Uuid> = src_ws.tabs.iter().map(|t| t.id).collect();
+        let src_pane_ids_before: Vec<PaneId> = src_ws
+            .tabs
+            .iter()
+            .filter_map(|t| match &t.pane_tree {
+                PaneTreeLayout::Leaf { pane_id } => Some(*pane_id),
+                _ => None,
+            })
+            .collect();
+        let src_tab_count_before = src_ws.tabs.len();
+
+        session.duplicate_workspace(0, None, size).expect("duplicate");
+
+        // Source snapshot AFTER duplicate.
+        let after = session.layout();
+        let src_ws_after = &after.workspaces[0];
+        let src_tab_ids_after: Vec<Uuid> = src_ws_after.tabs.iter().map(|t| t.id).collect();
+        let src_pane_ids_after: Vec<PaneId> = src_ws_after
+            .tabs
+            .iter()
+            .filter_map(|t| match &t.pane_tree {
+                PaneTreeLayout::Leaf { pane_id } => Some(*pane_id),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(src_tab_ids_before, src_tab_ids_after, "source tab ids must be unchanged");
+        assert_eq!(src_pane_ids_before, src_pane_ids_after, "source pane ids must be unchanged");
+        assert_eq!(
+            src_ws_after.tabs.len(),
+            src_tab_count_before,
+            "source tab count must be unchanged (not doubled)"
+        );
+        assert!(src_tab_ids_before.contains(&src_tab_a));
+        assert!(src_tab_ids_before.contains(&src_tab_b));
+    }
+
+    /// FIX-007 / SPEC §4 AC-6: duplicate of an empty source is a 0-tab workspace.
+    #[test]
+    fn test_duplicate_workspace_empty_source() {
+        let session = SessionManager::new();
+        let size = test_size();
+
+        // Default workspace has 0 tabs on fresh session.
+        assert_eq!(session.layout().workspaces[0].tabs.len(), 0);
+
+        let (_new_id, new_idx, dup_tabs) =
+            session.duplicate_workspace(0, None, size).expect("duplicate empty");
+
+        assert_eq!(dup_tabs.len(), 0, "duplicate has 0 tabs when source is empty");
+        let layout = session.layout();
+        assert_eq!(layout.workspaces[new_idx].tabs.len(), 0);
+        assert_eq!(layout.workspaces[new_idx].name, "Default (copy)");
+    }
+
+    /// FIX-007 / SPEC §5.1.7 + §4 AC-14: event ordering for duplicate is
+    /// WorkspaceCreated first, then per-tab PaneCreated then TabCreated.
+    #[tokio::test]
+    async fn test_duplicate_workspace_emits_events() {
+        let session = SessionManager::new();
+        let size = test_size();
+
+        // Source with 2 tabs.
+        session.create_tab(0, None, size, None).expect("tab A");
+        session.create_tab(0, None, size, None).expect("tab B");
+
+        // Subscribe BEFORE duplicate so we capture the full event sequence.
+        let mut rx = session.subscribe_output();
+
+        let (_new_id, new_idx, dup_tabs) =
+            session.duplicate_workspace(0, None, size).expect("duplicate");
+
+        // Drain until we see WorkspaceCreated + two TabCreated events.
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let mut saw_workspace_created = false;
+        let mut tab_created_count = 0;
+        let mut pane_created_after_ws_created = 0;
+        while std::time::Instant::now() < deadline
+            && (!saw_workspace_created || tab_created_count < dup_tabs.len())
+        {
+            match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+                Ok(Ok(SessionEvent::WorkspaceCreated { workspace_idx, .. })) => {
+                    assert_eq!(workspace_idx, new_idx, "WorkspaceCreated must carry the new index");
+                    saw_workspace_created = true;
+                }
+                Ok(Ok(SessionEvent::TabCreated { workspace_idx, .. })) => {
+                    assert!(
+                        saw_workspace_created,
+                        "TabCreated must follow WorkspaceCreated for ordering"
+                    );
+                    assert_eq!(workspace_idx, new_idx);
+                    tab_created_count += 1;
+                }
+                Ok(Ok(SessionEvent::PaneCreated { .. })) => {
+                    if saw_workspace_created {
+                        pane_created_after_ws_created += 1;
+                    }
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) | Err(_) => {}
+            }
+        }
+
+        assert!(saw_workspace_created, "WorkspaceCreated event must be emitted");
+        assert_eq!(tab_created_count, dup_tabs.len(), "one TabCreated per duplicate tab");
+        assert!(
+            pane_created_after_ws_created >= dup_tabs.len(),
+            "at least one PaneCreated per duplicate tab must follow WorkspaceCreated"
+        );
+    }
+
+    /// FIX-007 / SPEC §4 AC-8: out-of-bounds source_workspace_idx returns Err.
+    #[test]
+    fn test_duplicate_workspace_out_of_bounds_errors() {
+        let session = SessionManager::new();
+        let size = test_size();
+
+        let before = session.layout().workspaces.len();
+        let result = session.duplicate_workspace(99, None, size);
+        assert!(result.is_err(), "out-of-bounds must return Err");
+        assert_eq!(session.layout().workspaces.len(), before, "layout must be untouched on error");
+
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("out of bounds"),
+            "error message should mention out-of-bounds; got: {msg}"
+        );
+    }
+
+    /// FIX-007 / SPEC §5.1.2: explicit name overrides the `(copy)` derivation.
+    #[test]
+    fn test_duplicate_workspace_explicit_name() {
+        let session = SessionManager::new();
+        let size = test_size();
+
+        let (_id, new_idx, _tabs) = session
+            .duplicate_workspace(0, Some("CustomName"), size)
+            .expect("duplicate with custom name");
+
+        assert_eq!(session.layout().workspaces[new_idx].name, "CustomName");
+    }
+
+    /// FIX-007 / SPEC §4 AC-4: each duplicate tab's PaneState.cwd inherits
+    /// the corresponding source tab's leftmost-leaf CWD.
+    #[tokio::test]
+    async fn test_duplicate_workspace_cwd_inherited() {
+        let session = SessionManager::new();
+        let size = test_size();
+
+        // Create two source tabs with explicit CWDs.
+        let cwd_a = std::path::PathBuf::from("/tmp");
+        let cwd_b = std::env::var("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("/"));
+        let (_, _) = session.create_tab(0, Some(cwd_a.clone()), size, None).expect("tab A /tmp");
+        let (_, _) = session.create_tab(0, Some(cwd_b.clone()), size, None).expect("tab B $HOME");
+
+        let (_id, new_idx, dup_tabs) =
+            session.duplicate_workspace(0, None, size).expect("duplicate");
+
+        assert_eq!(dup_tabs.len(), 2);
+        let layout = session.layout();
+        assert_eq!(layout.workspaces[new_idx].tabs.len(), 2);
+
+        // Inspect each duplicate pane's CWD via pane_info.
+        let dup_cwd_a = session.pane_info(dup_tabs[0].pane_id).expect("dup A info").cwd;
+        let dup_cwd_b = session.pane_info(dup_tabs[1].pane_id).expect("dup B info").cwd;
+
+        // The PTY's /proc/{pid}/cwd refresh in process_pane_bytes may update
+        // pane.cwd away from the initial spawn CWD if the shell cd's
+        // immediately. Our spawn path sets PaneState.cwd to the supplied
+        // `cwd` argument (before any drain occurs), so the cached value
+        // right after duplicate should match the source's CWD.
+        assert_eq!(
+            dup_cwd_a, cwd_a,
+            "duplicate tab A CWD should inherit source A's CWD ({cwd_a:?})"
+        );
+        assert_eq!(
+            dup_cwd_b, cwd_b,
+            "duplicate tab B CWD should inherit source B's CWD ({cwd_b:?})"
+        );
+    }
+
+    /// FIX-007 / SPEC §5.1.6: active_workspace stays on the source when the
+    /// source itself is active.
+    #[tokio::test]
+    async fn test_duplicate_workspace_active_workspace_clamp_source_active() {
+        let session = SessionManager::new();
+        let size = test_size();
+
+        // Give the Default (idx 0) a tab so it can be active.
+        session.create_tab(0, None, size, None).expect("tab");
+
+        // active_workspace starts at 0; the source is at 0.
+        assert_eq!(session.layout().active_workspace, 0);
+
+        session.duplicate_workspace(0, None, size).expect("duplicate");
+
+        // The source stays at idx 0; active_workspace should remain 0.
+        assert_eq!(
+            session.layout().active_workspace,
+            0,
+            "duplicating the source must not shift active_workspace when source is active"
+        );
+        assert_eq!(session.layout().workspaces[0].name, "Default");
+        assert_eq!(session.layout().workspaces[1].name, "Default (copy)");
+    }
+
+    /// FIX-007 / SPEC §5.1.6: active_workspace shifts by +1 when the active
+    /// workspace is AFTER the source.
+    #[tokio::test]
+    async fn test_duplicate_workspace_active_workspace_shift_when_active_after() {
+        let session = SessionManager::new();
+        let size = test_size();
+
+        session.create_workspace("A");
+        session.create_workspace("B");
+        // Layout: [Default, A, B]. Source is Default (idx 0), active is B (idx 2).
+        session.create_tab(2, None, size, None).expect("B tab"); // make B selectable
+        session.set_active_workspace(2).expect("set active B");
+        assert_eq!(session.layout().active_workspace, 2);
+
+        session.duplicate_workspace(0, None, size).expect("duplicate Default");
+
+        // After duplicate: [Default, Default (copy), A, B]. B is now at idx 3.
+        assert_eq!(session.layout().workspaces.len(), 4);
+        assert_eq!(
+            session.layout().active_workspace,
+            3,
+            "active_workspace should shift by +1 to follow B across the insert"
+        );
+        assert_eq!(session.layout().workspaces[3].name, "B");
     }
 }

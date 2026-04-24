@@ -8913,6 +8913,27 @@ fn show_rename_workspace_dialog_for(
 /// Duplicate a workspace: create a new WorkspaceView with the same tab CWDs,
 /// insert it immediately after the source, and switch to it.
 #[allow(clippy::too_many_arguments)]
+/// Duplicate a workspace (FIX-007). The daemon is authoritative — GTK sends
+/// a `duplicate_workspace` RPC, then builds widgets from the response.
+///
+/// In `--temp` mode (no daemon) the pre-FIX-007 local-only behaviour is
+/// preserved. In daemon mode the old local-only flow is replaced by an
+/// RPC-first flow:
+///
+/// 1. TOCTOU-safe bounds re-check against GTK state (context menu already
+///    captured `workspace_idx` at construction time per the existing pattern
+///    at `app.rs:~8520`).
+/// 2. `dc.duplicate_workspace(workspace_idx, None)` — daemon builds the
+///    duplicate `SessionWorkspace` with fresh PTYs (one per source tab,
+///    inheriting leftmost-leaf CWDs).
+/// 3. On RPC success, GTK constructs the new `WorkspaceView` from the
+///    returned `(workspace_id, workspace_idx, tabs)` tuple — per-tab
+///    subscribe_output + terminal widget.
+/// 4. On RPC error, log + return without any local mutation.
+///
+/// Bonus from FIX-003: the duplicate's first-tab DrawingArea receives a
+/// `focus_when_mapped` grab so the AdwTabBar "+" button doesn't steal focus
+/// on first activation.
 fn duplicate_workspace(
     workspace_idx: usize,
     wm: &WorkspaceManager,
@@ -8920,6 +8941,274 @@ fn duplicate_workspace(
     tab_bar: &adw::TabBar,
     window: &adw::ApplicationWindow,
     daemon_client: &Option<Arc<DaemonClient>>,
+    shared_config: &SharedConfig,
+    sidebar_lb: &gtk4::ListBox,
+) {
+    // TOCTOU-safe bounds re-check — the context menu captured
+    // `workspace_idx` at menu-construction time (`app.rs:~8520`), but
+    // another client (paired Android) or mid-menu sidebar click could
+    // have shifted indices. Mirrors FIX-003's discipline
+    // (`do_delete_workspace_at_index` at `app.rs:~9277`).
+    {
+        let Ok(mgr) = wm.try_borrow() else { return };
+        if workspace_idx >= mgr.workspaces.len() {
+            return;
+        }
+    }
+
+    // --temp mode (no daemon client): fall back to the legacy local-only
+    // duplicate to keep in-memory workspaces working. Daily-driver runs
+    // the daemon-mode path below (AC-10).
+    let Some(dc) = daemon_client.as_ref().cloned() else {
+        duplicate_workspace_temp_fallback(
+            workspace_idx,
+            wm,
+            main_area,
+            tab_bar,
+            window,
+            shared_config,
+            sidebar_lb,
+        );
+        return;
+    };
+
+    // Borrow the config outside the RPC call — the RPC blocks on the socket
+    // and we don't want to hold the SharedConfig borrow across it.
+    let cfg = {
+        let Ok(cfg_borrow) = shared_config.try_borrow() else { return };
+        cfg_borrow.clone()
+    };
+
+    // Daemon-authoritative RPC. Daemon reads source CWDs from its own
+    // `PaneState.cwd` registry (SPEC §5.1.3) so GTK does not need to
+    // collect per-tab CWDs client-side anymore.
+    let (ws_id, daemon_idx, dup_tabs) = match dc.duplicate_workspace(workspace_idx, None) {
+        Ok(tuple) => tuple,
+        Err(e) => {
+            tracing::warn!(
+                workspace_idx,
+                "duplicate_workspace RPC failed: {e} — skipping local mutation"
+            );
+            return;
+        }
+    };
+
+    // Daemon is authoritative for placement (AD-007). Use the daemon's
+    // returned `workspace_idx` as the insertion index so GTK and daemon
+    // indices stay lock-step — critical because the daemon persists the
+    // layout by index and GTK's `set_active_workspace` RPC routes by the
+    // same index space. Clamp to `mgr.workspaces.len()` below (insert at
+    // end at worst) if the daemon and GTK disagree on workspace count.
+    let insert_at = daemon_idx;
+
+    // Build the new WorkspaceView scaffolding. Same shape as
+    // `create_and_switch_to_new_workspace`.
+    let new_tv = adw::TabView::new();
+    new_tv.set_vexpand(true);
+    new_tv.set_hexpand(true);
+
+    let new_tab_states: TabStateMap = Rc::new(RefCell::new(HashMap::new()));
+    let new_focus_tracker: FocusTracker = Rc::new(RefCell::new(String::new()));
+    let new_custom_titles: CustomTitles = Rc::new(RefCell::new(HashSet::new()));
+    let new_tab_id_map: TabIdMap = Rc::new(RefCell::new(HashMap::new()));
+    let new_tab_colors: TabColorMap = Rc::new(RefCell::new(HashMap::new()));
+
+    wire_tab_view_handlers(
+        &new_tv,
+        &new_tab_states,
+        &new_focus_tracker,
+        &new_tab_id_map,
+        window,
+        Some(Arc::clone(&dc)),
+    );
+    wire_tab_context_menu_signal(
+        &new_tv,
+        wm,
+        tab_bar,
+        window,
+        Some(Arc::clone(&dc)),
+        shared_config,
+    );
+    {
+        let app_c = window
+            .application()
+            .and_downcast::<adw::Application>()
+            .expect("window must be in an adw::Application");
+        new_tv.connect_create_window(move |_| Some(open_detached_tab_window(&app_c)));
+    }
+
+    // Build one widget per duplicated daemon tab. Same leaf-subscription
+    // pattern as `build_widget_from_pane_tree` / `create_and_switch_to_new_workspace`.
+    let mut first_da_opt: Option<gtk4::DrawingArea> = None;
+    for dup_tab in &dup_tabs {
+        let channel = match dc.subscribe_output(dup_tab.pane_id) {
+            Ok(ch) => ch,
+            Err(e) => {
+                tracing::warn!(
+                    pane_id = %dup_tab.pane_id,
+                    "duplicate_workspace: subscribe_output failed: {e} — skipping this tab"
+                );
+                continue;
+            }
+        };
+
+        let on_exit =
+            make_on_exit_callback(&new_tv, &new_tab_states, window, Some(Arc::clone(&dc)));
+        let on_notify = make_on_notify_callback(&new_tv, &new_tab_states, window);
+
+        match terminal::create_terminal(
+            &cfg,
+            dup_tab.pane_id,
+            Arc::clone(&dc),
+            channel,
+            None,
+            Some(on_exit),
+            Some(on_notify),
+        ) {
+            Ok((pane_vbox, drawing_area, state)) => {
+                let widget_name = next_pane_id();
+                drawing_area.set_widget_name(&widget_name);
+                new_tab_states.borrow_mut().insert(widget_name, Rc::clone(&state));
+                wire_focus_tracking(
+                    &drawing_area,
+                    &new_focus_tracker,
+                    &new_tv,
+                    &new_tab_states,
+                    &new_custom_titles,
+                    window,
+                );
+                let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+                container.set_hexpand(true);
+                container.set_vexpand(true);
+                container.append(&pane_vbox);
+                let page = new_tv.append(&container);
+                let page_key = page_identity_key(&page);
+                new_tab_id_map.borrow_mut().insert(page_key, dup_tab.tab_id);
+                page.set_title("shell");
+                register_title_timer(
+                    &page,
+                    &new_tv,
+                    &new_tab_states,
+                    &new_focus_tracker,
+                    &new_custom_titles,
+                    window,
+                );
+                if first_da_opt.is_none() {
+                    first_da_opt = Some(drawing_area);
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    pane_id = %dup_tab.pane_id,
+                    "duplicate_workspace: create_terminal failed: {e}"
+                );
+            }
+        }
+    }
+
+    // Select the first tab and arm focus_when_mapped so the "+" button
+    // doesn't steal focus after `main_area.prepend(&new_tv)` below (same
+    // rationale as `create_and_switch_to_new_workspace` / FIX-003 bonus).
+    if new_tv.n_pages() > 0 {
+        let first_page = new_tv.nth_page(0);
+        new_tv.set_selected_page(&first_page);
+    }
+    if let Some(ref da) = first_da_opt {
+        focus_when_mapped(da);
+    }
+
+    // Derive the duplicate's display name from the source workspace (for
+    // the sidebar row + window title). Daemon used the same derivation
+    // internally so they agree.
+    let dup_name = {
+        let Ok(mgr) = wm.try_borrow() else { return };
+        format!("{} (copy)", mgr.workspaces[workspace_idx].name)
+    };
+
+    let new_ws = WorkspaceView {
+        id: ws_id,
+        name: dup_name,
+        tab_view: new_tv.clone(),
+        tab_states: new_tab_states,
+        focus_tracker: new_focus_tracker,
+        custom_titles: new_custom_titles,
+        tab_id_map: new_tab_id_map,
+        tab_colors: new_tab_colors,
+        color: None,
+        color_css_provider: None,
+    };
+
+    // Insert the new workspace and switch to it.
+    let final_idx = {
+        let Ok(mut mgr) = wm.try_borrow_mut() else { return };
+
+        // Clamp insert_at to mgr.workspaces.len() so Vec::insert never
+        // panics if GTK and daemon workspace counts disagree (the daemon
+        // may have clamped internally if another mutator shrank the list
+        // between the RPC call and this borrow).
+        let clamped = insert_at.min(mgr.workspaces.len());
+
+        // Adjust active_index for indices that shift due to insertion.
+        if mgr.active_index >= clamped {
+            mgr.active_index += 1;
+        }
+
+        mgr.workspaces.insert(clamped, new_ws);
+
+        // Remove the current active TabView from main_area.
+        let old_tv = mgr.workspaces[mgr.active_index].tab_view.clone();
+        let mut child = main_area.first_child();
+        while let Some(c) = child {
+            if c == *old_tv.upcast_ref::<gtk4::Widget>() {
+                main_area.remove(&c);
+                break;
+            }
+            child = c.next_sibling();
+        }
+
+        // Set the duplicate as the new active workspace.
+        mgr.active_index = clamped;
+        main_area.prepend(&new_tv);
+        tab_bar.set_view(Some(&new_tv));
+
+        let ws_count = mgr.workspaces.len();
+        let ws_name = mgr.workspaces[clamped].name.clone();
+        drop(mgr);
+        update_delete_workspace_action(wm, window);
+        update_window_title_with_workspace(ws_count, &ws_name, wm, window);
+        clamped
+    };
+
+    // Tell the daemon to persist the new active-workspace index. Matches
+    // the SPEC §5.3.6 requirement: the daemon's `inner.layout.active_workspace`
+    // must agree with GTK's `mgr.active_index` so cold-restart lands the
+    // user on the duplicate (not the source).
+    if let Err(e) = dc.set_active_workspace(final_idx) {
+        tracing::debug!("duplicate_workspace: set_active_workspace({final_idx}) failed: {e}");
+    }
+
+    refresh_workspace_sidebar(
+        sidebar_lb,
+        wm,
+        main_area,
+        tab_bar,
+        window,
+        daemon_client,
+        shared_config,
+    );
+}
+
+/// Legacy local-only duplicate for `--temp` mode (no daemon client).
+///
+/// Pre-FIX-007 behaviour, kept unchanged for compatibility. Daemon mode
+/// (the daily-driver path) uses the RPC-authoritative `duplicate_workspace`
+/// above.
+fn duplicate_workspace_temp_fallback(
+    workspace_idx: usize,
+    wm: &WorkspaceManager,
+    main_area: &gtk4::Box,
+    tab_bar: &adw::TabBar,
+    window: &adw::ApplicationWindow,
     shared_config: &SharedConfig,
     sidebar_lb: &gtk4::ListBox,
 ) {
@@ -8968,16 +9257,9 @@ fn duplicate_workspace(
         &new_focus_tracker,
         &new_tab_id_map,
         window,
-        daemon_client.clone(),
+        None,
     );
-    wire_tab_context_menu_signal(
-        &new_tv,
-        wm,
-        tab_bar,
-        window,
-        daemon_client.clone(),
-        shared_config,
-    );
+    wire_tab_context_menu_signal(&new_tv, wm, tab_bar, window, None, shared_config);
     {
         let app_c = window
             .application()
@@ -8986,14 +9268,11 @@ fn duplicate_workspace(
         new_tv.connect_create_window(move |_| Some(open_detached_tab_window(&app_c)));
     }
 
-    // Add one tab per source CWD.
-    //
-    // NOTE: `duplicate_workspace` does NOT create a corresponding workspace
-    // on the daemon side (pre-existing limitation, tracked separately). The
-    // new_tab RPCs below therefore route to the source workspace on the
-    // daemon — not ideal, but avoids crashing with an out-of-bounds
-    // workspace_idx when we pass the post-insert GTK index which doesn't
-    // exist daemon-side yet.
+    // Add one tab per source CWD — in --temp mode `add_new_tab` no-ops
+    // without a daemon client, which means the duplicate is effectively
+    // an empty workspace. This matches pre-FIX-007 behaviour exactly
+    // (the old code also called `add_new_tab` with `daemon_client.clone()`
+    // which would be `None` in --temp mode).
     for cwd_opt in &cwds {
         add_new_tab(
             workspace_idx,
@@ -9005,24 +9284,7 @@ fn duplicate_workspace(
             window,
             cwd_opt.as_deref(),
             None,
-            daemon_client.clone(),
-            &new_tab_id_map,
-        );
-    }
-
-    // If no tabs were added (source had 0 pages), add one default tab.
-    if new_tv.n_pages() == 0 {
-        add_new_tab(
-            workspace_idx,
-            &new_tv,
-            &cfg,
-            &new_tab_states,
-            &new_focus_tracker,
-            &new_custom_titles,
-            window,
             None,
-            None,
-            daemon_client.clone(),
             &new_tab_id_map,
         );
     }
@@ -9041,7 +9303,7 @@ fn duplicate_workspace(
     };
 
     // Insert the new workspace and switch to it.
-    let new_idx = {
+    {
         let Ok(mut mgr) = wm.try_borrow_mut() else { return };
 
         let insert_at = workspace_idx + 1;
@@ -9082,22 +9344,10 @@ fn duplicate_workspace(
         let ws_name = mgr.workspaces[insert_at].name.clone();
         drop(mgr);
         update_delete_workspace_action(wm, window);
-        let wm_borrow = wm;
-        update_window_title_with_workspace(ws_count, &ws_name, wm_borrow, window);
-        insert_at
-    };
+        update_window_title_with_workspace(ws_count, &ws_name, wm, window);
+    }
 
-    let _ = new_idx;
-
-    refresh_workspace_sidebar(
-        sidebar_lb,
-        wm,
-        main_area,
-        tab_bar,
-        window,
-        daemon_client,
-        shared_config,
-    );
+    refresh_workspace_sidebar(sidebar_lb, wm, main_area, tab_bar, window, &None, shared_config);
 }
 
 /// Swap the workspace at `workspace_idx` with the one above it (idx - 1).

@@ -57,6 +57,7 @@ pub fn dispatch(
         methods::CREATE_WORKSPACE => handle_create_workspace(request, &sm),
         methods::RENAME_WORKSPACE => handle_rename_workspace(request, &sm),
         methods::DELETE_WORKSPACE => handle_delete_workspace(request, &sm),
+        methods::DUPLICATE_WORKSPACE => handle_duplicate_workspace(request, &sm),
         // Split ratio + pinned session methods (B-002).
         methods::UPDATE_SPLIT_RATIOS => handle_update_split_ratios(request, &sm),
         methods::SET_PINNED => handle_set_pinned(request, &sm),
@@ -518,6 +519,72 @@ fn handle_delete_workspace(request: &Request, sm: &SessionManager) -> Response {
             request.id.clone(),
             protocol::INTERNAL_ERROR,
             format!("delete_workspace failed: {e}"),
+        ),
+    }
+}
+
+/// Handle `duplicate_workspace` RPC (FIX-007).
+///
+/// Params: `{ "source_workspace_idx": u64, "new_name": Option<String> }`.
+/// Missing `source_workspace_idx` → `INVALID_PARAMS`. Out-of-range index or
+/// PTY spawn failure → `INTERNAL_ERROR` with the underlying reason.
+///
+/// Success payload:
+/// ```json
+/// {
+///   "workspace_id": "<uuid>",
+///   "workspace_idx": <usize>,
+///   "tabs": [ { "tab_id": "<uuid>", "pane_id": "<uuid>" }, ... ]
+/// }
+/// ```
+///
+/// The tab list matches the source's tab count in source order; each entry
+/// is backed by a fresh daemon-side PTY (subscribe_output-ready). GTK uses
+/// this response to build widgets without an extra `get_layout` round-trip.
+fn handle_duplicate_workspace(request: &Request, sm: &SessionManager) -> Response {
+    let source_workspace_idx =
+        match request.params.get("source_workspace_idx").and_then(|v| v.as_u64()) {
+            Some(n) => n as usize,
+            None => {
+                return Response::error(
+                    request.id.clone(),
+                    protocol::INVALID_PARAMS,
+                    "missing param: source_workspace_idx (u64)".to_string(),
+                )
+            }
+        };
+
+    // `new_name` is optional. `null` and absent are treated identically —
+    // the daemon derives `"<source> (copy)"`.
+    let new_name = request.params.get("new_name").and_then(|v| v.as_str());
+
+    let default_size =
+        PtySize { rows: DEFAULT_ROWS, cols: DEFAULT_COLS, pixel_width: 0, pixel_height: 0 };
+
+    match sm.duplicate_workspace(source_workspace_idx, new_name, default_size) {
+        Ok((workspace_id, workspace_idx, tabs)) => {
+            let tabs_json: Vec<serde_json::Value> = tabs
+                .iter()
+                .map(|dt| {
+                    serde_json::json!({
+                        "tab_id": dt.tab_id.to_string(),
+                        "pane_id": dt.pane_id.to_string(),
+                    })
+                })
+                .collect();
+            Response::success(
+                request.id.clone(),
+                serde_json::json!({
+                    "workspace_id": workspace_id.to_string(),
+                    "workspace_idx": workspace_idx,
+                    "tabs": tabs_json,
+                }),
+            )
+        }
+        Err(e) => Response::error(
+            request.id.clone(),
+            protocol::INTERNAL_ERROR,
+            format!("duplicate_workspace failed: {e}"),
         ),
     }
 }
@@ -1361,5 +1428,86 @@ mod tests {
         let result = resp.result.unwrap();
         assert_eq!(result.get("ok").and_then(|v| v.as_bool()), Some(true));
         assert_eq!(sm.layout().workspaces.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX-007 — duplicate_workspace RPC dispatch tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dispatch_duplicate_workspace_missing_idx_returns_invalid_params() {
+        let sm = make_sm();
+        let req = Request {
+            jsonrpc: "2.0".to_string(),
+            method: "duplicate_workspace".to_string(),
+            params: serde_json::json!({}),
+            id: Some(serde_json::json!(1)),
+        };
+        let resp = dispatch(&req, sm, None);
+        assert!(resp.error.is_some());
+        assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn dispatch_duplicate_workspace_out_of_bounds_returns_internal_error() {
+        let sm = make_sm();
+        let req = Request {
+            jsonrpc: "2.0".to_string(),
+            method: "duplicate_workspace".to_string(),
+            params: serde_json::json!({ "source_workspace_idx": 99 }),
+            id: Some(serde_json::json!(1)),
+        };
+        let resp = dispatch(&req, Arc::clone(&sm), None);
+        assert!(resp.error.is_some(), "out-of-range duplicate must error");
+        assert_eq!(resp.error.unwrap().code, protocol::INTERNAL_ERROR);
+        assert_eq!(sm.layout().workspaces.len(), 1, "workspace list must be untouched");
+    }
+
+    #[tokio::test]
+    async fn dispatch_duplicate_workspace_success_returns_tabs_array() {
+        let sm = make_sm();
+        // Source with 2 tabs.
+        let size = PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
+        sm.create_tab(0, None, size, None).expect("tab A");
+        sm.create_tab(0, None, size, None).expect("tab B");
+
+        let req = Request {
+            jsonrpc: "2.0".to_string(),
+            method: "duplicate_workspace".to_string(),
+            params: serde_json::json!({ "source_workspace_idx": 0 }),
+            id: Some(serde_json::json!(1)),
+        };
+        let resp = dispatch(&req, Arc::clone(&sm), None);
+        assert!(resp.result.is_some(), "successful duplicate must return a result");
+        let result = resp.result.unwrap();
+        assert!(
+            result.get("workspace_id").and_then(|v| v.as_str()).is_some(),
+            "workspace_id must be present"
+        );
+        assert_eq!(result.get("workspace_idx").and_then(|v| v.as_u64()), Some(1));
+        let tabs = result.get("tabs").and_then(|v| v.as_array()).expect("tabs array");
+        assert_eq!(tabs.len(), 2, "duplicate has same tab count as source");
+        for entry in tabs {
+            assert!(entry.get("tab_id").and_then(|v| v.as_str()).is_some());
+            assert!(entry.get("pane_id").and_then(|v| v.as_str()).is_some());
+        }
+    }
+
+    #[test]
+    fn dispatch_duplicate_workspace_with_explicit_name() {
+        let sm = make_sm();
+        let req = Request {
+            jsonrpc: "2.0".to_string(),
+            method: "duplicate_workspace".to_string(),
+            params: serde_json::json!({
+                "source_workspace_idx": 0,
+                "new_name": "ExplicitCopy",
+            }),
+            id: Some(serde_json::json!(1)),
+        };
+        let resp = dispatch(&req, Arc::clone(&sm), None);
+        assert!(resp.result.is_some());
+        let layout = sm.layout();
+        assert_eq!(layout.workspaces[1].name, "ExplicitCopy");
     }
 }
