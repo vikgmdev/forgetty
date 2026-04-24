@@ -371,6 +371,20 @@ impl DaemonClient {
         Ok(())
     }
 
+    /// Delete a workspace on the daemon (FIX-003). The daemon kills all panes
+    /// in the workspace, unlinks their byte logs, removes the workspace entry
+    /// from the layout, clamps `active_workspace`, and fans out `PaneClosed`
+    /// per pane followed by a single `WorkspaceDeleted` event via
+    /// `subscribe_layout`.
+    ///
+    /// Errors: out-of-range `workspace_idx` or last-workspace deletion return
+    /// an RPC error — the GTK caller should log and skip its local mutation
+    /// (the daemon is the source of truth, AD-002 / AD-007).
+    pub fn delete_workspace(&self, workspace_idx: usize) -> Result<(), DaemonError> {
+        self.rpc("delete_workspace", serde_json::json!({ "workspace_idx": workspace_idx }))?;
+        Ok(())
+    }
+
     /// Close a tab in the daemon by its `tab_id` (UUID).
     pub fn close_tab(&self, tab_id: uuid::Uuid) -> Result<(), DaemonError> {
         self.rpc("close_tab", serde_json::json!({ "tab_id": tab_id.to_string() }))?;
@@ -753,6 +767,15 @@ pub enum LayoutEvent {
     /// Daemon is the source of truth; the GTK subscriber should update its
     /// local `WorkspaceView.name` (idempotent) and refresh the sidebar label.
     WorkspaceRenamed { workspace_idx: usize, workspace_id: uuid::Uuid, name: String },
+
+    /// A workspace was deleted (FIX-003).
+    ///
+    /// For self-originated deletes (GTK called `dc.delete_workspace` and the
+    /// local mutation already ran in `do_delete_workspace_at_index`), this
+    /// event is a no-op on receipt — match on `workspace_id` to detect the
+    /// "already absent locally" case. Kept for symmetry with `WorkspaceRenamed`
+    /// and forward-compat with external deletes (e.g., a paired Android client).
+    WorkspaceDeleted { workspace_idx: usize, workspace_id: uuid::Uuid },
 }
 
 // ---------------------------------------------------------------------------
@@ -1058,6 +1081,17 @@ async fn subscribe_layout_task(
                 };
                 let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 LayoutEvent::WorkspaceRenamed { workspace_idx, workspace_id, name }
+            }
+            "workspace_deleted" => {
+                let workspace_idx =
+                    params.get("workspace_idx").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let workspace_id_str =
+                    params.get("workspace_id").and_then(|v| v.as_str()).unwrap_or("");
+                let workspace_id = match uuid::Uuid::parse_str(workspace_id_str) {
+                    Ok(u) => u,
+                    Err(_) => continue,
+                };
+                LayoutEvent::WorkspaceDeleted { workspace_idx, workspace_id }
             }
             _ => {
                 // Unknown layout notification — ignore silently.

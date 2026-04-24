@@ -117,6 +117,7 @@ pub mod methods {
     // Workspace management (T-067, FIX-001).
     pub const CREATE_WORKSPACE: &str = "create_workspace";
     pub const RENAME_WORKSPACE: &str = "rename_workspace";
+    pub const DELETE_WORKSPACE: &str = "delete_workspace";
     // Split ratio sync (B-002).
     pub const UPDATE_SPLIT_RATIOS: &str = "update_split_ratios";
     // Pinned sessions (B-002).

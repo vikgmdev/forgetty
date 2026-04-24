@@ -651,6 +651,28 @@ async fn handle_streaming_connection(
                                     break;
                                 }
                             }
+                            Ok(SessionEvent::WorkspaceDeleted {
+                                workspace_idx,
+                                workspace_id,
+                            }) => {
+                                let notification = serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "workspace_deleted",
+                                    "params": {
+                                        "workspace_idx": workspace_idx,
+                                        "workspace_id": workspace_id.to_string(),
+                                    }
+                                });
+                                let mut out = serde_json::to_string(&notification)
+                                    .unwrap_or_else(|_| "{}".to_string());
+                                out.push('\n');
+                                if writer.write_all(out.as_bytes()).await.is_err() {
+                                    break;
+                                }
+                                if writer.flush().await.is_err() {
+                                    break;
+                                }
+                            }
                             Ok(_) => {
                                 // Output events (PtyOutput, PaneCreated, PaneClosed,
                                 // Notification) are not forwarded to subscribe_layout clients.

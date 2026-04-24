@@ -56,6 +56,7 @@ pub fn dispatch(
         methods::CLOSE_PANE => handle_close_pane(request, &sm),
         methods::CREATE_WORKSPACE => handle_create_workspace(request, &sm),
         methods::RENAME_WORKSPACE => handle_rename_workspace(request, &sm),
+        methods::DELETE_WORKSPACE => handle_delete_workspace(request, &sm),
         // Split ratio + pinned session methods (B-002).
         methods::UPDATE_SPLIT_RATIOS => handle_update_split_ratios(request, &sm),
         methods::SET_PINNED => handle_set_pinned(request, &sm),
@@ -490,6 +491,33 @@ fn handle_rename_workspace(request: &Request, sm: &SessionManager) -> Response {
             request.id.clone(),
             protocol::INTERNAL_ERROR,
             format!("rename_workspace failed: {e}"),
+        ),
+    }
+}
+
+/// Handle `delete_workspace` RPC (FIX-003).
+///
+/// Params: `{ "workspace_idx": u64 }`.
+/// Success: `{ "ok": true }`. Out-of-range index or last-workspace deletion
+/// return `INTERNAL_ERROR` with the message from `SessionManager::delete_workspace`.
+fn handle_delete_workspace(request: &Request, sm: &SessionManager) -> Response {
+    let workspace_idx = match request.params.get("workspace_idx").and_then(|v| v.as_u64()) {
+        Some(n) => n as usize,
+        None => {
+            return Response::error(
+                request.id.clone(),
+                protocol::INVALID_PARAMS,
+                "missing param: workspace_idx (u64)".to_string(),
+            )
+        }
+    };
+
+    match sm.delete_workspace(workspace_idx) {
+        Ok(()) => Response::success(request.id.clone(), serde_json::json!({ "ok": true })),
+        Err(e) => Response::error(
+            request.id.clone(),
+            protocol::INTERNAL_ERROR,
+            format!("delete_workspace failed: {e}"),
         ),
     }
 }
@@ -1255,5 +1283,83 @@ mod tests {
         let resp = dispatch(&req, sm, None);
         assert!(resp.error.is_some());
         assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX-003 — delete_workspace RPC dispatch tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dispatch_delete_workspace_missing_idx_returns_invalid_params() {
+        let sm = make_sm();
+        let req = Request {
+            jsonrpc: "2.0".to_string(),
+            method: "delete_workspace".to_string(),
+            params: serde_json::json!({}),
+            id: Some(serde_json::json!(1)),
+        };
+        let resp = dispatch(&req, sm, None);
+        assert!(resp.error.is_some());
+        assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn dispatch_delete_workspace_last_workspace_rejected() {
+        let sm = make_sm();
+        // Default session has exactly one workspace (idx 0) — deleting it
+        // must be rejected by the daemon even though the UI also disables
+        // the menu entry (defense-in-depth).
+        let req = Request {
+            jsonrpc: "2.0".to_string(),
+            method: "delete_workspace".to_string(),
+            params: serde_json::json!({ "workspace_idx": 0 }),
+            id: Some(serde_json::json!(1)),
+        };
+        let resp = dispatch(&req, Arc::clone(&sm), None);
+        assert!(resp.error.is_some(), "last-workspace delete must error");
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, protocol::INTERNAL_ERROR);
+        assert!(
+            err.message.contains("last remaining workspace"),
+            "error message must surface the bounds reason; got: {}",
+            err.message
+        );
+        // Workspace list unchanged.
+        assert_eq!(sm.layout().workspaces.len(), 1);
+    }
+
+    #[test]
+    fn dispatch_delete_workspace_out_of_bounds_returns_error() {
+        let sm = make_sm();
+        sm.create_workspace("Second");
+        let req = Request {
+            jsonrpc: "2.0".to_string(),
+            method: "delete_workspace".to_string(),
+            params: serde_json::json!({ "workspace_idx": 99 }),
+            id: Some(serde_json::json!(1)),
+        };
+        let resp = dispatch(&req, Arc::clone(&sm), None);
+        assert!(resp.error.is_some(), "out-of-range delete must error");
+        assert_eq!(resp.error.unwrap().code, protocol::INTERNAL_ERROR);
+        assert_eq!(sm.layout().workspaces.len(), 2, "workspace list must be untouched");
+    }
+
+    #[test]
+    fn dispatch_delete_workspace_success() {
+        let sm = make_sm();
+        let (_, ws_idx) = sm.create_workspace("DropMe");
+        assert_eq!(sm.layout().workspaces.len(), 2);
+
+        let req = Request {
+            jsonrpc: "2.0".to_string(),
+            method: "delete_workspace".to_string(),
+            params: serde_json::json!({ "workspace_idx": ws_idx }),
+            id: Some(serde_json::json!(1)),
+        };
+        let resp = dispatch(&req, Arc::clone(&sm), None);
+        assert!(resp.result.is_some(), "successful delete must return a result");
+        let result = resp.result.unwrap();
+        assert_eq!(result.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(sm.layout().workspaces.len(), 1);
     }
 }
