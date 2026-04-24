@@ -163,8 +163,24 @@ fn handle_get_layout(request: &Request, sm: &SessionManager) -> Response {
 }
 
 fn handle_new_tab(request: &Request, sm: &SessionManager) -> Response {
-    let workspace_idx =
-        request.params.get("workspace_idx").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    // FIX-004: warn + default policy. Missing/non-u64 `workspace_idx` is
+    // preserved (defaults to 0) for wire compat with pre-FIX-004 callers
+    // such as `scripts/perf/typometer.sh` and older SDKs, but loudly logged
+    // so GTK-side regressions of the tab-routing bug are self-reporting
+    // rather than silently mis-attributing tabs to workspace 0.
+    let workspace_idx = match request.params.get("workspace_idx").and_then(|v| v.as_u64()) {
+        Some(idx) => idx as usize,
+        None => {
+            tracing::warn!(
+                method = methods::NEW_TAB,
+                request_id = ?request.id,
+                "new_tab: missing workspace_idx in payload — defaulting to 0 for wire compat \
+                 (FIX-004). GTK clients post-df4de18 always send this field; a warning here \
+                 indicates either an external caller or a client regression."
+            );
+            0
+        }
+    };
 
     let rows =
         request.params.get("rows").and_then(|v| v.as_u64()).unwrap_or(DEFAULT_ROWS as u64) as u16;
@@ -1148,11 +1164,10 @@ mod tests {
     #[tokio::test]
     async fn dispatch_focus_tab_real_tab_succeeds() {
         let sm = make_sm();
-        // Create a tab via new_tab RPC.
         let new_req = Request {
             jsonrpc: "2.0".to_string(),
             method: "new_tab".to_string(),
-            params: serde_json::json!({}),
+            params: serde_json::json!({ "workspace_idx": 0 }),
             id: Some(serde_json::json!(1)),
         };
         let new_resp = dispatch(&new_req, Arc::clone(&sm), None);
@@ -1197,7 +1212,7 @@ mod tests {
         let new_req = Request {
             jsonrpc: "2.0".to_string(),
             method: "new_tab".to_string(),
-            params: serde_json::json!({}),
+            params: serde_json::json!({ "workspace_idx": 0 }),
             id: Some(serde_json::json!(1)),
         };
         let new_resp = dispatch(&new_req, Arc::clone(&sm), None);
@@ -1356,7 +1371,7 @@ mod tests {
         let req = Request {
             jsonrpc: "2.0".to_string(),
             method: "new_tab".to_string(),
-            params: serde_json::json!({}),
+            params: serde_json::json!({ "workspace_idx": 0 }),
             id: Some(serde_json::json!(1)),
         };
         let resp = dispatch(&req, Arc::clone(&sm), None);
@@ -1623,5 +1638,83 @@ mod tests {
             assert_eq!(resp.result.unwrap().get("ok").and_then(|v| v.as_bool()), Some(true));
             assert!(sm.layout().workspaces[0].color.is_none());
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX-004 — new_tab workspace_idx routing tests
+    // -----------------------------------------------------------------------
+
+    /// FIX-004 AC-10: explicit `workspace_idx` routes tabs to the named
+    /// workspace, not the default (workspace 0).
+    #[tokio::test]
+    async fn dispatch_new_tab_routes_to_explicit_workspace_idx() {
+        let sm = make_sm();
+        // Seed a second workspace so idx=1 is a valid target.
+        let (_ws_id, ws_idx) = sm.create_workspace("B");
+        assert_eq!(ws_idx, 1, "create_workspace should return idx=1 for the second workspace");
+
+        let req = Request {
+            jsonrpc: "2.0".to_string(),
+            method: "new_tab".to_string(),
+            params: serde_json::json!({ "workspace_idx": 1 }),
+            id: Some(serde_json::json!(1)),
+        };
+        let resp = dispatch(&req, Arc::clone(&sm), None);
+        assert!(resp.result.is_some(), "new_tab should succeed");
+
+        let layout = sm.layout();
+        assert_eq!(layout.workspaces[0].tabs.len(), 0, "workspace 0 must remain tab-less");
+        assert_eq!(layout.workspaces[1].tabs.len(), 1, "workspace 1 must own the new tab");
+    }
+
+    /// FIX-004 AC-3/AC-10: missing `workspace_idx` still succeeds (wire compat)
+    /// and defaults to workspace 0. Log assertion is intentionally omitted —
+    /// adding `tracing-test` as a dev-dep is a scope expansion; the `warn!`
+    /// emission is verified by code review + the human socat probe in the
+    /// SPEC's §9 Test 3.
+    #[tokio::test]
+    async fn dispatch_new_tab_warns_and_defaults_to_zero_on_missing_workspace_idx() {
+        let sm = make_sm();
+        let req = Request {
+            jsonrpc: "2.0".to_string(),
+            method: "new_tab".to_string(),
+            params: serde_json::json!({}),
+            id: Some(serde_json::json!(1)),
+        };
+        let resp = dispatch(&req, Arc::clone(&sm), None);
+        assert!(resp.result.is_some(), "new_tab must succeed when workspace_idx is omitted");
+        assert!(resp.error.is_none());
+
+        let layout = sm.layout();
+        assert_eq!(
+            layout.workspaces[0].tabs.len(),
+            1,
+            "missing workspace_idx must default to workspace 0"
+        );
+    }
+
+    /// FIX-004 AC-5/AC-10: out-of-range `workspace_idx` returns INTERNAL_ERROR
+    /// and leaves session state untouched (no partial mutation, no PTY spawn).
+    #[tokio::test]
+    async fn dispatch_new_tab_errors_on_out_of_range_workspace_idx() {
+        let sm = make_sm();
+        // make_sm() returns a fresh daemon with one workspace (idx=0) — idx=999
+        // is therefore out of range.
+        let req = Request {
+            jsonrpc: "2.0".to_string(),
+            method: "new_tab".to_string(),
+            params: serde_json::json!({ "workspace_idx": 999 }),
+            id: Some(serde_json::json!(1)),
+        };
+        let resp = dispatch(&req, Arc::clone(&sm), None);
+        assert!(resp.error.is_some(), "out-of-range workspace_idx must error");
+        assert_eq!(resp.error.unwrap().code, protocol::INTERNAL_ERROR);
+
+        let layout = sm.layout();
+        assert_eq!(
+            layout.workspaces.iter().map(|w| w.tabs.len()).sum::<usize>(),
+            0,
+            "no tab should have been created"
+        );
     }
 }

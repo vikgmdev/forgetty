@@ -240,12 +240,12 @@ position. Walk the tree recursively to reach every pane.
 Create a new tab in the given workspace. Spawns a shell in a PTY at the
 default size; returns both the new tab UUID and the root pane UUID.
 
-**Request:** `{"jsonrpc":"2.0","method":"new_tab","params":{},"id":1}`
+**Request:** `{"jsonrpc":"2.0","method":"new_tab","params":{"workspace_idx":0},"id":1}`
 
 **Params:**
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `workspace_idx` | number | no | Workspace index; defaults to `0`. |
+| `workspace_idx` | number | yes (semantically) | Daemon-side workspace index the new tab belongs to. Omission is accepted for wire compat with pre-FIX-004 callers: the daemon logs a `WARN` (marker: `"new_tab: missing workspace_idx"`) and defaults to `0`. New clients MUST pass this field explicitly — the silent default is deprecated. |
 | `rows` | number | no | PTY rows; defaults to `24`. |
 | `cols` | number | no | PTY columns; defaults to `80`. |
 | `cwd` | string | no | Starting directory; silently ignored if not a directory. |
@@ -253,9 +253,13 @@ default size; returns both the new tab UUID and the root pane UUID.
 
 **Result:** `{"tab_id":"<uuid>","pane_id":"<uuid>"}`
 
+**Errors:** out-of-range `workspace_idx` (>= the workspace count) returns
+`INTERNAL_ERROR` with the message `"failed to create tab: workspace index
+N out of bounds (len=M)"`. No PTY is spawned in that case.
+
 **Example:**
 ```sh
-echo '{"jsonrpc":"2.0","method":"new_tab","params":{},"id":1}' \
+echo '{"jsonrpc":"2.0","method":"new_tab","params":{"workspace_idx":0},"id":1}' \
   | socat - UNIX-CONNECT:"$SOCK"
 ```
 Expected:
@@ -764,7 +768,7 @@ echo '{"jsonrpc":"2.0","method":"list_tabs","id":1}' \
 # 3. new_tab — creates a shell in a default-sized PTY and captures the
 #    new pane_id with jq. (jq is optional on Debian-family: `apt install jq`.
 #    Without jq, eyeball the response and set PANE=<paste pane_id> manually.)
-PANE=$(echo '{"jsonrpc":"2.0","method":"new_tab","params":{},"id":2}' \
+PANE=$(echo '{"jsonrpc":"2.0","method":"new_tab","params":{"workspace_idx":0},"id":2}' \
   | socat - UNIX-CONNECT:"$SOCK" | jq -r '.result.pane_id')
 echo "pane_id: $PANE"
 
