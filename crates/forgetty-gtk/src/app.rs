@@ -3829,6 +3829,13 @@ fn close_pane_by_name(
 
     // Remove both children from the Paned using the proper Paned API.
     // Direct unparent() doesn't clear Paned's internal child pointers.
+    //
+    // P-007: clear focus_child BEFORE clearing the slots. FIX-002 pinned
+    // parent_paned.focus_child to focused_vbox at split time; if we clear
+    // the slot while focus_child still points inside it, GTK emits
+    // `gtk_paned_set_focus_child was called on widget (nil)`. Clearing
+    // focus_child to None first suppresses the cosmetic warning.
+    parent_paned.set_focus_child(gtk4::Widget::NONE);
     parent_paned.set_start_child(gtk4::Widget::NONE);
     parent_paned.set_end_child(gtk4::Widget::NONE);
 
@@ -3860,6 +3867,12 @@ fn close_pane_by_name(
                 } else {
                     PanedSlot::End
                 };
+
+                // P-007: clear grandparent focus_child BEFORE replacing its
+                // slot. FIX-002 pinned gp_paned.focus_child to parent_paned;
+                // replacing the slot while focus_child still points at the
+                // outgoing parent_paned trips the same warning as above.
+                gp_paned.set_focus_child(gtk4::Widget::NONE);
 
                 // Use Paned API to remove and replace (not unparent)
                 match gp_slot {
