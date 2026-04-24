@@ -239,6 +239,7 @@ impl SessionManager {
             name: name.to_string(),
             tabs: Vec::new(),
             active_tab: 0,
+            color: None,
         };
         inner.layout.workspaces.push(ws);
         let idx = inner.layout.workspaces.len() - 1;
@@ -290,6 +291,53 @@ impl SessionManager {
         debug!(
             new_name,
             workspace_idx, %workspace_id, "rename_workspace: workspace renamed"
+        );
+        Ok(())
+    }
+
+    /// Set (or clear) a workspace's accent colour (FIX-010).
+    ///
+    /// Behaviour:
+    /// - Returns `Err` if `workspace_idx` is out of bounds.
+    /// - Returns `Ok(())` with no event if the new colour equals the current
+    ///   colour (idempotence — mirrors `rename_workspace`).
+    /// - Otherwise mutates `inner.layout.workspaces[workspace_idx].color` and
+    ///   broadcasts a `SessionEvent::WorkspaceColorChanged` event.
+    ///
+    /// The colour is stored verbatim — no hex validation, no trimming.
+    /// Per AD-007 the daemon is opaque to colour semantics; GTK is
+    /// responsible for producing valid `#RRGGBB` strings. Malformed hex
+    /// on the wire will simply fail to parse client-side and render as
+    /// "no colour" (graceful degradation).
+    pub fn set_workspace_color(&self, workspace_idx: usize, color: Option<&str>) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+
+        if workspace_idx >= inner.layout.workspaces.len() {
+            return Err(forgetty_core::ForgettyError::Pty(format!(
+                "workspace index {workspace_idx} out of bounds (len={})",
+                inner.layout.workspaces.len()
+            )));
+        }
+
+        let new_color: Option<String> = color.map(|s| s.to_string());
+
+        // Idempotence: no-op (and no event) if the colour is unchanged.
+        if inner.layout.workspaces[workspace_idx].color == new_color {
+            return Ok(());
+        }
+
+        inner.layout.workspaces[workspace_idx].color = new_color.clone();
+        let workspace_id = inner.layout.workspaces[workspace_idx].id;
+        let _ = inner.event_tx.send(SessionEvent::WorkspaceColorChanged {
+            workspace_idx,
+            workspace_id,
+            color: new_color,
+        });
+        debug!(
+            workspace_idx,
+            %workspace_id,
+            ?color,
+            "set_workspace_color: colour updated"
         );
         Ok(())
     }
@@ -549,6 +597,10 @@ impl SessionManager {
                 name: dup_name.clone(),
                 tabs: new_tabs,
                 active_tab: 0,
+                // FIX-010: duplicate workspace starts with no colour.
+                // Per FIX-007 §6 / FIX-010 §6, colour does not propagate from
+                // the source — the user chooses a colour for the copy if desired.
+                color: None,
             };
 
             inner.layout.workspaces.insert(clamped_insert, new_workspace);
@@ -1352,6 +1404,9 @@ impl SessionManager {
                     root_paths: Vec::new(),
                     tabs,
                     active_tab: session_ws.active_tab,
+                    // FIX-010: carry the daemon-owned accent colour into the
+                    // persisted JSON so it survives disconnect + cold restart.
+                    color: session_ws.color.clone(),
                 }
             })
             .collect();
@@ -2222,6 +2277,102 @@ mod tests {
 
         // Name is still "Default" — no accidental mutation.
         assert_eq!(session.layout().workspaces[0].name, "Default");
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX-010: set_workspace_color
+    // -----------------------------------------------------------------------
+
+    /// FIX-010 AC-8 test 1: `set_workspace_color` updates the colour field.
+    #[test]
+    fn test_set_workspace_color_updates_field() {
+        let session = SessionManager::new();
+        assert!(session.layout().workspaces[0].color.is_none());
+
+        session.set_workspace_color(0, Some("#3a6ee4")).expect("set color should succeed");
+
+        assert_eq!(session.layout().workspaces[0].color, Some("#3a6ee4".to_string()));
+    }
+
+    /// FIX-010 AC-8 test 2: setting Some then None clears the colour.
+    #[test]
+    fn test_set_workspace_color_clears_color() {
+        let session = SessionManager::new();
+
+        session.set_workspace_color(0, Some("#ff00aa")).expect("set color should succeed");
+        assert_eq!(session.layout().workspaces[0].color, Some("#ff00aa".to_string()));
+
+        session.set_workspace_color(0, None).expect("clear color should succeed");
+        assert!(session.layout().workspaces[0].color.is_none());
+    }
+
+    /// FIX-010 AC-8 test 3: out-of-bounds index returns Err.
+    #[test]
+    fn test_set_workspace_color_out_of_bounds_errors() {
+        let session = SessionManager::new();
+        let result = session.set_workspace_color(99, Some("#3a6ee4"));
+        assert!(result.is_err(), "out-of-bounds index must return Err");
+    }
+
+    /// FIX-010 AC-8 test 4: colour change emits `WorkspaceColorChanged`.
+    #[tokio::test]
+    async fn test_set_workspace_color_emits_event() {
+        let session = SessionManager::new();
+        let mut rx = session.subscribe_output();
+        let original_id = session.layout().workspaces[0].id;
+
+        session.set_workspace_color(0, Some("#58b967")).expect("set color should succeed");
+
+        // Drain events until we see the WorkspaceColorChanged variant.
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let mut got_event = false;
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+                Ok(Ok(SessionEvent::WorkspaceColorChanged {
+                    workspace_idx,
+                    workspace_id,
+                    color,
+                })) => {
+                    assert_eq!(workspace_idx, 0);
+                    assert_eq!(workspace_id, original_id);
+                    assert_eq!(color, Some("#58b967".to_string()));
+                    got_event = true;
+                    break;
+                }
+                Ok(Ok(_)) => {} // ignore unrelated events
+                Ok(Err(_)) | Err(_) => {}
+            }
+        }
+        assert!(got_event, "WorkspaceColorChanged event must be broadcast on colour change");
+    }
+
+    /// FIX-010 AC-8 test 5: setting the same colour twice is a no-op — no event emitted.
+    #[tokio::test]
+    async fn test_set_workspace_color_idempotent() {
+        let session = SessionManager::new();
+
+        // First set — this emits an event we don't care about here.
+        session.set_workspace_color(0, Some("#58b967")).expect("initial set should succeed");
+
+        // Subscribe BEFORE the no-op call so we'd see an event if one were emitted.
+        let mut rx = session.subscribe_output();
+
+        // Repeat the same value — idempotent, no event.
+        session.set_workspace_color(0, Some("#58b967")).expect("no-op set should succeed");
+
+        let deadline = std::time::Instant::now() + Duration::from_millis(200);
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+                Ok(Ok(SessionEvent::WorkspaceColorChanged { .. })) => {
+                    panic!("idempotent set must not emit WorkspaceColorChanged");
+                }
+                Ok(Ok(_)) => {} // ignore unrelated events
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+
+        // Value is unchanged.
+        assert_eq!(session.layout().workspaces[0].color, Some("#58b967".to_string()));
     }
 
     // -----------------------------------------------------------------------

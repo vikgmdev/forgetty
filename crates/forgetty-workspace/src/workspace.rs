@@ -44,6 +44,12 @@ pub struct Workspace {
     pub tabs: Vec<TabState>,
     /// Index of the currently active tab.
     pub active_tab: usize,
+    /// FIX-010: per-workspace accent colour. `"#RRGGBB"` (6 hex digits,
+    /// no alpha). Pre-FIX-010 session JSON files omit this field — serde
+    /// defaults to `None`. GTK falls back to no custom left border when
+    /// `None` (the GTK default row style).
+    #[serde(default)]
+    pub color: Option<String>,
 }
 
 /// The state of a single tab.
@@ -119,6 +125,7 @@ impl Workspace {
                 pane_id: None,
             }],
             active_tab: 0,
+            color: None,
         }
     }
 }
