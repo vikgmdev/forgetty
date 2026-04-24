@@ -291,7 +291,7 @@ pub fn load_theme_catalog() -> Vec<ThemeCatalogEntry> {
             }
         }
     }
-    bundled.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    bundled.sort_by_key(|t| t.name.to_lowercase());
 
     // 3. Load custom themes from ~/.config/forgetty/themes/
     let mut custom: Vec<ThemeCatalogEntry> = Vec::new();
@@ -335,7 +335,7 @@ pub fn load_theme_catalog() -> Vec<ThemeCatalogEntry> {
             }
         }
     }
-    custom.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    custom.sort_by_key(|t| t.name.to_lowercase());
 
     // 4. Merge: custom themes override bundled ones with the same name.
     //    Build a set of custom names for dedup.
@@ -376,7 +376,7 @@ pub fn load_theme_catalog() -> Vec<ThemeCatalogEntry> {
     }
 
     // 6. Sort everything alphabetically.
-    entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    entries.sort_by_key(|e| e.name.to_lowercase());
 
     entries
 }
