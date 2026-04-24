@@ -650,6 +650,35 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Set the globally-active workspace index.
+    ///
+    /// Returns `Err` if `workspace_idx` is out of bounds. Idempotent: setting
+    /// the index to its current value is a no-op (no event emitted). On an
+    /// actual change the method mutates `inner.layout.active_workspace` and
+    /// broadcasts `SessionEvent::ActiveWorkspaceChanged` so the daemon's
+    /// event watcher saves the updated layout. Used by the GTK client when
+    /// the user switches workspaces (session-restore fix).
+    pub fn set_active_workspace(&self, workspace_idx: usize) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+
+        if workspace_idx >= inner.layout.workspaces.len() {
+            return Err(forgetty_core::ForgettyError::Pty(format!(
+                "set_active_workspace: workspace index {workspace_idx} out of bounds (len={})",
+                inner.layout.workspaces.len()
+            )));
+        }
+
+        // Idempotence: no-op (and no event) if the index is unchanged.
+        if inner.layout.active_workspace == workspace_idx {
+            return Ok(());
+        }
+
+        inner.layout.active_workspace = workspace_idx;
+        let _ = inner.event_tx.send(SessionEvent::ActiveWorkspaceChanged { workspace_idx });
+        debug!(workspace_idx, "set_active_workspace: active workspace updated");
+        Ok(())
+    }
+
     /// Kill a pane's PTY and remove it from the registry.
     ///
     /// After this call, `pane_info(id)` returns `None`. The pane's `ByteLog`
@@ -1717,6 +1746,54 @@ mod tests {
         assert!(err2.is_err(), "should err on workspace_idx out of bounds");
 
         session.close_tab(tab0).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // session-restore: set_active_workspace
+    // -----------------------------------------------------------------------
+
+    /// session-restore: `set_active_workspace` mutates the index and is
+    /// idempotent; emits `ActiveWorkspaceChanged` exactly on real changes.
+    #[tokio::test]
+    async fn test_set_active_workspace_updates_and_is_idempotent() {
+        let session = SessionManager::new();
+        let mut rx = session.subscribe_output();
+        let (_, _) = session.create_workspace("Second");
+        let (_, _) = session.create_workspace("Third");
+
+        // Drain broadcasts emitted so far (WorkspaceCreated x2).
+        while rx.try_recv().is_ok() {}
+
+        // Mutate: 0 -> 1 should emit.
+        session.set_active_workspace(1).expect("set 1");
+        assert_eq!(session.layout().active_workspace, 1);
+        let evt = rx.recv().await.expect("first event");
+        matches!(evt, SessionEvent::ActiveWorkspaceChanged { workspace_idx: 1 });
+
+        // Idempotent: 1 -> 1 should NOT emit.
+        session.set_active_workspace(1).expect("idempotent");
+        assert!(rx.try_recv().is_err(), "no event on identical re-set");
+
+        // Mutate again: 1 -> 2 should emit.
+        session.set_active_workspace(2).expect("set 2");
+        assert_eq!(session.layout().active_workspace, 2);
+        let evt = rx.recv().await.expect("second event");
+        matches!(evt, SessionEvent::ActiveWorkspaceChanged { workspace_idx: 2 });
+    }
+
+    /// session-restore: `set_active_workspace` returns Err on out-of-bounds
+    /// index and does NOT mutate the layout.
+    #[tokio::test]
+    async fn test_set_active_workspace_out_of_bounds() {
+        let session = SessionManager::new();
+        assert_eq!(session.layout().workspaces.len(), 1);
+
+        let err = session.set_active_workspace(1);
+        assert!(err.is_err(), "should err on workspace_idx >= len");
+        assert_eq!(session.layout().active_workspace, 0, "failed call must not mutate");
+
+        let err2 = session.set_active_workspace(999);
+        assert!(err2.is_err(), "should err on gross out-of-bounds");
     }
 
     // -----------------------------------------------------------------------

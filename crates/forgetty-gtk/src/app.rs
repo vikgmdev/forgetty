@@ -61,6 +61,16 @@ const SIGINT: i32 = 2;
 /// Termination request (default `kill` signal).
 const SIGTERM: i32 = 15;
 
+/// Maximum number of idle ticks to wait for a restored `gtk4::Paned` to get a
+/// usable allocation before giving up on applying its saved split ratio. Used
+/// by `build_widget_from_pane_tree` (session-restore fix, bug 3).
+///
+/// On a loaded laptop a fresh GTK window typically needs 1–3 idle ticks to
+/// propagate size allocation through nested Paneds; 30 gives comfortable
+/// headroom without enabling an infinite loop when a Paned is permanently
+/// hidden (0-sized).
+const RESTORE_RATIO_MAX_RETRIES: u8 = 30;
+
 /// Lookup table mapping each pane's DrawingArea widget name to its TerminalState.
 ///
 /// This is NOT shared mutable terminal state -- it is a simple registry so that
@@ -538,7 +548,8 @@ fn register_profile_actions(
         action.connect_activate(move |_action, _param| {
             let Ok(cfg) = cfg_ref.try_borrow() else { return };
             let Ok(mgr) = wm_ref.try_borrow() else { return };
-            let ws = &mgr.workspaces[mgr.active_index];
+            let active_idx = mgr.active_index;
+            let ws = &mgr.workspaces[active_idx];
             let command: Option<Vec<String>> = if profile_clone.command.is_empty() {
                 None
             } else {
@@ -546,6 +557,7 @@ fn register_profile_actions(
             };
             let cwd = resolve_profile_dir(profile_clone.directory.as_deref());
             add_new_tab(
+                active_idx,
                 &ws.tab_view,
                 &cfg,
                 &ws.tab_states,
@@ -936,13 +948,15 @@ fn build_ui(
                 let Ok(mgr) = wm_click.try_borrow() else {
                     return;
                 };
-                let ws = &mgr.workspaces[mgr.active_index];
+                let active_idx = mgr.active_index;
+                let ws = &mgr.workspaces[active_idx];
                 // Use the picked page, or fall back to the selected page.
                 let p = match page.or_else(|| ws.tab_view.selected_page()) {
                     Some(p) => p,
                     None => return,
                 };
                 Some((
+                    active_idx,
                     p,
                     Rc::clone(&ws.tab_states),
                     Rc::clone(&ws.focus_tracker),
@@ -951,8 +965,15 @@ fn build_ui(
                     Rc::clone(&ws.tab_id_map),
                 ))
             };
-            let Some((page, tab_states, focus_tracker, custom_titles, tab_colors, tab_id_map)) =
-                result
+            let Some((
+                ws_idx,
+                page,
+                tab_states,
+                focus_tracker,
+                custom_titles,
+                tab_colors,
+                tab_id_map,
+            )) = result
             else {
                 return;
             };
@@ -961,6 +982,7 @@ fn build_ui(
                 return;
             };
             show_tab_context_menu(
+                ws_idx,
                 &tb_click,
                 &tv,
                 &page,
@@ -1064,9 +1086,13 @@ fn build_ui(
     }
 
     // --- Focus management on tab switch ---
-    // When switching tabs, find a leaf DrawingArea in the new tab and focus it.
+    // When switching tabs, find a leaf DrawingArea in the new tab and focus
+    // it, AND notify the daemon via `focus_tab` so session-restore can bring
+    // the correct tab back on cold restart (session-restore fix).
     {
         let focus_switch = Rc::clone(&focus_tracker);
+        let tim_focus = Rc::clone(&tab_id_map);
+        let dc_focus = daemon_client.clone();
         initial_tab_view.connect_selected_page_notify(move |tv| {
             if let Some(page) = tv.selected_page() {
                 let container = page.child();
@@ -1080,6 +1106,24 @@ fn build_ui(
                     .or_else(|| leaves.first());
                 if let Some(da) = target {
                     da.grab_focus();
+                }
+                // Send focus_tab RPC so the daemon's in-memory
+                // `SessionWorkspace.active_tab` is persisted. We resolve the
+                // tab_id via the map populated in `add_new_tab`; entries
+                // added by `build_widgets_from_layout` (cold restart) land
+                // here too because `wire_tab_view_handlers` wires the same
+                // notify callback. The first restore-time fire may find no
+                // mapping (map is populated after the synchronous select) —
+                // silent skip is correct, the daemon's `create_tab` event
+                // watcher already saved `active_tab` at that point.
+                if let Some(ref dc) = dc_focus {
+                    let page_key = page_identity_key(&page);
+                    let tab_id = tim_focus.borrow().get(&page_key).copied();
+                    if let Some(tid) = tab_id {
+                        if let Err(e) = dc.focus_tab(tid) {
+                            tracing::debug!("focus_tab RPC failed: {e}");
+                        }
+                    }
                 }
             }
         });
@@ -1144,10 +1188,12 @@ fn build_ui(
             let Ok(mgr) = wm_action.try_borrow() else {
                 return;
             };
-            let ws = &mgr.workspaces[mgr.active_index];
+            let active_idx = mgr.active_index;
+            let ws = &mgr.workspaces[active_idx];
             // Resolve default profile if any profiles are configured (AC-9).
             let (cmd, cwd_buf) = resolve_default_profile_args(&cfg);
             add_new_tab(
+                active_idx,
                 &ws.tab_view,
                 &cfg,
                 &ws.tab_states,
@@ -1917,7 +1963,14 @@ fn build_ui(
         let action = gio::SimpleAction::new(&action_name, None);
         action.connect_activate(move |_action, _param| {
             let target = (i - 1) as usize;
-            switch_workspace(&wm_switch, target, &main_area_sw, &tab_bar_sw, &win_sw);
+            switch_workspace(
+                &wm_switch,
+                target,
+                &main_area_sw,
+                &tab_bar_sw,
+                &win_sw,
+                dc_sw.as_ref(),
+            );
             refresh_workspace_sidebar(
                 &lb_sw,
                 &wm_switch,
@@ -1952,7 +2005,14 @@ fn build_ui(
             }
             let target = if mgr.active_index == 0 { count - 1 } else { mgr.active_index - 1 };
             drop(mgr);
-            switch_workspace(&wm_prev, target, &main_area_prev, &tab_bar_prev, &win_prev);
+            switch_workspace(
+                &wm_prev,
+                target,
+                &main_area_prev,
+                &tab_bar_prev,
+                &win_prev,
+                dc_prev.as_ref(),
+            );
             refresh_workspace_sidebar(
                 &lb_prev,
                 &wm_prev,
@@ -1988,7 +2048,14 @@ fn build_ui(
             }
             let target = (mgr.active_index + 1) % count;
             drop(mgr);
-            switch_workspace(&wm_next, target, &main_area_next, &tab_bar_next, &win_next);
+            switch_workspace(
+                &wm_next,
+                target,
+                &main_area_next,
+                &tab_bar_next,
+                &win_next,
+                dc_next.as_ref(),
+            );
             refresh_workspace_sidebar(
                 &lb_next,
                 &wm_next,
@@ -2090,8 +2157,15 @@ fn build_ui(
         match dc.get_layout() {
             Ok(ref layout) => {
                 tracing::info!("get_layout: received layout from daemon");
-                restored =
-                    build_widgets_from_layout(layout, dc, config, &workspace_manager, &window);
+                restored = build_widgets_from_layout(
+                    layout,
+                    dc,
+                    config,
+                    &workspace_manager,
+                    &window,
+                    &main_area,
+                    &tab_bar,
+                );
                 if restored {
                     // Wire right-click context menus for all restored workspaces.
                     let tab_views: Vec<adw::TabView> = workspace_manager
@@ -2119,12 +2193,16 @@ fn build_ui(
     }
 
     if !restored {
-        // Add a tab to the default workspace.
+        // Add a tab to the default workspace. workspace_idx=0 is correct here
+        // because `build_widgets_from_layout` falls through to this branch
+        // only when the saved layout was empty (first launch / nothing to
+        // restore), and GTK always starts with workspace[0] selected.
         let Ok(mgr) = workspace_manager.try_borrow() else {
             return;
         };
         let ws = &mgr.workspaces[0];
         add_new_tab(
+            0,
             &ws.tab_view,
             config,
             &ws.tab_states,
@@ -2417,20 +2495,15 @@ fn send_undo_close_notification(session_id: uuid::Uuid) {
                 .timeout(notify_rust::Timeout::Milliseconds(30_000))
                 .show();
 
-            match result {
-                Ok(handle) => {
-                    handle.wait_for_action(|action| {
-                        if action == "undo" || action == "__closed" {
-                            if action == "undo" {
-                                let _ = std::process::Command::new(&current_exe)
-                                    .arg("--restore-session")
-                                    .arg(session_id.to_string())
-                                    .spawn();
-                            }
-                        }
-                    });
-                }
-                Err(_) => {}
+            if let Ok(handle) = result {
+                handle.wait_for_action(|action| {
+                    if action == "undo" {
+                        let _ = std::process::Command::new(&current_exe)
+                            .arg("--restore-session")
+                            .arg(session_id.to_string())
+                            .spawn();
+                    }
+                });
             }
             // Exit the forked child cleanly.
             libc::_exit(0);
@@ -2827,20 +2900,66 @@ fn build_widget_from_pane_tree(
             paned.set_start_child(Some(&first_widget));
             paned.set_end_child(Some(&second_widget));
 
-            // Defer set_position after realization so the widget has a non-zero size.
-            let saved_ratio = *ratio;
-            let paned_weak = paned.downgrade();
-            glib::idle_add_local_once(move || {
-                let Some(paned) = paned_weak.upgrade() else {
+            // Apply the saved split ratio the first time the Paned is mapped
+            // AND has a usable size.
+            //
+            // Earlier iterations used `glib::idle_add_local_once` / a bounded
+            // idle-retry scheduled at build time, but both had the same flaw:
+            // for splits on INACTIVE tabs, the Paned's widget subtree never
+            // gets mapped or allocated during the retry window, so
+            // `width()/height()` reads as 0 for every retry and the loop
+            // exhausts. When the user later switches to that tab, the Paned
+            // finally gets a real allocation but no retry is pending — the
+            // divider sticks to GTK's default position and the top pane is
+            // visually collapsed (the inactive-tab edge case Vick hit on
+            // 2026-04-24 QA with a vertical split at ratio=0.05 on a
+            // background tab).
+            //
+            // The fix hooks `connect_map`: every time the Paned is mapped
+            // (first show, and subsequent show-after-tab-switch), we schedule
+            // an idle retry that walks until the widget reports a usable size.
+            // Once applied, `applied` latches true and subsequent `map` firings
+            // no-op. Uses the same latch pattern as FIX-002.
+            let saved_ratio = (*ratio).clamp(0.05, 0.95);
+            let applied = Rc::new(Cell::new(false));
+            let applied_for_map = applied.clone();
+            paned.connect_map(move |p| {
+                if applied_for_map.get() {
                     return;
-                };
-                let size = match paned.orientation() {
-                    gtk4::Orientation::Horizontal => paned.width(),
-                    _ => paned.height(),
-                };
-                if size > 0 {
-                    paned.set_position((size as f32 * saved_ratio) as i32);
                 }
+                let paned_weak = p.downgrade();
+                let applied_for_idle = applied_for_map.clone();
+                let retries_left = Rc::new(Cell::new(RESTORE_RATIO_MAX_RETRIES));
+                glib::idle_add_local(move || {
+                    if applied_for_idle.get() {
+                        return glib::ControlFlow::Break;
+                    }
+                    let Some(paned) = paned_weak.upgrade() else {
+                        return glib::ControlFlow::Break;
+                    };
+                    let size = match paned.orientation() {
+                        gtk4::Orientation::Horizontal => paned.width(),
+                        _ => paned.height(),
+                    };
+                    if size > 1 {
+                        let target = ((size as f32) * saved_ratio) as i32;
+                        if target > 0 {
+                            paned.set_position(target);
+                        }
+                        applied_for_idle.set(true);
+                        return glib::ControlFlow::Break;
+                    }
+                    let remaining = retries_left.get();
+                    if remaining == 0 {
+                        tracing::debug!(
+                            "session-restore: split ratio {:.3} not applied after map — Paned reported usable size too slowly",
+                            saved_ratio
+                        );
+                        return glib::ControlFlow::Break;
+                    }
+                    retries_left.set(remaining - 1);
+                    glib::ControlFlow::Continue
+                });
             });
 
             Some((paned.upcast::<gtk4::Widget>(), first_da))
@@ -2850,50 +2969,62 @@ fn build_widget_from_pane_tree(
 
 /// Build the full GTK tab widget tree from a `LayoutInfo` snapshot (T-064, T-067).
 ///
-/// For the active workspace, populates GTK's existing workspace[0] TabView.
-/// For every additional workspace in the daemon layout, creates a new TabView +
-/// WorkspaceView and appends it to the workspace_manager so the user can switch
-/// to it with Ctrl+Alt+2/3/etc.
+/// Preserves the daemon's workspace ordering (session-restore fix): daemon's
+/// workspace[0] is built into GTK's existing workspace[0], daemon's workspace
+/// [1..N] are appended as new WorkspaceViews in order. The daemon's
+/// `active_workspace` index is then used to switch the visible TabView into
+/// `main_area` so the user lands on the workspace they had focused at save
+/// time. This keeps daemon indices and GTK `mgr.workspaces` indices in lock-
+/// step, which is required because `new_tab` RPCs route by `workspace_idx`
+/// and `set_active_workspace` uses that same index space.
 ///
-/// Returns `true` if at least one tab was successfully created in the active workspace.
+/// Returns `true` if at least one tab was successfully created anywhere in
+/// the restored layout.
 fn build_widgets_from_layout(
     layout: &LayoutInfo,
     dc: &Arc<DaemonClient>,
     config: &Config,
     workspace_manager: &WorkspaceManager,
     window: &adw::ApplicationWindow,
+    main_area: &gtk4::Box,
+    tab_bar: &adw::TabBar,
 ) -> bool {
-    // Determine which workspace to display first.
+    if layout.workspaces.is_empty() {
+        tracing::info!("get_layout: no workspaces in layout — will create a fresh tab");
+        return false;
+    }
+
+    // Validate active_workspace index; clamp to 0 if out-of-range.
     let active_ws_idx = if layout.active_workspace < layout.workspaces.len() {
         layout.active_workspace
     } else {
-        if !layout.workspaces.is_empty() {
-            tracing::debug!(
-                "get_layout: active_workspace {} out of range, using 0",
-                layout.active_workspace
-            );
-        }
+        tracing::debug!(
+            "get_layout: active_workspace {} out of range, using 0",
+            layout.active_workspace
+        );
         0
     };
 
-    let Some(active_ws_info) = layout.workspaces.get(active_ws_idx) else {
-        tracing::info!("get_layout: no workspaces in layout — will create a fresh tab");
-        return false;
-    };
-
-    if active_ws_info.tabs.is_empty() {
-        tracing::info!("get_layout: active workspace has 0 tabs — will create a fresh tab");
+    // First pass: sanity check at least one workspace has tabs.
+    let total_tabs: usize = layout.workspaces.iter().map(|w| w.tabs.len()).sum();
+    if total_tabs == 0 {
+        tracing::info!(
+            "get_layout: layout has 0 tabs across all workspaces — will create a fresh tab"
+        );
         return false;
     }
 
     // -----------------------------------------------------------------------
-    // Build the active workspace into GTK's existing workspace[0].
+    // Build daemon-workspace[0] into GTK's existing workspace[0] TabView.
     // -----------------------------------------------------------------------
-    let restored = {
+    let daemon_ws0 = &layout.workspaces[0];
+    let mut daemon_ws0_built = false;
+
+    if !daemon_ws0.tabs.is_empty() {
         tracing::info!(
-            "build_widgets_from_layout: building {} tab(s) for active workspace {:?}",
-            active_ws_info.tabs.len(),
-            active_ws_info.name
+            "build_widgets_from_layout: building {} tab(s) into workspace[0] {:?}",
+            daemon_ws0.tabs.len(),
+            daemon_ws0.name
         );
 
         let (created, tab_view_clone) = {
@@ -2904,7 +3035,7 @@ fn build_widgets_from_layout(
             let ws = &mgr.workspaces[0];
             let mut created: Vec<(adw::TabPage, gtk4::DrawingArea)> = Vec::new();
 
-            for tab in &active_ws_info.tabs {
+            for tab in &daemon_ws0.tabs {
                 let Some((root_widget, first_da)) = build_widget_from_pane_tree(
                     &tab.pane_tree,
                     dc,
@@ -2942,44 +3073,25 @@ fn build_widgets_from_layout(
             (created, ws.tab_view.clone())
         };
 
-        if created.is_empty() {
-            false
-        } else {
-            // Select the active tab and focus its first DrawingArea.
-            // `set_selected_page` runs synchronously on the already-realized
-            // TabView. The focus grab uses `focus_when_mapped` because on
-            // the restore path the newly-built DrawingArea is not yet
-            // mapped — `grab_focus()` on an unmapped widget silently fails.
-            // V2-007 fix cycle 4 deferred via `idle_add_local_once`, but
-            // that tick can fire pre-map; fix cycle 5 uses the GTK `map`
-            // signal (see `focus_when_mapped` doc).
-            let active_tab_idx = active_ws_info.active_tab.min(created.len().saturating_sub(1));
-            let (ref active_page, ref active_da) = created[active_tab_idx];
+        if !created.is_empty() {
+            daemon_ws0_built = true;
+            // Select the saved active_tab inside this workspace.
+            let active_tab_idx = daemon_ws0.active_tab.min(created.len().saturating_sub(1));
+            let (ref active_page, _) = created[active_tab_idx];
             tab_view_clone.set_selected_page(active_page);
-            focus_when_mapped(active_da);
 
-            // Sync workspace[0]'s id/name with the daemon's active workspace.
+            // Sync workspace[0]'s id/name with the daemon's workspace[0].
             if let Ok(mut mgr) = workspace_manager.try_borrow_mut() {
-                mgr.workspaces[0].id = active_ws_info.id;
-                mgr.workspaces[0].name = active_ws_info.name.clone();
+                mgr.workspaces[0].id = daemon_ws0.id;
+                mgr.workspaces[0].name = daemon_ws0.name.clone();
             }
-
-            true
         }
-    };
-
-    if !restored {
-        return false;
     }
 
     // -----------------------------------------------------------------------
-    // Build all non-active workspaces as background WorkspaceViews (T-067).
-    // Their TabViews are not shown in main_area until the user switches to them.
+    // Build daemon workspaces[1..] as additional WorkspaceViews, in order.
     // -----------------------------------------------------------------------
-    for (daemon_idx, ws_info) in layout.workspaces.iter().enumerate() {
-        if daemon_idx == active_ws_idx {
-            continue; // already handled above
-        }
+    for ws_info in layout.workspaces.iter().skip(1) {
         if ws_info.tabs.is_empty() {
             tracing::debug!(
                 "build_widgets_from_layout: workspace {:?} has 0 tabs, skipping",
@@ -3001,6 +3113,7 @@ fn build_widgets_from_layout(
             &new_tv,
             &new_tab_states,
             &new_focus_tracker,
+            &new_tab_id_map,
             window,
             Some(Arc::clone(dc)),
         );
@@ -3056,7 +3169,15 @@ fn build_widgets_from_layout(
         }
 
         // Only add the WorkspaceView if at least one tab was created.
-        if new_tv.n_pages() > 0 {
+        let n_pages = new_tv.n_pages();
+        if n_pages > 0 {
+            // Select this workspace's saved active_tab before pushing. n_pages
+            // is u32 in libadwaita; active_tab is usize — clamp and cast.
+            let max_idx = (n_pages - 1) as usize;
+            let active_tab_idx = ws_info.active_tab.min(max_idx) as i32;
+            let page = new_tv.nth_page(active_tab_idx);
+            new_tv.set_selected_page(&page);
+
             let Ok(mut mgr) = workspace_manager.try_borrow_mut() else {
                 tracing::warn!(
                     "build_widgets_from_layout: failed to borrow_mut for ws {:?}",
@@ -3084,7 +3205,29 @@ fn build_widgets_from_layout(
         }
     }
 
-    true
+    // Switch into the daemon-active workspace (session-restore bug 2 fix).
+    // We built workspaces in daemon order so GTK indices match the daemon's;
+    // if the active workspace isn't index 0 swap the visible TabView via
+    // `switch_workspace`. That call also updates title + focus; we still
+    // call `focus_when_mapped` below because on the restore path the target
+    // DrawingArea isn't mapped yet and `grab_focus` would silently no-op.
+    if active_ws_idx > 0 {
+        switch_workspace(workspace_manager, active_ws_idx, main_area, tab_bar, window, Some(dc));
+    }
+
+    let Ok(mgr) = workspace_manager.try_borrow() else {
+        return daemon_ws0_built;
+    };
+    if let Some(ws) = mgr.workspaces.get(active_ws_idx) {
+        if let Some(page) = ws.tab_view.selected_page() {
+            let container = page.child();
+            let leaves = collect_leaf_drawing_areas(&container);
+            if let Some(da) = leaves.first() {
+                focus_when_mapped(da);
+            }
+        }
+    }
+    mgr.workspaces.iter().any(|w| w.tab_view.n_pages() > 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -3274,6 +3417,7 @@ fn focus_pane_by_name(
 }
 
 fn add_new_tab(
+    workspace_idx: usize,
     tab_view: &adw::TabView,
     config: &Config,
     tab_states: &TabStateMap,
@@ -3295,11 +3439,13 @@ fn add_new_tab(
     let on_notify = make_on_notify_callback(tab_view, tab_states, window);
 
     // Use profile-aware RPC when command or cwd are provided (AC-13, AC-14).
+    // workspace_idx routes the new tab to the correct daemon-side workspace
+    // so cold-restart restores it there (session-restore fix).
     let rpc_result = if command.is_some() || working_dir.is_some() {
         let cmd_vec = command.map(|c| c.to_vec());
-        dc.new_tab_with_profile(cmd_vec, working_dir)
+        dc.new_tab_with_profile(workspace_idx, cmd_vec, working_dir)
     } else {
-        dc.new_tab()
+        dc.new_tab(workspace_idx)
     };
     match rpc_result {
         Ok((pane_id, tab_id)) => {
@@ -3834,6 +3980,13 @@ fn close_pane_by_name(
 
     // Remove both children from the Paned using the proper Paned API.
     // Direct unparent() doesn't clear Paned's internal child pointers.
+    //
+    // P-007: clear focus_child BEFORE clearing the slots. FIX-002 pinned
+    // parent_paned.focus_child to focused_vbox at split time; if we clear
+    // the slot while focus_child still points inside it, GTK emits
+    // `gtk_paned_set_focus_child was called on widget (nil)`. Clearing
+    // focus_child to None first suppresses the cosmetic warning.
+    parent_paned.set_focus_child(gtk4::Widget::NONE);
     parent_paned.set_start_child(gtk4::Widget::NONE);
     parent_paned.set_end_child(gtk4::Widget::NONE);
 
@@ -3865,6 +4018,12 @@ fn close_pane_by_name(
                 } else {
                     PanedSlot::End
                 };
+
+                // P-007: clear grandparent focus_child BEFORE replacing its
+                // slot. FIX-002 pinned gp_paned.focus_child to parent_paned;
+                // replacing the slot while focus_child still points at the
+                // outgoing parent_paned trips the same warning as above.
+                gp_paned.set_focus_child(gtk4::Widget::NONE);
 
                 // Use Paned API to remove and replace (not unparent)
                 match gp_slot {
@@ -4004,10 +4163,8 @@ fn navigate_pane(tab_view: &adw::TabView, focus_tracker: &FocusTracker, directio
             }
         };
 
-        if is_valid {
-            if best.is_none() || distance < best.unwrap().1 {
-                best = Some((candidate, distance));
-            }
+        if is_valid && (best.is_none() || distance < best.unwrap().1) {
+            best = Some((candidate, distance));
         }
     }
 
@@ -4362,8 +4519,9 @@ fn copy_selection(
             };
 
             let mut line = String::new();
-            for col in col_start..=col_end.min(cells.len().saturating_sub(1)) {
-                line.push_str(&cells[col].grapheme);
+            let upper = col_end.min(cells.len().saturating_sub(1));
+            for cell in cells.iter().take(upper + 1).skip(col_start) {
+                line.push_str(&cell.grapheme);
             }
 
             // Soft-wrap detection: use the real wrap flag from libghostty-vt
@@ -4879,7 +5037,7 @@ fn compute_display_title(state: &TerminalState) -> String {
     // Fall back to OSC title — extract just the path portion.
     let osc_title = state.terminal.title();
     if !osc_title.is_empty() && osc_title != "shell" {
-        return tilde_path(cwd_from_osc_title(&osc_title));
+        return tilde_path(cwd_from_osc_title(osc_title));
     }
 
     "shell".to_string()
@@ -4909,7 +5067,7 @@ fn compute_window_title(state: &TerminalState) -> String {
     // Daemon panes: OSC 0/2 title is set on every prompt render — extract just the path.
     let osc_title = state.terminal.title();
     if !osc_title.is_empty() {
-        return tilde_cwd(cwd_from_osc_title(&osc_title));
+        return tilde_cwd(cwd_from_osc_title(osc_title));
     }
 
     // Daemon panes: fall back to CWD captured at connect time from PaneInfo.
@@ -5187,7 +5345,7 @@ fn epoch_to_timestamp(epoch_secs: u64) -> String {
     const DAYS_LEAP: [u64; 12] = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 
     fn is_leap(y: u64) -> bool {
-        (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+        (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
     }
 
     fn days_in_year(y: u64) -> u64 {
@@ -6223,10 +6381,8 @@ fn tab_bar_find_page_at(tab_bar: &adw::TabBar, x: f64, y: f64) -> Option<adw::Ta
             let by = bounds.y() as f64;
             let bw = bounds.width() as f64;
             let bh = bounds.height() as f64;
-            if x >= bx && x <= bx + bw && y >= by && y <= by + bh {
-                if (idx as i32) < n_pages {
-                    return Some(tv.nth_page(idx as i32));
-                }
+            if x >= bx && x <= bx + bw && y >= by && y <= by + bh && (idx as i32) < n_pages {
+                return Some(tv.nth_page(idx as i32));
             }
         }
     }
@@ -6284,13 +6440,16 @@ fn wire_tab_context_menu_signal(
             let (x, y) = mgr.last_tab_click;
             tracing::debug!("setup-menu: click pos ({x},{y}), {} workspaces", mgr.workspaces.len());
             // Find the workspace that owns this tab_view.
-            let Some(ws) = mgr.workspaces.iter().find(|ws| ws.tab_view == *tv) else {
+            let Some((ws_idx, ws)) =
+                mgr.workspaces.iter().enumerate().find(|(_, ws)| ws.tab_view == *tv)
+            else {
                 tracing::debug!("setup-menu: no workspace found for this tab_view");
                 return;
             };
             (
                 x,
                 y,
+                ws_idx,
                 Rc::clone(&ws.tab_states),
                 Rc::clone(&ws.focus_tracker),
                 Rc::clone(&ws.custom_titles),
@@ -6298,7 +6457,8 @@ fn wire_tab_context_menu_signal(
                 Rc::clone(&ws.tab_id_map),
             )
         };
-        let (x, y, tab_states, focus_tracker, custom_titles, tab_colors, tab_id_map) = result;
+        let (x, y, ws_idx, tab_states, focus_tracker, custom_titles, tab_colors, tab_id_map) =
+            result;
 
         tracing::debug!("setup-menu: showing context menu at ({x},{y})");
         // Mark as handled so the bubble-phase fallback skips this click.
@@ -6306,6 +6466,7 @@ fn wire_tab_context_menu_signal(
             mgr.tab_menu_shown = true;
         }
         show_tab_context_menu(
+            ws_idx,
             &tb,
             tv,
             page,
@@ -6324,8 +6485,13 @@ fn wire_tab_context_menu_signal(
 }
 
 /// Show the tab right-click context menu positioned at (x, y) in tab_bar coordinates.
+///
+/// `workspace_idx` — the workspace that owns the right-clicked tab; threaded
+/// through so `Duplicate Tab` routes the new tab to the correct workspace
+/// (session-restore fix).
 #[allow(clippy::too_many_arguments)]
 fn show_tab_context_menu(
+    workspace_idx: usize,
     tab_bar: &adw::TabBar,
     tab_view: &adw::TabView,
     page: &adw::TabPage,
@@ -6403,6 +6569,7 @@ fn show_tab_context_menu(
     }
 
     let menu_box = build_tab_context_menu_box(
+        workspace_idx,
         &popover,
         tab_view,
         page,
@@ -6422,6 +6589,7 @@ fn show_tab_context_menu(
 /// Build the full 11-item tab context menu box.
 #[allow(clippy::too_many_arguments)]
 fn build_tab_context_menu_box(
+    workspace_idx: usize,
     popover: &gtk4::Popover,
     tab_view: &adw::TabView,
     page: &adw::TabPage,
@@ -6493,7 +6661,17 @@ fn build_tab_context_menu_box(
         let btn = tab_menu_button("Duplicate Tab");
         btn.connect_clicked(move |_| {
             pop_d.popdown();
-            duplicate_tab(&tv_d, &page_d, &ts_d, &ft_d, &ct_d, &win_d, dc_d.clone(), &sc_d);
+            duplicate_tab(
+                workspace_idx,
+                &tv_d,
+                &page_d,
+                &ts_d,
+                &ft_d,
+                &ct_d,
+                &win_d,
+                dc_d.clone(),
+                &sc_d,
+            );
         });
         vbox.append(&btn);
     }
@@ -6864,7 +7042,12 @@ fn make_tab_color_dot_icon(rgba: &gtk4::gdk::RGBA) -> gtk4::gdk::MemoryTexture {
 }
 
 /// Duplicate a tab — open a new tab at the same CWD as the source tab's focused pane.
+///
+/// `workspace_idx` — the workspace that owns the source tab; the new tab is
+/// created in the same workspace (session-restore fix).
+#[allow(clippy::too_many_arguments)]
 fn duplicate_tab(
+    workspace_idx: usize,
     tab_view: &adw::TabView,
     page: &adw::TabPage,
     tab_states: &TabStateMap,
@@ -6898,6 +7081,7 @@ fn duplicate_tab(
     let dup_tab_id_map: TabIdMap = Rc::new(RefCell::new(HashMap::new()));
 
     add_new_tab(
+        workspace_idx,
         tab_view,
         &cfg,
         tab_states,
@@ -7066,6 +7250,7 @@ fn wire_tab_view_handlers(
     tab_view: &adw::TabView,
     tab_states: &TabStateMap,
     focus_tracker: &FocusTracker,
+    tab_id_map: &TabIdMap,
     window: &adw::ApplicationWindow,
     daemon_client: Option<Arc<DaemonClient>>,
 ) {
@@ -7073,7 +7258,7 @@ fn wire_tab_view_handlers(
     {
         let window_close = window.clone();
         let states_close = Rc::clone(tab_states);
-        let dc_close = daemon_client;
+        let dc_close = daemon_client.clone();
         tab_view.connect_close_page(move |tv, page| {
             let container = page.child();
             if let Some(ref dc) = dc_close {
@@ -7091,9 +7276,12 @@ fn wire_tab_view_handlers(
         });
     }
 
-    // Focus management on tab switch
+    // Focus management on tab switch — also notify the daemon via focus_tab
+    // so session-restore brings the correct tab back (session-restore fix).
     {
         let focus_switch = Rc::clone(focus_tracker);
+        let tim_focus = Rc::clone(tab_id_map);
+        let dc_focus = daemon_client;
         tab_view.connect_selected_page_notify(move |tv| {
             if let Some(page) = tv.selected_page() {
                 let container = page.child();
@@ -7105,6 +7293,18 @@ fn wire_tab_view_handlers(
                     .or_else(|| leaves.first());
                 if let Some(da) = target {
                     da.grab_focus();
+                }
+                // Persist active-tab on the daemon. See initial_tab_view's
+                // notify handler for the full rationale and silent-skip
+                // semantics.
+                if let Some(ref dc) = dc_focus {
+                    let page_key = page_identity_key(&page);
+                    let tab_id = tim_focus.borrow().get(&page_key).copied();
+                    if let Some(tid) = tab_id {
+                        if let Err(e) = dc.focus_tab(tid) {
+                            tracing::debug!("focus_tab RPC failed: {e}");
+                        }
+                    }
                 }
             }
         });
@@ -7176,6 +7376,7 @@ fn switch_workspace(
     main_area: &gtk4::Box,
     tab_bar: &adw::TabBar,
     window: &adw::ApplicationWindow,
+    daemon_client: Option<&Arc<DaemonClient>>,
 ) {
     let Ok(mut mgr) = workspace_manager.try_borrow_mut() else {
         return;
@@ -7221,6 +7422,14 @@ fn switch_workspace(
     let ws_name = ws.name.clone();
     drop(mgr);
     update_window_title_with_workspace(ws_count, &ws_name, workspace_manager, window);
+
+    // Persist the active-workspace index on the daemon so session-restore
+    // brings the correct workspace back on cold restart (session-restore fix).
+    if let Some(dc) = daemon_client {
+        if let Err(e) = dc.set_active_workspace(target_index) {
+            tracing::debug!("set_active_workspace RPC failed: {e}");
+        }
+    }
 }
 
 /// Show the "Restore Previous Session" dialog listing trashed sessions.
@@ -7267,7 +7476,7 @@ fn show_restore_session_dialog(window: &adw::ApplicationWindow) {
     let session_ids: Rc<Vec<uuid::Uuid>> = Rc::new(trashed.iter().map(|t| t.session_id).collect());
 
     for info in &trashed {
-        let row = adw::ActionRow::builder().title(&info.workspace_names.join(", ")).build();
+        let row = adw::ActionRow::builder().title(info.workspace_names.join(", ")).build();
 
         let tabs_label = format!("{} tab(s)", info.tab_count);
         let time_str = info
@@ -7420,6 +7629,7 @@ fn create_and_switch_to_new_workspace(
         &new_tv,
         &new_tab_states,
         &new_focus_tracker,
+        &new_tab_id_map,
         window,
         daemon_client.clone(),
     );
@@ -7887,7 +8097,7 @@ fn build_workspace_sidebar(
         let sc_ref = Rc::clone(shared_config);
         list_box.connect_row_activated(move |_lb, row| {
             let target = row.index() as usize;
-            switch_workspace(&wm, target, &ma, &tb, &win);
+            switch_workspace(&wm, target, &ma, &tb, &win, dc_ref.as_ref());
             refresh_workspace_sidebar(&lb_ref, &wm, &ma, &tb, &win, &dc_ref, &sc_ref);
         });
     }
@@ -8678,6 +8888,7 @@ fn duplicate_workspace(
         &new_tv,
         &new_tab_states,
         &new_focus_tracker,
+        &new_tab_id_map,
         window,
         daemon_client.clone(),
     );
@@ -8698,8 +8909,16 @@ fn duplicate_workspace(
     }
 
     // Add one tab per source CWD.
+    //
+    // NOTE: `duplicate_workspace` does NOT create a corresponding workspace
+    // on the daemon side (pre-existing limitation, tracked separately). The
+    // new_tab RPCs below therefore route to the source workspace on the
+    // daemon — not ideal, but avoids crashing with an out-of-bounds
+    // workspace_idx when we pass the post-insert GTK index which doesn't
+    // exist daemon-side yet.
     for cwd_opt in &cwds {
         add_new_tab(
+            workspace_idx,
             &new_tv,
             &cfg,
             &new_tab_states,
@@ -8716,6 +8935,7 @@ fn duplicate_workspace(
     // If no tabs were added (source had 0 pages), add one default tab.
     if new_tv.n_pages() == 0 {
         add_new_tab(
+            workspace_idx,
             &new_tv,
             &cfg,
             &new_tab_states,
@@ -8805,7 +9025,6 @@ fn duplicate_workspace(
 /// Swap the workspace at `workspace_idx` with the one above it (idx - 1).
 ///
 /// Updates `active_index` to follow the moved element (AC-22).
-#[allow(clippy::too_many_arguments)]
 fn move_workspace_up(
     workspace_idx: usize,
     wm: &WorkspaceManager,
@@ -8848,7 +9067,6 @@ fn move_workspace_up(
 /// Swap the workspace at `workspace_idx` with the one below it (idx + 1).
 ///
 /// Updates `active_index` to follow the moved element (AC-26).
-#[allow(clippy::too_many_arguments)]
 fn move_workspace_down(
     workspace_idx: usize,
     wm: &WorkspaceManager,

@@ -1311,7 +1311,7 @@ fn build_keybindings_section(shared_config: &SharedConfig, app: &adw::Applicatio
                     tracing::warn!("Failed to save config after keybinding reset: {e}");
                 }
                 // Restore default accelerator(s) on the app.
-                let accel_strs: Vec<&str> = default_accels.iter().copied().collect();
+                let accel_strs: Vec<&str> = default_accels.to_vec();
                 app_reset.set_accels_for_action(action_name, &accel_strs);
                 // Update the shortcut label back to default display.
                 let display = if !default_accels.is_empty() {
@@ -1579,7 +1579,7 @@ fn build_keybindings_section(shared_config: &SharedConfig, app: &adw::Applicatio
                 }
                 // Re-register all defaults.
                 for def in ACTION_DEFS {
-                    let accel_strs: Vec<&str> = def.default_accels.iter().copied().collect();
+                    let accel_strs: Vec<&str> = def.default_accels.to_vec();
                     app_dialog.set_accels_for_action(def.action_name, &accel_strs);
                 }
                 // Update all row UIs.

@@ -381,6 +381,7 @@ async fn main_async() -> anyhow::Result<()> {
                     | Ok(SessionEvent::PaneSplit { .. })
                     | Ok(SessionEvent::TabMoved { .. })
                     | Ok(SessionEvent::ActiveTabChanged { .. })
+                    | Ok(SessionEvent::ActiveWorkspaceChanged { .. })
                     | Ok(SessionEvent::WorkspaceCreated { .. }) => {
                         // Save immediately so sibling daemons' prune passes
                         // see this pane's UUID in the persisted-union (V2-007

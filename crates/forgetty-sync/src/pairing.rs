@@ -168,20 +168,15 @@ async fn reject_connection(conn: &Connection) {
 /// Read a single newline-terminated line from a `RecvStream`.
 async fn read_line_from_recv(recv: &mut iroh::endpoint::RecvStream) -> Option<String> {
     let mut buf = Vec::new();
-    loop {
-        let mut byte = [0u8; 1];
-        match recv.read_exact(&mut byte).await {
-            Ok(()) => {
-                if byte[0] == b'\n' {
-                    break;
-                }
-                buf.push(byte[0]);
-                if buf.len() > 4096 {
-                    // Guard against oversized lines.
-                    break;
-                }
-            }
-            Err(_) => break,
+    let mut byte = [0u8; 1];
+    while recv.read_exact(&mut byte).await.is_ok() {
+        if byte[0] == b'\n' {
+            break;
+        }
+        buf.push(byte[0]);
+        if buf.len() > 4096 {
+            // Guard against oversized lines.
+            break;
         }
     }
     if buf.is_empty() {
