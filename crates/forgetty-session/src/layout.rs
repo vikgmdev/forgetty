@@ -41,6 +41,10 @@ pub struct SessionWorkspace {
     /// Index of the visually-active tab. This is UI state advanced by GTK
     /// (via T-060 `set_active_tab`), NOT by `create_pane` (see AD-008).
     pub active_tab: usize,
+    /// FIX-010: per-workspace accent colour, stored verbatim as a
+    /// `"#RRGGBB"` hex string (the daemon is opaque to colour semantics;
+    /// see AD-007). `None` means "default GTK row style."
+    pub color: Option<String>,
 }
 
 /// One tab within a workspace: holds a pane tree (a leaf for a single pane,
@@ -68,6 +72,7 @@ impl SessionLayout {
                 name: "Default".to_string(),
                 tabs: Vec::new(),
                 active_tab: 0,
+                color: None,
             }],
             active_workspace: 0,
         }

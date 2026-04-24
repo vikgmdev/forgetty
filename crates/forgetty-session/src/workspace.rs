@@ -91,6 +91,7 @@ where
                 root_paths: Vec::new(),
                 tabs,
                 active_tab: ws_entry.active_tab,
+                color: None,
             }
         })
         .collect();

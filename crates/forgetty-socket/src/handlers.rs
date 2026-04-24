@@ -58,6 +58,7 @@ pub fn dispatch(
         methods::RENAME_WORKSPACE => handle_rename_workspace(request, &sm),
         methods::DELETE_WORKSPACE => handle_delete_workspace(request, &sm),
         methods::DUPLICATE_WORKSPACE => handle_duplicate_workspace(request, &sm),
+        methods::SET_WORKSPACE_COLOR => handle_set_workspace_color(request, &sm),
         // Split ratio + pinned session methods (B-002).
         methods::UPDATE_SPLIT_RATIOS => handle_update_split_ratios(request, &sm),
         methods::SET_PINNED => handle_set_pinned(request, &sm),
@@ -585,6 +586,42 @@ fn handle_duplicate_workspace(request: &Request, sm: &SessionManager) -> Respons
             request.id.clone(),
             protocol::INTERNAL_ERROR,
             format!("duplicate_workspace failed: {e}"),
+        ),
+    }
+}
+
+/// Handle `set_workspace_color` RPC (FIX-010).
+///
+/// Params: `{ "workspace_idx": u64, "color": "#RRGGBB" | null }`.
+///
+/// - Missing `workspace_idx` → `INVALID_PARAMS`.
+/// - Out-of-range index → `INTERNAL_ERROR`.
+/// - Success → `{ "ok": true }`. `null` (or absent) colour clears any
+///   existing colour.
+///
+/// The daemon stores the hex string verbatim (see AD-007); GTK produces
+/// and validates the hex format client-side.
+fn handle_set_workspace_color(request: &Request, sm: &SessionManager) -> Response {
+    let workspace_idx = match request.params.get("workspace_idx").and_then(|v| v.as_u64()) {
+        Some(n) => n as usize,
+        None => {
+            return Response::error(
+                request.id.clone(),
+                protocol::INVALID_PARAMS,
+                "missing param: workspace_idx (u64)".to_string(),
+            )
+        }
+    };
+
+    // `color` may be absent, null, or a string. Absent == null == clear.
+    let color: Option<&str> = request.params.get("color").and_then(|v| v.as_str());
+
+    match sm.set_workspace_color(workspace_idx, color) {
+        Ok(()) => Response::success(request.id.clone(), serde_json::json!({ "ok": true })),
+        Err(e) => Response::error(
+            request.id.clone(),
+            protocol::INTERNAL_ERROR,
+            format!("set_workspace_color failed: {e}"),
         ),
     }
 }
@@ -1509,5 +1546,82 @@ mod tests {
         assert!(resp.result.is_some());
         let layout = sm.layout();
         assert_eq!(layout.workspaces[1].name, "ExplicitCopy");
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX-010 — set_workspace_color RPC dispatch tests
+    // -----------------------------------------------------------------------
+
+    /// FIX-010 AC-8 test 8: dispatch covers the four parameter-path branches.
+    #[test]
+    fn dispatch_set_workspace_color_four_branches() {
+        // Sub-assert 1: missing workspace_idx → INVALID_PARAMS.
+        {
+            let sm = make_sm();
+            let req = Request {
+                jsonrpc: "2.0".to_string(),
+                method: "set_workspace_color".to_string(),
+                params: serde_json::json!({ "color": "#3a6ee4" }),
+                id: Some(serde_json::json!(1)),
+            };
+            let resp = dispatch(&req, sm, None);
+            assert!(resp.error.is_some(), "missing workspace_idx must error");
+            assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
+        }
+
+        // Sub-assert 2: out-of-range index → INTERNAL_ERROR.
+        {
+            let sm = make_sm();
+            let req = Request {
+                jsonrpc: "2.0".to_string(),
+                method: "set_workspace_color".to_string(),
+                params: serde_json::json!({ "workspace_idx": 99, "color": "#3a6ee4" }),
+                id: Some(serde_json::json!(1)),
+            };
+            let resp = dispatch(&req, Arc::clone(&sm), None);
+            assert!(resp.error.is_some(), "out-of-range must error");
+            assert_eq!(resp.error.unwrap().code, protocol::INTERNAL_ERROR);
+            // Daemon state unchanged.
+            assert!(sm.layout().workspaces[0].color.is_none());
+        }
+
+        // Sub-assert 3: success with a present color → { ok: true } and the
+        // colour is stored verbatim.
+        {
+            let sm = make_sm();
+            let req = Request {
+                jsonrpc: "2.0".to_string(),
+                method: "set_workspace_color".to_string(),
+                params: serde_json::json!({ "workspace_idx": 0, "color": "#58b967" }),
+                id: Some(serde_json::json!(1)),
+            };
+            let resp = dispatch(&req, Arc::clone(&sm), None);
+            assert!(resp.result.is_some(), "success path must return a result");
+            assert_eq!(resp.result.unwrap().get("ok").and_then(|v| v.as_bool()), Some(true));
+            assert_eq!(sm.layout().workspaces[0].color, Some("#58b967".to_string()));
+        }
+
+        // Sub-assert 4: success with explicit null color → { ok: true } and
+        // the colour is cleared.
+        {
+            let sm = make_sm();
+            // Seed a colour first.
+            sm.set_workspace_color(0, Some("#ff00aa")).expect("seed colour");
+            assert_eq!(sm.layout().workspaces[0].color, Some("#ff00aa".to_string()));
+
+            let req = Request {
+                jsonrpc: "2.0".to_string(),
+                method: "set_workspace_color".to_string(),
+                params: serde_json::json!({
+                    "workspace_idx": 0,
+                    "color": serde_json::Value::Null,
+                }),
+                id: Some(serde_json::json!(1)),
+            };
+            let resp = dispatch(&req, Arc::clone(&sm), None);
+            assert!(resp.result.is_some(), "explicit-null success path must return a result");
+            assert_eq!(resp.result.unwrap().get("ok").and_then(|v| v.as_bool()), Some(true));
+            assert!(sm.layout().workspaces[0].color.is_none());
+        }
     }
 }

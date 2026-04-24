@@ -476,6 +476,7 @@ mod tests {
                     pane_id: None,
                 }],
                 active_tab: 0,
+                color: None,
             }],
             active_workspace: 0,
             window_width: Some(960),
@@ -553,6 +554,59 @@ mod tests {
         assert_eq!(restored.window_height, Some(640));
     }
 
+    /// FIX-010: `Workspace.color` round-trips losslessly across JSON. A JSON
+    /// document with no `color` key (pre-FIX-010 shape) still deserialises,
+    /// and a document with `"color": "#3a6ee4"` round-trips to
+    /// `Some("#3a6ee4".into())`.
+    #[test]
+    fn test_workspace_color_serde_round_trip() {
+        // 1) Missing-field path: pre-FIX-010 JSON must load with color: None.
+        let old_json = r##"{
+            "version": 1,
+            "workspaces": [
+                {
+                    "id": "00000000-0000-0000-0000-000000000001",
+                    "name": "Default",
+                    "root_paths": [],
+                    "tabs": [],
+                    "active_tab": 0
+                }
+            ],
+            "active_workspace": 0
+        }"##;
+        let restored: WorkspaceState = serde_json::from_str(old_json).unwrap();
+        assert_eq!(restored.workspaces.len(), 1);
+        assert!(
+            restored.workspaces[0].color.is_none(),
+            "pre-FIX-010 JSON without color field must deserialise to None"
+        );
+
+        // 2) Present-field path: the hex string round-trips verbatim.
+        let new_json = r##"{
+            "version": 1,
+            "workspaces": [
+                {
+                    "id": "00000000-0000-0000-0000-000000000002",
+                    "name": "A",
+                    "root_paths": [],
+                    "tabs": [],
+                    "active_tab": 0,
+                    "color": "#3a6ee4"
+                }
+            ],
+            "active_workspace": 0
+        }"##;
+        let restored: WorkspaceState = serde_json::from_str(new_json).unwrap();
+        assert_eq!(restored.workspaces[0].color, Some("#3a6ee4".to_string()));
+
+        // 3) Full round-trip: serialise a Some(hex) workspace and parse back.
+        let mut state = sample_state();
+        state.workspaces[0].color = Some("#ff00aa".to_string());
+        let json = serde_json::to_string_pretty(&state).unwrap();
+        let restored: WorkspaceState = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.workspaces[0].color, Some("#ff00aa".to_string()));
+    }
+
     #[test]
     fn multi_workspace_round_trip() {
         let state = WorkspaceState {
@@ -581,6 +635,8 @@ mod tests {
                         },
                     ],
                     active_tab: 1,
+                    // FIX-010: verify colour survives round-trip alongside other fields.
+                    color: Some("#ff00aa".into()),
                 },
                 Workspace {
                     id: Uuid::new_v4(),
@@ -603,6 +659,7 @@ mod tests {
                         pane_id: None,
                     }],
                     active_tab: 0,
+                    color: None,
                 },
                 Workspace {
                     id: Uuid::new_v4(),
@@ -617,6 +674,7 @@ mod tests {
                         pane_id: None,
                     }],
                     active_tab: 0,
+                    color: None,
                 },
             ],
             active_workspace: 1,
@@ -637,13 +695,16 @@ mod tests {
         assert_eq!(restored.workspaces[0].name, "Default");
         assert_eq!(restored.workspaces[0].tabs.len(), 2);
         assert_eq!(restored.workspaces[0].active_tab, 1);
+        assert_eq!(restored.workspaces[0].color, Some("#ff00aa".into()));
 
         assert_eq!(restored.workspaces[1].name, "Range");
         assert_eq!(restored.workspaces[1].tabs.len(), 1);
         assert_eq!(restored.workspaces[1].active_tab, 0);
+        assert!(restored.workspaces[1].color.is_none());
 
         assert_eq!(restored.workspaces[2].name, "Personal");
         assert_eq!(restored.workspaces[2].tabs.len(), 1);
+        assert!(restored.workspaces[2].color.is_none());
     }
 
     #[test]
@@ -665,6 +726,7 @@ mod tests {
                     pane_id: None,
                 }],
                 active_tab: 0,
+                color: None,
             }],
             active_workspace: 0,
             window_width: None,
@@ -898,6 +960,7 @@ mod tests {
                         pane_id: Some(tab_root),
                     }],
                     active_tab: 0,
+                    color: None,
                 },
                 Workspace {
                     id: Uuid::new_v4(),
@@ -916,6 +979,7 @@ mod tests {
                         pane_id: Some(duplicate),
                     }],
                     active_tab: 0,
+                    color: None,
                 },
             ],
             active_workspace: 0,

@@ -76,4 +76,10 @@ pub enum SessionEvent {
     /// deleted workspace's panes, so subscribers unwind pane state before
     /// dropping the workspace row.
     WorkspaceDeleted { workspace_idx: usize, workspace_id: Uuid },
+
+    /// A workspace's accent colour changed (FIX-010). `color` is `Some(hex)`
+    /// for a set, `None` for a clear. Subscribers update their local row-style
+    /// without re-fetching the layout. Emitted only when the value actually
+    /// changed (idempotence — mirror `WorkspaceRenamed`).
+    WorkspaceColorChanged { workspace_idx: usize, workspace_id: Uuid, color: Option<String> },
 }

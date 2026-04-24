@@ -56,6 +56,10 @@ pub struct WorkspaceInfo {
     pub name: String,
     pub active_tab: usize,
     pub tabs: Vec<TabInfo>,
+    /// FIX-010: daemon-persisted accent colour, `"#RRGGBB"` hex.
+    /// `None` when the workspace has no colour set (pre-FIX-010 JSON,
+    /// or user cleared via the None button).
+    pub color: Option<String>,
 }
 
 /// Full layout snapshot returned by `get_layout`.
@@ -383,6 +387,30 @@ impl DaemonClient {
         Ok(())
     }
 
+    /// Update a workspace's accent colour on the daemon (FIX-010). The daemon
+    /// is the single source of truth for persisted colour (AD-007). GTK must
+    /// call this before mutating its local `WorkspaceView.color`, otherwise
+    /// the colour is lost on save (daemon writes its unchanged `SessionLayout`
+    /// on disconnect). Pass `None` (→ JSON `null`) to clear the colour.
+    pub fn set_workspace_color(
+        &self,
+        workspace_idx: usize,
+        color: Option<&str>,
+    ) -> Result<(), DaemonError> {
+        let color_json: serde_json::Value = match color {
+            Some(s) => serde_json::json!(s),
+            None => serde_json::Value::Null,
+        };
+        self.rpc(
+            "set_workspace_color",
+            serde_json::json!({
+                "workspace_idx": workspace_idx,
+                "color": color_json,
+            }),
+        )?;
+        Ok(())
+    }
+
     /// Delete a workspace on the daemon (FIX-003). The daemon kills all panes
     /// in the workspace, unlinks their byte logs, removes the workspace entry
     /// from the layout, clamps `active_workspace`, and fans out `PaneClosed`
@@ -540,6 +568,9 @@ impl DaemonClient {
                 .map_err(|e| DaemonError(format!("get_layout: invalid workspace id UUID: {e}")))?;
             let name = ws.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let active_tab = ws.get("active_tab").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            // FIX-010: per-workspace accent colour. Absent / null → None.
+            let color: Option<String> =
+                ws.get("color").and_then(|v| v.as_str()).map(str::to_string);
 
             let tabs_array = ws
                 .get("tabs")
@@ -562,7 +593,7 @@ impl DaemonClient {
                 tabs.push(TabInfo { tab_id, title, pane_tree });
             }
 
-            workspaces.push(WorkspaceInfo { id, name, active_tab, tabs });
+            workspaces.push(WorkspaceInfo { id, name, active_tab, tabs, color });
         }
 
         Ok(LayoutInfo { active_workspace, workspaces })
@@ -850,6 +881,14 @@ pub enum LayoutEvent {
     /// "already absent locally" case. Kept for symmetry with `WorkspaceRenamed`
     /// and forward-compat with external deletes (e.g., a paired Android client).
     WorkspaceDeleted { workspace_idx: usize, workspace_id: uuid::Uuid },
+
+    /// FIX-010: a workspace's accent colour changed (set or cleared).
+    ///
+    /// For self-originated changes the local mutation already ran in
+    /// `apply_workspace_color`; this arm is a no-op via idempotency
+    /// (current hex == event hex). External paired-device changes (future)
+    /// reconcile here.
+    WorkspaceColorChanged { workspace_idx: usize, workspace_id: uuid::Uuid, color: Option<String> },
 }
 
 // ---------------------------------------------------------------------------
@@ -1166,6 +1205,20 @@ async fn subscribe_layout_task(
                     Err(_) => continue,
                 };
                 LayoutEvent::WorkspaceDeleted { workspace_idx, workspace_id }
+            }
+            "workspace_color_changed" => {
+                // FIX-010: daemon-originated colour-change notification.
+                let workspace_idx =
+                    params.get("workspace_idx").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let workspace_id_str =
+                    params.get("workspace_id").and_then(|v| v.as_str()).unwrap_or("");
+                let workspace_id = match uuid::Uuid::parse_str(workspace_id_str) {
+                    Ok(u) => u,
+                    Err(_) => continue,
+                };
+                let color: Option<String> =
+                    params.get("color").and_then(|v| v.as_str()).map(str::to_string);
+                LayoutEvent::WorkspaceColorChanged { workspace_idx, workspace_id, color }
             }
             _ => {
                 // Unknown layout notification — ignore silently.

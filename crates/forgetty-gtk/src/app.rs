@@ -2184,6 +2184,16 @@ fn build_ui(
                             &shared_config,
                         );
                     }
+                    // FIX-010: install per-workspace CSS providers for each
+                    // restored colour. Runs after `build_widgets_from_layout`
+                    // populated `mgr.workspaces[i].color` from the daemon's
+                    // `get_layout` response. The sidebar rows may not exist
+                    // yet (they are built lazily on first sidebar-reveal),
+                    // but `rebuild_sidebar_rows_for_color` handles the
+                    // no-rows case gracefully; `refresh_workspace_sidebar`
+                    // reads `ws.color.is_some()` when it builds rows and
+                    // applies the `workspace-color-{uuid}` class.
+                    apply_restored_workspace_colors(&workspace_manager, &workspace_sidebar_lb);
                 }
             }
             Err(e) => {
@@ -2830,6 +2840,34 @@ fn handle_layout_event(
             };
             update_window_title_with_workspace(ws_count, &ws_name, workspace_manager, window);
         }
+        LayoutEvent::WorkspaceColorChanged { workspace_idx: _, workspace_id, color } => {
+            // FIX-010: daemon confirms a colour change. For self-originated
+            // changes (GTK called `dc.set_workspace_color` and
+            // `apply_workspace_color_local` already ran), the current hex
+            // equals the event hex — this arm becomes a no-op via
+            // idempotency. External changes (future paired-device) reconcile
+            // here. Match on `workspace_id` so concurrent reorders don't
+            // misroute the update.
+            let (local_idx, needs_apply) = {
+                let Ok(mgr) = workspace_manager.try_borrow() else { return };
+                let Some(local_idx) = mgr.workspaces.iter().position(|w| w.id == workspace_id)
+                else {
+                    tracing::debug!(
+                        "subscribe_layout: WorkspaceColorChanged id={workspace_id} not found locally (race or external)"
+                    );
+                    return;
+                };
+                let current_hex = mgr.workspaces[local_idx].color.as_ref().map(rgba_to_hex);
+                (local_idx, current_hex != color)
+            };
+            if !needs_apply {
+                return;
+            }
+            let rgba: Option<gtk4::gdk::RGBA> = color.as_deref().and_then(hex_to_rgba);
+            // Reuse the local-only helper — DO NOT call apply_workspace_color
+            // (that would re-issue the RPC the daemon just notified us about).
+            apply_workspace_color_local(workspace_manager, local_idx, rgba, sidebar_lb);
+        }
     }
 }
 
@@ -3141,10 +3179,15 @@ fn build_widgets_from_layout(
             let (ref active_page, _) = created[active_tab_idx];
             tab_view_clone.set_selected_page(active_page);
 
-            // Sync workspace[0]'s id/name with the daemon's workspace[0].
+            // Sync workspace[0]'s id/name/colour with the daemon's workspace[0].
             if let Ok(mut mgr) = workspace_manager.try_borrow_mut() {
                 mgr.workspaces[0].id = daemon_ws0.id;
                 mgr.workspaces[0].name = daemon_ws0.name.clone();
+                // FIX-010: adopt the daemon's persisted colour for ws 0.
+                // The CSS provider is installed by the post-loop
+                // `apply_restored_workspace_colors` pass (after the sidebar
+                // ListBox rows exist).
+                mgr.workspaces[0].color = daemon_ws0.color.as_deref().and_then(hex_to_rgba);
             }
         }
     }
@@ -3246,6 +3289,12 @@ fn build_widgets_from_layout(
                 );
                 continue;
             };
+            // FIX-010: carry the daemon-reported colour into the new
+            // WorkspaceView. The CSS provider is installed later by
+            // `apply_restored_workspace_colors` (it needs the ListBox row to
+            // already exist).
+            let initial_color: Option<gtk4::gdk::RGBA> =
+                ws_info.color.as_deref().and_then(hex_to_rgba);
             mgr.workspaces.push(WorkspaceView {
                 id: ws_info.id,
                 name: ws_info.name.clone(),
@@ -3255,7 +3304,7 @@ fn build_widgets_from_layout(
                 custom_titles: new_custom_titles,
                 tab_id_map: new_tab_id_map,
                 tab_colors: Rc::new(RefCell::new(HashMap::new())),
-                color: None,
+                color: initial_color,
                 color_css_provider: None,
             });
             tracing::info!(
@@ -6471,6 +6520,37 @@ const TAB_COLOR_PRESETS: &[(&str, (f32, f32, f32))] = &[
     ("Pink", (0.859, 0.365, 0.647)),
 ];
 
+/// FIX-010: format an `RGBA` as `"#RRGGBB"`. Alpha is ignored — workspace
+/// accent colours are always opaque (dialog `set_with_alpha(false)`). The
+/// components are clamped to `[0.0, 1.0]` and rounded down to `u8`.
+fn rgba_to_hex(rgba: &gtk4::gdk::RGBA) -> String {
+    format!(
+        "#{:02x}{:02x}{:02x}",
+        (rgba.red().clamp(0.0, 1.0) * 255.0) as u8,
+        (rgba.green().clamp(0.0, 1.0) * 255.0) as u8,
+        (rgba.blue().clamp(0.0, 1.0) * 255.0) as u8,
+    )
+}
+
+/// FIX-010: parse `"#RRGGBB"` (with or without leading `#`) into an opaque
+/// `RGBA`. Returns `None` on anything other than exactly 6 ASCII hex
+/// characters — malformed input (wrong length, non-ASCII, non-hex bytes)
+/// degrades gracefully to "no colour" rather than panicking.
+///
+/// Safety note: slicing `&str[0..2]` panics if the range doesn't align with
+/// UTF-8 character boundaries. The `is_ascii()` check below guarantees every
+/// byte is a single-byte ASCII codepoint, so slicing is always boundary-safe.
+fn hex_to_rgba(s: &str) -> Option<gtk4::gdk::RGBA> {
+    let hex = s.strip_prefix('#').unwrap_or(s);
+    if hex.len() != 6 || !hex.is_ascii() {
+        return None;
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+    Some(gtk4::gdk::RGBA::new(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0))
+}
+
 /// Wire the `setup-menu` signal on a tab view so that right-clicking any tab
 /// shows the custom context menu popover.
 ///
@@ -8471,7 +8551,13 @@ fn build_workspace_context_menu_box(
         let wm_c = Rc::clone(wm);
         let lb_c = sidebar_lb.clone();
         let win_c = window.clone();
-        let sub_box = build_workspace_color_picker_box(workspace_idx, &wm_c, &lb_c, &win_c);
+        let sub_box = build_workspace_color_picker_box(
+            workspace_idx,
+            &wm_c,
+            &lb_c,
+            &win_c,
+            daemon_client.as_ref(),
+        );
         color_sub.set_child(Some(&sub_box));
         color_sub.set_parent(&color_btn);
 
@@ -8609,11 +8695,16 @@ fn build_workspace_context_menu_box(
 /// Build the color picker box for the "Change Workspace Color" submenu.
 ///
 /// Reuses `TAB_COLOR_PRESETS`. Swatch clicks call `apply_workspace_color`.
+///
+/// FIX-010: `daemon_client` is threaded through so `apply_workspace_color`
+/// can call the daemon RPC first. Each click handler clones the `Arc`
+/// into its closure.
 fn build_workspace_color_picker_box(
     workspace_idx: usize,
     wm: &WorkspaceManager,
     sidebar_lb: &gtk4::ListBox,
     window: &adw::ApplicationWindow,
+    daemon_client: Option<&Arc<DaemonClient>>,
 ) -> gtk4::Box {
     let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
     vbox.set_margin_top(6);
@@ -8648,8 +8739,9 @@ fn build_workspace_color_picker_box(
 
         let wm_c = Rc::clone(wm);
         let lb_c = sidebar_lb.clone();
+        let dc_c = daemon_client.cloned();
         btn.connect_clicked(move |_| {
-            apply_workspace_color(&wm_c, workspace_idx, Some(rgba), &lb_c);
+            apply_workspace_color(&wm_c, workspace_idx, Some(rgba), &lb_c, dc_c.as_ref());
         });
         swatch_box.append(&btn);
     }
@@ -8664,18 +8756,20 @@ fn build_workspace_color_picker_box(
         let wm_c = Rc::clone(wm);
         let lb_c = sidebar_lb.clone();
         let win_c = window.clone();
+        let dc_c = daemon_client.cloned();
         custom_btn.connect_clicked(move |btn| {
             let dialog = gtk4::ColorDialog::new();
             dialog.set_with_alpha(false);
             let wm2 = Rc::clone(&wm_c);
             let lb2 = lb_c.clone();
+            let dc2 = dc_c.clone();
             let win = btn
                 .root()
                 .and_downcast::<gtk4::Window>()
                 .or_else(|| Some(win_c.clone().upcast::<gtk4::Window>()));
             dialog.choose_rgba(win.as_ref(), None, gtk4::gio::Cancellable::NONE, move |result| {
                 if let Ok(rgba) = result {
-                    apply_workspace_color(&wm2, workspace_idx, Some(rgba), &lb2);
+                    apply_workspace_color(&wm2, workspace_idx, Some(rgba), &lb2, dc2.as_ref());
                 }
             });
         });
@@ -8690,8 +8784,9 @@ fn build_workspace_color_picker_box(
 
         let wm_n = Rc::clone(wm);
         let lb_n = sidebar_lb.clone();
+        let dc_n = daemon_client.cloned();
         none_btn.connect_clicked(move |_| {
-            apply_workspace_color(&wm_n, workspace_idx, None, &lb_n);
+            apply_workspace_color(&wm_n, workspace_idx, None, &lb_n, dc_n.as_ref());
         });
         vbox.append(&none_btn);
     }
@@ -8699,16 +8794,61 @@ fn build_workspace_color_picker_box(
     vbox
 }
 
-/// Apply (or clear) a custom color on a workspace sidebar row.
+/// FIX-010: RPC-first orchestrator.
 ///
-/// Sets `mgr.workspaces[idx].color` and installs a per-workspace CSS provider
-/// that overrides the left-border color on the `.workspace-color-{uuid}` class.
-/// Then calls `refresh_workspace_sidebar` (via a direct ListBox rebuild) to
-/// apply the class to the newly-rebuilt row.
+/// Calls `DaemonClient::set_workspace_color` (when a daemon_client is
+/// available); on RPC error, logs and skips local mutation — daemon is the
+/// source of truth (AD-007). On RPC success, falls through to
+/// `apply_workspace_color_local` which does the CSS install + ListBox
+/// refresh. When `daemon_client.is_none()` (e.g. a hypothetical local-only
+/// mode), applies locally only.
 ///
-/// The CSS provider is stored in `WorkspaceView.color_css_provider` so it is
-/// only registered with the display once (on first color assignment).
+/// See BUILDER_NOTES §1 for why RPC errors log (not toast) — matches
+/// FIX-003's in-tree precedent; no toast infra exists in this codebase.
 fn apply_workspace_color(
+    wm: &WorkspaceManager,
+    idx: usize,
+    color: Option<gtk4::gdk::RGBA>,
+    lb: &gtk4::ListBox,
+    daemon_client: Option<&Arc<DaemonClient>>,
+) {
+    // TOCTOU-safe bounds check (FIX-003 discipline) before the RPC. A second
+    // client could have shifted the list between menu-construction time and
+    // swatch-click time.
+    {
+        let Ok(mgr) = wm.try_borrow() else { return };
+        if idx >= mgr.workspaces.len() {
+            return;
+        }
+    }
+
+    // FIX-010: RPC first. Daemon is authoritative — if it rejects, we must
+    // not mutate local state, otherwise we'd reintroduce the data-loss bug
+    // this fix is closing.
+    if let Some(dc) = daemon_client {
+        let hex: Option<String> = color.as_ref().map(rgba_to_hex);
+        if let Err(e) = dc.set_workspace_color(idx, hex.as_deref()) {
+            tracing::warn!(
+                workspace_idx = idx,
+                "set_workspace_color RPC failed: {e} — skipping local mutation"
+            );
+            return;
+        }
+    }
+
+    apply_workspace_color_local(wm, idx, color, lb);
+}
+
+/// FIX-010: the pre-existing local CSS install + sidebar-row refresh,
+/// factored out so both the RPC-success path and the
+/// `LayoutEvent::WorkspaceColorChanged` consumer can call it.
+///
+/// Sets `mgr.workspaces[idx].color` and installs (or refreshes) a
+/// per-workspace `CssProvider` whose rule targets
+/// `.workspace-color-{uuid.simple()}`. The provider is registered once
+/// with the display and reused across colour changes for the same
+/// workspace.
+fn apply_workspace_color_local(
     wm: &WorkspaceManager,
     idx: usize,
     color: Option<gtk4::gdk::RGBA>,
@@ -8771,6 +8911,30 @@ fn apply_workspace_color(
     glib::idle_add_local_once(move || {
         rebuild_sidebar_rows_for_color(&lb_idle, &wm_idle);
     });
+}
+
+/// FIX-010: after `build_widgets_from_layout` restores workspaces from the
+/// daemon, install a `CssProvider` for each workspace whose `color` is
+/// `Some`. This is the counterpart of the runtime `apply_workspace_color`
+/// call for fresh user-driven colour changes — both pipelines converge at
+/// `apply_workspace_color_local`, which owns the CSS-provider install.
+///
+/// Called exactly once per GTK window startup, right after
+/// `build_widgets_from_layout` has populated `WorkspaceView.color` from the
+/// daemon's `get_layout` response. Workspaces with `color: None` are
+/// skipped.
+fn apply_restored_workspace_colors(wm: &WorkspaceManager, lb: &gtk4::ListBox) {
+    let restored: Vec<(usize, gtk4::gdk::RGBA)> = {
+        let Ok(mgr) = wm.try_borrow() else { return };
+        mgr.workspaces
+            .iter()
+            .enumerate()
+            .filter_map(|(i, ws)| ws.color.map(|rgba| (i, rgba)))
+            .collect()
+    };
+    for (idx, rgba) in restored {
+        apply_workspace_color_local(wm, idx, Some(rgba), lb);
+    }
 }
 
 /// Minimal sidebar row rebuild used after a color change.

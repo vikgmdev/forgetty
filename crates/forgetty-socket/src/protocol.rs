@@ -123,6 +123,12 @@ pub mod methods {
     /// inheriting each source tab's leftmost-leaf CWD, and emits
     /// `WorkspaceCreated` + per-tab `PaneCreated`/`TabCreated` events.
     pub const DUPLICATE_WORKSPACE: &str = "duplicate_workspace";
+    /// FIX-010: set (or clear with `null`) a workspace's accent colour.
+    /// Params: `{ "workspace_idx": u64, "color": "#RRGGBB" | null }`.
+    /// The daemon is opaque to colour semantics (AD-007); the string is
+    /// stored verbatim and forwarded to subscribers via a
+    /// `workspace_color_changed` notification.
+    pub const SET_WORKSPACE_COLOR: &str = "set_workspace_color";
     // Split ratio sync (B-002).
     pub const UPDATE_SPLIT_RATIOS: &str = "update_split_ratios";
     // Pinned sessions (B-002).

@@ -256,6 +256,19 @@ async fn main_async() -> anyhow::Result<()> {
                             "workspace index mismatch during cold-start restore"
                         );
                     }
+                    // FIX-010: restore the persisted per-workspace accent colour.
+                    // Missing / null colour field in pre-FIX-010 JSON → no call
+                    // (deserialises to `None`). Non-fatal if the daemon rejects
+                    // the hex — colour is cosmetic.
+                    if saved_ws.color.is_some() {
+                        if let Err(e) =
+                            session_manager.set_workspace_color(ws_idx, saved_ws.color.as_deref())
+                        {
+                            warn!(
+                                "cold-start restore: failed to set colour on workspace {ws_idx}: {e}"
+                            );
+                        }
+                    }
                 }
 
                 // Now restore tabs for ALL workspaces, preserving split structure.
@@ -384,7 +397,8 @@ async fn main_async() -> anyhow::Result<()> {
                     | Ok(SessionEvent::ActiveWorkspaceChanged { .. })
                     | Ok(SessionEvent::WorkspaceCreated { .. })
                     | Ok(SessionEvent::WorkspaceRenamed { .. })
-                    | Ok(SessionEvent::WorkspaceDeleted { .. }) => {
+                    | Ok(SessionEvent::WorkspaceDeleted { .. })
+                    | Ok(SessionEvent::WorkspaceColorChanged { .. }) => {
                         // Save immediately so sibling daemons' prune passes
                         // see this pane's UUID in the persisted-union (V2-007
                         // fix cycle 7). Leave the dirty flag set as well so
