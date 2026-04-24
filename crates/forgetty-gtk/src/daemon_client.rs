@@ -65,6 +65,18 @@ pub struct LayoutInfo {
     pub workspaces: Vec<WorkspaceInfo>,
 }
 
+/// Per-tab entry returned by `DaemonClient::duplicate_workspace` (FIX-007).
+///
+/// Each entry corresponds to one tab in the duplicate workspace (in the same
+/// order as the source workspace's tabs). The GTK caller uses `pane_id` to
+/// drive `subscribe_output` + `terminal::create_terminal`, and records
+/// `tab_id` in its `TabIdMap` so page-reorder / focus RPCs work.
+#[derive(Debug, Clone)]
+pub struct DuplicatedTabInfo {
+    pub tab_id: uuid::Uuid,
+    pub pane_id: PaneId,
+}
+
 /// Information about a single paired device (from `list_devices` RPC).
 #[derive(Debug, Clone)]
 pub struct DeviceInfo {
@@ -383,6 +395,68 @@ impl DaemonClient {
     pub fn delete_workspace(&self, workspace_idx: usize) -> Result<(), DaemonError> {
         self.rpc("delete_workspace", serde_json::json!({ "workspace_idx": workspace_idx }))?;
         Ok(())
+    }
+
+    /// Duplicate a workspace on the daemon (FIX-007).
+    ///
+    /// The daemon creates a new `SessionWorkspace` at `source_workspace_idx + 1`
+    /// with the same tab count as the source, each tab backed by a fresh PTY
+    /// whose CWD inherits the corresponding source tab's leftmost-leaf CWD.
+    /// If `new_name` is `None`, the daemon derives `"<source> (copy)"`.
+    ///
+    /// Returns `(new_workspace_id, new_workspace_idx, tabs)` on success.
+    /// `tabs.len()` matches the source's tab count in source order; each
+    /// entry is a `{ tab_id, pane_id }` pair ready for
+    /// `subscribe_output(pane_id)` + `terminal::create_terminal` widget
+    /// construction.
+    pub fn duplicate_workspace(
+        &self,
+        source_workspace_idx: usize,
+        new_name: Option<&str>,
+    ) -> Result<(uuid::Uuid, usize, Vec<DuplicatedTabInfo>), DaemonError> {
+        let mut params = serde_json::json!({ "source_workspace_idx": source_workspace_idx });
+        if let Some(n) = new_name {
+            params["new_name"] = serde_json::json!(n);
+        }
+        let result = self.rpc("duplicate_workspace", params)?;
+
+        let workspace_id_str = result
+            .get("workspace_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| DaemonError("duplicate_workspace: missing workspace_id".into()))?;
+        let workspace_id = uuid::Uuid::parse_str(workspace_id_str).map_err(|e| {
+            DaemonError(format!("duplicate_workspace: invalid workspace_id UUID: {e}"))
+        })?;
+
+        let workspace_idx = result
+            .get("workspace_idx")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| DaemonError("duplicate_workspace: missing workspace_idx".into()))?
+            as usize;
+
+        let tabs_arr = result
+            .get("tabs")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| DaemonError("duplicate_workspace: missing tabs array".into()))?;
+
+        let mut tabs: Vec<DuplicatedTabInfo> = Vec::with_capacity(tabs_arr.len());
+        for (idx, entry) in tabs_arr.iter().enumerate() {
+            let tab_id_str = entry.get("tab_id").and_then(|v| v.as_str()).ok_or_else(|| {
+                DaemonError(format!("duplicate_workspace: tabs[{idx}] missing tab_id"))
+            })?;
+            let tab_id = uuid::Uuid::parse_str(tab_id_str).map_err(|e| {
+                DaemonError(format!("duplicate_workspace: tabs[{idx}] invalid tab_id UUID: {e}"))
+            })?;
+            let pane_id_str = entry.get("pane_id").and_then(|v| v.as_str()).ok_or_else(|| {
+                DaemonError(format!("duplicate_workspace: tabs[{idx}] missing pane_id"))
+            })?;
+            let pane_uuid = uuid::Uuid::parse_str(pane_id_str).map_err(|e| {
+                DaemonError(format!("duplicate_workspace: tabs[{idx}] invalid pane_id UUID: {e}"))
+            })?;
+            tabs.push(DuplicatedTabInfo { tab_id, pane_id: PaneId(pane_uuid) });
+        }
+
+        Ok((workspace_id, workspace_idx, tabs))
     }
 
     /// Close a tab in the daemon by its `tab_id` (UUID).

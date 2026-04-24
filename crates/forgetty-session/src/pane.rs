@@ -4,6 +4,7 @@
 use std::path::PathBuf;
 
 use forgetty_core::PaneId;
+use uuid::Uuid;
 
 use crate::pty_bridge::PtyBridge;
 
@@ -41,4 +42,15 @@ pub struct PaneInfo {
     pub cwd: PathBuf,
     /// Last known title.
     pub title: String,
+}
+
+/// Returned per-tab metadata from `SessionManager::duplicate_workspace` (FIX-007).
+///
+/// The caller (GTK socket handler) serialises this into the JSON-RPC response
+/// so the client can build widgets for each duplicated tab without an extra
+/// `get_layout` round-trip.
+#[derive(Debug, Clone)]
+pub struct DuplicatedTab {
+    pub tab_id: Uuid,
+    pub pane_id: PaneId,
 }

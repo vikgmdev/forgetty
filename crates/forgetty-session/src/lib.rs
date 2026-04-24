@@ -32,7 +32,7 @@ pub use drain_result::DrainResult;
 pub use events::SessionEvent;
 pub use layout::{SessionLayout, SessionTab, SessionWorkspace};
 pub use manager::SessionManager;
-pub use pane::{PaneInfo, PaneState};
+pub use pane::{DuplicatedTab, PaneInfo, PaneState};
 pub use pty_bridge::PtyBridge;
 pub use workspace::{
     build_workspace_state, PaneTreeLayout, TabLayoutEntry, WorkspaceLayout, WorkspaceLayoutEntry,
