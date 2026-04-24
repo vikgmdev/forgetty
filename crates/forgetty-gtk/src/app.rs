@@ -3389,41 +3389,71 @@ fn set_container_content(container: &gtk4::Box, new_content: &impl IsA<gtk4::Wid
     container.append(new_content);
 }
 
-/// Grant keyboard focus to `da` as soon as it is mapped (visible).
+/// Grant keyboard focus to `da` as soon as it is safely mappable.
 ///
-/// `grab_focus()` on an unmapped widget silently no-ops. Earlier fix cycles
-/// (V2-007 cycle 4) deferred the call via `glib::idle_add_local_once`, but on
-/// the session-restore path the idle tick can fire *before* the top-level
-/// window — and therefore the DrawingArea — is ever mapped, so the grab still
-/// fails silently. V2-007 fix cycle 5 switches to the GTK `map` signal, which
-/// is guaranteed to fire exactly when the widget becomes visible.
+/// `grab_focus()` on an unmapped widget silently no-ops, and the split
+/// path specifically triggers a transient unmap of the newly-inserted DA:
+/// after the Paned is added to the tree with `shrink_*_child=false`, GTK's
+/// first layout cycle honours both children's minimum sizes, and when the
+/// old pane hosts a large TUI (Claude Code, vim, htop), that minimum can
+/// consume the entire Paned — GTK allocates 0 pixels to the new pane and
+/// unmaps it. A separate `idle_add_local_once` later in `split_pane` sets
+/// the divider to 50% and the DA is re-mapped, but any grab that landed
+/// in the unmapped interval silently no-ops. FIX-002 Phase 4 cycles 1-2
+/// tried focus-child pinning and priority bumps; the root cause is the
+/// transient unmap, not the focus-chain walk.
 ///
-/// Behaviour:
+/// This helper therefore arms *both* a `connect_map` handler and a
+/// `HIGH_IDLE` idle callback:
 ///
-/// - If `da` is already mapped (fresh-pane / split-pane sites, whose parent
-///   window is already on-screen), focus is granted synchronously. No signal
-///   handler is registered.
-/// - Otherwise, a one-shot `connect_map` handler is installed. When the
-///   widget's `map` signal fires, the handler grabs focus and then disconnects
-///   itself so later unmap/remap cycles do not re-steal focus.
+/// - If the DA stays mapped through the layout cycle (horizontal split,
+///   non-TUI content, non-root split with plenty of space), the idle
+///   callback grabs focus and disconnects the map handler so that later
+///   unrelated map events (tab switch, workspace hide/show) do not steal
+///   focus back.
+/// - If the DA is transiently unmapped during layout (vertical split
+///   under a TUI, root-split under Claude), the idle callback's
+///   `is_mapped()` check is false and the grab is deferred; the still-
+///   armed map handler then fires on the re-map and grabs focus there.
+///
+/// Both paths self-disconnect after a single successful grab so later
+/// unrelated map cycles cannot re-steal focus.
 ///
 /// Thread-safety: GTK widgets are not `Send`; this helper must be invoked
-/// from the GTK main thread and uses `Rc<RefCell<...>>` for the
-/// self-disconnect handle (safe because GTK callbacks run single-threaded).
+/// from the GTK main thread. Closures use `Rc<RefCell<...>>` (safe because
+/// GTK callbacks are single-threaded on that thread).
 fn focus_when_mapped(da: &gtk4::DrawingArea) {
-    if da.is_mapped() {
-        da.grab_focus();
-        return;
-    }
     let handler_id_cell: Rc<RefCell<Option<glib::SignalHandlerId>>> = Rc::new(RefCell::new(None));
-    let cell_for_closure = Rc::clone(&handler_id_cell);
-    let handler_id = da.connect_map(move |widget| {
+
+    // Arm the connect_map handler. Fires on every map transition; the
+    // first one that lands with `is_mapped() == true` grabs focus and
+    // self-disconnects via the shared handler-id cell.
+    let cell_for_map = Rc::clone(&handler_id_cell);
+    let map_handler = da.connect_map(move |widget| {
         widget.grab_focus();
-        if let Some(id) = cell_for_closure.borrow_mut().take() {
+        if let Some(id) = cell_for_map.borrow_mut().take() {
             widget.disconnect(id);
         }
     });
-    *handler_id_cell.borrow_mut() = Some(handler_id);
+    *handler_id_cell.borrow_mut() = Some(map_handler);
+
+    // Also try a HIGH_IDLE grab. If the DA stays mapped through the
+    // upcoming layout cycle, this fires first and disconnects the map
+    // handler. If the DA transiently unmaps, is_mapped() is false here
+    // and we skip; the map handler stays armed for the re-map.
+    let da_weak = da.downgrade();
+    let cell_for_idle = Rc::clone(&handler_id_cell);
+    glib::idle_add_local_full(glib::Priority::HIGH_IDLE, move || {
+        if let Some(da) = da_weak.upgrade() {
+            if da.is_mapped() {
+                da.grab_focus();
+                if let Some(id) = cell_for_idle.borrow_mut().take() {
+                    da.disconnect(id);
+                }
+            }
+        }
+        glib::ControlFlow::Break
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -3599,6 +3629,12 @@ fn split_pane(
         paned.set_end_child(Some(&new_pane_vbox));
     }
 
+    // Defensive focus-chain hint: pin the new Paned's focus-child to
+    // the new pane's vbox so tab-traversal and programmatic
+    // child_focus calls prefer the new subtree. `focus_when_mapped`
+    // is the primary focus grant; this keeps the chain consistent.
+    paned.set_focus_child(Some(&new_pane_vbox));
+
     if is_direct_child {
         // The hbox was the sole content of the pane container.
         // Replace it with the new Paned.
@@ -3611,6 +3647,11 @@ fn split_pane(
                 PanedSlot::Start => parent_paned.set_start_child(Some(&paned)),
                 PanedSlot::End => parent_paned.set_end_child(Some(&paned)),
             }
+            // Mirror the hint on the parent Paned: its pre-split
+            // focus-child pointed at focused_vbox (now nested inside
+            // `paned`); re-pin to the new Paned so the chain walks
+            // parent_paned -> paned -> new_pane_vbox -> new_da.
+            parent_paned.set_focus_child(Some(&paned));
         }
     }
 
@@ -3631,12 +3672,12 @@ fn split_pane(
         });
     }
 
-    // Give focus to the new pane.
-    // `focus_when_mapped` handles the "widget may not yet be mapped" case:
-    // fresh split-pane insertion happens inside an already-mapped window,
-    // so in practice this takes the synchronous-grab branch. V2-007 fix
-    // cycle 5 unified the three deferred-focus sites (two restore-path,
-    // this one) behind the shared helper.
+    // Give focus to the new pane. `focus_when_mapped` arms both a
+    // connect_map handler and a HIGH_IDLE grab — whichever fires while
+    // the DA is actually mapped wins. This handles the transient-unmap
+    // that GtkPaned's first layout cycle causes when `shrink_*_child`
+    // is false and one child's minimum consumes the full allocation
+    // (e.g. splitting a pane running Claude Code vertically).
     focus_when_mapped(&new_da);
 }
 
