@@ -585,6 +585,24 @@ async fn handle_streaming_connection(
                                     break;
                                 }
                             }
+                            Ok(SessionEvent::ActiveWorkspaceChanged { workspace_idx }) => {
+                                let notification = serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "active_workspace_changed",
+                                    "params": {
+                                        "workspace_idx": workspace_idx,
+                                    }
+                                });
+                                let mut out = serde_json::to_string(&notification)
+                                    .unwrap_or_else(|_| "{}".to_string());
+                                out.push('\n');
+                                if writer.write_all(out.as_bytes()).await.is_err() {
+                                    break;
+                                }
+                                if writer.flush().await.is_err() {
+                                    break;
+                                }
+                            }
                             Ok(SessionEvent::WorkspaceCreated {
                                 workspace_idx,
                                 workspace_id,
