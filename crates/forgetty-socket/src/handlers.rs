@@ -54,6 +54,7 @@ pub fn dispatch(
         methods::NOTIFY => handle_notify(request, &sm),
         methods::CLOSE_PANE => handle_close_pane(request, &sm),
         methods::CREATE_WORKSPACE => handle_create_workspace(request, &sm),
+        methods::RENAME_WORKSPACE => handle_rename_workspace(request, &sm),
         // Split ratio + pinned session methods (B-002).
         methods::UPDATE_SPLIT_RATIOS => handle_update_split_ratios(request, &sm),
         methods::SET_PINNED => handle_set_pinned(request, &sm),
@@ -426,6 +427,44 @@ fn handle_create_workspace(request: &Request, sm: &SessionManager) -> Response {
             request.id.clone(),
             protocol::INTERNAL_ERROR,
             format!("create_workspace: create_tab failed: {e}"),
+        ),
+    }
+}
+
+/// Handle `rename_workspace` RPC (FIX-001).
+///
+/// Params: `{ "workspace_idx": u64, "name": "..." }`.
+/// Success: `{ "ok": true }`. Out-of-range index returns `INTERNAL_ERROR` with
+/// the bounds message from `SessionManager::rename_workspace`.
+fn handle_rename_workspace(request: &Request, sm: &SessionManager) -> Response {
+    let workspace_idx = match request.params.get("workspace_idx").and_then(|v| v.as_u64()) {
+        Some(n) => n as usize,
+        None => {
+            return Response::error(
+                request.id.clone(),
+                protocol::INVALID_PARAMS,
+                "missing param: workspace_idx (u64)".to_string(),
+            )
+        }
+    };
+
+    let name = match request.params.get("name").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => {
+            return Response::error(
+                request.id.clone(),
+                protocol::INVALID_PARAMS,
+                "missing param: name".to_string(),
+            )
+        }
+    };
+
+    match sm.rename_workspace(workspace_idx, name) {
+        Ok(()) => Response::success(request.id.clone(), serde_json::json!({ "ok": true })),
+        Err(e) => Response::error(
+            request.id.clone(),
+            protocol::INTERNAL_ERROR,
+            format!("rename_workspace failed: {e}"),
         ),
     }
 }

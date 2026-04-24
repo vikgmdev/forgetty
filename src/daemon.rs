@@ -237,7 +237,18 @@ async fn main_async() -> anyhow::Result<()> {
                 // SessionLayout::new_default() creates workspace[0]; create the rest.
                 for (ws_idx, saved_ws) in state.workspaces.iter().enumerate() {
                     if ws_idx == 0 {
-                        // Workspace 0 already exists from new_default(); skip.
+                        // FIX-001: workspace[0] was seeded by `SessionLayout::new_default()`
+                        // with the literal name "Default". The saved name takes precedence —
+                        // this is what lets a user's rename of the Default workspace
+                        // survive a daemon restart. Ignore errors: a malformed saved
+                        // name is non-fatal (restore loop is already tolerant of
+                        // per-workspace failures).
+                        if let Err(e) = session_manager.rename_workspace(0, &saved_ws.name) {
+                            warn!(
+                                "cold-start restore: failed to rename workspace 0 to '{}': {e}",
+                                saved_ws.name
+                            );
+                        }
                     } else {
                         let (_, created_idx) = session_manager.create_workspace(&saved_ws.name);
                         debug_assert_eq!(

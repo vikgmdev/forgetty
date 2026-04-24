@@ -1859,9 +1859,10 @@ fn build_ui(
     {
         let wm_rename = Rc::clone(&workspace_manager);
         let win_rename = window.clone();
+        let dc_rename = daemon_client.clone();
         let action = gio::SimpleAction::new("rename-workspace", None);
         action.connect_activate(move |_action, _param| {
-            show_rename_workspace_dialog(&win_rename, &wm_rename);
+            show_rename_workspace_dialog(&win_rename, &wm_rename, dc_rename.as_ref());
         });
         window.add_action(&action);
     }
@@ -2251,6 +2252,8 @@ fn build_ui(
             tracing::warn!("subscribe_layout failed to start: {e}");
         } else {
             let wm_layout = Rc::clone(&workspace_manager);
+            let win_layout = window.clone();
+            let lb_layout = workspace_sidebar_lb.clone();
             let layout_rx = std::sync::Mutex::new(layout_rx);
             // Drain layout events every 200ms on the GLib main thread.
             glib::timeout_add_local(Duration::from_millis(200), move || {
@@ -2258,7 +2261,7 @@ fn build_ui(
                 loop {
                     match rx.try_recv() {
                         Ok(event) => {
-                            handle_layout_event(event, &wm_layout);
+                            handle_layout_event(event, &wm_layout, &win_layout, &lb_layout);
                         }
                         Err(std::sync::mpsc::TryRecvError::Empty) => break,
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -2587,11 +2590,18 @@ fn leftmost_daemon_pane_id(
 /// mutations happen synchronously. Events for tabs/panes already present in the
 /// widget tree are silently ignored (idempotency — spec Section 4).
 ///
-/// Currently handles `TabCreated` for external sources (e.g. Android remote view).
-/// Other events (`TabClosed`, `PaneSplit`, `TabMoved`, `ActiveTabChanged`) are
-/// logged but not acted upon — GTK already processed these synchronously when it
-/// sent the original RPC, so acting again would double-execute.
-fn handle_layout_event(event: LayoutEvent, workspace_manager: &WorkspaceManager) {
+/// Currently handles `TabCreated` for external sources (e.g. Android remote view)
+/// and `WorkspaceRenamed` (FIX-001, for external rename events mirrored back
+/// to GTK to keep the local `WorkspaceView.name` in sync). Other events
+/// (`TabClosed`, `PaneSplit`, `TabMoved`, `ActiveTabChanged`) are logged but
+/// not acted upon — GTK already processed these synchronously when it sent
+/// the original RPC, so acting again would double-execute.
+fn handle_layout_event(
+    event: LayoutEvent,
+    workspace_manager: &WorkspaceManager,
+    window: &adw::ApplicationWindow,
+    sidebar_lb: &gtk4::ListBox,
+) {
     match event {
         LayoutEvent::TabCreated { workspace_idx, tab_id, pane_id } => {
             // Check if this tab is already in the widget tree (GTK created it
@@ -2640,6 +2650,51 @@ fn handle_layout_event(event: LayoutEvent, workspace_manager: &WorkspaceManager)
             tracing::debug!(
                 "subscribe_layout: ActiveTabChanged ws={workspace_idx} tab_idx={tab_idx} (already handled synchronously)"
             );
+        }
+        LayoutEvent::WorkspaceRenamed { workspace_idx, workspace_id: _, name } => {
+            // FIX-001: daemon is the source of truth for workspace names. When
+            // the daemon emits this event, update the GTK-local copy so that
+            // (a) external renames (paired Android client) reflect here, and
+            // (b) our own rename path stays idempotent — if `name` already
+            //     matches, nothing happens.
+            let (ws_count, is_active) = {
+                let Ok(mut mgr) = workspace_manager.try_borrow_mut() else { return };
+                if workspace_idx >= mgr.workspaces.len() {
+                    return;
+                }
+                if mgr.workspaces[workspace_idx].name == name {
+                    // Already in sync (our own rename or a replayed event).
+                    return;
+                }
+                mgr.workspaces[workspace_idx].name = name.clone();
+                let is_active = workspace_idx == mgr.active_index;
+                (mgr.workspaces.len(), is_active)
+            };
+
+            // Update the window title only when the renamed workspace is the
+            // active one (same policy as `show_rename_workspace_dialog_for`).
+            if is_active {
+                update_window_title_with_workspace(ws_count, &name, workspace_manager, window);
+            }
+
+            // Update the sidebar label for the renamed row only. Row layout:
+            // hbox → [number_label, name_label, meta_vbox]; name is at index 1.
+            if let Some(row) = sidebar_lb.row_at_index(workspace_idx as i32) {
+                if let Some(hbox) = row.child().and_then(|c| c.downcast::<gtk4::Box>().ok()) {
+                    let mut child = hbox.first_child();
+                    let mut child_idx = 0;
+                    while let Some(c) = child {
+                        if child_idx == 1 {
+                            if let Some(lbl) = c.downcast_ref::<gtk4::Label>() {
+                                lbl.set_text(&name);
+                            }
+                            break;
+                        }
+                        child = c.next_sibling();
+                        child_idx += 1;
+                    }
+                }
+            }
         }
     }
 }
@@ -7518,12 +7573,14 @@ fn create_and_switch_to_new_workspace(
 fn show_rename_workspace_dialog(
     window: &adw::ApplicationWindow,
     workspace_manager: &WorkspaceManager,
+    daemon_client: Option<&Arc<DaemonClient>>,
 ) {
-    let Ok(mgr) = workspace_manager.try_borrow() else {
-        return;
+    let (current_name, active_idx) = {
+        let Ok(mgr) = workspace_manager.try_borrow() else {
+            return;
+        };
+        (mgr.workspaces[mgr.active_index].name.clone(), mgr.active_index)
     };
-    let current_name = mgr.workspaces[mgr.active_index].name.clone();
-    drop(mgr);
 
     let dialog = adw::MessageDialog::new(
         Some(window),
@@ -7549,6 +7606,7 @@ fn show_rename_workspace_dialog(
 
     let wm = Rc::clone(workspace_manager);
     let win = window.clone();
+    let dc = daemon_client.cloned();
     dialog.connect_response(None, move |dialog, response| {
         if response != "rename" {
             dialog.close();
@@ -7561,15 +7619,36 @@ fn show_rename_workspace_dialog(
 
         dialog.close();
 
+        // FIX-001: call the daemon FIRST so the rename is persisted. Only
+        // mutate local GTK state on RPC success — on failure, the dialog
+        // reopening will show the daemon's (still-old) truth.
+        if let Some(ref dc) = dc {
+            if let Err(e) = dc.rename_workspace(active_idx, &new_name) {
+                tracing::warn!(
+                    "Failed to rename workspace {active_idx} on daemon: {e}; skipping local update"
+                );
+                return;
+            }
+        }
+
         let Ok(mut mgr) = wm.try_borrow_mut() else {
             return;
         };
-        let active = mgr.active_index;
-        mgr.workspaces[active].name = new_name.clone();
+        // FIX-001: use the `active_idx` captured at dialog open (same value
+        // passed to the RPC), not `mgr.active_index`. If the user switched
+        // workspaces while the dialog was open, the RPC renamed the original
+        // workspace — the local mutation must match to avoid drift.
+        if active_idx >= mgr.workspaces.len() {
+            return;
+        }
+        mgr.workspaces[active_idx].name = new_name.clone();
         let ws_count = mgr.workspaces.len();
+        let is_active = active_idx == mgr.active_index;
         drop(mgr);
 
-        update_window_title_with_workspace(ws_count, &new_name, &wm, &win);
+        if is_active {
+            update_window_title_with_workspace(ws_count, &new_name, &wm, &win);
+        }
     });
 
     dialog.present();
@@ -8122,10 +8201,11 @@ fn build_workspace_context_menu_box(
         let win_r = window.clone();
         let lb_r = sidebar_lb.clone();
         let pop_r = popover.clone();
+        let dc_r = daemon_client.clone();
         let btn = tab_menu_button("Rename Workspace");
         btn.connect_clicked(move |_| {
             pop_r.popdown();
-            show_rename_workspace_dialog_for(&win_r, &wm_r, workspace_idx, &lb_r);
+            show_rename_workspace_dialog_for(&win_r, &wm_r, workspace_idx, &lb_r, dc_r.as_ref());
         });
         vbox.append(&btn);
     }
@@ -8435,6 +8515,7 @@ fn show_rename_workspace_dialog_for(
     wm: &WorkspaceManager,
     target_idx: usize,
     sidebar_lb: &gtk4::ListBox,
+    daemon_client: Option<&Arc<DaemonClient>>,
 ) {
     let current_name = {
         let Ok(mgr) = wm.try_borrow() else { return };
@@ -8469,6 +8550,7 @@ fn show_rename_workspace_dialog_for(
     let wm_r = Rc::clone(wm);
     let win_r = window.clone();
     let lb_r = sidebar_lb.clone();
+    let dc_r = daemon_client.cloned();
     dialog.connect_response(None, move |dialog, response| {
         if response != "rename" {
             dialog.close();
@@ -8480,6 +8562,17 @@ fn show_rename_workspace_dialog_for(
         }
 
         dialog.close();
+
+        // FIX-001: call the daemon FIRST so the rename is persisted. Only
+        // mutate local GTK state on RPC success.
+        if let Some(ref dc) = dc_r {
+            if let Err(e) = dc.rename_workspace(target_idx, &new_name) {
+                tracing::warn!(
+                    "Failed to rename workspace {target_idx} on daemon: {e}; skipping local update"
+                );
+                return;
+            }
+        }
 
         let (ws_count, is_active) = {
             let Ok(mut mgr) = wm_r.try_borrow_mut() else { return };

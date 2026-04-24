@@ -336,6 +336,30 @@ impl DaemonClient {
         Ok((workspace_id, workspace_idx, PaneId(pane_uuid), tab_id))
     }
 
+    /// Rename an existing workspace on the daemon (FIX-001).
+    ///
+    /// The daemon is the single source of truth for workspace names
+    /// (AD-007). GTK must call this before mutating its local
+    /// `WorkspaceView.name`, otherwise the rename is lost on save
+    /// (daemon writes its unchanged `SessionLayout` on disconnect).
+    ///
+    /// Bounds checking is the daemon's responsibility. Empty or whitespace
+    /// names should be rejected client-side (see `show_rename_workspace_dialog`).
+    pub fn rename_workspace(
+        &self,
+        workspace_idx: usize,
+        new_name: &str,
+    ) -> Result<(), DaemonError> {
+        self.rpc(
+            "rename_workspace",
+            serde_json::json!({
+                "workspace_idx": workspace_idx,
+                "name": new_name,
+            }),
+        )?;
+        Ok(())
+    }
+
     /// Close a tab in the daemon by its `tab_id` (UUID).
     pub fn close_tab(&self, tab_id: uuid::Uuid) -> Result<(), DaemonError> {
         self.rpc("close_tab", serde_json::json!({ "tab_id": tab_id.to_string() }))?;
@@ -705,6 +729,11 @@ pub enum LayoutEvent {
     TabMoved { workspace_idx: usize, tab_id: uuid::Uuid, new_index: usize },
     /// The active tab changed for a workspace.
     ActiveTabChanged { workspace_idx: usize, tab_idx: usize },
+    /// An existing workspace was renamed (FIX-001).
+    ///
+    /// Daemon is the source of truth; the GTK subscriber should update its
+    /// local `WorkspaceView.name` (idempotent) and refresh the sidebar label.
+    WorkspaceRenamed { workspace_idx: usize, workspace_id: uuid::Uuid, name: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -998,6 +1027,18 @@ async fn subscribe_layout_task(
                     params.get("workspace_idx").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 let tab_idx = params.get("tab_idx").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 LayoutEvent::ActiveTabChanged { workspace_idx, tab_idx }
+            }
+            "workspace_renamed" => {
+                let workspace_idx =
+                    params.get("workspace_idx").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let workspace_id_str =
+                    params.get("workspace_id").and_then(|v| v.as_str()).unwrap_or("");
+                let workspace_id = match uuid::Uuid::parse_str(workspace_id_str) {
+                    Ok(u) => u,
+                    Err(_) => continue,
+                };
+                let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                LayoutEvent::WorkspaceRenamed { workspace_idx, workspace_id, name }
             }
             _ => {
                 // Unknown layout notification — ignore silently.
