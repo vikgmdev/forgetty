@@ -231,14 +231,20 @@ impl DaemonClient {
 
     /// Create a new tab in the daemon with an optional starting CWD.
     /// Returns `(pane_id, tab_id)`.
+    ///
+    /// `workspace_idx` tells the daemon which workspace the new tab belongs
+    /// to — required so cold-start restore puts the tab back in the same
+    /// workspace the user created it in (session-restore fix). Callers
+    /// typically pass `workspace_manager.active_index`.
     pub fn new_tab_with_cwd(
         &self,
+        workspace_idx: usize,
         cwd: Option<&std::path::Path>,
     ) -> Result<(PaneId, uuid::Uuid), DaemonError> {
-        let params = match cwd {
-            Some(p) => serde_json::json!({ "cwd": p.to_string_lossy().as_ref() }),
-            None => serde_json::json!({}),
-        };
+        let mut params = serde_json::json!({ "workspace_idx": workspace_idx });
+        if let Some(p) = cwd {
+            params["cwd"] = serde_json::json!(p.to_string_lossy().as_ref());
+        }
         let result = self.rpc("new_tab", params)?;
         let pane_id_str = result
             .get("pane_id")
@@ -258,19 +264,24 @@ impl DaemonClient {
     }
 
     /// Create a new tab in the daemon. Returns `(pane_id, tab_id)`.
-    pub fn new_tab(&self) -> Result<(PaneId, uuid::Uuid), DaemonError> {
-        self.new_tab_with_cwd(None)
+    ///
+    /// `workspace_idx` — see [`Self::new_tab_with_cwd`].
+    pub fn new_tab(&self, workspace_idx: usize) -> Result<(PaneId, uuid::Uuid), DaemonError> {
+        self.new_tab_with_cwd(workspace_idx, None)
     }
 
     /// Create a new tab using a shell profile. `command` is the pre-split argv
     /// (e.g. `["ssh", "user@host"]`). `cwd` is the profile's starting directory,
     /// already expanded and validated by the caller. Returns `(pane_id, tab_id)`.
+    ///
+    /// `workspace_idx` — see [`Self::new_tab_with_cwd`].
     pub fn new_tab_with_profile(
         &self,
+        workspace_idx: usize,
         command: Option<Vec<String>>,
         cwd: Option<&std::path::Path>,
     ) -> Result<(PaneId, uuid::Uuid), DaemonError> {
-        let mut params = serde_json::json!({});
+        let mut params = serde_json::json!({ "workspace_idx": workspace_idx });
         if let Some(ref cmd) = command {
             params["command"] = serde_json::json!(cmd);
         }
@@ -396,6 +407,14 @@ impl DaemonClient {
     /// Focus (set as active) a tab in the daemon by its `tab_id`.
     pub fn focus_tab(&self, tab_id: uuid::Uuid) -> Result<(), DaemonError> {
         self.rpc("focus_tab", serde_json::json!({ "tab_id": tab_id.to_string() }))?;
+        Ok(())
+    }
+
+    /// Set the globally-active workspace index on the daemon (session-restore
+    /// fix). GTK calls this from `switch_workspace` so cold restart brings the
+    /// user's last-focused workspace back to the front.
+    pub fn set_active_workspace(&self, workspace_idx: usize) -> Result<(), DaemonError> {
+        self.rpc("set_active_workspace", serde_json::json!({ "workspace_idx": workspace_idx }))?;
         Ok(())
     }
 

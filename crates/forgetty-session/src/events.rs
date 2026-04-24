@@ -51,6 +51,13 @@ pub enum SessionEvent {
     /// The active tab index changed for a workspace.
     ActiveTabChanged { workspace_idx: usize, tab_idx: usize },
 
+    /// The globally-active workspace index changed.
+    ///
+    /// Emitted when the client calls `set_active_workspace` so the daemon
+    /// persists the new `layout.active_workspace`. Session-restore relies on
+    /// this to bring the user's last-focused workspace back to the front.
+    ActiveWorkspaceChanged { workspace_idx: usize },
+
     // -----------------------------------------------------------------------
     // Workspace mutation events (T-067, FIX-001)
     // -----------------------------------------------------------------------

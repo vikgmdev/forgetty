@@ -108,6 +108,10 @@ pub mod methods {
     // Layout query + mutation methods (T-062).
     pub const GET_LAYOUT: &str = "get_layout";
     pub const MOVE_TAB: &str = "move_tab";
+    /// Update the globally-active workspace index. Used by the GTK client
+    /// when the user switches workspaces so the daemon persists the index
+    /// across cold restarts (session-restore fix).
+    pub const SET_ACTIVE_WORKSPACE: &str = "set_active_workspace";
     // Single-pane close (T-065): closes only one pane within a split.
     pub const CLOSE_PANE: &str = "close_pane";
     // Workspace management (T-067, FIX-001).

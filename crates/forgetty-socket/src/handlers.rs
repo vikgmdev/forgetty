@@ -45,6 +45,7 @@ pub fn dispatch(
         methods::NEW_TAB => handle_new_tab(request, &sm),
         methods::CLOSE_TAB => handle_close_tab(request, &sm),
         methods::FOCUS_TAB => handle_focus_tab(request, &sm),
+        methods::SET_ACTIVE_WORKSPACE => handle_set_active_workspace(request, &sm),
         methods::SPLIT_PANE => handle_split_pane(request, &sm),
         methods::MOVE_TAB => handle_move_tab(request, &sm),
         methods::SEND_INPUT => handle_send_input(request, &sm),
@@ -335,6 +336,30 @@ fn handle_focus_tab(request: &Request, sm: &SessionManager) -> Response {
             request.id.clone(),
             protocol::INTERNAL_ERROR,
             format!("set_active_tab failed: {e}"),
+        ),
+    }
+}
+
+/// Handle `set_active_workspace` RPC — persist the globally-active workspace
+/// index so session-restore brings the correct workspace back on cold start.
+fn handle_set_active_workspace(request: &Request, sm: &SessionManager) -> Response {
+    let ws_idx = match request.params.get("workspace_idx").and_then(|v| v.as_u64()) {
+        Some(n) => n as usize,
+        None => {
+            return Response::error(
+                request.id.clone(),
+                protocol::INVALID_PARAMS,
+                "missing param: workspace_idx".to_string(),
+            )
+        }
+    };
+
+    match sm.set_active_workspace(ws_idx) {
+        Ok(()) => Response::success(request.id.clone(), serde_json::json!({ "ok": true })),
+        Err(e) => Response::error(
+            request.id.clone(),
+            protocol::INVALID_PARAMS,
+            format!("set_active_workspace failed: {e}"),
         ),
     }
 }
