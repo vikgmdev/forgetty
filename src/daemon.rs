@@ -299,6 +299,34 @@ async fn main_async() -> anyhow::Result<()> {
                             }
                         }
                     }
+
+                    // FIX-005A: propagate the saved active_tab into the live SessionLayout.
+                    // `create_tab` above intentionally does not advance active_tab (per AD-008 —
+                    // that is UI state owned by GTK). We restore it explicitly here as a
+                    // control-plane operation, so that `get_layout` returns the correct
+                    // active_tab to the GTK client, and `build_widgets_from_layout` honors it.
+                    //
+                    // `set_active_tab` bounds-checks against the live tab count, which may be
+                    // smaller than `workspace.active_tab` if some tabs failed to restore.
+                    // Treat any error as a warning and continue — cosmetic restore failure
+                    // is strictly better than aborting cold restart.
+                    if let Err(e) = session_manager.set_active_tab(ws_idx, workspace.active_tab) {
+                        warn!(
+                            "cold-start restore: failed to set active_tab={} on workspace {ws_idx}: {e}",
+                            workspace.active_tab
+                        );
+                    }
+                }
+
+                // FIX-005A: propagate the saved active_workspace into the live SessionLayout.
+                // Matches the active_tab restore above. Bounds-checked; a stale saved index
+                // (e.g., active_workspace was the 3rd one but only 2 restored) degrades to
+                // a warning.
+                if let Err(e) = session_manager.set_active_workspace(state.active_workspace) {
+                    warn!(
+                        "cold-start restore: failed to set active_workspace={}: {e}",
+                        state.active_workspace
+                    );
                 }
             }
             Ok(Some(_)) => {

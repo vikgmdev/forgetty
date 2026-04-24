@@ -1108,14 +1108,11 @@ fn build_ui(
                     da.grab_focus();
                 }
                 // Send focus_tab RPC so the daemon's in-memory
-                // `SessionWorkspace.active_tab` is persisted. We resolve the
-                // tab_id via the map populated in `add_new_tab`; entries
-                // added by `build_widgets_from_layout` (cold restart) land
-                // here too because `wire_tab_view_handlers` wires the same
-                // notify callback. The first restore-time fire may find no
-                // mapping (map is populated after the synchronous select) —
-                // silent skip is correct, the daemon's `create_tab` event
-                // watcher already saved `active_tab` at that point.
+                // `SessionWorkspace.active_tab` is persisted. Runtime tabs
+                // populate the map in `add_new_tab`; restored tabs populate
+                // it in `build_widgets_from_layout` (FIX-005A fix-cycle 1).
+                // A mapping miss here indicates a bug — log at debug so QA
+                // can catch it without spamming production.
                 if let Some(ref dc) = dc_focus {
                     let page_key = page_identity_key(&page);
                     let tab_id = tim_focus.borrow().get(&page_key).copied();
@@ -3155,6 +3152,12 @@ fn build_widgets_from_layout(
                 container.append(&root_widget);
 
                 let page = ws.tab_view.append(&container);
+                // FIX-005A fix-cycle 1: populate tab_id_map so post-restart
+                // connect_selected_page_notify can resolve tab_id → focus_tab
+                // RPC → daemon set_active_tab → save. Without this line,
+                // restored tabs silently skip the RPC and tab switches never
+                // persist past the first cold-restart.
+                ws.tab_id_map.borrow_mut().insert(page_identity_key(&page), tab.tab_id);
                 let tab_title = if tab.title.is_empty() { "shell" } else { &tab.title };
                 page.set_title(tab_title);
 
@@ -3255,6 +3258,8 @@ fn build_widgets_from_layout(
             container.append(&root_widget);
 
             let page = new_tv.append(&container);
+            // FIX-005A fix-cycle 1: see workspace[0] branch for rationale.
+            new_tab_id_map.borrow_mut().insert(page_identity_key(&page), tab.tab_id);
             let tab_title = if tab.title.is_empty() { "shell" } else { &tab.title };
             page.set_title(tab_title);
 
@@ -7444,8 +7449,7 @@ fn wire_tab_view_handlers(
                     da.grab_focus();
                 }
                 // Persist active-tab on the daemon. See initial_tab_view's
-                // notify handler for the full rationale and silent-skip
-                // semantics.
+                // notify handler for the full rationale (FIX-005A fix-cycle 1).
                 if let Some(ref dc) = dc_focus {
                     let page_key = page_identity_key(&page);
                     let tab_id = tim_focus.borrow().get(&page_key).copied();
