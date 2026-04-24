@@ -5,9 +5,10 @@
 //! with a running Forgetty instance. Supports commands like listing tabs,
 //! opening new panes, sending input, and querying terminal state.
 
-// Pre-existing: `Response` is a large enum used as the error variant of
-// several `Result<T, Response>` helpers in handlers/protocol. Boxing is a
-// follow-up cleanup, not in V2-003 scope.
+// Why: `Response` is the JSON-RPC envelope; boxing would heap-allocate on
+// every handler-error path on the IPC hot-path. Large-by-design, not
+// pre-existing cleanup debt. Handlers short-circuit via `?` and the
+// `Response` propagates directly to the wire.
 #![allow(clippy::result_large_err)]
 
 pub mod framing;
