@@ -155,8 +155,8 @@ pub fn detect_code_blocks(screen: &Screen) -> Vec<CodeBlock> {
             // Scan right along the same row for horizontal border characters
             // until we find a top-right corner.
             let mut right_col = None;
-            for rc in (col + 1)..num_cols {
-                let rc_char = cells[rc].grapheme.chars().next().unwrap_or('\0');
+            for (rc, cell) in cells.iter().enumerate().take(num_cols).skip(col + 1) {
+                let rc_char = cell.grapheme.chars().next().unwrap_or('\0');
                 if is_top_right_corner(rc_char) {
                     right_col = Some(rc);
                     break;
@@ -274,20 +274,21 @@ fn detect_color_blocks(screen: &Screen, blocks: &mut Vec<CodeBlock>) {
         let mut cur_color = Color::Default;
         let mut cur_len = 0usize;
 
-        for col in 0..num_cols.min(cells.len()) {
-            let bg = cells[col].attrs.bg;
+        for (col, cell) in cells.iter().enumerate().take(num_cols.min(cells.len())) {
+            let bg = cell.attrs.bg;
             if bg != Color::Default && bg == cur_color {
                 cur_len += 1;
             } else {
                 // Save previous run if it's the longest
-                if cur_color != Color::Default && cur_len >= 10 {
-                    if best_span.as_ref().map_or(true, |s| cur_len > s.right - s.left + 1) {
-                        best_span = Some(BgSpan {
-                            left: cur_start,
-                            right: cur_start + cur_len - 1,
-                            color: cur_color,
-                        });
-                    }
+                if cur_color != Color::Default
+                    && cur_len >= 10
+                    && best_span.as_ref().is_none_or(|s| cur_len > s.right - s.left + 1)
+                {
+                    best_span = Some(BgSpan {
+                        left: cur_start,
+                        right: cur_start + cur_len - 1,
+                        color: cur_color,
+                    });
                 }
                 if bg != Color::Default {
                     cur_start = col;
@@ -300,14 +301,12 @@ fn detect_color_blocks(screen: &Screen, blocks: &mut Vec<CodeBlock>) {
             }
         }
         // Check final run
-        if cur_color != Color::Default && cur_len >= 10 {
-            if best_span.as_ref().map_or(true, |s| cur_len > s.right - s.left + 1) {
-                best_span = Some(BgSpan {
-                    left: cur_start,
-                    right: cur_start + cur_len - 1,
-                    color: cur_color,
-                });
-            }
+        if cur_color != Color::Default
+            && cur_len >= 10
+            && best_span.as_ref().is_none_or(|s| cur_len > s.right - s.left + 1)
+        {
+            best_span =
+                Some(BgSpan { left: cur_start, right: cur_start + cur_len - 1, color: cur_color });
         }
 
         row_spans.push(best_span);
@@ -328,8 +327,8 @@ fn detect_color_blocks(screen: &Screen, blocks: &mut Vec<CodeBlock>) {
         let mut block_bottom = row;
 
         // Extend downward while consecutive rows have a matching span
-        for next_row in (row + 1)..num_rows {
-            match &row_spans[next_row] {
+        for (next_row, next_span_opt) in row_spans.iter().enumerate().take(num_rows).skip(row + 1) {
+            match next_span_opt {
                 Some(next_span)
                     if next_span.color == block_color
                         && next_span.left == block_left
@@ -396,8 +395,8 @@ pub fn extract_content(screen: &Screen, block: &CodeBlock) -> String {
         let mut line = String::new();
         let start_col = block.left_col + col_start_offset;
         let end_col = (block.right_col + col_end_offset).min(cells.len());
-        for col in start_col..end_col {
-            line.push_str(&cells[col].grapheme);
+        for cell in cells.iter().take(end_col).skip(start_col) {
+            line.push_str(&cell.grapheme);
         }
         lines.push(line);
     }

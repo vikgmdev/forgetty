@@ -2417,20 +2417,15 @@ fn send_undo_close_notification(session_id: uuid::Uuid) {
                 .timeout(notify_rust::Timeout::Milliseconds(30_000))
                 .show();
 
-            match result {
-                Ok(handle) => {
-                    handle.wait_for_action(|action| {
-                        if action == "undo" || action == "__closed" {
-                            if action == "undo" {
-                                let _ = std::process::Command::new(&current_exe)
-                                    .arg("--restore-session")
-                                    .arg(session_id.to_string())
-                                    .spawn();
-                            }
-                        }
-                    });
-                }
-                Err(_) => {}
+            if let Ok(handle) = result {
+                handle.wait_for_action(|action| {
+                    if action == "undo" {
+                        let _ = std::process::Command::new(&current_exe)
+                            .arg("--restore-session")
+                            .arg(session_id.to_string())
+                            .spawn();
+                    }
+                });
             }
             // Exit the forked child cleanly.
             libc::_exit(0);
@@ -4017,10 +4012,8 @@ fn navigate_pane(tab_view: &adw::TabView, focus_tracker: &FocusTracker, directio
             }
         };
 
-        if is_valid {
-            if best.is_none() || distance < best.unwrap().1 {
-                best = Some((candidate, distance));
-            }
+        if is_valid && (best.is_none() || distance < best.unwrap().1) {
+            best = Some((candidate, distance));
         }
     }
 
@@ -4375,8 +4368,9 @@ fn copy_selection(
             };
 
             let mut line = String::new();
-            for col in col_start..=col_end.min(cells.len().saturating_sub(1)) {
-                line.push_str(&cells[col].grapheme);
+            let upper = col_end.min(cells.len().saturating_sub(1));
+            for cell in cells.iter().take(upper + 1).skip(col_start) {
+                line.push_str(&cell.grapheme);
             }
 
             // Soft-wrap detection: use the real wrap flag from libghostty-vt
@@ -4892,7 +4886,7 @@ fn compute_display_title(state: &TerminalState) -> String {
     // Fall back to OSC title — extract just the path portion.
     let osc_title = state.terminal.title();
     if !osc_title.is_empty() && osc_title != "shell" {
-        return tilde_path(cwd_from_osc_title(&osc_title));
+        return tilde_path(cwd_from_osc_title(osc_title));
     }
 
     "shell".to_string()
@@ -4922,7 +4916,7 @@ fn compute_window_title(state: &TerminalState) -> String {
     // Daemon panes: OSC 0/2 title is set on every prompt render — extract just the path.
     let osc_title = state.terminal.title();
     if !osc_title.is_empty() {
-        return tilde_cwd(cwd_from_osc_title(&osc_title));
+        return tilde_cwd(cwd_from_osc_title(osc_title));
     }
 
     // Daemon panes: fall back to CWD captured at connect time from PaneInfo.
@@ -5200,7 +5194,7 @@ fn epoch_to_timestamp(epoch_secs: u64) -> String {
     const DAYS_LEAP: [u64; 12] = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 
     fn is_leap(y: u64) -> bool {
-        (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+        (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
     }
 
     fn days_in_year(y: u64) -> u64 {
@@ -6236,10 +6230,8 @@ fn tab_bar_find_page_at(tab_bar: &adw::TabBar, x: f64, y: f64) -> Option<adw::Ta
             let by = bounds.y() as f64;
             let bw = bounds.width() as f64;
             let bh = bounds.height() as f64;
-            if x >= bx && x <= bx + bw && y >= by && y <= by + bh {
-                if (idx as i32) < n_pages {
-                    return Some(tv.nth_page(idx as i32));
-                }
+            if x >= bx && x <= bx + bw && y >= by && y <= by + bh && (idx as i32) < n_pages {
+                return Some(tv.nth_page(idx as i32));
             }
         }
     }
@@ -7280,7 +7272,7 @@ fn show_restore_session_dialog(window: &adw::ApplicationWindow) {
     let session_ids: Rc<Vec<uuid::Uuid>> = Rc::new(trashed.iter().map(|t| t.session_id).collect());
 
     for info in &trashed {
-        let row = adw::ActionRow::builder().title(&info.workspace_names.join(", ")).build();
+        let row = adw::ActionRow::builder().title(info.workspace_names.join(", ")).build();
 
         let tabs_label = format!("{} tab(s)", info.tab_count);
         let time_str = info
@@ -8818,7 +8810,6 @@ fn duplicate_workspace(
 /// Swap the workspace at `workspace_idx` with the one above it (idx - 1).
 ///
 /// Updates `active_index` to follow the moved element (AC-22).
-#[allow(clippy::too_many_arguments)]
 fn move_workspace_up(
     workspace_idx: usize,
     wm: &WorkspaceManager,
@@ -8861,7 +8852,6 @@ fn move_workspace_up(
 /// Swap the workspace at `workspace_idx` with the one below it (idx + 1).
 ///
 /// Updates `active_index` to follow the moved element (AC-26).
-#[allow(clippy::too_many_arguments)]
 fn move_workspace_down(
     workspace_idx: usize,
     wm: &WorkspaceManager,
