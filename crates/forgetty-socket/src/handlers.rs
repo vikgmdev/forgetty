@@ -1717,4 +1717,46 @@ mod tests {
             "no tab should have been created"
         );
     }
+
+    /// FIX-009 / AC-18: the `close_tab` RPC response shape is unchanged after
+    /// the auto-spawn side effect ships. Even when closing the last tab of a
+    /// non-last workspace (which now triggers daemon-side auto-seed), the RPC
+    /// response is exactly `{ "ok": true }` — no extra fields, no leak of
+    /// the auto-spawned tab/pane id. External clients (socat scripts, Android
+    /// pairing, `docs/socket-api.md`) keep parsing the same shape.
+    #[tokio::test]
+    async fn dispatch_close_tab_response_unchanged_after_auto_spawn() {
+        let sm = make_sm();
+        // Set up two workspaces, each with one tab. Closing era's tab will
+        // trigger the auto-spawn predicate.
+        let size = PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
+        sm.create_tab(0, None, size, None).expect("default tab");
+        let (_era_id, era_idx) = sm.create_workspace("era");
+        let (_era_pane, era_tab) = sm.create_tab(era_idx, None, size, None).expect("era tab");
+
+        let req = Request {
+            jsonrpc: "2.0".to_string(),
+            method: "close_tab".to_string(),
+            params: serde_json::json!({ "tab_id": era_tab.to_string() }),
+            id: Some(serde_json::json!(1)),
+        };
+        let resp = dispatch(&req, Arc::clone(&sm), None);
+
+        assert!(resp.error.is_none(), "close_tab must succeed");
+        let result = resp.result.expect("close_tab must return a result");
+        // Wire shape: exactly `{ "ok": true }`. No extra keys.
+        let obj = result.as_object().expect("result must be a JSON object");
+        assert_eq!(obj.len(), 1, "close_tab response must have exactly one key");
+        assert_eq!(obj.get("ok").and_then(|v| v.as_bool()), Some(true));
+
+        // Sanity: the auto-spawn DID happen on the session side (orthogonal
+        // verification — the wire shape stayed stable while the side effect
+        // landed).
+        let layout = sm.layout();
+        assert_eq!(
+            layout.workspaces[era_idx].tabs.len(),
+            1,
+            "auto-seed must have created a fresh tab in era"
+        );
+    }
 }
