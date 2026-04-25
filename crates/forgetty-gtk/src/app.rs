@@ -11,7 +11,7 @@
 //! during split/close operations without removing and re-inserting the TabPage.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -141,6 +141,21 @@ struct WorkspaceManagerInner {
     /// Set to true by setup-menu handler after showing the menu.
     /// Read by the bubble-phase fallback to avoid showing a second menu.
     tab_menu_shown: bool,
+    /// FIX-006 Cycle 1: pending self-originated workspace reorders awaiting
+    /// the daemon's `WorkspacesReordered` echo. Each entry is `(from_idx, to_idx)`
+    /// captured at the moment of the local swap. `move_workspace_up` /
+    /// `_down` push on the local-mutation path; the `LayoutEvent::WorkspacesReordered`
+    /// consumer pops the head on a match (provenance-based self-echo guard).
+    ///
+    /// This replaces the original content-based guard, which mis-fired when
+    /// two consecutive Move Up clicks landed inside the same 200ms layout-event
+    /// drain window — by the time the drainer processed the first event, the
+    /// second local swap had already perturbed the post-swap pattern, causing
+    /// the consumer to treat the self-echo as external and apply the swap a
+    /// second time. The FIFO queue is correct because the daemon emits
+    /// `WorkspacesReordered` events in the same order as the RPC calls landed
+    /// (single mutex on the daemon side).
+    pending_reorders: VecDeque<(usize, usize)>,
 }
 
 /// CLI-derived launch parameters for this specific invocation.
@@ -894,6 +909,7 @@ fn build_ui(
         active_index: 0,
         last_tab_click: (0.0, 0.0),
         tab_menu_shown: false,
+        pending_reorders: VecDeque::new(),
     }));
 
     // Convenience aliases for the active workspace's state during initial setup.
@@ -2690,6 +2706,36 @@ fn leftmost_daemon_pane_id(
     None
 }
 
+/// FIX-006 Cycle 1: provenance-based self-echo guard for workspace reorder
+/// events. Returns `true` when the incoming `(from_idx, to_idx)` matches the
+/// head of the `pending_reorders` queue (in either order — the daemon may
+/// emit the swap in either direction depending on which call landed first),
+/// in which case the head is popped and the caller should skip the apply.
+///
+/// Returns `false` when the queue is empty (a true external reorder, e.g.
+/// from a future paired-device sync) or when the head does not match
+/// (queue is reserved for a different swap; the caller should still apply).
+///
+/// Pure function on the queue — no GTK state, fully unit-testable. Replaces
+/// the original content-based guard at the consumer site, which mis-fired
+/// when two consecutive local swaps landed inside the same 200ms layout-event
+/// drain window. See INVESTIGATION.md §1–§3.
+fn consume_reorder_self_echo(
+    pending: &mut VecDeque<(usize, usize)>,
+    from_idx: usize,
+    to_idx: usize,
+) -> bool {
+    if let Some(&(pending_from, pending_to)) = pending.front() {
+        if (pending_from == from_idx && pending_to == to_idx)
+            || (pending_from == to_idx && pending_to == from_idx)
+        {
+            pending.pop_front();
+            return true;
+        }
+    }
+    false
+}
+
 /// Process a single `LayoutEvent` delivered by the `subscribe_layout` background task.
 ///
 /// This function runs on the GLib main thread (via the poll timer). All widget
@@ -2913,6 +2959,80 @@ fn handle_layout_event(
             // Reuse the local-only helper — DO NOT call apply_workspace_color
             // (that would re-issue the RPC the daemon just notified us about).
             apply_workspace_color_local(workspace_manager, local_idx, rgba, sidebar_lb);
+        }
+        LayoutEvent::WorkspacesReordered {
+            from_idx,
+            to_idx,
+            from_workspace_id: _from_workspace_id,
+            to_workspace_id: _to_workspace_id,
+        } => {
+            // FIX-006 Cycle 1: provenance-based self-echo guard. The
+            // local-swap path (`move_workspace_up`/`move_workspace_down`)
+            // pushes a `(from, to)` tuple onto `mgr.pending_reorders`. The
+            // daemon emits `WorkspacesReordered` events in the same order as
+            // the RPC calls landed (single mutex on the daemon side), so a
+            // head-of-queue match identifies a self-echo and we skip the
+            // apply. Replaces the original content-based guard, which
+            // mis-fired when two consecutive Move Up clicks landed inside
+            // the same 200ms layout-event drain window — see INVESTIGATION.md.
+            //
+            // The UUIDs `from_workspace_id` / `to_workspace_id` are bound to
+            // `_`-prefixed names because they are no longer used by the
+            // current consumer logic, but kept on the `LayoutEvent` variant
+            // (and the wire-format parser) for forward compatibility with a
+            // future UUID-based reconciliation path.
+            //
+            // Bounds-check both indices against the current local Vec
+            // length. A diverged length implies a concurrent local mutation
+            // (e.g. delete) that we cannot reconcile via swap; skip and let
+            // a later `get_layout` resync if needed.
+            let needs_apply = {
+                let Ok(mut mgr) = workspace_manager.try_borrow_mut() else { return };
+                if from_idx >= mgr.workspaces.len() || to_idx >= mgr.workspaces.len() {
+                    tracing::debug!(
+                        "subscribe_layout: WorkspacesReordered from={from_idx} to={to_idx} out of local bounds (len={}) — skipping",
+                        mgr.workspaces.len()
+                    );
+                    return;
+                }
+                !consume_reorder_self_echo(&mut mgr.pending_reorders, from_idx, to_idx)
+            };
+
+            if !needs_apply {
+                return;
+            }
+
+            // External / out-of-band reorder: apply locally, then refresh
+            // the sidebar so row labels/colours remain attached to their
+            // workspaces.
+            {
+                let Ok(mut mgr) = workspace_manager.try_borrow_mut() else { return };
+                if from_idx >= mgr.workspaces.len() || to_idx >= mgr.workspaces.len() {
+                    return;
+                }
+                mgr.workspaces.swap(from_idx, to_idx);
+                if mgr.active_index == from_idx {
+                    mgr.active_index = to_idx;
+                } else if mgr.active_index == to_idx {
+                    mgr.active_index = from_idx;
+                }
+            }
+
+            tracing::info!(
+                "subscribe_layout: external WorkspacesReordered from={from_idx} to={to_idx} — applied locally"
+            );
+
+            // The sidebar's per-row widgets were built from the workspaces
+            // Vec; without a refresh the row labels / colours / numbers no
+            // longer match the underlying entries. The TabBar/main_area do
+            // not change because the active workspace's TabView is already
+            // correct (only the *order* of inactive rows changed).
+            //
+            // Note: `handle_layout_event` does not have main_area / tab_bar
+            // refs. The sidebar refresh helper variant used by the reorder
+            // path here is the simpler row-only refresh used by
+            // FIX-001/FIX-010 — re-render the row labels in place.
+            refresh_sidebar_row_labels(workspace_manager, sidebar_lb);
         }
     }
 }
@@ -9239,6 +9359,59 @@ fn rebuild_sidebar_rows_for_color(lb: &gtk4::ListBox, wm: &WorkspaceManager) {
     }
 }
 
+/// FIX-006: minimal sidebar row-label refresh used by the
+/// `LayoutEvent::WorkspacesReordered` consumer when an external (paired
+/// device) reorder reaches GTK.
+///
+/// Self-originated reorders short-circuit before this is called (the local
+/// Vec swap already ran in `move_workspace_up`/`move_workspace_down`, then
+/// `refresh_workspace_sidebar` rebuilt the rows in full). This helper exists
+/// because the layout-event consumer does not have `main_area` / `tab_bar`
+/// refs and cannot call `refresh_workspace_sidebar` directly.
+///
+/// Walks each row's hbox children and rewrites the number_label (index 0)
+/// and name_label (index 1) text from the underlying `WorkspaceView`. The
+/// row order in the ListBox is unchanged — we only update text labels so the
+/// "1: Default" / "2: A" prefixes track the current Vec order. The colour
+/// CSS classes are also reapplied via `rebuild_sidebar_rows_for_color`-like
+/// logic so coloured rows track their workspace after the swap.
+fn refresh_sidebar_row_labels(wm: &WorkspaceManager, lb: &gtk4::ListBox) {
+    let Ok(mgr) = wm.try_borrow() else { return };
+
+    for (i, ws) in mgr.workspaces.iter().enumerate() {
+        let Some(row) = lb.row_at_index(i as i32) else { continue };
+        let Some(hbox) = row.child().and_then(|c| c.downcast::<gtk4::Box>().ok()) else {
+            continue;
+        };
+
+        let mut child = hbox.first_child();
+        let mut child_idx = 0;
+        while let Some(c) = child {
+            if let Some(lbl) = c.downcast_ref::<gtk4::Label>() {
+                if child_idx == 0 {
+                    // number_label: "1", "2", ... (1-indexed for users).
+                    lbl.set_text(&format!("{}", i + 1));
+                } else if child_idx == 1 {
+                    // name_label
+                    lbl.set_text(&ws.name);
+                    break;
+                }
+            }
+            child = c.next_sibling();
+            child_idx += 1;
+        }
+
+        // Reapply colour CSS class so the row's accent follows the
+        // reordered workspace, not its previous neighbour.
+        let class_name = format!("workspace-color-{}", ws.id.simple());
+        if ws.color.is_some() {
+            row.add_css_class(&class_name);
+        } else {
+            row.remove_css_class(&class_name);
+        }
+    }
+}
+
 /// Show the "Rename Workspace" dialog targeted at `target_idx` rather than the active workspace.
 ///
 /// Updates `mgr.workspaces[target_idx].name`. Only updates the window title if
@@ -9802,6 +9975,11 @@ fn duplicate_workspace_temp_fallback(
 /// Swap the workspace at `workspace_idx` with the one above it (idx - 1).
 ///
 /// Updates `active_index` to follow the moved element (AC-22).
+///
+/// FIX-006: daemon is authoritative for workspace order (AD-002 / AD-007).
+/// Calls `DaemonClient::move_workspace` first; on RPC error, logs and skips
+/// the local mutation so the daemon's persisted order remains the source of
+/// truth.
 fn move_workspace_up(
     workspace_idx: usize,
     wm: &WorkspaceManager,
@@ -9815,12 +9993,39 @@ fn move_workspace_up(
     if workspace_idx == 0 {
         return; // Already at the top.
     }
+    // TOCTOU-safe bounds re-check (FIX-003 discipline) before the RPC.
+    {
+        let Ok(mgr) = wm.try_borrow() else { return };
+        if workspace_idx >= mgr.workspaces.len() {
+            return;
+        }
+    }
+
+    // FIX-006: RPC first. Daemon is authoritative — if it rejects, we must
+    // not mutate local state, otherwise the daemon's persisted order would
+    // diverge from GTK's view.
+    if let Some(dc) = daemon_client.as_ref() {
+        if let Err(e) = dc.move_workspace(workspace_idx, workspace_idx - 1) {
+            tracing::warn!(
+                workspace_idx,
+                "move_workspace_up RPC failed: {e} — skipping local mutation"
+            );
+            return;
+        }
+    }
+
     let Ok(mut mgr) = wm.try_borrow_mut() else { return };
     if workspace_idx >= mgr.workspaces.len() {
         return;
     }
 
     mgr.workspaces.swap(workspace_idx, workspace_idx - 1);
+
+    // FIX-006 Cycle 1: record this self-originated reorder so the
+    // `WorkspacesReordered` consumer can identify (and skip) the daemon's
+    // echo. Pushed BEFORE the active_index follow-logic to keep the critical
+    // mutation block tight against the swap.
+    mgr.pending_reorders.push_back((workspace_idx, workspace_idx - 1));
 
     // Update active_index to follow the moved element.
     if mgr.active_index == workspace_idx {
@@ -9844,6 +10049,11 @@ fn move_workspace_up(
 /// Swap the workspace at `workspace_idx` with the one below it (idx + 1).
 ///
 /// Updates `active_index` to follow the moved element (AC-26).
+///
+/// FIX-006: daemon is authoritative for workspace order (AD-002 / AD-007).
+/// Calls `DaemonClient::move_workspace` first; on RPC error, logs and skips
+/// the local mutation so the daemon's persisted order remains the source of
+/// truth.
 fn move_workspace_down(
     workspace_idx: usize,
     wm: &WorkspaceManager,
@@ -9854,12 +10064,39 @@ fn move_workspace_down(
     daemon_client: &Option<Arc<DaemonClient>>,
     shared_config: &SharedConfig,
 ) {
+    // TOCTOU-safe bounds re-check (FIX-003 discipline) before the RPC.
+    {
+        let Ok(mgr) = wm.try_borrow() else { return };
+        if workspace_idx + 1 >= mgr.workspaces.len() {
+            return;
+        }
+    }
+
+    // FIX-006: RPC first. Daemon is authoritative — if it rejects, we must
+    // not mutate local state, otherwise the daemon's persisted order would
+    // diverge from GTK's view.
+    if let Some(dc) = daemon_client.as_ref() {
+        if let Err(e) = dc.move_workspace(workspace_idx, workspace_idx + 1) {
+            tracing::warn!(
+                workspace_idx,
+                "move_workspace_down RPC failed: {e} — skipping local mutation"
+            );
+            return;
+        }
+    }
+
     let Ok(mut mgr) = wm.try_borrow_mut() else { return };
     if workspace_idx + 1 >= mgr.workspaces.len() {
         return;
     }
 
     mgr.workspaces.swap(workspace_idx, workspace_idx + 1);
+
+    // FIX-006 Cycle 1: record this self-originated reorder so the
+    // `WorkspacesReordered` consumer can identify (and skip) the daemon's
+    // echo. Pushed BEFORE the active_index follow-logic to keep the critical
+    // mutation block tight against the swap.
+    mgr.pending_reorders.push_back((workspace_idx, workspace_idx + 1));
 
     // Update active_index to follow the moved element.
     if mgr.active_index == workspace_idx {
@@ -10073,4 +10310,93 @@ fn do_delete_workspace_at_index(
         daemon_client,
         shared_config,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    //! FIX-006 Cycle 1 unit tests for the workspace-reorder self-echo guard.
+    //!
+    //! These tests cover `consume_reorder_self_echo` — the pure helper that
+    //! replaced the original content-based guard at the
+    //! `LayoutEvent::WorkspacesReordered` consumer site. Direct unit testing
+    //! of `handle_layout_event` is not feasible (GTK widgets in signature),
+    //! but the queue-check logic was extracted into a free function precisely
+    //! so it can be exercised without a GTK context.
+    use super::consume_reorder_self_echo;
+    use std::collections::VecDeque;
+
+    /// Two consecutive local swaps push two `(from, to)` tuples; injecting
+    /// the corresponding daemon echoes back-to-back must dedupe both via
+    /// FIFO match and leave the queue empty.
+    #[test]
+    fn test_workspace_reorder_consumer_queue_dedup() {
+        let mut pending: VecDeque<(usize, usize)> = VecDeque::new();
+        // Simulate the local-swap path of two consecutive Move Up clicks
+        // on workspace `B` from initial `[Default, A, B]`:
+        //   1) move_workspace_up(2): swap (2, 1) -> [Default, B, A]
+        //   2) move_workspace_up(1): swap (1, 0) -> [B, Default, A]
+        pending.push_back((2, 1));
+        pending.push_back((1, 0));
+
+        // Daemon emits the same swaps in the same order. Both should be
+        // recognised as self-echoes (match) and popped.
+        assert!(
+            consume_reorder_self_echo(&mut pending, 2, 1),
+            "first echo should match queue head and pop"
+        );
+        assert_eq!(pending.len(), 1, "head popped, one entry remains");
+
+        assert!(
+            consume_reorder_self_echo(&mut pending, 1, 0),
+            "second echo should match new head and pop"
+        );
+        assert!(pending.is_empty(), "queue should be drained after both echoes");
+    }
+
+    /// The daemon may emit the swap in either direction `(from, to)` or
+    /// `(to, from)` depending on its internal swap call — the guard must
+    /// match either order.
+    #[test]
+    fn test_workspace_reorder_consumer_queue_dedup_reversed_order() {
+        let mut pending: VecDeque<(usize, usize)> = VecDeque::new();
+        pending.push_back((2, 1));
+
+        // Daemon emits (1, 2) — reversed direction. Still a self-echo.
+        assert!(
+            consume_reorder_self_echo(&mut pending, 1, 2),
+            "reversed-order echo should still match"
+        );
+        assert!(pending.is_empty(), "queue drained even on reversed match");
+    }
+
+    /// Empty queue + an incoming reorder event → not a self-echo. The caller
+    /// must apply (this models a future paired-device reorder arriving at
+    /// this client).
+    #[test]
+    fn test_workspace_reorder_consumer_external_applies() {
+        let mut pending: VecDeque<(usize, usize)> = VecDeque::new();
+        assert!(
+            !consume_reorder_self_echo(&mut pending, 1, 0),
+            "empty queue means external — must apply"
+        );
+        assert!(pending.is_empty(), "queue still empty after non-match");
+    }
+
+    /// Non-empty queue but the event does not match the head → caller must
+    /// still apply, and the queue must NOT be popped (the head is still
+    /// waiting for its own future echo). This protects against a hypothetical
+    /// out-of-order or interleaved external-reorder arriving while a local
+    /// reorder is still pending its echo.
+    #[test]
+    fn test_workspace_reorder_consumer_queue_mismatch() {
+        let mut pending: VecDeque<(usize, usize)> = VecDeque::new();
+        pending.push_back((2, 1));
+
+        assert!(
+            !consume_reorder_self_echo(&mut pending, 0, 1),
+            "mismatched event must not be treated as self-echo"
+        );
+        assert_eq!(pending.len(), 1, "queue head preserved on mismatch");
+        assert_eq!(pending.front(), Some(&(2, 1)), "exact head entry preserved");
+    }
 }

@@ -342,6 +342,71 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Swap the positions of two workspaces in the sidebar order (FIX-006).
+    ///
+    /// Behaviour:
+    /// - Returns `Err` if either `from_idx` or `to_idx` is out of bounds.
+    /// - Returns `Ok(())` with no event if `from_idx == to_idx`
+    ///   (idempotence — mirrors `rename_workspace`).
+    /// - Otherwise swaps `inner.layout.workspaces[from_idx]` with
+    ///   `inner.layout.workspaces[to_idx]`, updates `active_workspace` to
+    ///   follow the moved row if it equals either index, and broadcasts a
+    ///   `SessionEvent::WorkspacesReordered` event.
+    ///
+    /// The `active_workspace` follow-logic mirrors the GTK-side
+    /// `active_index` follow-logic already present in
+    /// `move_workspace_up`/`move_workspace_down` so the active pointer
+    /// remains attached to the moved workspace.
+    pub fn move_workspace(&self, from_idx: usize, to_idx: usize) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+
+        let len = inner.layout.workspaces.len();
+        if from_idx >= len {
+            return Err(forgetty_core::ForgettyError::Pty(format!(
+                "move_workspace: from_idx {from_idx} out of bounds (len={len})"
+            )));
+        }
+        if to_idx >= len {
+            return Err(forgetty_core::ForgettyError::Pty(format!(
+                "move_workspace: to_idx {to_idx} out of bounds (len={len})"
+            )));
+        }
+
+        // Idempotence: same-index swap is a no-op (no event, mirrors rename_workspace).
+        if from_idx == to_idx {
+            return Ok(());
+        }
+
+        let from_workspace_id = inner.layout.workspaces[from_idx].id;
+        let to_workspace_id = inner.layout.workspaces[to_idx].id;
+
+        inner.layout.workspaces.swap(from_idx, to_idx);
+
+        // active_workspace pointer: if it was pointing at from_idx it now
+        // points at to_idx, and vice versa. Mirrors GTK's active_index
+        // follow-logic in move_workspace_up / move_workspace_down.
+        if inner.layout.active_workspace == from_idx {
+            inner.layout.active_workspace = to_idx;
+        } else if inner.layout.active_workspace == to_idx {
+            inner.layout.active_workspace = from_idx;
+        }
+
+        let _ = inner.event_tx.send(SessionEvent::WorkspacesReordered {
+            from_idx,
+            to_idx,
+            from_workspace_id,
+            to_workspace_id,
+        });
+        debug!(
+            from_idx,
+            to_idx,
+            %from_workspace_id,
+            %to_workspace_id,
+            "move_workspace: swapped"
+        );
+        Ok(())
+    }
+
     /// Delete an existing workspace (FIX-003). Removes the `SessionWorkspace`
     /// entry from the layout, kills all its panes (PTY + byte log + on-disk
     /// log unlink), emits a `PaneClosed` event per pane followed by a single
@@ -2528,6 +2593,111 @@ mod tests {
 
         // Value is unchanged.
         assert_eq!(session.layout().workspaces[0].color, Some("#58b967".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX-006: move_workspace
+    // -----------------------------------------------------------------------
+
+    /// FIX-006 happy path: swap workspace 0 and workspace 2 in a 3-workspace
+    /// session. Verify positions, that the active_workspace pointer follows
+    /// the moved row, and that a `WorkspacesReordered` event is emitted.
+    #[tokio::test]
+    async fn test_move_workspace_swaps_positions_and_follows_active() {
+        let session = SessionManager::new();
+        // Seed two extra workspaces. The default session already has one
+        // ("Default" at idx 0); we add A at idx 1 and B at idx 2.
+        let (id_a, _) = session.create_workspace("A");
+        let (id_b, _) = session.create_workspace("B");
+        let id_default = session.layout().workspaces[0].id;
+
+        // Make B (idx 2) the active workspace before the swap so we can
+        // verify the active pointer follows.
+        session.set_active_workspace(2).expect("set_active_workspace should succeed");
+        assert_eq!(session.layout().active_workspace, 2);
+
+        let mut rx = session.subscribe_output();
+
+        session.move_workspace(0, 2).expect("happy-path swap should succeed");
+
+        // Positions: index 0 now holds B, index 2 now holds Default.
+        let layout = session.layout();
+        assert_eq!(layout.workspaces[0].id, id_b);
+        assert_eq!(layout.workspaces[1].id, id_a);
+        assert_eq!(layout.workspaces[2].id, id_default);
+
+        // active_workspace followed B from idx 2 to idx 0.
+        assert_eq!(layout.active_workspace, 0);
+
+        // Drain events until we see the WorkspacesReordered variant.
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let mut got_event = false;
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+                Ok(Ok(SessionEvent::WorkspacesReordered {
+                    from_idx,
+                    to_idx,
+                    from_workspace_id,
+                    to_workspace_id,
+                })) => {
+                    assert_eq!(from_idx, 0);
+                    assert_eq!(to_idx, 2);
+                    // The IDs reported are the IDs at from_idx/to_idx BEFORE
+                    // the swap — i.e. Default and B respectively.
+                    assert_eq!(from_workspace_id, id_default);
+                    assert_eq!(to_workspace_id, id_b);
+                    got_event = true;
+                    break;
+                }
+                Ok(Ok(_)) => {} // ignore unrelated events
+                Ok(Err(_)) | Err(_) => {}
+            }
+        }
+        assert!(got_event, "WorkspacesReordered event must be broadcast on swap");
+    }
+
+    /// FIX-006 idempotence: same-index call returns Ok(()), no event emitted.
+    #[tokio::test]
+    async fn test_move_workspace_same_index_idempotent() {
+        let session = SessionManager::new();
+        session.create_workspace("A");
+
+        let mut rx = session.subscribe_output();
+
+        session.move_workspace(1, 1).expect("same-index call should succeed");
+
+        // No event must be emitted.
+        let deadline = std::time::Instant::now() + Duration::from_millis(200);
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+                Ok(Ok(SessionEvent::WorkspacesReordered { .. })) => {
+                    panic!("same-index move_workspace must not emit WorkspacesReordered");
+                }
+                Ok(Ok(_)) => {} // ignore unrelated events
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+    }
+
+    /// FIX-006 bounds: out-of-range from_idx or to_idx returns Err and does
+    /// not mutate state.
+    #[test]
+    fn test_move_workspace_out_of_bounds_errors() {
+        let session = SessionManager::new();
+        session.create_workspace("A");
+        let len = session.layout().workspaces.len();
+        assert_eq!(len, 2);
+
+        // from_idx out of bounds.
+        let result = session.move_workspace(5, 0);
+        assert!(result.is_err(), "out-of-range from_idx must return Err");
+
+        // to_idx out of bounds.
+        let result = session.move_workspace(0, 5);
+        assert!(result.is_err(), "out-of-range to_idx must return Err");
+
+        // State is unchanged after both failed calls.
+        assert_eq!(session.layout().workspaces.len(), 2);
     }
 
     // -----------------------------------------------------------------------
