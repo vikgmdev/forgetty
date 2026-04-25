@@ -300,6 +300,32 @@ async fn main_async() -> anyhow::Result<()> {
                         }
                     }
 
+                    // FIX-009: heal legacy empty workspaces from pre-FIX-009 sessions.
+                    // If a saved workspace has `tabs: []` — either because the user hit
+                    // the carcass path before the daemon-side auto-spawn shipped, or
+                    // because every restored tab failed to spawn here — give it a
+                    // default shell so the user never sees a "0 tabs" sidebar row on
+                    // first launch after upgrading.
+                    //
+                    // Unlike the live-mutation path in `close_tab`, this heal runs for
+                    // every empty workspace including workspace 0 — cold restart is a
+                    // one-time repair so the user always lands in a usable state.
+                    if workspace.tabs.is_empty() {
+                        match session_manager.create_tab(ws_idx, None, default_size, None) {
+                            Ok(_) => {
+                                info!(
+                                    "cold-start restore: auto-seeded empty workspace {ws_idx} ({}) with default tab (FIX-009)",
+                                    workspace.name
+                                );
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "cold-start restore: auto-seed for empty workspace {ws_idx} failed: {e}"
+                                );
+                            }
+                        }
+                    }
+
                     // FIX-005A: propagate the saved active_tab into the live SessionLayout.
                     // `create_tab` above intentionally does not advance active_tab (per AD-008 —
                     // that is UI state owned by GTK). We restore it explicitly here as a

@@ -925,8 +925,115 @@ impl SessionManager {
 
         let _ = inner.event_tx.send(SessionEvent::TabClosed { workspace_idx: ws_idx, tab_id });
 
+        // FIX-009 9b: auto-spawn a default shell if the workspace just became
+        // empty AND it is not the only remaining workspace. This preserves the
+        // mental model "a workspace always has at least one shell" while
+        // keeping the genuine "close the last tab of the last workspace closes
+        // the window" exit path unchanged.
+        //
+        // `delete_workspace` is unaffected because it uses a direct
+        // workspace-removal code path (lines 365-441) that never calls
+        // `close_tab`, so this predicate cannot fire mid-delete.
+        let auto_spawned = if inner.layout.workspaces[ws_idx].tabs.is_empty()
+            && inner.layout.workspaces.len() > 1
+        {
+            // Default size matches the cold-restart loop in `daemon.rs`.
+            let default_size = PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
+            match Self::auto_seed_default_tab(&mut inner, ws_idx, default_size) {
+                Ok((pane_id, _new_tab_id)) => Some(pane_id),
+                Err(e) => {
+                    warn!(
+                        %tab_id,
+                        ws_idx,
+                        "close_tab: auto-seed default tab failed: {e} — workspace left empty"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        drop(inner);
+
+        // FIX-009 9b: drain task spawn must happen after the lock is released
+        // (mirrors `create_tab`'s pattern). Skipped on auto-seed failure.
+        if let Some(new_pane_id) = auto_spawned {
+            self.spawn_drain_task(new_pane_id);
+        }
+
         debug!(%tab_id, "close_tab: tab removed");
         Ok(())
+    }
+
+    /// FIX-009 9b: seed a default shell tab inside an existing workspace.
+    ///
+    /// Used by `close_tab` when the closed tab was the workspace's last tab
+    /// (and another workspace still exists), and by the cold-restart heal in
+    /// `daemon.rs` for empty-workspace carcasses written by pre-FIX-009
+    /// builds. Encapsulates the same insertion sequence as `create_tab`
+    /// without the public-API double-acquisition of the inner mutex.
+    ///
+    /// Precondition: the caller holds the `inner` mutex (passed by `&mut`).
+    /// The caller is responsible for invoking `spawn_drain_task` for the
+    /// returned `pane_id` AFTER releasing the lock — same lock-release
+    /// discipline as `create_tab` (manager.rs:713-714).
+    ///
+    /// Emits `PaneCreated` followed by `TabCreated`, matching `create_tab`
+    /// (manager.rs:710-711). No new `SessionEvent` variant is introduced.
+    fn auto_seed_default_tab(
+        inner: &mut SessionManagerInner,
+        workspace_idx: usize,
+        size: PtySize,
+    ) -> Result<(PaneId, Uuid)> {
+        // Bounds-check before any spawn so we never leave a dangling PTY.
+        if workspace_idx >= inner.layout.workspaces.len() {
+            return Err(forgetty_core::ForgettyError::Pty(format!(
+                "auto_seed_default_tab: workspace index {workspace_idx} out of bounds (len={})",
+                inner.layout.workspaces.len()
+            )));
+        }
+
+        // Spawn PTY first; if it fails the workspace stays empty and the
+        // caller logs. Same shell-resolution path as `create_tab`.
+        let pty_bridge = PtyBridge::spawn(size, None, None, None, true)
+            .map_err(forgetty_core::ForgettyError::Pty)?;
+
+        let pane_id = PaneId::new();
+        let pane = PaneState {
+            id: pane_id,
+            pty_bridge,
+            cwd: home_dir_fallback(),
+            title: String::new(),
+            rows: size.rows,
+            cols: size.cols,
+        };
+
+        inner.panes.insert(pane_id, pane);
+        inner.pane_order.push(pane_id);
+
+        let tab_id = Uuid::new_v4();
+        let tab = SessionTab {
+            id: tab_id,
+            title: String::new(),
+            pane_tree: PaneTreeLayout::Leaf { pane_id },
+        };
+        inner.layout.workspaces[workspace_idx].tabs.push(tab);
+
+        // The workspace just transitioned 0 → 1 tab: the only valid
+        // active_tab is index 0.
+        inner.layout.workspaces[workspace_idx].active_tab = 0;
+
+        let _ = inner.event_tx.send(SessionEvent::PaneCreated { pane_id });
+        let _ = inner.event_tx.send(SessionEvent::TabCreated { workspace_idx, tab_id, pane_id });
+
+        debug!(
+            %pane_id,
+            %tab_id,
+            workspace_idx,
+            "auto_seed_default_tab: default tab spawned"
+        );
+        Ok((pane_id, tab_id))
     }
 
     /// Move a tab to a new position within its workspace.
@@ -1041,8 +1148,16 @@ impl SessionManager {
     /// After this call, `pane_info(id)` returns `None`. The pane's `ByteLog`
     /// (V2-007) is also dropped here — its disk appender channel closes,
     /// ending the appender task.
+    ///
+    /// FIX-009 9b (cycle 1): when this is the last pane of a non-last workspace
+    /// (e.g., user typed `exit` in the only tab of `era`), auto-seed a fresh
+    /// default tab so the workspace never observably becomes empty. Mirrors
+    /// `close_tab`'s auto-spawn predicate. The PTY-exit path goes through
+    /// `spawn_drain_task` → `close_pane`; without this guard, the PTY-exit
+    /// repro reproduces 9b even after cycle-0 patched `close_tab`.
     pub fn close_pane(&self, id: PaneId) -> Result<()> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut emptied_ws_idx: Option<usize> = None;
         if let Some(mut pane) = inner.panes.remove(&id) {
             // V2-007: drop byte log (disk appender task exits on channel close).
             inner.byte_logs.remove(&id);
@@ -1053,7 +1168,7 @@ impl SessionManager {
             // workspaces (FIX-003 side-fix). Each pane lives in at most one
             // workspace, so `break` after first match is correct.
             // NOTE: do NOT call self.layout() from inside this lock — that deadlocks.
-            for ws in inner.layout.workspaces.iter_mut() {
+            for (ws_idx, ws) in inner.layout.workspaces.iter_mut().enumerate() {
                 let before = ws.tabs.len();
                 ws.tabs.retain(
                     |t| !matches!(&t.pane_tree, PaneTreeLayout::Leaf { pane_id } if *pane_id == id),
@@ -1064,6 +1179,9 @@ impl SessionManager {
                     if ws.active_tab >= ws.tabs.len() && !ws.tabs.is_empty() {
                         ws.active_tab = ws.tabs.len() - 1;
                     }
+                    if ws.tabs.is_empty() {
+                        emptied_ws_idx = Some(ws_idx);
+                    }
                     break;
                 }
             }
@@ -1073,6 +1191,43 @@ impl SessionManager {
             let _ = inner.event_tx.send(SessionEvent::PaneClosed { pane_id: id });
             debug!(%id, "session pane closed");
         }
+
+        // FIX-009 9b (cycle 1): mirror close_tab's auto-spawn predicate so the
+        // PTY-exit path (`exit` in the shell → drain task observes EOF →
+        // close_pane) heals an emptied non-last workspace too. `delete_workspace`
+        // bypasses `close_pane` (it removes panes via direct `inner.panes.remove`
+        // at manager.rs:386-415), so the predicate cannot fire mid-delete —
+        // covered by `test_delete_workspace_does_not_trigger_auto_seed`.
+        let auto_spawned = if let Some(ws_idx) = emptied_ws_idx {
+            if inner.layout.workspaces.len() > 1 {
+                // Default size matches the cold-restart loop in `daemon.rs`.
+                let default_size = PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
+                match Self::auto_seed_default_tab(&mut inner, ws_idx, default_size) {
+                    Ok((new_pane_id, _)) => Some(new_pane_id),
+                    Err(e) => {
+                        warn!(
+                            %id,
+                            ws_idx,
+                            "close_pane: auto-seed default tab failed: {e} — workspace left empty"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        drop(inner);
+
+        // FIX-009 9b: drain task spawn must happen after the lock is released
+        // (mirrors `close_tab` and `create_tab`'s pattern).
+        if let Some(new_pane_id) = auto_spawned {
+            self.spawn_drain_task(new_pane_id);
+        }
+
         Ok(())
     }
 
@@ -2915,5 +3070,322 @@ mod tests {
             "active_workspace should shift by +1 to follow B across the insert"
         );
         assert_eq!(session.layout().workspaces[3].name, "B");
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX-009 unit tests — close_tab auto-spawn (bug 9b)
+    // -----------------------------------------------------------------------
+
+    /// FIX-009 / SPEC §5.6: closing the last tab of a non-last workspace
+    /// auto-seeds a fresh default tab so the user never observes an empty
+    /// workspace.
+    #[tokio::test]
+    async fn test_close_tab_auto_seeds_on_empty_non_last_workspace() {
+        let session = SessionManager::new();
+        let size = test_size();
+
+        // Two workspaces, one tab each.
+        let (_def_pane, _def_tab) = session.create_tab(0, None, size, None).expect("default tab");
+        let (_ws1_id, ws1_idx) = session.create_workspace("era");
+        let (_era_pane, era_tab) = session.create_tab(ws1_idx, None, size, None).expect("era tab");
+
+        assert_eq!(session.layout().workspaces[ws1_idx].tabs.len(), 1);
+
+        session.close_tab(era_tab).expect("close era tab");
+
+        // The workspace must be re-seeded with exactly one fresh tab.
+        let layout = session.layout();
+        assert_eq!(
+            layout.workspaces[ws1_idx].tabs.len(),
+            1,
+            "auto-seed must replace the closed tab"
+        );
+        let new_tab = &layout.workspaces[ws1_idx].tabs[0];
+        assert_ne!(new_tab.id, era_tab, "auto-seed must produce a new tab UUID");
+
+        // The new tab's pane must be live in the registry.
+        let new_pane_id = match &new_tab.pane_tree {
+            PaneTreeLayout::Leaf { pane_id } => *pane_id,
+            _ => panic!("auto-seed must produce a Leaf, not a Split"),
+        };
+        assert!(
+            session.pane_info(new_pane_id).is_some(),
+            "auto-seeded pane must be in the live registry"
+        );
+        // active_tab is clamped/reset to 0 by the auto-seed.
+        assert_eq!(layout.workspaces[ws1_idx].active_tab, 0);
+    }
+
+    /// FIX-009 / SPEC §5.6: closing the last tab of the LAST workspace must
+    /// NOT auto-seed — the empty state lets the GTK exit path close the
+    /// window when the user genuinely wants to quit.
+    #[tokio::test]
+    async fn test_close_tab_does_not_auto_seed_on_last_workspace() {
+        let session = SessionManager::new();
+        let size = test_size();
+
+        // Single workspace, single tab.
+        let (_pane, tab_id) = session.create_tab(0, None, size, None).expect("tab");
+        assert_eq!(session.layout().workspaces.len(), 1);
+
+        session.close_tab(tab_id).expect("close last tab");
+
+        let layout = session.layout();
+        assert_eq!(layout.workspaces.len(), 1, "workspace count must be unchanged");
+        assert_eq!(
+            layout.workspaces[0].tabs.len(),
+            0,
+            "the only workspace must remain empty so the window-exit path is honoured"
+        );
+    }
+
+    /// FIX-009 / SPEC §5.6: closing one of multiple tabs must NOT trigger
+    /// auto-seed — the workspace still has surviving tabs.
+    #[tokio::test]
+    async fn test_close_tab_does_not_auto_seed_when_other_tabs_survive() {
+        let session = SessionManager::new();
+        let size = test_size();
+
+        let (_p0, tab0) = session.create_tab(0, None, size, None).expect("tab 0");
+        let (_p1, _tab1) = session.create_tab(0, None, size, None).expect("tab 1");
+        assert_eq!(session.layout().workspaces[0].tabs.len(), 2);
+
+        session.close_tab(tab0).expect("close tab 0");
+
+        // Exactly one tab remains; no auto-seed phantom.
+        assert_eq!(session.layout().workspaces[0].tabs.len(), 1);
+    }
+
+    /// FIX-009 / SPEC §5.6: a fault-injection test for the case where
+    /// `auto_seed_default_tab` itself fails (e.g., PTY spawn OOM). No clean
+    /// fault-injection seam exists in the current tree (`PtyBridge::spawn`
+    /// always fork-execs a real shell), so this test is a placeholder until
+    /// a fault-injection harness lands.
+    ///
+    // TODO: future fault-injection harness — see BUILDER_NOTES.md.
+    #[test]
+    fn test_close_tab_auto_seed_spawn_failure_logs_and_continues() {
+        // Placeholder: cannot deterministically force PTY spawn failure
+        // without modifying production code paths. The behaviour is exercised
+        // implicitly by `close_tab`'s `match` arm that converts an `Err` from
+        // `auto_seed_default_tab` into a `warn!` log + `Ok(())` return.
+    }
+
+    /// FIX-009 / SPEC §5.6: deleting a workspace must NOT trigger auto-seed
+    /// for any of its tabs. `delete_workspace` uses the direct-pane-removal
+    /// code path (manager.rs:394-415), bypassing `close_tab` entirely.
+    #[tokio::test]
+    async fn test_delete_workspace_does_not_trigger_auto_seed() {
+        let session = SessionManager::new();
+        let size = test_size();
+
+        let (_def_pane, _def_tab) = session.create_tab(0, None, size, None).expect("default tab");
+        let (_ws1_id, ws1_idx) = session.create_workspace("era");
+        let (_era_pane, _era_tab) = session.create_tab(ws1_idx, None, size, None).expect("era tab");
+
+        // Subscribe AFTER setup so we only see delete-lifecycle events.
+        let mut rx = session.subscribe_output();
+
+        session.delete_workspace(ws1_idx).expect("delete era");
+
+        // Era is fully gone; layout has only Default. No auto-seeded tab
+        // should appear in any workspace.
+        let layout = session.layout();
+        assert_eq!(layout.workspaces.len(), 1, "era must be removed");
+        assert_eq!(layout.workspaces[0].tabs.len(), 1, "Default's tab must be unchanged");
+
+        // Drain a short window of events; assert no `TabCreated` was emitted.
+        let deadline = std::time::Instant::now() + Duration::from_millis(200);
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(20), rx.recv()).await {
+                Ok(Ok(SessionEvent::TabCreated { .. })) => {
+                    panic!(
+                        "TabCreated must not fire during delete_workspace (auto-seed regression)"
+                    );
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) | Err(_) => {}
+            }
+        }
+    }
+
+    /// FIX-009 / SPEC §5.6 / AC-16: the auto-seed emits events in the order
+    /// `PaneClosed` → `TabClosed` → `PaneCreated` → `TabCreated`.
+    #[tokio::test]
+    async fn test_close_tab_auto_seed_emits_correct_event_order() {
+        let session = SessionManager::new();
+        let size = test_size();
+
+        let (_def_pane, _def_tab) = session.create_tab(0, None, size, None).expect("default tab");
+        let (_ws1_id, ws1_idx) = session.create_workspace("era");
+        let (era_pane, era_tab) = session.create_tab(ws1_idx, None, size, None).expect("era tab");
+
+        // Subscribe AFTER setup so the snapshot is taken right before close.
+        let mut rx = session.subscribe_output();
+
+        session.close_tab(era_tab).expect("close era tab");
+
+        // Walk events; record only those relevant to FIX-009's ordering.
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let mut saw_pane_closed = false;
+        let mut saw_tab_closed = false;
+        let mut saw_pane_created = false;
+        let mut saw_tab_created = false;
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+                Ok(Ok(SessionEvent::PaneClosed { pane_id })) if pane_id == era_pane => {
+                    assert!(!saw_tab_closed, "PaneClosed must precede TabClosed");
+                    assert!(!saw_pane_created, "PaneClosed must precede PaneCreated");
+                    saw_pane_closed = true;
+                }
+                Ok(Ok(SessionEvent::TabClosed { tab_id, .. })) if tab_id == era_tab => {
+                    assert!(saw_pane_closed, "TabClosed must arrive after PaneClosed");
+                    assert!(!saw_pane_created, "TabClosed must precede PaneCreated");
+                    saw_tab_closed = true;
+                }
+                Ok(Ok(SessionEvent::PaneCreated { .. })) => {
+                    assert!(saw_tab_closed, "PaneCreated must arrive after TabClosed");
+                    saw_pane_created = true;
+                }
+                Ok(Ok(SessionEvent::TabCreated { workspace_idx, .. })) => {
+                    if workspace_idx == ws1_idx {
+                        assert!(saw_pane_created, "TabCreated must arrive after PaneCreated");
+                        saw_tab_created = true;
+                        break;
+                    }
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) | Err(_) => {}
+            }
+        }
+
+        assert!(saw_pane_closed, "PaneClosed must fire for the original pane");
+        assert!(saw_tab_closed, "TabClosed must fire for the original tab");
+        assert!(saw_pane_created, "PaneCreated must fire for the auto-spawned pane");
+        assert!(saw_tab_created, "TabCreated must fire for the auto-spawned tab");
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX-009 cycle 1 unit tests — close_pane auto-spawn (PTY-exit path)
+    // -----------------------------------------------------------------------
+
+    /// FIX-009 cycle 1: closing the last pane of a non-last workspace via
+    /// `close_pane` (the PTY-exit path: shell exits → drain task EOF →
+    /// `close_pane`) must auto-seed a fresh default tab. Mirrors
+    /// `test_close_tab_auto_seeds_on_empty_non_last_workspace` but exercises
+    /// the second daemon entry point that cycle-0 missed.
+    #[tokio::test]
+    async fn test_close_pane_auto_seeds_on_empty_non_last_workspace() {
+        let session = SessionManager::new();
+        let size = test_size();
+
+        // Two workspaces, one tab each.
+        let (_def_pane, _def_tab) = session.create_tab(0, None, size, None).expect("default tab");
+        let (_ws1_id, ws1_idx) = session.create_workspace("era");
+        let (era_pane, era_tab) = session.create_tab(ws1_idx, None, size, None).expect("era tab");
+
+        assert_eq!(session.layout().workspaces[ws1_idx].tabs.len(), 1);
+
+        // Subscribe AFTER setup so we observe only close-lifecycle events.
+        let mut rx = session.subscribe_output();
+
+        // Direct close_pane call simulates the PTY-exit drain-task pathway.
+        session.close_pane(era_pane).expect("close era pane");
+
+        // The workspace must be re-seeded with exactly one fresh tab.
+        let layout = session.layout();
+        assert_eq!(
+            layout.workspaces[ws1_idx].tabs.len(),
+            1,
+            "auto-seed must replace the closed pane's tab"
+        );
+        let new_tab = &layout.workspaces[ws1_idx].tabs[0];
+        assert_ne!(new_tab.id, era_tab, "auto-seed must produce a new tab UUID");
+
+        // The new tab's pane must be live in the registry.
+        let new_pane_id = match &new_tab.pane_tree {
+            PaneTreeLayout::Leaf { pane_id } => *pane_id,
+            _ => panic!("auto-seed must produce a Leaf, not a Split"),
+        };
+        assert_ne!(new_pane_id, era_pane, "auto-seed must produce a new pane id");
+        assert!(
+            session.pane_info(new_pane_id).is_some(),
+            "auto-seeded pane must be in the live registry"
+        );
+        // active_tab is reset to 0 by the auto-seed (workspace went 0 → 1).
+        assert_eq!(layout.workspaces[ws1_idx].active_tab, 0);
+
+        // Confirm the lifecycle order: PaneClosed must arrive before the
+        // auto-spawn's PaneCreated/TabCreated.
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let mut saw_pane_closed = false;
+        let mut saw_pane_created = false;
+        let mut saw_tab_created = false;
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+                Ok(Ok(SessionEvent::PaneClosed { pane_id })) if pane_id == era_pane => {
+                    assert!(!saw_pane_created, "PaneClosed must precede PaneCreated");
+                    saw_pane_closed = true;
+                }
+                Ok(Ok(SessionEvent::PaneCreated { pane_id })) if pane_id == new_pane_id => {
+                    assert!(saw_pane_closed, "PaneCreated must arrive after PaneClosed");
+                    saw_pane_created = true;
+                }
+                Ok(Ok(SessionEvent::TabCreated { workspace_idx, .. }))
+                    if workspace_idx == ws1_idx =>
+                {
+                    assert!(saw_pane_created, "TabCreated must arrive after PaneCreated");
+                    saw_tab_created = true;
+                    break;
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) | Err(_) => {}
+            }
+        }
+        assert!(saw_pane_closed, "PaneClosed must fire for the original pane");
+        assert!(saw_pane_created, "PaneCreated must fire for the auto-spawned pane");
+        assert!(saw_tab_created, "TabCreated must fire for the auto-spawned tab");
+    }
+
+    /// FIX-009 cycle 1: closing the last pane of the LAST workspace via
+    /// `close_pane` must NOT auto-seed — the empty state lets the GTK exit
+    /// path close the window when the user genuinely wants to quit (mirrors
+    /// `close_tab`'s behaviour at AC-1 / AC-10).
+    #[tokio::test]
+    async fn test_close_pane_does_not_auto_seed_on_last_workspace() {
+        let session = SessionManager::new();
+        let size = test_size();
+
+        // Single workspace, single tab.
+        let (pane_id, _tab_id) = session.create_tab(0, None, size, None).expect("tab");
+        assert_eq!(session.layout().workspaces.len(), 1);
+
+        // Subscribe AFTER setup so we only see close-lifecycle events.
+        let mut rx = session.subscribe_output();
+
+        session.close_pane(pane_id).expect("close last pane");
+
+        let layout = session.layout();
+        assert_eq!(layout.workspaces.len(), 1, "workspace count must be unchanged");
+        assert_eq!(
+            layout.workspaces[0].tabs.len(),
+            0,
+            "the only workspace must remain empty so the window-exit path is honoured"
+        );
+
+        // Drain a short window of events; assert no `TabCreated` was emitted
+        // (auto-spawn must not fire on the last-workspace path).
+        let deadline = std::time::Instant::now() + Duration::from_millis(200);
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(20), rx.recv()).await {
+                Ok(Ok(SessionEvent::TabCreated { .. })) => {
+                    panic!(
+                        "TabCreated must not fire for close_pane on the last workspace's last pane"
+                    );
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) | Err(_) => {}
+            }
+        }
     }
 }

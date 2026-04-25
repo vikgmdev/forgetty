@@ -568,6 +568,7 @@ fn register_profile_actions(
                 command.as_deref(),
                 dc_ref.clone(),
                 &ws.tab_id_map,
+                &wm_ref,
             );
         });
         window.add_action(&action);
@@ -996,6 +997,7 @@ fn build_ui(
                 &win_click,
                 dc_click.clone(),
                 &sc_click,
+                &wm_click,
             );
         });
         tab_bar.add_controller(gesture);
@@ -1062,6 +1064,7 @@ fn build_ui(
         let window_close = window.clone();
         let states_close = Rc::clone(&tab_states);
         let dc_close = daemon_client.clone();
+        let wm_close = Rc::clone(&workspace_manager);
         initial_tab_view.connect_close_page(move |tv, page| {
             let container = page.child();
             if let Some(ref dc) = dc_close {
@@ -1072,9 +1075,15 @@ fn build_ui(
                 remove_panes_in_subtree(&container, &states_close);
             }
 
-            // If this is the last page, close the window
+            // FIX-009 9a: only close the window when the TabView is still
+            // attached to the main widget tree AND no other workspace is
+            // alive. See `wire_tab_view_handlers` for the rationale.
             if tv.n_pages() <= 1 {
-                window_close.close();
+                let is_last_workspace =
+                    wm_close.try_borrow().map(|m| m.workspaces.len() <= 1).unwrap_or(true);
+                if tv.parent().is_some() && is_last_workspace {
+                    window_close.close();
+                }
             }
 
             // Confirm the close
@@ -1201,6 +1210,7 @@ fn build_ui(
                 cmd.as_deref(),
                 dc_newtab.clone(),
                 &ws.tab_id_map,
+                &wm_action,
             );
         });
         window.add_action(&action);
@@ -1325,6 +1335,7 @@ fn build_ui(
                 before,
                 &win_split,
                 dc_split.clone(),
+                &wm_split,
             );
         });
         window.add_action(&action);
@@ -1341,17 +1352,20 @@ fn build_ui(
         let dc_closepane = daemon_client.clone();
         let action = gio::SimpleAction::new("close-pane", None);
         action.connect_activate(move |_action, _param| {
-            let Ok(mgr) = wm_close.try_borrow() else {
-                return;
+            // Snapshot the active workspace's GTK handles, then DROP the
+            // borrow before calling close_focused_pane — the call chain
+            // re-enters the WorkspaceManager (FIX-009 9a's window-count guard
+            // does `wm.try_borrow()`), which would otherwise fall back to
+            // unwrap_or(true) and close the window even with sibling
+            // workspaces alive.
+            let (tv, ts, ft) = {
+                let Ok(mgr) = wm_close.try_borrow() else {
+                    return;
+                };
+                let ws = &mgr.workspaces[mgr.active_index];
+                (ws.tab_view.clone(), Rc::clone(&ws.tab_states), Rc::clone(&ws.focus_tracker))
             };
-            let ws = &mgr.workspaces[mgr.active_index];
-            close_focused_pane(
-                &ws.tab_view,
-                &ws.tab_states,
-                &ws.focus_tracker,
-                &window_close,
-                dc_closepane.clone(),
-            );
+            close_focused_pane(&tv, &ts, &ft, &window_close, dc_closepane.clone(), &wm_close);
         });
         window.add_action(&action);
     }
@@ -2220,6 +2234,7 @@ fn build_ui(
             launch.command.as_deref(),
             daemon_client.clone(),
             &ws.tab_id_map,
+            &workspace_manager,
         );
         drop(mgr);
     }
@@ -2339,6 +2354,10 @@ fn build_ui(
             let wm_layout = Rc::clone(&workspace_manager);
             let win_layout = window.clone();
             let lb_layout = workspace_sidebar_lb.clone();
+            // FIX-009 9b: clone the Arc<DaemonClient> + SharedConfig so the
+            // event handler can build the widget for the daemon's auto-spawn.
+            let dc_layout_handler = Arc::clone(dc_layout);
+            let shared_config_layout = Rc::clone(&shared_config);
             let layout_rx = std::sync::Mutex::new(layout_rx);
             // Drain layout events every 200ms on the GLib main thread.
             glib::timeout_add_local(Duration::from_millis(200), move || {
@@ -2346,7 +2365,14 @@ fn build_ui(
                 loop {
                     match rx.try_recv() {
                         Ok(event) => {
-                            handle_layout_event(event, &wm_layout, &win_layout, &lb_layout);
+                            handle_layout_event(
+                                event,
+                                &wm_layout,
+                                &win_layout,
+                                &lb_layout,
+                                Some(&dc_layout_handler),
+                                &shared_config_layout,
+                            );
                         }
                         Err(std::sync::mpsc::TryRecvError::Empty) => break,
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -2681,6 +2707,8 @@ fn handle_layout_event(
     workspace_manager: &WorkspaceManager,
     window: &adw::ApplicationWindow,
     sidebar_lb: &gtk4::ListBox,
+    daemon_client: Option<&Arc<DaemonClient>>,
+    shared_config: &SharedConfig,
 ) {
     match event {
         LayoutEvent::TabCreated { workspace_idx, tab_id, pane_id } => {
@@ -2703,13 +2731,34 @@ fn handle_layout_event(
                 return;
             }
 
-            // External tab creation (e.g. Android pairing, socat test). Log it for now.
-            // Full implementation would call add_new_tab / add_tab_for_pane here.
-            // This is safe as a no-op because we do not have a daemon_client reference
-            // here — the full implementation is deferred to T-066 (Android pairing).
-            tracing::info!(
-                "subscribe_layout: external TabCreated ws={workspace_idx} tab={tab_id} pane={pane_id} (deferred widget build)"
-            );
+            // FIX-009 9b: build the widget for an externally-created tab.
+            // The most common (only) source today is the daemon's auto-spawn
+            // when `close_tab` empties a non-last workspace. Without this
+            // build, the auto-spawned tab would only appear after the next
+            // `get_layout` round-trip, breaking AC-5 (the user expects era to
+            // visibly retain a fresh shell as soon as their last tab closes).
+            //
+            // The widget-build is gated on a daemon_client reference because
+            // we need `subscribe_output` to obtain the byte stream channel.
+            // In `--temp` mode there is no daemon path that fires this event
+            // (auto-spawn runs in the per-temp-window daemon), so the gate is
+            // tight in practice. If the gate fails we degrade to the original
+            // log-and-continue.
+            if let Some(dc) = daemon_client {
+                build_auto_spawned_tab_widget(
+                    workspace_manager,
+                    workspace_idx,
+                    tab_id,
+                    pane_id,
+                    dc,
+                    shared_config,
+                    window,
+                );
+            } else {
+                tracing::info!(
+                    "subscribe_layout: external TabCreated ws={workspace_idx} tab={tab_id} pane={pane_id} (deferred widget build, no daemon client)"
+                );
+            }
         }
         LayoutEvent::TabClosed { workspace_idx, tab_id } => {
             tracing::debug!(
@@ -2868,6 +2917,130 @@ fn handle_layout_event(
     }
 }
 
+/// FIX-009 9b: build the GTK widget for a tab that the daemon auto-spawned.
+///
+/// When the user closes the last tab of a non-last workspace, the daemon's
+/// `close_tab` predicate seeds a fresh shell (see manager.rs auto_seed_default_tab)
+/// and emits `PaneCreated` + `TabCreated` events. This handler picks up the
+/// `TabCreated` event and renders the new tab into the target workspace's
+/// existing TabView so the user observes a healthy era → 1 visible shell
+/// without needing to click the workspace row.
+///
+/// Idempotency: the caller already filtered out events whose `tab_id` is
+/// in `tab_id_map` (the GTK-synchronous create path). Bounds-check on
+/// `workspace_idx` is repeated here for safety; failures degrade to a log.
+fn build_auto_spawned_tab_widget(
+    workspace_manager: &WorkspaceManager,
+    workspace_idx: usize,
+    tab_id: uuid::Uuid,
+    pane_id: forgetty_core::PaneId,
+    dc: &Arc<DaemonClient>,
+    shared_config: &SharedConfig,
+    window: &adw::ApplicationWindow,
+) {
+    // Snapshot the per-workspace handle maps under a borrow, then drop the
+    // borrow before doing any GTK or RPC work. This mirrors the pattern used
+    // elsewhere in handle_layout_event.
+    let (tab_view, tab_states, focus_tracker, custom_titles, tab_id_map) = {
+        let Ok(mgr) = workspace_manager.try_borrow() else {
+            tracing::warn!("auto-spawn build: workspace_manager borrowed re-entrantly — skipping");
+            return;
+        };
+        if workspace_idx >= mgr.workspaces.len() {
+            tracing::warn!(
+                "auto-spawn build: workspace_idx={workspace_idx} out of bounds (len={})",
+                mgr.workspaces.len()
+            );
+            return;
+        }
+        let ws = &mgr.workspaces[workspace_idx];
+        (
+            ws.tab_view.clone(),
+            Rc::clone(&ws.tab_states),
+            Rc::clone(&ws.focus_tracker),
+            Rc::clone(&ws.custom_titles),
+            Rc::clone(&ws.tab_id_map),
+        )
+    };
+
+    let channel = match dc.subscribe_output(pane_id) {
+        Ok(ch) => ch,
+        Err(e) => {
+            tracing::warn!("auto-spawn build: subscribe_output failed for pane {pane_id}: {e}");
+            return;
+        }
+    };
+
+    // Same on_exit / on_notify wiring as `add_new_tab` — the auto-spawned tab
+    // closes via the same `close_pane_by_name` path when its shell exits.
+    let on_exit = make_on_exit_callback(
+        &tab_view,
+        &tab_states,
+        window,
+        Some(Arc::clone(dc)),
+        workspace_manager,
+    );
+    let on_notify = make_on_notify_callback(&tab_view, &tab_states, window);
+
+    let cfg = shared_config.borrow();
+    let create_result = terminal::create_terminal(
+        &cfg,
+        pane_id,
+        Arc::clone(dc),
+        channel,
+        None, // CWD not needed — daemon already started the PTY
+        Some(on_exit),
+        Some(on_notify),
+    );
+    drop(cfg);
+
+    let (pane_vbox, drawing_area, state) = match create_result {
+        Ok(triple) => triple,
+        Err(e) => {
+            tracing::error!(
+                "auto-spawn build: terminal::create_terminal failed for pane {pane_id}: {e}"
+            );
+            return;
+        }
+    };
+
+    let widget_name = next_pane_id();
+    drawing_area.set_widget_name(&widget_name);
+    tab_states.borrow_mut().insert(widget_name, Rc::clone(&state));
+    wire_focus_tracking(
+        &drawing_area,
+        &focus_tracker,
+        &tab_view,
+        &tab_states,
+        &custom_titles,
+        window,
+    );
+
+    let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    container.set_hexpand(true);
+    container.set_vexpand(true);
+    container.append(&pane_vbox);
+    let page = tab_view.append(&container);
+    let page_key = page_identity_key(&page);
+    tab_id_map.borrow_mut().insert(page_key, tab_id);
+    page.set_title("shell");
+
+    // Only steal focus + select the new page if this workspace's TabView is
+    // currently visible to the user. If the auto-spawn fires on a workspace
+    // that is NOT the active one (e.g., user closed era's last tab while
+    // viewing Default), keep Default focused — the user's mental model says
+    // "I'm working in Default; era's healing is silent."
+    if tab_view.parent().is_some() {
+        tab_view.set_selected_page(&page);
+    }
+
+    register_title_timer(&page, &tab_view, &tab_states, &focus_tracker, &custom_titles, window);
+
+    tracing::info!(
+        "auto-spawn build: rendered widget for ws={workspace_idx} tab={tab_id} pane={pane_id}"
+    );
+}
+
 /// Close every pane in the workspace: send daemon close RPCs (or clear the registry
 /// in `--temp` mode).
 fn close_workspace_panes(tab_states: &TabStateMap, daemon_client: Option<&DaemonClient>) {
@@ -2903,6 +3076,7 @@ fn build_widget_from_pane_tree(
     custom_titles: &CustomTitles,
     window: &adw::ApplicationWindow,
     tab_view: &adw::TabView,
+    workspace_manager: &WorkspaceManager,
 ) -> Option<(gtk4::Widget, gtk4::DrawingArea)> {
     match node {
         PaneTreeNode::Leaf { pane_id } => {
@@ -2917,7 +3091,13 @@ fn build_widget_from_pane_tree(
 
             // V2-007: byte-log replay in subscribe_output populates the VT.
             // The daemon's `get_screen` RPC was retired in V2-008.
-            let on_exit = make_on_exit_callback(tab_view, tab_states, window, Some(Arc::clone(dc)));
+            let on_exit = make_on_exit_callback(
+                tab_view,
+                tab_states,
+                window,
+                Some(Arc::clone(dc)),
+                workspace_manager,
+            );
             let on_notify = make_on_notify_callback(tab_view, tab_states, window);
 
             match terminal::create_terminal(
@@ -2966,6 +3146,7 @@ fn build_widget_from_pane_tree(
                 custom_titles,
                 window,
                 tab_view,
+                workspace_manager,
             );
             let second_result = build_widget_from_pane_tree(
                 second,
@@ -2976,6 +3157,7 @@ fn build_widget_from_pane_tree(
                 custom_titles,
                 window,
                 tab_view,
+                workspace_manager,
             );
 
             let (Some((first_widget, first_da)), Some((second_widget, _))) =
@@ -3141,6 +3323,7 @@ fn build_widgets_from_layout(
                     &ws.custom_titles,
                     window,
                     &ws.tab_view,
+                    workspace_manager,
                 ) else {
                     tracing::warn!("build_widget_from_pane_tree failed for tab {:?}", tab.title);
                     continue;
@@ -3223,6 +3406,7 @@ fn build_widgets_from_layout(
             &new_tab_id_map,
             window,
             Some(Arc::clone(dc)),
+            workspace_manager,
         );
 
         tracing::info!(
@@ -3243,6 +3427,7 @@ fn build_widgets_from_layout(
                 &new_custom_titles,
                 window,
                 &new_tv,
+                workspace_manager,
             ) else {
                 tracing::warn!(
                     "build_widget_from_pane_tree failed for tab {:?} in workspace {:?}",
@@ -3357,18 +3542,23 @@ fn build_widgets_from_layout(
 /// Build an `on_exit` callback for a terminal pane.
 ///
 /// When the PTY channel disconnects (shell exits), this callback fires on the
-/// GTK main thread and calls `close_pane_by_name()` to remove the pane.
+/// GTK main thread and calls `close_pane_by_name()` to remove the pane. The
+/// `workspace_manager` clone is captured into the closure so the FIX-009 9a
+/// window-close guard inside `close_pane_by_name` can read the workspace
+/// count when the PTY-exit triggers a last-tab close.
 fn make_on_exit_callback(
     tab_view: &adw::TabView,
     tab_states: &TabStateMap,
     window: &adw::ApplicationWindow,
     daemon_client: Option<Arc<DaemonClient>>,
+    workspace_manager: &WorkspaceManager,
 ) -> Rc<dyn Fn(String)> {
     let tv = tab_view.clone();
     let states = Rc::clone(tab_states);
     let win = window.clone();
+    let wm = Rc::clone(workspace_manager);
     Rc::new(move |pane_name: String| {
-        close_pane_by_name(&pane_name, &tv, &states, &win, daemon_client.clone());
+        close_pane_by_name(&pane_name, &tv, &states, &win, daemon_client.clone(), &wm);
     })
 }
 
@@ -3531,6 +3721,7 @@ fn focus_pane_by_name(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn add_new_tab(
     workspace_idx: usize,
     tab_view: &adw::TabView,
@@ -3543,6 +3734,7 @@ fn add_new_tab(
     command: Option<&[String]>,
     daemon_client: Option<Arc<DaemonClient>>,
     tab_id_map: &TabIdMap,
+    workspace_manager: &WorkspaceManager,
 ) {
     // --- Daemon mode: create pane via RPC and subscribe to output. ---
     let Some(ref dc) = daemon_client else {
@@ -3550,7 +3742,13 @@ fn add_new_tab(
         return;
     };
 
-    let on_exit = make_on_exit_callback(tab_view, tab_states, window, daemon_client.clone());
+    let on_exit = make_on_exit_callback(
+        tab_view,
+        tab_states,
+        window,
+        daemon_client.clone(),
+        workspace_manager,
+    );
     let on_notify = make_on_notify_callback(tab_view, tab_states, window);
 
     // Use profile-aware RPC when command or cwd are provided (AC-13, AC-14).
@@ -3730,6 +3928,7 @@ fn focus_when_mapped(da: &gtk4::DrawingArea) {
 /// start_child, new pane in end_child.
 /// When `before` is true (split-left, split-up): new pane goes in start_child,
 /// existing pane in end_child.
+#[allow(clippy::too_many_arguments)]
 fn split_pane(
     tab_view: &adw::TabView,
     config: &Config,
@@ -3740,6 +3939,7 @@ fn split_pane(
     before: bool,
     window: &adw::ApplicationWindow,
     daemon_client: Option<Arc<DaemonClient>>,
+    workspace_manager: &WorkspaceManager,
 ) {
     // Find the currently focused DrawingArea
     let focused_name = {
@@ -3778,7 +3978,13 @@ fn split_pane(
         tracing::warn!("split_pane called without a daemon client — ignoring");
         return;
     };
-    let on_exit = make_on_exit_callback(tab_view, tab_states, window, daemon_client.clone());
+    let on_exit = make_on_exit_callback(
+        tab_view,
+        tab_states,
+        window,
+        daemon_client.clone(),
+        workspace_manager,
+    );
     let on_notify = make_on_notify_callback(tab_view, tab_states, window);
 
     // Get the daemon PaneId for the currently focused DrawingArea.
@@ -3975,6 +4181,7 @@ fn close_focused_pane(
     focus_tracker: &FocusTracker,
     window: &adw::ApplicationWindow,
     daemon_client: Option<Arc<DaemonClient>>,
+    workspace_manager: &WorkspaceManager,
 ) {
     let focused_name = {
         let Ok(name) = focus_tracker.try_borrow() else {
@@ -3987,7 +4194,14 @@ fn close_focused_pane(
         return;
     }
 
-    close_pane_by_name(&focused_name, tab_view, tab_states, window, daemon_client);
+    close_pane_by_name(
+        &focused_name,
+        tab_view,
+        tab_states,
+        window,
+        daemon_client,
+        workspace_manager,
+    );
 }
 
 /// Close a specific pane identified by its DrawingArea widget name.
@@ -4004,6 +4218,7 @@ fn close_pane_by_name(
     tab_states: &TabStateMap,
     window: &adw::ApplicationWindow,
     daemon_client: Option<Arc<DaemonClient>>,
+    workspace_manager: &WorkspaceManager,
 ) {
     // Idempotency guard: if the pane is already gone from the registry,
     // it was already closed (e.g., by a concurrent manual Ctrl+Shift+W).
@@ -4059,14 +4274,36 @@ fn close_pane_by_name(
         }
 
         if tab_view.n_pages() <= 1 {
-            // FIX-003 AC-9: only close the window when this TabView is still
-            // attached to the main widget tree. During workspace delete the
-            // deleted workspace's TabView is removed from `main_area` before
-            // the daemon-initiated on_exit callback runs — skipping
-            // `window.close()` in that case prevents the window from
-            // disappearing when the user deletes the active workspace.
+            // FIX-003 AC-9 + FIX-009 9a: only close the window when BOTH
+            // (a) this TabView is still attached to the main widget tree
+            // and (b) no other workspace is alive. The parent-attached check
+            // (FIX-003 AC-9) handles workspace-delete: the deleted workspace's
+            // TabView is removed from `main_area` before the daemon-initiated
+            // on_exit callback runs, so `parent().is_some()` is false and we
+            // skip `window.close()`. The workspace-count check (FIX-009 9a)
+            // handles the PTY-exit / X-button last-tab-of-non-last-workspace
+            // case, where the TabView IS still attached but another workspace
+            // exists — closing the window would be a UX shocker.
+            //
+            // FIX-009 cycle 2: when the workspace-count guard says "don't
+            // close the window," we STILL must close the dead page. The
+            // daemon's auto-spawn emits `TabCreated` which builds a fresh
+            // widget AS A NEW PAGE; without this `close_page` call the
+            // workspace's TabView ends up holding both the dead old page
+            // (frozen on the user's last command) AND the new auto-spawned
+            // page. Closing here clears the stale page so the auto-spawn
+            // leaves a single fresh tab.
+            //
+            // `unwrap_or(true)` falls back to the pre-FIX-009 close-window
+            // behaviour if the WorkspaceManager is re-entrantly borrowed.
+            let is_last_workspace =
+                workspace_manager.try_borrow().map(|m| m.workspaces.len() <= 1).unwrap_or(true);
             if tab_view.parent().is_some() {
-                window.close();
+                if is_last_workspace {
+                    window.close();
+                } else {
+                    tab_view.close_page(&page);
+                }
             }
         } else {
             tab_view.close_page(&page);
@@ -6634,6 +6871,7 @@ fn wire_tab_context_menu_signal(
             &win,
             dc.clone(),
             &sc,
+            &wm,
         );
     });
 }
@@ -6659,6 +6897,7 @@ fn show_tab_context_menu(
     window: &adw::ApplicationWindow,
     daemon_client: Option<Arc<DaemonClient>>,
     shared_config: &SharedConfig,
+    workspace_manager: &WorkspaceManager,
 ) {
     let popover = gtk4::Popover::new();
     popover.set_parent(tab_bar);
@@ -6735,6 +6974,7 @@ fn show_tab_context_menu(
         window,
         daemon_client,
         shared_config,
+        workspace_manager,
     );
     popover.set_child(Some(&menu_box));
     popover.popup();
@@ -6755,6 +6995,7 @@ fn build_tab_context_menu_box(
     window: &adw::ApplicationWindow,
     daemon_client: Option<Arc<DaemonClient>>,
     shared_config: &SharedConfig,
+    workspace_manager: &WorkspaceManager,
 ) -> gtk4::Box {
     let _ = tab_id_map; // used later if daemon move_tab is needed
     let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
@@ -6810,6 +7051,7 @@ fn build_tab_context_menu_box(
         let win_d = window.clone();
         let dc_d = daemon_client.clone();
         let sc_d = Rc::clone(shared_config);
+        let wm_d = Rc::clone(workspace_manager);
         let page_d = page.clone();
         let pop_d = popover.clone();
         let btn = tab_menu_button("Duplicate Tab");
@@ -6825,6 +7067,7 @@ fn build_tab_context_menu_box(
                 &win_d,
                 dc_d.clone(),
                 &sc_d,
+                &wm_d,
             );
         });
         vbox.append(&btn);
@@ -7210,6 +7453,7 @@ fn duplicate_tab(
     window: &adw::ApplicationWindow,
     daemon_client: Option<Arc<DaemonClient>>,
     shared_config: &SharedConfig,
+    workspace_manager: &WorkspaceManager,
 ) {
     // Read CWD from the first leaf pane in the source tab.
     let cwd: Option<PathBuf> = {
@@ -7246,6 +7490,7 @@ fn duplicate_tab(
         cmd.as_deref(),
         daemon_client,
         &dup_tab_id_map,
+        workspace_manager,
     );
 }
 
@@ -7400,6 +7645,12 @@ fn refocus_active_pane(workspace_manager: &WorkspaceManager, window: &adw::Appli
 ///
 /// Called for every workspace TabView except the initial one (which has these
 /// handlers wired inline during build_ui setup).
+///
+/// The `workspace_manager` reference is captured so the close-page handler can
+/// distinguish "the genuine last tab of the genuine last workspace" (which
+/// SHOULD close the window — terminal exit semantics) from "the last tab of a
+/// non-last workspace" (which should leave the window open and let FIX-009's
+/// daemon-side auto-spawn refill the workspace).
 fn wire_tab_view_handlers(
     tab_view: &adw::TabView,
     tab_states: &TabStateMap,
@@ -7407,12 +7658,14 @@ fn wire_tab_view_handlers(
     tab_id_map: &TabIdMap,
     window: &adw::ApplicationWindow,
     daemon_client: Option<Arc<DaemonClient>>,
+    workspace_manager: &WorkspaceManager,
 ) {
     // Tab close handling
     {
         let window_close = window.clone();
         let states_close = Rc::clone(tab_states);
         let dc_close = daemon_client.clone();
+        let wm_close = Rc::clone(workspace_manager);
         tab_view.connect_close_page(move |tv, page| {
             let container = page.child();
             if let Some(ref dc) = dc_close {
@@ -7421,8 +7674,20 @@ fn wire_tab_view_handlers(
                 remove_panes_in_subtree(&container, &states_close);
             }
 
+            // FIX-009 9a: only close the window when the TabView is still
+            // attached to the main widget tree AND no other workspace is alive.
+            // §3.7 of the SPEC explains why both conjuncts are needed —
+            // active-workspace delete detaches the TabView before this fires
+            // (parent check) while also dropping the workspace count by one
+            // (count check); keeping both keeps the guard robust to either
+            // ordering. `unwrap_or(true)` falls back to the pre-FIX-009 close
+            // if the WorkspaceManager is somehow re-entrantly borrowed.
             if tv.n_pages() <= 1 {
-                window_close.close();
+                let is_last_workspace =
+                    wm_close.try_borrow().map(|m| m.workspaces.len() <= 1).unwrap_or(true);
+                if tv.parent().is_some() && is_last_workspace {
+                    window_close.close();
+                }
             }
 
             tv.close_page_finish(page, true);
@@ -7501,7 +7766,14 @@ fn open_detached_tab_window(app: &adw::Application) -> adw::TabView {
         new_tv.connect_close_page(move |tv, page| {
             // Don't kill PTY on close here — the tab arrived from another
             // window whose state maps own the TerminalState.
-            if tv.n_pages() <= 1 {
+            //
+            // FIX-009 9a: detached windows have no WorkspaceManager — they are
+            // single-TabView standalone windows so closing the last tab
+            // legitimately closes the detached window. Add the
+            // `tv.parent().is_some()` guard for symmetry with handlers 1 & 2
+            // (and to avoid surprises if a future change detaches the TabView
+            // from the window's content before this fires).
+            if tv.n_pages() <= 1 && tv.parent().is_some() {
                 win_c.close();
             }
             tv.close_page_finish(page, true);
@@ -7785,6 +8057,7 @@ fn create_and_switch_to_new_workspace(
         &new_tab_id_map,
         window,
         daemon_client.clone(),
+        workspace_manager,
     );
     wire_tab_context_menu_signal(
         &new_tv,
@@ -7819,8 +8092,13 @@ fn create_and_switch_to_new_workspace(
                     }
                 };
                 // V2-007: byte-log replay populates the VT via subscribe_output.
-                let on_exit =
-                    make_on_exit_callback(&new_tv, &new_tab_states, window, Some(Arc::clone(dc)));
+                let on_exit = make_on_exit_callback(
+                    &new_tv,
+                    &new_tab_states,
+                    window,
+                    Some(Arc::clone(dc)),
+                    workspace_manager,
+                );
                 let on_notify = make_on_notify_callback(&new_tv, &new_tab_states, window);
                 match terminal::create_terminal(
                     config,
@@ -9188,6 +9466,7 @@ fn duplicate_workspace(
         &new_tab_id_map,
         window,
         Some(Arc::clone(&dc)),
+        wm,
     );
     wire_tab_context_menu_signal(
         &new_tv,
@@ -9221,7 +9500,7 @@ fn duplicate_workspace(
         };
 
         let on_exit =
-            make_on_exit_callback(&new_tv, &new_tab_states, window, Some(Arc::clone(&dc)));
+            make_on_exit_callback(&new_tv, &new_tab_states, window, Some(Arc::clone(&dc)), wm);
         let on_notify = make_on_notify_callback(&new_tv, &new_tab_states, window);
 
         match terminal::create_terminal(
@@ -9426,6 +9705,7 @@ fn duplicate_workspace_temp_fallback(
         &new_tab_id_map,
         window,
         None,
+        wm,
     );
     wire_tab_context_menu_signal(&new_tv, wm, tab_bar, window, None, shared_config);
     {
@@ -9454,6 +9734,7 @@ fn duplicate_workspace_temp_fallback(
             None,
             None,
             &new_tab_id_map,
+            wm,
         );
     }
 
