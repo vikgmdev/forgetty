@@ -43,7 +43,7 @@ iroh = { version = "0.97", default-features = false, features = ["metrics", "por
 qrcode = "0.14"
 image = { version = "0.25", default-features = false, features = ["png"] }
 hostname = "0.4"
-rand = "0.9"
+rand = "0.10"
 
 [package]
 name = "forgetty"
