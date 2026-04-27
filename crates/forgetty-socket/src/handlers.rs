@@ -59,6 +59,7 @@ pub fn dispatch(
         methods::DELETE_WORKSPACE => handle_delete_workspace(request, &sm),
         methods::DUPLICATE_WORKSPACE => handle_duplicate_workspace(request, &sm),
         methods::SET_WORKSPACE_COLOR => handle_set_workspace_color(request, &sm),
+        methods::MOVE_WORKSPACE => handle_move_workspace(request, &sm),
         // Split ratio + pinned session methods (B-002).
         methods::UPDATE_SPLIT_RATIOS => handle_update_split_ratios(request, &sm),
         methods::SET_PINNED => handle_set_pinned(request, &sm),
@@ -638,6 +639,48 @@ fn handle_set_workspace_color(request: &Request, sm: &SessionManager) -> Respons
             request.id.clone(),
             protocol::INTERNAL_ERROR,
             format!("set_workspace_color failed: {e}"),
+        ),
+    }
+}
+
+/// Handle `move_workspace` RPC (FIX-006).
+///
+/// Params: `{ "from_idx": u64, "to_idx": u64 }`.
+///
+/// - Missing `from_idx` or `to_idx` → `INVALID_PARAMS`.
+/// - Out-of-range index → `INTERNAL_ERROR`.
+/// - Same-index call → `{ "ok": true }` (idempotent no-op; no event emitted).
+/// - Success → `{ "ok": true }` and a `WorkspacesReordered` event is
+///   broadcast on the session event channel.
+fn handle_move_workspace(request: &Request, sm: &SessionManager) -> Response {
+    let from_idx = match request.params.get("from_idx").and_then(|v| v.as_u64()) {
+        Some(n) => n as usize,
+        None => {
+            return Response::error(
+                request.id.clone(),
+                protocol::INVALID_PARAMS,
+                "missing param: from_idx (u64)".to_string(),
+            )
+        }
+    };
+
+    let to_idx = match request.params.get("to_idx").and_then(|v| v.as_u64()) {
+        Some(n) => n as usize,
+        None => {
+            return Response::error(
+                request.id.clone(),
+                protocol::INVALID_PARAMS,
+                "missing param: to_idx (u64)".to_string(),
+            )
+        }
+    };
+
+    match sm.move_workspace(from_idx, to_idx) {
+        Ok(()) => Response::success(request.id.clone(), serde_json::json!({ "ok": true })),
+        Err(e) => Response::error(
+            request.id.clone(),
+            protocol::INTERNAL_ERROR,
+            format!("move_workspace failed: {e}"),
         ),
     }
 }
@@ -1638,6 +1681,83 @@ mod tests {
             assert_eq!(resp.result.unwrap().get("ok").and_then(|v| v.as_bool()), Some(true));
             assert!(sm.layout().workspaces[0].color.is_none());
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX-006 — move_workspace RPC dispatch tests
+    // -----------------------------------------------------------------------
+
+    /// FIX-006: missing `from_idx` or `to_idx` → INVALID_PARAMS.
+    #[test]
+    fn dispatch_move_workspace_missing_param_returns_invalid_params() {
+        // Sub-assert 1: missing from_idx → INVALID_PARAMS.
+        {
+            let sm = make_sm();
+            let req = Request {
+                jsonrpc: "2.0".to_string(),
+                method: "move_workspace".to_string(),
+                params: serde_json::json!({ "to_idx": 0 }),
+                id: Some(serde_json::json!(1)),
+            };
+            let resp = dispatch(&req, sm, None);
+            assert!(resp.error.is_some(), "missing from_idx must error");
+            assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
+        }
+
+        // Sub-assert 2: missing to_idx → INVALID_PARAMS.
+        {
+            let sm = make_sm();
+            let req = Request {
+                jsonrpc: "2.0".to_string(),
+                method: "move_workspace".to_string(),
+                params: serde_json::json!({ "from_idx": 0 }),
+                id: Some(serde_json::json!(1)),
+            };
+            let resp = dispatch(&req, sm, None);
+            assert!(resp.error.is_some(), "missing to_idx must error");
+            assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
+        }
+    }
+
+    /// FIX-006: out-of-range index → INTERNAL_ERROR; daemon state unchanged.
+    /// Covers both `from_idx` and `to_idx` out-of-range branches.
+    #[test]
+    fn dispatch_move_workspace_out_of_range_returns_internal_error() {
+        let sm = make_sm();
+        // Seed two extra workspaces so we have idx 0..=2 (3 total).
+        sm.create_workspace("A");
+        sm.create_workspace("B");
+        let original_ids: Vec<_> = sm.layout().workspaces.iter().map(|w| w.id).collect();
+
+        // Sub-assert 1: out-of-range to_idx → INTERNAL_ERROR.
+        {
+            let req = Request {
+                jsonrpc: "2.0".to_string(),
+                method: "move_workspace".to_string(),
+                params: serde_json::json!({ "from_idx": 0, "to_idx": 99 }),
+                id: Some(serde_json::json!(1)),
+            };
+            let resp = dispatch(&req, Arc::clone(&sm), None);
+            assert!(resp.error.is_some(), "out-of-range to_idx must error");
+            assert_eq!(resp.error.unwrap().code, protocol::INTERNAL_ERROR);
+        }
+
+        // Sub-assert 2: out-of-range from_idx → INTERNAL_ERROR.
+        {
+            let req = Request {
+                jsonrpc: "2.0".to_string(),
+                method: "move_workspace".to_string(),
+                params: serde_json::json!({ "from_idx": 99, "to_idx": 0 }),
+                id: Some(serde_json::json!(1)),
+            };
+            let resp = dispatch(&req, Arc::clone(&sm), None);
+            assert!(resp.error.is_some(), "out-of-range from_idx must error");
+            assert_eq!(resp.error.unwrap().code, protocol::INTERNAL_ERROR);
+        }
+
+        // Daemon state unchanged after both failed calls.
+        let after_ids: Vec<_> = sm.layout().workspaces.iter().map(|w| w.id).collect();
+        assert_eq!(after_ids, original_ids, "failed move must not mutate workspace order");
     }
 
     // -----------------------------------------------------------------------

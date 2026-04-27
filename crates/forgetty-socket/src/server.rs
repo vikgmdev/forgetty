@@ -700,6 +700,36 @@ async fn handle_streaming_connection(
                                     break;
                                 }
                             }
+                            Ok(SessionEvent::WorkspacesReordered {
+                                from_idx,
+                                to_idx,
+                                from_workspace_id,
+                                to_workspace_id,
+                            }) => {
+                                // FIX-006: fan out workspace-reorder notifications
+                                // to subscribed clients. Both UUIDs are stringified
+                                // so subscribers can reconcile by ID even if their
+                                // local indices have drifted.
+                                let notification = serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "workspaces_reordered",
+                                    "params": {
+                                        "from_idx": from_idx,
+                                        "to_idx": to_idx,
+                                        "from_workspace_id": from_workspace_id.to_string(),
+                                        "to_workspace_id": to_workspace_id.to_string(),
+                                    }
+                                });
+                                let mut out = serde_json::to_string(&notification)
+                                    .unwrap_or_else(|_| "{}".to_string());
+                                out.push('\n');
+                                if writer.write_all(out.as_bytes()).await.is_err() {
+                                    break;
+                                }
+                                if writer.flush().await.is_err() {
+                                    break;
+                                }
+                            }
                             Ok(_) => {
                                 // Output events (PtyOutput, PaneCreated, PaneClosed,
                                 // Notification) are not forwarded to subscribe_layout clients.

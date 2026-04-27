@@ -411,6 +411,26 @@ impl DaemonClient {
         Ok(())
     }
 
+    /// Swap two workspaces' positions in the sidebar order (FIX-006). The
+    /// daemon is the single source of truth for workspace ordering (AD-007).
+    /// GTK must call this before mutating its local `WorkspaceManagerInner.
+    /// workspaces` Vec, otherwise the reorder is lost on save (daemon writes
+    /// its unchanged `SessionLayout` on disconnect).
+    ///
+    /// Same-index calls are idempotent no-ops on the daemon side. Out-of-range
+    /// indices return an RPC error — GTK callers should log and skip the
+    /// local swap (the daemon is the source of truth, AD-002 / AD-007).
+    pub fn move_workspace(&self, from_idx: usize, to_idx: usize) -> Result<(), DaemonError> {
+        self.rpc(
+            "move_workspace",
+            serde_json::json!({
+                "from_idx": from_idx,
+                "to_idx": to_idx,
+            }),
+        )?;
+        Ok(())
+    }
+
     /// Delete a workspace on the daemon (FIX-003). The daemon kills all panes
     /// in the workspace, unlinks their byte logs, removes the workspace entry
     /// from the layout, clamps `active_workspace`, and fans out `PaneClosed`
@@ -889,6 +909,20 @@ pub enum LayoutEvent {
     /// (current hex == event hex). External paired-device changes (future)
     /// reconcile here.
     WorkspaceColorChanged { workspace_idx: usize, workspace_id: uuid::Uuid, color: Option<String> },
+
+    /// FIX-006: two workspaces swapped positions (`from_idx` ↔ `to_idx`).
+    ///
+    /// For self-originated reorders (GTK called `dc.move_workspace` and the
+    /// local swap already ran in `move_workspace_up`/`move_workspace_down`),
+    /// this arm is a no-op via the self-echo guard: if `mgr.workspaces[from_idx].id`
+    /// already equals `to_workspace_id`, the swap was already applied.
+    /// External paired-device reorders (future) reconcile here.
+    WorkspacesReordered {
+        from_idx: usize,
+        to_idx: usize,
+        from_workspace_id: uuid::Uuid,
+        to_workspace_id: uuid::Uuid,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1219,6 +1253,30 @@ async fn subscribe_layout_task(
                 let color: Option<String> =
                     params.get("color").and_then(|v| v.as_str()).map(str::to_string);
                 LayoutEvent::WorkspaceColorChanged { workspace_idx, workspace_id, color }
+            }
+            "workspaces_reordered" => {
+                // FIX-006: daemon-originated reorder notification.
+                let from_idx =
+                    params.get("from_idx").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let to_idx = params.get("to_idx").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let from_id_str =
+                    params.get("from_workspace_id").and_then(|v| v.as_str()).unwrap_or("");
+                let to_id_str =
+                    params.get("to_workspace_id").and_then(|v| v.as_str()).unwrap_or("");
+                let from_workspace_id = match uuid::Uuid::parse_str(from_id_str) {
+                    Ok(u) => u,
+                    Err(_) => continue,
+                };
+                let to_workspace_id = match uuid::Uuid::parse_str(to_id_str) {
+                    Ok(u) => u,
+                    Err(_) => continue,
+                };
+                LayoutEvent::WorkspacesReordered {
+                    from_idx,
+                    to_idx,
+                    from_workspace_id,
+                    to_workspace_id,
+                }
             }
             _ => {
                 // Unknown layout notification — ignore silently.
