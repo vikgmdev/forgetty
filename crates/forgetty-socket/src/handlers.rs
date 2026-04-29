@@ -60,6 +60,7 @@ pub fn dispatch(
         methods::DUPLICATE_WORKSPACE => handle_duplicate_workspace(request, &sm),
         methods::SET_WORKSPACE_COLOR => handle_set_workspace_color(request, &sm),
         methods::MOVE_WORKSPACE => handle_move_workspace(request, &sm),
+        methods::SET_ACTIVE_PANE => handle_set_active_pane(request, &sm),
         // Split ratio + pinned session methods (B-002).
         methods::UPDATE_SPLIT_RATIOS => handle_update_split_ratios(request, &sm),
         methods::SET_PINNED => handle_set_pinned(request, &sm),
@@ -681,6 +682,84 @@ fn handle_move_workspace(request: &Request, sm: &SessionManager) -> Response {
             request.id.clone(),
             protocol::INTERNAL_ERROR,
             format!("move_workspace failed: {e}"),
+        ),
+    }
+}
+
+/// FIX-005B: handle `set_active_pane` RPC — persist the focused pane id of a
+/// tab so cold restart restores the user's last-typed pane.
+///
+/// Params:
+///   - `workspace_idx: u64`
+///   - `tab_id: String` (UUID)
+///   - `pane_id: Option<String>` (UUID, or null to clear)
+///
+/// Errors:
+///   - missing/invalid `workspace_idx` / `tab_id` → INVALID_PARAMS
+///   - workspace out-of-bounds, tab not found, or `pane_id` not a leaf in
+///     the tab's pane_tree → INTERNAL_ERROR
+fn handle_set_active_pane(request: &Request, sm: &SessionManager) -> Response {
+    let workspace_idx = match request.params.get("workspace_idx").and_then(|v| v.as_u64()) {
+        Some(n) => n as usize,
+        None => {
+            return Response::error(
+                request.id.clone(),
+                protocol::INVALID_PARAMS,
+                "missing param: workspace_idx (u64)".to_string(),
+            )
+        }
+    };
+
+    let tab_id_str = match request.params.get("tab_id").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            return Response::error(
+                request.id.clone(),
+                protocol::INVALID_PARAMS,
+                "missing param: tab_id".to_string(),
+            )
+        }
+    };
+    let tab_uuid = match Uuid::parse_str(&tab_id_str) {
+        Ok(u) => u,
+        Err(_) => {
+            return Response::error(
+                request.id.clone(),
+                protocol::INVALID_PARAMS,
+                format!("invalid tab_id UUID: {tab_id_str}"),
+            )
+        }
+    };
+
+    // pane_id is Option<String>: explicit null is allowed and means
+    // "clear the focus pointer". A missing field is treated as null too.
+    let pane_id = match request.params.get("pane_id") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) => match Uuid::parse_str(s) {
+            Ok(u) => Some(PaneId(u)),
+            Err(_) => {
+                return Response::error(
+                    request.id.clone(),
+                    protocol::INVALID_PARAMS,
+                    format!("invalid pane_id UUID: {s}"),
+                );
+            }
+        },
+        Some(other) => {
+            return Response::error(
+                request.id.clone(),
+                protocol::INVALID_PARAMS,
+                format!("invalid pane_id type: expected string or null, got {other}"),
+            );
+        }
+    };
+
+    match sm.set_active_pane(workspace_idx, tab_uuid, pane_id) {
+        Ok(()) => Response::success(request.id.clone(), serde_json::json!({ "ok": true })),
+        Err(e) => Response::error(
+            request.id.clone(),
+            protocol::INTERNAL_ERROR,
+            format!("set_active_pane failed: {e}"),
         ),
     }
 }
@@ -1758,6 +1837,80 @@ mod tests {
         // Daemon state unchanged after both failed calls.
         let after_ids: Vec<_> = sm.layout().workspaces.iter().map(|w| w.id).collect();
         assert_eq!(after_ids, original_ids, "failed move must not mutate workspace order");
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX-005B — set_active_pane RPC dispatch tests
+    // -----------------------------------------------------------------------
+
+    /// FIX-005B: missing `tab_id` → INVALID_PARAMS.
+    #[test]
+    fn dispatch_set_active_pane_missing_tab_id_returns_invalid_params() {
+        let sm = make_sm();
+        let req = Request {
+            jsonrpc: "2.0".to_string(),
+            method: "set_active_pane".to_string(),
+            params: serde_json::json!({ "workspace_idx": 0 }),
+            id: Some(serde_json::json!(1)),
+        };
+        let resp = dispatch(&req, sm, None);
+        assert!(resp.error.is_some(), "missing tab_id must error");
+        assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
+    }
+
+    /// FIX-005B: unknown tab UUID → INTERNAL_ERROR (manager bounds-check).
+    #[test]
+    fn dispatch_set_active_pane_unknown_tab_returns_internal_error() {
+        let sm = make_sm();
+        let req = Request {
+            jsonrpc: "2.0".to_string(),
+            method: "set_active_pane".to_string(),
+            params: serde_json::json!({
+                "workspace_idx": 0,
+                "tab_id": "00000000-0000-0000-0000-000000000000",
+                "pane_id": null,
+            }),
+            id: Some(serde_json::json!(1)),
+        };
+        let resp = dispatch(&req, sm, None);
+        assert!(resp.error.is_some(), "unknown tab must error");
+        assert_eq!(resp.error.unwrap().code, protocol::INTERNAL_ERROR);
+    }
+
+    /// FIX-005B: real tab + orphan pane UUID (not present in pane_tree) →
+    /// INTERNAL_ERROR. Daemon state untouched.
+    #[tokio::test]
+    async fn dispatch_set_active_pane_orphan_pane_uuid_returns_internal_error() {
+        let sm = make_sm();
+        // Create a tab so we have a real (workspace_idx, tab_id) pair.
+        let new_req = Request {
+            jsonrpc: "2.0".to_string(),
+            method: "new_tab".to_string(),
+            params: serde_json::json!({ "workspace_idx": 0 }),
+            id: Some(serde_json::json!(1)),
+        };
+        let new_resp = dispatch(&new_req, Arc::clone(&sm), None);
+        assert!(new_resp.result.is_some(), "new_tab should succeed");
+        let tab_id = new_resp.result.unwrap()["tab_id"].as_str().unwrap().to_string();
+
+        let bogus_pane = "11111111-2222-3333-4444-555555555555";
+        let req = Request {
+            jsonrpc: "2.0".to_string(),
+            method: "set_active_pane".to_string(),
+            params: serde_json::json!({
+                "workspace_idx": 0,
+                "tab_id": tab_id,
+                "pane_id": bogus_pane,
+            }),
+            id: Some(serde_json::json!(2)),
+        };
+        let resp = dispatch(&req, Arc::clone(&sm), None);
+        assert!(resp.error.is_some(), "orphan pane must error");
+        assert_eq!(resp.error.unwrap().code, protocol::INTERNAL_ERROR);
+
+        // Daemon state untouched: active_pane_id stays None.
+        let layout = sm.layout();
+        assert_eq!(layout.workspaces[0].tabs[0].active_pane_id, None);
     }
 
     // -----------------------------------------------------------------------

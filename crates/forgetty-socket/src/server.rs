@@ -730,6 +730,33 @@ async fn handle_streaming_connection(
                                     break;
                                 }
                             }
+                            Ok(SessionEvent::ActivePaneChanged {
+                                workspace_idx,
+                                tab_id,
+                                pane_id,
+                            }) => {
+                                // FIX-005B: fan out active-pane changes so paired
+                                // clients can mirror per-tab focus. `pane_id` is
+                                // stringified (or `null` for the cleared case).
+                                let notification = serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "active_pane_changed",
+                                    "params": {
+                                        "workspace_idx": workspace_idx,
+                                        "tab_id": tab_id.to_string(),
+                                        "pane_id": pane_id.map(|p| p.to_string()),
+                                    }
+                                });
+                                let mut out = serde_json::to_string(&notification)
+                                    .unwrap_or_else(|_| "{}".to_string());
+                                out.push('\n');
+                                if writer.write_all(out.as_bytes()).await.is_err() {
+                                    break;
+                                }
+                                if writer.flush().await.is_err() {
+                                    break;
+                                }
+                            }
                             Ok(_) => {
                                 // Output events (PtyOutput, PaneCreated, PaneClosed,
                                 // Notification) are not forwarded to subscribe_layout clients.

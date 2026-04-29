@@ -354,6 +354,65 @@ async fn main_async() -> anyhow::Result<()> {
                         state.active_workspace
                     );
                 }
+
+                // FIX-005B: propagate each saved tab's `active_pane_id` into the
+                // live SessionLayout. Unlike `active_tab` (a stable index),
+                // `active_pane_id` is a UUID and the daemon mints fresh PaneIds
+                // for every restored leaf. We walk the saved + live pane_trees
+                // in lock-step (`live_pane_id_for_saved`) to translate the
+                // saved UUID into the live PaneId at the same tree position.
+                //
+                // Pre-collect every `(ws_idx, live_tab_id, live_pane_id)` tuple
+                // before calling `set_active_pane` so the layout snapshot is
+                // not held across the manager's mutex re-acquire. Orphan saved
+                // UUIDs (saved leaf no longer in the restored tree, e.g. partial
+                // split-restore failure) degrade to `warn!` per AC-7.
+                //
+                // Ordering note: this restore happens BEFORE the layout-event
+                // watcher's `tokio::spawn` below — `ActivePaneChanged` events
+                // fire into the broadcast channel's zero subscribers and are
+                // silently dropped (`Err(NoReceivers)`), preserving the FIX-005A
+                // "quiet startup" invariant.
+                let mut restore_targets: Vec<(usize, uuid::Uuid, PaneId)> = Vec::new();
+                {
+                    let live_layout = session_manager.layout();
+                    for (ws_idx, saved_workspace) in state.workspaces.iter().enumerate() {
+                        let Some(live_ws) = live_layout.workspaces.get(ws_idx) else {
+                            continue;
+                        };
+                        for (i, saved_tab) in saved_workspace.tabs.iter().enumerate() {
+                            let Some(live_tab) = live_ws.tabs.get(i) else { continue };
+                            let Some(saved_pane_uuid) = saved_tab.active_pane_id else {
+                                continue;
+                            };
+                            match live_pane_id_for_saved(
+                                &saved_tab.pane_tree,
+                                &live_tab.pane_tree,
+                                saved_pane_uuid,
+                            ) {
+                                Some(live_pane_id) => {
+                                    restore_targets.push((ws_idx, live_tab.id, live_pane_id));
+                                }
+                                None => {
+                                    warn!(
+                                        "cold-start restore: saved active_pane_id={saved_pane_uuid} \
+                                         not found in workspace {ws_idx} tab {} pane_tree \
+                                         (orphan; falling back to first leaf)",
+                                        live_tab.id
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                for (ws_idx, tab_id, pane_id) in restore_targets {
+                    if let Err(e) = session_manager.set_active_pane(ws_idx, tab_id, Some(pane_id)) {
+                        warn!(
+                            "cold-start restore: failed to set active_pane on workspace {ws_idx} \
+                             tab {tab_id}: {e}"
+                        );
+                    }
+                }
             }
             Ok(Some(_)) => {
                 debug!("cold-start restore: session file has no workspaces, starting fresh");
@@ -453,7 +512,8 @@ async fn main_async() -> anyhow::Result<()> {
                     | Ok(SessionEvent::WorkspaceRenamed { .. })
                     | Ok(SessionEvent::WorkspaceDeleted { .. })
                     | Ok(SessionEvent::WorkspaceColorChanged { .. })
-                    | Ok(SessionEvent::WorkspacesReordered { .. }) => {
+                    | Ok(SessionEvent::WorkspacesReordered { .. })
+                    | Ok(SessionEvent::ActivePaneChanged { .. }) => {
                         // Save immediately so sibling daemons' prune passes
                         // see this pane's UUID in the persisted-union (V2-007
                         // fix cycle 7). Leave the dirty flag set as well so
@@ -602,6 +662,46 @@ fn first_leaf_cwd(tree: &forgetty_workspace::PaneTreeState) -> &std::path::Path 
     match tree {
         forgetty_workspace::PaneTreeState::Leaf { cwd, .. } => cwd,
         forgetty_workspace::PaneTreeState::Split { first, .. } => first_leaf_cwd(first),
+    }
+}
+
+/// FIX-005B: walk the saved pane_tree and the live pane_tree in lock-step,
+/// returning the **live** PaneId of the leaf at the same position as the
+/// saved leaf whose `pane_id == saved_target`.
+///
+/// Cold restart re-mints `PaneId::new()` for every restored leaf, so the
+/// saved UUID is never directly present in the live layout. The trees are
+/// built in matching shape by `restore_subtree` (recursive on the saved
+/// tree), so a parallel walk lets us translate "the leaf that used to be
+/// `saved_target`" → "this live PaneId".
+///
+/// Returns `None` if the trees diverge in shape (would only happen if a
+/// future refactor of `restore_subtree` broke the invariant) or if no
+/// saved leaf matches `saved_target` (orphan UUID — caller falls back to
+/// the first leaf).
+fn live_pane_id_for_saved(
+    saved: &forgetty_workspace::PaneTreeState,
+    live: &forgetty_session::workspace::PaneTreeLayout,
+    saved_target: uuid::Uuid,
+) -> Option<PaneId> {
+    use forgetty_session::workspace::PaneTreeLayout as Live;
+    use forgetty_workspace::PaneTreeState as Saved;
+
+    match (saved, live) {
+        (Saved::Leaf { pane_id: saved_id, .. }, Live::Leaf { pane_id: live_id }) => {
+            if *saved_id == Some(saved_target) {
+                Some(*live_id)
+            } else {
+                None
+            }
+        }
+        (Saved::Split { first: sa, second: sb, .. }, Live::Split { first: la, second: lb, .. }) => {
+            live_pane_id_for_saved(sa, la, saved_target)
+                .or_else(|| live_pane_id_for_saved(sb, lb, saved_target))
+        }
+        // Tree shape mismatch — should not happen because `restore_subtree`
+        // builds the live tree from the saved tree, but degrade safely.
+        _ => None,
     }
 }
 

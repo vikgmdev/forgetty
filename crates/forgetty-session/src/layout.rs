@@ -56,6 +56,14 @@ pub struct SessionTab {
     /// Empty until the client reports one.
     pub title: String,
     pub pane_tree: PaneTreeLayout,
+    /// FIX-005B: the pane id of the focused leaf within this tab's pane tree.
+    /// `None` means "focus the leftmost leaf" (cold-restart fallback). Set by
+    /// `SessionManager::set_active_pane` (live path) or by cold-restart restore
+    /// from the persisted `forgetty_workspace::TabState.active_pane_id`. Must
+    /// always reference a leaf currently in `pane_tree` — orphan UUIDs are
+    /// possible after restore from a stale JSON (see AC-7) and are degraded
+    /// to a `warn!` + first-leaf fallback at the GTK consumer site.
+    pub active_pane_id: Option<forgetty_core::PaneId>,
 }
 
 // ---------------------------------------------------------------------------

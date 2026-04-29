@@ -105,6 +105,24 @@ type TabIdMap = Rc<RefCell<HashMap<String, uuid::Uuid>>>;
 /// Cleared when the user picks "None".
 type TabColorMap = Rc<RefCell<HashMap<String, gtk4::gdk::RGBA>>>;
 
+/// FIX-005B fix-cycle 1: per-workspace map `tab_id → daemon PaneId of the
+/// saved-focused leaf`.
+///
+/// Populated at cold restart from the layout snapshot, updated by
+/// `wire_focus_tracking`'s `connect_enter` (live focus changes), and
+/// updated by the `LayoutEvent::ActivePaneChanged` consumer (echo path).
+///
+/// Read by `connect_selected_page_notify` BEFORE the legacy `focus_tracker`
+/// fallback so that a tab's saved focused pane wins over a stale per-
+/// workspace single-string tracker that may belong to a different tab.
+///
+/// Without this, the synchronous `selected-page-notify` fired by
+/// `tab_view.append(&container)` during cold-restart build grabs the
+/// leftmost leaf, whose `connect_enter` then RPCs the WRONG pane back to
+/// the daemon, corrupting the persisted `active_pane_id` before the
+/// post-build deferred `focus_when_mapped(RIGHT_DA)` ever runs.
+type TabActivePaneMap = Rc<RefCell<HashMap<uuid::Uuid, forgetty_core::PaneId>>>;
+
 /// Per-workspace GTK state -- owns the TabView and associated state for one workspace.
 struct WorkspaceView {
     /// Unique ID matching the Workspace in the session file.
@@ -127,6 +145,11 @@ struct WorkspaceView {
     color: Option<gtk4::gdk::RGBA>,
     /// CSS provider for per-row color override (reused across sidebar refreshes).
     color_css_provider: Option<gtk4::CssProvider>,
+    /// FIX-005B fix-cycle 1: per-tab saved active_pane_id, consulted by
+    /// `connect_selected_page_notify` to grab the correct leaf when the
+    /// page's tab_id has a recorded focused pane. See `TabActivePaneMap`
+    /// docstring for the full rationale.
+    tab_active_pane: TabActivePaneMap,
 }
 
 /// Shared state tracking all workspaces and which is active.
@@ -156,6 +179,19 @@ struct WorkspaceManagerInner {
     /// `WorkspacesReordered` events in the same order as the RPC calls landed
     /// (single mutex on the daemon side).
     pending_reorders: VecDeque<(usize, usize)>,
+    /// FIX-005B: pending self-originated active-pane changes awaiting the
+    /// daemon's `ActivePaneChanged` echo. Each entry is the
+    /// `(workspace_idx, tab_id, pane_id)` tuple captured at the moment of
+    /// the local focus-enter handler. The `LayoutEvent::ActivePaneChanged`
+    /// consumer pops the head on FIFO match (provenance-based self-echo
+    /// guard, same idiom as `pending_reorders`).
+    ///
+    /// MUST be a queue, NOT a content-match guard — under fast pane-switch
+    /// sequences (e.g. mouse-click flurry across 4 panes) two RPCs can land
+    /// inside the same 200ms layout drain window; a content guard mis-fires
+    /// when the second event drains while local state already shows the
+    /// post-second-RPC value (see FIX-006 INVESTIGATION.md §1–§3).
+    pending_active_pane: VecDeque<(usize, uuid::Uuid, forgetty_core::PaneId)>,
 }
 
 /// CLI-derived launch parameters for this specific invocation.
@@ -892,6 +928,7 @@ fn build_ui(
     let initial_custom_titles: CustomTitles = Rc::new(RefCell::new(HashSet::new()));
     let initial_tab_id_map: TabIdMap = Rc::new(RefCell::new(HashMap::new()));
     let initial_tab_colors: TabColorMap = Rc::new(RefCell::new(HashMap::new()));
+    let initial_tab_active_pane: TabActivePaneMap = Rc::new(RefCell::new(HashMap::new()));
 
     let workspace_manager: WorkspaceManager = Rc::new(RefCell::new(WorkspaceManagerInner {
         workspaces: vec![WorkspaceView {
@@ -905,11 +942,13 @@ fn build_ui(
             tab_colors: Rc::clone(&initial_tab_colors),
             color: None,
             color_css_provider: None,
+            tab_active_pane: Rc::clone(&initial_tab_active_pane),
         }],
         active_index: 0,
         last_tab_click: (0.0, 0.0),
         tab_menu_shown: false,
         pending_reorders: VecDeque::new(),
+        pending_active_pane: VecDeque::new(),
     }));
 
     // Convenience aliases for the active workspace's state during initial setup.
@@ -1117,17 +1156,46 @@ fn build_ui(
     {
         let focus_switch = Rc::clone(&focus_tracker);
         let tim_focus = Rc::clone(&tab_id_map);
+        let states_focus = Rc::clone(&initial_tab_states);
+        let active_pane_map = Rc::clone(&initial_tab_active_pane);
         let dc_focus = daemon_client.clone();
         initial_tab_view.connect_selected_page_notify(move |tv| {
             if let Some(page) = tv.selected_page() {
                 let container = page.child();
-                // Try to focus the pane that was last focused in this tab,
-                // otherwise just focus the first leaf.
-                let focused_name = focus_switch.borrow().clone();
                 let leaves = collect_leaf_drawing_areas(&container);
-                let target = leaves
-                    .iter()
-                    .find(|da| da.widget_name().as_str() == focused_name)
+                let page_key = page_identity_key(&page);
+                let tab_id = tim_focus.borrow().get(&page_key).copied();
+
+                // FIX-005B fix-cycle 1: prefer per-tab saved active_pane_id
+                // over the per-workspace `focus_tracker` (single-string,
+                // shared across tabs in a workspace, so it cross-
+                // contaminates between tabs with different leaf sets).
+                //
+                // Without this, the synchronous `selected-page-notify`
+                // fired by `tab_view.append(&container)` during cold
+                // restart grabs `leaves.first()` (the LEFT pane), whose
+                // `connect_enter` then RPCs the wrong pane back to the
+                // daemon, corrupting the persisted active_pane_id BEFORE
+                // the post-build deferred `focus_when_mapped(RIGHT_DA)`
+                // ever runs (Phase 4 cycle-1 root cause analysis).
+                let saved_pane_id: Option<forgetty_core::PaneId> =
+                    tab_id.and_then(|tid| active_pane_map.borrow().get(&tid).copied());
+                let target_idx_via_map: Option<usize> = saved_pane_id.and_then(|pid| {
+                    leaves.iter().position(|da| {
+                        let widget_name = da.widget_name().to_string();
+                        states_focus
+                            .try_borrow()
+                            .ok()
+                            .and_then(|m| m.get(&widget_name).cloned())
+                            .and_then(|rc| rc.try_borrow().ok().and_then(|s| s.daemon_pane_id))
+                            == Some(pid)
+                    })
+                });
+
+                let focused_name = focus_switch.borrow().clone();
+                let target = target_idx_via_map
+                    .and_then(|i| leaves.get(i))
+                    .or_else(|| leaves.iter().find(|da| da.widget_name().as_str() == focused_name))
                     .or_else(|| leaves.first());
                 if let Some(da) = target {
                     da.grab_focus();
@@ -1139,8 +1207,6 @@ fn build_ui(
                 // A mapping miss here indicates a bug — log at debug so QA
                 // can catch it without spamming production.
                 if let Some(ref dc) = dc_focus {
-                    let page_key = page_identity_key(&page);
-                    let tab_id = tim_focus.borrow().get(&page_key).copied();
                     if let Some(tid) = tab_id {
                         if let Err(e) = dc.focus_tab(tid) {
                             tracing::debug!("focus_tab RPC failed: {e}");
@@ -1352,6 +1418,7 @@ fn build_ui(
                 &win_split,
                 dc_split.clone(),
                 &wm_split,
+                &ws.tab_id_map,
             );
         });
         window.add_action(&action);
@@ -2736,6 +2803,50 @@ fn consume_reorder_self_echo(
     false
 }
 
+/// FIX-005B: provenance-based self-echo guard for `ActivePaneChanged` events.
+/// Mirrors `consume_reorder_self_echo`'s pure-function shape so it can be
+/// unit-tested without GTK widgets in scope.
+///
+/// Returns `true` if the head of `pending` matches the incoming triple and
+/// pops; `false` if the queue is empty, the head does not match, or the
+/// incoming `pane_id` is `None` (cleared focus pointers are never
+/// self-originated by `wire_focus_tracking` — only `Some(pid)` RPCs go in
+/// the queue).
+fn consume_active_pane_self_echo(
+    pending: &mut VecDeque<(usize, uuid::Uuid, forgetty_core::PaneId)>,
+    workspace_idx: usize,
+    tab_id: uuid::Uuid,
+    pane_id: Option<forgetty_core::PaneId>,
+) -> bool {
+    let Some(pid) = pane_id else { return false };
+    if let Some(&(p_ws, p_tab, p_pane)) = pending.front() {
+        if p_ws == workspace_idx && p_tab == tab_id && p_pane == pid {
+            pending.pop_front();
+            return true;
+        }
+    }
+    false
+}
+
+/// FIX-005B fix-cycle 1: pure helper that populates a per-workspace
+/// `tab_id → PaneId` map from a slice of `(tab_id, Option<active_pane_id>)`
+/// pairs. Extracted from the cold-restart build path so the population
+/// contract can be unit-tested without GTK widgets.
+///
+/// Tabs without a saved `active_pane_id` (legacy JSON, AC-4) are simply
+/// omitted from the map — `selected-page-notify` then falls back through
+/// `focus_tracker` → `leaves.first()` for that tab.
+fn populate_tab_active_pane_map<I>(map: &mut HashMap<uuid::Uuid, forgetty_core::PaneId>, tabs: I)
+where
+    I: IntoIterator<Item = (uuid::Uuid, Option<uuid::Uuid>)>,
+{
+    for (tab_id, active_pane_id) in tabs {
+        if let Some(pid) = active_pane_id {
+            map.insert(tab_id, forgetty_core::PaneId(pid));
+        }
+    }
+}
+
 /// Process a single `LayoutEvent` delivered by the `subscribe_layout` background task.
 ///
 /// This function runs on the GLib main thread (via the poll timer). All widget
@@ -3034,6 +3145,78 @@ fn handle_layout_event(
             // FIX-001/FIX-010 — re-render the row labels in place.
             refresh_sidebar_row_labels(workspace_manager, sidebar_lb);
         }
+        LayoutEvent::ActivePaneChanged { workspace_idx, tab_id, pane_id } => {
+            // FIX-005B: provenance-based self-echo guard. Local focus-enter
+            // pushed (workspace_idx, tab_id, pane_id) onto pending_active_pane
+            // BEFORE issuing the RPC; the daemon emits the same triple back
+            // here. FIFO match → pop and skip apply.
+            //
+            // External (future paired-device) ActivePaneChanged events fall
+            // through the empty-queue / mismatch branches and apply locally:
+            // grab_focus on the matching DrawingArea. If the saved pane_id is
+            // not present in the live pane_tree (orphan from a stale daemon
+            // state), warn-and-noop — fall back to first-leaf on the next
+            // re-render is acceptable.
+            let needs_apply = {
+                let Ok(mut mgr) = workspace_manager.try_borrow_mut() else { return };
+                !consume_active_pane_self_echo(
+                    &mut mgr.pending_active_pane,
+                    workspace_idx,
+                    tab_id,
+                    pane_id,
+                )
+            };
+            if !needs_apply {
+                return;
+            }
+
+            // External: locate the DrawingArea for this pane_id and call
+            // grab_focus. The widget_name → daemon_pane_id mapping lives on
+            // TerminalState; iterate the active workspace's tab_states.
+            let Some(pid) = pane_id else { return }; // None = cleared pointer.
+            let Ok(mgr) = workspace_manager.try_borrow() else { return };
+            let Some(ws) = mgr.workspaces.get(workspace_idx) else { return };
+            // FIX-005B fix-cycle 1: keep `tab_active_pane` authoritative
+            // even on externally-originated focus events (paired-device,
+            // future-Android). The selected-page-notify handler reads the
+            // map; without this update, switching to a tab whose focus
+            // was changed by another client would fall back to
+            // leaves.first().
+            if let Ok(mut m) = ws.tab_active_pane.try_borrow_mut() {
+                m.insert(tab_id, pid);
+            }
+            let n = ws.tab_view.n_pages();
+            for i in 0..n {
+                let page = ws.tab_view.nth_page(i);
+                let key_matches =
+                    ws.tab_id_map.borrow().get(&page_identity_key(&page)) == Some(&tab_id);
+                if !key_matches {
+                    continue;
+                }
+                let container = page.child();
+                let leaves = collect_leaf_drawing_areas(&container);
+                for da in &leaves {
+                    let widget_name = da.widget_name().to_string();
+                    let matches = ws
+                        .tab_states
+                        .borrow()
+                        .get(&widget_name)
+                        .and_then(|rc| rc.try_borrow().ok().and_then(|s| s.daemon_pane_id))
+                        == Some(pid);
+                    if matches {
+                        da.grab_focus();
+                        return;
+                    }
+                }
+                // Tab found but pane_id not in any leaf — orphan; warn+noop.
+                tracing::warn!(
+                    "ActivePaneChanged: pane {pid} not found in tab {tab_id}'s widget tree (orphan, skipping)"
+                );
+                return;
+            }
+            // Tab not found locally — also orphan. Debug-noop.
+            tracing::debug!("ActivePaneChanged: tab {tab_id} not found locally; ignoring");
+        }
     }
 }
 
@@ -3134,6 +3317,9 @@ fn build_auto_spawned_tab_widget(
         &tab_states,
         &custom_titles,
         window,
+        &tab_id_map,
+        workspace_manager,
+        Some(Arc::clone(dc)),
     );
 
     let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
@@ -3197,6 +3383,7 @@ fn build_widget_from_pane_tree(
     window: &adw::ApplicationWindow,
     tab_view: &adw::TabView,
     workspace_manager: &WorkspaceManager,
+    tab_id_map: &TabIdMap,
 ) -> Option<(gtk4::Widget, gtk4::DrawingArea)> {
     match node {
         PaneTreeNode::Leaf { pane_id } => {
@@ -3240,6 +3427,9 @@ fn build_widget_from_pane_tree(
                         tab_states,
                         custom_titles,
                         window,
+                        tab_id_map,
+                        workspace_manager,
+                        Some(Arc::clone(dc)),
                     );
                     Some((pane_vbox.upcast::<gtk4::Widget>(), drawing_area))
                 }
@@ -3267,6 +3457,7 @@ fn build_widget_from_pane_tree(
                 window,
                 tab_view,
                 workspace_manager,
+                tab_id_map,
             );
             let second_result = build_widget_from_pane_tree(
                 second,
@@ -3278,6 +3469,7 @@ fn build_widget_from_pane_tree(
                 window,
                 tab_view,
                 workspace_manager,
+                tab_id_map,
             );
 
             let (Some((first_widget, first_da)), Some((second_widget, _))) =
@@ -3425,6 +3617,24 @@ fn build_widgets_from_layout(
             daemon_ws0.name
         );
 
+        // FIX-005B fix-cycle 1: pre-populate ws[0]'s `tab_active_pane` from
+        // the layout snapshot BEFORE the build loop calls `tab_view.append`.
+        // Append fires `selected-page-notify` synchronously on the first
+        // page, which reads this map to grab the correct leaf instead of
+        // falling back to `leaves.first()` (which would then echo the wrong
+        // pane back to the daemon and corrupt the persisted active_pane_id).
+        {
+            if let Ok(mgr) = workspace_manager.try_borrow() {
+                let ws = &mgr.workspaces[0];
+                let mut map = ws.tab_active_pane.borrow_mut();
+                map.clear();
+                populate_tab_active_pane_map(
+                    &mut map,
+                    daemon_ws0.tabs.iter().map(|t| (t.tab_id, t.active_pane_id)),
+                );
+            }
+        }
+
         let (created, tab_view_clone) = {
             let Ok(mgr) = workspace_manager.try_borrow() else {
                 tracing::warn!("build_widgets_from_layout: failed to borrow workspace_manager");
@@ -3444,6 +3654,7 @@ fn build_widgets_from_layout(
                     window,
                     &ws.tab_view,
                     workspace_manager,
+                    &ws.tab_id_map,
                 ) else {
                     tracing::warn!("build_widget_from_pane_tree failed for tab {:?}", tab.title);
                     continue;
@@ -3454,12 +3665,26 @@ fn build_widgets_from_layout(
                 container.set_vexpand(true);
                 container.append(&root_widget);
 
+                // FIX-005B fix-cycle 2: pre-populate tab_id_map BEFORE
+                // tab_view.append. AdwTabView fires `selected-page-notify`
+                // synchronously when the first page transitions the
+                // selection from None → page. The cycle-1 handler reads
+                // `tab_id_map.get(page_key)` at that instant; with the
+                // post-append insert it sees an empty map, falls through
+                // to `leaves.first()` (LEFT), and the synchronous
+                // connect_enter then RPCs the wrong active_pane_id to the
+                // daemon (corrupting tab 1 when the user later switches
+                // to it). Pre-insert eliminates the race because
+                // `container.as_ptr() == page.child().as_ptr()` —
+                // page.child() returns the same GObject we just appended,
+                // so `page_identity_key` produces the same string.
+                let pre_insert_key =
+                    format!("page-{:p}", container.upcast_ref::<gtk4::Widget>().as_ptr());
+                ws.tab_id_map.borrow_mut().insert(pre_insert_key, tab.tab_id);
                 let page = ws.tab_view.append(&container);
-                // FIX-005A fix-cycle 1: populate tab_id_map so post-restart
-                // connect_selected_page_notify can resolve tab_id → focus_tab
-                // RPC → daemon set_active_tab → save. Without this line,
-                // restored tabs silently skip the RPC and tab switches never
-                // persist past the first cold-restart.
+                // Defensive idempotent write: same key, same value as the
+                // pre-insert above. Kept so this code stays robust if the
+                // container construction is later refactored.
                 ws.tab_id_map.borrow_mut().insert(page_identity_key(&page), tab.tab_id);
                 let tab_title = if tab.title.is_empty() { "shell" } else { &tab.title };
                 page.set_title(tab_title);
@@ -3518,12 +3743,26 @@ fn build_widgets_from_layout(
         let new_focus_tracker: FocusTracker = Rc::new(RefCell::new(String::new()));
         let new_custom_titles: CustomTitles = Rc::new(RefCell::new(HashSet::new()));
         let new_tab_id_map: TabIdMap = Rc::new(RefCell::new(HashMap::new()));
+        let new_tab_active_pane: TabActivePaneMap = Rc::new(RefCell::new(HashMap::new()));
+
+        // FIX-005B fix-cycle 1: pre-populate the per-tab active-pane map
+        // BEFORE `wire_tab_view_handlers` connects `selected-page-notify`
+        // and BEFORE the build loop's `new_tv.append` fires that signal.
+        // See ws[0] branch above for the full rationale.
+        {
+            let mut map = new_tab_active_pane.borrow_mut();
+            populate_tab_active_pane_map(
+                &mut map,
+                ws_info.tabs.iter().map(|t| (t.tab_id, t.active_pane_id)),
+            );
+        }
 
         wire_tab_view_handlers(
             &new_tv,
             &new_tab_states,
             &new_focus_tracker,
             &new_tab_id_map,
+            &new_tab_active_pane,
             window,
             Some(Arc::clone(dc)),
             workspace_manager,
@@ -3548,6 +3787,7 @@ fn build_widgets_from_layout(
                 window,
                 &new_tv,
                 workspace_manager,
+                &new_tab_id_map,
             ) else {
                 tracing::warn!(
                     "build_widget_from_pane_tree failed for tab {:?} in workspace {:?}",
@@ -3562,8 +3802,14 @@ fn build_widgets_from_layout(
             container.set_vexpand(true);
             container.append(&root_widget);
 
+            // FIX-005B fix-cycle 2: pre-populate tab_id_map BEFORE
+            // new_tv.append fires `selected-page-notify` synchronously on
+            // the first page. See ws[0] branch above for full rationale.
+            let pre_insert_key =
+                format!("page-{:p}", container.upcast_ref::<gtk4::Widget>().as_ptr());
+            new_tab_id_map.borrow_mut().insert(pre_insert_key, tab.tab_id);
             let page = new_tv.append(&container);
-            // FIX-005A fix-cycle 1: see workspace[0] branch for rationale.
+            // Defensive idempotent write — same key, same value.
             new_tab_id_map.borrow_mut().insert(page_identity_key(&page), tab.tab_id);
             let tab_title = if tab.title.is_empty() { "shell" } else { &tab.title };
             page.set_title(tab_title);
@@ -3616,6 +3862,7 @@ fn build_widgets_from_layout(
                 tab_colors: Rc::new(RefCell::new(HashMap::new())),
                 color: initial_color,
                 color_css_provider: None,
+                tab_active_pane: new_tab_active_pane,
             });
             tracing::info!(
                 "build_widgets_from_layout: added WorkspaceView {:?} at gtx_idx={}",
@@ -3642,7 +3889,33 @@ fn build_widgets_from_layout(
         if let Some(page) = ws.tab_view.selected_page() {
             let container = page.child();
             let leaves = collect_leaf_drawing_areas(&container);
-            if let Some(da) = leaves.first() {
+
+            // FIX-005B: respect the daemon's active_pane_id when restoring
+            // focus on cold start. Resolve the page's tab_id via tab_id_map
+            // (populated by build_widgets_from_layout above), then walk the
+            // layout snapshot for the matching tab's persisted active_pane_id.
+            // If the saved pane is in this tab's leaves, focus it; otherwise
+            // fall back to the first leaf (pre-FIX-005B behaviour).
+            let target_pane_id: Option<uuid::Uuid> =
+                ws.tab_id_map.borrow().get(&page_identity_key(&page)).and_then(|tab_id| {
+                    layout
+                        .workspaces
+                        .iter()
+                        .find_map(|w| w.tabs.iter().find(|t| t.tab_id == *tab_id))
+                        .and_then(|t| t.active_pane_id)
+                });
+            let target_da = target_pane_id.and_then(|pid| {
+                leaves.iter().find(|da| {
+                    let widget_name = da.widget_name().to_string();
+                    ws.tab_states
+                        .borrow()
+                        .get(&widget_name)
+                        .and_then(|rc| rc.try_borrow().ok().and_then(|s| s.daemon_pane_id))
+                        == Some(forgetty_core::PaneId(pid))
+                })
+            });
+
+            if let Some(da) = target_da.or_else(|| leaves.first()) {
                 focus_when_mapped(da);
             }
         }
@@ -3910,6 +4183,9 @@ fn add_new_tab(
                         tab_states,
                         custom_titles,
                         window,
+                        tab_id_map,
+                        workspace_manager,
+                        Some(Arc::clone(dc)),
                     );
                     let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
                     container.set_hexpand(true);
@@ -4060,6 +4336,7 @@ fn split_pane(
     window: &adw::ApplicationWindow,
     daemon_client: Option<Arc<DaemonClient>>,
     workspace_manager: &WorkspaceManager,
+    tab_id_map: &TabIdMap,
 ) {
     // Find the currently focused DrawingArea
     let focused_name = {
@@ -4161,7 +4438,17 @@ fn split_pane(
     let new_pane_id = next_pane_id();
     new_da.set_widget_name(&new_pane_id);
     tab_states.borrow_mut().insert(new_pane_id, new_state);
-    wire_focus_tracking(&new_da, focus_tracker, tab_view, tab_states, custom_titles, window);
+    wire_focus_tracking(
+        &new_da,
+        focus_tracker,
+        tab_view,
+        tab_states,
+        custom_titles,
+        window,
+        tab_id_map,
+        workspace_manager,
+        daemon_client.clone(),
+    );
 
     // Create the Paned container
     let paned = gtk4::Paned::new(orientation);
@@ -5224,6 +5511,14 @@ fn write_to_focused_pane(
 /// when this pane gains focus.
 ///
 /// Also triggers a redraw on focus change so the visual indicator updates.
+///
+/// FIX-005B: when a daemon client is present, the focus-enter handler also
+/// pushes a provenance entry onto `WorkspaceManagerInner::pending_active_pane`
+/// and issues a `set_active_pane` RPC so the daemon persists "which split
+/// was I typing in" across cold restart. The push-before-RPC order matches
+/// the FIX-006 reorder pattern — the daemon's broadcast may arrive before
+/// the RPC return path drops the borrow.
+#[allow(clippy::too_many_arguments)]
 fn wire_focus_tracking(
     drawing_area: &gtk4::DrawingArea,
     focus_tracker: &FocusTracker,
@@ -5231,6 +5526,9 @@ fn wire_focus_tracking(
     tab_states: &TabStateMap,
     custom_titles: &CustomTitles,
     window: &adw::ApplicationWindow,
+    tab_id_map: &TabIdMap,
+    workspace_manager: &WorkspaceManager,
+    daemon_client: Option<Arc<DaemonClient>>,
 ) {
     let focus_controller = gtk4::EventControllerFocus::new();
 
@@ -5242,6 +5540,9 @@ fn wire_focus_tracking(
         let states = Rc::clone(tab_states);
         let ct = Rc::clone(custom_titles);
         let win = window.clone();
+        let tid_map = Rc::clone(tab_id_map);
+        let wm = Rc::clone(workspace_manager);
+        let dc = daemon_client.clone();
         focus_controller.connect_enter(move |_controller| {
             let pane_name = da.widget_name().to_string();
             if let Ok(mut name) = tracker.try_borrow_mut() {
@@ -5259,6 +5560,63 @@ fn wire_focus_tracking(
 
             // Redraw to show the focus indicator (and clear the ring)
             da.queue_draw();
+
+            // FIX-005B: persist the focused pane id on the daemon so cold
+            // restart restores the user's last-typed pane. Path:
+            //   1. tab_states[pane_name].daemon_pane_id → PaneId
+            //   2. tv.selected_page() → page → tab_id_map[page_key] → tab_id
+            //   3. workspace_manager.borrow().active_index → workspace_idx
+            //   4. Push provenance entry, drop the borrow, then RPC.
+            //
+            // Errors are debug-logged; never fail the focus event itself.
+            if let Some(ref dc) = dc {
+                let daemon_pane_id: Option<forgetty_core::PaneId> = states
+                    .try_borrow()
+                    .ok()
+                    .and_then(|m| m.get(&pane_name).cloned())
+                    .and_then(|rc| rc.try_borrow().ok().and_then(|s| s.daemon_pane_id));
+                let tab_id: Option<uuid::Uuid> = tv.selected_page().and_then(|page| {
+                    tid_map
+                        .try_borrow()
+                        .ok()
+                        .and_then(|m| m.get(&page_identity_key(&page)).copied())
+                });
+                if let (Some(pane_id), Some(tab_id)) = (daemon_pane_id, tab_id) {
+                    let active_idx = wm.try_borrow().ok().map(|m| m.active_index);
+                    if let Some(active_idx) = active_idx {
+                        // Push the provenance entry BEFORE the RPC so the
+                        // daemon's echo (which may race the RPC return) finds
+                        // a populated queue head. Also update this
+                        // workspace's `tab_active_pane[tab_id] = pane_id`
+                        // (FIX-005B fix-cycle 1) so a later
+                        // `selected-page-notify` reads the right leaf
+                        // without hitting the focus_tracker fallback.
+                        // We snapshot the per-workspace map handle inside
+                        // the borrow, then drop the borrow before the RPC
+                        // to avoid holding it across an I/O call.
+                        let map_handle: Option<TabActivePaneMap> = {
+                            if let Ok(mut mgr) = wm.try_borrow_mut() {
+                                mgr.pending_active_pane.push_back((active_idx, tab_id, pane_id));
+                                mgr.workspaces
+                                    .get(active_idx)
+                                    .map(|ws| Rc::clone(&ws.tab_active_pane))
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some(map) = map_handle {
+                            if let Ok(mut m) = map.try_borrow_mut() {
+                                m.insert(tab_id, pane_id);
+                            }
+                        }
+                        if let Err(e) = dc.set_active_pane(active_idx, tab_id, Some(pane_id)) {
+                            tracing::debug!(
+                                "set_active_pane RPC failed (ws={active_idx} tab={tab_id} pane={pane_id}): {e}"
+                            );
+                        }
+                    }
+                }
+            }
 
             // Clear tab badge if ALL panes in the tab have notification_ring == false.
             // (AC-14 / AC-15: only clear badge if the specific ringed pane is focused)
@@ -7771,11 +8129,13 @@ fn refocus_active_pane(workspace_manager: &WorkspaceManager, window: &adw::Appli
 /// SHOULD close the window — terminal exit semantics) from "the last tab of a
 /// non-last workspace" (which should leave the window open and let FIX-009's
 /// daemon-side auto-spawn refill the workspace).
+#[allow(clippy::too_many_arguments)]
 fn wire_tab_view_handlers(
     tab_view: &adw::TabView,
     tab_states: &TabStateMap,
     focus_tracker: &FocusTracker,
     tab_id_map: &TabIdMap,
+    tab_active_pane: &TabActivePaneMap,
     window: &adw::ApplicationWindow,
     daemon_client: Option<Arc<DaemonClient>>,
     workspace_manager: &WorkspaceManager,
@@ -7820,15 +8180,43 @@ fn wire_tab_view_handlers(
     {
         let focus_switch = Rc::clone(focus_tracker);
         let tim_focus = Rc::clone(tab_id_map);
+        let states_focus = Rc::clone(tab_states);
+        let active_pane_map = Rc::clone(tab_active_pane);
         let dc_focus = daemon_client;
         tab_view.connect_selected_page_notify(move |tv| {
             if let Some(page) = tv.selected_page() {
                 let container = page.child();
-                let focused_name = focus_switch.borrow().clone();
                 let leaves = collect_leaf_drawing_areas(&container);
-                let target = leaves
-                    .iter()
-                    .find(|da| da.widget_name().as_str() == focused_name)
+                let page_key = page_identity_key(&page);
+                let tab_id = tim_focus.borrow().get(&page_key).copied();
+
+                // FIX-005B fix-cycle 1: prefer per-tab saved
+                // active_pane_id over the per-workspace single-string
+                // focus_tracker (which holds the LAST focused widget name
+                // across the whole workspace and so cross-contaminates
+                // when switching between tabs that have different leaves).
+                //
+                // Lookup `tab_active_pane[tab_id]` → daemon PaneId, then
+                // find the leaf whose `TerminalState.daemon_pane_id`
+                // matches. Fall through to focus_tracker, then leaves.first().
+                let saved_pane_id: Option<forgetty_core::PaneId> =
+                    tab_id.and_then(|tid| active_pane_map.borrow().get(&tid).copied());
+                let target_idx_via_map: Option<usize> = saved_pane_id.and_then(|pid| {
+                    leaves.iter().position(|da| {
+                        let widget_name = da.widget_name().to_string();
+                        states_focus
+                            .try_borrow()
+                            .ok()
+                            .and_then(|m| m.get(&widget_name).cloned())
+                            .and_then(|rc| rc.try_borrow().ok().and_then(|s| s.daemon_pane_id))
+                            == Some(pid)
+                    })
+                });
+
+                let focused_name = focus_switch.borrow().clone();
+                let target = target_idx_via_map
+                    .and_then(|i| leaves.get(i))
+                    .or_else(|| leaves.iter().find(|da| da.widget_name().as_str() == focused_name))
                     .or_else(|| leaves.first());
                 if let Some(da) = target {
                     da.grab_focus();
@@ -7836,8 +8224,6 @@ fn wire_tab_view_handlers(
                 // Persist active-tab on the daemon. See initial_tab_view's
                 // notify handler for the full rationale (FIX-005A fix-cycle 1).
                 if let Some(ref dc) = dc_focus {
-                    let page_key = page_identity_key(&page);
-                    let tab_id = tim_focus.borrow().get(&page_key).copied();
                     if let Some(tid) = tab_id {
                         if let Err(e) = dc.focus_tab(tid) {
                             tracing::debug!("focus_tab RPC failed: {e}");
@@ -8169,12 +8555,14 @@ fn create_and_switch_to_new_workspace(
     let new_custom_titles: CustomTitles = Rc::new(RefCell::new(HashSet::new()));
     let new_tab_id_map: TabIdMap = Rc::new(RefCell::new(HashMap::new()));
     let new_tab_colors: TabColorMap = Rc::new(RefCell::new(HashMap::new()));
+    let new_tab_active_pane: TabActivePaneMap = Rc::new(RefCell::new(HashMap::new()));
 
     wire_tab_view_handlers(
         &new_tv,
         &new_tab_states,
         &new_focus_tracker,
         &new_tab_id_map,
+        &new_tab_active_pane,
         window,
         daemon_client.clone(),
         workspace_manager,
@@ -8240,6 +8628,9 @@ fn create_and_switch_to_new_workspace(
                             &new_tab_states,
                             &new_custom_titles,
                             window,
+                            &new_tab_id_map,
+                            workspace_manager,
+                            Some(Arc::clone(dc)),
                         );
                         let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
                         container.set_hexpand(true);
@@ -8318,6 +8709,7 @@ fn create_and_switch_to_new_workspace(
             tab_colors: new_tab_colors,
             color: None,
             color_css_provider: None,
+            tab_active_pane: new_tab_active_pane,
         });
 
         let idx = mgr.workspaces.len() - 1;
@@ -9631,12 +10023,14 @@ fn duplicate_workspace(
     let new_custom_titles: CustomTitles = Rc::new(RefCell::new(HashSet::new()));
     let new_tab_id_map: TabIdMap = Rc::new(RefCell::new(HashMap::new()));
     let new_tab_colors: TabColorMap = Rc::new(RefCell::new(HashMap::new()));
+    let new_tab_active_pane: TabActivePaneMap = Rc::new(RefCell::new(HashMap::new()));
 
     wire_tab_view_handlers(
         &new_tv,
         &new_tab_states,
         &new_focus_tracker,
         &new_tab_id_map,
+        &new_tab_active_pane,
         window,
         Some(Arc::clone(&dc)),
         wm,
@@ -9696,6 +10090,9 @@ fn duplicate_workspace(
                     &new_tab_states,
                     &new_custom_titles,
                     window,
+                    &new_tab_id_map,
+                    wm,
+                    Some(Arc::clone(&dc)),
                 );
                 let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
                 container.set_hexpand(true);
@@ -9756,6 +10153,7 @@ fn duplicate_workspace(
         tab_colors: new_tab_colors,
         color: None,
         color_css_provider: None,
+        tab_active_pane: new_tab_active_pane,
     };
 
     // Insert the new workspace and switch to it.
@@ -9870,12 +10268,14 @@ fn duplicate_workspace_temp_fallback(
     let new_custom_titles: CustomTitles = Rc::new(RefCell::new(HashSet::new()));
     let new_tab_id_map: TabIdMap = Rc::new(RefCell::new(HashMap::new()));
     let new_tab_colors: TabColorMap = Rc::new(RefCell::new(HashMap::new()));
+    let new_tab_active_pane: TabActivePaneMap = Rc::new(RefCell::new(HashMap::new()));
 
     wire_tab_view_handlers(
         &new_tv,
         &new_tab_states,
         &new_focus_tracker,
         &new_tab_id_map,
+        &new_tab_active_pane,
         window,
         None,
         wm,
@@ -9922,6 +10322,7 @@ fn duplicate_workspace_temp_fallback(
         tab_colors: new_tab_colors,
         color: None,
         color_css_provider: None,
+        tab_active_pane: new_tab_active_pane,
     };
 
     // Insert the new workspace and switch to it.
@@ -10314,16 +10715,21 @@ fn do_delete_workspace_at_index(
 
 #[cfg(test)]
 mod tests {
-    //! FIX-006 Cycle 1 unit tests for the workspace-reorder self-echo guard.
+    //! FIX-006 Cycle 1 + FIX-005B unit tests for the self-echo guards.
     //!
-    //! These tests cover `consume_reorder_self_echo` — the pure helper that
-    //! replaced the original content-based guard at the
-    //! `LayoutEvent::WorkspacesReordered` consumer site. Direct unit testing
-    //! of `handle_layout_event` is not feasible (GTK widgets in signature),
-    //! but the queue-check logic was extracted into a free function precisely
-    //! so it can be exercised without a GTK context.
-    use super::consume_reorder_self_echo;
-    use std::collections::VecDeque;
+    //! These tests cover `consume_reorder_self_echo` and
+    //! `consume_active_pane_self_echo` — pure helpers that absorb the
+    //! daemon's broadcast echo when GTK was the originator of a layout
+    //! mutation. Direct unit testing of `handle_layout_event` is not
+    //! feasible (GTK widgets in signature), but the queue-check logic was
+    //! extracted into a free function precisely so it can be exercised
+    //! without a GTK context.
+    use super::{
+        consume_active_pane_self_echo, consume_reorder_self_echo, populate_tab_active_pane_map,
+    };
+    use forgetty_core::PaneId;
+    use std::collections::{HashMap, VecDeque};
+    use uuid::Uuid;
 
     /// Two consecutive local swaps push two `(from, to)` tuples; injecting
     /// the corresponding daemon echoes back-to-back must dedupe both via
@@ -10398,5 +10804,167 @@ mod tests {
         );
         assert_eq!(pending.len(), 1, "queue head preserved on mismatch");
         assert_eq!(pending.front(), Some(&(2, 1)), "exact head entry preserved");
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX-005B unit tests for `consume_active_pane_self_echo`
+    // -----------------------------------------------------------------------
+
+    /// Two consecutive local focus-enters push two `(ws_idx, tab_id, pane_id)`
+    /// triples; the daemon echoes them back in the same order. Both must
+    /// dedupe via FIFO match and leave the queue empty.
+    #[test]
+    fn test_active_pane_consumer_queue_dedup() {
+        let mut pending: VecDeque<(usize, Uuid, PaneId)> = VecDeque::new();
+        let tab1 = Uuid::new_v4();
+        let pane_a = PaneId::new();
+        let pane_b = PaneId::new();
+        pending.push_back((0, tab1, pane_a));
+        pending.push_back((0, tab1, pane_b));
+
+        assert!(
+            consume_active_pane_self_echo(&mut pending, 0, tab1, Some(pane_a)),
+            "first echo should match queue head and pop"
+        );
+        assert_eq!(pending.len(), 1, "head popped, one entry remains");
+
+        assert!(
+            consume_active_pane_self_echo(&mut pending, 0, tab1, Some(pane_b)),
+            "second echo should match new head and pop"
+        );
+        assert!(pending.is_empty(), "queue should be drained after both echoes");
+    }
+
+    /// Empty queue + an incoming pane-changed event → external (not a
+    /// self-echo). The caller must apply (paired-device focus arriving here).
+    #[test]
+    fn test_active_pane_consumer_external_applies() {
+        let mut pending: VecDeque<(usize, Uuid, PaneId)> = VecDeque::new();
+        let tab1 = Uuid::new_v4();
+        let pane_a = PaneId::new();
+        assert!(
+            !consume_active_pane_self_echo(&mut pending, 0, tab1, Some(pane_a)),
+            "empty queue means external — must apply"
+        );
+        assert!(pending.is_empty(), "queue still empty after non-match");
+    }
+
+    /// Non-empty queue but the event does not match the head → caller must
+    /// still apply, and the queue must NOT be popped.
+    #[test]
+    fn test_active_pane_consumer_queue_mismatch() {
+        let mut pending: VecDeque<(usize, Uuid, PaneId)> = VecDeque::new();
+        let tab1 = Uuid::new_v4();
+        let tab2 = Uuid::new_v4();
+        let pane_a = PaneId::new();
+        let pane_b = PaneId::new();
+        pending.push_back((0, tab1, pane_a));
+
+        assert!(
+            !consume_active_pane_self_echo(&mut pending, 0, tab2, Some(pane_b)),
+            "mismatched (tab, pane) must not be treated as self-echo"
+        );
+        assert_eq!(pending.len(), 1, "queue head preserved on mismatch");
+        assert_eq!(pending.front(), Some(&(0, tab1, pane_a)), "exact head entry preserved");
+    }
+
+    /// `None` pane_id incoming with a non-empty queue → external apply (do
+    /// not pop). Local clears are not generated by `wire_focus_tracking`,
+    /// only daemon-initiated clears (e.g., on tab close), so a `None` is
+    /// always external.
+    #[test]
+    fn test_active_pane_consumer_none_is_external() {
+        let mut pending: VecDeque<(usize, Uuid, PaneId)> = VecDeque::new();
+        let tab1 = Uuid::new_v4();
+        let pane_a = PaneId::new();
+        pending.push_back((0, tab1, pane_a));
+
+        assert!(
+            !consume_active_pane_self_echo(&mut pending, 0, tab1, None),
+            "None pane_id must be treated as external — do not pop"
+        );
+        assert_eq!(pending.len(), 1, "queue preserved on None incoming");
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX-005B fix-cycle 1 unit tests for `populate_tab_active_pane_map`
+    //
+    // These tests cover the cold-restart population path: the `selected-
+    // page-notify` handler reads the map populated here, so the contract
+    // tested is "tabs with a saved active_pane_id end up in the map; tabs
+    // without one are absent". The handler then falls back through
+    // focus_tracker → leaves.first() for absent tabs.
+    // -----------------------------------------------------------------------
+
+    /// Cold-restart population: a workspace with three tabs where two have
+    /// saved focus and one is legacy (None) populates only the two.
+    #[test]
+    fn test_populate_tab_active_pane_skips_none_entries() {
+        let tab1 = Uuid::new_v4();
+        let tab2 = Uuid::new_v4();
+        let tab3 = Uuid::new_v4();
+        let pane1 = Uuid::new_v4();
+        let pane2 = Uuid::new_v4();
+
+        let mut map: HashMap<Uuid, PaneId> = HashMap::new();
+        populate_tab_active_pane_map(
+            &mut map,
+            vec![(tab1, Some(pane1)), (tab2, None), (tab3, Some(pane2))],
+        );
+
+        assert_eq!(map.len(), 2, "tabs with None active_pane_id must be absent");
+        assert_eq!(map.get(&tab1), Some(&PaneId(pane1)));
+        assert_eq!(map.get(&tab3), Some(&PaneId(pane2)));
+        assert!(!map.contains_key(&tab2), "legacy tab must not be in the map");
+    }
+
+    /// `connect_enter` updates the map: simulate the live-path mutation of
+    /// `ws.tab_active_pane.insert(tab_id, pane_id)` so a subsequent
+    /// `selected-page-notify` reads the latest value.
+    #[test]
+    fn test_tab_active_pane_live_update_overrides() {
+        let tab1 = Uuid::new_v4();
+        let pane_a = PaneId::new();
+        let pane_b = PaneId::new();
+
+        let mut map: HashMap<Uuid, PaneId> = HashMap::new();
+        // Cold restart populates pane_a.
+        populate_tab_active_pane_map(&mut map, vec![(tab1, Some(pane_a.0))]);
+        assert_eq!(map.get(&tab1), Some(&pane_a));
+
+        // Live `connect_enter` for pane_b — exercises the same insert path
+        // used inside `wire_focus_tracking`'s focus-enter closure.
+        map.insert(tab1, pane_b);
+        assert_eq!(map.get(&tab1), Some(&pane_b), "live update must override cold-restart value");
+    }
+
+    /// `ActivePaneChanged` echo updates the map: external (paired-device)
+    /// pane changes also write to the map so subsequent tab switches read
+    /// the freshest value.
+    #[test]
+    fn test_tab_active_pane_external_event_updates_map() {
+        let tab1 = Uuid::new_v4();
+        let pane_a = PaneId::new();
+        let pane_b = PaneId::new();
+
+        let mut map: HashMap<Uuid, PaneId> = HashMap::new();
+        map.insert(tab1, pane_a);
+
+        // Simulate `LayoutEvent::ActivePaneChanged { pane_id: Some(pane_b), .. }`
+        // arriving from another client (not a self-echo).
+        map.insert(tab1, pane_b);
+
+        assert_eq!(map.get(&tab1), Some(&pane_b), "external event must update the map");
+    }
+
+    /// Empty layout (no workspaces saved any active_pane_id) yields an
+    /// empty map — handler falls through to leaves.first() for every tab,
+    /// matching pre-FIX-005B behaviour (AC-4).
+    #[test]
+    fn test_populate_tab_active_pane_empty_layout() {
+        let mut map: HashMap<Uuid, PaneId> = HashMap::new();
+        let no_tabs: Vec<(Uuid, Option<Uuid>)> = vec![];
+        populate_tab_active_pane_map(&mut map, no_tabs);
+        assert!(map.is_empty(), "empty input yields empty map");
     }
 }

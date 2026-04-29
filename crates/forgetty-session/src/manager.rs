@@ -158,6 +158,7 @@ impl SessionManager {
                 id: Uuid::new_v4(),
                 title: String::new(),
                 pane_tree: PaneTreeLayout::Leaf { pane_id: id },
+                active_pane_id: None,
             };
             if let Some(ws) = inner.layout.workspaces.first_mut() {
                 ws.tabs.push(tab);
@@ -653,6 +654,7 @@ impl SessionManager {
                     id: tab_id,
                     title: String::new(),
                     pane_tree: PaneTreeLayout::Leaf { pane_id },
+                    active_pane_id: None,
                 });
                 dup_tabs.push(DuplicatedTab { tab_id, pane_id });
             }
@@ -769,6 +771,7 @@ impl SessionManager {
             id: tab_id,
             title: String::new(),
             pane_tree: PaneTreeLayout::Leaf { pane_id },
+            active_pane_id: None,
         };
         inner.layout.workspaces[workspace_idx].tabs.push(tab);
 
@@ -1082,6 +1085,7 @@ impl SessionManager {
             id: tab_id,
             title: String::new(),
             pane_tree: PaneTreeLayout::Leaf { pane_id },
+            active_pane_id: None,
         };
         inner.layout.workspaces[workspace_idx].tabs.push(tab);
 
@@ -1205,6 +1209,69 @@ impl SessionManager {
         inner.layout.active_workspace = workspace_idx;
         let _ = inner.event_tx.send(SessionEvent::ActiveWorkspaceChanged { workspace_idx });
         debug!(workspace_idx, "set_active_workspace: active workspace updated");
+        Ok(())
+    }
+
+    /// Set the active pane id for a tab within a workspace (FIX-005B).
+    ///
+    /// Returns `Err` if the workspace_idx is out of bounds, the tab_id is
+    /// not in the workspace, or `pane_id` is `Some(pid)` but `pid` is NOT
+    /// a leaf currently in the tab's pane_tree. `None` is always valid and
+    /// resets the focus pointer to "first leaf" (cold-restart fallback).
+    ///
+    /// Idempotent: setting the field to its current value is a no-op AND
+    /// does NOT emit `ActivePaneChanged` (mirror `set_active_workspace`'s
+    /// idempotence above). This matters because GTK's cold-restart
+    /// `focus_when_mapped(da)` triggers `connect_enter`, which now sends
+    /// `set_active_pane` with the value the daemon just restored —
+    /// without idempotence each cold restart fires N spurious save events
+    /// (one per workspace's active pane).
+    pub fn set_active_pane(
+        &self,
+        workspace_idx: usize,
+        tab_id: Uuid,
+        pane_id: Option<PaneId>,
+    ) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+
+        if workspace_idx >= inner.layout.workspaces.len() {
+            return Err(forgetty_core::ForgettyError::Pty(format!(
+                "set_active_pane: workspace index {workspace_idx} out of bounds (len={})",
+                inner.layout.workspaces.len()
+            )));
+        }
+        let ws = &mut inner.layout.workspaces[workspace_idx];
+
+        let tab = match ws.tabs.iter_mut().find(|t| t.id == tab_id) {
+            Some(t) => t,
+            None => {
+                return Err(forgetty_core::ForgettyError::Pty(format!(
+                    "set_active_pane: tab {tab_id} not found in workspace {workspace_idx}"
+                )));
+            }
+        };
+
+        // Validate pane_id is a leaf in this tab's pane_tree. `None` is
+        // always valid (clears the focus pointer).
+        if let Some(pid) = pane_id {
+            if !pane_tree_contains_leaf(&tab.pane_tree, pid) {
+                return Err(forgetty_core::ForgettyError::Pty(format!(
+                    "set_active_pane: pane {pid} is not a leaf in tab {tab_id}'s pane_tree"
+                )));
+            }
+        }
+
+        // Idempotence — match `set_active_workspace`'s no-op-no-event semantics.
+        // Load-bearing: cold-restart focus-grab fires `connect_enter`, which
+        // sends this RPC with the same value the daemon just restored.
+        if tab.active_pane_id == pane_id {
+            return Ok(());
+        }
+
+        tab.active_pane_id = pane_id;
+        let _ =
+            inner.event_tx.send(SessionEvent::ActivePaneChanged { workspace_idx, tab_id, pane_id });
+        debug!(workspace_idx, %tab_id, ?pane_id, "set_active_pane: active pane updated");
         Ok(())
     }
 
@@ -1615,6 +1682,11 @@ impl SessionManager {
                         title: session_tab.title.clone(),
                         pane_id: None,
                         pane_tree: convert_pane_tree_layout(&session_tab.pane_tree, &inner.panes),
+                        // FIX-005B: thread the daemon-owned active_pane_id
+                        // into the persisted JSON so cold restart restores
+                        // the user's last-typed pane. `PaneId(Uuid)` → `Uuid`
+                        // for the wire/disk shape.
+                        active_pane_id: session_tab.active_pane_id.map(|p| p.0),
                     })
                     .collect();
 
@@ -1770,6 +1842,21 @@ fn leftmost_leaf_id(tree: &PaneTreeLayout) -> Option<PaneId> {
     match tree {
         PaneTreeLayout::Leaf { pane_id } => Some(*pane_id),
         PaneTreeLayout::Split { first, .. } => leftmost_leaf_id(first),
+    }
+}
+
+/// FIX-005B: walk a `PaneTreeLayout` and return `true` iff `target` appears
+/// as a `Leaf`'s `pane_id`. Used by `set_active_pane` to validate that the
+/// supplied pane id is actually present (and a leaf, not the implicit root
+/// of an inner Split node) in the tab's pane_tree.
+///
+/// Bounded by tree size (max ~100 leaves per tab in practice).
+fn pane_tree_contains_leaf(tree: &PaneTreeLayout, target: PaneId) -> bool {
+    match tree {
+        PaneTreeLayout::Leaf { pane_id } => *pane_id == target,
+        PaneTreeLayout::Split { first, second, .. } => {
+            pane_tree_contains_leaf(first, target) || pane_tree_contains_leaf(second, target)
+        }
     }
 }
 
@@ -3557,5 +3644,149 @@ mod tests {
                 Ok(Err(_)) | Err(_) => {}
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX-005B unit tests — set_active_pane + pane_tree_contains_leaf
+    // -----------------------------------------------------------------------
+
+    /// FIX-005B: `pane_tree_contains_leaf` returns `true` iff the target
+    /// PaneId appears as a `Leaf` somewhere in the tree.
+    #[test]
+    fn test_pane_tree_contains_leaf() {
+        let a = PaneId::new();
+        let b = PaneId::new();
+        let c = PaneId::new();
+        let unknown = PaneId::new();
+
+        let leaf = PaneTreeLayout::Leaf { pane_id: a };
+        assert!(pane_tree_contains_leaf(&leaf, a));
+        assert!(!pane_tree_contains_leaf(&leaf, unknown));
+
+        let split = PaneTreeLayout::Split {
+            direction: "horizontal".into(),
+            ratio: 0.5,
+            first: Box::new(PaneTreeLayout::Leaf { pane_id: a }),
+            second: Box::new(PaneTreeLayout::Split {
+                direction: "vertical".into(),
+                ratio: 0.5,
+                first: Box::new(PaneTreeLayout::Leaf { pane_id: b }),
+                second: Box::new(PaneTreeLayout::Leaf { pane_id: c }),
+            }),
+        };
+        assert!(pane_tree_contains_leaf(&split, a));
+        assert!(pane_tree_contains_leaf(&split, b));
+        assert!(pane_tree_contains_leaf(&split, c));
+        assert!(!pane_tree_contains_leaf(&split, unknown));
+    }
+
+    /// FIX-005B: `set_active_pane` updates the field, emits an event on a
+    /// real change, and is idempotent (no event on equal value). The
+    /// idempotence is load-bearing: GTK's cold-restart focus-grab fires
+    /// `connect_enter` which sends this RPC with the value the daemon
+    /// already restored — without no-op-no-event semantics, every cold
+    /// restart fires N spurious save events.
+    #[tokio::test]
+    async fn test_set_active_pane_updates_and_is_idempotent() {
+        let session = SessionManager::new();
+        let size = test_size();
+
+        let (pane1, tab_id) = session.create_tab(0, None, size, None).expect("create_tab");
+        let pane2 = session.split_pane(pane1, "horizontal", size, None).expect("split_pane");
+
+        // Drain pre-existing events.
+        let mut rx = session.subscribe_output();
+
+        // First set: None → Some(pane2) emits.
+        session.set_active_pane(0, tab_id, Some(pane2)).expect("set_active_pane");
+        let layout = session.layout();
+        assert_eq!(
+            layout.workspaces[0].tabs[0].active_pane_id,
+            Some(pane2),
+            "active_pane_id must reflect the set"
+        );
+
+        // Pull the event from the broadcast.
+        let evt = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("event recv timeout")
+            .expect("event recv error");
+        assert!(
+            matches!(
+                evt,
+                SessionEvent::ActivePaneChanged {
+                    workspace_idx: 0,
+                    tab_id: t,
+                    pane_id: Some(p),
+                } if t == tab_id && p == pane2
+            ),
+            "expected ActivePaneChanged(ws=0, tab=tab_id, pane=Some(pane2)), got {evt:?}"
+        );
+
+        // Idempotence: setting the same value emits NO event.
+        session.set_active_pane(0, tab_id, Some(pane2)).expect("idempotent");
+        let next = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await;
+        assert!(next.is_err(), "idempotent set must NOT emit ActivePaneChanged (got {next:?})");
+
+        // A real change still fires.
+        session.set_active_pane(0, tab_id, Some(pane1)).expect("set back to pane1");
+        let evt = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("event recv timeout")
+            .expect("event recv error");
+        assert!(matches!(
+            evt,
+            SessionEvent::ActivePaneChanged { pane_id: Some(p), .. } if p == pane1
+        ));
+
+        // Setting to None also fires (different value).
+        session.set_active_pane(0, tab_id, None).expect("clear");
+        let evt = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("event recv timeout")
+            .expect("event recv error");
+        assert!(matches!(evt, SessionEvent::ActivePaneChanged { pane_id: None, .. }));
+
+        // Cleanup.
+        session.close_pane(pane1).ok();
+        session.close_pane(pane2).ok();
+    }
+
+    /// FIX-005B: bounds and validation errors are reported with no mutation.
+    #[tokio::test]
+    async fn test_set_active_pane_bounds_and_validation() {
+        let session = SessionManager::new();
+        let size = test_size();
+
+        let (pane1, tab_id) = session.create_tab(0, None, size, None).expect("create_tab");
+        let foreign = PaneId::new();
+
+        // Out-of-bounds workspace_idx.
+        assert!(
+            session.set_active_pane(99, tab_id, Some(pane1)).is_err(),
+            "workspace_idx out of bounds must error"
+        );
+
+        // Unknown tab_id.
+        let unknown_tab = uuid::Uuid::new_v4();
+        assert!(
+            session.set_active_pane(0, unknown_tab, Some(pane1)).is_err(),
+            "unknown tab_id must error"
+        );
+
+        // Pane id not a leaf in this tab's pane_tree.
+        assert!(
+            session.set_active_pane(0, tab_id, Some(foreign)).is_err(),
+            "pane id outside pane_tree must error"
+        );
+
+        // None always valid.
+        session.set_active_pane(0, tab_id, None).expect("None always valid");
+
+        // Layout untouched by the failing calls (still None after the
+        // explicit None set above).
+        assert_eq!(session.layout().workspaces[0].tabs[0].active_pane_id, None);
+
+        session.close_pane(pane1).ok();
     }
 }
