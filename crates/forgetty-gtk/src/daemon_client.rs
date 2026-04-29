@@ -47,6 +47,10 @@ pub struct TabInfo {
     pub tab_id: uuid::Uuid,
     pub title: String,
     pub pane_tree: PaneTreeNode,
+    /// FIX-005B: daemon-persisted focused pane id (the leaf the user was
+    /// last typing in). `None` on pre-FIX-005B JSON files or when no focus
+    /// pointer has been set (cold-restart fallback to first leaf).
+    pub active_pane_id: Option<uuid::Uuid>,
 }
 
 /// One workspace in the layout (from `get_layout`).
@@ -554,6 +558,30 @@ impl DaemonClient {
         Ok(())
     }
 
+    /// FIX-005B: persist the focused pane id of a tab on the daemon.
+    ///
+    /// `pane_id: None` clears the focus pointer (used on tab close or split
+    /// collapse where the saved pane no longer exists). Idempotent on the
+    /// daemon — same value as the current `SessionTab.active_pane_id` is a
+    /// no-op-no-event (load-bearing for GTK's cold-restart focus-grab
+    /// firing `connect_enter` with the value the daemon just restored).
+    pub fn set_active_pane(
+        &self,
+        workspace_idx: usize,
+        tab_id: uuid::Uuid,
+        pane_id: Option<PaneId>,
+    ) -> Result<(), DaemonError> {
+        self.rpc(
+            "set_active_pane",
+            serde_json::json!({
+                "workspace_idx": workspace_idx,
+                "tab_id": tab_id.to_string(),
+                "pane_id": pane_id.map(|p| p.to_string()),
+            }),
+        )?;
+        Ok(())
+    }
+
     /// Move a tab to a new position in its workspace.
     pub fn move_tab(&self, tab_id: uuid::Uuid, new_index: usize) -> Result<(), DaemonError> {
         self.rpc(
@@ -610,7 +638,15 @@ impl DaemonClient {
                     .get("pane_tree")
                     .ok_or_else(|| DaemonError("get_layout: tab missing pane_tree".into()))?;
                 let pane_tree = parse_pane_tree(pane_tree_val)?;
-                tabs.push(TabInfo { tab_id, title, pane_tree });
+                // FIX-005B: parse the daemon-persisted active_pane_id. Absent /
+                // null → None. Invalid UUID → log + None (forward-compat with
+                // hand-edited or stale JSON; daemon is source of truth on next
+                // focus event).
+                let active_pane_id = tab
+                    .get("active_pane_id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| uuid::Uuid::parse_str(s).ok());
+                tabs.push(TabInfo { tab_id, title, pane_tree, active_pane_id });
             }
 
             workspaces.push(WorkspaceInfo { id, name, active_tab, tabs, color });
@@ -923,6 +959,17 @@ pub enum LayoutEvent {
         from_workspace_id: uuid::Uuid,
         to_workspace_id: uuid::Uuid,
     },
+
+    /// FIX-005B: a tab's focused pane changed.
+    ///
+    /// For self-originated changes (local `connect_enter` pushed onto
+    /// `pending_active_pane` and called `dc.set_active_pane`), the
+    /// `consume_active_pane_self_echo` guard at the consumer site pops the
+    /// queue head on FIFO match and skips the apply. External paired-device
+    /// changes fall through and call `grab_focus` on the matching DrawingArea.
+    /// `pane_id: None` means the daemon cleared the focus pointer (treated
+    /// as external — GTK simply lets the next focus event fire).
+    ActivePaneChanged { workspace_idx: usize, tab_id: uuid::Uuid, pane_id: Option<PaneId> },
 }
 
 // ---------------------------------------------------------------------------
@@ -1277,6 +1324,29 @@ async fn subscribe_layout_task(
                     from_workspace_id,
                     to_workspace_id,
                 }
+            }
+            "active_pane_changed" => {
+                // FIX-005B: daemon-originated active-pane-changed notification.
+                let workspace_idx =
+                    params.get("workspace_idx").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let tab_id_str = params.get("tab_id").and_then(|v| v.as_str()).unwrap_or("");
+                let tab_id = match uuid::Uuid::parse_str(tab_id_str) {
+                    Ok(u) => u,
+                    Err(_) => continue,
+                };
+                // pane_id is Option<String>: a JSON null (cleared focus) or
+                // missing field deserialises to None; an invalid UUID is
+                // skipped (log + continue) — same defensive pattern as the
+                // sibling tab_id branch.
+                let pane_id = match params.get("pane_id") {
+                    None | Some(serde_json::Value::Null) => None,
+                    Some(serde_json::Value::String(s)) => match uuid::Uuid::parse_str(s) {
+                        Ok(u) => Some(PaneId(u)),
+                        Err(_) => continue,
+                    },
+                    Some(_) => continue,
+                };
+                LayoutEvent::ActivePaneChanged { workspace_idx, tab_id, pane_id }
             }
             _ => {
                 // Unknown layout notification — ignore silently.

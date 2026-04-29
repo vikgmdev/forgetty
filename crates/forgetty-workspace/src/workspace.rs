@@ -65,6 +65,12 @@ pub struct TabState {
     /// or for session files written before this field was added.
     #[serde(default)]
     pub pane_id: Option<uuid::Uuid>,
+    /// FIX-005B: the pane id of the focused leaf within this tab's pane tree.
+    /// Pre-FIX-005B session JSON files omit this field — serde defaults to
+    /// `None`. GTK falls back to the leftmost leaf when `None` (the pre-
+    /// FIX-005B default behaviour).
+    #[serde(default)]
+    pub active_pane_id: Option<uuid::Uuid>,
 }
 
 /// Recursive tree describing the pane layout inside a tab.
@@ -123,6 +129,7 @@ impl Workspace {
                 title: String::from("Shell"),
                 pane_tree: PaneTreeState::Leaf { cwd: root, pane_id: None },
                 pane_id: None,
+                active_pane_id: None,
             }],
             active_tab: 0,
             color: None,
