@@ -87,3 +87,47 @@ pub fn list_trashed_sessions_with_info() -> Vec<persistence::TrashedSessionInfo>
 pub fn purge_old_trash(max_days: u32) {
     persistence::purge_old_trash(max_days)
 }
+
+// ---------------------------------------------------------------------------
+// P-018 / AD-016: three-bucket lifecycle (active/, sessions/, trash/)
+// ---------------------------------------------------------------------------
+
+/// Persist `state` to `sessions/active/{session_id}.json`.
+pub fn move_to_active(session_id: uuid::Uuid, state: &WorkspaceState) -> std::io::Result<()> {
+    persistence::move_to_active(session_id, state)
+}
+
+/// Move the live (active) session file to `sessions/{uuid}.json` (pinned close).
+pub fn move_active_to_sessions(session_id: uuid::Uuid) -> std::io::Result<()> {
+    persistence::move_active_to_sessions(session_id)
+}
+
+/// Move the live (active) session file to `sessions/trash/{uuid}.json` (unpinned close).
+pub fn move_active_to_trash(session_id: uuid::Uuid) -> std::io::Result<()> {
+    persistence::move_active_to_trash(session_id)
+}
+
+/// Delete the live (active) session file (orphan cleanup for unpinned crashes).
+pub fn delete_active_for(session_id: uuid::Uuid) -> std::io::Result<()> {
+    persistence::delete_active_for(session_id)
+}
+
+/// Restore a trashed session back into the active bucket (Undo Close).
+pub fn restore_from_trash_to_active(session_id: uuid::Uuid) -> std::io::Result<()> {
+    persistence::restore_from_trash_to_active(session_id)
+}
+
+/// Scan `active/` for crash orphans. Returns `(uuid, is_pinned)` pairs.
+pub fn recover_orphans_in_active() -> Vec<(uuid::Uuid, bool)> {
+    persistence::recover_orphans_in_active()
+}
+
+/// Run the one-shot P-018 migration to the three-bucket layout.
+pub fn run_migration_p018() -> std::io::Result<()> {
+    persistence::run_migration_p018()
+}
+
+/// Pinned-aware exit move: pinned → `sessions/`, unpinned → `sessions/trash/`.
+pub fn pinned_aware_exit_move(session_id: uuid::Uuid, pinned: bool, caller: &str) {
+    persistence::pinned_aware_exit_move(session_id, pinned, caller);
+}

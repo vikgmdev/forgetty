@@ -144,10 +144,22 @@ No cell snapshots. The VT parser does what VT parsers do: process bytes in, prod
 
 ### Window close → reopen
 ```
-GTK close → socket.send(Disconnect RPC) → daemon drops this connection, stays alive
-GTK launch → ensure_daemon: socket exists → connect → resubscribe →
-    daemon replays recent byte log to catch up → seamless
+GTK close → socket.send(shutdown_clean RPC) →
+    daemon flushes byte logs →
+    if pinned: moves sessions/active/{uuid}.json → sessions/{uuid}.json
+    if unpinned: moves sessions/active/{uuid}.json → sessions/trash/{uuid}.json
+    daemon exits (process::exit)
+GTK launch → ensure_daemon: cold-spawns daemon (~50–100 ms) →
+    daemon loads sessions/{uuid}.json (pinned restore) →
+    connect → subscribe_output → daemon replays byte log → seamless
 ```
+
+Per AD-016 (amends AD-012): the daemon does **not** survive window close.
+Every clean exit moves the live session file out of `sessions/active/` —
+either to `sessions/{uuid}.json` (pinned, auto-restored on launch) or to
+`sessions/trash/{uuid}.json` (unpinned, recoverable via `--restore-session`).
+The cold-spawn cost (~50–100 ms) is below human perception threshold and
+eliminates the stale-daemon failure mode of warm-reattach.
 
 ### Android pairing + streaming
 ```
@@ -284,14 +296,26 @@ The QA test binaries (`forgetty-pair-test`, `forgetty-stream-test`) stay feature
 ~/.local/share/forgetty/
 ├── identity.key           Ed25519 private key (0600)
 ├── authorized_devices.json  Paired devices
-├── sessions/              One file per window
-│   └── {uuid}.json        WorkspaceState: tabs, pane tree, CWDs, dimensions
+├── .migration_p018        One-shot migration marker ("p018-v1")
+├── sessions/
+│   ├── {uuid}.json        Pinned, persistent. Restored on next launch (AD-016).
+│   ├── active/
+│   │   └── {uuid}.json    Live sessions. Empty after clean shutdown (AD-016).
+│   └── trash/
+│       └── {uuid}.json    Closed unpinned. Recoverable via --restore-session.
 └── logs/                  Byte logs for replay
     └── {pane_uuid}.log    Append-only raw PTY output, rotated at size cap
 
 $XDG_RUNTIME_DIR/
 └── forgetty-{uuid}.sock   Per-window Unix socket
 ```
+
+Lifecycle (AD-016):
+- Daemon startup writes `active/{uuid}.json` and saves there continuously.
+- Clean exit (X-close, Ctrl+Shift+Q, SIGTERM): pinned → `sessions/{uuid}.json`,
+  unpinned → `trash/{uuid}.json`.
+- Crash (kill -9): file remains in `active/`. Next launch promotes pinned
+  orphans to `sessions/` and deletes unpinned orphans.
 
 ---
 

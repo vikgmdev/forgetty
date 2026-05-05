@@ -734,6 +734,22 @@ impl SessionManager {
         size: PtySize,
         command: Option<Vec<String>>,
     ) -> Result<(PaneId, Uuid)> {
+        self.create_tab_with_pane_id(workspace_idx, cwd, size, command, PaneId::new())
+    }
+
+    /// Like `create_tab`, but uses the supplied `pane_id` instead of generating a fresh one.
+    ///
+    /// Used by cold-start restore (FIX-013): preserving the saved pane_id keeps the
+    /// per-pane byte log file (`logs/{pane_uuid}.log`) reachable, so `ByteLog::new`'s
+    /// pre-load-from-disk path actually finds the saved scrollback to replay.
+    pub fn create_tab_with_pane_id(
+        &self,
+        workspace_idx: usize,
+        cwd: Option<PathBuf>,
+        size: PtySize,
+        command: Option<Vec<String>>,
+        pane_id: PaneId,
+    ) -> Result<(PaneId, Uuid)> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
         // Bounds-check BEFORE spawning, so we never spawn a dangling PTY.
@@ -743,8 +759,6 @@ impl SessionManager {
                 inner.layout.workspaces.len()
             )));
         }
-
-        let pane_id = PaneId::new();
 
         // Spawn PTY first; insert into layout only if spawn succeeds (R-2).
         // When a profile command is provided, pass it as the explicit argv.
@@ -875,6 +889,28 @@ impl SessionManager {
         size: PtySize,
         cwd: Option<PathBuf>,
     ) -> Result<PaneId> {
+        self.split_pane_with_ratio_and_pane_id(
+            pane_id,
+            direction,
+            ratio,
+            size,
+            cwd,
+            PaneId::new(),
+        )
+    }
+
+    /// Like `split_pane_with_ratio`, but uses the supplied `new_pane_id` instead of
+    /// generating a fresh one. Used by cold-start restore (FIX-013): preserving the
+    /// saved pane_id keeps the per-pane byte log file reachable for replay.
+    pub fn split_pane_with_ratio_and_pane_id(
+        &self,
+        pane_id: PaneId,
+        direction: &str,
+        ratio: f32,
+        size: PtySize,
+        cwd: Option<PathBuf>,
+        new_pane_id: PaneId,
+    ) -> Result<PaneId> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
         if !inner.panes.contains_key(&pane_id) {
@@ -883,7 +919,6 @@ impl SessionManager {
             )));
         }
 
-        let new_pane_id = PaneId::new();
         let pty_bridge = PtyBridge::spawn(size, cwd.as_deref(), None, None, true)
             .map_err(forgetty_core::ForgettyError::Pty)?;
 
@@ -2247,6 +2282,64 @@ mod tests {
         );
 
         assert!(session.pane_info(pane_b).is_some());
+        session.close_tab(tab_id).ok();
+    }
+
+    /// FIX-013: `create_tab_with_pane_id` honours the caller-supplied pane id, so
+    /// the per-pane byte log file (`logs/{pane_uuid}.log`) is reachable on cold
+    /// restart and saved scrollback can replay.
+    #[tokio::test]
+    async fn test_create_tab_with_pane_id_honours_supplied_id() {
+        let session = SessionManager::new();
+        let size = test_size();
+
+        let supplied = PaneId::new();
+        let (live, tab_id) = session
+            .create_tab_with_pane_id(0, None, size, None, supplied)
+            .expect("create_tab_with_pane_id");
+
+        assert_eq!(live, supplied, "live pane id must match supplied");
+
+        let layout = session.layout();
+        let tab = &layout.workspaces[0].tabs[0];
+        assert!(
+            matches!(&tab.pane_tree, PaneTreeLayout::Leaf { pane_id } if *pane_id == supplied),
+            "pane_tree leaf must carry the supplied pane id"
+        );
+        assert_eq!(tab.id, tab_id);
+        assert!(session.pane_info(supplied).is_some());
+        session.close_tab(tab_id).ok();
+    }
+
+    /// FIX-013: `split_pane_with_ratio_and_pane_id` honours the caller-supplied
+    /// new pane id; same rationale as `test_create_tab_with_pane_id_honours_supplied_id`.
+    #[tokio::test]
+    async fn test_split_pane_with_ratio_and_pane_id_honours_supplied_id() {
+        let session = SessionManager::new();
+        let size = test_size();
+
+        let (pane_a, tab_id) = session.create_tab(0, None, size, None).expect("create_tab");
+        let supplied = PaneId::new();
+        let pane_b = session
+            .split_pane_with_ratio_and_pane_id(pane_a, "vertical", 0.4, size, None, supplied)
+            .expect("split_pane_with_ratio_and_pane_id");
+
+        assert_eq!(pane_b, supplied, "returned new pane id must match supplied");
+
+        let layout = session.layout();
+        let tab = &layout.workspaces[0].tabs[0];
+        assert!(
+            matches!(
+                &tab.pane_tree,
+                PaneTreeLayout::Split { direction, ratio, first, second }
+                if direction == "vertical"
+                && (*ratio - 0.4).abs() < 1e-6
+                && matches!(first.as_ref(), PaneTreeLayout::Leaf { pane_id } if *pane_id == pane_a)
+                && matches!(second.as_ref(), PaneTreeLayout::Leaf { pane_id } if *pane_id == supplied)
+            ),
+            "pane_tree leaf must carry the supplied pane id on the second branch"
+        );
+        assert!(session.pane_info(supplied).is_some());
         session.close_tab(tab_id).ok();
     }
 
