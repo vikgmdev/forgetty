@@ -322,6 +322,52 @@ pub fn run(config: Config, launch: LaunchOptions) -> Result<(), Box<dyn std::err
     let session_id: uuid::Uuid = launch.session_id.unwrap_or_else(uuid::Uuid::new_v4);
     info!("GTK session_id: {session_id}");
 
+    // P-018 / AD-016: one-shot migration + crash-recovery for the three-bucket
+    // layout. Skipped in `--temp` mode so ephemeral runs never touch on-disk
+    // state.
+    //
+    // 1. `run_migration_p018()` is gated on the `.migration_p018` marker; it
+    //    triages pre-P-018 `sessions/*.json` files (pinned → stay, unpinned →
+    //    move to trash/) on the first launch of the new build.
+    // 2. `recover_orphans_in_active()` enumerates leftover files in `active/`
+    //    (i.e. crashes / kill -9). Pinned orphans get promoted back to
+    //    `sessions/`, unpinned orphans are deleted. A clean previous shutdown
+    //    leaves `active/` empty, so this is a no-op on the happy path.
+    //
+    // Both operations are synchronous, single-threaded, run before any daemon
+    // spawns or socket binds. AD-009 (no polling) is not at risk here — this
+    // is one-shot startup work, not the hot path.
+    if !launch.temp {
+        if let Err(e) = forgetty_workspace::run_migration_p018() {
+            tracing::warn!("p018 migration: {e} (continuing — not fatal)");
+        }
+        let orphans = forgetty_workspace::recover_orphans_in_active();
+        if !orphans.is_empty() {
+            tracing::info!("p018 orphan recovery: {} file(s) found in active/", orphans.len());
+            for (uuid, is_pinned) in orphans {
+                if is_pinned {
+                    match forgetty_workspace::move_active_to_sessions(uuid) {
+                        Ok(()) => tracing::info!(
+                            "p018 orphan recovery: promoted pinned {uuid} → sessions/"
+                        ),
+                        Err(e) => {
+                            tracing::warn!("p018 orphan recovery: failed to promote {uuid}: {e}")
+                        }
+                    }
+                } else {
+                    match forgetty_workspace::delete_active_for(uuid) {
+                        Ok(()) => {
+                            tracing::info!("p018 orphan recovery: deleted unpinned orphan {uuid}")
+                        }
+                        Err(e) => {
+                            tracing::warn!("p018 orphan recovery: failed to delete {uuid}: {e}")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Attempt to connect to (or spawn) the daemon before entering the GTK loop.
     // This is done outside connect_activate so it runs once, not once per window.
     // Ephemeral (--temp) sessions skip the daemon entirely — they are self-contained
@@ -1695,9 +1741,13 @@ fn build_ui(
     }
 
     // --- Close Window Permanently action (menu only, no accelerator) ---
-    // Deletes the session file so the window is never restored on next launch,
-    // then kills the daemon (if running) and closes the window.
-    // In --temp mode: session file does not exist, so skip deletion.
+    // Kills the daemon first (so it can't auto-save), then deletes the
+    // session file from BOTH the legacy `sessions/{uuid}.json` location
+    // (pinned sessions) and the P-018 `active/{uuid}.json` location (the
+    // live bucket). In --temp mode: nothing to delete.
+    //
+    // Order matters: daemon shutdown FIRST so the debounce/periodic save
+    // tasks cannot race with the file delete and re-create the file.
     {
         let win_perm_close = window.clone();
         let dc_perm_close = daemon_client.clone();
@@ -1707,29 +1757,38 @@ fn build_ui(
         action.connect_activate(move |_action, _param| {
             // Prevent the window close handler from re-writing the session file.
             skip_save_perm.set(true);
-            // Delete the UUID session file so restore-all won't bring it back.
+            // Kill the daemon FIRST so its save tasks can't race the delete.
+            if let Some(ref dc) = dc_perm_close {
+                dc.shutdown();
+            }
             if !is_temp {
+                // Pinned session file (top-level).
                 let path = forgetty_workspace::session_path_for(session_id);
                 if path.exists() {
                     if let Err(e) = std::fs::remove_file(&path) {
                         tracing::warn!("Failed to delete session file on permanent close: {e}");
                     }
                 }
-            }
-            // Kill the daemon so it can't auto-save the file back to disk.
-            if let Some(ref dc) = dc_perm_close {
-                dc.shutdown();
+                // P-018: also remove the live `active/` file so it doesn't
+                // appear as a crash orphan on next launch.
+                if let Err(e) = forgetty_workspace::delete_active_for(session_id) {
+                    tracing::warn!("Failed to delete active session file on permanent close: {e}");
+                }
             }
             win_perm_close.close();
         });
         window.add_action(&action);
     }
 
-    // --- Pin Session toggle (B-002 Part 4) ---
+    // --- Pin Session toggle (B-002 Part 4 / P-018) ---
     // Pin icon in the header bar, updated by the action handler.
+    //
+    // P-018 / AD-016: the tooltip explains what pinning does in the new
+    // model. Unpinned sessions are temporary by definition and do not
+    // restore on next launch; pinning is the explicit opt-in to persistence.
     let pin_icon = gtk4::Image::from_icon_name("view-pin-symbolic");
     pin_icon.set_visible(false);
-    pin_icon.set_tooltip_text(Some("Session is pinned"));
+    pin_icon.set_tooltip_text(Some("Pin to keep this window across launches"));
     header.pack_end(&pin_icon);
 
     {
@@ -1938,17 +1997,16 @@ fn build_ui(
     }
 
     // --- Quit action (Ctrl+Shift+Q) ---
-    // In daemon mode: do NOT kill daemon PTYs — sessions survive the quit
-    // (V2-005 / AD-012). The daemon stays running; relaunching reconnects.
-    // In --temp mode (dc is None): nothing to save; the session is ephemeral by design.
+    // P-018 / AD-016: Ctrl+Shift+Q uses the same pinned-aware close as the
+    // X-button. Pre-P-018 (AD-012) the daemon survived this path; the AD-016
+    // amendment binds daemon survival to the single explicit pin action.
+    // --temp mode (dc is None): nothing to save; the session is ephemeral.
     {
         let app_quit = app.clone();
         let wm_quit = Rc::clone(&workspace_manager);
         let dc_quit = daemon_client.clone();
         let action = gio::SimpleAction::new("quit", None);
         action.connect_activate(move |_action, _param| {
-            // Daemon mode: push split ratios then disconnect.
-            // --temp mode (dc is None): nothing to save or clean up — just quit.
             if let Some(ref dc) = dc_quit {
                 if let Ok(mgr) = wm_quit.try_borrow() {
                     let mut all_ratios = Vec::new();
@@ -1959,8 +2017,8 @@ fn build_ui(
                         let _ = dc.update_split_ratios(&all_ratios);
                     }
                 }
-                // V2-005 / AD-012: disconnect keeps the daemon alive.
-                dc.disconnect();
+                // P-018 / AD-016: pinned-aware close + daemon exit.
+                dc.shutdown_clean();
             }
             app_quit.quit();
         });
@@ -2328,18 +2386,27 @@ fn build_ui(
     // --- Window close request handler ---
     // Fires when the user clicks the CSD X button, when window.close() is
     // called programmatically, or when the window manager requests a close.
-    // Daemon mode: push split ratios then disconnect — the daemon keeps the
-    // session alive so a subsequent `forgetty` launch reconnects seamlessly
-    // (V2-005 / AD-012). Pinned vs. unpinned no longer gates the close path
-    // because the session always survives; "Close Window Permanently" remains
-    // the explicit-shutdown path.
+    //
+    // P-018 / AD-016: every clean close exits the daemon. The pinned-aware
+    // file move runs server-side under `shutdown_clean`:
+    //   - pinned: `sessions/active/{uuid}.json` → `sessions/{uuid}.json`
+    //   - unpinned: `sessions/active/{uuid}.json` → `sessions/trash/{uuid}.json`
+    // Pre-P-018 the X-close used `disconnect` to keep the daemon alive (AD-012);
+    // AD-016 amends that. Cold-spawn on relaunch is the new norm.
+    //
+    // If the closing window has any sibling forgetty windows still open and
+    // the session is unpinned, an "Undo Close" desktop notification is
+    // emitted so the user can recover within 30 s.
+    //
     // --temp mode (dc is None): nothing to persist — just proceed with the close.
     {
         let wm_close = Rc::clone(&workspace_manager);
         let dc_window_close = daemon_client.clone();
+        let app_close = app.clone();
+        let session_id_close = session_id;
         window.connect_close_request(move |_win| {
             if let Some(ref dc) = dc_window_close {
-                // Push actual widget-measured split ratios to daemon before save.
+                // Push actual widget-measured split ratios to daemon before close.
                 if let Ok(mgr) = wm_close.try_borrow() {
                     let mut all_ratios = Vec::new();
                     for ws in &mgr.workspaces {
@@ -2349,9 +2416,22 @@ fn build_ui(
                         let _ = dc.update_split_ratios(&all_ratios);
                     }
                 }
-                // V2-005 / AD-012: disconnect keeps the daemon alive.
-                // Relaunching reconnects seamlessly.
-                dc.disconnect();
+                // P-018 (AC-7): capture pin state + sibling count BEFORE
+                // shutdown_clean (the daemon exits after the move and a
+                // post-shutdown `get_pinned()` would fail).
+                let is_pinned = dc.get_pinned().unwrap_or(false);
+                let has_sibling = app_close.windows().len() > 1;
+                // P-018 / AD-016: pinned-aware close. Daemon performs the
+                // file move and exits before acking, so this call returns
+                // only after `trash/{uuid}.json` (or `sessions/{uuid}.json`)
+                // is committed on disk — no Undo-Close race window.
+                dc.shutdown_clean();
+                // Now safe to fire the toast: the file is in trash/ and
+                // `restore_from_trash_to_active` will succeed if the user
+                // clicks Undo within 30 s. AC-8: skipped on last-window close.
+                if !is_pinned && has_sibling {
+                    send_undo_close_notification(session_id_close);
+                }
             }
             glib::Propagation::Proceed
         });
@@ -2362,10 +2442,11 @@ fn build_ui(
     // GLib source callbacks on the main thread, avoiding async-signal-safety
     // issues. Must be registered before window.present() so signals arriving
     // immediately after startup are caught.
-    // Daemon mode: disconnect only — the daemon keeps running so the session
-    // survives a logout SIGTERM or a pkill on this GTK process (V2-005 /
-    // AD-012). Explicit daemon shutdown happens via the hamburger
-    // "Close Window Permanently" action or by signalling the daemon directly.
+    //
+    // P-018 / AD-016: every clean exit path runs the pinned-aware close.
+    // Pre-P-018 (V2-005 / AD-012) signals dropped the connection but kept
+    // the daemon alive; AD-016 amends that — daemon survival is bound to
+    // the explicit pin, not to client lifecycle.
     // --temp mode (dc is None): nothing to persist — just quit.
     {
         let signals: &[(i32, &str)] =
@@ -2386,8 +2467,8 @@ fn build_ui(
                             let _ = dc.update_split_ratios(&all_ratios);
                         }
                     }
-                    // V2-005 / AD-012: disconnect keeps the daemon alive.
-                    dc.disconnect();
+                    // P-018 / AD-016: pinned-aware close + daemon exit.
+                    dc.shutdown_clean();
                 }
                 app_signal.quit();
                 glib::ControlFlow::Break
@@ -2574,17 +2655,19 @@ fn build_ui(
 /// Send a desktop notification after a session is trashed.
 ///
 /// Includes an "Undo" action. If the user clicks it within 30 seconds,
-/// a new `forgetty --restore-session` process is spawned.
+/// a new `forgetty --restore-session` process is spawned. The
+/// `--restore-session` path moves `sessions/trash/{uuid}.json` to
+/// `sessions/active/{uuid}.json` (P-018 / AD-016) and the resulting
+/// daemon takes ownership of the file from there.
 ///
 /// The notification is sent before the GTK process exits. The undo action
 /// handler runs in a forked child process because `NotificationHandle` is
 /// not `Send` and the GTK main loop is shutting down.
 ///
-/// Currently unused after V2-005: window-close no longer trashes the session
-/// (AD-012). Kept for a future follow-up that may reintroduce the toast on
-/// an explicit trash flow.
+/// P-018 (AC-7/AC-8/AC-10): the caller (window-close handler) gates this
+/// notification on the existence of a sibling forgetty window — last-window
+/// close does not show the toast (no host window to display it).
 #[cfg(target_os = "linux")]
-#[allow(dead_code)]
 fn send_undo_close_notification(session_id: uuid::Uuid) {
     let current_exe = match std::env::current_exe() {
         Ok(p) => p,
@@ -2631,7 +2714,6 @@ fn send_undo_close_notification(session_id: uuid::Uuid) {
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 fn send_undo_close_notification(_session_id: uuid::Uuid) {
     // Desktop notifications not implemented for non-Linux platforms.
 }

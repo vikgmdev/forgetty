@@ -34,10 +34,17 @@ const DEFAULT_COLS: u16 = 80;
 ///
 /// `sync_endpoint` is `None` when the daemon was started without iroh support;
 /// sync-related methods return a graceful `METHOD_NOT_FOUND` in that case.
+///
+/// `session_id` is threaded through so `handle_set_pinned` can durably write
+/// the pin state to `sessions/active/{uuid}.json` synchronously before
+/// returning OK (P-018 / AD-016, AC-14). `None` in test/legacy contexts where
+/// no `active/` file is needed; in that case the persistence write is
+/// skipped.
 pub fn dispatch(
     request: &Request,
     sm: Arc<SessionManager>,
     sync_endpoint: Option<Arc<SyncEndpoint>>,
+    session_id: Option<Uuid>,
 ) -> Response {
     match request.method.as_str() {
         methods::LIST_TABS => handle_list_tabs(request, &sm),
@@ -63,7 +70,7 @@ pub fn dispatch(
         methods::SET_ACTIVE_PANE => handle_set_active_pane(request, &sm),
         // Split ratio + pinned session methods (B-002).
         methods::UPDATE_SPLIT_RATIOS => handle_update_split_ratios(request, &sm),
-        methods::SET_PINNED => handle_set_pinned(request, &sm),
+        methods::SET_PINNED => handle_set_pinned(request, &sm, session_id),
         methods::GET_PINNED => handle_get_pinned(request, &sm),
         // Sync / pairing methods — require sync_endpoint.
         methods::LIST_DEVICES => handle_list_devices(request, sync_endpoint.as_deref()),
@@ -797,7 +804,7 @@ fn handle_update_split_ratios(request: &Request, sm: &SessionManager) -> Respons
     Response::success(request.id.clone(), serde_json::json!({ "ok": true }))
 }
 
-fn handle_set_pinned(request: &Request, sm: &SessionManager) -> Response {
+fn handle_set_pinned(request: &Request, sm: &SessionManager, session_id: Option<Uuid>) -> Response {
     let pinned = match request.params.get("pinned").and_then(|v| v.as_bool()) {
         Some(b) => b,
         None => {
@@ -809,6 +816,27 @@ fn handle_set_pinned(request: &Request, sm: &SessionManager) -> Response {
         }
     };
     sm.set_pinned(pinned);
+
+    // P-018 / AD-016 (AC-14): persist the pin state to `active/{uuid}.json`
+    // synchronously before returning OK. A crash between this write and the
+    // next debounced save would otherwise lose the user's pin toggle, leading
+    // to an unpinned-orphan deletion on next launch.
+    //
+    // `session_id == None` in test/legacy contexts (e.g. unit tests that
+    // bypass the daemon's session-id wiring); skip persistence so the test
+    // path stays in-memory only.
+    if let Some(sid) = session_id {
+        let state = sm.snapshot_to_workspace_state();
+        if let Err(e) = forgetty_workspace::move_to_active(sid, &state) {
+            tracing::warn!("set_pinned: failed to persist active/{sid}.json: {e}");
+            return Response::error(
+                request.id.clone(),
+                protocol::INTERNAL_ERROR,
+                format!("failed to persist pinned state: {e}"),
+            );
+        }
+    }
+
     Response::success(request.id.clone(), serde_json::json!({ "ok": true }))
 }
 
@@ -1253,7 +1281,7 @@ mod tests {
     #[test]
     fn dispatch_list_tabs_empty() {
         let sm = make_sm();
-        let resp = dispatch(&make_request("list_tabs"), sm, None);
+        let resp = dispatch(&make_request("list_tabs"), sm, None, None);
         assert!(resp.result.is_some());
         assert!(resp.error.is_none());
         let tabs = resp.result.unwrap()["tabs"].as_array().unwrap().len();
@@ -1264,7 +1292,7 @@ mod tests {
     fn dispatch_focus_tab_missing_tab_id_returns_invalid_params() {
         let sm = make_sm();
         // No tab_id in params → INVALID_PARAMS.
-        let resp = dispatch(&make_request("focus_tab"), sm, None);
+        let resp = dispatch(&make_request("focus_tab"), sm, None, None);
         assert!(resp.error.is_some());
         assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
     }
@@ -1278,7 +1306,7 @@ mod tests {
             params: serde_json::json!({ "tab_id": "00000000-0000-0000-0000-000000000000" }),
             id: Some(serde_json::json!(1)),
         };
-        let resp = dispatch(&req, sm, None);
+        let resp = dispatch(&req, sm, None, None);
         assert!(resp.error.is_some());
         assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
     }
@@ -1292,7 +1320,7 @@ mod tests {
             params: serde_json::json!({ "workspace_idx": 0 }),
             id: Some(serde_json::json!(1)),
         };
-        let new_resp = dispatch(&new_req, Arc::clone(&sm), None);
+        let new_resp = dispatch(&new_req, Arc::clone(&sm), None, None);
         assert!(new_resp.result.is_some(), "new_tab should succeed");
         let tab_id = new_resp.result.unwrap()["tab_id"].as_str().unwrap().to_string();
 
@@ -1302,7 +1330,7 @@ mod tests {
             params: serde_json::json!({ "tab_id": tab_id }),
             id: Some(serde_json::json!(2)),
         };
-        let resp = dispatch(&focus_req, Arc::clone(&sm), None);
+        let resp = dispatch(&focus_req, Arc::clone(&sm), None, None);
         assert!(resp.result.is_some());
         assert_eq!(resp.result.unwrap()["ok"], true);
 
@@ -1322,7 +1350,7 @@ mod tests {
             params: serde_json::json!({ "direction": "horizontal" }),
             id: Some(serde_json::json!(1)),
         };
-        let resp = dispatch(&req, sm, None);
+        let resp = dispatch(&req, sm, None, None);
         assert!(resp.error.is_some());
         assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
     }
@@ -1337,7 +1365,7 @@ mod tests {
             params: serde_json::json!({ "workspace_idx": 0 }),
             id: Some(serde_json::json!(1)),
         };
-        let new_resp = dispatch(&new_req, Arc::clone(&sm), None);
+        let new_resp = dispatch(&new_req, Arc::clone(&sm), None, None);
         let pane_id = new_resp.result.unwrap()["pane_id"].as_str().unwrap().to_string();
 
         let req = Request {
@@ -1346,7 +1374,7 @@ mod tests {
             params: serde_json::json!({ "pane_id": pane_id, "direction": "diagonal" }),
             id: Some(serde_json::json!(2)),
         };
-        let resp = dispatch(&req, Arc::clone(&sm), None);
+        let resp = dispatch(&req, Arc::clone(&sm), None, None);
         assert!(resp.error.is_some());
         assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
     }
@@ -1354,7 +1382,7 @@ mod tests {
     #[test]
     fn dispatch_unknown_method() {
         let sm = make_sm();
-        let resp = dispatch(&make_request("nonexistent"), sm, None);
+        let resp = dispatch(&make_request("nonexistent"), sm, None, None);
         assert!(resp.error.is_some());
         assert_eq!(resp.error.unwrap().code, protocol::METHOD_NOT_FOUND);
     }
@@ -1368,7 +1396,7 @@ mod tests {
             params: serde_json::Value::Null,
             id: Some(serde_json::json!("abc-123")),
         };
-        let resp = dispatch(&req, sm, None);
+        let resp = dispatch(&req, sm, None, None);
         assert_eq!(resp.id, Some(serde_json::json!("abc-123")));
     }
 
@@ -1381,7 +1409,7 @@ mod tests {
             params: serde_json::json!({ "data": "dGVzdAo=" }),
             id: Some(serde_json::json!(1)),
         };
-        let resp = dispatch(&req, sm, None);
+        let resp = dispatch(&req, sm, None, None);
         assert!(resp.error.is_some());
         assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
     }
@@ -1395,7 +1423,7 @@ mod tests {
             params: serde_json::json!({ "pane_id": "not-a-uuid", "data": "dGVzdAo=" }),
             id: Some(serde_json::json!(1)),
         };
-        let resp = dispatch(&req, sm, None);
+        let resp = dispatch(&req, sm, None, None);
         assert!(resp.error.is_some());
         assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
     }
@@ -1412,7 +1440,7 @@ mod tests {
             }),
             id: Some(serde_json::json!(1)),
         };
-        let resp = dispatch(&req, sm, None);
+        let resp = dispatch(&req, sm, None, None);
         assert!(resp.error.is_some());
         assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
     }
@@ -1430,7 +1458,7 @@ mod tests {
             params: serde_json::json!({ "pane_id": id.to_string(), "data": "!!!notbase64!!!" }),
             id: Some(serde_json::json!(1)),
         };
-        let resp = dispatch(&req, Arc::clone(&sm), None);
+        let resp = dispatch(&req, Arc::clone(&sm), None, None);
         assert!(resp.error.is_some());
         assert_eq!(resp.error.as_ref().unwrap().code, protocol::INVALID_PARAMS);
 
@@ -1446,7 +1474,7 @@ mod tests {
             params: serde_json::json!({ "pane_id": "00000000-0000-0000-0000-000000000000" }),
             id: Some(serde_json::json!(1)),
         };
-        let resp = dispatch(&req, sm, None);
+        let resp = dispatch(&req, sm, None, None);
         assert!(resp.error.is_some());
         assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
     }
@@ -1460,7 +1488,7 @@ mod tests {
             params: serde_json::json!({ "pane_id": "00000000-0000-0000-0000-000000000000" }),
             id: Some(serde_json::json!(1)),
         };
-        let resp = dispatch(&req, sm, None);
+        let resp = dispatch(&req, sm, None, None);
         assert!(resp.error.is_some());
         assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
     }
@@ -1468,7 +1496,7 @@ mod tests {
     #[test]
     fn close_tab_missing_params_returns_invalid_params() {
         let sm = make_sm();
-        let resp = dispatch(&make_request("close_tab"), sm, None);
+        let resp = dispatch(&make_request("close_tab"), sm, None, None);
         assert!(resp.error.is_some());
         assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
     }
@@ -1476,7 +1504,7 @@ mod tests {
     #[test]
     fn dispatch_get_layout_empty() {
         let sm = make_sm();
-        let resp = dispatch(&make_request("get_layout"), sm, None);
+        let resp = dispatch(&make_request("get_layout"), sm, None, None);
         assert!(resp.result.is_some());
         assert!(resp.error.is_none());
         let result = resp.result.unwrap();
@@ -1496,7 +1524,7 @@ mod tests {
             params: serde_json::json!({ "workspace_idx": 0 }),
             id: Some(serde_json::json!(1)),
         };
-        let resp = dispatch(&req, Arc::clone(&sm), None);
+        let resp = dispatch(&req, Arc::clone(&sm), None, None);
         assert!(resp.result.is_some());
         let result = resp.result.unwrap();
         assert!(result.get("tab_id").and_then(|v| v.as_str()).is_some(), "tab_id must be present");
@@ -1521,7 +1549,7 @@ mod tests {
             id: Some(serde_json::json!(1)),
         };
         // missing new_index
-        let resp = dispatch(&req, sm, None);
+        let resp = dispatch(&req, sm, None, None);
         assert!(resp.error.is_some());
         assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
     }
@@ -1539,7 +1567,7 @@ mod tests {
             params: serde_json::json!({}),
             id: Some(serde_json::json!(1)),
         };
-        let resp = dispatch(&req, sm, None);
+        let resp = dispatch(&req, sm, None, None);
         assert!(resp.error.is_some());
         assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
     }
@@ -1556,7 +1584,7 @@ mod tests {
             params: serde_json::json!({ "workspace_idx": 0 }),
             id: Some(serde_json::json!(1)),
         };
-        let resp = dispatch(&req, Arc::clone(&sm), None);
+        let resp = dispatch(&req, Arc::clone(&sm), None, None);
         assert!(resp.error.is_some(), "last-workspace delete must error");
         let err = resp.error.unwrap();
         assert_eq!(err.code, protocol::INTERNAL_ERROR);
@@ -1579,7 +1607,7 @@ mod tests {
             params: serde_json::json!({ "workspace_idx": 99 }),
             id: Some(serde_json::json!(1)),
         };
-        let resp = dispatch(&req, Arc::clone(&sm), None);
+        let resp = dispatch(&req, Arc::clone(&sm), None, None);
         assert!(resp.error.is_some(), "out-of-range delete must error");
         assert_eq!(resp.error.unwrap().code, protocol::INTERNAL_ERROR);
         assert_eq!(sm.layout().workspaces.len(), 2, "workspace list must be untouched");
@@ -1597,7 +1625,7 @@ mod tests {
             params: serde_json::json!({ "workspace_idx": ws_idx }),
             id: Some(serde_json::json!(1)),
         };
-        let resp = dispatch(&req, Arc::clone(&sm), None);
+        let resp = dispatch(&req, Arc::clone(&sm), None, None);
         assert!(resp.result.is_some(), "successful delete must return a result");
         let result = resp.result.unwrap();
         assert_eq!(result.get("ok").and_then(|v| v.as_bool()), Some(true));
@@ -1617,7 +1645,7 @@ mod tests {
             params: serde_json::json!({}),
             id: Some(serde_json::json!(1)),
         };
-        let resp = dispatch(&req, sm, None);
+        let resp = dispatch(&req, sm, None, None);
         assert!(resp.error.is_some());
         assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
     }
@@ -1631,7 +1659,7 @@ mod tests {
             params: serde_json::json!({ "source_workspace_idx": 99 }),
             id: Some(serde_json::json!(1)),
         };
-        let resp = dispatch(&req, Arc::clone(&sm), None);
+        let resp = dispatch(&req, Arc::clone(&sm), None, None);
         assert!(resp.error.is_some(), "out-of-range duplicate must error");
         assert_eq!(resp.error.unwrap().code, protocol::INTERNAL_ERROR);
         assert_eq!(sm.layout().workspaces.len(), 1, "workspace list must be untouched");
@@ -1651,7 +1679,7 @@ mod tests {
             params: serde_json::json!({ "source_workspace_idx": 0 }),
             id: Some(serde_json::json!(1)),
         };
-        let resp = dispatch(&req, Arc::clone(&sm), None);
+        let resp = dispatch(&req, Arc::clone(&sm), None, None);
         assert!(resp.result.is_some(), "successful duplicate must return a result");
         let result = resp.result.unwrap();
         assert!(
@@ -1679,7 +1707,7 @@ mod tests {
             }),
             id: Some(serde_json::json!(1)),
         };
-        let resp = dispatch(&req, Arc::clone(&sm), None);
+        let resp = dispatch(&req, Arc::clone(&sm), None, None);
         assert!(resp.result.is_some());
         let layout = sm.layout();
         assert_eq!(layout.workspaces[1].name, "ExplicitCopy");
@@ -1701,7 +1729,7 @@ mod tests {
                 params: serde_json::json!({ "color": "#3a6ee4" }),
                 id: Some(serde_json::json!(1)),
             };
-            let resp = dispatch(&req, sm, None);
+            let resp = dispatch(&req, sm, None, None);
             assert!(resp.error.is_some(), "missing workspace_idx must error");
             assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
         }
@@ -1715,7 +1743,7 @@ mod tests {
                 params: serde_json::json!({ "workspace_idx": 99, "color": "#3a6ee4" }),
                 id: Some(serde_json::json!(1)),
             };
-            let resp = dispatch(&req, Arc::clone(&sm), None);
+            let resp = dispatch(&req, Arc::clone(&sm), None, None);
             assert!(resp.error.is_some(), "out-of-range must error");
             assert_eq!(resp.error.unwrap().code, protocol::INTERNAL_ERROR);
             // Daemon state unchanged.
@@ -1732,7 +1760,7 @@ mod tests {
                 params: serde_json::json!({ "workspace_idx": 0, "color": "#58b967" }),
                 id: Some(serde_json::json!(1)),
             };
-            let resp = dispatch(&req, Arc::clone(&sm), None);
+            let resp = dispatch(&req, Arc::clone(&sm), None, None);
             assert!(resp.result.is_some(), "success path must return a result");
             assert_eq!(resp.result.unwrap().get("ok").and_then(|v| v.as_bool()), Some(true));
             assert_eq!(sm.layout().workspaces[0].color, Some("#58b967".to_string()));
@@ -1755,7 +1783,7 @@ mod tests {
                 }),
                 id: Some(serde_json::json!(1)),
             };
-            let resp = dispatch(&req, Arc::clone(&sm), None);
+            let resp = dispatch(&req, Arc::clone(&sm), None, None);
             assert!(resp.result.is_some(), "explicit-null success path must return a result");
             assert_eq!(resp.result.unwrap().get("ok").and_then(|v| v.as_bool()), Some(true));
             assert!(sm.layout().workspaces[0].color.is_none());
@@ -1778,7 +1806,7 @@ mod tests {
                 params: serde_json::json!({ "to_idx": 0 }),
                 id: Some(serde_json::json!(1)),
             };
-            let resp = dispatch(&req, sm, None);
+            let resp = dispatch(&req, sm, None, None);
             assert!(resp.error.is_some(), "missing from_idx must error");
             assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
         }
@@ -1792,7 +1820,7 @@ mod tests {
                 params: serde_json::json!({ "from_idx": 0 }),
                 id: Some(serde_json::json!(1)),
             };
-            let resp = dispatch(&req, sm, None);
+            let resp = dispatch(&req, sm, None, None);
             assert!(resp.error.is_some(), "missing to_idx must error");
             assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
         }
@@ -1816,7 +1844,7 @@ mod tests {
                 params: serde_json::json!({ "from_idx": 0, "to_idx": 99 }),
                 id: Some(serde_json::json!(1)),
             };
-            let resp = dispatch(&req, Arc::clone(&sm), None);
+            let resp = dispatch(&req, Arc::clone(&sm), None, None);
             assert!(resp.error.is_some(), "out-of-range to_idx must error");
             assert_eq!(resp.error.unwrap().code, protocol::INTERNAL_ERROR);
         }
@@ -1829,7 +1857,7 @@ mod tests {
                 params: serde_json::json!({ "from_idx": 99, "to_idx": 0 }),
                 id: Some(serde_json::json!(1)),
             };
-            let resp = dispatch(&req, Arc::clone(&sm), None);
+            let resp = dispatch(&req, Arc::clone(&sm), None, None);
             assert!(resp.error.is_some(), "out-of-range from_idx must error");
             assert_eq!(resp.error.unwrap().code, protocol::INTERNAL_ERROR);
         }
@@ -1853,7 +1881,7 @@ mod tests {
             params: serde_json::json!({ "workspace_idx": 0 }),
             id: Some(serde_json::json!(1)),
         };
-        let resp = dispatch(&req, sm, None);
+        let resp = dispatch(&req, sm, None, None);
         assert!(resp.error.is_some(), "missing tab_id must error");
         assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
     }
@@ -1872,7 +1900,7 @@ mod tests {
             }),
             id: Some(serde_json::json!(1)),
         };
-        let resp = dispatch(&req, sm, None);
+        let resp = dispatch(&req, sm, None, None);
         assert!(resp.error.is_some(), "unknown tab must error");
         assert_eq!(resp.error.unwrap().code, protocol::INTERNAL_ERROR);
     }
@@ -1889,7 +1917,7 @@ mod tests {
             params: serde_json::json!({ "workspace_idx": 0 }),
             id: Some(serde_json::json!(1)),
         };
-        let new_resp = dispatch(&new_req, Arc::clone(&sm), None);
+        let new_resp = dispatch(&new_req, Arc::clone(&sm), None, None);
         assert!(new_resp.result.is_some(), "new_tab should succeed");
         let tab_id = new_resp.result.unwrap()["tab_id"].as_str().unwrap().to_string();
 
@@ -1904,7 +1932,7 @@ mod tests {
             }),
             id: Some(serde_json::json!(2)),
         };
-        let resp = dispatch(&req, Arc::clone(&sm), None);
+        let resp = dispatch(&req, Arc::clone(&sm), None, None);
         assert!(resp.error.is_some(), "orphan pane must error");
         assert_eq!(resp.error.unwrap().code, protocol::INTERNAL_ERROR);
 
@@ -1932,7 +1960,7 @@ mod tests {
             params: serde_json::json!({ "workspace_idx": 1 }),
             id: Some(serde_json::json!(1)),
         };
-        let resp = dispatch(&req, Arc::clone(&sm), None);
+        let resp = dispatch(&req, Arc::clone(&sm), None, None);
         assert!(resp.result.is_some(), "new_tab should succeed");
 
         let layout = sm.layout();
@@ -1954,7 +1982,7 @@ mod tests {
             params: serde_json::json!({}),
             id: Some(serde_json::json!(1)),
         };
-        let resp = dispatch(&req, Arc::clone(&sm), None);
+        let resp = dispatch(&req, Arc::clone(&sm), None, None);
         assert!(resp.result.is_some(), "new_tab must succeed when workspace_idx is omitted");
         assert!(resp.error.is_none());
 
@@ -1979,7 +2007,7 @@ mod tests {
             params: serde_json::json!({ "workspace_idx": 999 }),
             id: Some(serde_json::json!(1)),
         };
-        let resp = dispatch(&req, Arc::clone(&sm), None);
+        let resp = dispatch(&req, Arc::clone(&sm), None, None);
         assert!(resp.error.is_some(), "out-of-range workspace_idx must error");
         assert_eq!(resp.error.unwrap().code, protocol::INTERNAL_ERROR);
 
@@ -2013,7 +2041,7 @@ mod tests {
             params: serde_json::json!({ "tab_id": era_tab.to_string() }),
             id: Some(serde_json::json!(1)),
         };
-        let resp = dispatch(&req, Arc::clone(&sm), None);
+        let resp = dispatch(&req, Arc::clone(&sm), None, None);
 
         assert!(resp.error.is_none(), "close_tab must succeed");
         let result = resp.result.expect("close_tab must return a result");
@@ -2031,5 +2059,95 @@ mod tests {
             1,
             "auto-seed must have created a fresh tab in era"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // P-018 / AD-016: handle_set_pinned persists to active/{uuid}.json
+    // -----------------------------------------------------------------------
+
+    /// Serialize XDG_DATA_HOME-mutating tests for handle_set_pinned.
+    fn xdg_lock_handlers() -> &'static std::sync::Mutex<()> {
+        use std::sync::OnceLock;
+        static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    #[test]
+    fn p018_set_pinned_persists_to_active_when_session_id_present() {
+        let lock = xdg_lock_handlers().lock().unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var_os("XDG_DATA_HOME");
+        let tmp = tempfile::tempdir().unwrap();
+        // SAFETY: serialized by xdg_lock_handlers; this test is the sole
+        // mutator within the socket crate.
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", tmp.path());
+        }
+
+        let sid = Uuid::new_v4();
+        let sm = make_sm();
+
+        // Initial state: pinned=false (default in WorkspaceState).
+        let req = Request {
+            jsonrpc: "2.0".to_string(),
+            method: "set_pinned".to_string(),
+            params: serde_json::json!({ "pinned": true }),
+            id: Some(serde_json::json!(1)),
+        };
+
+        let resp = dispatch(&req, Arc::clone(&sm), None, Some(sid));
+        assert!(resp.error.is_none(), "set_pinned should succeed: {:?}", resp.error);
+        assert!(resp.result.is_some());
+
+        // Verify file exists at active/{sid}.json with pinned: true.
+        let active_path = forgetty_workspace::session_path_active_for(sid);
+        assert!(active_path.exists(), "active/{sid}.json must be written synchronously");
+        let contents = std::fs::read_to_string(&active_path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&contents).unwrap();
+        assert_eq!(
+            v.get("pinned").and_then(|p| p.as_bool()),
+            Some(true),
+            "persisted file must reflect pinned=true"
+        );
+
+        // Restore env.
+        unsafe {
+            if let Some(p) = prior {
+                std::env::set_var("XDG_DATA_HOME", p);
+            } else {
+                std::env::remove_var("XDG_DATA_HOME");
+            }
+        }
+        drop(lock);
+    }
+
+    #[test]
+    fn p018_set_pinned_skips_persistence_when_session_id_none() {
+        // Without session_id (test/legacy contexts) the handler must still
+        // succeed but skip the file write.
+        let sm = make_sm();
+        let req = Request {
+            jsonrpc: "2.0".to_string(),
+            method: "set_pinned".to_string(),
+            params: serde_json::json!({ "pinned": true }),
+            id: Some(serde_json::json!(1)),
+        };
+        let resp = dispatch(&req, Arc::clone(&sm), None, None);
+        assert!(resp.error.is_none(), "set_pinned with None session_id must succeed");
+        // In-memory state was updated.
+        assert!(sm.is_pinned());
+    }
+
+    #[test]
+    fn p018_set_pinned_missing_param_returns_invalid_params() {
+        let sm = make_sm();
+        let req = Request {
+            jsonrpc: "2.0".to_string(),
+            method: "set_pinned".to_string(),
+            params: serde_json::json!({}),
+            id: Some(serde_json::json!(1)),
+        };
+        let resp = dispatch(&req, sm, None, Some(Uuid::new_v4()));
+        assert!(resp.error.is_some());
+        assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
     }
 }

@@ -787,84 +787,44 @@ async fn handle_streaming_connection(
             return Ok(());
         }
 
-        // Synchronous handler for all other methods.
-        if request.method == methods::SHUTDOWN_SAVE {
-            // Acknowledge before saving so the client unblocks immediately.
-            let resp = Response::success(request.id, serde_json::json!({ "ok": true }));
-            write_response(&mut writer, &resp).await?;
-            info!("Received shutdown_save RPC — saving session and exiting");
-            // Flush byte-log ring to disk (V2-007 / AD-013).
+        // P-018 / AD-016: shutdown_save, shutdown_clean, and disconnect all
+        // converge on the same pinned-aware exit path:
+        //   1. flush byte logs,
+        //   2. refresh `active/{uuid}.json` with the latest snapshot,
+        //   3. move active → sessions/ (pinned) or sessions/trash/ (unpinned),
+        //   4. ack the RPC (so the client's blocking call returns AFTER the
+        //      file move is committed — no Undo-Close race window),
+        //   5. process::exit.
+        // The three RPC names are preserved for backward compatibility with
+        // existing clients/tooling; semantics are identical.
+        //
+        // Order rationale: the GTK client's "Undo Close" toast fires
+        // immediately on RPC return; if we acked before the move, the user
+        // could click Undo before `trash/{uuid}.json` exists, and the
+        // restore would fail. Ack-after-move closes that race window.
+        if matches!(
+            request.method.as_str(),
+            methods::SHUTDOWN_SAVE | methods::SHUTDOWN_CLEAN | methods::DISCONNECT
+        ) {
+            let caller: &'static str = match request.method.as_str() {
+                methods::SHUTDOWN_SAVE => "shutdown_save",
+                methods::SHUTDOWN_CLEAN => "shutdown_clean",
+                _ => "disconnect",
+            };
+            info!("Received {caller} RPC — pinned-aware close, exiting");
             sm.flush_all_byte_logs().await;
-            info!("shutdown_save: byte logs flushed");
-            // Save the session layout so restore-by-default can bring it back.
+            info!("{caller}: byte logs flushed");
             if let Some(sid) = session_id {
                 let state = sm.snapshot_to_workspace_state();
-                match forgetty_workspace::save_session_for(sid, &state) {
-                    Ok(()) => info!("shutdown_save: session {sid} saved"),
-                    Err(e) => warn!("shutdown_save: failed to save session: {e}"),
+                if let Err(e) = forgetty_workspace::move_to_active(sid, &state) {
+                    warn!("{caller}: failed to refresh active/{sid}.json: {e}");
                 }
+                forgetty_workspace::pinned_aware_exit_move(sid, sm.is_pinned(), caller);
             }
-            std::process::exit(0);
-        }
-
-        if request.method == methods::SHUTDOWN_CLEAN {
-            // Browser-model close: save session, move to trash, then exit.
-            let resp = Response::success(request.id, serde_json::json!({ "ok": true }));
+            // Ack only after the file move has committed.
+            let resp = Response::success(request.id.clone(), serde_json::json!({ "ok": true }));
             write_response(&mut writer, &resp).await?;
-            info!("Received shutdown_clean RPC — saving, trashing, and exiting");
-            // Flush byte-log ring to disk (V2-007 / AD-013).
-            sm.flush_all_byte_logs().await;
-            info!("shutdown_clean: byte logs flushed");
-            if let Some(sid) = session_id {
-                // Check if pinned — pinned sessions do NOT get trashed.
-                let is_pinned = sm.is_pinned();
-                if is_pinned {
-                    // Pinned: just save the session file (no trash).
-                    let state = sm.snapshot_to_workspace_state();
-                    match forgetty_workspace::save_session_for(sid, &state) {
-                        Ok(()) => info!("shutdown_clean: pinned session {sid} saved"),
-                        Err(e) => warn!("shutdown_clean: failed to save session: {e}"),
-                    }
-                } else {
-                    // Unpinned: save then move to trash.
-                    let state = sm.snapshot_to_workspace_state();
-                    match forgetty_workspace::save_session_for(sid, &state) {
-                        Ok(()) => {
-                            info!("shutdown_clean: session {sid} saved");
-                            match forgetty_workspace::trash_session_for(sid) {
-                                Ok(()) => info!("shutdown_clean: session {sid} moved to trash"),
-                                Err(e) => warn!("shutdown_clean: trash failed: {e}"),
-                            }
-                        }
-                        Err(e) => warn!("shutdown_clean: failed to save session: {e}"),
-                    }
-                }
-            }
             std::process::exit(0);
-        }
-
-        if request.method == methods::DISCONNECT {
-            // V2-005 (AD-012): daemon survives window close.
-            //
-            // Acknowledge before saving so the client unblocks immediately.
-            let resp = Response::success(request.id, serde_json::json!({ "ok": true }));
-            write_response(&mut writer, &resp).await?;
-            info!("Received disconnect RPC — saving session, daemon continues running");
-            // Flush byte-log ring to disk (V2-007 / AD-013).
-            sm.flush_all_byte_logs().await;
-            info!("disconnect: byte logs flushed");
-            // Flush the session layout so reconnecting GTK clients can restore state.
-            if let Some(sid) = session_id {
-                let state = sm.snapshot_to_workspace_state();
-                match forgetty_workspace::save_session_for(sid, &state) {
-                    Ok(()) => info!("disconnect: session {sid} saved"),
-                    Err(e) => warn!("disconnect: failed to save session: {e}"),
-                }
-            }
-            // Connection ends here. The UnixListener loop in run_with_streaming
-            // continues accepting new connections. PTY processes and panes remain
-            // alive. AD-012.
-            return Ok(());
         }
 
         if request.method == methods::SHUTDOWN {
@@ -897,8 +857,12 @@ async fn handle_streaming_connection(
             continue;
         }
 
-        let response =
-            handlers::dispatch(&request, Arc::clone(&sm), sync_endpoint.as_ref().map(Arc::clone));
+        let response = handlers::dispatch(
+            &request,
+            Arc::clone(&sm),
+            sync_endpoint.as_ref().map(Arc::clone),
+            session_id,
+        );
         write_response(&mut writer, &response).await?;
     }
 
@@ -969,8 +933,9 @@ mod tests {
         // Spawn server accept loop in background.
         let handle = tokio::spawn(async move {
             let sm_inner = Arc::clone(&sm);
-            let handler =
-                Arc::new(move |req: Request| handlers::dispatch(&req, Arc::clone(&sm_inner), None));
+            let handler = Arc::new(move |req: Request| {
+                handlers::dispatch(&req, Arc::clone(&sm_inner), None, None)
+            });
             let (stream, _) = listener.accept().await.unwrap();
             handle_connection(stream, handler).await.unwrap();
         });
