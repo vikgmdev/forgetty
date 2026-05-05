@@ -15,7 +15,8 @@ use uuid::Uuid;
 ///
 /// As of T-063 this channel also carries layout mutation events
 /// (`TabCreated`, `TabClosed`, `PaneSplit`, `TabMoved`, `ActiveTabChanged`).
-/// T-067 added `WorkspaceCreated`; FIX-001 added `WorkspaceRenamed`.
+/// T-067 added `WorkspaceCreated`; FIX-001 added `WorkspaceRenamed`;
+/// FIX-006 added `WorkspacesReordered`; FIX-005B added `ActivePaneChanged`.
 /// Subscribers that only care about one class of event should filter in the
 /// receive loop.
 #[derive(Debug, Clone)]
@@ -82,4 +83,24 @@ pub enum SessionEvent {
     /// without re-fetching the layout. Emitted only when the value actually
     /// changed (idempotence — mirror `WorkspaceRenamed`).
     WorkspaceColorChanged { workspace_idx: usize, workspace_id: Uuid, color: Option<String> },
+
+    /// Two workspaces swapped positions in the sidebar order (FIX-006).
+    /// Carries both stable workspace IDs (not just indices) so subscribers
+    /// can reconcile by UUID if their local indices are stale. Emitted only
+    /// when `from_idx != to_idx` (same-index calls are idempotent no-ops).
+    WorkspacesReordered {
+        from_idx: usize,
+        to_idx: usize,
+        from_workspace_id: Uuid,
+        to_workspace_id: Uuid,
+    },
+
+    /// FIX-005B: the active pane id changed for a tab. `None` means the
+    /// focus pointer was cleared (resets to leftmost leaf on next render).
+    /// Emitted by `SessionManager::set_active_pane` only when the value
+    /// actually changed (idempotent). Subscribers update the per-tab
+    /// `active_pane_id` and (on the GTK side) call `grab_focus` on the
+    /// matching DrawingArea for genuinely-external events; self-echoes
+    /// are filtered via a provenance queue (see GTK `pending_active_pane`).
+    ActivePaneChanged { workspace_idx: usize, tab_id: Uuid, pane_id: Option<PaneId> },
 }

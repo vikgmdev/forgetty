@@ -129,6 +129,18 @@ pub mod methods {
     /// stored verbatim and forwarded to subscribers via a
     /// `workspace_color_changed` notification.
     pub const SET_WORKSPACE_COLOR: &str = "set_workspace_color";
+    /// FIX-006: swap two workspaces' positions in the sidebar order.
+    /// Params: `{ "from_idx": u64, "to_idx": u64 }`. Same-index calls are
+    /// idempotent no-ops; out-of-range indices return `INTERNAL_ERROR`.
+    /// On a successful swap the daemon broadcasts a
+    /// `workspaces_reordered` notification to `subscribe_layout` clients.
+    pub const MOVE_WORKSPACE: &str = "move_workspace";
+    /// FIX-005B: set the focused pane within a tab so cold restart restores
+    /// the user's last-typed pane. Params:
+    ///   { "workspace_idx": u64, "tab_id": "<uuid>", "pane_id": "<uuid>" | null }
+    /// `pane_id: null` clears the focus pointer (falls back to first leaf).
+    /// Daemon emits an `active_pane_changed` notification on success.
+    pub const SET_ACTIVE_PANE: &str = "set_active_pane";
     // Split ratio sync (B-002).
     pub const UPDATE_SPLIT_RATIOS: &str = "update_split_ratios";
     // Pinned sessions (B-002).

@@ -278,12 +278,27 @@ async fn main_async() -> anyhow::Result<()> {
                         let root_cwd = first_leaf_cwd(&tab.pane_tree);
                         let effective_root_cwd =
                             if root_cwd.is_dir() { Some(root_cwd.to_path_buf()) } else { None };
-                        match session_manager.create_tab(
-                            ws_idx,
-                            effective_root_cwd,
-                            default_size,
-                            None,
-                        ) {
+                        // FIX-013: reuse the saved leftmost-leaf pane_id when present so
+                        // `logs/{pane_uuid}.log` is reopened by `ByteLog::new` and the
+                        // saved scrollback replays. Falls back to a fresh UUID for
+                        // pre-FIX-013 sessions where `pane_id` is `None`.
+                        let saved_root_pane_id = first_leaf_pane_id(&tab.pane_tree);
+                        let create_result = match saved_root_pane_id {
+                            Some(pid) => session_manager.create_tab_with_pane_id(
+                                ws_idx,
+                                effective_root_cwd,
+                                default_size,
+                                None,
+                                forgetty_core::PaneId(pid),
+                            ),
+                            None => session_manager.create_tab(
+                                ws_idx,
+                                effective_root_cwd,
+                                default_size,
+                                None,
+                            ),
+                        };
+                        match create_result {
                             Ok((root_pane_id, _tab_id)) => {
                                 debug!("cold-start restore: created root pane {root_pane_id} for workspace {ws_idx}");
                                 // Restore the full split tree rooted at this pane.
@@ -354,6 +369,65 @@ async fn main_async() -> anyhow::Result<()> {
                         state.active_workspace
                     );
                 }
+
+                // FIX-005B: propagate each saved tab's `active_pane_id` into the
+                // live SessionLayout. Unlike `active_tab` (a stable index),
+                // `active_pane_id` is a UUID and the daemon mints fresh PaneIds
+                // for every restored leaf. We walk the saved + live pane_trees
+                // in lock-step (`live_pane_id_for_saved`) to translate the
+                // saved UUID into the live PaneId at the same tree position.
+                //
+                // Pre-collect every `(ws_idx, live_tab_id, live_pane_id)` tuple
+                // before calling `set_active_pane` so the layout snapshot is
+                // not held across the manager's mutex re-acquire. Orphan saved
+                // UUIDs (saved leaf no longer in the restored tree, e.g. partial
+                // split-restore failure) degrade to `warn!` per AC-7.
+                //
+                // Ordering note: this restore happens BEFORE the layout-event
+                // watcher's `tokio::spawn` below — `ActivePaneChanged` events
+                // fire into the broadcast channel's zero subscribers and are
+                // silently dropped (`Err(NoReceivers)`), preserving the FIX-005A
+                // "quiet startup" invariant.
+                let mut restore_targets: Vec<(usize, uuid::Uuid, PaneId)> = Vec::new();
+                {
+                    let live_layout = session_manager.layout();
+                    for (ws_idx, saved_workspace) in state.workspaces.iter().enumerate() {
+                        let Some(live_ws) = live_layout.workspaces.get(ws_idx) else {
+                            continue;
+                        };
+                        for (i, saved_tab) in saved_workspace.tabs.iter().enumerate() {
+                            let Some(live_tab) = live_ws.tabs.get(i) else { continue };
+                            let Some(saved_pane_uuid) = saved_tab.active_pane_id else {
+                                continue;
+                            };
+                            match live_pane_id_for_saved(
+                                &saved_tab.pane_tree,
+                                &live_tab.pane_tree,
+                                saved_pane_uuid,
+                            ) {
+                                Some(live_pane_id) => {
+                                    restore_targets.push((ws_idx, live_tab.id, live_pane_id));
+                                }
+                                None => {
+                                    warn!(
+                                        "cold-start restore: saved active_pane_id={saved_pane_uuid} \
+                                         not found in workspace {ws_idx} tab {} pane_tree \
+                                         (orphan; falling back to first leaf)",
+                                        live_tab.id
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                for (ws_idx, tab_id, pane_id) in restore_targets {
+                    if let Err(e) = session_manager.set_active_pane(ws_idx, tab_id, Some(pane_id)) {
+                        warn!(
+                            "cold-start restore: failed to set active_pane on workspace {ws_idx} \
+                             tab {tab_id}: {e}"
+                        );
+                    }
+                }
             }
             Ok(Some(_)) => {
                 debug!("cold-start restore: session file has no workspaces, starting fresh");
@@ -413,6 +487,16 @@ async fn main_async() -> anyhow::Result<()> {
     // Bind the socket server (with session_id so shutdown_save can write the correct file).
     let socket_server = SocketServer::new_with_session(socket_path.clone(), session_id)?;
 
+    // P-018 / AD-016 (AC-2): write `sessions/active/{uuid}.json` synchronously
+    // BEFORE the socket server starts accepting connections. The first GTK
+    // client must observe a live `active/` file the moment it can read the
+    // socket, so any externally-driven check (`ls active/`, file watcher) sees
+    // the daemon's existence.
+    //
+    // Safety: this runs single-threaded before tokio spawns watchers. There is
+    // no concurrent writer to `active/{session_id}.json` here.
+    save_session_from_layout(&session_manager, session_id);
+
     info!("forgetty-daemon started, socket at {}", socket_path.display());
 
     // Per-pane drain tasks are spawned by the SessionManager automatically
@@ -452,7 +536,9 @@ async fn main_async() -> anyhow::Result<()> {
                     | Ok(SessionEvent::WorkspaceCreated { .. })
                     | Ok(SessionEvent::WorkspaceRenamed { .. })
                     | Ok(SessionEvent::WorkspaceDeleted { .. })
-                    | Ok(SessionEvent::WorkspaceColorChanged { .. }) => {
+                    | Ok(SessionEvent::WorkspaceColorChanged { .. })
+                    | Ok(SessionEvent::WorkspacesReordered { .. })
+                    | Ok(SessionEvent::ActivePaneChanged { .. }) => {
                         // Save immediately so sibling daemons' prune passes
                         // see this pane's UUID in the persisted-union (V2-007
                         // fix cycle 7). Leave the dirty flag set as well so
@@ -570,7 +656,16 @@ async fn main_async() -> anyhow::Result<()> {
     // clients (and next cold-start) see up-to-date scrollback.
     session_manager.flush_all_byte_logs().await;
     info!("byte logs flushed");
+    // P-018 / AD-016: snapshot to active/, then pinned-aware move on signal exit.
+    // Same shape as the in-RPC paths (shutdown_clean/disconnect/shutdown_save):
+    // refresh the active/ file with the latest in-memory state, then move it
+    // out based on pin state.
     save_session_from_layout(&session_manager, session_id);
+    forgetty_workspace::pinned_aware_exit_move(
+        session_id,
+        session_manager.is_pinned(),
+        "signal exit",
+    );
     session_manager.kill_all();
 
     Ok(())
@@ -580,15 +675,20 @@ async fn main_async() -> anyhow::Result<()> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Snapshot the live session layout and write it to the UUID-named session file.
+/// Snapshot the live session layout and write it to `sessions/active/{uuid}.json`.
+///
+/// P-018 / AD-016: live daemons write to the `active/` bucket. The file is
+/// only moved into `sessions/{uuid}.json` (pinned) or `sessions/trash/{uuid}.json`
+/// (unpinned) by the daemon's clean-exit path (see `pinned_aware_exit_move`
+/// in `forgetty-socket`).
 ///
 /// This is the single call site used by all three save triggers (SIGTERM/SIGINT
 /// shutdown, debounced auto-save, and the periodic safety save). Save failures
 /// are non-fatal: a warning is logged but no error is propagated.
 fn save_session_from_layout(session_manager: &SessionManager, session_id: uuid::Uuid) {
     let state = session_manager.snapshot_to_workspace_state();
-    match forgetty_workspace::save_session_for(session_id, &state) {
-        Ok(()) => debug!(session_id = %session_id, "daemon: session layout saved"),
+    match forgetty_workspace::move_to_active(session_id, &state) {
+        Ok(()) => debug!(session_id = %session_id, "daemon: session layout saved to active/"),
         Err(e) => warn!("daemon: failed to save session layout: {e}"),
     }
 }
@@ -601,6 +701,57 @@ fn first_leaf_cwd(tree: &forgetty_workspace::PaneTreeState) -> &std::path::Path 
     match tree {
         forgetty_workspace::PaneTreeState::Leaf { cwd, .. } => cwd,
         forgetty_workspace::PaneTreeState::Split { first, .. } => first_leaf_cwd(first),
+    }
+}
+
+/// Walk to the leftmost leaf of a saved pane tree and return its `pane_id` (FIX-013).
+///
+/// Returns `None` if the leaf has no recorded pane_id (pre-FIX-013 session JSONs
+/// where `PaneTreeState::Leaf::pane_id` deserialised via `#[serde(default)]`).
+fn first_leaf_pane_id(tree: &forgetty_workspace::PaneTreeState) -> Option<uuid::Uuid> {
+    match tree {
+        forgetty_workspace::PaneTreeState::Leaf { pane_id, .. } => *pane_id,
+        forgetty_workspace::PaneTreeState::Split { first, .. } => first_leaf_pane_id(first),
+    }
+}
+
+/// FIX-005B: walk the saved pane_tree and the live pane_tree in lock-step,
+/// returning the **live** PaneId of the leaf at the same position as the
+/// saved leaf whose `pane_id == saved_target`.
+///
+/// Cold restart re-mints `PaneId::new()` for every restored leaf, so the
+/// saved UUID is never directly present in the live layout. The trees are
+/// built in matching shape by `restore_subtree` (recursive on the saved
+/// tree), so a parallel walk lets us translate "the leaf that used to be
+/// `saved_target`" → "this live PaneId".
+///
+/// Returns `None` if the trees diverge in shape (would only happen if a
+/// future refactor of `restore_subtree` broke the invariant) or if no
+/// saved leaf matches `saved_target` (orphan UUID — caller falls back to
+/// the first leaf).
+fn live_pane_id_for_saved(
+    saved: &forgetty_workspace::PaneTreeState,
+    live: &forgetty_session::workspace::PaneTreeLayout,
+    saved_target: uuid::Uuid,
+) -> Option<PaneId> {
+    use forgetty_session::workspace::PaneTreeLayout as Live;
+    use forgetty_workspace::PaneTreeState as Saved;
+
+    match (saved, live) {
+        (Saved::Leaf { pane_id: saved_id, .. }, Live::Leaf { pane_id: live_id }) => {
+            if *saved_id == Some(saved_target) {
+                Some(*live_id)
+            } else {
+                None
+            }
+        }
+        (Saved::Split { first: sa, second: sb, .. }, Live::Split { first: la, second: lb, .. }) => {
+            live_pane_id_for_saved(sa, la, saved_target)
+                .or_else(|| live_pane_id_for_saved(sb, lb, saved_target))
+        }
+        // Tree shape mismatch — should not happen because `restore_subtree`
+        // builds the live tree from the saved tree, but degrade safely.
+        _ => None,
     }
 }
 
@@ -630,13 +781,29 @@ fn restore_subtree(
             let effective_cwd =
                 if second_cwd.is_dir() { Some(second_cwd.to_path_buf()) } else { None };
 
-            match session_manager.split_pane_with_ratio(
-                anchor_id,
-                direction,
-                *ratio,
-                size,
-                effective_cwd,
-            ) {
+            // FIX-013: reuse the saved leftmost-leaf pane_id of the `second` subtree
+            // when present so its byte log is replayed on cold restart. The `first`
+            // subtree's leaves stay anchored on the existing `anchor_id` chain.
+            let saved_second_pane_id = first_leaf_pane_id(second);
+            let split_result = match saved_second_pane_id {
+                Some(pid) => session_manager.split_pane_with_ratio_and_pane_id(
+                    anchor_id,
+                    direction,
+                    *ratio,
+                    size,
+                    effective_cwd,
+                    forgetty_core::PaneId(pid),
+                ),
+                None => session_manager.split_pane_with_ratio(
+                    anchor_id,
+                    direction,
+                    *ratio,
+                    size,
+                    effective_cwd,
+                ),
+            };
+
+            match split_result {
                 Ok(second_pane_id) => {
                     restore_subtree(session_manager, anchor_id, first, size);
                     restore_subtree(session_manager, second_pane_id, second, size);
