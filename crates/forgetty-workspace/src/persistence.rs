@@ -137,6 +137,360 @@ pub fn trash_dir() -> PathBuf {
     data_dir().join("sessions").join("trash")
 }
 
+// ---------------------------------------------------------------------------
+// Active-bucket persistence (P-018 / AD-016)
+// ---------------------------------------------------------------------------
+
+/// Return the path to the `active/` directory for live (running) sessions.
+///
+/// Typically `~/.local/share/forgetty/sessions/active/`.
+///
+/// AD-016: live daemons write their session JSON here. On clean exit the file
+/// is moved to `sessions/{uuid}.json` (pinned) or `sessions/trash/{uuid}.json`
+/// (unpinned). Files left here at startup are crash orphans and are processed
+/// by [`recover_orphans_in_active`].
+pub fn active_dir() -> PathBuf {
+    data_dir().join("sessions").join("active")
+}
+
+/// Return the path to a UUID-named live session file in `active/`.
+///
+/// Typically `~/.local/share/forgetty/sessions/active/{session_id}.json`.
+pub fn session_path_active_for(session_id: uuid::Uuid) -> PathBuf {
+    active_dir().join(format!("{session_id}.json"))
+}
+
+/// Persist `state` to `sessions/active/{session_id}.json`.
+///
+/// Creates `active/` if absent. Uses the same atomic-write helper as
+/// `save_session_for` (write `.tmp`, rename), inheriting 0600 mode from the
+/// process umask the daemon sets at startup.
+///
+/// This is the canonical "live daemon write" path: called once at daemon
+/// startup before the socket binds, again on every save trigger
+/// (set_pinned, debounce, periodic, shutdown). The file is moved out of
+/// `active/` by [`move_active_to_sessions`] or [`move_active_to_trash`] on
+/// clean shutdown.
+pub fn move_to_active(session_id: uuid::Uuid, state: &WorkspaceState) -> io::Result<()> {
+    save_to_path(&session_path_active_for(session_id), state)
+}
+
+/// Move `src` → `dest`, creating `dest`'s parent directory if needed and
+/// falling back to copy+remove for cross-device renames.
+///
+/// All three buckets (`sessions/`, `active/`, `trash/`) live under the same
+/// XDG data subtree so `rename(2)` is atomic. The cross-device fallback is
+/// preserved for unusual `XDG_DATA_HOME` setups (e.g. data dir on a different
+/// filesystem from `/tmp`).
+fn rename_with_fallback(src: &std::path::Path, dest: &std::path::Path) -> io::Result<()> {
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if fs::rename(src, dest).is_err() {
+        fs::copy(src, dest)?;
+        fs::remove_file(src)?;
+    }
+    Ok(())
+}
+
+/// Atomically move `sessions/active/{uuid}.json` → `sessions/{uuid}.json`.
+///
+/// Used for the **pinned** clean-close path (AD-016). Idempotent: returns
+/// `Ok(())` if the source does not exist (already moved or never created).
+pub fn move_active_to_sessions(session_id: uuid::Uuid) -> io::Result<()> {
+    let src = session_path_active_for(session_id);
+    if !src.exists() {
+        return Ok(());
+    }
+    rename_with_fallback(&src, &session_path_for(session_id))
+}
+
+/// Atomically move `sessions/active/{uuid}.json` → `sessions/trash/{uuid}.json`.
+///
+/// Used for the **unpinned** clean-close path (AD-016). Idempotent: returns
+/// `Ok(())` if the source does not exist.
+pub fn move_active_to_trash(session_id: uuid::Uuid) -> io::Result<()> {
+    let src = session_path_active_for(session_id);
+    if !src.exists() {
+        return Ok(());
+    }
+    rename_with_fallback(&src, &trash_dir().join(format!("{session_id}.json")))
+}
+
+/// Delete `sessions/active/{uuid}.json` for the given session.
+///
+/// Used during crash-recovery for unpinned orphans (AD-016, AC-16). Silent if
+/// the file does not exist.
+pub fn delete_active_for(session_id: uuid::Uuid) -> io::Result<()> {
+    let path = session_path_active_for(session_id);
+    if path.exists() {
+        fs::remove_file(&path)?;
+    }
+    Ok(())
+}
+
+/// Atomically move `sessions/trash/{uuid}.json` → `sessions/active/{uuid}.json`.
+///
+/// Used by the "Undo Close" toast restore path: the trashed file is promoted
+/// back into the live bucket so a subsequent `--restore-session` can spawn
+/// a daemon that writes there.
+///
+/// Returns `Err(NotFound)` if the trash file does not exist — the caller
+/// (notification action handler) needs to know if the recovery window has
+/// closed.
+pub fn restore_from_trash_to_active(session_id: uuid::Uuid) -> io::Result<()> {
+    let src = trash_dir().join(format!("{session_id}.json"));
+    if !src.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("trash file not found: {}", src.display()),
+        ));
+    }
+    rename_with_fallback(&src, &session_path_active_for(session_id))
+}
+
+/// AD-016 pinned-aware exit move.
+///
+/// `pinned == true`  → `move_active_to_sessions(session_id)`.
+/// `pinned == false` → `move_active_to_trash(session_id)`.
+///
+/// Failures are warn-logged via `tracing` and swallowed — the caller is in
+/// an exit path and cannot meaningfully recover. `caller` is a short label
+/// for log attribution (e.g. `"shutdown_clean"`, `"signal exit"`).
+///
+/// Single-call helper that closes the duplicated branch logic in the daemon
+/// signal path and the socket-server RPC handlers.
+pub fn pinned_aware_exit_move(session_id: uuid::Uuid, pinned: bool, caller: &str) {
+    if pinned {
+        match move_active_to_sessions(session_id) {
+            Ok(()) => tracing::info!("{caller}: pinned session {session_id} promoted to sessions/"),
+            Err(e) => tracing::warn!("{caller}: move_active_to_sessions failed: {e}"),
+        }
+    } else {
+        match move_active_to_trash(session_id) {
+            Ok(()) => tracing::info!("{caller}: unpinned session {session_id} moved to trash"),
+            Err(e) => tracing::warn!("{caller}: move_active_to_trash failed: {e}"),
+        }
+    }
+}
+
+/// Scan `sessions/active/` for orphan files (unclean shutdown remnants) and
+/// return their `(uuid, is_pinned)` pairs.
+///
+/// Called once at GTK startup before the daemon spawns. The caller drives
+/// the resulting moves: pinned → `move_active_to_sessions`; unpinned →
+/// `delete_active_for`.
+///
+/// Tolerant of:
+/// - missing `active/` directory (returns empty `Vec`),
+/// - corrupt JSON files (warn-logged and skipped),
+/// - non-UUID filenames (silently skipped — same filter as `list_sessions`),
+/// - subdirectories or other non-file entries (skipped).
+///
+/// Reads only the `pinned` field — uses a dedicated `OrphanProbe` struct so
+/// schema-incompatible files (older or newer versions) still load if the
+/// `pinned` boolean is parseable.
+pub fn recover_orphans_in_active() -> Vec<(uuid::Uuid, bool)> {
+    let dir = active_dir();
+    let entries = match fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let s = name.to_string_lossy();
+        let stem = match s.strip_suffix(".json") {
+            Some(s) => s,
+            None => continue,
+        };
+        let uuid = match uuid::Uuid::parse_str(stem) {
+            Ok(u) => u,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        match read_pinned_field(&path) {
+            Ok(is_pinned) => out.push((uuid, is_pinned)),
+            Err(e) => {
+                tracing::warn!(
+                    "recover_orphans_in_active: skipping corrupt orphan {}: {e}",
+                    path.display()
+                );
+            }
+        }
+    }
+    out
+}
+
+/// Read just the `pinned` field from a session JSON file.
+///
+/// Uses a minimal `OrphanProbe` struct with `serde(default)` so the function
+/// succeeds on older (pre-`pinned`) schemas, returning `false`. Returns an
+/// error only for I/O failures or syntactically invalid JSON.
+fn read_pinned_field(path: &std::path::Path) -> io::Result<bool> {
+    #[derive(serde::Deserialize)]
+    struct OrphanProbe {
+        #[serde(default)]
+        pinned: bool,
+    }
+
+    let contents = fs::read_to_string(path)?;
+    let probe: OrphanProbe = serde_json::from_str(&contents)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    Ok(probe.pinned)
+}
+
+// ---------------------------------------------------------------------------
+// One-shot migration to the three-bucket layout (P-018 / AD-016)
+// ---------------------------------------------------------------------------
+
+/// Path to the migration idempotency marker.
+///
+/// Typically `~/.local/share/forgetty/.migration_p018`. Contains the literal
+/// string `"p018-v1\n"` (one line, LF-terminated) when migration has run.
+/// Future migrations (`p018-v2`, `p019-v1`) will inspect this file to decide
+/// whether to re-run.
+pub fn migration_p018_marker_path() -> PathBuf {
+    data_dir().join(".migration_p018")
+}
+
+/// One-shot migration to the AD-016 three-bucket layout.
+///
+/// Behaviour (idempotent — gated on [`migration_p018_marker_path`]):
+///
+/// 1. If the marker exists, return `Ok(())` immediately.
+/// 2. List `sessions/*.json` (top-level only; `active/`, `trash/`, and
+///    `snapshots/` are skipped by the `.json` suffix filter on directories).
+/// 3. For each file, read just the `pinned` field. On JSON corruption: log a
+///    `WARN` line and leave the file in place (skip semantics — AC-23).
+/// 4. If `pinned: true`: leave in `sessions/` (no-op).
+/// 5. If `pinned: false`: rename to `sessions/trash/{uuid}.json`. If the
+///    trash file already exists (partial prior migration — AC-24), the
+///    `sessions/` copy is the duplicate and is removed; the `trash/` copy
+///    is authoritative.
+/// 6. Create `sessions/active/` if absent.
+/// 7. Write the marker with content `"p018-v1\n"`.
+///
+/// Failure modes are non-fatal at the caller (GTK startup): file-level errors
+/// are logged and skipped; only marker-write failure propagates as `Err` so
+/// the caller can decide whether to re-run on the next launch.
+pub fn run_migration_p018() -> io::Result<()> {
+    let marker = migration_p018_marker_path();
+    if marker.exists() {
+        tracing::debug!("run_migration_p018: marker present at {}, skipping", marker.display());
+        return Ok(());
+    }
+
+    let sessions_root = data_dir().join("sessions");
+    let trash = trash_dir();
+    let active = active_dir();
+
+    // Ensure `active/` exists for new daemons (created up-front so a daemon
+    // start that races with migration still has the directory).
+    fs::create_dir_all(&active)?;
+    fs::create_dir_all(&trash)?;
+
+    // Enumerate top-level UUID-named JSON files.
+    let entries = match fs::read_dir(&sessions_root) {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            // No `sessions/` at all — first ever launch. Write the marker so
+            // we don't re-scan on every launch.
+            write_marker(&marker)?;
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("run_migration_p018: cannot stat {}: {e}; skipping", path.display());
+                continue;
+            }
+        };
+        if !file_type.is_file() {
+            continue; // skip `active/`, `trash/`, `snapshots/`, etc.
+        }
+        let name = entry.file_name();
+        let s = name.to_string_lossy();
+        let stem = match s.strip_suffix(".json") {
+            Some(stem) => stem,
+            None => continue, // not a session file
+        };
+        let session_id = match uuid::Uuid::parse_str(stem) {
+            Ok(u) => u,
+            Err(_) => continue, // non-UUID name — leave it alone
+        };
+
+        let pinned = match read_pinned_field(&path) {
+            Ok(p) => p,
+            Err(e) => {
+                // Corrupt JSON or I/O — leave file in place and warn (AC-23).
+                tracing::warn!(
+                    "run_migration_p018: corrupt or unreadable session {}: {e}; skipping",
+                    path.display()
+                );
+                continue;
+            }
+        };
+
+        if pinned {
+            tracing::debug!("run_migration_p018: leaving pinned session in place: {session_id}");
+            continue;
+        }
+
+        // Unpinned: move to trash. Handle AC-24 duplicate semantics.
+        let dest = trash.join(format!("{session_id}.json"));
+        if dest.exists() {
+            // Partial prior migration: trash is authoritative; the
+            // `sessions/` copy is the duplicate. Remove it.
+            if let Err(e) = fs::remove_file(&path) {
+                tracing::warn!(
+                    "run_migration_p018: duplicate cleanup failed for {}: {e}",
+                    path.display()
+                );
+            } else {
+                tracing::info!(
+                    "run_migration_p018: removed duplicate {} (trash copy kept)",
+                    path.display()
+                );
+            }
+            continue;
+        }
+        if let Err(e) = fs::rename(&path, &dest) {
+            // Cross-device fallback.
+            if fs::copy(&path, &dest).is_ok() && fs::remove_file(&path).is_ok() {
+                tracing::info!(
+                    "run_migration_p018: copy+delete fallback moved {session_id} to trash"
+                );
+            } else {
+                tracing::warn!(
+                    "run_migration_p018: rename {} → {} failed: {e}",
+                    path.display(),
+                    dest.display()
+                );
+            }
+        } else {
+            tracing::info!("run_migration_p018: moved unpinned session {session_id} to trash");
+        }
+    }
+
+    write_marker(&marker)?;
+    Ok(())
+}
+
+/// Write the migration marker with content `"p018-v1\n"`.
+fn write_marker(marker: &std::path::Path) -> io::Result<()> {
+    if let Some(parent) = marker.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(marker, b"p018-v1\n")?;
+    Ok(())
+}
+
 /// Move a session file from `sessions/{uuid}.json` to `sessions/trash/{uuid}.json`.
 ///
 /// Creates the trash directory if needed. Uses `rename()` for atomicity (same
@@ -474,6 +828,7 @@ mod tests {
                         }),
                     },
                     pane_id: None,
+                    active_pane_id: None,
                 }],
                 active_tab: 0,
                 color: None,
@@ -624,6 +979,7 @@ mod tests {
                                 pane_id: None,
                             },
                             pane_id: None,
+                            active_pane_id: None,
                         },
                         TabState {
                             title: "build".into(),
@@ -632,6 +988,7 @@ mod tests {
                                 pane_id: None,
                             },
                             pane_id: None,
+                            active_pane_id: None,
                         },
                     ],
                     active_tab: 1,
@@ -657,6 +1014,7 @@ mod tests {
                             }),
                         },
                         pane_id: None,
+                        active_pane_id: None,
                     }],
                     active_tab: 0,
                     color: None,
@@ -672,6 +1030,7 @@ mod tests {
                             pane_id: None,
                         },
                         pane_id: None,
+                        active_pane_id: None,
                     }],
                     active_tab: 0,
                     color: None,
@@ -724,6 +1083,7 @@ mod tests {
                         pane_id: None,
                     },
                     pane_id: None,
+                    active_pane_id: None,
                 }],
                 active_tab: 0,
                 color: None,
@@ -958,6 +1318,7 @@ mod tests {
                             }),
                         },
                         pane_id: Some(tab_root),
+                        active_pane_id: None,
                     }],
                     active_tab: 0,
                     color: None,
@@ -977,6 +1338,7 @@ mod tests {
                         // TabState.pane_id identical to the leaf above —
                         // exercises dedup path.
                         pane_id: Some(duplicate),
+                        active_pane_id: None,
                     }],
                     active_tab: 0,
                     color: None,
@@ -997,5 +1359,360 @@ mod tests {
         assert!(set.contains(&duplicate));
         // None leaf should not contribute; duplicate should appear exactly once.
         assert_eq!(set.len(), 4, "expected 4 unique ids after dedup, got {}: {set:?}", set.len());
+    }
+
+    // -----------------------------------------------------------------------
+    // P-018: three-bucket layout (active/, sessions/, trash/) + migration
+    // -----------------------------------------------------------------------
+    //
+    // These tests use a process-global mutex to serialize XDG_DATA_HOME
+    // mutation. `cargo test` runs tests in parallel by default, and
+    // `data_dir()` reads the env var at call time — without serialization,
+    // tests would leak XDG_DATA_HOME values into each other.
+
+    use std::sync::Mutex;
+
+    /// Serialize XDG_DATA_HOME-mutating tests. Lazily initialized on first
+    /// use; lock held for the duration of each individual test.
+    fn xdg_lock() -> &'static Mutex<()> {
+        use std::sync::OnceLock;
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// RAII guard: sets `XDG_DATA_HOME` to a temp dir, restores prior value
+    /// on drop. Unsafe in the same sense as `std::env::set_var` but used
+    /// only inside the `xdg_lock` mutex.
+    struct XdgGuard {
+        _tmp: tempfile::TempDir,
+        prior: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+    impl XdgGuard {
+        fn new() -> Self {
+            let lock = xdg_lock().lock().unwrap_or_else(|e| e.into_inner());
+            let prior = std::env::var_os("XDG_DATA_HOME");
+            let tmp = tempfile::tempdir().expect("tempdir");
+            // SAFETY: serialized by `xdg_lock`; tests in this file are the
+            // only XDG_DATA_HOME mutators.
+            unsafe {
+                std::env::set_var("XDG_DATA_HOME", tmp.path());
+            }
+            Self { _tmp: tmp, prior, _lock: lock }
+        }
+    }
+    impl Drop for XdgGuard {
+        fn drop(&mut self) {
+            // SAFETY: serialized by `xdg_lock`.
+            unsafe {
+                if let Some(prev) = self.prior.take() {
+                    std::env::set_var("XDG_DATA_HOME", prev);
+                } else {
+                    std::env::remove_var("XDG_DATA_HOME");
+                }
+            }
+        }
+    }
+
+    fn write_pinned_session_file(path: &std::path::Path, pinned: bool) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        let body = format!(
+            "{{\"version\":1,\"workspaces\":[],\"active_workspace\":0,\"pinned\":{pinned}}}"
+        );
+        fs::write(path, body).unwrap();
+    }
+
+    #[test]
+    fn p018_active_dir_under_sessions() {
+        let _g = XdgGuard::new();
+        let active = active_dir();
+        assert!(active.ends_with("sessions/active"), "{}", active.display());
+    }
+
+    #[test]
+    fn p018_session_path_active_for_format() {
+        let _g = XdgGuard::new();
+        let id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let path = session_path_active_for(id);
+        assert!(path
+            .to_string_lossy()
+            .ends_with("sessions/active/550e8400-e29b-41d4-a716-446655440000.json"));
+    }
+
+    #[test]
+    fn p018_move_to_active_writes_file() {
+        let _g = XdgGuard::new();
+        let id = Uuid::new_v4();
+        let state = WorkspaceState::default();
+        move_to_active(id, &state).unwrap();
+        let p = session_path_active_for(id);
+        assert!(p.exists(), "active file should exist at {}", p.display());
+    }
+
+    #[test]
+    fn p018_move_active_to_sessions_pinned_path() {
+        let _g = XdgGuard::new();
+        let id = Uuid::new_v4();
+        let mut state = WorkspaceState::default();
+        state.pinned = true;
+        move_to_active(id, &state).unwrap();
+        move_active_to_sessions(id).unwrap();
+
+        assert!(!session_path_active_for(id).exists(), "active should be empty");
+        assert!(session_path_for(id).exists(), "sessions/{id}.json should exist");
+    }
+
+    #[test]
+    fn p018_move_active_to_trash_unpinned_path() {
+        let _g = XdgGuard::new();
+        let id = Uuid::new_v4();
+        let state = WorkspaceState::default();
+        move_to_active(id, &state).unwrap();
+        move_active_to_trash(id).unwrap();
+
+        assert!(!session_path_active_for(id).exists(), "active should be empty");
+        assert!(trash_dir().join(format!("{id}.json")).exists(), "trash file should exist");
+        assert!(!session_path_for(id).exists(), "no top-level file should exist");
+    }
+
+    #[test]
+    fn p018_move_active_to_sessions_idempotent_on_missing() {
+        let _g = XdgGuard::new();
+        let id = Uuid::new_v4();
+        // No file in active/ — should be a no-op, not an error.
+        move_active_to_sessions(id).unwrap();
+        move_active_to_trash(id).unwrap();
+    }
+
+    #[test]
+    fn p018_delete_active_for_removes_file() {
+        let _g = XdgGuard::new();
+        let id = Uuid::new_v4();
+        let state = WorkspaceState::default();
+        move_to_active(id, &state).unwrap();
+        assert!(session_path_active_for(id).exists());
+
+        delete_active_for(id).unwrap();
+        assert!(!session_path_active_for(id).exists());
+
+        // Idempotent.
+        delete_active_for(id).unwrap();
+    }
+
+    #[test]
+    fn p018_restore_from_trash_to_active_round_trip() {
+        let _g = XdgGuard::new();
+        let id = Uuid::new_v4();
+        let state = WorkspaceState::default();
+        move_to_active(id, &state).unwrap();
+        move_active_to_trash(id).unwrap();
+        assert!(trash_dir().join(format!("{id}.json")).exists());
+
+        restore_from_trash_to_active(id).unwrap();
+        assert!(session_path_active_for(id).exists());
+        assert!(!trash_dir().join(format!("{id}.json")).exists());
+    }
+
+    #[test]
+    fn p018_recover_orphans_in_active_returns_pinned_pairs() {
+        let _g = XdgGuard::new();
+        let pinned_id = Uuid::new_v4();
+        let unpinned_id = Uuid::new_v4();
+
+        write_pinned_session_file(&session_path_active_for(pinned_id), true);
+        write_pinned_session_file(&session_path_active_for(unpinned_id), false);
+
+        let orphans = recover_orphans_in_active();
+        assert_eq!(orphans.len(), 2);
+
+        let pinned = orphans.iter().find(|(u, _)| *u == pinned_id).unwrap();
+        assert!(pinned.1, "pinned session should report pinned=true");
+
+        let unpinned = orphans.iter().find(|(u, _)| *u == unpinned_id).unwrap();
+        assert!(!unpinned.1, "unpinned session should report pinned=false");
+    }
+
+    #[test]
+    fn p018_recover_orphans_skips_corrupt_json() {
+        let _g = XdgGuard::new();
+        let valid = Uuid::new_v4();
+        let corrupt = Uuid::new_v4();
+
+        write_pinned_session_file(&session_path_active_for(valid), true);
+        // Corrupt JSON: just `{`.
+        fs::create_dir_all(active_dir()).unwrap();
+        fs::write(session_path_active_for(corrupt), b"{").unwrap();
+
+        let orphans = recover_orphans_in_active();
+        assert_eq!(orphans.len(), 1, "corrupt orphan must be skipped");
+        assert_eq!(orphans[0].0, valid);
+    }
+
+    #[test]
+    fn p018_recover_orphans_on_missing_dir() {
+        let _g = XdgGuard::new();
+        // No active/ exists — empty vec, not an error.
+        let orphans = recover_orphans_in_active();
+        assert!(orphans.is_empty());
+    }
+
+    #[test]
+    fn p018_recover_orphans_skips_non_uuid_filenames() {
+        let _g = XdgGuard::new();
+        fs::create_dir_all(active_dir()).unwrap();
+        fs::write(active_dir().join("not-a-uuid.json"), b"{\"pinned\":true}").unwrap();
+        fs::write(active_dir().join("nojson.txt"), b"meh").unwrap();
+        let orphans = recover_orphans_in_active();
+        assert!(orphans.is_empty(), "non-UUID files must be skipped, got: {orphans:?}");
+    }
+
+    #[test]
+    fn p018_migration_creates_marker_with_version() {
+        let _g = XdgGuard::new();
+        run_migration_p018().unwrap();
+
+        let marker = migration_p018_marker_path();
+        assert!(marker.exists(), "marker should exist");
+        let content = fs::read_to_string(&marker).unwrap();
+        assert_eq!(content, "p018-v1\n");
+    }
+
+    #[test]
+    fn p018_migration_moves_unpinned_to_trash_keeps_pinned() {
+        let _g = XdgGuard::new();
+        let pinned_ids: Vec<_> = (0..3).map(|_| Uuid::new_v4()).collect();
+        let unpinned_ids: Vec<_> = (0..3).map(|_| Uuid::new_v4()).collect();
+
+        for &id in &pinned_ids {
+            write_pinned_session_file(&session_path_for(id), true);
+        }
+        for &id in &unpinned_ids {
+            write_pinned_session_file(&session_path_for(id), false);
+        }
+
+        run_migration_p018().unwrap();
+
+        for &id in &pinned_ids {
+            assert!(session_path_for(id).exists(), "pinned {id} should remain in sessions/");
+            assert!(!trash_dir().join(format!("{id}.json")).exists());
+        }
+        for &id in &unpinned_ids {
+            assert!(!session_path_for(id).exists(), "unpinned {id} must leave sessions/");
+            assert!(
+                trash_dir().join(format!("{id}.json")).exists(),
+                "unpinned {id} must be in trash/"
+            );
+        }
+    }
+
+    #[test]
+    fn p018_migration_idempotent_skip_on_marker() {
+        let _g = XdgGuard::new();
+        let id = Uuid::new_v4();
+        write_pinned_session_file(&session_path_for(id), false);
+
+        run_migration_p018().unwrap();
+        assert!(trash_dir().join(format!("{id}.json")).exists());
+
+        // Place a new unpinned file after migration ran. With the marker
+        // present, migration must NOT re-process.
+        let id2 = Uuid::new_v4();
+        write_pinned_session_file(&session_path_for(id2), false);
+        run_migration_p018().unwrap();
+
+        assert!(
+            session_path_for(id2).exists(),
+            "marker must prevent re-migration; id2 should still be in sessions/"
+        );
+    }
+
+    #[test]
+    fn p018_migration_corrupt_skipped_warn() {
+        let _g = XdgGuard::new();
+        let valid = Uuid::new_v4();
+        let corrupt = Uuid::new_v4();
+        write_pinned_session_file(&session_path_for(valid), false);
+        fs::create_dir_all(data_dir().join("sessions")).unwrap();
+        fs::write(session_path_for(corrupt), b"{").unwrap();
+
+        run_migration_p018().unwrap();
+
+        // Valid file moved to trash.
+        assert!(trash_dir().join(format!("{valid}.json")).exists());
+        // Corrupt file left in place.
+        assert!(session_path_for(corrupt).exists());
+        // Marker still written (migration completed despite skip).
+        assert!(migration_p018_marker_path().exists());
+    }
+
+    #[test]
+    fn p018_migration_duplicate_in_trash_removes_source() {
+        let _g = XdgGuard::new();
+        let id = Uuid::new_v4();
+        // Both source and trash exist (partial prior migration).
+        write_pinned_session_file(&session_path_for(id), false);
+        write_pinned_session_file(&trash_dir().join(format!("{id}.json")), false);
+
+        run_migration_p018().unwrap();
+
+        // Source removed (it was the duplicate).
+        assert!(!session_path_for(id).exists(), "duplicate source must be removed");
+        // Trash kept (authoritative copy).
+        assert!(trash_dir().join(format!("{id}.json")).exists());
+    }
+
+    #[test]
+    fn p018_migration_marker_present_skips_run() {
+        let _g = XdgGuard::new();
+        // Pre-create the marker; do NOT pre-create trash/.
+        let marker = migration_p018_marker_path();
+        if let Some(p) = marker.parent() {
+            fs::create_dir_all(p).unwrap();
+        }
+        fs::write(&marker, b"p018-v1\n").unwrap();
+
+        // An unpinned file exists. With the marker present, it must NOT move.
+        let id = Uuid::new_v4();
+        write_pinned_session_file(&session_path_for(id), false);
+
+        run_migration_p018().unwrap();
+        assert!(
+            session_path_for(id).exists(),
+            "marker present → migration must not run, file should stay"
+        );
+        assert!(
+            !trash_dir().join(format!("{id}.json")).exists(),
+            "marker present → no migration, no trash creation"
+        );
+    }
+
+    #[test]
+    fn p018_migration_creates_active_dir_on_clean_install() {
+        let _g = XdgGuard::new();
+        // No `sessions/` at all. Migration must still write the marker and
+        // leave active/ + trash/ ready.
+        run_migration_p018().unwrap();
+        assert!(migration_p018_marker_path().exists());
+    }
+
+    #[test]
+    fn p018_list_sessions_skips_active_and_trash_subdirs() {
+        let _g = XdgGuard::new();
+        // Create active/ and trash/ as subdirs of sessions/. They must not
+        // confuse list_sessions(): only top-level *.json with UUID stem are
+        // returned (R-7 confirmation).
+        let id = Uuid::new_v4();
+        write_pinned_session_file(&session_path_for(id), true);
+        fs::create_dir_all(active_dir()).unwrap();
+        fs::create_dir_all(trash_dir()).unwrap();
+        // Add JSON files in subdirs — these should NOT appear via list_sessions.
+        let inner = Uuid::new_v4();
+        write_pinned_session_file(&session_path_active_for(inner), true);
+        write_pinned_session_file(&trash_dir().join(format!("{inner}.json")), true);
+
+        let listed = list_sessions();
+        assert_eq!(listed, vec![id], "list_sessions should only return top-level UUIDs");
     }
 }

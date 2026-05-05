@@ -275,6 +275,35 @@ Everything terminal-specific (the stream payload, the RPC schema, byte-log repla
 
 ---
 
+## AD-016: Unpinned sessions exit on clean close; pinned sessions persist; daemon does not survive across launches
+
+**Decision:** The daemon's survival scope is bounded by pin state.
+
+- **Unpinned, clean close:** the daemon moves `sessions/active/{uuid}.json` →
+  `sessions/trash/{uuid}.json`, then exits. The GTK client shows an "Undo Close"
+  toast on any surviving sibling window for 30 seconds. Files in `trash/` are
+  retained indefinitely (no new auto-purge in v1) and are recoverable via
+  `--restore-session UUID`.
+- **Pinned, clean close:** the daemon moves `sessions/active/{uuid}.json` →
+  `sessions/{uuid}.json`, then exits. The session is restored on next launch.
+- **Daemon never survives window close.** The warm-reattach path (daemon already
+  running, client reconnects) is removed. Every relaunch goes through
+  `ensure_daemon` (cold spawn, ~50–100 ms).
+- **Crash recovery:** any `sessions/active/{uuid}.json` present at startup is
+  an orphan (the daemon did not exit cleanly). If `pinned: true`, promote to
+  `sessions/{uuid}.json` and restore. If `pinned: false`, delete.
+- **`--temp` mode** (process-level ephemeral, no daemon at all) is orthogonal
+  and unchanged.
+
+**Trade-off accepted:** ~50–100 ms cold spawn per relaunch vs. indefinitely-surviving
+daemons consuming memory for sessions the user considers closed. Cold spawn cost is
+below human perception threshold and eliminates the stale-daemon failure mode
+(FIX-007).
+
+**Decided:** 2026-05-04. Amends AD-012.
+
+---
+
 ## Superseded / rejected decisions
 
 The following concepts are **explicitly rejected**. Do not reintroduce without a new AD that supersedes the rejection.

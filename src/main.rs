@@ -119,16 +119,20 @@ fn main() {
         }
     });
 
-    // --restore-session <UUID>: move the trashed session back and launch it.
+    // --restore-session <UUID>: move the trashed session back to active/ and launch it.
+    //
+    // P-018 / AD-016: the destination is `sessions/active/{uuid}.json` (the
+    // live bucket). The spawning daemon will pick the file up at startup and
+    // re-promote/trash it on its own clean-close path.
     if let Some(restore_uuid) = args.restore_session {
-        match forgetty_workspace::restore_from_trash(restore_uuid) {
+        match forgetty_workspace::restore_from_trash_to_active(restore_uuid) {
             Ok(()) => {
-                tracing::info!("--restore-session: restored {restore_uuid} from trash");
+                tracing::info!("--restore-session: restored {restore_uuid} from trash → active/");
             }
             Err(e) => {
                 tracing::warn!("--restore-session: failed to restore {restore_uuid}: {e}");
                 // Fall through to launch the session anyway — if the file is already
-                // in sessions/ (e.g. race with another restore), this still works.
+                // in active/ (e.g. race with another restore), this still works.
             }
         }
         let launch_opts = LaunchOptions { session_id: Some(restore_uuid), ..Default::default() };
