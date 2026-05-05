@@ -1,0 +1,31 @@
+# cargo-audit / rustsec/audit-check@v2 configuration
+#
+# Each ignore MUST have a comment with (a) why it's ignored, (b) what would
+# trigger re-evaluation. Audit this file every time we bump iroh or hickory.
+#
+# Last reviewed: 2026-05-05 (post-P-018 merge).
+
+[advisories]
+ignore = [
+    # ----- hickory-proto (transitive via iroh-relay → hickory-resolver) -----
+    #
+    # RUSTSEC-2026-0119 — CPU exhaustion via O(n²) DNS name compression during
+    # message encoding. Fix available in hickory-proto >= 0.26.1, but iroh
+    # 0.97.x pins hickory-proto 0.25.x. Bumping iroh to a release that pulls
+    # hickory 0.26+ is tracked as CHORE-iroh-bump in BACKLOG.md.
+    #
+    # Threat-model note: would require an attacker who can return crafted
+    # DNS responses for iroh relay name resolution. Low realistic exposure
+    # for forgetty's solo-dogfood use case (LAN pairing); higher once
+    # external users pair devices over untrusted networks.
+    "RUSTSEC-2026-0119",
+
+    # RUSTSEC-2026-0118 — NSEC3 closest-encloser proof validation enters an
+    # unbounded loop on cross-zone responses. NO upstream fix available
+    # (https://github.com/hickory-dns/hickory-dns/security/advisories/GHSA-3v94-mw7p-v465).
+    # Re-evaluate when hickory-dns ships a fix.
+    #
+    # Threat-model note: same as above — DNSSEC validation path during iroh
+    # relay resolution.
+    "RUSTSEC-2026-0118",
+]
