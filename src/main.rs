@@ -195,7 +195,6 @@ fn main() {
     // In that case, if config says Restore and sessions exist, spawn one window
     // per saved session and exit — identical to --restore-all.
     let is_bare_launch = !args.no_restore
-        && !args.temp
         && args.session_id.is_none()
         && working_directory.is_none()
         && args.execute.is_empty();
@@ -269,7 +268,6 @@ fn main() {
         no_restore: args.no_restore,
         session_id: args.session_id,
         restore_all: args.restore_all,
-        temp: args.temp,
     };
 
     if let Err(e) = forgetty_gtk::app::run(config, launch_opts) {
