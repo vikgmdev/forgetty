@@ -229,17 +229,10 @@ pub static ACTION_DEFS: &[ActionDef] = &[
         category: "Configuration",
     },
     ActionDef {
-        display_name: "Command Palette",
-        config_key: "command-palette",
-        action_name: "win.command-palette",
-        default_accels: &["<Control><Shift>p"],
-        category: "Configuration",
-    },
-    ActionDef {
         display_name: "Keyboard Shortcuts (reference)",
         config_key: "show-shortcuts",
         action_name: "win.show-shortcuts",
-        default_accels: &["F1"],
+        default_accels: &["F1", "<Control><Shift>p"],
         category: "Configuration",
     },
     // --- Workspaces ---
@@ -353,13 +346,6 @@ pub static ACTION_DEFS: &[ActionDef] = &[
         display_name: "New Window",
         config_key: "new-window",
         action_name: "win.new-window",
-        default_accels: &[],
-        category: "Application",
-    },
-    ActionDef {
-        display_name: "New Temporary Window",
-        config_key: "new-temp-window",
-        action_name: "win.new-temp-window",
         default_accels: &["<Control><Shift>n"],
         category: "Application",
     },
