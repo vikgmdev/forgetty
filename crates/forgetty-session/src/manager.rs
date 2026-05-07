@@ -889,14 +889,7 @@ impl SessionManager {
         size: PtySize,
         cwd: Option<PathBuf>,
     ) -> Result<PaneId> {
-        self.split_pane_with_ratio_and_pane_id(
-            pane_id,
-            direction,
-            ratio,
-            size,
-            cwd,
-            PaneId::new(),
-        )
+        self.split_pane_with_ratio_and_pane_id(pane_id, direction, ratio, size, cwd, PaneId::new())
     }
 
     /// Like `split_pane_with_ratio`, but uses the supplied `new_pane_id` instead of

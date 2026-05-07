@@ -1194,10 +1194,19 @@ pub fn create_terminal(
         drawing_area.add_controller(scroll_controller);
     }
 
+    // --- Scrollbar (declared before connect_resize so the resize handler can update
+    // the adjustment directly under `updating_scrollbar` to coordinate with the
+    // 16 ms scrollbar poll; see FIX-015).
+    let adjustment = gtk4::Adjustment::new(0.0, 0.0, 0.0, 1.0, 10.0, 0.0);
+    let scrollbar = gtk4::Scrollbar::new(gtk4::Orientation::Vertical, Some(&adjustment));
+    scrollbar.set_vexpand(true);
+    scrollbar.set_visible(false);
+
     // --- Resize handler ---
     {
         let state = Rc::clone(&state);
         let cell_measured_resize = Rc::clone(&cell_measured);
+        let adj_resize = adjustment.clone();
         drawing_area.connect_resize(move |da, width, height| {
             if !*cell_measured_resize.borrow() {
                 return;
@@ -1223,8 +1232,18 @@ pub fn create_terminal(
                 s.cols = new_cols;
                 s.rows = new_rows;
                 s.terminal.resize(new_rows, new_cols);
-                let (_, off, _) = s.terminal.scrollbar_state();
+                // Snapshot scrollbar state once after the resize and become the canonical
+                // writer of the adjustment for this event — closes the FIX-015 race where
+                // the 16 ms scrollbar poll could race with the resize handler and trigger
+                // a divergent viewport scroll via connect_value_changed.
+                let (total, off, len) = s.terminal.scrollbar_state();
                 s.viewport_offset = off;
+                s.updating_scrollbar = true;
+                adj_resize.set_lower(0.0);
+                adj_resize.set_upper(total as f64);
+                adj_resize.set_page_size(len as f64);
+                adj_resize.set_value(off as f64);
+                s.updating_scrollbar = false;
                 if let (Some(ref dc), Some(pane_id)) = (s.daemon_client.clone(), s.daemon_pane_id) {
                     let _ = dc.resize_pane(pane_id, new_rows as u16, new_cols as u16);
                 }
@@ -1234,12 +1253,7 @@ pub fn create_terminal(
         });
     }
 
-    // --- Scrollbar ---
-    let adjustment = gtk4::Adjustment::new(0.0, 0.0, 0.0, 1.0, 10.0, 0.0);
-    let scrollbar = gtk4::Scrollbar::new(gtk4::Orientation::Vertical, Some(&adjustment));
-    scrollbar.set_vexpand(true);
-    scrollbar.set_visible(false);
-
+    // --- Scrollbar value-changed (user scroll via scrollbar widget) ---
     {
         let state = Rc::clone(&state);
         let da_scroll = drawing_area.clone();
@@ -2326,11 +2340,6 @@ fn draw_terminal(
     // Clone search state for rendering
     let search = s.search.clone();
 
-    // Query viewport offset for converting absolute selection rows to screen rows.
-    // Selection coordinates are stored as absolute scrollback positions; we need
-    // the viewport offset to map them back to screen-space for drawing.
-    let viewport_offset = s.viewport_offset as usize;
-
     // Build font description using the current zoom level
     let font_desc = font_description_with_size(&s.config, s.font_size);
 
@@ -2359,6 +2368,15 @@ fn draw_terminal(
             }
         }
     }
+
+    // FIX-015 step 3: re-read libghostty's scrollbar state at the top of every paint
+    // so the cells we draw and the viewport offset we use for absolute→screen row
+    // projection (selection, search highlight) are consistent within one frame.
+    // `scrollbar_state()` is a single FFI struct read — sub-µs — far under the
+    // per-frame paint budget.
+    let (_sb_total, sb_offset, _sb_len) = s.terminal.scrollbar_state();
+    s.viewport_offset = sb_offset;
+    let viewport_offset = sb_offset as usize;
 
     let cell_w = s.cell_width;
     let cell_h = s.cell_height;
