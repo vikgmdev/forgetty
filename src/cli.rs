@@ -36,11 +36,6 @@ pub struct Args {
     #[arg(long)]
     pub restore_all: bool,
 
-    /// Open an ephemeral session that is never persisted. The terminal works
-    /// normally but no session file is written on close.
-    #[arg(long)]
-    pub temp: bool,
-
     /// Restore a specific trashed session by UUID.
     ///
     /// Moves the session file from `sessions/trash/` back to `sessions/`,
