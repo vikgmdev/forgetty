@@ -609,9 +609,16 @@ impl Terminal {
         }
 
         let first_sync = cache.screen.generation() == 0;
-        tracing::trace!("sync_screen: dirty={dirty}, first_sync={first_sync}");
+        tracing::trace!(
+            "sync_screen: dirty={dirty}, first_sync={first_sync}, screen_dirty={}",
+            cache.screen_dirty
+        );
 
-        if dirty == ffi::GHOSTTY_RENDER_STATE_DIRTY_FALSE && !first_sync {
+        // `cache.screen_dirty` forces re-extraction even when libghostty's render-state
+        // dirty flag is clear: resize and viewport scroll mutate the libghostty viewport
+        // but don't always set the render-state dirty flag, and a stale cache in the new
+        // geometry/offset is the FIX-015 root cause.
+        if dirty == ffi::GHOSTTY_RENDER_STATE_DIRTY_FALSE && !first_sync && !cache.screen_dirty {
             return;
         }
 
