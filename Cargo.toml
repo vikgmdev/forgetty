@@ -39,7 +39,7 @@ git2 = "0.19"
 gtk4 = { version = "0.9", features = ["v4_14"] }
 libadwaita = { version = "0.7", features = ["v1_4"] }
 gdk-pixbuf = "0.20"
-iroh = { version = "0.97", default-features = false, features = ["metrics", "portmapper"] }
+iroh = { version = "0.98", default-features = false, features = ["metrics", "portmapper"] }
 qrcode = "0.14"
 image = { version = "0.25", default-features = false, features = ["png"] }
 hostname = "0.4"
