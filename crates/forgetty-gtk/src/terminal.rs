@@ -129,6 +129,13 @@ pub struct TerminalState {
     /// Suppress BEL flash until this instant. Set when Ctrl+C is written so the
     /// shell's readline BEL response (zsh beeps on SIGINT) doesn't cause a flash.
     pub suppress_bell_until: Option<Instant>,
+    /// Suppress the line-discipline echo of the VINTR byte until this instant.
+    /// Set when Ctrl+C is dispatched so we can drop the upcoming `^X` (or `^C`,
+    /// `^D`, etc.) caret-form echo from the byte stream before it reaches the
+    /// VT parser. Without this, users who have remapped VINTR away from 0x03
+    /// see e.g. `^X` printed after pressing Ctrl+C, which doesn't match what
+    /// they pressed (FIX-017 round 2).
+    pub suppress_intr_echo_until: Option<Instant>,
     /// Timestamp of the last PTY data received. Used to detect idle periods
     /// for calling `malloc_trim(0)` to return freed memory to the OS (T-028).
     pub last_pty_data: Instant,
@@ -255,6 +262,7 @@ pub fn create_terminal(
         bell_flash_until: None,
         last_bell: Instant::now() - Duration::from_secs(1),
         suppress_bell_until: None,
+        suppress_intr_echo_until: None,
         last_pty_data: Instant::now(),
         malloc_trimmed: false,
         notification_ring: false,
@@ -358,10 +366,20 @@ pub fn create_terminal(
                         let (_, offset, _) = s.terminal.scrollbar_state();
                         s.viewport_offset = offset;
 
-                        // Scan for OSC notification sequences BEFORE feeding to VT parser.
-                        let osc_notification = scan_osc_notification(&data);
+                        // FIX-017 round 2: if a Ctrl+C was recently dispatched,
+                        // drop the line-discipline ECHOCTL echo of the VINTR
+                        // byte (e.g. `^X` for VINTR=0x18, `^C` for the default).
+                        // The echo arrives as two printable bytes `^<letter>`
+                        // from the remote PTY's output stream. We drop the
+                        // first such pair within the 150 ms window so the user
+                        // doesn't see a control-char-name printed after Ctrl+C.
+                        let filtered_data =
+                            drop_first_caret_form_echo(&data, &mut s.suppress_intr_echo_until);
 
-                        s.terminal.feed(&data);
+                        // Scan for OSC notification sequences BEFORE feeding to VT parser.
+                        let osc_notification = scan_osc_notification(&filtered_data);
+
+                        s.terminal.feed(&filtered_data);
                         s.last_pty_data = Instant::now();
                         s.malloc_trimmed = false;
 
@@ -612,6 +630,15 @@ pub fn create_terminal(
                         s.cursor_blink_visible = true;
                         s.last_blink_toggle = Instant::now();
                         s.suppress_bell_until = Some(Instant::now() + Duration::from_millis(300));
+                        // FIX-017 round 2: also suppress the ECHOCTL echo of
+                        // the VINTR byte that the remote line discipline will
+                        // emit. Without this, the next ~150 ms of output
+                        // shows e.g. `^X` (when VINTR is remapped) printed
+                        // before the shell prompt — visually mismatched with
+                        // what the user pressed. Window is short and only
+                        // drops the FIRST caret-form echo it sees.
+                        s.suppress_intr_echo_until =
+                            Some(Instant::now() + Duration::from_millis(150));
                     }
                     return glib::Propagation::Stop;
                 }
@@ -1429,6 +1456,45 @@ pub fn create_terminal(
     vbox.append(&hbox);
 
     Ok((vbox, drawing_area, state))
+}
+
+/// Drop the first `^<letter>` (caret-form control-char echo) from `data`
+/// if `suppress_until` is set and hasn't expired. Returns either a borrow
+/// of `data` (unmodified) or an owned `Vec<u8>` with the two echo bytes
+/// removed. Clears `suppress_until` once it either drops a match or
+/// observes the deadline has passed.
+///
+/// The line-discipline ECHOCTL echo of a control char `c` (0x00..=0x1f or
+/// 0x7f) is the two printable bytes `0x5e` (caret) followed by either
+/// `c + 0x40` (for 0x00..=0x1f → range 0x40..=0x5f) or `0x3f` (`?`, for
+/// 0x7f). We scan for the first such pair within the suppression window;
+/// the FIRST match consumes the suppression so a later legitimate `^X`
+/// in real output isn't filtered (FIX-017 round 2).
+fn drop_first_caret_form_echo<'a>(
+    data: &'a [u8],
+    suppress_until: &mut Option<Instant>,
+) -> std::borrow::Cow<'a, [u8]> {
+    use std::borrow::Cow;
+
+    let Some(deadline) = *suppress_until else {
+        return Cow::Borrowed(data);
+    };
+    if Instant::now() > deadline {
+        *suppress_until = None;
+        return Cow::Borrowed(data);
+    }
+
+    // Scan for `^<letter>` where letter ∈ [0x40, 0x5f] ∪ {0x3f}.
+    for (i, w) in data.windows(2).enumerate() {
+        if w[0] == 0x5e && ((0x40..=0x5f).contains(&w[1]) || w[1] == 0x3f) {
+            *suppress_until = None;
+            let mut out = Vec::with_capacity(data.len().saturating_sub(2));
+            out.extend_from_slice(&data[..i]);
+            out.extend_from_slice(&data[i + 2..]);
+            return Cow::Owned(out);
+        }
+    }
+    Cow::Borrowed(data)
 }
 
 /// Helper: convert a `Color` to `(r, g, b)` f64 values (0.0..1.0), using
@@ -2912,4 +2978,88 @@ fn draw_rounded_rect(ctx: &cairo::Context, x: f64, y: f64, w: f64, h: f64, r: f6
     ctx.arc(x + r, y + h - r, r, std::f64::consts::FRAC_PI_2, std::f64::consts::PI);
     ctx.arc(x + r, y + r, r, std::f64::consts::PI, 3.0 * std::f64::consts::FRAC_PI_2);
     ctx.close_path();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::drop_first_caret_form_echo;
+    use std::time::{Duration, Instant};
+
+    /// FIX-017 round 2: with an active suppression deadline, the first
+    /// `^X` (caret + uppercase letter) pair is removed and the deadline
+    /// is consumed.
+    #[test]
+    fn test_drop_caret_x_drops_first_match_and_clears_flag() {
+        let mut deadline = Some(Instant::now() + Duration::from_secs(1));
+        let input = b"^X\r\nprompt$ ";
+        let out = drop_first_caret_form_echo(input, &mut deadline);
+        assert_eq!(&*out, b"\r\nprompt$ ", "echo bytes ^X should be removed");
+        assert!(deadline.is_none(), "suppression flag should clear after a successful drop");
+    }
+
+    /// `^C` (default VINTR echo) is also caret-form and gets dropped.
+    #[test]
+    fn test_drop_caret_c_default_vintr_echo() {
+        let mut deadline = Some(Instant::now() + Duration::from_secs(1));
+        let input = b"running\r\n^C\r\n";
+        let out = drop_first_caret_form_echo(input, &mut deadline);
+        assert_eq!(&*out, b"running\r\n\r\n");
+        assert!(deadline.is_none());
+    }
+
+    /// `^?` is the caret-form echo of DEL (0x7f) and must also be dropped.
+    #[test]
+    fn test_drop_caret_question_mark_for_del() {
+        let mut deadline = Some(Instant::now() + Duration::from_secs(1));
+        let input = b"^?ok";
+        let out = drop_first_caret_form_echo(input, &mut deadline);
+        assert_eq!(&*out, b"ok");
+        assert!(deadline.is_none());
+    }
+
+    /// No suppression set: bytes are returned unchanged, no `Vec` allocation.
+    #[test]
+    fn test_no_suppression_means_no_filtering() {
+        let mut deadline: Option<Instant> = None;
+        let input = b"^X anywhere in output\r\n";
+        let out = drop_first_caret_form_echo(input, &mut deadline);
+        assert_eq!(&*out, input);
+        assert!(deadline.is_none());
+    }
+
+    /// Suppression set but deadline has passed: bytes returned unchanged AND
+    /// the flag is cleared (so subsequent calls short-circuit immediately).
+    #[test]
+    fn test_expired_deadline_clears_flag_and_returns_unchanged() {
+        let mut deadline = Some(Instant::now() - Duration::from_millis(10));
+        let input = b"^X should NOT be filtered";
+        let out = drop_first_caret_form_echo(input, &mut deadline);
+        assert_eq!(&*out, input);
+        assert!(deadline.is_none(), "expired deadline must be cleared");
+    }
+
+    /// Caret followed by a non-caret-form letter (e.g. lowercase, digit,
+    /// punctuation) is not an ECHOCTL echo and must NOT be dropped.
+    #[test]
+    fn test_caret_followed_by_non_control_letter_not_dropped() {
+        let mut deadline = Some(Instant::now() + Duration::from_secs(1));
+        // ^a (0x5e 0x61) — lowercase 'a' is outside the caret-form letter range.
+        let input = b"see ^a here";
+        let out = drop_first_caret_form_echo(input, &mut deadline);
+        assert_eq!(&*out, input);
+        assert!(deadline.is_some(), "no match means flag stays active for the rest of the window");
+    }
+
+    /// Only the FIRST caret-form pair is dropped within a single call.
+    /// (A second echo within the same call is exceedingly unlikely from
+    /// a single Ctrl+C, and the flag is cleared after the first drop so
+    /// subsequent calls won't filter either.)
+    #[test]
+    fn test_only_first_caret_form_dropped() {
+        let mut deadline = Some(Instant::now() + Duration::from_secs(1));
+        let input = b"^X ^Y";
+        let out = drop_first_caret_form_echo(input, &mut deadline);
+        assert_eq!(&*out, b" ^Y", "second ^Y stays — flag is consumed");
+        assert!(deadline.is_none());
+    }
 }

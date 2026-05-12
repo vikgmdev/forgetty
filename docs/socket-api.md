@@ -408,8 +408,13 @@ writes them to the PTY master fd unchanged. Invalid base64 returns
 
 #### `send_sigint`
 
-Send SIGINT (`0x03`) to the foreground process group of a pane. Equivalent
-to the user pressing Ctrl+C.
+Sends `0x03` (ETX/Ctrl+C) to the PTY unconditionally. Additionally calls
+`kill(-pgid, SIGINT)` on the foreground process group **unless** the
+foreground process is a known signal-forwarder (`ssh`, `mosh-client`,
+`telnet`, `rsh`) — those tools forward `0x03` to a remote PTY and would
+be killed by a local SIGINT (FIX-017). For shells and most TUIs, the
+line discipline handles `0x03` via ISIG; the kill catches raw-mode apps
+that swallow `0x03` without acting on it (Node.js, pm2 — BUG-001).
 
 **Request:** `{"jsonrpc":"2.0","method":"send_sigint","params":{"pane_id":"<uuid>"},"id":1}`
 
