@@ -198,6 +198,36 @@ impl PtyProcess {
         self.master.process_group_leader()
     }
 
+    /// Get the `VINTR` character (the byte the kernel's line discipline
+    /// translates to `SIGINT` when `ISIG` is enabled).
+    ///
+    /// Reads `c_cc[VINTR]` via `tcgetattr` on the master PTY fd. Returns
+    /// `None` if the master fd is unavailable or `tcgetattr` fails — callers
+    /// fall back to the POSIX default `0x03`.
+    ///
+    /// Used by the daemon's Ctrl+C path (FIX-017) to write a byte that
+    /// matches the current `VINTR` setting rather than hardcoded `0x03`.
+    /// This makes Ctrl+C work for users who have remapped `VINTR` (via
+    /// `stty intr <char>` or shell init) and for SSH sessions where the
+    /// remote PTY inherits the local `VINTR` through ssh's `pty-modes`.
+    #[cfg(unix)]
+    pub fn vintr(&self) -> Option<u8> {
+        use std::os::unix::io::RawFd;
+        let fd: RawFd = self.master.as_raw_fd()?;
+        let mut termios = unsafe { std::mem::zeroed::<libc::termios>() };
+        if unsafe { libc::tcgetattr(fd, &mut termios) } != 0 {
+            return None;
+        }
+        Some(termios.c_cc[libc::VINTR])
+    }
+
+    /// Non-Unix stub: VINTR is a POSIX termios concept and not meaningful
+    /// off Unix. Returns `None` so callers use the POSIX default `0x03`.
+    #[cfg(not(unix))]
+    pub fn vintr(&self) -> Option<u8> {
+        None
+    }
+
     /// Kill the child process.
     pub fn kill(&mut self) -> Result<()> {
         self.child.kill().map_err(|e| ForgettyError::Pty(format!("failed to kill child: {e}")))
@@ -399,6 +429,21 @@ mod tests {
             output_str.contains("hello_forgetty_test"),
             "expected output to contain 'hello_forgetty_test', got: {output_str}"
         );
+    }
+
+    /// FIX-017 round 2: `vintr()` reads the line discipline's interrupt
+    /// character from a freshly spawned PTY. Newly created PTYs use the
+    /// kernel default termios, where `c_cc[VINTR] == 0x03` (Ctrl+C).
+    /// Verifies the syscall plumbing works end-to-end; it doesn't test the
+    /// remapping case (that requires `stty intr <other>` and falls under
+    /// AC-10's human test).
+    #[cfg(unix)]
+    #[test]
+    fn test_vintr_default_is_etx() {
+        let proc = PtyProcess::spawn(default_size(), None, None, true).expect("failed to spawn");
+        let vintr = proc.vintr().expect("vintr() should succeed on a fresh PTY");
+        assert_eq!(vintr, 0x03, "fresh PTY's VINTR should be 0x03 (Ctrl+C), got {vintr:#04x}");
+        drop(proc);
     }
 
     #[test]

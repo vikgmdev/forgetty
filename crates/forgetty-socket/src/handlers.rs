@@ -1101,11 +1101,20 @@ fn handle_send_sigint(request: &Request, sm: &SessionManager) -> Response {
         Err(e) => return e,
     };
 
-    // Write 0x03 (ETX / Ctrl+C) to the PTY.
-    // The daemon owns the master PTY fd; it can also do the kill(-pgid, SIGINT).
-    match sm.write_pty(id, &[0x03]) {
+    // Resolve the byte the kernel's line discipline treats as the interrupt
+    // character (c_cc[VINTR]). Falls back to 0x03 (POSIX default) if the
+    // termios read fails. Writing this byte — instead of hardcoded 0x03 —
+    // makes Ctrl+C work for local users who have remapped VINTR (e.g.,
+    // `stty intr ^X`), and for ssh sessions where the remote PTY inherits
+    // the local VINTR via ssh's pty-modes payload (FIX-017).
+    let intr_byte = sm.intr_byte(id).unwrap_or(0x03);
+
+    match sm.write_pty(id, &[intr_byte]) {
         Ok(()) => {
-            // Also send SIGINT to the foreground process group via the session manager.
+            // For non-forwarder foreground processes (e.g., Node.js, pm2 in
+            // raw mode that swallow the byte), also kill(-pgid, SIGINT) so
+            // the signal reaches them via the kernel directly (BUG-001).
+            // Forwarders (ssh, mosh) are skipped — see `send_sigint`.
             sm.send_sigint(id);
             Response::success(request.id.clone(), serde_json::json!({ "ok": true }))
         }

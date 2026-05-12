@@ -1395,6 +1395,21 @@ impl SessionManager {
     // I/O
     // -----------------------------------------------------------------------
 
+    /// Read the byte the kernel's line discipline treats as the interrupt
+    /// character (`c_cc[VINTR]`) for the given pane's PTY.
+    ///
+    /// Returns `None` if the pane is unknown or the termios read fails;
+    /// callers should fall back to `0x03` (POSIX default). The daemon's
+    /// Ctrl+C path uses this so it can write the byte the line discipline
+    /// will actually translate to `SIGINT` — both locally and (because ssh
+    /// forwards `VINTR` via `pty-modes`) on the remote end of an SSH
+    /// session (FIX-017).
+    pub fn intr_byte(&self, id: PaneId) -> Option<u8> {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let pane = inner.panes.get(&id)?;
+        pane.pty_bridge.pty.vintr()
+    }
+
     /// Write raw bytes to the PTY master for the given pane.
     pub fn write_pty(&self, id: PaneId, data: &[u8]) -> Result<()> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -1747,11 +1762,14 @@ impl SessionManager {
 
     /// Send SIGINT to the foreground process group of a pane.
     ///
-    /// This is the daemon-side implementation of the Ctrl+C signal path.
-    /// It does two things:
+    /// Daemon-side implementation of the Ctrl+C signal path:
     /// 1. The caller (handle_send_sigint) already wrote 0x03 via write_pty.
-    /// 2. This method calls kill(-pgid, SIGINT) via tcgetpgrp on the master PTY fd.
-    ///    This is necessary when the child has disabled ISIG (e.g. Node.js, pm2).
+    /// 2. This method calls kill(-pgid, SIGINT) UNLESS the foreground pgrp
+    ///    leader is a known signal-forwarder (ssh, mosh-client, telnet, rsh).
+    ///    Forwarders read 0x03 from stdin and pass it through; killing them
+    ///    kills the local end of the forward (FIX-017).
+    /// 3. For non-forwarders, the kill catches raw-mode apps that swallow
+    ///    0x03 without acting on it (Node.js, pm2 — BUG-001).
     pub fn send_sigint(&self, id: PaneId) {
         #[cfg(target_os = "linux")]
         {
@@ -1759,8 +1777,16 @@ impl SessionManager {
             if let Some(pane) = inner.panes.get(&id) {
                 if let Some(pgid) = pane.pty_bridge.pty.foreground_pgrp() {
                     let my_pid = std::process::id() as libc::pid_t;
-                    if pgid > 0 && pgid != my_pid {
+                    if pgid > 0 && pgid != my_pid && !pgid_is_signal_forwarder(pgid) {
                         unsafe { libc::kill(-(pgid as libc::c_int), libc::SIGINT) };
+                    } else if pgid > 0 && pgid != my_pid {
+                        debug!(
+                            %id,
+                            pgid,
+                            "send_sigint: foreground is a signal forwarder \
+                             (e.g. ssh) — skipping kill(-pgid), intr byte \
+                             already written"
+                        );
                     }
                 }
             }
@@ -1799,6 +1825,39 @@ impl Default for SessionManager {
 
 fn home_dir_fallback() -> PathBuf {
     std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/"))
+}
+
+/// Pure matcher: is this `comm` value a known signal-forwarder?
+///
+/// Linux `/proc/<pid>/comm` contents (whitespace-trimmed, max 16 chars).
+/// Forwarders read `0x03` from stdin and pass it across a connection
+/// (SSH, mosh, telnet, rsh). Sending `kill(-pgid, SIGINT)` to them
+/// kills the local end of the forward and severs the connection — see
+/// FIX-017. We skip `kill` for these and rely on the unconditional
+/// `0x03` byte write to interrupt the remote process.
+///
+/// Allowlist contents:
+/// - `ssh` — OpenSSH client (covers `sshpass` which exec's into ssh).
+/// - `mosh-client` — actual mosh interactive binary; the `mosh` wrapper
+///   is a Perl script that exec's into `mosh-client` post-handshake.
+/// - `telnet` — legacy but still in use; same forwarding semantics.
+/// - `rsh` — vintage but in scope for parity.
+fn is_signal_forwarder_comm(comm: &str) -> bool {
+    matches!(comm, "ssh" | "mosh-client" | "telnet" | "rsh")
+}
+
+/// Read `/proc/<pgid>/comm` and check the allowlist.
+///
+/// Returns `false` on any read error (safe default: kill fires, matching
+/// the pre-FIX-017 behavior). The unit-testable matcher is
+/// `is_signal_forwarder_comm`.
+#[cfg(target_os = "linux")]
+fn pgid_is_signal_forwarder(pgid: i32) -> bool {
+    let path = format!("/proc/{pgid}/comm");
+    match std::fs::read_to_string(&path) {
+        Ok(s) => is_signal_forwarder_comm(s.trim()),
+        Err(_) => false,
+    }
 }
 
 /// Recursively find the `Leaf` node matching `target` in `tree` and replace it
@@ -3874,5 +3933,44 @@ mod tests {
         assert_eq!(session.layout().workspaces[0].tabs[0].active_pane_id, None);
 
         session.close_pane(pane1).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX-017: signal-forwarder allowlist (AC-9)
+    //
+    // Pure-function test of the matcher used to gate kill(-pgid) in
+    // SessionManager::send_sigint. Independent of /proc — exercises the
+    // string match alone.
+    // -----------------------------------------------------------------------
+
+    /// AC-9: known forwarders must match the allowlist exactly.
+    #[test]
+    fn test_is_signal_forwarder_comm_known_forwarders() {
+        assert!(is_signal_forwarder_comm("ssh"), "ssh must be allowlisted");
+        assert!(is_signal_forwarder_comm("mosh-client"), "mosh-client must be allowlisted");
+        assert!(is_signal_forwarder_comm("telnet"), "telnet must be allowlisted");
+        assert!(is_signal_forwarder_comm("rsh"), "rsh must be allowlisted");
+    }
+
+    /// AC-9: shells, TUIs, raw-mode apps, and look-alikes must NOT match.
+    /// kill(-pgid) must still fire for these to preserve BUG-001 behavior.
+    #[test]
+    fn test_is_signal_forwarder_comm_non_forwarders() {
+        for comm in ["node", "python3", "bash", "zsh", "vim", "", "sshd", "my-ssh-wrapper"] {
+            assert!(
+                !is_signal_forwarder_comm(comm),
+                "{comm:?} must NOT be classified as a forwarder"
+            );
+        }
+    }
+
+    /// I/O wrapper must return false for a pgid with no /proc entry.
+    /// Safe-default: any read error => kill fires (current pre-FIX-017 behavior).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_pgid_is_signal_forwarder_missing_pid_returns_false() {
+        // i32::MAX is well outside the kernel's pid_max range on any
+        // realistic system; the /proc read will fail with ENOENT.
+        assert!(!pgid_is_signal_forwarder(i32::MAX));
     }
 }
