@@ -7,7 +7,7 @@ license.workspace = true
 [dependencies]
 # iroh 0.97 (latest stable). The spec was written for 0.35; API diverged significantly.
 # Key differences documented in src/endpoint.rs.
-iroh = { version = "0.97", default-features = false, features = ["metrics", "portmapper"] }
+iroh = { version = "0.98", default-features = false, features = ["metrics", "portmapper"] }
 qrcode = "0.14"
 image = { version = "0.25", default-features = false, features = ["png"] }
 serde = { workspace = true }
