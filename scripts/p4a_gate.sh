@@ -10,7 +10,9 @@
 #      show in `ls --json`; OSC 9 shows as last_notification
 #   4. `capture --trim` returns an earlier line, also after a server restart
 #   5. `close` removes a kept pane and `events` shows PaneClosed (P-010)
-#   6. the scanner benchmark prints its number and stays under 1 % (SKIP_BENCH=1 skips)
+#   6. the scanner benchmark prints its ns/byte and its share at 16 KiB chunks,
+#      and the share stays under 1 % (SKIP_BENCH=1 skips). The real-drain share
+#      is printed for information: it depends on load.
 #
 # Runs as the current user with all state under a temp dir (--state-dir).
 # Env: PROFILE=debug|release (default debug), KEEP=1 keeps the temp dir.
@@ -186,7 +188,7 @@ if [ "${SKIP_BENCH:-0}" = "1" ]; then
 else
   BENCH_OUT="$(cargo bench -p forgetty-session --bench osc_scanner 2>&1)"
   BRC=$?
-  echo "$BENCH_OUT" | grep -E "scanner alone|scanner adds|drain saw|SCANNER OVERHEAD"
+  echo "$BENCH_OUT" | grep -E "scanner alone|scanner cost|scanner adds|drain saw|REAL DRAIN|SCANNER COST|SCANNER OVERHEAD"
   [ "$BRC" = 0 ] || fail "scanner benchmark failed or is at 1 % or more"
   echo "$BENCH_OUT" | qgrep "SCANNER OVERHEAD" || fail "benchmark printed no number"
   pass "benchmark number printed, under 1 %"
