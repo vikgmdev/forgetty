@@ -959,13 +959,24 @@ async fn supervise(shared: Arc<Shared>) {
 /// A dial to the cached direct address gives up after this long.
 const DIRECT_DIAL_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Connect to `target` and run the handshake.
-async fn dial_to(shared: &Shared, target: EndpointAddr) -> Result<Established, DialError> {
-    let conn = shared
-        .endpoint
-        .connect(target, ALPN_RPC)
-        .await
-        .map_err(|e| DialError::Transient(e.to_string()))?;
+/// Connect to `target` and run the handshake. `connect_limit` bounds the QUIC
+/// connect only: once the path is up the handshake can take as long as the
+/// overall dial timeout, because a slow server (a busy `Welcome`) is not a
+/// dead address.
+async fn dial_to(
+    shared: &Shared,
+    target: EndpointAddr,
+    connect_limit: Option<Duration>,
+) -> Result<Established, DialError> {
+    let connecting = shared.endpoint.connect(target, ALPN_RPC);
+    let conn = match connect_limit {
+        Some(limit) => match tokio::time::timeout(limit, connecting).await {
+            Ok(r) => r,
+            Err(_) => return Err(DialError::Transient("direct connect timed out".into())),
+        },
+        None => connecting.await,
+    }
+    .map_err(|e| DialError::Transient(e.to_string()))?;
     match handshake(shared, &conn).await {
         Ok((send, recv, welcome)) => Ok(Established { conn, send, recv, welcome }),
         Err(e) => {
@@ -977,25 +988,21 @@ async fn dial_to(shared: &Shared, target: EndpointAddr) -> Result<Established, D
 
 /// The cached direct address and the addresses of the pairing payload (relay
 /// URLs, direct addresses) are dialed in parallel, not one after the other
-/// (happy eyeballs). The direct dial gets 1 s: a dead cached address (the
-/// network changed) must not hold up the relay. The first handshake wins and
+/// (happy eyeballs). The direct connect gets 1 s: a dead cached address (the
+/// network changed) must not hold up the relay. The 1 s covers the QUIC
+/// connect, not the handshake after it. The first handshake wins and
 /// the other dial is dropped. A fatal error ends the race at once.
 async fn dial(shared: &Shared) -> Result<Established, DialError> {
     let Some(ip) = shared.opts.addr_cache.get(shared.server.id) else {
-        return dial_to(shared, shared.server.clone()).await;
+        return dial_to(shared, shared.server.clone(), None).await;
     };
     let direct = EndpointAddr::new(shared.server.id).with_ip_addr(ip);
     if shared.server.is_empty() {
         // Nothing to fall back to: the direct dial has the whole dial timeout.
-        return dial_to(shared, direct).await;
+        return dial_to(shared, direct, None).await;
     }
-    let a = async {
-        match tokio::time::timeout(DIRECT_DIAL_TIMEOUT, dial_to(shared, direct)).await {
-            Ok(r) => r,
-            Err(_) => Err(DialError::Transient("direct dial timed out".into())),
-        }
-    };
-    let b = dial_to(shared, shared.server.clone());
+    let a = dial_to(shared, direct, Some(DIRECT_DIAL_TIMEOUT));
+    let b = dial_to(shared, shared.server.clone(), None);
     tokio::pin!(a, b);
     let (mut a_done, mut b_done) = (false, false);
     let mut last = DialError::Transient("no address".into());

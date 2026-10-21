@@ -191,16 +191,19 @@ fn tolerant_event<'de, D: Deserializer<'de>>(d: D) -> Result<ServerEvent, D::Err
     let v = Value::deserialize(d)?;
     match from_value::<ServerEvent>(v.clone()) {
         Ok(e) => Ok(e),
-        // An externally tagged variant is a map with one entry, the tag.
-        Err(_) if matches!(&v, Value::Map(m) if m.len() == 1 && m[0].0.is_str()) => {
-            let tag = v.as_map().and_then(|m| m[0].0.as_str()).unwrap_or_default();
-            if KNOWN_EVENTS.contains(&tag) {
-                Err(serde::de::Error::custom(format!("malformed {tag} event")))
-            } else {
-                Ok(ServerEvent::Unknown)
+        Err(e) => {
+            // An externally tagged variant is a map with one entry, the tag.
+            // A variant without fields is the bare tag string.
+            let tag = match &v {
+                Value::Map(m) if m.len() == 1 => m[0].0.as_str(),
+                Value::String(_) => v.as_str(),
+                _ => None,
+            };
+            match tag {
+                Some(tag) if !KNOWN_EVENTS.contains(&tag) => Ok(ServerEvent::Unknown),
+                _ => Err(serde::de::Error::custom(e.to_string())),
             }
         }
-        Err(e) => Err(serde::de::Error::custom(e.to_string())),
     }
 }
 
@@ -602,4 +605,38 @@ pub fn to_value<T: Serialize>(v: &T) -> Result<Value, FrameError> {
 
 fn is_zero_u32(n: &u32) -> bool {
     *n == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `KNOWN_EVENTS` must list every variant a client can decode, or a
+    /// malformed known event would pass for an unknown one. serde's own
+    /// "expected one of" list for a bogus tag is generated from the enum, so a
+    /// variant added without a `KNOWN_EVENTS` entry fails here.
+    #[test]
+    fn known_events_lists_every_server_event_variant() {
+        let bogus = Value::Map(vec![(Value::from("NoSuchEvent"), Value::Nil)]);
+        let err = from_value::<ServerEvent>(bogus).unwrap_err().to_string();
+        let list = err.split("expected one of").nth(1).unwrap_or_else(|| panic!("no list: {err}"));
+        let mut generated: Vec<&str> = list.split('`').skip(1).step_by(2).collect();
+        generated.sort_unstable();
+        let mut known = KNOWN_EVENTS.to_vec();
+        known.sort_unstable();
+        assert_eq!(known, generated, "KNOWN_EVENTS and the ServerEvent variants differ");
+    }
+
+    /// A bare tag string (an event without fields in a newer server) is an
+    /// unknown event too.
+    #[test]
+    fn a_bare_unknown_tag_is_an_unknown_event() {
+        let ev = Value::Map(vec![
+            (Value::from("seq"), Value::from(3)),
+            (Value::from("event"), Value::from("FutureThing")),
+        ]);
+        let msg = Value::Map(vec![(Value::from("Event"), ev)]);
+        let got: ControlMsg = from_value(msg).unwrap();
+        assert_eq!(got, ControlMsg::Event { seq: 3, event: ServerEvent::Unknown });
+    }
 }

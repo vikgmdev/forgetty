@@ -26,8 +26,14 @@ pub struct SizeOwner {
 /// the server. Without one, a local resize goes straight to the PTY.
 pub trait SizeGovernor: Send + Sync {
     /// The registered local client `client` asks for `size` on `pane`. It
-    /// takes the pane's size ownership when the policy allows.
+    /// takes the pane's size ownership when it has a `subscribe_output` there.
     fn local_resize(&self, client: Uuid, pane: PaneId, size: PtySize);
+
+    /// `client` started a `subscribe_output` on `pane`: it has a stream there.
+    fn local_attached(&self, client: Uuid, pane: PaneId);
+
+    /// That `subscribe_output` ended.
+    fn local_detached(&self, client: Uuid, pane: PaneId);
 
     /// The last connection of the local client `client` closed.
     fn local_left(&self, client: Uuid);

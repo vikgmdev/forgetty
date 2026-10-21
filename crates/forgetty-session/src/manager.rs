@@ -149,6 +149,22 @@ pub struct SessionManager {
     governor: Arc<std::sync::OnceLock<Arc<dyn crate::sizes::SizeGovernor>>>,
 }
 
+/// A local `subscribe_output` on a pane (see
+/// [`SessionManager::attach_local_output`]). Drop it when the stream ends.
+pub struct LocalOutputGuard {
+    sm: SessionManager,
+    client: Uuid,
+    pane: PaneId,
+}
+
+impl Drop for LocalOutputGuard {
+    fn drop(&mut self) {
+        if let Some(g) = self.sm.governor.get() {
+            g.local_detached(self.client, self.pane);
+        }
+    }
+}
+
 /// Largest rows or columns a pane takes. A client can ask for any `u16`; the
 /// grid memory and the VT work of a pane grow with its size.
 pub const MAX_PANE_DIM: u16 = 1000;
@@ -248,6 +264,10 @@ impl SessionManager {
 
     /// Record the size owner of `id`. Sends `SizeOwnerChanged` when it
     /// differs from the recorded one. Returns whether it changed.
+    ///
+    /// The server calls this while it holds its per-pane `sizes` lock, so the
+    /// lock order is `sizes`, then `inner`. Never take that lock while holding
+    /// `inner`.
     pub fn set_size_owner(&self, id: PaneId, owner: Option<crate::sizes::SizeOwner>) -> bool {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if inner.size_owners.get(&id) == owner.as_ref() {
@@ -264,6 +284,15 @@ impl SessionManager {
     /// Drop the owner record of a pane that is gone. No event.
     pub fn forget_size_owner(&self, id: PaneId) {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).size_owners.remove(&id);
+    }
+
+    /// A local client has a `subscribe_output` on `pane` until the guard is
+    /// dropped. Only such a client can own the pane's size (AD-020).
+    pub fn attach_local_output(&self, client: Uuid, pane: PaneId) -> LocalOutputGuard {
+        if let Some(g) = self.governor.get() {
+            g.local_attached(client, pane);
+        }
+        LocalOutputGuard { sm: self.clone(), client, pane }
     }
 
     /// A resize asked for by a local client. With a `client` the size policy

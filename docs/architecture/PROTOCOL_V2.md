@@ -244,9 +244,14 @@ A **local socket client** (the GTK app, tools) counts as a client. It names
 itself by passing `client_id` (a UUID) and `client_name` to `subscribe_layout`
 or `subscribe_output`. That connection is an attached client until it closes,
 and `list_clients` returns it with `client_kind: "local"` (one entry per
-`client_id`). Its `resize_pane` calls pass the same `client_id`. A resize with a
+`client_id`). A local client has a stream on a pane only while it has a
+`subscribe_output` on that pane, and only such a client can own the pane. When
+that connection closes the client lets go of the pane at once, though it stays
+connected. Its `resize_pane` calls pass the same `client_id`. A resize with a
 `client_id` makes that client the owner at once, because a user at a local
-window is the active user. A `client_id` that is not an attached streaming
+window is the active user. Without a `subscribe_output` on the pane the size
+applies and the owner does not change. A remote `Hello` with `client_kind`
+`local` or `unknown` is refused (`bad_request`, message `bad_hello`). A `client_id` that is not an attached streaming
 client is an error (`invalid_params`). A one-shot `resize_pane` without
 `client_id` (the CLI) applies the size and does not change the owner. When the
 last connection of a local client closes, the owner passes on like any owner

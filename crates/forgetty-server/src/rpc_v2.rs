@@ -344,6 +344,7 @@ pub struct RpcV2 {
     /// connections: a peer cannot reset its backoff by attaching again.
     pacing: Mutex<HashMap<(iroh::EndpointId, Uuid), Pace>>,
     clients: Mutex<HashMap<Uuid, ClientRec>>,
+    /// Lock order: `sizes`, then `clients`, then the session manager's `inner`.
     sizes: Mutex<HashMap<Uuid, PaneSizes>>,
     /// Orders `user` input across clients, for the owner hand over (AD-025).
     user_tick: AtomicU64,
@@ -609,6 +610,25 @@ impl RpcV2 {
         // client events: strip control characters and cap the length.
         hello.client_name =
             forgetty_core::sanitize::untrusted_max(&hello.client_name, MAX_CLIENT_NAME_CHARS);
+
+        // `local` names the server's own socket clients and `unknown` is what
+        // a decoder makes of a kind it does not know. A remote client is
+        // neither, and must not pass for a local one in `list_clients` or as
+        // a size owner.
+        if matches!(hello.client_kind, ClientKind::Local | ClientKind::Unknown) {
+            let reply = HandshakeReply::Error(ErrorMsg {
+                code: error_code::BAD_REQUEST.into(),
+                message: format!(
+                    "bad_hello: client_kind {} is not allowed",
+                    hello.client_kind.as_str()
+                ),
+            });
+            let _ = write_msg(&mut send, &reply).await;
+            let _ = send.finish();
+            let _ = tokio::time::timeout(Duration::from_secs(2), conn.closed()).await;
+            conn.close(close_code::OK.into(), b"bad hello");
+            return;
+        }
 
         if hello.proto_major != PROTO_MAJOR {
             let reply = HandshakeReply::Error(ErrorMsg {
@@ -1085,8 +1105,16 @@ impl RpcV2 {
     /// Tell the session manager who owns `pane` now. It sends
     /// `SizeOwnerChanged` when that changed. Call it before the resize the
     /// owner's size causes, so the events arrive in that order.
+    ///
+    /// Lock order: `sizes`, then `clients` (here), then the session manager's
+    /// `inner` (in `set_size_owner`). The owner is worked out and recorded
+    /// under one `sizes` lock, so two racing calls cannot record an older
+    /// owner after a newer one. Nothing takes `sizes` while holding `inner`:
+    /// `inner` only sends session events, and this server reads those on its
+    /// own task.
     fn publish_owner(&self, pane: Uuid) {
-        let owner = lock(&self.sizes).get(&pane).and_then(|ps| ps.owner());
+        let sizes = lock(&self.sizes);
+        let owner = sizes.get(&pane).and_then(|ps| ps.owner());
         let info = owner.and_then(|c| self.size_owner_info(c));
         self.sm.set_size_owner(PaneId(pane), info);
     }
@@ -1111,22 +1139,26 @@ impl RpcV2 {
     }
 
     /// A registered local client resizes `pane`. A user at a local window is
-    /// the active user: the client takes the pane's size and ownership.
+    /// the active user: a client with a `subscribe_output` on the pane takes
+    /// the pane's size and ownership. One without it only sets the size.
     fn local_resize(&self, client: Uuid, pane: Uuid, rows: u16, cols: u16) {
         let (rows, cols) =
             (forgetty_session::clamp_pane_dim(rows), forgetty_session::clamp_pane_dim(cols));
         // A remote client already uses this id: no ownership, the size applies.
         if !lock(&self.clients).contains_key(&client) {
-            {
+            let owns = {
                 let mut sizes = lock(&self.sizes);
                 let ps = sizes.entry(pane).or_default();
-                if !ps.attached.contains(&client) {
-                    ps.attached.push(client);
+                let attached = ps.attached.contains(&client);
+                if attached {
+                    ps.by_client.insert(client, (rows, cols));
+                    ps.active = Some(client);
                 }
-                ps.by_client.insert(client, (rows, cols));
-                ps.active = Some(client);
+                attached
+            };
+            if owns {
+                self.publish_owner(pane);
             }
-            self.publish_owner(pane);
         }
         self.apply_size(pane, rows, cols);
     }
@@ -1369,6 +1401,22 @@ impl SizeGovernor for LocalSizes {
         }
     }
 
+    fn local_attached(&self, client: Uuid, pane: PaneId) {
+        if let Some(rpc) = self.0.upgrade() {
+            if !lock(&rpc.clients).contains_key(&client) {
+                rpc.note_attached(client, pane.0);
+            }
+        }
+    }
+
+    fn local_detached(&self, client: Uuid, pane: PaneId) {
+        if let Some(rpc) = self.0.upgrade() {
+            if !lock(&rpc.clients).contains_key(&client) {
+                rpc.note_detached(client, pane.0);
+            }
+        }
+    }
+
     fn local_left(&self, client: Uuid) {
         if let Some(rpc) = self.0.upgrade() {
             // A remote client with this id is not a local one.
@@ -1386,7 +1434,8 @@ fn wire_owner(o: &SizeOwner) -> forgetty_proto::SizeOwner {
         "android" => ClientKind::Android,
         "cli" => ClientKind::Cli,
         "gtk" => ClientKind::Gtk,
-        _ => ClientKind::Local,
+        "local" => ClientKind::Local,
+        _ => ClientKind::Unknown,
     };
     forgetty_proto::SizeOwner {
         client_id: o.client_id,
@@ -2773,5 +2822,25 @@ mod owner_tests {
         assert_eq!(ps.owner(), Some(b));
         ps.leave(b, false);
         assert_eq!(ps.owner(), None);
+    }
+
+    #[test]
+    fn wire_owner_maps_every_kind_and_an_unknown_one_to_unknown() {
+        let o = |k: &str| SizeOwner {
+            client_id: Uuid::nil(),
+            client_kind: k.to_string(),
+            client_name: String::new(),
+        };
+        for (s, k) in [
+            ("windows", ClientKind::Windows),
+            ("android", ClientKind::Android),
+            ("cli", ClientKind::Cli),
+            ("gtk", ClientKind::Gtk),
+            ("local", ClientKind::Local),
+            ("unknown", ClientKind::Unknown),
+            ("something new", ClientKind::Unknown),
+        ] {
+            assert_eq!(wire_owner(&o(s)).client_kind, k, "{s}");
+        }
     }
 }

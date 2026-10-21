@@ -1211,6 +1211,9 @@ async fn capture_right_after_a_full_ring_answers() {
 struct LocalClient {
     _stream: std::os::unix::net::UnixStream,
     id: Uuid,
+    name: String,
+    /// The `subscribe_output` connections, by pane.
+    outputs: std::collections::HashMap<Uuid, std::os::unix::net::UnixStream>,
 }
 
 impl LocalClient {
@@ -1224,7 +1227,26 @@ impl LocalClient {
         let mut ack = String::new();
         BufReader::new(stream.try_clone().unwrap()).read_line(&mut ack).unwrap();
         assert!(ack.contains("\"ok\""), "subscribe_layout: {ack}");
-        LocalClient { _stream: stream, id }
+        LocalClient { _stream: stream, id, name: name.into(), outputs: Default::default() }
+    }
+
+    /// Start a `subscribe_output` on `pane`: the client has a stream there.
+    fn watch(&mut self, server: &TestServer, pane: Uuid) {
+        use std::io::{BufRead, BufReader, Write};
+        let mut stream = std::os::unix::net::UnixStream::connect(server.socket_path()).unwrap();
+        let req = json!({"jsonrpc": "2.0", "id": 1, "method": "subscribe_output",
+            "params": {"pane_id": pane.to_string(), "client_id": self.id.to_string(),
+                       "client_name": self.name}});
+        writeln!(stream, "{req}").unwrap();
+        let mut ack = String::new();
+        BufReader::new(stream.try_clone().unwrap()).read_line(&mut ack).unwrap();
+        assert!(ack.contains("\"ok\""), "subscribe_output: {ack}");
+        self.outputs.insert(pane, stream);
+    }
+
+    /// End the `subscribe_output` on `pane`.
+    fn unwatch(&mut self, pane: Uuid) {
+        self.outputs.remove(&pane);
     }
 
     fn resize(&self, server: &TestServer, pane: Uuid, rows: u16, cols: u16) {
@@ -1299,7 +1321,13 @@ async fn a_local_socket_client_owns_a_pane_and_is_listed() {
     let pane = server.add_script_pane("exec cat");
     assert!(owner_of(&server, pane).is_null(), "a pane nobody attached has no owner");
 
-    let gtk = LocalClient::attach(&server, "gtk-test");
+    let mut gtk = LocalClient::attach(&server, "gtk-test");
+    // No stream on the pane yet: the size applies, the client owns nothing.
+    gtk.resize(&server, pane, 20, 80);
+    assert_eq!(pane_dims(&server, pane), (20, 80));
+    assert!(owner_of(&server, pane).is_null(), "a client with no stream owns the pane");
+    gtk.watch(&server, pane);
+    wait_for("the stream's owner", || !owner_of(&server, pane).is_null()).await;
     gtk.resize(&server, pane, 30, 100);
     assert_eq!(pane_dims(&server, pane), (30, 100));
     let owner = owner_of(&server, pane);
@@ -1332,9 +1360,11 @@ async fn a_local_socket_client_owns_a_pane_and_is_listed() {
     assert_eq!((local[0].client_id, local[0].client_name.as_str()), (gtk.id, "gtk-test"));
     assert!(list.iter().any(|c| c.client_kind == ClientKind::Android));
 
-    // The client leaves: the pane has no owner again.
-    drop(gtk);
+    // Its stream closes: the pane has no owner again, though the client is
+    // still connected.
+    gtk.unwatch(pane);
     wait_for("the owner to clear", || owner_of(&server, pane).is_null()).await;
+    drop(gtk);
     h.close().await;
     server.shutdown().await;
 }
@@ -1362,17 +1392,19 @@ async fn the_size_owner_is_announced_before_its_size_and_handed_over() {
     assert_eq!(owner["client_name"], "phone");
 
     // A local client resizes: it takes the pane.
-    let gtk = LocalClient::attach(&server, "gtk-test");
+    let mut gtk = LocalClient::attach(&server, "gtk-test");
+    gtk.watch(&server, pane);
     gtk.resize(&server, pane, 40, 120);
     wait_for("local takeover", || seen(4)).await;
     assert_eq!(owner_of(&server, pane)["client_kind"], "local");
 
-    // The local client goes away: the phone, still attached, gets the pane
-    // and its own size back.
-    drop(gtk);
+    // The local client's stream on the pane closes (it stays connected): the
+    // phone, still attached, gets the pane and its own size back.
+    gtk.unwatch(pane);
     wait_for("handover to the phone", || seen(6)).await;
     assert_eq!(pane_dims(&server, pane), (30, 100));
     assert_eq!(owner_of(&server, pane)["client_kind"], "android");
+    drop(gtk);
 
     // The phone detaches: nobody owns the pane.
     h.detach_pane(pane).await.unwrap();
@@ -1457,5 +1489,31 @@ async fn one_ctrl_c_on_a_busy_cooked_pane_is_one_sigint() {
         );
     }
     c.close().await;
+    server.shutdown().await;
+}
+
+/// `local` and `unknown` name the server's own socket clients and a kind the
+/// decoder does not know. A remote `Hello` with either is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_remote_hello_cannot_claim_to_be_local() {
+    if !real_only() {
+        return;
+    }
+    let server = TestServer::start(TestServerConfig::default()).await;
+    for kind in [ClientKind::Local, ClientKind::Unknown] {
+        let endpoint = raw_endpoint(&server).await;
+        let conn = endpoint.connect(server.addr(), ALPN_RPC).await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        let hello = Hello::new(Uuid::new_v4(), Uuid::new_v4(), kind, "liar", "0.0.0", Vec::new());
+        write_msg(&mut send, &hello).await.unwrap();
+        match read_msg::<_, HandshakeReply>(&mut recv).await.unwrap() {
+            Some(HandshakeReply::Error(e)) => {
+                assert_eq!(e.code, "bad_request");
+                assert!(e.message.contains("bad_hello"), "{}", e.message);
+            }
+            other => panic!("{kind:?}: expected a refusal, got {other:?}"),
+        }
+        endpoint.close().await;
+    }
     server.shutdown().await;
 }

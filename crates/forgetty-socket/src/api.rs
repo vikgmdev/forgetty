@@ -301,8 +301,8 @@ static METHODS: &[MethodSpec] = &[
         "Set the PTY size of a pane.",
         "Sends the new size to the PTY. A size change is reported to subscribers as a \
          `pane_resized` event. With `client_id` (a streaming client's own id) the caller \
-         takes the pane's size ownership when the size policy allows (AD-020). Without \
-         it the size applies and ownership stays as it is.",
+         takes the pane's size ownership when it has a `subscribe_output` on that pane \
+         (AD-020). Without either, the size applies and ownership stays as it is.",
         t::ResizePaneParams,
         t::OkResult,
         concat!(r#"{"pane_id":""#, pane!(), r#"","rows":40,"cols":120}"#),

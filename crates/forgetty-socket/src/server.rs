@@ -420,7 +420,7 @@ async fn handle_streaming_connection(
             let (mut rx, replay_bytes, _replay_hwm) = sm.subscribe_with_snapshot(pane_id);
             // AD-017: a streaming socket is an attached client until it closes.
             let (cid, cname) = client_identity(&request, || format!("subscribe_output {pane_id}"));
-            let Ok(_client) = sm.clients().register(cid, "socket", cname) else {
+            let Ok(_client) = sm.clients().register(cid.clone(), "socket", cname) else {
                 let resp = Response::error(
                     request.id.clone(),
                     crate::protocol::SERVER_BUSY,
@@ -429,6 +429,11 @@ async fn handle_streaming_connection(
                 write_response(&mut writer, &resp).await?;
                 return Ok(());
             };
+            // AD-020: this client has a stream on the pane until this
+            // function returns. Only such a client can own the pane's size.
+            let _output = uuid::Uuid::parse_str(&cid)
+                .ok()
+                .map(|client| sm.attach_local_output(client, pane_id));
 
             // Send the initial acknowledgment (last line-mode JSON response
             // on this connection).
