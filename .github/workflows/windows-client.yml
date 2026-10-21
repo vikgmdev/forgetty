@@ -49,6 +49,21 @@ jobs:
           Write-Host "forgetty-win --smoke exit code: $code"
           exit $code
 
+      - name: Frame-rate experiments
+        if: always()
+        continue-on-error: true
+        shell: pwsh
+        working-directory: clients/windows/target/release
+        run: |
+          foreach ($ab in 7) {
+            $env:FORGETTY_AB = "$ab"
+            $out = .\forgetty-win.exe --smoke 2>$null
+            $json = ($out | Where-Object { $_ -like '{*' } | Select-Object -Last 1)
+            $o = $json | ConvertFrom-Json
+            Write-Host ("AB=$ab key_p50={0} conpty_s={1} frames={2} cpu_p50={3} idle_p50={4}" -f $o.key_to_frame_p50_ms, $o.conpty_drain_s, $o.conpty_frames, $o.frame_cpu_p50_ms, $o.frame_idle_p50_ms)
+            Write-Host ($o.keys_cpu | ConvertTo-Json -Compress)
+          }
+
       - name: Upload layout screenshot
         if: always()
         uses: actions/upload-artifact@v4

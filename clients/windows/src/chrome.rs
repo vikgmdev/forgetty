@@ -643,6 +643,26 @@ impl Render for AppShell {
                 .h(px(1.0)),
             );
         crate::smoke::trace("r", 0);
-        out
+        if self.smoke_mode && crate::smoke::ab() == 7 {
+            // Diagnostic: only the active terminal, no chrome (the W1 layout).
+            let v = self.active_pane().and_then(|p| self.views.get(&p).cloned());
+            let entity = cx.entity();
+            return div()
+                .size_full()
+                .children(v)
+                .child(
+                    canvas(
+                        |_, _, _| (),
+                        move |_, _, window, cx| {
+                            entity.update(cx, |s, cx| s.after_paint(window, cx));
+                        },
+                    )
+                    .absolute()
+                    .w(px(1.0))
+                    .h(px(1.0)),
+                )
+                .into_any_element();
+        }
+        out.into_any_element()
     }
 }

@@ -26,6 +26,7 @@ pub const KEYSTROKES: usize = 100;
 pub const TOTAL_TIMEOUT: Duration = Duration::from_secs(300);
 /// Frame/feed trace for a short window (diagnostics only).
 pub static TRACE_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static CPU0: Mutex<Option<(Instant, (f64, f64, f64))>> = Mutex::new(None);
 static TRACE: Mutex<Vec<String>> = Mutex::new(Vec::new());
 fn t0() -> Instant {
     static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
@@ -431,6 +432,7 @@ impl ShellSmoke {
                         check("echo_found", true);
                         self.start_probe(v, cr, cc);
                         trace_start();
+                        *CPU0.lock().unwrap() = Some((Instant::now(), crate::prof::cpu_snapshot()));
                         self.goto(Phase::Keys);
                     }
                 }
@@ -448,6 +450,11 @@ impl ShellSmoke {
                         let (p50, reshaped) = summarize_keys(&self.lat_ms, self.max_reshaped_per_key, "");
                         dump_trace("keys");
                         record("prof_keys", json!(crate::prof::report()));
+                        if let Some((t0, (p0, i0, s0))) = CPU0.lock().unwrap().take() {
+                            let (p1, i1, s1) = crate::prof::cpu_snapshot();
+                            let wall = ms(t0.elapsed());
+                            record("keys_cpu", json!({"wall_ms": wall, "process_cpu_ms": p1 - p0, "system_idle_ms": i1 - i0, "system_total_ms": s1 - s0}));
+                        }
                         check("key_p50_le_18ms", p50 <= 18.0);
                         check("damage_only_redraw", reshaped <= 3);
                         self.lat_ms.clear();

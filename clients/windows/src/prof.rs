@@ -114,3 +114,34 @@ pub fn report() -> Vec<String> {
     v.sort_by(|a, b| b.1.cmp(a.1));
     v.into_iter().take(14).map(|(k, n)| format!("{n}x {k}")).collect()
 }
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct FileTime {
+    lo: u32,
+    hi: u32,
+}
+impl FileTime {
+    fn ms(self) -> f64 {
+        (((self.hi as u64) << 32) | self.lo as u64) as f64 / 10_000.0
+    }
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetCurrentProcess() -> isize;
+    fn GetProcessTimes(h: isize, c: *mut FileTime, e: *mut FileTime, k: *mut FileTime, u: *mut FileTime) -> i32;
+    fn GetSystemTimes(idle: *mut FileTime, k: *mut FileTime, u: *mut FileTime) -> i32;
+}
+
+/// (process cpu ms, system idle ms, system kernel+user ms) since boot / process start.
+pub fn cpu_snapshot() -> (f64, f64, f64) {
+    let (mut c, mut e, mut k, mut u) = (FileTime::default(), FileTime::default(), FileTime::default(), FileTime::default());
+    let (mut idle, mut sk, mut su) = (FileTime::default(), FileTime::default(), FileTime::default());
+    // SAFETY: out pointers are valid for the call.
+    unsafe {
+        GetProcessTimes(GetCurrentProcess(), &mut c, &mut e, &mut k, &mut u);
+        GetSystemTimes(&mut idle, &mut sk, &mut su);
+    }
+    (k.ms() + u.ms(), idle.ms(), sk.ms() + su.ms())
+}
