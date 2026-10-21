@@ -1394,3 +1394,68 @@ async fn the_size_owner_is_announced_before_its_size_and_handed_over() {
     h.close().await;
     server.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------
+// One Ctrl+C is one SIGINT
+// ---------------------------------------------------------------------------
+
+/// A cooked-mode program (ISIG on) that counts its SIGINTs and prints the
+/// count. It never reads its input, so a paste leaves the pane's queue busy
+/// and the Ctrl+C takes the interrupt path.
+const SIGINT_COUNTER: &str = r#"
+d=$(mktemp -d)
+cat > "$d/c.c" <<'EOF'
+#include <signal.h>
+#include <stdio.h>
+#include <unistd.h>
+static volatile sig_atomic_t n;
+static void h(int s) { (void)s; n++; }
+int main(void) {
+    struct sigaction a = {0};
+    a.sa_handler = h;
+    sigaction(SIGINT, &a, 0);
+    int last = 0;
+    setvbuf(stdout, 0, _IONBF, 0);
+    puts("READY");
+    for (;;) {
+        if (n != last) { last = n; printf("SIGINT=%d\n", last); }
+        usleep(1000);
+    }
+}
+EOF
+cc -o "$d/c" "$d/c.c" && exec "$d/c"
+"#;
+
+/// terraform and docker compose skip their graceful stop on a second SIGINT.
+/// A typed Ctrl+C on a busy cooked-mode pane must signal once: the interrupt
+/// byte goes through the tty, and the group is not signalled as well.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_ctrl_c_on_a_busy_cooked_pane_is_one_sigint() {
+    if !real_only() {
+        return;
+    }
+    let server = TestServer::start(TestServerConfig::default()).await;
+    let pane = server.add_script_pane(SIGINT_COUNTER);
+    let c = connect(&server, "typist").await;
+    let logged = |needle: &str| contains(&server.log(pane), needle.as_bytes());
+    wait_for("the program to start", || logged("READY")).await;
+
+    let paste: Vec<u8> = b"0123456789abcdef\n".iter().copied().cycle().take(40_000).collect();
+    for round in 1..=4 {
+        c.send_input(pane, &paste).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        c.send_input(pane, &[0x03]).await.unwrap();
+        // A double signal can show as `SIGINT={round+1}` at once.
+        wait_for("the SIGINT", || {
+            logged(&format!("SIGINT={round}\r\n")) || logged(&format!("SIGINT={}", round + 1))
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            !logged(&format!("SIGINT={}", round + 1)),
+            "round {round}: one Ctrl+C signalled the program twice"
+        );
+    }
+    c.close().await;
+    server.shutdown().await;
+}

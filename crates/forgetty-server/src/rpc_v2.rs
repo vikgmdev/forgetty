@@ -916,24 +916,16 @@ impl RpcV2 {
     }
 
     /// Ctrl+C for a pane that cannot take it in order: drop the input queued
-    /// behind the interrupted program, then signal its foreground group. In
-    /// that order, so the shell that gets the prompt back finds no stale
+    /// behind the interrupted program, then interrupt it once. In that order, so the shell that gets the prompt back finds no stale
     /// paste waiting. The drop waits for a stuck write, so it runs on the
     /// blocking pool.
     async fn interrupt_pane(&self, pane: Uuid) {
         let sm = self.sm.clone();
         let dropped = tokio::task::spawn_blocking(move || {
             let dropped = sm.discard_queued_input(PaneId(pane));
-            // The interrupt byte itself goes in too: ssh and mosh are skipped
-            // by the signal below (they forward the byte to the far side), so
-            // without it the Ctrl+C would be lost. Best effort, as in the
-            // local `send_sigint`.
-            if let Some(b) = sm.intr_byte(PaneId(pane)) {
-                if let Err(e) = sm.write_pty(PaneId(pane), &[b]) {
-                    debug!("rpc2: interrupt byte for pane {pane} not queued: {e}");
-                }
-            }
-            sm.send_sigint(PaneId(pane));
+            // One SIGINT: the byte through the tty, or the group signal when
+            // no byte went in (see `SessionManager::interrupt`).
+            sm.interrupt(PaneId(pane));
             dropped
         })
         .await

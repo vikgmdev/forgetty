@@ -1725,6 +1725,28 @@ impl SessionManager {
         pane.pty_bridge.pty.vintr()
     }
 
+    /// Interrupt the pane's foreground program once. The interrupt byte goes
+    /// into the PTY and the line discipline turns it into SIGINT (cooked
+    /// mode), which also reaches programs that forward the byte (ssh, mosh).
+    /// The group is signalled directly only when no byte was queued: `ISIG`
+    /// is off (a raw-mode program that swallows Ctrl+C, BUG-001), VINTR is
+    /// disabled or the queue is full. Both together would deliver SIGINT
+    /// twice to a cooked-mode program, and terraform or docker compose skip
+    /// their graceful stop on the second one.
+    ///
+    /// Returns `true` when the byte was queued. The caller drops the stale
+    /// input first ([`Self::discard_queued_input`]).
+    pub fn interrupt(&self, id: PaneId) -> bool {
+        if let Some(b) = self.intr_byte(id) {
+            match self.write_pty(id, &[b]) {
+                Ok(()) => return true,
+                Err(e) => debug!(%id, "interrupt: byte not queued: {e}"),
+            }
+        }
+        self.send_sigint(id);
+        false
+    }
+
     /// The pane's input queue. Takes `inner` only to find it.
     pub fn pane_writer(&self, id: PaneId) -> Option<crate::pane_writer::PaneWriter> {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -2449,8 +2471,9 @@ impl SessionManager {
 
     /// Send SIGINT to the foreground process group of a pane.
     ///
-    /// Daemon-side implementation of the Ctrl+C signal path:
-    /// 1. The caller (handle_send_sigint) already wrote 0x03 via write_pty.
+    /// Daemon-side implementation of the Ctrl+C signal path. Call it through
+    /// [`Self::interrupt`], which runs it only when no interrupt byte went in.
+    /// 1. The caller wrote no byte (or it failed).
     /// 2. This method calls kill(-pgid, SIGINT) UNLESS the foreground pgrp
     ///    leader is a known signal-forwarder (ssh, mosh-client, telnet, rsh).
     ///    Forwarders read 0x03 from stdin and pass it through; killing them

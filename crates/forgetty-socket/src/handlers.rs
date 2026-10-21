@@ -1264,20 +1264,12 @@ pub(crate) fn handle_send_sigint(request: &Request, sm: &SessionManager) -> Resp
     // for is gone: a paste behind Ctrl+C must not run in the shell after it.
     sm.discard_queued_input(id);
 
-    // The byte the line discipline turns into SIGINT (c_cc[VINTR]), written
-    // only while ISIG is on and VINTR is set (FIX-017). It is best effort: a
-    // pane whose queue is full (a program that never reads) must still be
-    // interruptible, so the signal below always goes out.
-    if let Some(intr_byte) = sm.intr_byte(id) {
-        if let Err(e) = sm.write_pty(id, &[intr_byte]) {
-            tracing::debug!(pane = %id, "send_sigint: intr byte not queued: {e}");
-        }
-    }
-    // For non-forwarder foreground processes (e.g., Node.js, pm2 in raw mode
-    // that swallow the byte), also kill(-pgid, SIGINT) so the signal reaches
-    // them via the kernel directly (BUG-001). Forwarders (ssh, mosh) are
-    // skipped, see `send_sigint`.
-    sm.send_sigint(id);
+    // One SIGINT: the interrupt byte through the tty when ISIG is on and the
+    // queue takes it, else the signal to the foreground group (a raw-mode
+    // program that swallows the byte, BUG-001, or a full queue). Never both:
+    // a cooked-mode program would get SIGINT twice. Forwarders (ssh, mosh)
+    // are never signalled directly, see `SessionManager::send_sigint`.
+    sm.interrupt(id);
     Response::success(request.id.clone(), serde_json::json!({ "ok": true }))
 }
 
