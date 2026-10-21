@@ -111,9 +111,32 @@ const MAX_CATCHUP_BACKOFF: Duration = Duration::from_secs(10);
 /// took live bytes at [`KEEPING_PACE_RATE`] since its last snapshot, or the
 /// snapshot was late by the build time alone): no backoff, only this floor.
 const KEEPING_PACE_INTERVAL: Duration = Duration::from_millis(100);
-/// A cycle shorter than this is too short to read a rate from, so its bytes
-/// do not show that the peer keeps pace.
-const KEEPING_PACE_MIN_CYCLE: Duration = Duration::from_millis(2);
+/// Live bytes a cycle must have delivered to prove that the peer reads. A
+/// peer that never reads still takes one 128 KiB chunk (or two) into whatever
+/// room its QUIC window has left, and that is 1 GB/s when the cycle lasts
+/// 100 us. A peer that reads takes more than the room that was left.
+const KEEPING_PACE_MIN_LIVE: u64 = 4 * CHUNK as u64;
+
+/// What a catch-up says about its peer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Claim {
+    /// The write stalled, or the peer reads too slowly to tell.
+    Stalled,
+    /// The snapshot went out quickly and the log ran past it before a live
+    /// byte: the build was too slow for the program, not the peer.
+    Weak,
+    /// One or two chunks in a few microseconds: a good rate on paper, and what
+    /// a peer that never reads gets into the room its QUIC window has left.
+    /// Only [`KEEPING_PACE_TINY_BURST`] of these in a row are taken at face
+    /// value.
+    Tiny,
+    /// The peer took live bytes at a good rate: it reads.
+    Strong,
+}
+
+/// Tiny claims in a row, without a strong one between, that still count as
+/// keeping pace.
+const KEEPING_PACE_TINY_BURST: u32 = 4;
 /// Live bytes per second since its last snapshot that put a stream among the
 /// peers that read (a 100 KB/s link does not, a loaded localhost reader does).
 const KEEPING_PACE_RATE: f64 = 1024.0 * 1024.0;
@@ -1946,17 +1969,31 @@ async fn pane_stream(
                 let live = next.saturating_sub(header.start_offset);
                 let cycle = cycle_start.elapsed();
                 let rate = live as f64 / cycle.as_secs_f64().max(0.001);
-                // A cycle of a few microseconds says nothing about the peer's
-                // rate: a peer that never reads still takes one 128 KiB chunk
-                // into whatever room its QUIC window has left, and 128 KiB in
-                // 100 us looks like 1 GB/s.
-                let keeping_pace = !stalled
-                    && if live == 0 {
-                        snapshot_sent_in < SNAPSHOT_SEND_OK
+                // `Strong` is evidence that the peer reads: it took a good rate
+                // of live bytes, more than the room a peer that never reads has
+                // left in its QUIC window. Only `Strong` ends the backoff that
+                // stalls built up. `Tiny` (one chunk in a few microseconds) is
+                // what a peer that never reads shows too, so it is believed
+                // only a few times in a row. `Weak` (a slow build, no live
+                // byte) is the server's doing and costs a token.
+                let claim = if stalled {
+                    Claim::Stalled
+                } else if live == 0 {
+                    if snapshot_sent_in < SNAPSHOT_SEND_OK {
+                        Claim::Weak
                     } else {
-                        cycle >= KEEPING_PACE_MIN_CYCLE && rate >= KEEPING_PACE_RATE
-                    };
-                tokio::time::sleep(rpc.catchup_delay(conn.remote_id(), pane, keeping_pace)).await;
+                        Claim::Stalled
+                    }
+                } else if rate >= KEEPING_PACE_RATE {
+                    if live >= KEEPING_PACE_MIN_LIVE {
+                        Claim::Strong
+                    } else {
+                        Claim::Tiny
+                    }
+                } else {
+                    Claim::Stalled
+                };
+                tokio::time::sleep(rpc.catchup_delay(conn.remote_id(), pane, claim)).await;
                 // Stop the old stream, so it queues nothing more for the peer.
                 let _ = send.reset(stream_code::SUPERSEDED.into());
                 let Some((h, snap)) = take_snapshot(&rpc, conn.remote_id(), pane, &shared).await
@@ -2039,16 +2076,18 @@ struct Pace {
     /// resume, so a peer that attaches again and again without reading
     /// between gets the backoff.
     kept_pace: bool,
+    /// Tiny claims since the last strong one.
+    tiny_streak: u32,
 }
 
 impl RpcV2 {
     /// How long `(node, pane)` waits before its next snapshot catch-up.
-    /// `keeping_pace`: the peer read what the server wrote. Such a peer gets a
-    /// burst of 6, then one catch-up per second, and its backoff is left
-    /// alone. A peer whose write stalled, or that reads too slowly to tell,
+    /// A peer that claims to keep pace (`Weak` or `Strong`) gets a burst of 6,
+    /// then one catch-up per second. `Strong` also ends the backoff its stalls
+    /// built up. A peer whose write stalled, or that reads too slowly to tell,
     /// waits 1 s, then 2, 4, 8, 10 s while it keeps needing them.
-    fn catchup_delay(&self, node: iroh::EndpointId, pane: PaneId, keeping_pace: bool) -> Duration {
-        Self::pace(&mut lock(&self.pacing), node, pane, keeping_pace)
+    fn catchup_delay(&self, node: iroh::EndpointId, pane: PaneId, claim: Claim) -> Duration {
+        Self::pace(&mut lock(&self.pacing), node, pane, claim)
     }
 
     /// How long an attach that resumes far behind waits for its snapshot. A
@@ -2066,7 +2105,7 @@ impl RpcV2 {
         pane: PaneId,
     ) -> Duration {
         let reads = map.get(&(node, pane.0)).is_some_and(|p| p.kept_pace);
-        let wait = Self::pace(map, node, pane, reads);
+        let wait = Self::pace(map, node, pane, if reads { Claim::Weak } else { Claim::Stalled });
         if let Some(p) = map.get_mut(&(node, pane.0)) {
             p.kept_pace = false;
         }
@@ -2082,7 +2121,7 @@ impl RpcV2 {
         map: &mut HashMap<(iroh::EndpointId, Uuid), Pace>,
         node: iroh::EndpointId,
         pane: PaneId,
-        keeping_pace: bool,
+        claim: Claim,
     ) -> Duration {
         let now = tokio::time::Instant::now();
         if map.len() > 4096 {
@@ -2094,10 +2133,23 @@ impl RpcV2 {
             tokens: KEEPING_PACE_BURST,
             refilled: now,
             kept_pace: false,
+            tiny_streak: 0,
         });
         let earned = now.saturating_duration_since(p.refilled).as_secs_f64() * KEEPING_PACE_PER_SEC;
         p.tokens = (p.tokens + earned).min(KEEPING_PACE_BURST);
-        let wait = if keeping_pace {
+        match claim {
+            Claim::Strong => p.tiny_streak = 0,
+            Claim::Tiny => p.tiny_streak += 1,
+            Claim::Weak | Claim::Stalled => {}
+        }
+        // A peer that keeps claiming a few bytes without ever proving a read
+        // is treated as one whose write stalls.
+        let claim = if claim == Claim::Tiny && p.tiny_streak > KEEPING_PACE_TINY_BURST {
+            Claim::Stalled
+        } else {
+            claim
+        };
+        let wait = if claim != Claim::Stalled {
             // Out of burst: the wait is the time to the next token.
             let for_token = if p.tokens >= 1.0 {
                 p.tokens -= 1.0;
@@ -2109,11 +2161,14 @@ impl RpcV2 {
             };
             let gap = p.limiter.floor(KEEPING_PACE_INTERVAL);
             let w = for_token.max(gap);
-            // The peer reads what it gets: whatever backoff its stalls built
-            // up is over, or an honest client would wait 2 to 10 s for it.
-            p.limiter.reset_backoff();
+            // A peer that reads what it gets is done with the backoff its
+            // stalls built up, or an honest client would wait 2 to 10 s for
+            // it. A claim that proves nothing leaves the backoff alone.
+            if claim == Claim::Strong {
+                p.limiter.reset_backoff();
+            }
             p.limiter.mark(now + w);
-            p.kept_pace = true;
+            p.kept_pace = claim == Claim::Strong;
             w
         } else {
             p.kept_pace = false;
@@ -2354,7 +2409,16 @@ mod pacing_tests {
         pane: Uuid,
         keeping: bool,
     ) -> Duration {
-        RpcV2::pace(&mut lock(map), n, PaneId(pane), keeping)
+        let claim = if keeping { Claim::Strong } else { Claim::Stalled };
+        RpcV2::pace(&mut lock(map), n, PaneId(pane), claim)
+    }
+
+    fn weak(
+        map: &Mutex<HashMap<(iroh::EndpointId, Uuid), Pace>>,
+        n: iroh::EndpointId,
+        pane: Uuid,
+    ) -> Duration {
+        RpcV2::pace(&mut lock(map), n, PaneId(pane), Claim::Weak)
     }
 
     #[tokio::test(start_paused = true)]
@@ -2423,6 +2487,47 @@ mod pacing_tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
         let w = RpcV2::resume(&mut lock(&map), n, PaneId(pane));
         assert!(w <= Duration::from_millis(1200), "resume waits {w:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_claim_that_proves_nothing_does_not_end_the_backoff() {
+        let map = pace_map();
+        let (n, pane) = (node(), Uuid::new_v4());
+        for _ in 0..5 {
+            let w = delay(&map, n, pane, false);
+            tokio::time::sleep(w).await;
+        }
+        // A peer that never reads can make weak claims all day.
+        let w = weak(&map, n, pane);
+        tokio::time::sleep(w).await;
+        let w = delay(&map, n, pane, false);
+        assert!(w >= Duration::from_secs(8), "weak claims reset the backoff: {w:?}");
+        // A strong one does end it.
+        tokio::time::sleep(w).await;
+        let w = delay(&map, n, pane, true);
+        tokio::time::sleep(w).await;
+        let w = delay(&map, n, pane, false);
+        assert!(w <= Duration::from_secs(2), "a strong claim kept the backoff: {w:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_that_only_ever_claims_a_chunk_is_backed_off_after_four() {
+        let map = pace_map();
+        let (n, pane) = (node(), Uuid::new_v4());
+        let mut waits = Vec::new();
+        for _ in 0..12 {
+            let w = RpcV2::pace(&mut lock(&map), n, PaneId(pane), Claim::Tiny);
+            waits.push(w.as_secs());
+            tokio::time::sleep(w).await;
+        }
+        // 4 are believed (100 ms apart), then the stall rules apply: 2, 4, 8, 10.
+        assert!(waits[..4].iter().all(|w| *w == 0), "{waits:?}");
+        assert!(waits[4..].iter().any(|w| *w >= 8), "{waits:?}");
+        // One proven read gives the burst back.
+        let w = delay(&map, n, pane, true);
+        tokio::time::sleep(w).await;
+        let w = RpcV2::pace(&mut lock(&map), n, PaneId(pane), Claim::Tiny);
+        assert!(w <= Duration::from_secs(2), "{w:?}");
     }
 
     #[tokio::test(start_paused = true)]
