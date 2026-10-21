@@ -169,9 +169,13 @@ async fn exactly_once_across_five_drops_and_one_restart() {
 /// the same run drops nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unacked_input_is_dropped_and_reported_when_the_server_restarts() {
-    let server = TestServer::start(TestServerConfig::default()).await;
+    let server = TestServer::start(TestServerConfig {
+        panes: vec![(Uuid::new_v4(), Vec::new())],
+        ..Default::default()
+    })
+    .await;
     let port = server.udp_addr().port();
-    let pane = server.add_pane();
+    let pane = server.initial_pane(0); // an initial pane survives the restart
     let h = connect(&server, "typist").await;
     let first_boot = h.welcome().unwrap().boot_id;
     assert!(first_boot.is_some(), "the server sends a boot_id");
