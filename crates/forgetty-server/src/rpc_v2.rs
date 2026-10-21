@@ -172,6 +172,8 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 struct InputRec {
     /// Last `seq` the PTY has taken (what `Pong.input_acked` says).
     last: AtomicU64,
+    /// Last `seq` put in the pane's queue. A frame at or below it is a resend.
+    queued: AtomicU64,
     /// Held across dedup and the real write, so frames of one client epoch
     /// stay in order and are written once, even on overlapping connections.
     /// An async lock: a write that waits on a full pane queue holds up this
@@ -370,7 +372,11 @@ impl RpcV2 {
                 };
                 inputs.insert(
                     (c, ep),
-                    Arc::new(InputRec { last: AtomicU64::new(last), ..Default::default() }),
+                    Arc::new(InputRec {
+                        last: AtomicU64::new(last),
+                        queued: AtomicU64::new(last),
+                        ..Default::default()
+                    }),
                 );
                 loaded += 1;
             }
@@ -693,20 +699,40 @@ impl RpcV2 {
             if self.inputs_frozen.load(Ordering::SeqCst) {
                 return; // shutting down: not written, so not acked, so resent
             }
-            if seq <= rec.last.load(Ordering::SeqCst) {
+            if seq <= rec.queued.load(Ordering::SeqCst) {
                 self.qa.dedup_drops.fetch_add(1, Ordering::SeqCst);
                 return;
             }
             #[cfg(feature = "qa-tools")]
             let copy = bytes.clone();
-            match self.sm.write_pty_wait(PaneId(pane), bytes).await {
-                Ok(()) => {}
-                Err(e) => debug!("rpc2: input for pane {pane}: {e}"),
-            }
-            // A pane that is gone takes no more input; the frame is spent.
-            rec.last.store(seq, Ordering::SeqCst);
+            // Wait for room only. The `await` returns with the bytes queued, and
+            // `queued` is set before the next `await`: a connection that dies
+            // here (this future is dropped) either queued nothing and recorded
+            // nothing, or queued and recorded. A resend is then never written
+            // twice.
+            let done = match self.sm.write_pty_enqueue(PaneId(pane), bytes).await {
+                Ok(done) => Some(done),
+                Err(e) => {
+                    debug!("rpc2: input for pane {pane}: {e}");
+                    None
+                }
+            };
+            rec.queued.fetch_max(seq, Ordering::SeqCst);
             #[cfg(feature = "qa-tools")]
             lock(&self.qa.input_log).entry(pane).or_default().extend_from_slice(&copy);
+            // The ack follows the real write. It runs on its own task, so it
+            // lands even when this connection goes away while the pane is
+            // slow. The gate stays held until then: a program that does not
+            // read stalls this client's input and nothing else. A pane that is
+            // gone takes no more input; its frame is spent.
+            let r = rec.clone();
+            let ack = tokio::spawn(async move {
+                if let Some(done) = done {
+                    let _ = done.await;
+                }
+                r.last.fetch_max(seq, Ordering::SeqCst);
+            });
+            let _ = ack.await;
         }
         if policy {
             self.touch_active(client, pane);

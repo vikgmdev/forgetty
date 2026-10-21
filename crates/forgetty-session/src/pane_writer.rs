@@ -187,6 +187,20 @@ impl PaneWriter {
         }
     }
 
+    /// Queue `data`, waiting for room only, and hand back the receiver that
+    /// fires when the PTY has taken all of it (or the pane closed). Once this
+    /// returns `Ok` the bytes are in the queue: the caller records that
+    /// without an `await` in between, so a dropped caller cannot leave bytes
+    /// queued and unrecorded.
+    pub async fn queue_with_done(
+        &self,
+        data: Vec<u8>,
+    ) -> Result<oneshot::Receiver<Result<(), String>>, QueueError> {
+        let (tx, rx) = oneshot::channel();
+        self.push_waiting(Job { data, done: Some(tx) }).await?;
+        Ok(rx)
+    }
+
     /// Bytes waiting in the queue (test and QA hook).
     pub fn queued_bytes(&self) -> usize {
         self.shared.lock().bytes

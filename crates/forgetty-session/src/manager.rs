@@ -1690,6 +1690,23 @@ impl SessionManager {
             .map_err(|e| forgetty_core::ForgettyError::Pty(format!("pane {id}: {e}")))
     }
 
+    /// Queue input for a pane, waiting for room only, and return the receiver
+    /// that fires once the PTY has taken the bytes. Dropping the future before
+    /// it returns queues nothing. After it returns the bytes are queued, so
+    /// the caller can record them as written-in-order at once.
+    pub async fn write_pty_enqueue(
+        &self,
+        id: PaneId,
+        data: Vec<u8>,
+    ) -> Result<tokio::sync::oneshot::Receiver<std::result::Result<(), String>>> {
+        let w = self
+            .pane_writer(id)
+            .ok_or_else(|| forgetty_core::ForgettyError::Pty(format!("pane {id} not found")))?;
+        w.queue_with_done(data)
+            .await
+            .map_err(|e| forgetty_core::ForgettyError::Pty(format!("pane {id}: {e}")))
+    }
+
     /// Resize a pane's PTY to new dimensions.
     ///
     /// The daemon no longer owns a VT (AD-007) — clients resize their own
