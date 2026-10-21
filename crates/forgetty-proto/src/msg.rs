@@ -173,6 +173,18 @@ pub enum ControlMsg {
         /// The event.
         event: ServerEvent,
     },
+    /// Client to server liveness probe, every 1 s while connected.
+    Ping {
+        /// Echoed in the `Pong`.
+        nonce: u64,
+    },
+    /// Server to client answer to `Ping`.
+    Pong {
+        /// The `Ping` nonce.
+        nonce: u64,
+        /// Highest input `seq` written to a PTY for this `client_id`.
+        input_acked: u64,
+    },
 }
 
 impl ControlMsg {

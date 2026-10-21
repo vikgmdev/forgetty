@@ -198,10 +198,11 @@ fn golden_cliententry() {
 
 #[test]
 fn golden_input_frame() {
-    let payload = encode_input_frame(id(3), b"ls\r");
-    assert_eq!(hex(&payload), "030303030303030303030303030303036c730d");
-    let (pane, bytes) = decode_input_frame(&payload).unwrap();
+    let payload = encode_input_frame(id(3), 258, b"ls\r");
+    assert_eq!(hex(&payload), "0303030303030303030303030303030300000000000001026c730d");
+    let (pane, seq, bytes) = decode_input_frame(&payload).unwrap();
     assert_eq!(pane, id(3));
+    assert_eq!(seq, 258);
     assert_eq!(bytes, b"ls\r");
 }
 
@@ -271,4 +272,17 @@ fn uuids_are_strings_not_bin() {
 fn params_are_maps() {
     let m = to_value(&AttachPaneParams { pane_id: id(3), from_offset: None }).unwrap();
     assert!(matches!(m, Value::Map(_)));
+}
+
+#[test]
+fn golden_ping() {
+    golden::<ControlMsg>(ControlMsg::Ping { nonce: 5 }, "81a450696e6781a56e6f6e636505");
+}
+
+#[test]
+fn golden_pong() {
+    golden::<ControlMsg>(
+        ControlMsg::Pong { nonce: 5, input_acked: 1000 },
+        "81a4506f6e6782a56e6f6e636505ab696e7075745f61636b6564cd03e8",
+    );
 }

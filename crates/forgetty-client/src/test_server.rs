@@ -78,6 +78,10 @@ struct PaneLog {
 
 struct State {
     cfg: TestServerConfig,
+    /// Last input `seq` written per `client_id` (exactly-once input).
+    input_seq: Mutex<HashMap<Uuid, u64>>,
+    dedup_drops: AtomicU64,
+    hold_acks: AtomicBool,
     server_id: Uuid,
     panes: Mutex<HashMap<Uuid, PaneLog>>,
     conns: Mutex<Vec<Connection>>,
@@ -107,7 +111,10 @@ pub struct TestServer {
 impl TestServer {
     /// Bind on localhost without relay and start accepting.
     pub async fn start(cfg: TestServerConfig) -> TestServer {
-        let key = SecretKey::generate(&mut rand::rng());
+        Self::start_inner(cfg, SecretKey::generate(&mut rand::rng())).await
+    }
+
+    async fn start_inner(cfg: TestServerConfig, key: SecretKey) -> TestServer {
         let endpoint = Endpoint::empty_builder()
             .secret_key(key)
             .alpns(vec![ALPN_RPC.to_vec(), ALPN_PAIR.to_vec()])
@@ -125,6 +132,9 @@ impl TestServer {
             .with_ip_addr(std::net::SocketAddr::from(([127, 0, 0, 1], port)));
         let (events, _) = broadcast::channel(256);
         let state = Arc::new(State {
+            input_seq: Mutex::new(HashMap::new()),
+            dedup_drops: AtomicU64::new(0),
+            hold_acks: AtomicBool::new(false),
             server_id: Uuid::new_v4(),
             panes: Mutex::new(HashMap::new()),
             conns: Mutex::new(Vec::new()),
@@ -145,6 +155,22 @@ impl TestServer {
     /// Address clients dial (direct localhost address, no relay).
     pub fn addr(&self) -> EndpointAddr {
         self.addr.clone()
+    }
+
+    /// The raw `127.0.0.1:port` this server listens on.
+    pub fn udp_addr(&self) -> std::net::SocketAddr {
+        *self.addr.ip_addrs().next().expect("direct address")
+    }
+
+    /// Frames dropped as duplicates (`seq <=` last written) so far.
+    pub fn dedup_drops(&self) -> u64 {
+        self.state.dedup_drops.load(Ordering::SeqCst)
+    }
+
+    /// While held, `Pong.input_acked` stays 0, so clients keep (and after a
+    /// reconnect resend) all their input.
+    pub fn hold_acks(&self, hold: bool) {
+        self.state.hold_acks.store(hold, Ordering::SeqCst);
     }
 
     /// Create an empty pane.
@@ -200,6 +226,11 @@ impl TestServer {
         let panes = lock(&self.state.panes);
         let p = panes.get(&pane).expect("pane exists");
         p.first + p.data.len() as u64
+    }
+
+    /// The pane log from its first retained byte.
+    pub fn log(&self, pane: Uuid) -> Vec<u8> {
+        lock(&self.state.panes).get(&pane).expect("pane exists").data.clone()
     }
 
     /// Everything clients typed into the pane, in arrival order.
@@ -370,9 +401,19 @@ async fn handle_rpc(conn: Connection, state: Arc<State>) {
     {
         let conn = conn.clone();
         let state = state.clone();
+        let client_id = hello.client_id;
         tasks.spawn(async move {
             let Ok(mut input) = conn.accept_uni().await else { return };
-            while let Ok(Some((pane, bytes))) = read_input_frame(&mut input).await {
+            while let Ok(Some((pane, seq, bytes))) = read_input_frame(&mut input).await {
+                // Dedup and write under one lock, so a resend on a new
+                // connection can never overtake or double a frame.
+                let mut seqs = lock(&state.input_seq);
+                let last = seqs.entry(client_id).or_insert(0);
+                if seq <= *last {
+                    state.dedup_drops.fetch_add(1, Ordering::SeqCst);
+                    continue;
+                }
+                *last = seq;
                 let notify = {
                     let mut panes = lock(&state.panes);
                     let Some(p) = panes.get_mut(&pane) else { continue };
@@ -382,6 +423,7 @@ async fn handle_rpc(conn: Connection, state: Arc<State>) {
                     }
                     p.notify.clone()
                 };
+                drop(seqs);
                 notify.notify_waiters();
             }
         });
@@ -395,6 +437,15 @@ async fn handle_rpc(conn: Connection, state: Arc<State>) {
         tokio::select! {
             msg = read_msg::<_, ControlMsg>(&mut recv) => {
                 let Ok(Some(msg)) = msg else { break };
+                if let ControlMsg::Ping { nonce } = msg {
+                    let input_acked = if state.hold_acks.load(Ordering::SeqCst) {
+                        0
+                    } else {
+                        lock(&state.input_seq).get(&hello.client_id).copied().unwrap_or(0)
+                    };
+                    let _ = out_tx.send(ControlMsg::Pong { nonce, input_acked });
+                    continue;
+                }
                 let ControlMsg::Request { id, method: m, params } = msg else { continue };
                 let reply = handle_request(
                     &conn, &state, &mut tasks, &mut streams, &mut events_subscribed, &m, params,
@@ -547,5 +598,110 @@ async fn pane_stream(
             }
             Some(_) => wake.await,
         }
+    }
+}
+
+/// A UDP forwarder between clients and a server, used to blackhole a
+/// connection silently (no packets, no QUIC close), as a dead network would.
+pub struct UdpProxy {
+    addr: std::net::SocketAddr,
+    inner: Arc<ProxyInner>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+struct ProxyInner {
+    upstream: Mutex<std::net::SocketAddr>,
+    /// `Some(next_upstream)` while blackholed.
+    blackhole: Mutex<Option<std::net::SocketAddr>>,
+    /// When the last blackhole was lifted by a redial.
+    lifted_at: Mutex<Option<std::time::Instant>>,
+}
+
+impl UdpProxy {
+    /// Listen on a free localhost port and forward to `upstream`.
+    pub async fn start(upstream: std::net::SocketAddr) -> UdpProxy {
+        let front = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.expect("bind proxy"));
+        let addr = front.local_addr().expect("proxy addr");
+        let inner = Arc::new(ProxyInner {
+            upstream: Mutex::new(upstream),
+            blackhole: Mutex::new(None),
+            lifted_at: Mutex::new(None),
+        });
+        let task = tokio::spawn(proxy_loop(front, inner.clone()));
+        UdpProxy { addr, inner, task }
+    }
+
+    /// Address clients dial, for a server with node id `id`.
+    pub fn addr_for(&self, id: EndpointId) -> EndpointAddr {
+        EndpointAddr::new(id).with_ip_addr(self.addr)
+    }
+
+    /// Drop every packet in both directions, silently. The network comes
+    /// back at the first new QUIC Initial packet from a client (a redial),
+    /// and from then on traffic goes to `next_upstream`.
+    pub fn blackhole_until_redial(&self, next_upstream: std::net::SocketAddr) {
+        *lock(&self.inner.blackhole) = Some(next_upstream);
+    }
+
+    /// When the blackhole was lifted by a redial: the moment the client gave
+    /// up on the dead connection.
+    pub fn lifted_at(&self) -> Option<std::time::Instant> {
+        *lock(&self.inner.lifted_at)
+    }
+
+    /// `true` once the blackhole was lifted by a redial.
+    pub fn blackhole_lifted(&self) -> bool {
+        lock(&self.inner.blackhole).is_none()
+    }
+
+    /// Stop the proxy.
+    pub fn stop(self) {
+        self.task.abort();
+    }
+}
+
+async fn proxy_loop(front: Arc<tokio::net::UdpSocket>, inner: Arc<ProxyInner>) {
+    use tokio::net::UdpSocket;
+    // client address -> socket towards the upstream, plus its reply pump
+    let mut flows: HashMap<std::net::SocketAddr, (Arc<UdpSocket>, tokio::task::JoinHandle<()>)> =
+        HashMap::new();
+    let mut buf = vec![0u8; 65536];
+    loop {
+        let Ok((n, client)) = front.recv_from(&mut buf).await else { return };
+        // QUIC long header and a padded datagram: a new connection's Initial.
+        let initial = n >= 1200 && buf[0] & 0x80 != 0;
+        {
+            let mut bh = lock(&inner.blackhole);
+            match *bh {
+                Some(next) if initial => {
+                    *bh = None;
+                    *lock(&inner.lifted_at) = Some(std::time::Instant::now());
+                    *lock(&inner.upstream) = next;
+                    for (_, (_, pump)) in flows.drain() {
+                        pump.abort();
+                    }
+                }
+                Some(_) => continue, // blackholed: drop
+                None => {}
+            }
+        }
+        if let std::collections::hash_map::Entry::Vacant(slot) = flows.entry(client) {
+            let up = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind upstream"));
+            let target = *lock(&inner.upstream);
+            let (front, inner2, up2) = (front.clone(), inner.clone(), up.clone());
+            let pump = tokio::spawn(async move {
+                let mut b = vec![0u8; 65536];
+                while let Ok((m, from)) = up2.recv_from(&mut b).await {
+                    if from != target || lock(&inner2.blackhole).is_some() {
+                        continue;
+                    }
+                    let _ = front.send_to(&b[..m], client).await;
+                }
+            });
+            slot.insert((up, pump));
+        }
+        let (up, _) = &flows[&client];
+        let target = *lock(&inner.upstream);
+        let _ = up.send_to(&buf[..n], target).await;
     }
 }

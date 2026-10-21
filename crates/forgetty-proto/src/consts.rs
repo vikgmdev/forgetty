@@ -21,6 +21,17 @@ pub const IDLE_TIMEOUT_SECS: u64 = 30;
 
 /// Length of a pane uuid inside an input frame.
 pub const PANE_UUID_LEN: usize = 16;
+/// Length of the sequence number inside an input frame.
+pub const INPUT_SEQ_LEN: usize = 8;
+/// Length of an input frame header: `[16 uuid][u64 BE seq]`.
+pub const INPUT_HEADER_LEN: usize = PANE_UUID_LEN + INPUT_SEQ_LEN;
+
+/// The client sends `Ping` this often while connected (section 4).
+pub const PING_INTERVAL_MS: u64 = 1000;
+/// No `Pong` for this long means the connection is dead.
+pub const PONG_DEAD_AFTER_MS: u64 = 3000;
+/// After `network_changed()` the client waits this long for a `Pong`.
+pub const NETWORK_CHANGE_PONG_MS: u64 = 1000;
 
 /// Reconnect backoff in milliseconds (section 9). The first redial is
 /// immediate. After that the client waits these delays and then 2 s forever.

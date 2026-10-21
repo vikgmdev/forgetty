@@ -19,7 +19,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use uuid::Uuid;
 
-use crate::consts::{MAX_FRAME_LEN, PANE_UUID_LEN};
+use crate::consts::{INPUT_HEADER_LEN, INPUT_SEQ_LEN, MAX_FRAME_LEN, PANE_UUID_LEN};
 
 /// Frames up to this size are written with one `write_all` call.
 const COALESCE_LIMIT: usize = 16 * 1024;
@@ -46,8 +46,8 @@ pub enum FrameError {
     /// MessagePack decode failed.
     #[error("decode error: {0}")]
     Decode(String),
-    /// An input frame shorter than 16 bytes.
-    #[error("input frame of {len} bytes has no pane uuid")]
+    /// An input frame shorter than its 24 byte header.
+    #[error("input frame of {len} bytes is shorter than its header")]
     ShortInput {
         /// Frame length.
         len: usize,
@@ -161,42 +161,45 @@ pub async fn read_output_frame<R: AsyncRead + Unpin>(
     read_frame_into(r, buf).await
 }
 
-/// Build the payload of an input frame: `[16 byte uuid][bytes]`.
-pub fn encode_input_frame(pane: Uuid, bytes: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(PANE_UUID_LEN + bytes.len());
+/// Build the payload of an input frame: `[16 byte uuid][u64 BE seq][bytes]`.
+pub fn encode_input_frame(pane: Uuid, seq: u64, bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(INPUT_HEADER_LEN + bytes.len());
     out.extend_from_slice(pane.as_bytes());
+    out.extend_from_slice(&seq.to_be_bytes());
     out.extend_from_slice(bytes);
     out
 }
 
-/// Split an input frame payload into pane and bytes.
-pub fn decode_input_frame(payload: &[u8]) -> Result<(Uuid, &[u8]), FrameError> {
-    if payload.len() < PANE_UUID_LEN {
+/// Split an input frame payload into pane, sequence number and bytes.
+pub fn decode_input_frame(payload: &[u8]) -> Result<(Uuid, u64, &[u8]), FrameError> {
+    if payload.len() < INPUT_HEADER_LEN {
         return Err(FrameError::ShortInput { len: payload.len() });
     }
-    let (head, rest) = payload.split_at(PANE_UUID_LEN);
     let mut raw = [0u8; PANE_UUID_LEN];
-    raw.copy_from_slice(head);
-    Ok((Uuid::from_bytes(raw), rest))
+    raw.copy_from_slice(&payload[..PANE_UUID_LEN]);
+    let mut seq = [0u8; INPUT_SEQ_LEN];
+    seq.copy_from_slice(&payload[PANE_UUID_LEN..INPUT_HEADER_LEN]);
+    Ok((Uuid::from_bytes(raw), u64::from_be_bytes(seq), &payload[INPUT_HEADER_LEN..]))
 }
 
 /// Write an input frame.
 pub async fn write_input_frame<W: AsyncWrite + Unpin>(
     w: &mut W,
     pane: Uuid,
+    seq: u64,
     bytes: &[u8],
 ) -> Result<(), FrameError> {
-    write_frame(w, &encode_input_frame(pane, bytes)).await
+    write_frame(w, &encode_input_frame(pane, seq, bytes)).await
 }
 
 /// Read an input frame. `Ok(None)` is a clean end of stream.
 pub async fn read_input_frame<R: AsyncRead + Unpin>(
     r: &mut R,
-) -> Result<Option<(Uuid, Vec<u8>)>, FrameError> {
+) -> Result<Option<(Uuid, u64, Vec<u8>)>, FrameError> {
     match read_frame(r).await? {
         Some(payload) => {
-            let (pane, rest) = decode_input_frame(&payload)?;
-            Ok(Some((pane, rest.to_vec())))
+            let (pane, seq, rest) = decode_input_frame(&payload)?;
+            Ok(Some((pane, seq, rest.to_vec())))
         }
         None => Ok(None),
     }

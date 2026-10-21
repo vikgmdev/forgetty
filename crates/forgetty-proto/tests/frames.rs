@@ -80,20 +80,20 @@ async fn input_frames_round_trip() {
     let (mut a, mut b) = duplex(1 << 16);
     let p1 = Uuid::from_bytes([1; 16]);
     let p2 = Uuid::from_bytes([2; 16]);
-    write_input_frame(&mut a, p1, b"a").await.unwrap();
-    write_input_frame(&mut a, p2, &vec![0u8; 1024]).await.unwrap();
+    write_input_frame(&mut a, p1, 1, b"a").await.unwrap();
+    write_input_frame(&mut a, p2, u64::MAX, &vec![0u8; 1024]).await.unwrap();
     drop(a);
-    assert_eq!(read_input_frame(&mut b).await.unwrap().unwrap(), (p1, b"a".to_vec()));
-    let (p, bytes) = read_input_frame(&mut b).await.unwrap().unwrap();
-    assert_eq!((p, bytes.len()), (p2, 1024));
+    assert_eq!(read_input_frame(&mut b).await.unwrap().unwrap(), (p1, 1, b"a".to_vec()));
+    let (p, seq, bytes) = read_input_frame(&mut b).await.unwrap().unwrap();
+    assert_eq!((p, seq, bytes.len()), (p2, u64::MAX, 1024));
     assert!(read_input_frame(&mut b).await.unwrap().is_none());
 }
 
 #[test]
 fn short_input_frame_is_rejected() {
-    assert!(matches!(decode_input_frame(&[0u8; 15]), Err(FrameError::ShortInput { len: 15 })));
-    // Exactly a uuid and no bytes is legal.
-    assert!(decode_input_frame(&[0u8; 16]).unwrap().1.is_empty());
+    assert!(matches!(decode_input_frame(&[0u8; 23]), Err(FrameError::ShortInput { len: 23 })));
+    // Exactly the header and no bytes is legal.
+    assert!(decode_input_frame(&[0u8; 24]).unwrap().2.is_empty());
 }
 
 #[tokio::test]

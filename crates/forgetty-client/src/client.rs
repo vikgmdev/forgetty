@@ -24,7 +24,8 @@ use forgetty_proto::{
     cap, close_code, decode_msg, encode_input_frame, encode_msg, error_code, from_value, method,
     read_frame_into, read_msg, read_output_frame, to_value, write_frame, write_msg,
     AttachPaneParams, ControlMsg, DetachPaneParams, HandshakeReply, Hello, PaneStreamHeader,
-    ResizePaneParams, ServerEvent, Value, Welcome, ALPN_RPC, INPUT_BUFFER_CAP, PROTO_MAJOR,
+    ResizePaneParams, ServerEvent, Value, Welcome, ALPN_RPC, INPUT_BUFFER_CAP,
+    NETWORK_CHANGE_PONG_MS, PING_INTERVAL_MS, PONG_DEAD_AFTER_MS, PROTO_MAJOR,
     RECONNECT_BACKOFF_MS,
 };
 use iroh::endpoint::{Connection, ConnectionError, RecvStream, SendStream};
@@ -125,6 +126,10 @@ pub(crate) struct Link {
     conn: Connection,
     /// Set when `session_init` finished: events and panes are resumed.
     resumed: AtomicBool,
+    /// When the last `Pong` arrived (session start counts as one).
+    last_pong: Mutex<Instant>,
+    /// Highest `Ping` nonce answered so far.
+    pong_tx: watch::Sender<u64>,
 }
 
 impl Link {
@@ -162,10 +167,44 @@ pub(crate) struct PaneShared {
     attached_gen: Arc<tokio::sync::Mutex<u64>>,
 }
 
+/// One input frame kept until the server acks it.
+struct InFrame {
+    seq: u64,
+    /// Encoded payload `[uuid][seq][bytes]`.
+    payload: Arc<Vec<u8>>,
+    /// Input bytes inside (what the 64 KiB cap counts).
+    len: usize,
+}
+
+struct InputState {
+    /// Unacked frames in `seq` order.
+    frames: VecDeque<InFrame>,
+    /// Sum of `len` over `frames`.
+    bytes: usize,
+    next_seq: u64,
+}
+
 struct InputQueue {
-    frames: Mutex<(VecDeque<Arc<Vec<u8>>>, usize)>,
+    state: Mutex<InputState>,
     ready: Notify,
     space: Notify,
+}
+
+impl InputQueue {
+    /// Drop every frame the server wrote to a PTY (`seq <= acked`).
+    fn ack(&self, acked: u64) {
+        let mut st = lock(&self.state);
+        let mut freed = false;
+        while st.frames.front().is_some_and(|f| f.seq <= acked) {
+            let f = st.frames.pop_front().expect("front checked");
+            st.bytes -= f.len;
+            freed = true;
+        }
+        drop(st);
+        if freed {
+            self.space.notify_waiters();
+        }
+    }
 }
 
 pub(crate) struct Shared {
@@ -186,6 +225,9 @@ pub(crate) struct Shared {
     welcome: Mutex<Option<Welcome>>,
     shutdown_tx: watch::Sender<bool>,
     kick: Notify,
+    /// Wakes the liveness task for an immediate `Ping`.
+    ping_now: Notify,
+    next_nonce: AtomicU64,
 }
 
 // ---------------------------------------------------------------------------
@@ -264,7 +306,7 @@ impl Client {
             next_gen: AtomicU64::new(0),
             panes: Mutex::new(HashMap::new()),
             input: InputQueue {
-                frames: Mutex::new((VecDeque::new(), 0)),
+                state: Mutex::new(InputState { frames: VecDeque::new(), bytes: 0, next_seq: 1 }),
                 ready: Notify::new(),
                 space: Notify::new(),
             },
@@ -275,6 +317,8 @@ impl Client {
             welcome: Mutex::new(None),
             shutdown_tx,
             kick: Notify::new(),
+            ping_now: Notify::new(),
+            next_nonce: AtomicU64::new(1),
         });
         let supervisor = tokio::spawn(supervise(shared.clone()));
         Ok(ClientHandle {
@@ -426,23 +470,25 @@ impl ClientHandle {
             return Err(ClientError::Closed);
         }
         let disconnected = !self.state().is_connected();
-        if disconnected {
-            let used = lock(&shared.input.frames).1;
-            if used + bytes.len() > INPUT_BUFFER_CAP {
-                return Err(ClientError::InputBufferFull);
-            }
+        if disconnected && lock(&shared.input.state).bytes + bytes.len() > INPUT_BUFFER_CAP {
+            return Err(ClientError::InputBufferFull);
         }
         for chunk in bytes.chunks(INPUT_CHUNK) {
-            let frame = Arc::new(encode_input_frame(pane_id, chunk));
             loop {
                 let space = shared.input.space.notified();
                 tokio::pin!(space);
                 space.as_mut().enable();
                 {
-                    let mut q = lock(&shared.input.frames);
-                    if q.1 + chunk.len() <= INPUT_BUFFER_CAP || q.0.is_empty() {
-                        q.1 += chunk.len();
-                        q.0.push_back(frame.clone());
+                    let mut st = lock(&shared.input.state);
+                    if st.bytes + chunk.len() <= INPUT_BUFFER_CAP || st.frames.is_empty() {
+                        let seq = st.next_seq;
+                        st.next_seq += 1;
+                        st.bytes += chunk.len();
+                        st.frames.push_back(InFrame {
+                            seq,
+                            payload: Arc::new(encode_input_frame(pane_id, seq, chunk)),
+                            len: chunk.len(),
+                        });
                         shared.input.ready.notify_one();
                         break;
                     }
@@ -450,10 +496,17 @@ impl ClientHandle {
                 if !self.state().is_connected() {
                     return Err(ClientError::InputBufferFull);
                 }
+                // Full of unacked frames: ask for an ack now, then wait.
+                shared.ping_now.notify_one();
                 space.await;
             }
         }
         Ok(())
+    }
+
+    /// Input bytes sent or buffered but not yet acked by the server.
+    pub fn unacked_input_bytes(&self) -> usize {
+        lock(&self.shared().input.state).bytes
     }
 
     /// Tell the server the size this client wants for a pane (`resize_pane`).
@@ -476,9 +529,27 @@ impl ClientHandle {
     }
 
     /// Call when the OS reports a network change (Wi-Fi to LTE). Tells iroh to
-    /// re-probe paths.
+    /// re-probe paths, sends a `Ping` at once and redials if no `Pong` comes
+    /// back within 1 s.
     pub async fn network_changed(&self) {
-        self.shared().endpoint.network_change().await;
+        let shared = self.shared();
+        // Probe first: `network_change` can take long on a dead network, and
+        // must not delay the Ping.
+        let link = shared.link_tx.borrow().clone();
+        let endpoint = shared.endpoint.clone();
+        tokio::spawn(async move { endpoint.network_change().await });
+        let Some(link) = link else { return };
+        let nonce = shared.next_nonce.fetch_add(1, Ordering::Relaxed);
+        let mut pong_rx = link.pong_tx.subscribe();
+        if send_ping(&link, nonce).is_err() {
+            return;
+        }
+        let wait = pong_rx.wait_for(|n| *n >= nonce);
+        let limit = Duration::from_millis(NETWORK_CHANGE_PONG_MS);
+        if !matches!(tokio::time::timeout(limit, wait).await, Ok(Ok(_))) {
+            info!("client: no Pong after network change, redialing");
+            link.conn.close(close_code::OK.into(), b"network changed");
+        }
     }
 
     /// Drop the current connection (if any) and redial at once.
@@ -883,6 +954,8 @@ async fn run_session(
         caps,
         conn: conn.clone(),
         resumed: AtomicBool::new(false),
+        last_pong: Mutex::new(Instant::now()),
+        pong_tx: watch::channel(0).0,
     });
 
     let input_send = match conn.open_uni().await {
@@ -904,6 +977,7 @@ async fn run_session(
     tasks.spawn(input_writer(shared.clone(), input_send, resumed_rx));
     tasks.spawn(accept_streams(conn.clone(), stream_tx));
     tasks.spawn(session_init(shared.clone(), link.clone(), resumed_tx));
+    tasks.spawn(liveness(shared.clone(), link.clone()));
 
     *lock(&shared.welcome) = Some(welcome);
     shared.link_tx.send_replace(Some(link.clone()));
@@ -974,7 +1048,14 @@ async fn control_reader(link: Arc<Link>, shared: Arc<Shared>, mut recv: RecvStre
                 Ok(ControlMsg::Event { seq, event }) => {
                     let _ = shared.events_tx.send(EventItem::Server { seq, event });
                 }
-                Ok(ControlMsg::Request { .. }) => warn!("client: server sent a Request, ignored"),
+                Ok(ControlMsg::Pong { nonce, input_acked }) => {
+                    *lock(&link.last_pong) = Instant::now();
+                    link.pong_tx.send_modify(|n| *n = (*n).max(nonce));
+                    shared.input.ack(input_acked);
+                }
+                Ok(ControlMsg::Request { .. } | ControlMsg::Ping { .. }) => {
+                    warn!("client: server sent a client-only message, ignored")
+                }
                 // An event type this version does not know. The frame is
                 // length delimited, so skipping it is safe.
                 Err(e) => warn!("client: undecodable control frame skipped: {e}"),
@@ -1052,6 +1133,9 @@ async fn session_init(
     TaskEnd::Done
 }
 
+/// Send every unacked frame in `seq` order. After a reconnect `sent` starts
+/// at 0, so all unacked frames go out again; the server drops the ones it
+/// already wrote (exactly-once input, PROTOCOL_V2 section 5).
 async fn input_writer(
     shared: Arc<Shared>,
     mut send: SendStream,
@@ -1061,26 +1145,54 @@ async fn input_writer(
         return TaskEnd::Done; // init failed, the session is ending
     }
     let q = &shared.input;
+    let mut sent = 0u64;
     loop {
         let ready = q.ready.notified();
         tokio::pin!(ready);
         ready.as_mut().enable();
-        let front = lock(&q.frames).0.front().cloned();
-        let Some(frame) = front else {
+        let next = {
+            let st = lock(&q.state);
+            let i = st.frames.partition_point(|f| f.seq <= sent);
+            st.frames.get(i).map(|f| (f.seq, f.payload.clone()))
+        };
+        let Some((seq, payload)) = next else {
             ready.await;
             continue;
         };
-        if let Err(e) = write_frame(&mut send, &frame).await {
-            // The frame stays queued and goes out on the next connection.
+        if let Err(e) = write_frame(&mut send, &payload).await {
             return TaskEnd::Lost(format!("input write: {e}"));
         }
-        {
-            let mut guard = lock(&q.frames);
-            guard.0.pop_front();
-            guard.1 = guard.1.saturating_sub(frame.len() - forgetty_proto::PANE_UUID_LEN);
-        }
-        q.space.notify_waiters();
+        sent = seq;
     }
+}
+
+/// Ping every second; declare the connection dead after 3 s without a Pong.
+async fn liveness(shared: Arc<Shared>, link: Arc<Link>) -> TaskEnd {
+    let interval = Duration::from_millis(PING_INTERVAL_MS);
+    let dead_after = Duration::from_millis(PONG_DEAD_AFTER_MS);
+    let mut last_ping: Option<Instant> = None;
+    loop {
+        let due = last_ping.is_none_or(|t| t.elapsed() >= interval);
+        if due {
+            let nonce = shared.next_nonce.fetch_add(1, Ordering::Relaxed);
+            if send_ping(&link, nonce).is_err() {
+                return TaskEnd::Lost("control closed".into());
+            }
+            last_ping = Some(Instant::now());
+        }
+        if lock(&link.last_pong).elapsed() > dead_after {
+            return TaskEnd::Lost("no Pong in 3 s".into());
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+            _ = shared.ping_now.notified() => { last_ping = None; }
+        }
+    }
+}
+
+fn send_ping(link: &Link, nonce: u64) -> Result<(), ClientError> {
+    let frame = encode_msg(&ControlMsg::Ping { nonce })?;
+    link.control_tx.send(frame).map_err(|_| ClientError::ConnectionLost)
 }
 
 /// Feed one pane output stream into its `PaneStream`.
