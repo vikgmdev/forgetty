@@ -186,3 +186,27 @@ stream to the subscriber's own next offset from the log.
   per-pane offset tracking, event stream. Public async API used by Android
   (through JNI) and Windows. No UI code.
 - Server: `forgetty-server` implements v2 with `forgetty-proto`.
+
+## 11. Amendments (2026-10-21, from the P2b implementation)
+
+1. Input dedup table (section 5) is persisted to `input_seq.json` on graceful
+   stop and loaded on start. After `kill -9` it is lost, and a resend after a
+   crash can repeat input once. This is accepted.
+2. A reader that falls behind the whole log gets its pane stream reset with
+   QUIC stream error code `0x11 behind_log`. The client re-attaches with
+   `from_offset` and gets `reset = true`.
+3. The byte log never drops bytes to keep up. When its disk queue is full, the
+   server stops reading that PTY until the queue drains (PTY flow control), so
+   the program blocks on write. The in-memory ring default is 8 MiB per pane.
+   Readers behind the ring but inside the disk log are served from disk, not
+   reset.
+4. Methods with their own v2 form are not in the generic Request allow-list:
+   `send_input` (input stream), `resize_pane` is allowed and goes through the
+   size policy, `list_clients` returns a bare array. `pair_*` and
+   `get_pairing_info` are local-socket only.
+5. A stopping server answers `Hello` with `Error { code: "server_stopping" }`.
+   The client treats `server_stopping` as retryable (normal backoff). Every
+   other handshake error is fatal.
+6. Size policy (section 6): when a pane has no active client yet, the first
+   `resize_pane` applies.
+7. `Notification.title` is a `String`, empty when the sequence has none.
