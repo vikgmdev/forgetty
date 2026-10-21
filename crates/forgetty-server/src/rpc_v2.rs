@@ -66,9 +66,24 @@ const EVENT_BUFFER: usize = 256;
 const CONTROL_QUEUE_BYTES: usize = 8 * 1024 * 1024;
 /// Requests a connection may have running at once. One more closes it.
 const MAX_INFLIGHT: usize = 64;
-/// A connection whose Control queue stays (half) full this long with no write
-/// completing is closed. The client reconnects and gets the state again.
+/// A connection whose Control queue stays (half) full this long without
+/// draining at least [`MIN_DRAIN_RATE`] is closed. The client reconnects and
+/// gets the state again.
 const STALL_LIMIT: Duration = Duration::from_secs(10);
+/// Bytes per second a connection with a (half) full Control queue must take
+/// off it. A client that reads one small frame now and then does not count.
+const MIN_DRAIN_RATE: u64 = 32 * 1024;
+/// Bytes set aside against the Control budget for each request that runs on
+/// its own task, until its answer is queued. Answers are small except
+/// `capture`.
+const ANSWER_RESERVE: usize = 64 * 1024;
+/// The same for `capture`, whose answer can fill a whole frame.
+const CAPTURE_RESERVE: usize = forgetty_proto::MAX_FRAME_LEN;
+/// Connections one device may hold. A new one past this closes the oldest.
+const MAX_CONNS_PER_DEVICE: usize = 4;
+/// Application close code for the oldest connection of a device that opened
+/// more than [`MAX_CONNS_PER_DEVICE`].
+pub const TOO_MANY_CONNECTIONS_CODE: u32 = 0x15;
 /// At most one lag resync (`LayoutChanged`) per connection in this time.
 const RESYNC_MIN: Duration = Duration::from_millis(250);
 /// Application close code for a connection whose Control queue stalled.
@@ -529,7 +544,25 @@ impl RpcV2 {
         }
 
         let conn_key = self.next_conn.fetch_add(1, Ordering::Relaxed);
-        lock(&self.live).push((conn_key, conn.clone()));
+        {
+            // One device holds a few connections (a reconnect overlaps the
+            // old one for a while). Past the cap the oldest goes.
+            let mut live = lock(&self.live);
+            live.push((conn_key, conn.clone()));
+            let mine: Vec<usize> = live
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, c))| c.remote_id() == remote)
+                .map(|(i, _)| i)
+                .collect();
+            if mine.len() > MAX_CONNS_PER_DEVICE {
+                let excess = mine.len() - MAX_CONNS_PER_DEVICE;
+                for i in &mine[..excess] {
+                    warn!("rpc2: device {device_id} has too many connections, closing the oldest");
+                    live[*i].1.close(TOO_MANY_CONNECTIONS_CODE.into(), b"too-many-connections");
+                }
+            }
+        }
         self.client_joined(&hello);
         info!(
             client = %hello.client_name, kind = kind.as_str(), id = %hello.client_id,
@@ -1018,7 +1051,7 @@ impl Session {
                     if write_frame(&mut send, &frame).await.is_err() {
                         break;
                     }
-                    q.wrote();
+                    q.wrote(frame.len());
                 }
             });
         }
@@ -1033,7 +1066,7 @@ impl Session {
             let (q, conn) = (queue.clone(), session.conn.clone());
             core.spawn(async move {
                 loop {
-                    q.wait_below(CONTROL_QUEUE_BYTES).await;
+                    q.wait_below_committed(CONTROL_QUEUE_BYTES).await;
                     match read_msg::<_, ControlMsg>(&mut recv).await {
                         Ok(Some(m)) => {
                             if req_tx.send(m).await.is_err() {
@@ -1209,7 +1242,12 @@ impl Session {
 
     /// Count one request that runs on its own task. `None` (and the connection
     /// closed) when [`MAX_INFLIGHT`] are running already.
-    fn begin_task(&self, inflight: &Arc<AtomicUsize>) -> Option<InflightGuard> {
+    fn begin_task(
+        &self,
+        inflight: &Arc<AtomicUsize>,
+        out: &Arc<ControlQueue>,
+        reserve: usize,
+    ) -> Option<InflightGuard> {
         if inflight.fetch_add(1, Ordering::SeqCst) >= MAX_INFLIGHT {
             inflight.fetch_sub(1, Ordering::SeqCst);
             warn!(
@@ -1220,7 +1258,8 @@ impl Session {
             self.conn.close(TOO_MANY_REQUESTS_CODE.into(), b"too-many-requests");
             return None;
         }
-        Some(InflightGuard(inflight.clone()))
+        out.reserve(reserve);
+        Some(InflightGuard { count: inflight.clone(), queue: out.clone(), reserved: reserve })
     }
 
     /// Handle one `Request`. The cheap, connection-local methods answer here.
@@ -1258,7 +1297,7 @@ impl Session {
             method::ATTACH_PANE => {
                 // An attach counts as a request in flight until its stream is
                 // open (a stream may start with a snapshot build).
-                let Some(guard) = self.begin_task(inflight) else { return false };
+                let Some(guard) = self.begin_task(inflight, out, 0) else { return false };
                 let r = from_value::<AttachPaneParams>(params)
                     .map_err(bad)
                     .and_then(|p| self.attach(p, work, streams, guard));
@@ -1274,7 +1313,7 @@ impl Session {
                 out.push(control_frame(&reply(r)));
             }
             method::RESIZE_PANE => {
-                let Some(guard) = self.begin_task(inflight) else { return false };
+                let Some(guard) = self.begin_task(inflight, out, ANSWER_RESERVE) else { return false };
                 let s = self.clone();
                 let out = out.clone();
                 work.spawn(async move {
@@ -1318,7 +1357,8 @@ impl Session {
                     }));
                     return true;
                 }
-                let Some(guard) = self.begin_task(inflight) else { return false };
+                let reserve = if other == method::CAPTURE { CAPTURE_RESERVE } else { ANSWER_RESERVE };
+                let Some(guard) = self.begin_task(inflight, out, reserve) else { return false };
                 let s = self.clone();
                 let out = out.clone();
                 let other = other.to_string();
@@ -1397,11 +1437,17 @@ impl Session {
 }
 
 /// Counts one running request. Drops with the task.
-struct InflightGuard(Arc<AtomicUsize>);
+struct InflightGuard {
+    count: Arc<AtomicUsize>,
+    /// The queue the request's answer goes to, and the bytes set aside on it.
+    queue: Arc<ControlQueue>,
+    reserved: usize,
+}
 
 impl Drop for InflightGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
+        self.count.fetch_sub(1, Ordering::SeqCst);
+        self.queue.release(self.reserved);
     }
 }
 
@@ -1434,10 +1480,14 @@ async fn watchdog(queue: Arc<ControlQueue>, conn: Connection, rpc: Arc<RpcV2>) {
     let half = CONTROL_QUEUE_BYTES / 2;
     loop {
         queue.wait_at_least(half).await;
-        let before = queue.written();
+        let before = queue.written_bytes();
         tokio::time::sleep(STALL_LIMIT).await;
-        if queue.bytes() >= half && queue.written() == before {
-            warn!("rpc2: a client did not read Control for {STALL_LIMIT:?}, closing");
+        let drained = queue.written_bytes().saturating_sub(before);
+        if queue.bytes() >= half && drained < MIN_DRAIN_RATE * STALL_LIMIT.as_secs() {
+            warn!(
+                "rpc2: a client drained {drained} bytes of Control in {STALL_LIMIT:?} \
+                 with the queue half full, closing"
+            );
             rpc.qa.stall_closes.fetch_add(1, Ordering::SeqCst);
             conn.close(STALLED_CODE.into(), b"control-stalled");
             return;

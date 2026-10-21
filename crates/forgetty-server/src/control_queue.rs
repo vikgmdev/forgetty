@@ -31,6 +31,10 @@ struct State {
     layout: Option<u64>,
     /// Frames the writer finished writing.
     written: u64,
+    /// Payload bytes of those frames.
+    written_bytes: u64,
+    /// Bytes set aside for answers still being computed (see [`ControlQueue::reserve`]).
+    reserved: usize,
 }
 
 /// A byte-capped FIFO of encoded Control frames with one replaceable slot.
@@ -58,6 +62,8 @@ impl ControlQueue {
                 pushed: 0,
                 layout: None,
                 written: 0,
+                written_bytes: 0,
+                reserved: 0,
             }),
             changed: Notify::new(),
             closed: AtomicBool::new(false),
@@ -131,10 +137,57 @@ impl ControlQueue {
         }
     }
 
-    /// The writer calls this after a frame is fully written.
-    pub fn wrote(&self) {
-        self.lock().written += 1;
+    /// The writer calls this after a frame of `len` bytes is fully written.
+    pub fn wrote(&self, len: usize) {
+        {
+            let mut st = self.lock();
+            st.written += 1;
+            st.written_bytes += len as u64;
+        }
         self.changed.notify_waiters();
+    }
+
+    /// Payload bytes written so far. A stall is also a queue at pressure that
+    /// drains slower than a minimum rate.
+    pub fn written_bytes(&self) -> u64 {
+        self.lock().written_bytes
+    }
+
+    /// Set `n` bytes aside for an answer that is not computed yet. They count
+    /// against the budget the request reader checks ([`Self::wait_below_committed`]),
+    /// so a connection cannot have more answer bytes owed and queued than its
+    /// budget allows, however many requests it has in flight. Pair with
+    /// [`Self::release`].
+    pub fn reserve(&self, n: usize) {
+        self.lock().reserved += n;
+    }
+
+    /// Give back a [`Self::reserve`].
+    pub fn release(&self, n: usize) {
+        {
+            let mut st = self.lock();
+            st.reserved = st.reserved.saturating_sub(n);
+        }
+        self.changed.notify_waiters();
+    }
+
+    /// Queued bytes plus reserved bytes.
+    pub fn committed(&self) -> usize {
+        let st = self.lock();
+        st.bytes + st.reserved
+    }
+
+    /// Wait until fewer than `limit` bytes are queued or reserved.
+    pub async fn wait_below_committed(&self, limit: usize) {
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.committed() < limit {
+                return;
+            }
+            notified.await;
+        }
     }
 
     /// Frames written so far. A stall is a queue at pressure whose count does
@@ -260,5 +313,31 @@ mod tests {
         q.close();
         assert!(q.pop().await.is_some());
         assert!(q.pop().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn reserved_bytes_count_against_the_request_budget_only() {
+        let q = std::sync::Arc::new(ControlQueue::new());
+        q.reserve(1000);
+        assert_eq!(q.bytes(), 0, "a reservation is not queued data");
+        assert_eq!(q.committed(), 1000);
+        let w = {
+            let q = q.clone();
+            tokio::spawn(async move { q.wait_below_committed(500).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!w.is_finished());
+        q.release(600);
+        tokio::time::timeout(std::time::Duration::from_secs(1), w).await.unwrap().unwrap();
+        q.release(10_000);
+        assert_eq!(q.committed(), 0, "release never goes below zero");
+    }
+
+    #[test]
+    fn written_bytes_add_up() {
+        let q = ControlQueue::new();
+        q.wrote(10);
+        q.wrote(5);
+        assert_eq!((q.written(), q.written_bytes()), (2, 15));
     }
 }

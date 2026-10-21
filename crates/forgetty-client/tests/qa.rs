@@ -263,3 +263,117 @@ async fn a_bad_input_frame_closes_the_connection() {
     endpoint.close().await;
     server.shutdown().await;
 }
+
+/// A device that opens more than four connections loses its oldest one (0x15).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_holds_at_most_four_connections() {
+    use iroh::endpoint::ConnectionError;
+    if !real_only() {
+        return;
+    }
+    let server = TestServer::start(TestServerConfig::default()).await;
+    let k = SecretKey::generate(&mut rand::rng());
+    server.authorize(k.public());
+    let endpoint = iroh::Endpoint::empty_builder()
+        .secret_key(k)
+        .relay_mode(iroh::RelayMode::Disabled)
+        .transport_config(forgetty_client::transport_config())
+        .bind()
+        .await
+        .unwrap();
+    let mut conns = Vec::new();
+    let mut keep = Vec::new();
+    for i in 0..6 {
+        let conn = endpoint.connect(server.addr(), ALPN_RPC).await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        let hello = Hello::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            ClientKind::Cli,
+            "raw",
+            "0.0.0",
+            vec![],
+        );
+        write_msg(&mut send, &hello).await.unwrap();
+        match read_msg::<_, HandshakeReply>(&mut recv).await.unwrap() {
+            Some(HandshakeReply::Welcome(_)) => {}
+            other => panic!("handshake {i}: {other:?}"),
+        }
+        keep.push((send, recv));
+        conns.push(conn);
+    }
+    // The first two were over the cap and got closed; the last four stay.
+    for (i, conn) in conns.iter().enumerate() {
+        let r = tokio::time::timeout(Duration::from_secs(3), conn.closed()).await;
+        if i < 2 {
+            match r.unwrap_or_else(|_| panic!("connection {i} was not closed")) {
+                ConnectionError::ApplicationClosed(c) => {
+                    assert_eq!(u64::from(c.error_code), 0x15, "connection {i}")
+                }
+                other => panic!("connection {i} closed for another reason: {other:?}"),
+            }
+        } else {
+            assert!(r.is_err(), "connection {i} should stay open");
+        }
+    }
+    endpoint.close().await;
+    server.shutdown().await;
+}
+
+/// A client that reads one answer every few seconds keeps "a write completing"
+/// but drains far less than the minimum rate: the watchdog still closes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_that_drips_reads_is_closed_as_stalled() {
+    use iroh::endpoint::ConnectionError;
+    if !real_only() {
+        return;
+    }
+    let server = TestServer::start(TestServerConfig::default()).await;
+    server.add_pane();
+    let k = SecretKey::generate(&mut rand::rng());
+    server.authorize(k.public());
+    let endpoint = iroh::Endpoint::empty_builder()
+        .secret_key(k)
+        .relay_mode(iroh::RelayMode::Disabled)
+        .transport_config(forgetty_client::transport_config())
+        .bind()
+        .await
+        .unwrap();
+    let conn = endpoint.connect(server.addr(), ALPN_RPC).await.unwrap();
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    let hello = Hello::new(Uuid::new_v4(), Uuid::new_v4(), ClientKind::Cli, "drip", "0.0.0", vec![]);
+    write_msg(&mut send, &hello).await.unwrap();
+    assert!(matches!(
+        read_msg::<_, HandshakeReply>(&mut recv).await.unwrap(),
+        Some(HandshakeReply::Welcome(_))
+    ));
+    let sender = tokio::spawn(async move {
+        for id in 1..=200_000u64 {
+            let msg = ControlMsg::Request { id, method: "list_clients".into(), params: Value::Nil };
+            if write_msg(&mut send, &msg).await.is_err() {
+                break;
+            }
+        }
+        send
+    });
+    // One answer every 4 s: the writer completes a frame now and then.
+    let reader = tokio::spawn(async move {
+        loop {
+            if read_msg::<_, ControlMsg>(&mut recv).await.is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(4)).await;
+        }
+    });
+    let why = tokio::time::timeout(Duration::from_secs(60), conn.closed())
+        .await
+        .expect("a client draining one answer every 4 s was never closed");
+    match why {
+        ConnectionError::ApplicationClosed(c) => assert_eq!(u64::from(c.error_code), 0x12),
+        other => panic!("closed for another reason: {other:?}"),
+    }
+    sender.abort();
+    reader.abort();
+    endpoint.close().await;
+    server.shutdown().await;
+}
