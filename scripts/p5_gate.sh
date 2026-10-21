@@ -244,7 +244,7 @@ cp "$DOC_BACKUP" docs/socket-api.md; DOC_BACKUP=""
 
 # ------------------------------------------------------------------ 5. protocol v2
 say "5. protocol v2 (real server)"
-if FORGETTY_REAL_SERVER="$BIN/forgetty" cargo test -p forgetty-client --test p5 -- --nocapture >"$WORK/v2.log" 2>&1 && qgrep "1 passed" "$WORK/v2.log"; then
+if FORGETTY_REQUIRE_REAL=1 FORGETTY_REAL_SERVER="$BIN/forgetty" cargo test -p forgetty-client --test p5 -- --nocapture >"$WORK/v2.log" 2>&1 && qgrep "1 passed" "$WORK/v2.log"; then
   ok "v2: api.list, api.describe, set_label, LayoutChanged with the label, refused methods"
 else bad "v2 test"; tail -15 "$WORK/v2.log"; fi
 

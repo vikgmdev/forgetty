@@ -9,21 +9,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use common::{TestServer, TestServerConfig};
+use common::{real_only, TestServer, TestServerConfig};
 use forgetty_client::proto::{ClientKind, ServerEvent};
 use forgetty_client::{
     Client, ClientHandle, ClientInfo, ConnectionState, EventItem, PaneItem, SecretKey,
 };
 use serde_json::json;
 use uuid::Uuid;
-
-fn real_only() -> bool {
-    if common::is_real() {
-        return true;
-    }
-    println!("skipped: needs the real server (set FORGETTY_REAL_SERVER)");
-    false
-}
 
 fn key() -> SecretKey {
     SecretKey::generate(&mut rand::rng())

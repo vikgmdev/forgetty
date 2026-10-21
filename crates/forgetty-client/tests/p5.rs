@@ -7,19 +7,11 @@ mod common;
 
 use std::time::Duration;
 
-use common::{TestServer, TestServerConfig};
+use common::{real_only, TestServer, TestServerConfig};
 use forgetty_client::proto::{ClientKind, ServerEvent};
 use forgetty_client::{Client, ClientError, ClientHandle, ClientInfo, EventItem, SecretKey};
 use serde_json::{json, Value};
 use uuid::Uuid;
-
-fn real_only() -> bool {
-    if common::is_real() {
-        return true;
-    }
-    println!("skipped: needs the real server (set FORGETTY_REAL_SERVER)");
-    false
-}
 
 async fn connect(server: &TestServer) -> ClientHandle {
     let key = SecretKey::generate(&mut rand::rng());

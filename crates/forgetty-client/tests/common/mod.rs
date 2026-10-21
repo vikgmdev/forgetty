@@ -30,6 +30,27 @@ pub fn is_real() -> bool {
     std::env::var_os("FORGETTY_REAL_SERVER").is_some()
 }
 
+/// First line of a test that needs the real server: `if !real_only() { return; }`.
+///
+/// Without `FORGETTY_REAL_SERVER` the test cannot run. It then prints
+/// `SKIPPED (FORGETTY_REAL_SERVER unset)` (shown with `--nocapture`, or when
+/// the run fails) and returns `false`. A bare `ok` after 0.00 s proves
+/// nothing, so with `FORGETTY_REQUIRE_REAL=1` (the gates set it) the test
+/// fails instead.
+pub fn real_only() -> bool {
+    if is_real() {
+        return true;
+    }
+    if std::env::var("FORGETTY_REQUIRE_REAL").is_ok_and(|v| v == "1") {
+        panic!(
+            "FORGETTY_REQUIRE_REAL=1 but FORGETTY_REAL_SERVER is unset: \
+             this test needs the real server and would have been skipped"
+        );
+    }
+    println!("SKIPPED (FORGETTY_REAL_SERVER unset)");
+    false
+}
+
 fn b64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }

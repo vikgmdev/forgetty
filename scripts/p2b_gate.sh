@@ -109,7 +109,7 @@ if want 1; then
   done
   for t in unit integration reliability latency p2b; do
     run=ct; case "$t" in latency) run=ct_timing ;; esac
-    FORGETTY_REAL_SERVER="$REAL" $run "real-$t" $CT_REL --test $t -- --test-threads=1 --nocapture \
+    FORGETTY_REQUIRE_REAL=1 FORGETTY_REAL_SERVER="$REAL" $run "real-$t" $CT_REL --test $t -- --test-threads=1 --nocapture \
       || { ok=0; echo "    real $t FAILED, see $LOGS/real-$t.log"; tail -30 "$LOGS/real-$t.log"; }
   done
   # Each scenario must have run both ways: same count of tests in both modes.
@@ -127,7 +127,7 @@ if want 2; then
   if grep -q "exactly-once:" "$LOGS/real-p2b.log" 2>/dev/null; then
     line=$(grep -h "exactly-once:" "$LOGS/real-p2b.log" | head -1)
   else
-    FORGETTY_REAL_SERVER="$REAL" ct exactly $CT_REL --test p2b exactly_once -- --nocapture || true
+    FORGETTY_REQUIRE_REAL=1 FORGETTY_REAL_SERVER="$REAL" ct exactly $CT_REL --test p2b exactly_once -- --nocapture || true
     line=$(grep -h "exactly-once:" "$LOGS/exactly.log" | head -1)
   fi
   if [ -n "$line" ] && p2b_real_ok; then

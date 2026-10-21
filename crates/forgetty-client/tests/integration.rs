@@ -184,7 +184,7 @@ async fn proto_mismatch_client_side_fails_for_good() {
     init_log();
     if common::is_real() {
         // Needs a server that answers with another major; the real one never does.
-        println!("skipped against the real server: it always speaks major 2");
+        println!("SKIPPED (mock-only: the real server always speaks major 2)");
         return;
     }
     // A server that answers with a different major: the client must stop.

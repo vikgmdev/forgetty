@@ -6,21 +6,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use common::{TestServer, TestServerConfig};
+use common::{real_only, TestServer, TestServerConfig};
 use forgetty_client::proto::{
     read_msg, to_value, write_msg, ClientKind, ControlMsg, HandshakeReply, Hello, Value, ALPN_RPC,
 };
 use forgetty_client::{Client, ClientHandle, ClientInfo, PaneItem, SecretKey};
 use serde_json::json;
 use uuid::Uuid;
-
-fn real_only() -> bool {
-    if common::is_real() {
-        return true;
-    }
-    println!("skipped: needs the real server (set FORGETTY_REAL_SERVER)");
-    false
-}
 
 async fn connect(server: &TestServer, name: &str) -> ClientHandle {
     let k = SecretKey::generate(&mut rand::rng());
