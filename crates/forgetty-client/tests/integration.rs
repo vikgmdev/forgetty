@@ -1,14 +1,17 @@
 //! Protocol v2 integration tests over real iroh endpoints on localhost
-//! (direct addresses, no relay), against the in-process test server.
+//! (direct addresses, no relay). Every scenario runs against the in-process
+//! test server and, with `FORGETTY_REAL_SERVER` set, against the real server.
+
+mod common;
 
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
+use common::{TestServer, TestServerConfig};
 use forgetty_client::proto::{
     error_code, write_msg, ClientKind, ErrorMsg, HandshakeReply, Hello, ServerEvent, Value,
     PROTO_MAJOR,
 };
-use forgetty_client::test_server::{TestServer, TestServerConfig};
 use forgetty_client::{
     Client, ClientError, ClientHandle, ClientInfo, ClientOptions, ConnectionState, EventItem,
     PaneItem, PaneStream, SecretKey,
@@ -110,11 +113,20 @@ async fn handshake_and_requests() {
 
     let w = h.welcome().expect("welcome");
     assert_eq!(w.proto_major, PROTO_MAJOR);
-    assert_eq!(w.hostname, "test-host");
-    // Negotiated: both sides listed `resume`; only the client lists status_events.
+    assert!(!w.hostname.is_empty());
     assert!(h.has_capability("resume"));
-    assert!(!h.has_capability("status_events"));
-    assert!(!h.has_capability("capture"));
+    if server.is_real() {
+        // The real server offers every capability the client lists, and capture.
+        assert!(h.has_capability("status_events"));
+        assert!(h.has_capability("layout_events"));
+        assert!(h.has_capability("size_policy_latest"));
+        assert!(!h.has_capability("capture"), "the client does not list capture");
+    } else {
+        // Negotiated: both sides listed `resume`; only the client lists status_events.
+        assert_eq!(w.hostname, "test-host");
+        assert!(!h.has_capability("status_events"));
+        assert!(!h.has_capability("capture"));
+    }
 
     // list_clients shows this client.
     let clients = h.request("list_clients", Value::Map(vec![])).await.unwrap();
@@ -167,6 +179,11 @@ async fn proto_mismatch_server_side_error_frame() {
 #[tokio::test]
 async fn proto_mismatch_client_side_fails_for_good() {
     init_log();
+    if common::is_real() {
+        // Needs a server that answers with another major; the real one never does.
+        println!("skipped against the real server: it always speaks major 2");
+        return;
+    }
     // A server that answers with a different major: the client must stop.
     let cfg = TestServerConfig { proto_major: 3, ..Default::default() };
     let server = TestServer::start(cfg).await;
@@ -195,6 +212,7 @@ async fn not_authorized_then_pair_then_connect() {
         ..Default::default()
     };
     let server = TestServer::start(cfg).await;
+    let secret = server.pair_secret();
     let key = new_identity();
 
     // Unknown node: close code 0x01, the client stops with a clear reason.
@@ -227,7 +245,7 @@ async fn not_authorized_then_pair_then_connect() {
     // Right secret pairs; the same identity now connects.
     forgetty_client::pair_with_addr(
         server.addr(),
-        "SECRETSECRET",
+        &secret,
         key.clone(),
         "pixel",
         ClientKind::Android,
@@ -241,7 +259,7 @@ async fn not_authorized_then_pair_then_connect() {
     // The window closed after one device.
     let err = forgetty_client::pair_with_addr(
         server.addr(),
-        "SECRETSECRET",
+        &secret,
         new_identity(),
         "other",
         ClientKind::Android,
@@ -532,9 +550,8 @@ fn params(entries: &[(&str, &str)]) -> Value {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn layout_methods_drive_a_ui() {
     init_log();
-    let pane = Uuid::new_v4();
     let server = TestServer::start(TestServerConfig {
-        panes: vec![(pane, b"hello".to_vec())],
+        panes: vec![(Uuid::new_v4(), b"hello".to_vec())],
         ..Default::default()
     })
     .await;
@@ -554,7 +571,12 @@ async fn layout_methods_drive_a_ui() {
         .await
         .expect("split_pane");
     let split_pane = find(&split, "pane_id").as_str().expect("pane_id").to_string();
-    h.request("rename_workspace", params(&[("name", "work")])).await.expect("rename");
+    // The socket API names the workspace by index.
+    let rename = Value::Map(vec![
+        (Value::from("workspace_idx"), Value::from(0u64)),
+        (Value::from("name"), Value::from("work")),
+    ]);
+    h.request("rename_workspace", rename).await.expect("rename");
 
     let tabs = h.request("list_tabs", Value::Nil).await.expect("list_tabs");
     assert_eq!(find(&tabs, "tabs").as_array().expect("tabs").len(), 3);
@@ -586,12 +608,12 @@ async fn layout_methods_drive_a_ui() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn resize_pane_emits_pane_resized() {
     init_log();
-    let pane = Uuid::new_v4();
     let server = TestServer::start(TestServerConfig {
-        panes: vec![(pane, Vec::new())],
+        panes: vec![(Uuid::new_v4(), Vec::new())],
         ..Default::default()
     })
     .await;
+    let pane = server.initial_pane(0);
     let h = connect(&server).await;
     let mut events = h.events().await.expect("events");
     h.resize(pane, 40, 100).await.expect("resize");

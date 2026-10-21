@@ -255,6 +255,25 @@ pub enum ServerEvent {
         /// Status text.
         message: String,
     },
+    /// A desktop notification from the pane (OSC 9/99/777, cap `status_events`).
+    Notification {
+        /// Pane id.
+        #[serde(with = "uuid_str")]
+        pane_id: Uuid,
+        /// Notification title, empty when the program sent none.
+        title: String,
+        /// Notification body.
+        body: String,
+    },
+    /// The pane's process ended. The pane stays listed only if it is
+    /// `remain_on_exit` (cap `status_events`).
+    PaneExited {
+        /// Pane id.
+        #[serde(with = "uuid_str")]
+        pane_id: Uuid,
+        /// Exit code, `None` when unknown.
+        exit_code: Option<i32>,
+    },
     /// Another client attached.
     ClientConnected {
         /// Client id.
@@ -264,6 +283,9 @@ pub enum ServerEvent {
         client_kind: ClientKind,
         /// Device name.
         client_name: String,
+        /// RFC 3339 time of the connection. Empty from a server that omits it.
+        #[serde(default)]
+        connected_at: String,
     },
     /// A client detached.
     ClientDisconnected {

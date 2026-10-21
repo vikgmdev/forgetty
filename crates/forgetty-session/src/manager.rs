@@ -35,6 +35,40 @@ use crate::workspace::{build_workspace_state, PaneTreeLayout, WorkspaceLayout};
 
 /// Capacity of the broadcast event channel.
 const BROADCAST_CAPACITY: usize = 1024;
+/// Capacity of the metadata channel. Only layout, title, status and similar
+/// events travel on it (never PTY bytes), so it does not lag under output load.
+const META_CAPACITY: usize = 4096;
+
+/// Two broadcast channels: `all` carries every event, `meta` everything except
+/// `PtyOutput`. A consumer of metadata (the v2 event hub) takes `meta`, so a
+/// burst of PTY output cannot make it lag and lose a title or layout change.
+struct EventBus {
+    all: broadcast::Sender<SessionEvent>,
+    meta: broadcast::Sender<SessionEvent>,
+}
+
+impl EventBus {
+    fn new() -> Self {
+        Self {
+            all: broadcast::channel(BROADCAST_CAPACITY).0,
+            meta: broadcast::channel(META_CAPACITY).0,
+        }
+    }
+
+    fn send(
+        &self,
+        ev: SessionEvent,
+    ) -> std::result::Result<usize, broadcast::error::SendError<SessionEvent>> {
+        if !matches!(ev, SessionEvent::PtyOutput { .. }) {
+            let _ = self.meta.send(ev.clone());
+        }
+        self.all.send(ev)
+    }
+
+    fn subscribe(&self) -> broadcast::Receiver<SessionEvent> {
+        self.all.subscribe()
+    }
+}
 
 /// How many exited-pane exit codes the manager remembers.
 const EXIT_HISTORY_CAP: usize = 1024;
@@ -53,7 +87,7 @@ struct SessionManagerInner {
     /// `HashMap` iteration is non-deterministic; preserving order ensures tabs
     /// are restored in the same visual position after a window reopen.
     pane_order: Vec<PaneId>,
-    event_tx: broadcast::Sender<SessionEvent>,
+    event_tx: EventBus,
     /// Daemon-owned layout: workspaces → tabs → pane trees (AD-002, AD-007).
     /// Mutated by `create_pane` and `close_pane`; exposed via `layout()`.
     layout: SessionLayout,
@@ -101,7 +135,7 @@ pub struct SessionManager {
 impl SessionManager {
     /// Create a new, empty session manager.
     pub fn new() -> Self {
-        let (event_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
+        let event_tx = EventBus::new();
         Self {
             clients: crate::clients::ClientRegistry::new(),
             inner: Arc::new(Mutex::new(SessionManagerInner {
@@ -536,6 +570,7 @@ impl SessionManager {
                     warn!(%pid, path = ?log_path, "delete_workspace: unlink log failed: {e}");
                 }
             }
+            let _ = std::fs::remove_file(crate::byte_log::offset_sidecar_path(&log_path));
             let _ = inner.event_tx.send(SessionEvent::PaneClosed { pane_id: *pid });
         }
 
@@ -1526,9 +1561,17 @@ impl SessionManager {
             .panes
             .get_mut(&id)
             .ok_or_else(|| forgetty_core::ForgettyError::Pty(format!("pane {id} not found")))?;
+        let changed = pane.rows != size.rows || pane.cols != size.cols;
         pane.pty_bridge.pty.resize(size)?;
         pane.rows = size.rows;
         pane.cols = size.cols;
+        if changed {
+            let _ = inner.event_tx.send(SessionEvent::PaneResized {
+                pane_id: id,
+                rows: size.rows,
+                cols: size.cols,
+            });
+        }
         Ok(())
     }
 
@@ -1639,6 +1682,48 @@ impl SessionManager {
     pub fn get_ring_snapshot(&self, pane_id: PaneId) -> Option<(bytes::Bytes, u64)> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.byte_logs.get_mut(&pane_id).map(|log| log.ring_snapshot())
+    }
+
+    /// Shared wake-up and file state of the pane's byte log, for stream readers.
+    pub fn log_shared(
+        &self,
+        pane_id: PaneId,
+    ) -> Option<std::sync::Arc<crate::byte_log::LogShared>> {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.byte_logs.get(&pane_id).map(|log| log.shared())
+    }
+
+    /// Absolute offsets of the pane's byte log: `(first_available, total_written)`.
+    pub fn log_bounds(&self, pane_id: PaneId) -> Option<(u64, u64)> {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.byte_logs.get(&pane_id).map(|log| (log.first_available(), log.total_written()))
+    }
+
+    /// Decide how to read up to `max` bytes at absolute offset `next` of the
+    /// pane's byte log. `None` when the pane has no log.
+    pub fn plan_log(
+        &self,
+        pane_id: PaneId,
+        next: u64,
+        max: usize,
+    ) -> Option<crate::byte_log::LogPlan> {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.byte_logs.get(&pane_id).map(|log| log.plan(next, max))
+    }
+
+    /// Test hook for the protocol harness: drop log bytes older than `offset`.
+    pub async fn truncate_log_before(&self, pane_id: PaneId, offset: u64) -> bool {
+        // Take the log out of the map lock for the await: truncate_before awaits
+        // the disk appender. The ring edit is short, so do it under the lock via
+        // a detached future built from the shared channel.
+        let fut = {
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            match inner.byte_logs.get_mut(&pane_id) {
+                Some(log) => log.begin_truncate_before(offset),
+                None => return false,
+            }
+        };
+        fut.await.is_ok()
     }
 
     /// Flush every pane's on-disk log buffer.
@@ -1879,6 +1964,13 @@ impl SessionManager {
     pub fn subscribe_output(&self) -> broadcast::Receiver<SessionEvent> {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.event_tx.subscribe()
+    }
+
+    /// Subscribe to every event except `PtyOutput`. The channel is separate, so
+    /// a burst of PTY output cannot make this receiver lag.
+    pub fn subscribe_meta(&self) -> broadcast::Receiver<SessionEvent> {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.event_tx.meta.subscribe()
     }
 
     /// Atomically subscribe to the session event stream AND take a snapshot of

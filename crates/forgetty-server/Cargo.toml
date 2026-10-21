@@ -26,7 +26,7 @@ path = "src/stream_test.rs"
 required-features = ["qa-tools"]
 
 [features]
-qa-tools = []
+qa-tools = ["forgetty-socket/qa-tools"]
 
 [[bench]]
 # V2-013: in-process hot-path micro-bench (PTY -> broadcast subscriber).
@@ -46,6 +46,7 @@ forgetty-pty = { path = "../forgetty-pty" }
 forgetty-session = { path = "../forgetty-session" }
 forgetty-socket = { path = "../forgetty-socket" }
 forgetty-sync = { path = "../forgetty-sync" }
+forgetty-proto = { path = "../forgetty-proto" }
 forgetty-workspace = { path = "../forgetty-workspace" }
 tokio = { workspace = true }
 clap = { workspace = true }
@@ -62,3 +63,5 @@ serde = { workspace = true }
 serde_bytes = "0.11"
 base64 = "0.22"
 libc = "0.2"
+hostname = "0.4"
+rmpv = { version = "1", features = ["with-serde"] }

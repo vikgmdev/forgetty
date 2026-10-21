@@ -841,6 +841,9 @@ pub fn prune_orphan_logs(live_pane_ids: &[Uuid]) {
             stem
         } else if let Some(stem) = s.strip_suffix(".log.tmp") {
             stem
+        } else if let Some(stem) = s.strip_suffix(".log.off") {
+            // Offset sidecar of the byte log (absolute offset of the first byte).
+            stem
         } else {
             continue;
         };

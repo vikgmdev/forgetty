@@ -1062,6 +1062,17 @@ fn save_layout_final(sm: &SessionManager, session_id: uuid::Uuid) {
 /// Killing them would make the drain tasks close panes and rewrite the layout
 /// file as empty. When the process exits the PTY masters close and the shells
 /// get SIGHUP.
+/// Callbacks that run during [`graceful_exit`], after the byte logs are
+/// flushed and before the endpoint closes (the v2 server saves its input
+/// state here).
+static SHUTDOWN_HOOKS: std::sync::Mutex<Vec<Box<dyn Fn() + Send + Sync>>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Register a callback for [`graceful_exit`].
+pub fn add_shutdown_hook(hook: Box<dyn Fn() + Send + Sync>) {
+    SHUTDOWN_HOOKS.lock().unwrap_or_else(|e| e.into_inner()).push(hook);
+}
+
 pub async fn graceful_exit(
     sm: &SessionManager,
     sync_endpoint: Option<&SyncEndpoint>,
@@ -1073,6 +1084,9 @@ pub async fn graceful_exit(
     sm.begin_shutdown();
     sm.flush_all_byte_logs().await;
     info!("byte logs flushed");
+    for hook in SHUTDOWN_HOOKS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        hook();
+    }
     if let Some(sid) = session_id {
         save_layout_final(sm, sid);
     }

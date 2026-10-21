@@ -36,7 +36,7 @@ pub mod status;
 pub mod workspace;
 
 // Convenient top-level re-exports for downstream crates.
-pub use byte_log::ByteLog;
+pub use byte_log::{read_disk, ByteLog, DiskState, LogPlan, LogShared};
 pub use clients::{ClientGuard, ClientInfo, ClientRegistry};
 pub use drain_result::DrainResult;
 pub use events::SessionEvent;

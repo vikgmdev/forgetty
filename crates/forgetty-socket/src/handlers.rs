@@ -82,11 +82,17 @@ pub fn dispatch(
         methods::LIST_DEVICES => handle_list_devices(request, sync_endpoint.as_deref()),
         methods::REVOKE_DEVICE => handle_revoke_device(request, sync_endpoint.as_deref()),
         methods::GET_PAIRING_INFO => handle_get_pairing_info(request, sync_endpoint.as_deref()),
-        _ => Response::error(
-            request.id.clone(),
-            protocol::METHOD_NOT_FOUND,
-            format!("Unknown method: {}", request.method),
-        ),
+        _ => {
+            #[cfg(feature = "qa-tools")]
+            if let Some(resp) = crate::qa::call(request, &sm) {
+                return resp;
+            }
+            Response::error(
+                request.id.clone(),
+                protocol::METHOD_NOT_FOUND,
+                format!("Unknown method: {}", request.method),
+            )
+        }
     }
 }
 

@@ -74,6 +74,36 @@ Without systemd: `forgetty server start` runs the server detached and logs to
   instead: it shows the exit status, stays listed as `exited N`, and is removed
   by the `close_pane` socket method. The server records every pane exit code.
 
+## Protocol v2 (`forgetty/rpc/2`)
+
+The server accepts the iroh ALPN `forgetty/rpc/2` (see
+`docs/architecture/PROTOCOL_V2.md`) next to `forgetty/stream/1`, which stays for
+one more release. Control requests go through the same dispatch table as the
+local socket, so a method behaves the same on both. Methods that need a local
+trust root (`pair_*`, `get_pairing_info`), `send_input` (v2 has its own input
+stream) and the `qa_*` test methods are not reachable over v2.
+
+- The UDP port is fixed: `forgetty server run --port N`, default 47297 (`0`
+  picks a free port, for tests). A second server on a taken port exits with a
+  bind error.
+- Every pane has an absolute byte offset. The ring and the disk log know the
+  offset of their first byte. The first offset is stored in
+  `logs/<pane>.log.off`, so a client resumes at its offset after a server
+  restart. A client that is behind the ring reads from the disk log. A client
+  behind the whole log is reset to the first available byte.
+- Input is deduplicated by `(client_id, input_epoch)` and `seq`. The server
+  writes the dedup table to `input_seq.json` in the state dir when it stops
+  and loads it at start, so a frame the client did not see acked is not written
+  to the new shell twice. A `kill -9` loses the table.
+- The pane size follows the last active client (AD-020). The first client that
+  resizes a pane without an active owner becomes the owner. Any later client
+  becomes the owner when it sends input or focuses the tab.
+- Each v2 connection is in the client registry (`client ls`). A stopping server
+  closes a new v2 connection without a reply, and the client retries.
+- The release build with `--features qa-tools` adds `qa_*` socket methods that
+  the client test suites use to drive a real server (drop connections, hold
+  acks, read the byte log). They are not compiled into a normal build.
+
 ## CLI
 
 ```text
@@ -159,6 +189,8 @@ scripts/p0_gate.sh   # local socket and iroh echo
 scripts/p1_gate.sh   # durability, pairing secret, restart, stop --if-idle
 scripts/p4a_gate.sh  # OSC scanner, status, capture, agent CLI
 scripts/p1qa_gate.sh # revoke, concurrent start, SIGTERM, kill -9, session file, modes
+scripts/p2b_gate.sh  # protocol v2: client suites against the real server, exactly-once,
+                     # size policy, 50 MiB burst latency, restart reconnect, port 47297
 ```
 
 Both run a server in a temp state dir as the current user and need outbound

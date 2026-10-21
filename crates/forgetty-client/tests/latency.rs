@@ -1,10 +1,13 @@
 //! Input latency under a concurrent output burst. Own test binary, so it does
-//! not compete for CPU with the other integration tests.
+//! not compete for CPU with the other integration tests. Runs against the
+//! in-process test server, or the real one with `FORGETTY_REAL_SERVER` set.
+
+mod common;
 
 use std::time::{Duration, Instant};
 
+use common::{TestServer, TestServerConfig};
 use forgetty_client::proto::ClientKind;
-use forgetty_client::test_server::{TestServer, TestServerConfig};
 use forgetty_client::{Client, ClientHandle, ClientInfo, PaneItem, PaneStream, SecretKey};
 use uuid::Uuid;
 
@@ -23,9 +26,11 @@ async fn connect(server: &TestServer) -> ClientHandle {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn keystroke_not_delayed_by_concurrent_50mb_output_burst() {
     const BURST: usize = 50 * 1024 * 1024;
-    let server = TestServer::start(TestServerConfig::default()).await;
+    // The byte log keeps the whole burst, so a reader that is a little behind
+    // is served from the log and never has to reset.
+    let server = TestServer::start_with(TestServerConfig::default(), Some(256)).await;
     let echo_pane = server.add_pane();
-    let burst_pane = server.add_pane();
+    let burst_pane = server.add_burst_pane(BURST);
     let h = connect(&server).await;
     let mut echo = h.attach_pane(echo_pane).await.unwrap();
     let mut burst = h.attach_pane(burst_pane).await.unwrap();
@@ -33,13 +38,19 @@ async fn keystroke_not_delayed_by_concurrent_50mb_output_burst() {
     // Drain the burst pane like a UI would.
     let drain = tokio::spawn(async move {
         let mut total = 0usize;
+        let mut resets = 0usize;
         let mut done_at = None;
-        while total < BURST {
-            match burst.next().await.unwrap() {
-                PaneItem::Data { bytes, .. } => total += bytes.len(),
-                PaneItem::Reset { .. } => {}
-                PaneItem::Ended => break,
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while total < BURST && Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_secs(5), burst.next()).await {
+                Ok(Some(PaneItem::Data { bytes, .. })) => total += bytes.len(),
+                Ok(Some(PaneItem::Reset { .. })) => resets += 1,
+                Ok(Some(PaneItem::Ended)) | Ok(None) => break,
+                Err(_) => break,
             }
+        }
+        if total < BURST {
+            eprintln!("burst drain stopped at {total} of {BURST} bytes, {resets} resets");
         }
         if total >= BURST {
             done_at = Some(Instant::now());
@@ -72,7 +83,7 @@ async fn keystroke_not_delayed_by_concurrent_50mb_output_burst() {
 
     // Start the burst, then ping continuously while it is in flight.
     let burst_start = Instant::now();
-    server.append(burst_pane, &vec![0x41u8; BURST]);
+    server.start_burst(burst_pane, BURST);
     let mut during = Vec::new();
     let mut n = 1000;
     while !drain.is_finished() {

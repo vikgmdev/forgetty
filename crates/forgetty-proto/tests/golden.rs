@@ -146,8 +146,24 @@ fn golden_ev_status() {
 #[test]
 fn golden_ev_cconn() {
     golden::<ControlMsg>(
-        ControlMsg::Event { seq: 7, event: ServerEvent::ClientConnected { client_id: id(1), client_kind: ClientKind::Windows, client_name: "desk".into() } },
-        "81a54576656e7482a373657107a56576656e7481af436c69656e74436f6e6e656374656483a9636c69656e745f6964d92430313031303130312d303130312d303130312d303130312d303130313031303130313031ab636c69656e745f6b696e64a777696e646f7773ab636c69656e745f6e616d65a46465736b",
+        ControlMsg::Event { seq: 7, event: ServerEvent::ClientConnected { client_id: id(1), client_kind: ClientKind::Windows, client_name: "desk".into(), connected_at: "2026-10-21T08:00:00Z".into() } },
+        "81a54576656e7482a373657107a56576656e7481af436c69656e74436f6e6e656374656484a9636c69656e745f6964d92430313031303130312d303130312d303130312d303130312d303130313031303130313031ab636c69656e745f6b696e64a777696e646f7773ab636c69656e745f6e616d65a46465736bac636f6e6e65637465645f6174b4323032362d31302d32315430383a30303a30305a",
+    );
+}
+
+#[test]
+fn golden_ev_notification() {
+    golden::<ControlMsg>(
+        ControlMsg::Event { seq: 9, event: ServerEvent::Notification { pane_id: id(3), title: "build".into(), body: "done".into() } },
+        "81a54576656e7482a373657109a56576656e7481ac4e6f74696669636174696f6e83a770616e655f6964d92430333033303330332d303330332d303330332d303330332d303330333033303330333033a57469746c65a56275696c64a4626f6479a4646f6e65",
+    );
+}
+
+#[test]
+fn golden_ev_pane_exited() {
+    golden::<ControlMsg>(
+        ControlMsg::Event { seq: 10, event: ServerEvent::PaneExited { pane_id: id(3), exit_code: Some(7) } },
+        "81a54576656e7482a37365710aa56576656e7481aa50616e6545786974656482a770616e655f6964d92430333033303330332d303330332d303330332d303330332d303330333033303330333033a9657869745f636f646507",
     );
 }
 

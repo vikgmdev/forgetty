@@ -606,8 +606,8 @@ List paired devices (from `authorized_devices.json`).
 #### `revoke_device`
 
 Remove a paired device. Every open connection of that device, on every ALPN
-(pairing, `forgetty/stream/1` and any later protocol), is closed at once with
-application code 403 `device-revoked`. It leaves the client registry
+(pairing, `forgetty/stream/1`, `forgetty/rpc/2` and any later protocol), is
+closed at once with application code 403 `device-revoked`. It leaves the client registry
 (`list_clients`) and a `DeviceRevoked` event is emitted on the local sync event
 channel. Connections are closed even if the device was no longer in the
 registry.
@@ -726,9 +726,11 @@ The CLI warns on stderr when `version` differs from its own.
 
 #### `list_clients`
 
-Attached clients: iroh connections and sockets that are streaming
-(`subscribe_output`, `subscribe_layout`). Short request/response sockets are
-not clients.
+Attached clients: iroh connections (`forgetty/stream/1` and `forgetty/rpc/2`)
+and sockets that are streaming (`subscribe_output`, `subscribe_layout`). Short
+request/response sockets are not clients. A v2 client appears for as long as its
+connection lives and is counted once per `client_id`. Over v2 the same method
+returns the array of client entries directly.
 
 **Params:** none.
 
@@ -758,6 +760,19 @@ reattach.
 **Result:** `{"attached":<bool>}`
 
 ---
+
+### 5.8 Protocol v2 and test methods
+
+`forgetty/rpc/2` Control requests use the methods in this chapter through the
+same dispatch table. Error codes map to `unknown_method`, `not_found`,
+`bad_request` and `internal`. `send_input`, `resize_pane`, `list_clients` and
+`subscribe_events` have v2 forms of their own, and `pair_*` and
+`get_pairing_info` are not available over v2.
+
+A server built with `--features qa-tools` also answers `qa_*` methods on the
+local socket (`qa_state`, `qa_drop_connections`, `qa_hold_acks`, `qa_append`,
+`qa_read_log` and others). The client test suites use them. A normal build
+returns "method not found".
 
 ## 6. Errors
 

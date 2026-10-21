@@ -30,3 +30,6 @@ rand = { workspace = true }
 forgetty-client = { path = ".", features = ["test-util"] }
 tracing-subscriber = { workspace = true }
 serde_json = { workspace = true }
+tempfile = "3"
+base64 = "0.22"
+libc = "0.2"

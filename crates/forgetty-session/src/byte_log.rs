@@ -1,30 +1,44 @@
-//! Per-pane byte log — in-memory ring + on-disk append-only file.
+//! Per-pane byte log: in-memory ring + on-disk append-only file, with
+//! absolute offsets.
 //!
-//! V2-007 / AD-013: raw PTY bytes are durably logged to
+//! V2-007 / AD-013 / PROTOCOL_V2 section 8. Raw PTY bytes are logged to
 //! `~/.local/share/forgetty/logs/{pane_uuid}.log` and held in a per-pane
-//! in-memory ring buffer. When a client subscribes to a pane's output, the
-//! daemon emits the ring contents as binary frames before switching to live
-//! output. The client's own VT parser reconstructs the screen.
+//! in-memory ring. Every byte has an absolute offset in the life of the pane:
+//!
+//! - `total_written`: offset one past the newest byte.
+//! - the ring holds `[total_written - ring.len(), total_written)`.
+//! - the file holds `[disk_first, disk_first + file_len)`. `disk_first` is
+//!   persisted in the sidecar `{pane_uuid}.log.off` (written when the file is
+//!   rotated or restarted), so offsets survive a server restart: at start
+//!   `total_written = disk_first + file_len`.
+//!
+//! Readers (the v2 pane output streams) pull by offset ([`ByteLog::plan`],
+//! `SessionManager::read_log`). A slow reader therefore never loses bytes
+//! while they are in the ring or the file, and never needs a broadcast
+//! subscription.
 //!
 //! ## Hot-path contract (AD-009)
 //!
-//! `append(&mut self, data: &[u8])` is called from `SessionManager::process_pane_bytes`
-//! while the `SessionManagerInner` mutex is held. It must never block.
-//! - Ring write: `VecDeque<u8>::extend` + `pop_front` while over cap. O(data_len).
-//! - Disk write: `mpsc::Sender::try_send`. Non-blocking. Drops silently under
-//!   sustained burst (SPEC §6 R-3).
+//! `append` is called from `SessionManager::process_pane_bytes` while the
+//! manager mutex is held. It never blocks:
+//! - ring write: a slice copy,
+//! - disk write: `mpsc::Sender::try_send`. When the queue is full the chunk
+//!   is not queued. The appender sees the offset jump on the next chunk and
+//!   restarts the file there (`disk_first` moves), so the file always holds
+//!   one contiguous range.
 //!
-//! No timers, no `tokio::time::sleep`, no polling — the disk appender task
-//! blocks on `rx.recv().await` until a chunk arrives.
+//! No timers, no polling: the appender blocks on `rx.recv().await`, and it
+//! flushes at the end of every drain wake (event driven).
 
 use std::collections::VecDeque;
 use std::io;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt, BufWriter};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -35,8 +49,65 @@ const DISK_CHANNEL_CAP: usize = 64;
 
 /// Private message type: chunks to append + flush-signal with oneshot reply.
 enum DiskMsg {
-    Chunk(Bytes),
+    /// `start` is the absolute pane offset of `data[0]`.
+    Chunk {
+        start: u64,
+        data: Bytes,
+    },
     Flush(oneshot::Sender<()>),
+    /// Restart the file at absolute offset `first` holding `data` (test hook).
+    Restart {
+        first: u64,
+        data: Bytes,
+        reply: oneshot::Sender<()>,
+    },
+}
+
+/// What the disk file holds right now: `[first, flushed_to)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiskState {
+    /// Absolute offset of the first byte of the file.
+    pub first: u64,
+    /// Absolute offset one past the last byte written to the file (flushed).
+    pub flushed_to: u64,
+}
+
+/// State shared between the log, its disk appender and the stream readers.
+pub struct LogShared {
+    /// Path of the log file.
+    pub path: PathBuf,
+    /// Whether a disk appender runs for this log.
+    pub disk_enabled: bool,
+    disk: Mutex<DiskState>,
+    /// Woken when bytes were appended.
+    pub wake: Notify,
+    /// Woken when the disk appender flushed more bytes (or moved the file).
+    pub disk_progress: Notify,
+}
+
+impl LogShared {
+    /// Current extent of the file.
+    pub fn disk_state(&self) -> DiskState {
+        *self.disk.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn set_disk(&self, state: DiskState) {
+        *self.disk.lock().unwrap_or_else(|e| e.into_inner()) = state;
+    }
+}
+
+/// Where to read the next bytes of a pane log from ([`ByteLog::plan`]).
+#[derive(Debug)]
+pub enum LogPlan {
+    /// Bytes copied out of the ring. `bytes` is never empty.
+    Ring(Vec<u8>),
+    /// `next` equals `total_written`: wait for [`LogShared::wake`].
+    Caught,
+    /// `next` is older than the ring: read `[next, next + len)` from the
+    /// file, which holds `[disk.first, disk.flushed_to)` right now.
+    Disk { disk: DiskState, len: usize },
+    /// `next` is older than anything still logged. The oldest byte is `first`.
+    Lost { first: u64 },
 }
 
 /// Per-pane in-memory ring + async disk appender handle.
@@ -47,11 +118,41 @@ enum DiskMsg {
 pub struct ByteLog {
     ring: VecDeque<u8>,
     ring_capacity: usize,
-    /// Monotonic count of bytes appended since construction, including those
-    /// evicted from the ring. Serves as the replay cursor high-water mark.
+    /// Absolute offset one past the newest byte. Includes bytes evicted from
+    /// the ring. Serves as the replay cursor high-water mark.
     total_bytes_written: u64,
     /// Bounded channel to the disk appender task.
     disk_tx: mpsc::Sender<DiskMsg>,
+    shared: Arc<LogShared>,
+}
+
+impl Drop for ByteLog {
+    /// Wake the readers of a closed log, so their streams see the pane is gone.
+    fn drop(&mut self) {
+        self.shared.wake.notify_waiters();
+    }
+}
+
+/// Path of the sidecar that stores the absolute offset of the file's first byte.
+pub fn offset_sidecar_path(log_path: &Path) -> PathBuf {
+    let mut name = log_path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    name.push(".off");
+    log_path.with_file_name(name)
+}
+
+fn read_sidecar(log_path: &Path) -> u64 {
+    std::fs::read_to_string(offset_sidecar_path(log_path))
+        .ok()
+        .and_then(|t| t.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+fn write_sidecar(log_path: &Path, first: u64) {
+    let path = offset_sidecar_path(log_path);
+    if let Err(e) = forgetty_core::fsutil::write_private_atomic(&path, first.to_string().as_bytes())
+    {
+        warn!(path = %path.display(), "byte log: could not write the offset sidecar: {e}");
+    }
 }
 
 impl ByteLog {
@@ -68,23 +169,12 @@ impl ByteLog {
     ///   with mode 0600.
     /// - Deletes any stale `{pane_uuid}.log.tmp` from a crashed rotation (R-6).
     /// - Pre-loads last `min(file_size, ring_capacity)` bytes of the existing log
-    ///   into the ring (AC-17 cold-start replay).
+    ///   into the ring (AC-17 cold-start replay) and restores the absolute
+    ///   offsets from the sidecar.
     /// - Spawns a tokio task as the disk appender.
     pub fn new(pane_id: Uuid, ring_capacity: usize, max_disk_bytes: u64) -> io::Result<Self> {
         let dir = logs_dir();
-        std::fs::create_dir_all(&dir)?;
-        // Mode 0700 on the directory (AC-2). Re-applied even if dir existed
-        // because `create_dir_all` preserves whatever mode was there.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o700);
-            // Best-effort: log (but do not fail) if setting perms fails — the
-            // ByteLog still functions and the daemon stays alive.
-            if let Err(e) = std::fs::set_permissions(&dir, perms) {
-                warn!(dir = %dir.display(), "ByteLog::new: failed to chmod 0700: {e}");
-            }
-        }
+        forgetty_core::fsutil::ensure_private_dir(&dir)?;
 
         let log_path = pane_log_path(pane_id);
         let tmp_path = log_path.with_extension("log.tmp");
@@ -96,16 +186,15 @@ impl ByteLog {
             }
         }
 
-        // Pre-load the tail into the ring (AC-17). Must happen before we open
-        // in append mode (the seek end gives the right size either way, but
-        // reading before open avoids interleaving concerns).
-        let mut ring: VecDeque<u8> = VecDeque::with_capacity(ring_capacity);
-        let mut total_bytes_written: u64 = 0;
+        // Pre-load the tail into the ring (AC-17).
+        let mut ring: VecDeque<u8> = VecDeque::with_capacity(ring_capacity.min(1 << 20));
+        let mut file_len: u64 = 0;
+        let disk_first = if log_path.exists() { read_sidecar(&log_path) } else { 0 };
         if log_path.exists() {
             match std::fs::metadata(&log_path) {
                 Ok(meta) => {
                     let size = meta.len();
-                    total_bytes_written = size;
+                    file_len = size;
                     if ring_capacity > 0 && size > 0 {
                         let to_read = std::cmp::min(size as usize, ring_capacity);
                         let mut buf = vec![0u8; to_read];
@@ -119,34 +208,34 @@ impl ByteLog {
                 Err(e) => warn!(path = %log_path.display(), "ByteLog::new: stat failed: {e}"),
             }
         }
+        let total_bytes_written = disk_first + file_len;
 
-        // Open the log file for append. Mode 0600 set at open time via
-        // OpenOptionsExt; if the file already existed with different perms,
-        // chmod below fixes it. Uses std::fs::OpenOptions so we can apply the
-        // mode atomically at creation.
+        // Open the log file for append, mode 0600 at creation.
         let std_file =
             std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(&log_path)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o600);
-            if let Err(e) = std_file.set_permissions(perms) {
-                warn!(path = %log_path.display(), "ByteLog::new: failed to chmod 0600: {e}");
-            }
-        }
+        forgetty_core::fsutil::fix_file_mode(&log_path)?;
         let tokio_file = tokio::fs::File::from_std(std_file);
+
+        let disk_enabled = max_disk_bytes > 0;
+        let shared = Arc::new(LogShared {
+            path: log_path.clone(),
+            disk_enabled,
+            disk: Mutex::new(DiskState { first: disk_first, flushed_to: total_bytes_written }),
+            wake: Notify::new(),
+            disk_progress: Notify::new(),
+        });
 
         // Bounded disk channel. `try_send` drops chunks when full (R-3).
         let (disk_tx, disk_rx) = mpsc::channel::<DiskMsg>(DISK_CHANNEL_CAP);
 
-        if max_disk_bytes > 0 {
-            // Spawn the per-pane disk appender task.
+        if disk_enabled {
             tokio::spawn(disk_appender_task(
                 pane_id,
-                log_path.clone(),
                 tokio_file,
-                total_bytes_written,
+                disk_first,
+                file_len,
                 max_disk_bytes,
+                shared.clone(),
                 disk_rx,
             ));
         } else {
@@ -158,36 +247,105 @@ impl ByteLog {
         debug!(
             pane = %pane_id,
             ring_bytes = ring.len(),
-            file_bytes = total_bytes_written,
+            file_bytes = file_len,
+            disk_first,
+            total = total_bytes_written,
             "ByteLog::new"
         );
 
-        Ok(Self { ring, ring_capacity, total_bytes_written, disk_tx })
+        Ok(Self { ring, ring_capacity, total_bytes_written, disk_tx, shared })
     }
 
     /// Append raw bytes to the ring and enqueue a disk write.
     ///
-    /// Hot path — must never block. Disk queue full → chunk dropped silently.
+    /// Hot path — must never block. Disk queue full → chunk not queued (the
+    /// appender restarts the file at the next chunk it gets).
     pub fn append(&mut self, data: &[u8]) {
         if data.is_empty() {
             return;
         }
-        // Ring write. `VecDeque::extend` is O(data_len); when over cap we
-        // drop the oldest bytes.
-        self.ring.extend(data.iter().copied());
+        let start = self.total_bytes_written;
         if self.ring_capacity == 0 {
-            // Edge case: ring disabled. Still count bytes for cursor arithmetic.
             self.ring.clear();
+        } else if data.len() >= self.ring_capacity {
+            self.ring.clear();
+            self.ring.extend(&data[data.len() - self.ring_capacity..]);
         } else {
-            while self.ring.len() > self.ring_capacity {
-                self.ring.pop_front();
+            self.ring.extend(data);
+            let excess = self.ring.len().saturating_sub(self.ring_capacity);
+            if excess > 0 {
+                self.ring.drain(..excess);
             }
         }
 
-        self.total_bytes_written = self.total_bytes_written.saturating_add(data.len() as u64);
+        self.total_bytes_written = start.saturating_add(data.len() as u64);
 
-        // Disk write: non-blocking enqueue. Under burst, try_send drops chunks.
-        let _ = self.disk_tx.try_send(DiskMsg::Chunk(Bytes::copy_from_slice(data)));
+        if self.shared.disk_enabled {
+            let _ =
+                self.disk_tx.try_send(DiskMsg::Chunk { start, data: Bytes::copy_from_slice(data) });
+        }
+        self.shared.wake.notify_waiters();
+    }
+
+    /// Shared state for readers: wake-ups and the file extent.
+    pub fn shared(&self) -> Arc<LogShared> {
+        self.shared.clone()
+    }
+
+    /// Absolute offset one past the newest byte.
+    pub fn total_written(&self) -> u64 {
+        self.total_bytes_written
+    }
+
+    /// Absolute offset of the first byte in the ring.
+    pub fn ring_first(&self) -> u64 {
+        self.total_bytes_written - self.ring.len() as u64
+    }
+
+    /// Absolute offset of the oldest byte still readable (ring or file).
+    pub fn first_available(&self) -> u64 {
+        let ring_first = self.ring_first();
+        if self.shared.disk_enabled {
+            ring_first.min(self.shared.disk_state().first)
+        } else {
+            ring_first
+        }
+    }
+
+    /// Decide how to read up to `max` bytes at absolute offset `next`.
+    pub fn plan(&self, next: u64, max: usize) -> LogPlan {
+        let total = self.total_bytes_written;
+        if next >= total {
+            return LogPlan::Caught;
+        }
+        let ring_first = self.ring_first();
+        if next >= ring_first {
+            let from = (next - ring_first) as usize;
+            let take = (self.ring.len() - from).min(max);
+            let (a, b) = self.ring.as_slices();
+            let mut out = Vec::with_capacity(take);
+            if from < a.len() {
+                let end = (from + take).min(a.len());
+                out.extend_from_slice(&a[from..end]);
+                if out.len() < take {
+                    out.extend_from_slice(&b[..take - out.len()]);
+                }
+            } else {
+                let bfrom = from - a.len();
+                out.extend_from_slice(&b[bfrom..bfrom + take]);
+            }
+            return LogPlan::Ring(out);
+        }
+        // Older than the ring: the file, if it still reaches back that far.
+        if self.shared.disk_enabled {
+            let disk = self.shared.disk_state();
+            if next >= disk.first {
+                let len = (ring_first - next).min(max as u64) as usize;
+                return LogPlan::Disk { disk, len };
+            }
+            return LogPlan::Lost { first: disk.first.min(ring_first) };
+        }
+        LogPlan::Lost { first: ring_first }
     }
 
     /// Return a contiguous copy of the ring plus the cursor high-water mark.
@@ -202,7 +360,7 @@ impl ByteLog {
     /// Send a flush signal to the disk appender and await its completion.
     ///
     /// Called on clean shutdown / disconnect to ensure the file buffer is
-    /// fsync-free-flushed to disk. Safe to call concurrently with `append`.
+    /// flushed and fsynced. Safe to call concurrently with `append`.
     pub async fn flush_signal(&self) -> io::Result<()> {
         let (tx, rx) = oneshot::channel();
         self.disk_tx
@@ -230,6 +388,62 @@ impl ByteLog {
             Ok(())
         }
     }
+
+    /// Test hook: drop log bytes before `offset` (ring and file). The log then
+    /// starts at `offset`, rounded up to the ring start when the ring cannot
+    /// go further back. The ring edit happens now. The returned future finishes
+    /// the file edit and does not borrow `self`, so the caller can await it
+    /// after releasing its lock.
+    pub fn begin_truncate_before(
+        &mut self,
+        offset: u64,
+    ) -> impl std::future::Future<Output = io::Result<()>> + 'static {
+        let offset = offset.min(self.total_bytes_written);
+        let drop_n = offset.saturating_sub(self.ring_first()).min(self.ring.len() as u64) as usize;
+        self.ring.drain(..drop_n);
+        let new_first = self.ring_first();
+        let data = Bytes::from(self.ring.iter().copied().collect::<Vec<u8>>());
+        let tx = self.disk_tx.clone();
+        let enabled = self.shared.disk_enabled;
+        let shared = self.shared.clone();
+        async move {
+            if enabled {
+                let (reply, rx) = oneshot::channel();
+                tx.send(DiskMsg::Restart { first: new_first, data, reply })
+                    .await
+                    .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
+                rx.await.map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
+            }
+            shared.wake.notify_waiters();
+            Ok(())
+        }
+    }
+}
+
+/// Read `len` bytes at absolute offset `next` from the log file described by
+/// `disk`. Returns `Ok(None)` when the file moved while reading (rotation or
+/// restart): the caller plans again.
+pub async fn read_disk(
+    shared: &LogShared,
+    disk: DiskState,
+    next: u64,
+    len: usize,
+) -> io::Result<Option<Vec<u8>>> {
+    use tokio::io::AsyncReadExt;
+    let avail = disk.flushed_to.saturating_sub(next);
+    let want = (len as u64).min(avail) as usize;
+    if want == 0 {
+        return Ok(Some(Vec::new()));
+    }
+    let mut f = tokio::fs::File::open(&shared.path).await?;
+    f.seek(tokio::io::SeekFrom::Start(next - disk.first)).await?;
+    let mut buf = vec![0u8; want];
+    f.read_exact(&mut buf).await?;
+    // The file may have been rotated between the state read and the read.
+    if shared.disk_state().first != disk.first {
+        return Ok(None);
+    }
+    Ok(Some(buf))
 }
 
 /// Per-pane disk appender. One tokio task per `ByteLog`.
@@ -239,15 +453,16 @@ impl ByteLog {
 /// loop exits naturally. That is how `close_pane_byte_log` terminates this task.
 async fn disk_appender_task(
     pane_id: Uuid,
-    log_path: PathBuf,
     file: tokio::fs::File,
-    mut file_size_approx: u64,
+    mut file_first: u64,
+    mut file_len: u64,
     max_disk_bytes: u64,
+    shared: Arc<LogShared>,
     mut rx: mpsc::Receiver<DiskMsg>,
 ) {
-    // BufWriter amortises the cost of small PTY chunks — typical chunk is
-    // ~65,536 bytes but output can arrive in smaller bursts.
+    // BufWriter amortises the cost of small PTY chunks.
     let mut writer = BufWriter::new(file);
+    let log_path = shared.path.clone();
 
     loop {
         match rx.recv().await {
@@ -257,12 +472,32 @@ async fn disk_appender_task(
                 debug!(pane = %pane_id, "disk appender: channel closed, exiting");
                 return;
             }
-            Some(DiskMsg::Chunk(data)) => {
+            Some(DiskMsg::Chunk { start, data }) => {
+                if start != file_first + file_len {
+                    // A chunk was not queued (queue full) or the file was
+                    // restarted: the file would have a hole. Start it over at
+                    // this chunk so it stays one contiguous range.
+                    let _ = writer.flush().await;
+                    match restart_file(&log_path).await {
+                        Ok(f) => {
+                            writer = BufWriter::new(f);
+                            file_first = start;
+                            file_len = 0;
+                            write_sidecar(&log_path, start);
+                            shared.set_disk(DiskState { first: start, flushed_to: start });
+                            warn!(pane = %pane_id, start, "disk appender: gap in the log, file restarted");
+                        }
+                        Err(e) => {
+                            warn!(pane = %pane_id, "disk appender: restart failed: {e}");
+                            continue;
+                        }
+                    }
+                }
                 if let Err(e) = writer.write_all(&data).await {
                     warn!(pane = %pane_id, "disk appender: write_all failed: {e}");
                     continue;
                 }
-                file_size_approx = file_size_approx.saturating_add(data.len() as u64);
+                file_len = file_len.saturating_add(data.len() as u64);
 
                 // End of this drain wake: nothing else is queued, so hand the
                 // buffered bytes to the kernel now. A kill -9 or a crash then
@@ -272,17 +507,29 @@ async fn disk_appender_task(
                 if rx.is_empty() {
                     if let Err(e) = writer.flush().await {
                         warn!(pane = %pane_id, "disk appender: flush failed: {e}");
+                    } else {
+                        shared.set_disk(DiskState {
+                            first: file_first,
+                            flushed_to: file_first + file_len,
+                        });
+                        shared.disk_progress.notify_waiters();
                     }
                 }
 
-                if file_size_approx >= max_disk_bytes {
+                if file_len >= max_disk_bytes {
                     // Rotation: keep newest max_disk_bytes / 2 (SPEC §10.6).
-                    // Rationale: halving the size avoids immediate re-rotation
-                    // on the next write at steady-state.
                     match rotate_log(&log_path, &mut writer, max_disk_bytes / 2).await {
-                        Ok(new_size) => {
-                            file_size_approx = new_size;
-                            debug!(pane = %pane_id, new_size, "disk appender: rotated");
+                        Ok(kept) => {
+                            let new_first = file_first + (file_len - kept);
+                            file_first = new_first;
+                            file_len = kept;
+                            write_sidecar(&log_path, new_first);
+                            shared.set_disk(DiskState {
+                                first: new_first,
+                                flushed_to: new_first + kept,
+                            });
+                            shared.disk_progress.notify_waiters();
+                            debug!(pane = %pane_id, new_first, kept, "disk appender: rotated");
                         }
                         Err(e) => {
                             warn!(pane = %pane_id, "disk appender: rotation failed: {e}");
@@ -290,6 +537,25 @@ async fn disk_appender_task(
                         }
                     }
                 }
+            }
+            Some(DiskMsg::Restart { first, data, reply }) => {
+                let _ = writer.flush().await;
+                match restart_file(&log_path).await {
+                    Ok(f) => {
+                        writer = BufWriter::new(f);
+                        file_first = first;
+                        file_len = 0;
+                        write_sidecar(&log_path, first);
+                        if !data.is_empty() && writer.write_all(&data).await.is_ok() {
+                            file_len = data.len() as u64;
+                        }
+                        let _ = writer.flush().await;
+                        shared.set_disk(DiskState { first, flushed_to: first + file_len });
+                        shared.disk_progress.notify_waiters();
+                    }
+                    Err(e) => warn!(pane = %pane_id, "disk appender: restart failed: {e}"),
+                }
+                let _ = reply.send(());
             }
             Some(DiskMsg::Flush(reply)) => {
                 // Explicit flush (shutdown, disconnect): also fsync, so the log
@@ -300,14 +566,31 @@ async fn disk_appender_task(
                 if let Err(e) = writer.get_ref().sync_data().await {
                     warn!(pane = %pane_id, "disk appender: fsync failed: {e}");
                 }
+                shared.set_disk(DiskState { first: file_first, flushed_to: file_first + file_len });
+                shared.disk_progress.notify_waiters();
                 let _ = reply.send(());
             }
         }
     }
 }
 
+/// Truncate the log file and reopen it for append. Used when the log restarts
+/// at a new absolute offset.
+async fn restart_file(log_path: &Path) -> io::Result<tokio::fs::File> {
+    let std_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(log_path)?;
+    drop(std_file);
+    let std_file =
+        std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(log_path)?;
+    Ok(tokio::fs::File::from_std(std_file))
+}
+
 /// Rotate the log file: read the last `keep_bytes` bytes, write them to a
-/// `.tmp` sibling, rename over the original.
+/// `.tmp` sibling, rename over the original. Returns the number of bytes kept.
 ///
 /// The appender replaces its own `BufWriter` to point at the freshly-rotated
 /// file so subsequent writes hit the truncated file.
@@ -538,5 +821,112 @@ mod tests {
         assert!(!tmp_path.exists(), "ByteLog::new must delete stale .log.tmp");
 
         let _ = std::fs::remove_file(&log_path);
+    }
+
+    fn cleanup(pane_id: Uuid) {
+        let path = pane_log_path(pane_id);
+        let _ = std::fs::remove_file(offset_sidecar_path(&path));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Offsets are absolute: after rotation the file starts at a later offset,
+    /// the sidecar stores it, and a reopen restores `total_written`.
+    #[tokio::test]
+    async fn offsets_survive_rotation_and_reopen() {
+        let pane_id = Uuid::new_v4();
+        let max_disk = 32 * 1024u64;
+        let mut log = ByteLog::new(pane_id, 1024, max_disk).unwrap();
+        let chunk: Vec<u8> = (0..8 * 1024).map(|i| (i % 251) as u8).collect();
+        for _ in 0..12 {
+            log.append(&chunk);
+        }
+        log.flush_signal().await.unwrap();
+        let total = log.total_written();
+        assert_eq!(total, 12 * 8 * 1024);
+        let disk = log.shared().disk_state();
+        assert!(disk.first > 0, "rotation moved the first offset");
+        assert_eq!(disk.flushed_to, total);
+        let on_disk = std::fs::read(pane_log_path(pane_id)).unwrap();
+        assert_eq!(disk.first + on_disk.len() as u64, total);
+        let sidecar =
+            std::fs::read_to_string(offset_sidecar_path(&pane_log_path(pane_id))).unwrap();
+        assert_eq!(sidecar.trim().parse::<u64>().unwrap(), disk.first);
+        drop(log);
+
+        let log2 = ByteLog::new(pane_id, 1024, max_disk).unwrap();
+        assert_eq!(log2.total_written(), total, "total survives a restart");
+        assert_eq!(log2.ring_first(), total - 1024);
+        assert_eq!(log2.first_available(), disk.first);
+        cleanup(pane_id);
+    }
+
+    /// `plan` covers ring, disk, caught-up and lost.
+    #[tokio::test]
+    async fn plan_reads_ring_then_disk_then_lost() {
+        let pane_id = Uuid::new_v4();
+        let max_disk = 32 * 1024u64;
+        let mut log = ByteLog::new(pane_id, 1024, max_disk).unwrap();
+        let data: Vec<u8> = (0..40_000u32).map(|i| (i % 253) as u8).collect();
+        for c in data.chunks(4000) {
+            log.append(c);
+        }
+        log.flush_signal().await.unwrap();
+        let total = log.total_written();
+        assert_eq!(total, 40_000);
+        assert!(matches!(log.plan(total, 100), LogPlan::Caught));
+        match log.plan(total - 10, 100) {
+            LogPlan::Ring(b) => assert_eq!(b, data[39_990..]),
+            other => panic!("{other:?}"),
+        }
+        let disk = log.shared().disk_state();
+        match log.plan(disk.first + 5, 100) {
+            LogPlan::Disk { disk: d, len } => {
+                assert_eq!(len, 100);
+                let got = read_disk(&log.shared(), d, disk.first + 5, len).await.unwrap().unwrap();
+                assert_eq!(got, data[(disk.first + 5) as usize..(disk.first + 105) as usize]);
+            }
+            other => panic!("{other:?}"),
+        }
+        match log.plan(0, 100) {
+            LogPlan::Lost { first } => assert_eq!(first, disk.first),
+            other => panic!("{other:?}"),
+        }
+        cleanup(pane_id);
+    }
+
+    /// A chunk that never reached the disk queue leaves a hole. The appender
+    /// restarts the file at the next chunk, so the file stays contiguous.
+    #[tokio::test]
+    async fn dropped_chunk_restarts_the_file_at_the_new_offset() {
+        let pane_id = Uuid::new_v4();
+        let mut log = ByteLog::new(pane_id, 4096, 1024 * 1024).unwrap();
+        log.append(b"aaaa");
+        log.flush_signal().await.unwrap();
+        // Simulate a dropped chunk: advance the offset without queueing.
+        log.total_bytes_written += 6;
+        log.append(b"bbbb");
+        log.flush_signal().await.unwrap();
+        let disk = log.shared().disk_state();
+        assert_eq!(disk, DiskState { first: 10, flushed_to: 14 });
+        assert_eq!(std::fs::read(pane_log_path(pane_id)).unwrap(), b"bbbb");
+        cleanup(pane_id);
+    }
+
+    /// The test hook drops old bytes and the log then starts at the offset.
+    #[tokio::test]
+    async fn truncate_before_moves_the_first_offset() {
+        let pane_id = Uuid::new_v4();
+        let mut log = ByteLog::new(pane_id, 4096, 1024 * 1024).unwrap();
+        log.append(b"0123456789");
+        log.flush_signal().await.unwrap();
+        log.begin_truncate_before(4).await.unwrap();
+        assert_eq!(log.first_available(), 4);
+        assert!(matches!(log.plan(2, 10), LogPlan::Lost { first: 4 }));
+        match log.plan(4, 100) {
+            LogPlan::Ring(b) => assert_eq!(b, b"456789"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(std::fs::read(pane_log_path(pane_id)).unwrap(), b"456789");
+        cleanup(pane_id);
     }
 }

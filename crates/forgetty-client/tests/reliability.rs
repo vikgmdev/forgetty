@@ -1,11 +1,15 @@
 //! Liveness, exactly-once input and network-change handling
 //! (PROTOCOL_V2 sections 4, 5 and 9). Own test binary: these tests depend on
-//! wall-clock timing and must not compete for CPU with the others.
+//! wall-clock timing and must not compete for CPU with the others. Runs
+//! against the in-process test server, or the real one with
+//! `FORGETTY_REAL_SERVER` set.
+
+mod common;
 
 use std::time::{Duration, Instant};
 
+use common::{Saved, TestServer, TestServerConfig};
 use forgetty_client::proto::ClientKind;
-use forgetty_client::test_server::{TestServer, TestServerConfig};
 use forgetty_client::{
     AddrCache, AddrCacheSnapshot, CachedAddr, Client, ClientHandle, ClientInfo, ClientOptions,
     EndpointAddr, PaneItem, PaneStream, SecretKey,
@@ -294,26 +298,27 @@ fn addr_cache_snapshot_round_trips_through_serde() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn server_restart_on_the_cached_port_reconnects_every_time() {
     const RESTARTS: usize = 10;
-    let key = SecretKey::generate(&mut rand::rng());
-    let pane = Uuid::new_v4();
-    let cfg = |port: Option<u16>, log: Vec<u8>| TestServerConfig {
-        port,
-        secret_key: Some(key.clone()),
-        panes: vec![(pane, log)],
+    let first = TestServer::start(TestServerConfig {
+        panes: vec![(Uuid::new_v4(), Vec::new())],
         ..Default::default()
-    };
-    let first = TestServer::start(cfg(None, Vec::new())).await;
+    })
+    .await;
+    let pane = first.initial_pane(0);
+    let node_id = first.node_id();
     let port = first.udp_addr().port();
 
     // What the app would have persisted from an earlier run.
     let cache = AddrCache::from_snapshot(&AddrCacheSnapshot {
-        entries: vec![CachedAddr { node_id: key.public().to_string(), addr: first.udp_addr() }],
+        entries: vec![CachedAddr { node_id: node_id.to_string(), addr: first.udp_addr() }],
     });
     let opts = ClientOptions { addr_cache: cache, ..Default::default() };
     let info = ClientInfo::new(Uuid::new_v4(), ClientKind::Cli, "restart", "0");
+    let key = SecretKey::generate(&mut rand::rng());
+    // The real server only takes paired devices; the mock takes everyone.
+    first.authorize(key.public());
     let h = Client::connect_with(
-        EndpointAddr::new(key.public()), // node id only: nothing but the cache to dial
-        SecretKey::generate(&mut rand::rng()),
+        EndpointAddr::new(node_id), // node id only: nothing but the cache to dial
+        key,
         info,
         opts,
     )
@@ -367,11 +372,10 @@ async fn server_restart_on_the_cached_port_reconnects_every_time() {
         tokio::time::sleep(Duration::from_millis(300)).await;
         let mut guard = current.lock().await;
         let old = guard.take().unwrap();
-        let log = old.log(pane);
-        old.shutdown().await; // process A dies
+        let saved: Saved = old.stop_for_restart().await; // process A dies
         tokio::time::sleep(Duration::from_millis(50 + (round as u64 * 37) % 250)).await;
         let started = Instant::now();
-        let fresh = TestServer::start(cfg(Some(port), log)).await; // process B, same port
+        let fresh = TestServer::start_again(saved, port).await; // process B, same port
         *guard = Some(fresh);
         drop(guard);
         loop {
@@ -398,6 +402,11 @@ async fn server_restart_on_the_cached_port_reconnects_every_time() {
         .expect("client never caught up")
         .unwrap();
     println!("server restarts: reconnect after B up: {reconnect_times:?}");
+    let slowest = reconnect_times.iter().max().unwrap();
+    assert!(
+        *slowest < Duration::from_millis(1500),
+        "slowest reconnect after a restart was {slowest:?}"
+    );
     assert_eq!(resets, 1, "restarts with restored logs must resume, not reset");
     let want: Vec<u8> = (0..total).map(pattern).collect();
     assert_eq!(have.len(), want.len(), "client missed bytes");

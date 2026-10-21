@@ -13,3 +13,8 @@
 pub mod iroh_terminal;
 
 pub mod sockpath;
+
+pub mod rpc_v2;
+
+#[cfg(feature = "qa-tools")]
+pub mod qa_hook;

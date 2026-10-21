@@ -49,6 +49,10 @@ pub enum SessionEvent {
     /// `PaneClosed`.
     PaneExited { pane_id: PaneId, exit_code: Option<i32> },
 
+    /// The pane's PTY size changed (AD-020). Sent only when rows or cols
+    /// actually changed.
+    PaneResized { pane_id: PaneId, rows: u16, cols: u16 },
+
     // -----------------------------------------------------------------------
     // Layout mutation events (T-063)
     // -----------------------------------------------------------------------

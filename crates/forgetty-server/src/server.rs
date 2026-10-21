@@ -25,6 +25,7 @@ use forgetty_socket::SocketServer;
 use forgetty_sync::{identity::load_or_generate, SyncEndpoint};
 
 use forgetty_server::iroh_terminal::{handle_terminal_stream, FORGETTY_STREAM_ALPN};
+use forgetty_server::rpc_v2::RpcV2;
 use forgetty_server::sockpath;
 
 /// Options for `forgetty server run`.
@@ -42,6 +43,27 @@ pub struct RunArgs {
     /// Used by the paused GTK client, which runs one server per window.
     #[arg(long, hide = true)]
     pub session_id: Option<uuid::Uuid>,
+
+    /// UDP port of the iroh endpoint (default 47297). The port stays the same
+    /// across restarts, so clients can redial the last direct address. `0`
+    /// picks a free port.
+    #[arg(long)]
+    pub port: Option<u16>,
+}
+
+/// Default UDP port of the iroh endpoint (PROTOCOL_V2 section 1).
+pub const DEFAULT_PORT: u16 = 47297;
+
+/// QUIC settings of the server: keep-alive 5 s, idle timeout 30 s (section 1).
+fn quic_config() -> iroh::endpoint::QuicTransportConfig {
+    use forgetty_proto::{IDLE_TIMEOUT_SECS, KEEP_ALIVE_SECS};
+    iroh::endpoint::QuicTransportConfig::builder()
+        .keep_alive_interval(Duration::from_secs(KEEP_ALIVE_SECS))
+        .max_idle_timeout(Some(
+            iroh::endpoint::IdleTimeout::try_from(Duration::from_secs(IDLE_TIMEOUT_SECS))
+                .expect("30 s fits"),
+        ))
+        .build()
 }
 
 /// `server run` exit code when another server already holds the instance lock.
@@ -597,7 +619,12 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
     // handler in `forgetty_server::iroh_terminal`, keeping all terminal-
     // specific behaviour out of the transport crate.
     let sm_for_alpn = Arc::clone(&session_manager);
+    let rpc_v2 = RpcV2::new(Arc::clone(&session_manager), session_id);
+    let port = args.port.unwrap_or(DEFAULT_PORT);
     let sync_endpoint = match SyncEndpoint::builder(secret_key)
+        .bind_port(port)
+        .transport_config(quic_config())
+        .register_alpn(forgetty_proto::ALPN_RPC, rpc_v2.alpn_handler())
         .register_alpn(
             FORGETTY_STREAM_ALPN,
             Arc::new(move |conn, registry| {
@@ -612,8 +639,9 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
     {
         Ok(ep) => {
             info!(
-                "iroh endpoint bound, node_id={}, alpns=[forgetty/pair/2, forgetty/pair/1 (refuses), forgetty/stream/1]",
-                ep.node_id()
+                "iroh endpoint bound, node_id={}, udp={:?}, alpns=[forgetty/rpc/2, forgetty/pair/2, forgetty/pair/1 (refuses), forgetty/stream/1]",
+                ep.node_id(),
+                ep.bound_sockets()
             );
             Arc::new(ep)
         }
@@ -622,6 +650,10 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
             return Err(anyhow::anyhow!("iroh bind failed: {e}"));
         }
     };
+
+    rpc_v2.set_sync(Arc::clone(&sync_endpoint));
+    #[cfg(feature = "qa-tools")]
+    forgetty_server::qa_hook::install(Arc::clone(&rpc_v2), Arc::clone(&sync_endpoint));
 
     // Spawn iroh accept loop.
     {
