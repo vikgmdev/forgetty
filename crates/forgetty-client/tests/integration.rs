@@ -515,3 +515,100 @@ async fn pane_close_ends_the_stream_and_reconnect_now_redials() {
     assert_eq!(h.state(), ConnectionState::Closed);
     server.shutdown().await;
 }
+
+fn find<'a>(v: &'a Value, key: &str) -> &'a Value {
+    &v.as_map()
+        .unwrap_or_else(|| panic!("not a map: {v:?}"))
+        .iter()
+        .find(|(k, _)| k.as_str() == Some(key))
+        .unwrap_or_else(|| panic!("no key {key} in {v:?}"))
+        .1
+}
+
+fn params(entries: &[(&str, &str)]) -> Value {
+    Value::Map(entries.iter().map(|(k, v)| (Value::from(*k), Value::from(*v))).collect())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn layout_methods_drive_a_ui() {
+    init_log();
+    let pane = Uuid::new_v4();
+    let server = TestServer::start(TestServerConfig {
+        panes: vec![(pane, b"hello".to_vec())],
+        ..Default::default()
+    })
+    .await;
+    let h = connect(&server).await;
+    let mut events = h.events().await.expect("events");
+
+    let layout = h.request("get_layout", Value::Nil).await.expect("get_layout");
+    let ws = &find(&layout, "workspaces").as_array().expect("workspaces")[0];
+    assert_eq!(find(ws, "name").as_str(), Some("Default"));
+    assert_eq!(find(ws, "tabs").as_array().expect("tabs").len(), 1);
+
+    // New tab, split, rename: each emits LayoutChanged.
+    let tab = h.request("new_tab", params(&[])).await.expect("new_tab");
+    let new_pane = find(&tab, "pane_id").as_str().expect("pane_id").to_string();
+    let split = h
+        .request("split_pane", params(&[("pane_id", &new_pane), ("direction", "vertical")]))
+        .await
+        .expect("split_pane");
+    let split_pane = find(&split, "pane_id").as_str().expect("pane_id").to_string();
+    h.request("rename_workspace", params(&[("name", "work")])).await.expect("rename");
+
+    let tabs = h.request("list_tabs", Value::Nil).await.expect("list_tabs");
+    assert_eq!(find(&tabs, "tabs").as_array().expect("tabs").len(), 3);
+
+    h.request("close_pane", params(&[("pane_id", &split_pane)])).await.expect("close_pane");
+    let layout = h.request("get_layout", Value::Nil).await.expect("get_layout");
+    let ws = &find(&layout, "workspaces").as_array().expect("workspaces")[0];
+    assert_eq!(find(ws, "name").as_str(), Some("work"));
+    assert_eq!(find(ws, "tabs").as_array().expect("tabs").len(), 2);
+
+    // The events arrived in order, at least one LayoutChanged and one PaneClosed.
+    let mut layout_changed = 0;
+    let mut closed = false;
+    while let Ok(Some(EventItem::Server { event, .. })) =
+        tokio::time::timeout(Duration::from_millis(300), events.next()).await
+    {
+        match event {
+            ServerEvent::LayoutChanged { .. } => layout_changed += 1,
+            ServerEvent::PaneClosed { pane_id } => closed = pane_id.to_string() == split_pane,
+            _ => {}
+        }
+    }
+    assert!(layout_changed >= 3, "layout events: {layout_changed}");
+    assert!(closed, "no PaneClosed for the split pane");
+    h.close().await;
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resize_pane_emits_pane_resized() {
+    init_log();
+    let pane = Uuid::new_v4();
+    let server = TestServer::start(TestServerConfig {
+        panes: vec![(pane, Vec::new())],
+        ..Default::default()
+    })
+    .await;
+    let h = connect(&server).await;
+    let mut events = h.events().await.expect("events");
+    h.resize(pane, 40, 100).await.expect("resize");
+    let got = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(EventItem::Server {
+                event: ServerEvent::PaneResized { rows, cols, .. },
+                ..
+            }) = events.next().await
+            {
+                return (rows, cols);
+            }
+        }
+    })
+    .await
+    .expect("PaneResized");
+    assert_eq!(got, (40, 100));
+    h.close().await;
+    server.shutdown().await;
+}

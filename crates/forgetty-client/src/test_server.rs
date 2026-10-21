@@ -3,9 +3,12 @@
 //! It speaks exactly PROTOCOL_V2 with `forgetty-proto`: handshake, the
 //! `attach_pane` / `detach_pane` / `subscribe_events` / `resize_pane` /
 //! `list_clients` methods, offset resume over an in-memory byte log, input
-//! echo and pairing. Panes are plain byte logs. The server is not a model of
-//! the real one: it exists to drive the client through resume, reset and drop
-//! scenarios on real iroh endpoints.
+//! echo and pairing. Panes are plain byte logs. A flat layout model answers
+//! `get_layout`, `list_tabs`, `new_tab`, `split_pane`, `close_pane`,
+//! `close_tab`, `focus_tab`, `rename_workspace` and `get_pane_info`, so a UI
+//! can be driven against it. The server is not a model of the real one: it
+//! exists to drive the client through resume, reset and drop scenarios on
+//! real iroh endpoints.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -78,6 +81,102 @@ impl Default for TestServerConfig {
     }
 }
 
+/// Pane tree of one tab, shaped like the real `PaneTreeLayout`.
+#[derive(Debug, Clone)]
+enum Tree {
+    Leaf(Uuid),
+    Split { direction: String, first: Box<Tree>, second: Box<Tree> },
+}
+
+impl Tree {
+    fn contains(&self, pane: Uuid) -> bool {
+        match self {
+            Tree::Leaf(id) => *id == pane,
+            Tree::Split { first, second, .. } => first.contains(pane) || second.contains(pane),
+        }
+    }
+
+    /// Replace the leaf `pane` with a split holding it and `new_pane`.
+    fn split(&mut self, pane: Uuid, new_pane: Uuid, direction: &str) -> bool {
+        match self {
+            Tree::Leaf(id) if *id == pane => {
+                *self = Tree::Split {
+                    direction: direction.to_string(),
+                    first: Box::new(Tree::Leaf(pane)),
+                    second: Box::new(Tree::Leaf(new_pane)),
+                };
+                true
+            }
+            Tree::Leaf(_) => false,
+            Tree::Split { first, second, .. } => {
+                first.split(pane, new_pane, direction) || second.split(pane, new_pane, direction)
+            }
+        }
+    }
+
+    /// Remove the leaf `pane`; the sibling takes its place. `None` when the
+    /// tree was only that leaf.
+    fn remove(self, pane: Uuid) -> Option<Tree> {
+        match self {
+            Tree::Leaf(id) if id == pane => None,
+            Tree::Leaf(_) => Some(self),
+            Tree::Split { direction, first, second } => {
+                match (first.remove(pane), second.remove(pane)) {
+                    (Some(a), Some(b)) => {
+                        Some(Tree::Split { direction, first: Box::new(a), second: Box::new(b) })
+                    }
+                    (Some(only), None) | (None, Some(only)) => Some(only),
+                    (None, None) => None,
+                }
+            }
+        }
+    }
+
+    fn panes(&self, out: &mut Vec<Uuid>) {
+        match self {
+            Tree::Leaf(id) => out.push(*id),
+            Tree::Split { first, second, .. } => {
+                first.panes(out);
+                second.panes(out);
+            }
+        }
+    }
+
+    fn to_value(&self) -> Value {
+        match self {
+            Tree::Leaf(id) => map(&[("Leaf", map(&[("pane_id", str_val(&id.to_string()))]))]),
+            Tree::Split { direction, first, second } => map(&[(
+                "Split",
+                map(&[
+                    ("direction", str_val(direction)),
+                    ("ratio", Value::F32(0.5)),
+                    ("first", first.to_value()),
+                    ("second", second.to_value()),
+                ]),
+            )]),
+        }
+    }
+}
+
+struct TabNode {
+    id: Uuid,
+    title: String,
+    tree: Tree,
+}
+
+struct Layout {
+    workspace: String,
+    tabs: Vec<TabNode>,
+}
+
+fn str_val(s: &str) -> Value {
+    Value::String(s.into())
+}
+
+fn map(entries: &[(&str, Value)]) -> Value {
+    Value::Map(entries.iter().map(|(k, v)| (str_val(k), v.clone())).collect())
+}
+
 struct PaneLog {
     /// Absolute offset of `data[0]`.
     first: u64,
@@ -107,6 +206,7 @@ struct State {
     attaches: Mutex<Vec<(Uuid, Option<u64>)>>,
     handshakes: AtomicU64,
     paused: AtomicBool,
+    layout: Mutex<Layout>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -177,6 +277,7 @@ impl TestServer {
             attaches: Mutex::new(Vec::new()),
             handshakes: AtomicU64::new(0),
             paused: AtomicBool::new(false),
+            layout: Mutex::new(Layout { workspace: "Default".into(), tabs: Vec::new() }),
             cfg,
         });
         for (id, log) in &state.cfg.panes {
@@ -191,6 +292,11 @@ impl TestServer {
                     input: Vec::new(),
                 },
             );
+            lock(&state.layout).tabs.push(TabNode {
+                id: Uuid::new_v4(),
+                title: String::new(),
+                tree: Tree::Leaf(*id),
+            });
         }
         let accept = tokio::spawn(accept_loop(endpoint.clone(), state.clone()));
         TestServer { rt: None, endpoint, state, addr, accept }
@@ -248,10 +354,16 @@ impl TestServer {
     /// Close a pane: its output streams finish and it can no longer be
     /// attached.
     pub fn close_pane(&self, pane: Uuid) {
-        let notify = lock(&self.state.panes).remove(&pane).map(|p| p.notify);
-        if let Some(n) = notify {
-            n.notify_waiters();
-        }
+        remove_pane(&self.state, pane);
+    }
+
+    /// Send a `StatusChanged` event to every subscribed client.
+    pub fn push_status(&self, pane: Uuid, status: &str, message: &str) {
+        self.push_event(ServerEvent::StatusChanged {
+            pane_id: pane,
+            status: status.to_string(),
+            message: message.to_string(),
+        });
     }
 
     /// Forget log bytes before `offset` (the log now starts there).
@@ -596,6 +708,13 @@ fn handle_request(
             };
             log.rows = p.rows;
             log.cols = p.cols;
+            drop(panes);
+            // AD-020: the latest client's size is the PTY size.
+            let seq = state.event_seq.fetch_add(1, Ordering::SeqCst) + 1;
+            let _ = state.events.send((
+                seq,
+                ServerEvent::PaneResized { pane_id: p.pane_id, rows: p.rows, cols: p.cols },
+            ));
             to_value(&OkResult { ok: true }).map_err(bad)
         }
         method::LIST_CLIENTS => {
@@ -603,8 +722,200 @@ fn handle_request(
                 lock(&state.clients).iter().map(|c| to_value(c).unwrap_or(Value::Nil)).collect();
             Ok(Value::Array(list))
         }
+        "get_layout" => Ok(layout_value(state)),
+        "list_tabs" => {
+            let layout = lock(&state.layout);
+            let panes = lock(&state.panes);
+            let mut ids = Vec::new();
+            for t in &layout.tabs {
+                t.tree.panes(&mut ids);
+            }
+            let tabs: Vec<Value> = ids
+                .iter()
+                .filter_map(|id| panes.get(id).map(|p| (id, p)))
+                .map(|(id, p)| {
+                    map(&[
+                        ("pane_id", str_val(&id.to_string())),
+                        ("pid", Value::from(1u32)),
+                        ("rows", Value::from(p.rows)),
+                        ("cols", Value::from(p.cols)),
+                        ("cwd", str_val("/home/test")),
+                        ("title", str_val(&format!("pane {}", &id.to_string()[..8]))),
+                    ])
+                })
+                .collect();
+            Ok(map(&[("tabs", Value::Array(tabs))]))
+        }
+        "new_tab" => {
+            let pane = new_pane_log(state, 24, 80);
+            let tab_id = Uuid::new_v4();
+            lock(&state.layout).tabs.push(TabNode {
+                id: tab_id,
+                title: String::new(),
+                tree: Tree::Leaf(pane),
+            });
+            layout_changed(state);
+            Ok(map(&[
+                ("tab_id", str_val(&tab_id.to_string())),
+                ("pane_id", str_val(&pane.to_string())),
+            ]))
+        }
+        "split_pane" => {
+            let pane = param_uuid(&params, "pane_id")?;
+            let direction = param_str(&params, "direction").unwrap_or("horizontal");
+            if !lock(&state.panes).contains_key(&pane) {
+                return Err((error_code::NOT_FOUND, "no such pane".into()));
+            }
+            let new_pane = new_pane_log(state, 24, 80);
+            let split = lock(&state.layout)
+                .tabs
+                .iter_mut()
+                .any(|t| t.tree.contains(pane) && t.tree.split(pane, new_pane, direction));
+            if !split {
+                remove_pane(state, new_pane);
+                return Err((error_code::NOT_FOUND, "pane is in no tab".into()));
+            }
+            layout_changed(state);
+            Ok(map(&[("pane_id", str_val(&new_pane.to_string()))]))
+        }
+        "close_pane" => {
+            let pane = param_uuid(&params, "pane_id")?;
+            if !lock(&state.panes).contains_key(&pane) {
+                return Err((error_code::NOT_FOUND, "no such pane".into()));
+            }
+            remove_pane(state, pane);
+            Ok(map(&[("ok", Value::Boolean(true))]))
+        }
+        "close_tab" => {
+            let tab = param_uuid(&params, "tab_id")?;
+            let mut ids = Vec::new();
+            {
+                let layout = lock(&state.layout);
+                match layout.tabs.iter().find(|t| t.id == tab) {
+                    Some(t) => t.tree.panes(&mut ids),
+                    None => return Err((error_code::NOT_FOUND, "no such tab".into())),
+                }
+            }
+            for id in ids {
+                remove_pane(state, id);
+            }
+            Ok(map(&[("ok", Value::Boolean(true))]))
+        }
+        "focus_tab" => {
+            param_uuid(&params, "tab_id")?;
+            Ok(map(&[("ok", Value::Boolean(true))]))
+        }
+        "rename_workspace" => {
+            let name = param_str(&params, "name")
+                .ok_or((error_code::BAD_REQUEST, "name is required".to_string()))?
+                .to_string();
+            lock(&state.layout).workspace = name;
+            layout_changed(state);
+            Ok(map(&[("ok", Value::Boolean(true))]))
+        }
+        "get_pane_info" => {
+            let pane = param_uuid(&params, "pane_id")?;
+            let panes = lock(&state.panes);
+            let Some(p) = panes.get(&pane) else {
+                return Err((error_code::NOT_FOUND, "no such pane".into()));
+            };
+            Ok(map(&[
+                ("pane_id", str_val(&pane.to_string())),
+                ("rows", Value::from(p.rows)),
+                ("cols", Value::from(p.cols)),
+                ("title", str_val(&format!("pane {}", &pane.to_string()[..8]))),
+                ("cwd", str_val("/home/test")),
+                ("pid", Value::from(1u32)),
+            ]))
+        }
         _ => Err((error_code::UNKNOWN_METHOD, format!("unknown method {m}"))),
     }
+}
+
+fn param_str<'a>(params: &'a Value, key: &str) -> Option<&'a str> {
+    params.as_map()?.iter().find(|(k, _)| k.as_str() == Some(key))?.1.as_str()
+}
+
+fn param_uuid(params: &Value, key: &str) -> Result<Uuid, (&'static str, String)> {
+    param_str(params, key)
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .ok_or((error_code::BAD_REQUEST, format!("{key} must be a uuid string")))
+}
+
+fn new_pane_log(state: &Arc<State>, rows: u16, cols: u16) -> Uuid {
+    let id = Uuid::new_v4();
+    lock(&state.panes).insert(
+        id,
+        PaneLog {
+            first: 0,
+            data: Vec::new(),
+            notify: Arc::new(Notify::new()),
+            rows,
+            cols,
+            input: Vec::new(),
+        },
+    );
+    id
+}
+
+/// Drop a pane from the byte logs and the layout, and tell subscribers.
+fn remove_pane(state: &Arc<State>, pane: Uuid) {
+    let notify = lock(&state.panes).remove(&pane).map(|p| p.notify);
+    if let Some(n) = notify {
+        n.notify_waiters();
+    }
+    {
+        let mut layout = lock(&state.layout);
+        let tabs = std::mem::take(&mut layout.tabs);
+        layout.tabs = tabs
+            .into_iter()
+            .filter_map(|t| {
+                let TabNode { id, title, tree } = t;
+                tree.remove(pane).map(|tree| TabNode { id, title, tree })
+            })
+            .collect();
+    }
+    let seq = state.event_seq.fetch_add(1, Ordering::SeqCst) + 1;
+    let _ = state.events.send((seq, ServerEvent::PaneClosed { pane_id: pane }));
+    layout_changed(state);
+}
+
+fn layout_value(state: &Arc<State>) -> Value {
+    let layout = lock(&state.layout);
+    let tabs: Vec<Value> = layout
+        .tabs
+        .iter()
+        .map(|t| {
+            let mut ids = Vec::new();
+            t.tree.panes(&mut ids);
+            let active = ids.first().map(|id| str_val(&id.to_string())).unwrap_or(Value::Nil);
+            map(&[
+                ("id", str_val(&t.id.to_string())),
+                ("title", str_val(&t.title)),
+                ("pane_tree", t.tree.to_value()),
+                ("active_pane_id", active),
+            ])
+        })
+        .collect();
+    map(&[
+        (
+            "workspaces",
+            Value::Array(vec![map(&[
+                ("id", str_val("00000000-0000-0000-0000-000000000001")),
+                ("name", str_val(&layout.workspace)),
+                ("tabs", Value::Array(tabs)),
+                ("active_tab", Value::from(0u32)),
+                ("color", Value::Nil),
+            ])]),
+        ),
+        ("active_workspace", Value::from(0u32)),
+    ])
+}
+
+fn layout_changed(state: &Arc<State>) {
+    let layout = layout_value(state);
+    let seq = state.event_seq.fetch_add(1, Ordering::SeqCst) + 1;
+    let _ = state.events.send((seq, ServerEvent::LayoutChanged { layout }));
 }
 
 /// One Pane output stream: header, then raw frames from the log.

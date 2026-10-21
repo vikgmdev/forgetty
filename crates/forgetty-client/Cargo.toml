@@ -10,6 +10,11 @@ default = []
 # In-process protocol v2 test server (`forgetty_client::test_server`).
 test-util = []
 
+[[bin]]
+name = "v2-test-server"
+path = "src/bin/v2-test-server.rs"
+required-features = ["test-util"]
+
 [dependencies]
 forgetty-proto = { path = "../forgetty-proto" }
 iroh = { workspace = true }
