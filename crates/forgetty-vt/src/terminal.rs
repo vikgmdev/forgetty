@@ -78,11 +78,26 @@ impl Terminal {
     /// `sync_screen` to resolve palette color indices 0–15.  Indices 16–255
     /// always use the standard xterm 256-color formula.
     pub fn new(rows: usize, cols: usize, ansi_palette: [forgetty_core::Rgba; 16]) -> Self {
+        Self::with_scrollback(rows, cols, ansi_palette, 10_000)
+    }
+
+    /// Like [`Terminal::new`] with an explicit scrollback limit.
+    ///
+    /// NOTE: libghostty-vt counts `max_scrollback` in BYTES of page memory
+    /// (the C header says "lines" but Ghostty's PageList limit is a byte size).
+    /// The default 10_000 keeps only about 1000 rows of 80 columns. Budget
+    /// roughly `lines * cols * 16` bytes for a line-count target.
+    pub fn with_scrollback(
+        rows: usize,
+        cols: usize,
+        ansi_palette: [forgetty_core::Rgba; 16],
+        max_scrollback: usize,
+    ) -> Self {
         let mut handle: ffi::GhosttyTerminal = std::ptr::null_mut();
         let opts = ffi::GhosttyTerminalOptions {
             cols: cols as u16,
             rows: rows as u16,
-            max_scrollback: 10_000,
+            max_scrollback,
         };
         let rc = unsafe { ffi::ghostty_terminal_new(std::ptr::null(), &mut handle, opts) };
         assert_eq!(rc, ffi::GHOSTTY_SUCCESS, "ghostty_terminal_new failed: {rc}");
@@ -573,6 +588,35 @@ impl Terminal {
         }
     }
 
+    /// Wide-ness of the cell the row-cells iterator currently points at
+    /// (`GHOSTTY_CELL_WIDE_*`). Returns narrow on any FFI failure.
+    fn row_cell_wide(&self) -> i32 {
+        let mut raw: ffi::GhosttyCell = 0;
+        let rc = unsafe {
+            ffi::ghostty_render_state_row_cells_get(
+                self.row_cells,
+                ffi::GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW,
+                &mut raw as *mut ffi::GhosttyCell as *mut c_void,
+            )
+        };
+        if rc != ffi::GHOSTTY_SUCCESS {
+            return ffi::GHOSTTY_CELL_WIDE_NARROW;
+        }
+        let mut wide: i32 = 0;
+        let rc = unsafe {
+            ffi::ghostty_cell_get(
+                raw,
+                ffi::GHOSTTY_CELL_DATA_WIDE,
+                &mut wide as *mut i32 as *mut c_void,
+            )
+        };
+        if rc == ffi::GHOSTTY_SUCCESS {
+            wide
+        } else {
+            ffi::GHOSTTY_CELL_WIDE_NARROW
+        }
+    }
+
     /// Synchronize the cached Screen from the libghostty-vt render state.
     ///
     /// This follows the exact same API call sequence as Ghostling's
@@ -768,7 +812,9 @@ impl Terminal {
                         }
                     };
 
-                    let attrs = CellAttributes { bg, ..CellAttributes::default() };
+                    // Empty cells can be the spacer half of a wide glyph.
+                    let spacer = self.row_cell_wide() >= ffi::GHOSTTY_CELL_WIDE_SPACER_TAIL;
+                    let attrs = CellAttributes { bg, spacer, ..CellAttributes::default() };
                     cache.screen.update_cell_in_place(row_idx, col_idx, " ", attrs);
                     col_idx += 1;
                     continue;
@@ -843,6 +889,9 @@ impl Terminal {
                     strikethrough: style.strikethrough,
                     inverse: false, // Already handled above via color swap
                     dim: style.faint,
+                    // Only codepoints that can be wide need the extra FFI hop.
+                    wide: codepoints[0] >= 0x1100 && self.row_cell_wide() == ffi::GHOSTTY_CELL_WIDE_WIDE,
+                    spacer: false,
                 };
 
                 cache.screen.update_cell_in_place(row_idx, col_idx, grapheme_str, attrs);

@@ -26,17 +26,29 @@ target\release\forgetty-win.exe --smoke    # headless measurement, JSON on stdou
 
 CI: `.github/workflows/windows-client.yml` (branch `v3/win-spike`).
 
-## Design
+## Design (W1)
 
-- `src/pty.rs`: portable-pty (ConPTY) spawn, reader thread, async channel to the UI thread.
-- `src/view.rs`: `TerminalView` owns `forgetty_vt::Terminal`. Feeds PTY bytes (coalesced),
-  writes VT replies (DA, CPR) back to the PTY, caches one shaped line per row and re-shapes
-  only rows the VT reports dirty (`Screen::row_dirty_since`). Redraw happens only on
-  `cx.notify()`, which only the PTY pump calls.
-- `src/element.rs`: custom GPUI `Element`. Paint = background quads (merged runs) + cursor
-  block + one `ShapedLine::paint` per row. `shape_line(.., force_width = cell width)` keeps
-  the monospace grid exact. GPUI's text system (DirectWrite) provides the glyph atlas.
-- `src/keys.rs`: legacy xterm key encoding (Enter, Backspace, arrows, Ctrl+letter, F-keys, Alt prefix).
+- `src/source.rs`: `PaneSource` trait (events channel with `Output`/`Closed`, `write_input`,
+  `resize`, `shutdown`) and `LocalConPty` (portable-pty). The view only sees the trait, so the
+  remote `forgetty-client` pane plugs in without view changes. Output channel is bounded
+  (backpressure), writes go through a writer thread (never block the UI).
+- `src/view.rs`: `TerminalView` owns `forgetty_vt::Terminal`. Output is fed in <=256 KB batches
+  with a yield between batches. One resize per frame (grid follows the window, VT + PTY).
+  Shaped lines are cached per row by content hash (rows the VT did not touch are not even hashed).
+  Selection (drag, double-click word, triple-click line), copy on select, Ctrl+Shift+C/V,
+  bracketed paste, wheel and Shift+PageUp/PageDown scrolling (pixel deltas accumulate, view snaps
+  to rows, no re-parse), DECSET 1004 focus reports, window title from OSC.
+- `src/element.rs`: custom GPUI `Element`: background quads, selection, cursor (block, bar,
+  underline, hollow, DECSCUSR blink), shaped text per row, IME preedit at the cursor.
+- `src/encoder.rs`: libghostty-vt key encoder (DECCKM, Kitty keyboard protocol, release events)
+  and mouse encoder (1000/1002/1003, SGR/UTF-8/URxvt) through `forgetty_vt::ffi`. Used directly:
+  no fallback to hand-written key tables.
+- `src/config.rs`: `%APPDATA%\forgetty\config.toml` (`FORGETTY_CONFIG` overrides the path).
+  Defaults: Cascadia Mono 11pt (falls back to Cascadia Code, Consolas, Courier New if not
+  installed), Campbell theme, 10000 lines scrollback.
+- `forgetty-vt` additions: `CellAttributes::{wide, spacer}`, `Terminal::with_scrollback`.
+  NOTE: libghostty-vt counts `max_scrollback` in BYTES. `Terminal::new` passes 10_000, which keeps
+  only about 1000 rows. The GTK client has the same limit.
 
 ## IME (out of scope for the spike)
 
@@ -49,22 +61,13 @@ anchors at the cursor. Marked text can be drawn with `UnderlineStyle`.
 
 ## Smoke mode
 
-`--smoke` opens the window, runs `echo spike-ok` in `cmd.exe`, waits until a screen row
-equals `spike-ok` and the next prompt is drawn, then types 100 letters one by one. For each
-letter it records the time from the PTY write to the end of the paint pass whose scene
-contains the echoed glyph. Prints one JSON object and exits 0. Exit 1 on a 10 s timeout.
-Keystrokes are injected at the PTY write, below GPUI's OS key dispatch, so the number covers
-PTY round trip + VT parse + vsync-aligned frame + scene build, not the Win32 key event hop.
+`--smoke` opens the window, drives `cmd.exe` through ConPTY and prints one JSON object. Exit 0
+only if every check in `checks` is true. 10 s is no longer the budget (the throughput test needs
+more): hard timeout 120 s, 45 s per phase. On failure the JSON carries the last screen dump.
 
-## Spike result (CI run 39556646718, windows-latest, first attempt green)
+Checks: `echo_found`, `key_p50_le_18ms`, `damage_only_redraw`, `key_encoder`, `kitty_encoder`,
+`wide_direct`, `wide_shell`, `scrollback_direct`, `scrollback_shell`, `resize`, `throughput`,
+`config`, `mouse_encoder`, `paste`, `selection`.
 
-```
-{"ok":true,"found":"spike-ok","time_to_first_frame_ms":107.8,"time_to_prompt_ms":178.1,
- "time_to_echo_found_ms":213.1,"keystrokes":100,"key_to_frame_avg_ms":17.27,
- "key_to_frame_p50_ms":15.81,"key_to_frame_p95_ms":31.52,"key_to_frame_max_ms":46.85,"frames_drawn":106}
-```
-
-Build: about 10 min cold on the runner (GPUI + Zig DLL). exe 10.4 MB, `ghostty-vt.dll` 1.75 MB.
-The runner has no GPU, so numbers are a software-adapter floor for render cost and include
-ConPTY/conhost latency plus up to one vsync of frame alignment. Not measured: Win32 key event
-hop, real GPU present, resize, scrollback, wide chars.
+Keystrokes in the latency test are injected at `TerminalView::send_keystroke` (same encoder path
+as a real key), below the Win32 key event hop.

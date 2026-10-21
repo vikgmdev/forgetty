@@ -56,6 +56,11 @@ pub struct CellAttributes {
     pub strikethrough: bool,
     pub inverse: bool,
     pub dim: bool,
+    /// This cell is the head of a double-width glyph (CJK, emoji). The next
+    /// cell is its `spacer`.
+    pub wide: bool,
+    /// This cell is the empty tail (or line-end head) of a double-width glyph.
+    pub spacer: bool,
 }
 
 /// A color value for terminal cells.
