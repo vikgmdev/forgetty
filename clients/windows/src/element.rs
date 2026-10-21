@@ -146,6 +146,7 @@ impl Element for TerminalElement {
         // IME: register the handler so TSF/IMM talks to the view.
         window.handle_input(&focus, ElementInputHandler::new(bounds, self.view.clone()), cx);
 
+        crate::smoke::trace("h", 0);
         // Pass 1: backgrounds.
         for (r, row) in prepaint.rows.iter().enumerate() {
             let Some(row) = row else { continue };
@@ -155,6 +156,7 @@ impl Element for TerminalElement {
                 window.paint_quad(fill(Bounds::new(point(x, y), size(cw * (c1 - c0) as f32, lh)), color));
             }
         }
+        crate::smoke::trace("1", 0);
         // Pass 2: selection.
         for &(r, c0, c1) in &prepaint.selection {
             let x = bounds.origin.x + cw * c0 as f32;
@@ -167,6 +169,7 @@ impl Element for TerminalElement {
             c.a = 0.7;
             window.paint_quad(fill(b, c));
         }
+        crate::smoke::trace("3", 0);
         // Pass 4: text, one shaped line per row.
         for (r, row) in prepaint.rows.iter().enumerate() {
             if let Some(row) = row {
@@ -174,6 +177,7 @@ impl Element for TerminalElement {
                 let _ = row.line.paint(origin, lh, TextAlign::Left, None, window, cx);
             }
         }
+        crate::smoke::trace("4", 0);
         // Pass 5: thin cursors over the text.
         if let Some((b, shape)) = prepaint.cursor {
             match shape {
