@@ -125,6 +125,9 @@ pub struct AppShell {
     pub layout: Layout,
     pub views: HashMap<PaneId, Entity<TerminalView>>,
     pub(crate) attaching: HashSet<PaneId>,
+    /// Failed attaches per pane. A new pane can be listed a moment before its server-side
+    /// byte log exists, so a failed attach retries a few times.
+    attach_tries: HashMap<PaneId, u8>,
     pub meta: HashMap<PaneId, PaneMeta>,
     /// Active pane per tab (UI state; also reported to the backend).
     pub local_active: HashMap<Uuid, PaneId>,
@@ -223,6 +226,7 @@ impl AppShell {
             layout: Layout::default(),
             views: HashMap::new(),
             attaching: HashSet::new(),
+            attach_tries: HashMap::new(),
             meta: HashMap::new(),
             local_active: HashMap::new(),
             zoomed: HashMap::new(),
@@ -423,8 +427,32 @@ impl AppShell {
             let _ = this.update(cx, |s, cx| {
                 s.attaching.remove(&pane);
                 match src {
-                    Ok(src) => s.add_view(pane, src, info, cx),
-                    Err(e) => eprintln!("forgetty-win: attach {}: {e}", pane.0),
+                    Ok(src) => {
+                        s.attach_tries.remove(&pane);
+                        s.add_view(pane, src, info, cx)
+                    }
+                    Err(e) => {
+                        eprintln!("forgetty-win: attach {}: {e}", pane.0);
+                        let tries = s.attach_tries.entry(pane).or_insert(0);
+                        *tries += 1;
+                        if *tries <= 25 && s.layout.all_panes().contains(&pane) {
+                            s.retry_attach(pane, cx);
+                        } else {
+                            s.attach_tries.remove(&pane);
+                        }
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn retry_attach(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(std::time::Duration::from_millis(200)).await;
+            let _ = this.update(cx, |s, cx| {
+                if s.attach_enabled && s.layout.all_panes().contains(&pane) {
+                    s.attach(pane, cx);
                 }
             });
         })
