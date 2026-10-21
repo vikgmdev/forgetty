@@ -239,3 +239,27 @@ async fn re_attaching_does_not_reset_the_catch_up_backoff() {
     endpoint.close().await;
     server.shutdown().await;
 }
+
+/// A bad frame on the input stream closes the connection (0x02), so the
+/// client redials instead of typing into a dead stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bad_input_frame_closes_the_connection() {
+    use forgetty_client::proto::write_frame;
+    use iroh::endpoint::ConnectionError;
+    if !real_only() {
+        return;
+    }
+    let server = TestServer::start(TestServerConfig::default()).await;
+    let (endpoint, conn, _send) = raw_peer(&server, &["resume"], Uuid::new_v4()).await;
+    let mut input = conn.open_uni().await.unwrap();
+    write_frame(&mut input, &[1, 2, 3]).await.unwrap(); // shorter than the 24 byte header
+    let why = tokio::time::timeout(Duration::from_secs(5), conn.closed())
+        .await
+        .expect("the connection stayed open after a bad input frame");
+    match why {
+        ConnectionError::ApplicationClosed(c) => assert_eq!(u64::from(c.error_code), 0x02),
+        other => panic!("closed for another reason: {other:?}"),
+    }
+    endpoint.close().await;
+    server.shutdown().await;
+}

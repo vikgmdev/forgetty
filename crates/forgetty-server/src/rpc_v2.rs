@@ -1072,10 +1072,40 @@ impl Session {
             work.spawn(async move {
                 let Ok(mut input) = s.conn.accept_uni().await else { return };
                 let policy = s.has(cap::SIZE_POLICY_LATEST);
-                while let Ok(Some((pane, seq, bytes))) = read_input_frame(&mut input).await {
-                    // Awaited here, so the frames of one client stay in order.
-                    // A pane that does not read holds this loop and nothing else.
-                    s.rpc.handle_input(s.client_id, s.epoch, pane, seq, bytes, policy).await;
+                loop {
+                    match read_input_frame(&mut input).await {
+                        Ok(Some((pane, seq, bytes))) => {
+                            // Awaited here, so the frames of one client stay in
+                            // order. A pane that does not read holds this loop
+                            // and nothing else.
+                            s.rpc
+                                .handle_input(s.client_id, s.epoch, pane, seq, bytes, policy)
+                                .await;
+                        }
+                        // The client finished the stream, or the connection is
+                        // going down anyway.
+                        Ok(None)
+                        | Err(
+                            forgetty_proto::FrameError::Io(_)
+                            | forgetty_proto::FrameError::UnexpectedEof,
+                        ) => break,
+                        // A frame this server cannot take ends the input for
+                        // good. Say so, so the client redials with a fresh
+                        // input stream instead of typing into nothing.
+                        Err(e) => {
+                            warn!("rpc2: bad frame on the input stream: {e}");
+                            let reason: &[u8] = if matches!(
+                                e,
+                                forgetty_proto::FrameError::TooLarge { .. }
+                            ) {
+                                b"frame_too_large"
+                            } else {
+                                b"bad_input_frame"
+                            };
+                            s.conn.close(close_code::FRAME_TOO_LARGE.into(), reason);
+                            break;
+                        }
+                    }
                 }
             });
         }
