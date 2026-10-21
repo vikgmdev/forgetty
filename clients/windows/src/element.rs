@@ -77,7 +77,6 @@ impl Element for TerminalElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Prepaint {
-        crate::smoke::trace("e", 0);
         let focused = self.view.read(cx).focus.is_focused(window);
         let active = window.is_window_active();
         self.view.update(cx, |v, _cx| {
@@ -110,7 +109,6 @@ impl Element for TerminalElement {
             } else {
                 None
             };
-            crate::smoke::trace("E", v.rows_reshaped_last);
             Prepaint { rows: v.rows_shaped.clone(), cursor, selection: v.selection_spans() }
         })
     }
@@ -142,12 +140,8 @@ impl Element for TerminalElement {
                 v.term.cursor(),
             )
         };
-
-        crate::smoke::trace("g", 0);
         // IME: register the handler so TSF/IMM talks to the view.
         window.handle_input(&focus, ElementInputHandler::new(bounds, self.view.clone()), cx);
-
-        crate::smoke::trace("h", 0);
         // Pass 1: backgrounds.
         for (r, row) in prepaint.rows.iter().enumerate() {
             let Some(row) = row else { continue };
@@ -157,7 +151,6 @@ impl Element for TerminalElement {
                 window.paint_quad(fill(Bounds::new(point(x, y), size(cw * (c1 - c0) as f32, lh)), color));
             }
         }
-        crate::smoke::trace("1", 0);
         // Pass 2: selection.
         for &(r, c0, c1) in &prepaint.selection {
             let x = bounds.origin.x + cw * c0 as f32;
@@ -170,9 +163,7 @@ impl Element for TerminalElement {
             c.a = 0.7;
             window.paint_quad(fill(b, c));
         }
-        crate::smoke::trace("3", 0);
         // Pass 4: text, one shaped line per row.
-        crate::prof::SAMPLE_ON.store(true, std::sync::atomic::Ordering::Release);
         for (r, row) in prepaint.rows.iter().enumerate() {
             if let Some(row) = row {
                 let origin = point(bounds.origin.x, bounds.origin.y + lh * r as f32);
@@ -180,12 +171,9 @@ impl Element for TerminalElement {
                 let _ = row.line.paint(origin, lh, TextAlign::Left, None, window, cx);
                 let us = t_row.elapsed().as_micros() as usize;
                 if us > 3000 {
-                    crate::smoke::trace("x", r * 1_000_000 + us);
                 }
             }
         }
-        crate::prof::SAMPLE_ON.store(false, std::sync::atomic::Ordering::Release);
-        crate::smoke::trace("4", 0);
         // Pass 5: thin cursors over the text.
         if let Some((b, shape)) = prepaint.cursor {
             match shape {
@@ -221,8 +209,6 @@ impl Element for TerminalElement {
             let line = window.text_system().shape_line(text.into(), font_size, &[run], Some(cw));
             let _ = line.paint(origin, lh, TextAlign::Left, None, window, cx);
         }
-
-        crate::smoke::trace("G", 0);
         self.view.update(cx, |v, _cx| v.after_paint(window));
     }
 }

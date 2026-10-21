@@ -272,9 +272,7 @@ impl TerminalView {
     fn feed(&mut self, bytes: &[u8], closed: Option<String>, cx: &mut Context<Self>) {
         if !bytes.is_empty() {
             let t0 = Instant::now();
-            crate::smoke::trace("f", 0);
             self.term.feed(bytes);
-            crate::smoke::trace("F", bytes.len());
             let dt = t0.elapsed();
             self.fed_bytes += bytes.len() as u64;
             self.feed_time += dt;

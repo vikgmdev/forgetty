@@ -24,61 +24,6 @@ use crate::view::TerminalView;
 
 pub const KEYSTROKES: usize = 100;
 pub const TOTAL_TIMEOUT: Duration = Duration::from_secs(300);
-/// Frame/feed trace for a short window (diagnostics only).
-pub static TRACE_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static CPU0: Mutex<Option<(Instant, (f64, f64, f64))>> = Mutex::new(None);
-static TRACE: Mutex<Vec<String>> = Mutex::new(Vec::new());
-fn t0() -> Instant {
-    static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-    *T0.get_or_init(Instant::now)
-}
-pub fn trace(tag: &str, extra: usize) {
-    use std::sync::atomic::Ordering;
-    if !TRACE_ON.load(Ordering::Relaxed) {
-        return;
-    }
-    let t0 = t0();
-    let mut g = TRACE.lock().unwrap();
-    if g.len() < 4000 {
-        g.push(format!("{tag}{:.1}{}", t0.elapsed().as_secs_f64() * 1000.0, if extra > 0 { format!("({extra})") } else { String::new() }));
-    }
-}
-
-
-/// Move the collected frame/read/write traces into the result under `name`.
-fn dump_trace(name: &str) {
-    use std::sync::atomic::Ordering;
-    TRACE_ON.store(false, Ordering::Relaxed);
-    forgetty_shell_core::conpty::READ_TRACE.store(false, Ordering::Relaxed);
-    let base = t0();
-    let frames: Vec<String> = std::mem::take(&mut *TRACE.lock().unwrap());
-    record(&format!("{name}_trace"), json!(frames.join(" ")));
-    let reads: Vec<String> = std::mem::take(&mut *forgetty_shell_core::conpty::READ_LOG.lock().unwrap())
-        .iter()
-        .filter(|(_, n, _)| *n != 90)
-        .map(|(a, n, b)| format!("r{:.1}({n})>{:.1}", a.saturating_duration_since(base).as_secs_f64() * 1000.0, b.saturating_duration_since(base).as_secs_f64() * 1000.0))
-        .collect();
-    record(&format!("{name}_reads"), json!(reads.join(" ")));
-    let writes: Vec<String> = std::mem::take(&mut *forgetty_shell_core::conpty::WRITE_LOG.lock().unwrap())
-        .iter()
-        .map(|(a, b)| format!("w{:.1}:{}", a.saturating_duration_since(base).as_secs_f64() * 1000.0, b.iter().map(|x| format!("{x:02x}")).collect::<String>()))
-        .collect();
-    record(&format!("{name}_writes"), json!(writes.join(" ")));
-}
-
-fn trace_start() {
-    use std::sync::atomic::Ordering;
-    let _ = t0();
-    TRACE_ON.store(true, Ordering::Relaxed);
-    forgetty_shell_core::conpty::READ_TRACE.store(true, Ordering::Relaxed);
-}
-
-/// Diagnostic A/B switch for frame-rate experiments (env FORGETTY_AB). 0 = normal.
-pub fn ab() -> u32 {
-    static AB: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *AB.get_or_init(|| std::env::var("FORGETTY_AB").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
-}
-
 const PHASE_TIMEOUT: Duration = Duration::from_secs(60);
 const CONPTY_LINES: u32 = 25_000;
 const CONPTY_BYTES: f64 = CONPTY_LINES as f64 * 90.0;
@@ -391,9 +336,6 @@ impl ShellSmoke {
             view.update(cx, |v, _| {
                 finished = self.w1_step(v, window, now_t, frames);
             });
-            if finished && ab() != 0 {
-                self.finish(shell);
-            }
             if finished {
                 self.goto(Phase::Restore);
             }
@@ -431,8 +373,6 @@ impl ShellSmoke {
                         record("time_to_echo_found_ms", json!(ms(now - self.start)));
                         check("echo_found", true);
                         self.start_probe(v, cr, cc);
-                        trace_start();
-                        *CPU0.lock().unwrap() = Some((Instant::now(), crate::prof::cpu_snapshot()));
                         self.goto(Phase::Keys);
                     }
                 }
@@ -448,13 +388,6 @@ impl ShellSmoke {
                     self.max_reshaped_per_key = self.max_reshaped_per_key.max(v.rows_reshaped_last);
                     if self.lat_ms.len() >= KEYSTROKES {
                         let (p50, reshaped) = summarize_keys(&self.lat_ms, self.max_reshaped_per_key, "");
-                        dump_trace("keys");
-                        record("prof_keys", json!(crate::prof::report()));
-                        if let Some((t0, (p0, i0, s0))) = CPU0.lock().unwrap().take() {
-                            let (p1, i1, s1) = crate::prof::cpu_snapshot();
-                            let wall = ms(t0.elapsed());
-                            record("keys_cpu", json!({"wall_ms": wall, "process_cpu_ms": p1 - p0, "system_idle_ms": i1 - i0, "system_total_ms": s1 - s0}));
-                        }
                         check("key_p50_le_18ms", p50 <= 18.0);
                         check("damage_only_redraw", reshaped <= 3);
                         self.lat_ms.clear();
@@ -529,7 +462,6 @@ impl ShellSmoke {
                         v.send_bytes(format!("type {BIG_FILE} & echo THRU-DONE\r").as_bytes());
                         self.thr_t0 = Instant::now();
                         self.thr_last = None;
-                        trace_start();
                         self.goto(Phase::Throughput);
                     }
                 }
@@ -543,7 +475,6 @@ impl ShellSmoke {
                 if let Some(fr) = find_exact("THRU-DONE") {
                     if at_prompt && cr > fr {
                         let secs = (now - self.thr_t0).as_secs_f64();
-                        dump_trace("thr");
                         record("conpty_drain_s", json!((secs * 1000.0).round() / 1000.0));
                         record("conpty_mb_per_s", json!(((CONPTY_BYTES / 1e6 / secs) * 100.0).round() / 100.0));
                         record("conpty_max_frame_gap_ms", json!(self.thr_max_gap));

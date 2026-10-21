@@ -95,6 +95,12 @@ Notes and decisions:
   network share. The OSC scanner decodes on bytes and runs under `catch_unwind`.
 - Mica is used on Windows 11 22H2+ (`backdrop = "mica"`); older builds and `backdrop = "none"` get a solid
   themed background. Panes always paint opaque.
+- Rendering cost: `windows-latest` has no GPU, so GPUI draws through WARP and every full-window
+  quad costs about 8 ms there. The shell therefore paints no redundant full-window backgrounds,
+  dims unfocused panes by recoloring their rows (no alpha overlay) and draws the focus ring as four
+  1 px bars. Startup also asks for a 1 ms timer tick (`timeBeginPeriod(1)`); the default 15.6 ms
+  tick quantizes timed wake-ups. Smoke numbers on CI: key-to-frame p50 about 16.5 ms with 1 and
+  with 4 panes (one 60 Hz frame), `frame_cpu_*` and `frame_idle_*` show the frame cost split.
 - Scrollback is 10 MiB of libghostty bytes per pane by default (`Terminal::new` too);
   `scrollback_bytes` in `config.toml` changes it.
 

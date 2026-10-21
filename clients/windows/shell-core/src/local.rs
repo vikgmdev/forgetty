@@ -147,9 +147,6 @@ impl Inner {
         let w_exit = weak;
         let hooks = Hooks {
             on_output: Box::new(move |bytes| {
-                if std::env::var("FORGETTY_AB").as_deref() == Ok("5") {
-                    return;
-                }
                 // A panic inside the scanner may leave it half-updated: log,
                 // drop this chunk, and start from a fresh scanner.
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scanner.feed(bytes)));
@@ -181,8 +178,7 @@ impl Inner {
         // Spawn directory: the caller's (the parent pane's spawn cwd), else the
         // configured default, else the user profile. Never taken from escape
         // codes, and never a UNC/device path.
-        let ab6 = std::env::var("FORGETTY_AB").as_deref() == Ok("6");
-        let spawn_cwd = [cwd, if ab6 { None } else { self.cfg.default_cwd.clone() }, if ab6 { None } else { user_profile_dir() }]
+        let spawn_cwd = [cwd, self.cfg.default_cwd.clone(), user_profile_dir()]
             .into_iter()
             .flatten()
             .find(|c| crate::osc::is_safe_local_path(c));

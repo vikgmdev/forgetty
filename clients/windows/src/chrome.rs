@@ -392,7 +392,7 @@ impl AppShell {
                 .top(px(r.y))
                 .w(px(r.w))
                 .h(px(r.h))
-                .when(!(self.smoke_mode && crate::smoke::ab() == 3), |d| d.overflow_hidden())
+                .overflow_hidden()
                 .on_mouse_down(MouseButton::Left, cx.listener(move |s, _e, w, cx| s.focus_pane(pane, w, cx)));
             d = match self.views.get(&pane) {
                 Some(v) => d.child(v.clone()),
@@ -593,7 +593,6 @@ impl Render for AppShell {
                 }
             }
             self.render_t0 = Some(now);
-            crate::smoke::trace("R", 0);
         }
         let vp = window.viewport_size();
         self.viewport = (f32::from(vp.width), f32::from(vp.height));
@@ -622,7 +621,7 @@ impl Render for AppShell {
             }))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
-            .child(if self.smoke_mode && crate::smoke::ab() == 2 { div().h(px(36.0)).w_full() } else { self.render_titlebar(window, cx) })
+            .child(self.render_titlebar(window, cx))
             .child(body)
             .children(self.render_palette())
             .child(
@@ -636,27 +635,6 @@ impl Render for AppShell {
                 .w(px(1.0))
                 .h(px(1.0)),
             );
-        crate::smoke::trace("r", 0);
-        if self.smoke_mode && crate::smoke::ab() == 7 {
-            // Diagnostic: only the active terminal, no chrome (the W1 layout).
-            let v = self.active_pane().and_then(|p| self.views.get(&p).cloned());
-            let entity = cx.entity();
-            return div()
-                .size_full()
-                .children(v)
-                .child(
-                    canvas(
-                        |_, _, _| (),
-                        move |_, _, window, cx| {
-                            entity.update(cx, |s, cx| s.after_paint(window, cx));
-                        },
-                    )
-                    .absolute()
-                    .w(px(1.0))
-                    .h(px(1.0)),
-                )
-                .into_any_element();
-        }
-        out.into_any_element()
+        out
     }
 }
