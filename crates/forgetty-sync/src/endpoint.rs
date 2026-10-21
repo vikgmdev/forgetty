@@ -347,24 +347,26 @@ impl SyncEndpoint {
                 }
             };
 
-            // Read the negotiated ALPN before completing the handshake.
-            // `Accepting::alpn()` is async and takes `&mut self`; after it
-            // returns the `Accepting` can still be awaited for the Connection.
-            let alpn = match accepting.alpn().await {
-                Ok(a) => a,
-                Err(e) => {
-                    warn!("totem-sync: failed to read ALPN: {e}");
-                    continue;
-                }
-            };
-
             let registry = Arc::clone(&self.registry);
             let pairing_state = Arc::clone(&self.pairing);
             let event_tx = self.event_tx.clone();
             let extras = Arc::clone(&self.extra_alpns);
             let live = self.live.clone();
 
+            // Everything that waits on the peer happens in the spawned task:
+            // a peer that stalls its handshake (up to the 30 s idle timeout)
+            // must not hold up the next one.
             tokio::spawn(async move {
+                // Read the negotiated ALPN before completing the handshake.
+                // `Accepting::alpn()` is async and takes `&mut self`; after it
+                // returns the `Accepting` can still be awaited for the Connection.
+                let alpn = match accepting.alpn().await {
+                    Ok(a) => a,
+                    Err(e) => {
+                        warn!("totem-sync: failed to read ALPN: {e}");
+                        return;
+                    }
+                };
                 match accepting.await {
                     Ok(conn) => {
                         // Track before dispatch: a revoke that lands while the
