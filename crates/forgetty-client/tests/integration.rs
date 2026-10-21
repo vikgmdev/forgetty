@@ -141,6 +141,8 @@ async fn handshake_and_requests() {
 
     // resize reaches the server.
     let pane = server.add_pane();
+    // A client owns a pane's size only while it has a stream on it (AD-025).
+    let _stream = h.attach_pane(pane).await.unwrap();
     h.resize(pane, 40, 120).await.unwrap();
     assert_eq!(server.pane_size(pane), (40, 120));
 
@@ -618,6 +620,7 @@ async fn resize_pane_emits_pane_resized() {
     let pane = server.initial_pane(0);
     let h = connect(&server).await;
     let mut events = h.events().await.expect("events");
+    let _stream = h.attach_pane(pane).await.expect("attach");
     h.resize(pane, 40, 100).await.expect("resize");
     let got = tokio::time::timeout(Duration::from_secs(5), async {
         loop {

@@ -315,10 +315,16 @@ async fn a_revoke_that_cannot_be_saved_still_cuts_and_denies_the_device() {
     std::fs::create_dir(&file).unwrap();
     std::fs::write(file.join("keep"), b"x").unwrap();
 
-    let err = server
+    // The record in `revoked.pending` is written in place first, so the revoke
+    // is durable although the registry file is not: the call succeeds and
+    // carries a warning.
+    let out = server
         .socket_call("revoke_device", json!({"device_id": k.public().to_string()}))
-        .expect_err("the revoke should report the failed save");
-    assert!(err.contains("revoked") && err.contains("could not be saved"), "{err}");
+        .expect("a durable revoke succeeds");
+    let warning = out["warning"].as_str().unwrap_or_default().to_string();
+    assert!(warning.contains("revoked.pending") && warning.contains("not be saved"), "{out}");
+    let pending = server.state_dir().unwrap().join("data/forgetty/revoked.pending");
+    assert!(std::fs::read_to_string(&pending).unwrap().contains(&k.public().to_string()));
 
     wait_for("the client to lose the connection", Duration::from_secs(2), || {
         !h.state().is_connected()
@@ -335,6 +341,37 @@ async fn a_revoke_that_cannot_be_saved_still_cuts_and_denies_the_device() {
     )
     .await;
     assert!(!matches!(again, Ok(Ok(_))), "a revoked device connected again");
+
+    // Neither the record nor the registry file can be written: the revoke
+    // still holds and cuts the device, and the caller is told it is not
+    // durable (the CLI exits 1 with this text).
+    let k2 = key();
+    let _ = std::fs::remove_dir_all(&file);
+    forgetty_client::pair_with_addr(
+        server.addr(),
+        &server.pair_secret(),
+        k2.clone(),
+        "revoke-undurable",
+        ClientKind::Cli,
+        &Default::default(),
+    )
+    .await
+    .unwrap();
+    let h2 = Client::connect(server.addr(), k2.clone(), info("revoke-undurable")).await.unwrap();
+    std::fs::remove_file(&file).expect("the registry file exists after pairing");
+    std::fs::create_dir(&file).unwrap();
+    std::fs::write(file.join("keep"), b"x").unwrap();
+    std::fs::remove_file(&pending).unwrap();
+    std::fs::create_dir(&pending).unwrap();
+    let err = server
+        .socket_call("revoke_device", json!({"device_id": k2.public().to_string()}))
+        .expect_err("an undurable revoke must say so");
+    assert!(err.contains("NOT durable"), "{err}");
+    wait_for("the second client to fail for good", Duration::from_secs(10), || {
+        matches!(h2.state(), ConnectionState::Failed(_))
+    })
+    .await;
+    h2.close().await;
     h.close().await;
     server.shutdown().await;
 }
