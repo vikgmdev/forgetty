@@ -367,7 +367,9 @@ known gap, section 12).
   So a client that drops after it kept pace resumes within about a second:
   - A stream whose peer reads (it took live bytes at 1 MiB/s or more since its
     last snapshot, or took a snapshot in under 500 ms that the log outran
-    before any live byte) gets a burst of 6 catch-ups at least 100 ms apart,
+    before any live byte; a cycle shorter than 2 ms shows no rate, so a peer
+    that never reads cannot claim this with one chunk its QUIC window still
+    had room for) gets a burst of 6 catch-ups at least 100 ms apart,
     then one per second. It never backs off.
   - A stream whose write made no progress for 2 s, or whose peer reads too
     slowly to show it reads, waits at least 1 s between catch-ups, with backoff

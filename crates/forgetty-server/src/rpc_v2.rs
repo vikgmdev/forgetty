@@ -111,6 +111,9 @@ const MAX_CATCHUP_BACKOFF: Duration = Duration::from_secs(10);
 /// took live bytes at [`KEEPING_PACE_RATE`] since its last snapshot, or the
 /// snapshot was late by the build time alone): no backoff, only this floor.
 const KEEPING_PACE_INTERVAL: Duration = Duration::from_millis(100);
+/// A cycle shorter than this is too short to read a rate from, so its bytes
+/// do not show that the peer keeps pace.
+const KEEPING_PACE_MIN_CYCLE: Duration = Duration::from_millis(2);
 /// Live bytes per second since its last snapshot that put a stream among the
 /// peers that read (a 100 KB/s link does not, a loaded localhost reader does).
 const KEEPING_PACE_RATE: f64 = 1024.0 * 1024.0;
@@ -1941,12 +1944,17 @@ async fn pane_stream(
                 // took longer than the ring holds at the program's speed).
                 // Only a peer that is slow itself waits and backs off.
                 let live = next.saturating_sub(header.start_offset);
-                let rate = live as f64 / cycle_start.elapsed().as_secs_f64().max(0.001);
+                let cycle = cycle_start.elapsed();
+                let rate = live as f64 / cycle.as_secs_f64().max(0.001);
+                // A cycle of a few microseconds says nothing about the peer's
+                // rate: a peer that never reads still takes one 128 KiB chunk
+                // into whatever room its QUIC window has left, and 128 KiB in
+                // 100 us looks like 1 GB/s.
                 let keeping_pace = !stalled
                     && if live == 0 {
                         snapshot_sent_in < SNAPSHOT_SEND_OK
                     } else {
-                        rate >= KEEPING_PACE_RATE
+                        cycle >= KEEPING_PACE_MIN_CYCLE && rate >= KEEPING_PACE_RATE
                     };
                 tokio::time::sleep(rpc.catchup_delay(conn.remote_id(), pane, keeping_pace)).await;
                 // Stop the old stream, so it queues nothing more for the peer.
@@ -2025,9 +2033,12 @@ struct Pace {
     tokens: f64,
     /// Tokens earn from here on. Time spent waiting out a delay earns none.
     refilled: tokio::time::Instant,
-    /// The last catch-up of this peer was a stall (or too slow to tell). An
-    /// attach that resumes after it waits out the backoff.
-    stalled: bool,
+    /// The last catch-up of this peer was a reading one: its stream took live
+    /// bytes at a good rate, so it has shown that it reads. The next attach
+    /// that resumes far behind may take the token path. Used up by that
+    /// resume, so a peer that attaches again and again without reading
+    /// between gets the backoff.
+    kept_pace: bool,
 }
 
 impl RpcV2 {
@@ -2040,13 +2051,26 @@ impl RpcV2 {
         Self::pace(&mut lock(&self.pacing), node, pane, keeping_pace)
     }
 
-    /// How long an attach that resumes far behind waits for its snapshot. It
-    /// goes through the token path like any reading peer, unless its last
-    /// catch-up was a stall: then the backoff stands.
+    /// How long an attach that resumes far behind waits for its snapshot. A
+    /// peer whose last catch-up showed that it reads (an honest client that
+    /// dropped and comes back) goes through the token path, once. Any other
+    /// resume, a peer with no such record or one that attaches again and again
+    /// without reading, waits out the backoff.
     fn resume_delay(&self, node: iroh::EndpointId, pane: PaneId) -> Duration {
-        let mut map = lock(&self.pacing);
-        let stalled = map.get(&(node, pane.0)).is_some_and(|p| p.stalled);
-        Self::pace(&mut map, node, pane, !stalled)
+        Self::resume(&mut lock(&self.pacing), node, pane)
+    }
+
+    fn resume(
+        map: &mut HashMap<(iroh::EndpointId, Uuid), Pace>,
+        node: iroh::EndpointId,
+        pane: PaneId,
+    ) -> Duration {
+        let reads = map.get(&(node, pane.0)).is_some_and(|p| p.kept_pace);
+        let wait = Self::pace(map, node, pane, reads);
+        if let Some(p) = map.get_mut(&(node, pane.0)) {
+            p.kept_pace = false;
+        }
+        wait
     }
 
     /// A pane that closed has no catch-ups left to pace.
@@ -2069,7 +2093,7 @@ impl RpcV2 {
             limiter: CatchupLimiter::default(),
             tokens: KEEPING_PACE_BURST,
             refilled: now,
-            stalled: false,
+            kept_pace: false,
         });
         let earned = now.saturating_duration_since(p.refilled).as_secs_f64() * KEEPING_PACE_PER_SEC;
         p.tokens = (p.tokens + earned).min(KEEPING_PACE_BURST);
@@ -2089,10 +2113,10 @@ impl RpcV2 {
             // up is over, or an honest client would wait 2 to 10 s for it.
             p.limiter.reset_backoff();
             p.limiter.mark(now + w);
-            p.stalled = false;
+            p.kept_pace = true;
             w
         } else {
-            p.stalled = true;
+            p.kept_pace = false;
             p.limiter.delay()
         };
         p.refilled = now + wait;
@@ -2397,9 +2421,7 @@ mod pacing_tests {
         // It drops and resumes: the attach goes through the token path, not
         // the backoff, and is served in 1.2 s at most.
         tokio::time::sleep(Duration::from_millis(300)).await;
-        let stalled = lock(&map).get(&(n, pane)).is_some_and(|p| p.stalled);
-        assert!(!stalled, "the last catch-up was a reading one");
-        let w = RpcV2::pace(&mut lock(&map), n, PaneId(pane), !stalled);
+        let w = RpcV2::resume(&mut lock(&map), n, PaneId(pane));
         assert!(w <= Duration::from_millis(1200), "resume waits {w:?}");
     }
 
@@ -2426,10 +2448,28 @@ mod pacing_tests {
             let w = delay(&map, n, pane, false);
             tokio::time::sleep(w).await;
         }
-        let stalled = lock(&map).get(&(n, pane)).is_some_and(|p| p.stalled);
-        assert!(stalled);
-        let w = RpcV2::pace(&mut lock(&map), n, PaneId(pane), !stalled);
+        let w = RpcV2::resume(&mut lock(&map), n, PaneId(pane));
         assert!(w >= Duration::from_secs(1), "{w:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_that_attaches_again_and_again_without_reading_gets_the_backoff() {
+        let map = pace_map();
+        let (n, pane) = (node(), Uuid::new_v4());
+        // It once showed that it reads: one resume goes the token path.
+        delay(&map, n, pane, true);
+        let first = RpcV2::resume(&mut lock(&map), n, PaneId(pane));
+        assert!(first <= Duration::from_secs(1), "{first:?}");
+        tokio::time::sleep(first).await;
+        // Then it only attaches, and never reads between: the backoff grows
+        // to the 10 s cap, whatever its pace.
+        let mut waits = Vec::new();
+        for _ in 0..6 {
+            let w = RpcV2::resume(&mut lock(&map), n, PaneId(pane));
+            waits.push(w.as_secs());
+            tokio::time::sleep(w.max(Duration::from_millis(1200))).await;
+        }
+        assert!(waits.iter().all(|w| *w >= 1) && *waits.last().unwrap() >= 8, "{waits:?}");
     }
 }
 

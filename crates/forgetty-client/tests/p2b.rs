@@ -799,10 +799,12 @@ async fn log_offsets_persist_across_rotation_and_restart() {
     fresh.shutdown().await;
 }
 
-/// Frames the server sees while it shuts down are not written. The client
-/// resends them to the new process, so nothing is lost or doubled.
+/// Input typed while the server restarts never reaches the new process: its
+/// programs are gone, so the client drops what it holds when it sees the new
+/// `boot_id` (PROTOCOL_V2 section 9) and counts it. Input typed once it is
+/// connected again arrives once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn input_typed_during_a_restart_arrives_once() {
+async fn input_typed_during_a_restart_is_dropped_and_input_after_it_arrives_once() {
     if !real_only() {
         return;
     }
@@ -821,8 +823,12 @@ async fn input_typed_during_a_restart_arrives_once() {
     let saved = server.stop_for_restart().await;
     h.send_input(pane, b"during ").await.unwrap();
     let fresh = TestServer::start_again(saved, port).await;
+    wait_for("the client to see the restart", Duration::from_secs(15), || {
+        h.state().is_connected() && h.lost_input_bytes() >= 7
+    })
+    .await;
     h.send_input(pane, b"after").await.unwrap();
-    while got.len() < 19 {
+    while got.len() < 12 {
         if let PaneItem::Data { bytes, .. } =
             tokio::time::timeout(Duration::from_secs(15), stream.next())
                 .await
@@ -832,7 +838,15 @@ async fn input_typed_during_a_restart_arrives_once() {
             got.extend_from_slice(&bytes);
         }
     }
-    assert_eq!(got, b"before during after");
+    // The echo has no more to say: "during" was dropped, not delayed.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    while let Ok(Some(item)) = tokio::time::timeout(Duration::from_millis(50), stream.next()).await
+    {
+        if let PaneItem::Data { bytes, .. } = item {
+            got.extend_from_slice(&bytes);
+        }
+    }
+    assert_eq!(got, b"before after");
     h.close().await;
     fresh.shutdown().await;
 }
