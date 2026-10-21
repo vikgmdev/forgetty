@@ -239,11 +239,18 @@ impl ShellSmoke {
                 }
             },
             Phase::RealPair => {
-                if shell.machines.len() == 2 && shell.machine.kind == MachineKind::Remote && !self.real.made_tabs && shell.layout.tab_count() == 0 && shell.pair.is_none() {
-                    // A fresh server has no tabs yet: open two.
+                if shell.machines.len() == 2
+                    && shell.machine.kind == MachineKind::Remote
+                    && !self.real.made_tabs
+                    && shell.pair.is_none()
+                    && matches!(shell.active_conn(), Some(ConnState::Connected))
+                    && self.real.t_pair.is_some_and(|t| t.elapsed() > Duration::from_millis(2500))
+                {
+                    // A fresh server has at most its default tab: top up to two.
                     self.real.made_tabs = true;
-                    shell.new_tab(cx);
-                    shell.new_tab(cx);
+                    for _ in shell.layout.tab_count()..2 {
+                        shell.new_tab(cx);
+                    }
                 }
                 let up = shell.machines.len() == 2
                     && shell.machine.kind == MachineKind::Remote
