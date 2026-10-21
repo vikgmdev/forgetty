@@ -678,6 +678,7 @@ mod tests {
         assert_eq!(joined.offset, 5, "node 2 joined node 1's build");
         assert!(took < Duration::from_millis(300), "node 2 waited {took:?}");
         first.await.unwrap().unwrap();
+        busy.await.unwrap().unwrap();
         for j in joins {
             j.await.unwrap().unwrap();
         }
