@@ -207,6 +207,7 @@ pub struct ShellSmoke {
     base_col: usize,
     max_reshaped_per_key: usize,
     others_reshaped: usize,
+    fed4: u64,
     old_dims: (usize, usize),
     resize_t0: Option<Instant>,
     thr_t0: Instant,
@@ -288,6 +289,7 @@ impl ShellSmoke {
             base_col: 0,
             max_reshaped_per_key: 0,
             others_reshaped: 0,
+            fed4: 0,
             old_dims: (0, 0),
             resize_t0: None,
             thr_t0: t,
@@ -843,6 +845,13 @@ impl ShellSmoke {
                 if self.sub == 0 {
                     shell.focus_pane(p0, window, cx);
                     let Some(s) = snap(shell, cx, p0) else { return };
+                    // Late shell repaints after a resize are not what this check measures:
+                    // wait until no pane has received output for the settle time.
+                    let fed: u64 = self.panes4.iter().filter_map(|p| shell.views.get(p)).map(|v| v.read(cx).fed_bytes).sum();
+                    if fed != self.fed4 {
+                        self.fed4 = fed;
+                        self.sub_t0 = Instant::now();
+                    }
                     // Let the focus change settle: dimming recolors (re-shapes) the other panes once.
                     if s.at_prompt() && shell.active_pane() == Some(p0) && self.sub_t0.elapsed() > Duration::from_millis(400) {
                         let (r, c) = (s.cr, s.cc);
@@ -875,6 +884,14 @@ impl ShellSmoke {
                     .filter_map(|p| shell.views.get(p))
                     .map(|v| v.read(cx).rows_reshaped_last)
                     .sum();
+                if others > 0 && self.others_reshaped == 0 {
+                    let per: Vec<(usize, u64)> = self.panes4[1..]
+                        .iter()
+                        .filter_map(|p| shell.views.get(p))
+                        .map(|v| (v.read(cx).rows_reshaped_last, v.read(cx).fed_bytes))
+                        .collect();
+                    record("keys4_unfocused_reshape", json!({"per_pane_rows_fed": per, "keys_done": self.lat_ms.len()}));
+                }
                 self.others_reshaped += others;
                 let (done, focused_reshaped, row, col) = {
                     let v = view.read(cx);
