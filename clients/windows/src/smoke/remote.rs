@@ -36,6 +36,7 @@ impl ServerProc {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()?;
+        super::SERVER_PID.store(child.id(), std::sync::atomic::Ordering::SeqCst);
         let lines = Arc::new(Mutex::new(Vec::new()));
         let out = child.stdout.take().expect("piped stdout");
         let l2 = lines.clone();
@@ -246,17 +247,15 @@ impl ShellSmoke {
                 let p = self.w3.panes[i];
                 let tok = format!("W3-ECHO-{i}");
                 if self.sub % 2 == 0 {
-                    // Make the pane visible and focused: its tab, then the pane.
-                    if let Some((w, t)) = shell.layout.find_pane(p) {
-                        let tab = shell.layout.workspaces[w].tabs[t].id;
-                        if shell.active_tab().map(|x| x.id) != Some(tab) {
-                            shell.focus_tab(tab, cx);
-                            return;
-                        }
+                    // A pane in the active tab is focused first. A pane in another tab
+                    // gets its input straight into the view: the test server does not
+                    // switch tabs, a real server does.
+                    let in_active = shell.active_tab().is_some_and(|t| t.pane_tree.contains(p));
+                    if in_active {
+                        shell.focus_pane(p, window, cx);
                     }
-                    shell.focus_pane(p, window, cx);
                     let Some(s) = snap(shell, cx, p) else { return };
-                    if shell.active_pane() == Some(p) && s.rows.iter().any(|r| r.contains("forgetty v2 test server")) {
+                    if (!in_active || shell.active_pane() == Some(p)) && s.rows.iter().any(|r| r.contains("forgetty v2 test server")) {
                         let Some(view) = shell.views.get(&p).cloned() else { return };
                         view.update(cx, |v, _| v.send_bytes(tok.as_bytes()));
                         self.sub += 1;
@@ -271,11 +270,7 @@ impl ShellSmoke {
             Phase::RKeys => {
                 let p0 = self.w3.panes[0];
                 if shell.active_tab().map(|t| t.pane_tree.contains(p0)) != Some(true) {
-                    if let Some((w, t)) = shell.layout.find_pane(p0) {
-                        let tab = shell.layout.workspaces[w].tabs[t].id;
-                        shell.focus_tab(tab, cx);
-                    }
-                    return;
+                    fail("remote key probe: the first remote pane is not in the active tab");
                 }
                 shell.focus_pane(p0, window, cx);
                 let Some(view) = shell.views.get(&p0).cloned() else { return };

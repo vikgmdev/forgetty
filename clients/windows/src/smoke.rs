@@ -38,6 +38,8 @@ const WIN_H: f32 = 680.0;
 
 static RESULTS: Mutex<Option<Map<String, Value>>> = Mutex::new(None);
 static PHASE: Mutex<&'static str> = Mutex::new("window");
+/// Process id of the W3 test server, so a failure can take it down too.
+pub static SERVER_PID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static SCREEN_DUMP: Mutex<String> = Mutex::new(String::new());
 
 pub fn record_pub(key: &str, value: Value) {
@@ -74,7 +76,28 @@ pub fn fail(msg: &str) -> ! {
     println!("{v}");
     let _ = std::io::stdout().flush();
     eprintln!("forgetty-win smoke FAILED: {msg} (phase {})", *PHASE.lock().unwrap());
-    std::process::exit(1);
+    hard_exit(1)
+}
+
+/// Leave without running any destructors. `std::process::exit` can hang in
+/// `ExitProcess` while the loader lock waits on a thread stuck in a driver or
+/// in the network stack.
+pub fn hard_exit(code: i32) -> ! {
+    // The test server holds a copy of our inherited stdout; until it dies the
+    // CI shell keeps waiting for the pipe to close.
+    #[cfg(windows)]
+    {
+        let pid = SERVER_PID.load(std::sync::atomic::Ordering::SeqCst);
+        if pid != 0 {
+            let _ = std::process::Command::new("taskkill").args(["/F", "/T", "/PID", &pid.to_string()]).output();
+        }
+    }
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+        let _ = TerminateProcess(GetCurrentProcess(), code as u32);
+    }
+    std::process::exit(code)
 }
 
 fn ms(d: Duration) -> f64 {
@@ -330,6 +353,31 @@ fn is_w1(p: Phase) -> bool {
 }
 
 impl ShellSmoke {
+    /// What the shell looks like when a phase sticks: the state a person would
+    /// check first.
+    fn diag(&self, shell: &AppShell, cx: &gpui::App) -> String {
+        let mut o = format!(
+            "sub={} active_tab={:?} active_pane={:?} machines={} conn={:?} tabs={} views={}\n",
+            self.sub,
+            shell.active_tab().map(|t| t.id),
+            shell.active_pane(),
+            shell.machines.len(),
+            shell.backend.connection(),
+            shell.layout.tab_count(),
+            shell.views.len()
+        );
+        for p in shell.views.keys() {
+            if let (Some(s), Some(v)) = (snap(shell, cx, *p), shell.views.get(p)) {
+                let v = v.read(cx);
+                o.push_str(&format!("pane {:?} resets={} fed={} cursor=({},{})\n", p, v.resets, v.fed_bytes, s.cr, s.cc));
+                for r in s.rows.iter().filter(|r| !r.trim().is_empty()).take(6) {
+                    o.push_str(&format!("  | {}\n", r.trim_end()));
+                }
+            }
+        }
+        o
+    }
+
     pub fn step(&mut self, shell: &mut AppShell, window: &mut Window, cx: &mut Context<AppShell>) {
         let now_t = Instant::now();
         if !self.first_frame_seen {
@@ -342,6 +390,9 @@ impl ShellSmoke {
         }
         self.frames_seen += 1;
         if self.phase_t0.elapsed() > PHASE_TIMEOUT {
+            if !is_w1(self.phase) {
+                *SCREEN_DUMP.lock().unwrap() = self.diag(shell, cx);
+            }
             fail(&format!("phase {} stuck for {:?}", self.phase.name(), PHASE_TIMEOUT));
         }
 
@@ -1149,7 +1200,7 @@ impl ShellSmoke {
         let _ = std::io::stdout().flush();
         self.local.shutdown_all();
         self.w3_kill_server();
-        std::process::exit(if all { 0 } else { 1 });
+        hard_exit(if all { 0 } else { 1 });
     }
 }
 
