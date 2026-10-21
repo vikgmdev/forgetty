@@ -208,12 +208,17 @@ impl SnapshotHub {
             drop(permit);
             {
                 let mut map = hub.lock();
-                match &built {
-                    Some(s) => {
-                        map.insert(pane, Slot::Ready(Instant::now(), s.clone()));
-                    }
-                    None => {
-                        map.remove(&pane);
+                // Only if the slot is still this build. A `forget` (the pane
+                // closed) or a newer build owns it otherwise, and this late
+                // result must not bring the slot back.
+                if matches!(map.get(&pane), Some(Slot::Building(x)) if Arc::ptr_eq(x, &b)) {
+                    match &built {
+                        Some(s) => {
+                            map.insert(pane, Slot::Ready(Instant::now(), s.clone()));
+                        }
+                        None => {
+                            map.remove(&pane);
+                        }
                     }
                 }
             }
@@ -281,6 +286,27 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(150)).await;
         get(hub.clone(), runs.clone()).await.unwrap();
         assert_eq!(runs.load(Ordering::SeqCst), 2, "old result rebuilt");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_build_that_ends_after_forget_leaves_no_slot() {
+        let hub = Arc::new(SnapshotHub::default());
+        let p = pane();
+        let waiter = {
+            let hub = hub.clone();
+            tokio::spawn(async move {
+                hub.get(p, || {
+                    std::thread::sleep(Duration::from_millis(150));
+                    Some(snap(3))
+                })
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        hub.forget(p);
+        // The waiter still gets its answer.
+        assert_eq!(waiter.await.unwrap().unwrap().offset, 3);
+        assert!(hub.lock().get(&p).is_none(), "the finished build re-inserted a slot");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
