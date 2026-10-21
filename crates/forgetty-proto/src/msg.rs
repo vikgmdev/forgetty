@@ -68,6 +68,9 @@ pub enum ClientKind {
     Cli,
     /// GTK client.
     Gtk,
+    /// A local socket client of the server itself (GTK, tools), listed by
+    /// `list_clients` and named as a size owner. Never sent in `Hello`.
+    Local,
 }
 
 impl ClientKind {
@@ -78,6 +81,7 @@ impl ClientKind {
             ClientKind::Android => "android",
             ClientKind::Cli => "cli",
             ClientKind::Gtk => "gtk",
+            ClientKind::Local => "local",
         }
     }
 }
@@ -274,6 +278,19 @@ pub enum ServerEvent {
         rows: u16,
         /// Columns.
         cols: u16,
+        /// Who owns the pane's size now. Absent when nobody does, and from
+        /// servers that do not send it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        size_owner: Option<SizeOwner>,
+    },
+    /// The pane's size owner changed (AD-020, cap `size_owner`). Sent before
+    /// the `PaneResized` the new owner's size causes.
+    SizeOwnerChanged {
+        /// Pane id.
+        #[serde(with = "uuid_str")]
+        pane_id: Uuid,
+        /// The new owner, `None` when the pane has none.
+        owner: Option<SizeOwner>,
     },
     /// Agent status change (P4, cap `status_events`).
     StatusChanged {
@@ -493,6 +510,19 @@ pub struct OkResult {
 pub struct SubscribeResult {
     /// Sequence number of the last event before the subscription.
     pub seq: u64,
+}
+
+/// The client that owns a pane's size (AD-020): the PTY has its size and its
+/// `auto` input reaches the PTY.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SizeOwner {
+    /// Client id.
+    #[serde(with = "uuid_str")]
+    pub client_id: Uuid,
+    /// Kind of client. `local` for a socket client of the server.
+    pub client_kind: ClientKind,
+    /// Device name.
+    pub client_name: String,
 }
 
 /// One element of the `list_clients` result.

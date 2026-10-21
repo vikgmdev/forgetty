@@ -768,6 +768,14 @@ impl TestServer {
         }
     }
 
+    /// Path of the real server's local socket.
+    pub fn socket_path(&self) -> PathBuf {
+        match &self.inner {
+            Inner::Real(r) => Real::socket(r.dir.path()),
+            Inner::Mock { .. } => panic!("mock server has no socket"),
+        }
+    }
+
     /// Call a method on the real server's local socket.
     pub fn socket_call(&self, method: &str, params: Value) -> Result<Value, String> {
         match &self.inner {

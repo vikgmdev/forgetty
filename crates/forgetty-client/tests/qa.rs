@@ -1201,3 +1201,196 @@ async fn capture_right_after_a_full_ring_answers() {
     }
     server.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------
+// AD-020: the size owner is visible to clients
+// ---------------------------------------------------------------------------
+
+/// A local socket client that stays attached: a `subscribe_layout` connection
+/// with its own id and name. Dropping it closes the connection.
+struct LocalClient {
+    _stream: std::os::unix::net::UnixStream,
+    id: Uuid,
+}
+
+impl LocalClient {
+    fn attach(server: &TestServer, name: &str) -> LocalClient {
+        use std::io::{BufRead, BufReader, Write};
+        let id = Uuid::new_v4();
+        let mut stream = std::os::unix::net::UnixStream::connect(server.socket_path()).unwrap();
+        let req = json!({"jsonrpc": "2.0", "id": 1, "method": "subscribe_layout",
+            "params": {"client_id": id.to_string(), "client_name": name}});
+        writeln!(stream, "{req}").unwrap();
+        let mut ack = String::new();
+        BufReader::new(stream.try_clone().unwrap()).read_line(&mut ack).unwrap();
+        assert!(ack.contains("\"ok\""), "subscribe_layout: {ack}");
+        LocalClient { _stream: stream, id }
+    }
+
+    fn resize(&self, server: &TestServer, pane: Uuid, rows: u16, cols: u16) {
+        server
+            .socket_call(
+                "resize_pane",
+                json!({"pane_id": pane.to_string(), "rows": rows, "cols": cols,
+                       "client_id": self.id.to_string()}),
+            )
+            .expect("resize_pane with client_id");
+    }
+}
+
+fn owner_of(server: &TestServer, pane: Uuid) -> serde_json::Value {
+    server.socket_call("get_pane_info", json!({"pane_id": pane.to_string()})).unwrap()["size_owner"]
+        .clone()
+}
+
+/// A remote client, `Android` named `phone`, with the events of the pane
+/// collected as short labels, in arrival order.
+async fn phone(
+    server: &TestServer,
+    pane: Uuid,
+) -> (ClientHandle, Uuid, Arc<std::sync::Mutex<Vec<String>>>) {
+    use forgetty_client::proto::ServerEvent;
+    use forgetty_client::EventItem;
+    let k = SecretKey::generate(&mut rand::rng());
+    server.authorize(k.public());
+    let id = Uuid::new_v4();
+    let info = ClientInfo::new(id, ClientKind::Android, "phone", "0.0.0");
+    let h = tokio::time::timeout(Duration::from_secs(10), Client::connect(server.addr(), k, info))
+        .await
+        .expect("connect timed out")
+        .expect("connect failed");
+    assert!(h.has_capability("size_owner"));
+    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut events = h.events().await.unwrap();
+    let sink = log.clone();
+    tokio::spawn(async move {
+        while let Some(item) = events.next().await {
+            let EventItem::Server { event, .. } = item else { continue };
+            let label = match event {
+                ServerEvent::SizeOwnerChanged { pane_id, owner } if pane_id == pane => format!(
+                    "owner:{}",
+                    owner.map_or("none".to_string(), |o| format!(
+                        "{}:{}",
+                        o.client_kind.as_str(),
+                        o.client_name
+                    ))
+                ),
+                ServerEvent::PaneResized { pane_id, rows, cols, size_owner } if pane_id == pane => {
+                    format!(
+                        "resized:{rows}x{cols}:{}",
+                        size_owner.map_or("none", |o| o.client_kind.as_str())
+                    )
+                }
+                _ => continue,
+            };
+            sink.lock().unwrap().push(label);
+        }
+    });
+    (h, id, log)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_local_socket_client_owns_a_pane_and_is_listed() {
+    use forgetty_client::proto::{from_value, ClientEntry};
+    if !real_only() {
+        return;
+    }
+    let server = TestServer::start(TestServerConfig::default()).await;
+    let pane = server.add_script_pane("exec cat");
+    assert!(owner_of(&server, pane).is_null(), "a pane nobody attached has no owner");
+
+    let gtk = LocalClient::attach(&server, "gtk-test");
+    gtk.resize(&server, pane, 30, 100);
+    assert_eq!(pane_dims(&server, pane), (30, 100));
+    let owner = owner_of(&server, pane);
+    assert_eq!(owner["client_id"], gtk.id.to_string());
+    assert_eq!(owner["client_kind"], "local");
+    assert_eq!(owner["client_name"], "gtk-test");
+
+    // A client_id that is not an attached streaming client is refused.
+    let err = server.socket_call(
+        "resize_pane",
+        json!({"pane_id": pane.to_string(), "rows": 10, "cols": 10,
+               "client_id": Uuid::new_v4().to_string()}),
+    );
+    assert!(err.is_err(), "an unknown client_id was accepted");
+    assert_eq!(pane_dims(&server, pane), (30, 100));
+
+    // A one-shot resize (the CLI) applies the size and takes no ownership.
+    server
+        .socket_call("resize_pane", json!({"pane_id": pane.to_string(), "rows": 25, "cols": 90}))
+        .unwrap();
+    assert_eq!(pane_dims(&server, pane), (25, 90));
+    assert_eq!(owner_of(&server, pane)["client_id"], gtk.id.to_string());
+
+    // `list_clients` over the v2 protocol shows the local client once.
+    let (h, _, _) = phone(&server, pane).await;
+    let list: Vec<ClientEntry> =
+        from_value(h.request("list_clients", Value::Nil).await.unwrap()).unwrap();
+    let local: Vec<_> = list.iter().filter(|c| c.client_kind == ClientKind::Local).collect();
+    assert_eq!(local.len(), 1, "list_clients: {list:?}");
+    assert_eq!((local[0].client_id, local[0].client_name.as_str()), (gtk.id, "gtk-test"));
+    assert!(list.iter().any(|c| c.client_kind == ClientKind::Android));
+
+    // The client leaves: the pane has no owner again.
+    drop(gtk);
+    wait_for("the owner to clear", || owner_of(&server, pane).is_null()).await;
+    h.close().await;
+    server.shutdown().await;
+}
+
+/// Remote owner, local takeover, handover on detach, and the order of the
+/// events: `SizeOwnerChanged` always comes before the `PaneResized` it causes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_size_owner_is_announced_before_its_size_and_handed_over() {
+    if !real_only() {
+        return;
+    }
+    let server = TestServer::start(TestServerConfig::default()).await;
+    let pane = server.add_script_pane("exec cat");
+    let (h, id, log) = phone(&server, pane).await;
+    let seen = |n: usize| log.lock().unwrap().len() >= n;
+
+    // The phone attaches first: it owns the pane. Its resize follows.
+    let _stream = h.attach_pane(pane).await.unwrap();
+    wait_for("phone as owner", || seen(1)).await;
+    h.resize(pane, 30, 100).await.unwrap();
+    wait_for("phone's size", || seen(2)).await;
+    let owner = owner_of(&server, pane);
+    assert_eq!(owner["client_id"], id.to_string());
+    assert_eq!(owner["client_kind"], "android");
+    assert_eq!(owner["client_name"], "phone");
+
+    // A local client resizes: it takes the pane.
+    let gtk = LocalClient::attach(&server, "gtk-test");
+    gtk.resize(&server, pane, 40, 120);
+    wait_for("local takeover", || seen(4)).await;
+    assert_eq!(owner_of(&server, pane)["client_kind"], "local");
+
+    // The local client goes away: the phone, still attached, gets the pane
+    // and its own size back.
+    drop(gtk);
+    wait_for("handover to the phone", || seen(6)).await;
+    assert_eq!(pane_dims(&server, pane), (30, 100));
+    assert_eq!(owner_of(&server, pane)["client_kind"], "android");
+
+    // The phone detaches: nobody owns the pane.
+    h.detach_pane(pane).await.unwrap();
+    wait_for("no owner", || seen(7)).await;
+    assert!(owner_of(&server, pane).is_null());
+
+    assert_eq!(
+        *log.lock().unwrap(),
+        [
+            "owner:android:phone",
+            "resized:30x100:android",
+            "owner:local:gtk-test",
+            "resized:40x120:local",
+            "owner:android:phone",
+            "resized:30x100:android",
+            "owner:none",
+        ]
+    );
+    h.close().await;
+    server.shutdown().await;
+}

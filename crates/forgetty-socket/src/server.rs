@@ -285,6 +285,30 @@ where
 /// the client writes are dropped unread (V2-003 SPEC §4.4).
 ///
 /// For all other methods: delegates synchronously to `handlers::dispatch`.
+/// The id and name a streaming connection registers under. A `client_id`
+/// param (a UUID) names the client across its connections; without one every
+/// connection is a client of its own. The name is clipped and cleaned: it
+/// reaches `list_clients` and logs.
+fn client_identity(
+    request: &crate::protocol::Request,
+    default_name: impl FnOnce() -> String,
+) -> (String, String) {
+    let id = request
+        .params
+        .get("client_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        .unwrap_or_else(uuid::Uuid::new_v4);
+    let name = request
+        .params
+        .get("client_name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.chars().filter(|c| !c.is_control()).take(64).collect::<String>())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(default_name);
+    (id.to_string(), name)
+}
+
 async fn handle_streaming_connection(
     stream: tokio::net::UnixStream,
     sm: Arc<SessionManager>,
@@ -395,11 +419,8 @@ async fn handle_streaming_connection(
             // ---------------------------------------------------------------
             let (mut rx, replay_bytes, _replay_hwm) = sm.subscribe_with_snapshot(pane_id);
             // AD-017: a streaming socket is an attached client until it closes.
-            let Ok(_client) = sm.clients().register(
-                uuid::Uuid::new_v4().to_string(),
-                "socket",
-                format!("subscribe_output {pane_id}"),
-            ) else {
+            let (cid, cname) = client_identity(&request, || format!("subscribe_output {pane_id}"));
+            let Ok(_client) = sm.clients().register(cid, "socket", cname) else {
                 let resp = Response::error(
                     request.id.clone(),
                     crate::protocol::SERVER_BUSY,
@@ -510,11 +531,8 @@ async fn handle_streaming_connection(
             // Reuse the same broadcast channel as subscribe_output; we filter
             // to layout variants in the loop below.
             let mut rx = sm.subscribe_output();
-            let Ok(_client) = sm.clients().register(
-                uuid::Uuid::new_v4().to_string(),
-                "socket",
-                "subscribe_layout".to_string(),
-            ) else {
+            let (cid, cname) = client_identity(&request, || "subscribe_layout".to_string());
+            let Ok(_client) = sm.clients().register(cid, "socket", cname) else {
                 let resp = Response::error(
                     request.id.clone(),
                     crate::protocol::SERVER_BUSY,

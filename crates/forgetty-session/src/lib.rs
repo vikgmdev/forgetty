@@ -33,6 +33,7 @@ pub mod osc;
 pub mod pane;
 pub mod pane_writer;
 pub mod pty_bridge;
+pub mod sizes;
 pub mod snapshot;
 pub mod status;
 pub mod workspace;
@@ -50,6 +51,7 @@ pub use manager::{
 pub use pane::{DuplicatedTab, NotificationInfo, PaneInfo, PaneOsc, PaneState};
 pub use pane_writer::{OnEnd, PaneWriter, QueueError, INPUT_QUEUE_BYTES};
 pub use pty_bridge::PtyBridge;
+pub use sizes::{SizeGovernor, SizeOwner};
 pub use status::{PaneStatus, StatusSnapshot};
 pub use workspace::{
     build_workspace_state, PaneTreeLayout, TabLayoutEntry, WorkspaceLayout, WorkspaceLayoutEntry,

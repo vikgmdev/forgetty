@@ -512,3 +512,23 @@ The following concepts are **explicitly rejected**. Do not reintroduce without a
 | "Multiple GTK windows attach to the same daemon simultaneously" | DAEMON_SYNC_ARCHITECTURE.md | Superseded by AD-001 (one daemon per window) in 2026-04-03. |
 | Old AD-007: "libghostty-vt is per-pane only" in the daemon | (This file, pre-2026-04-13) | Superseded by AD-007 (daemon has no VT) + AD-008 (VT lives in client). libghostty-vt is still per-pane, but only the client links it. |
 | Old AD-008: "GTK is a stateless renderer, no terminal semantics" | (This file, pre-2026-04-13) | Superseded by AD-008 (clients own terminal semantics). The M4-era intent was "GTK doesn't own layout state"; that part is still true. What changed: GTK owns VT parsing. |
+
+## AD-026: The size owner is visible to clients (amends AD-020 and AD-025)
+
+**Decision:**
+- `get_pane_info` and `PaneResized` carry `size_owner` (`{ client_id,
+  client_kind, client_name }` or none). `SizeOwnerChanged` (capability
+  `size_owner`) reports each change, before the `PaneResized` it causes.
+- The owner is the one AD-025 uses for `auto` input, so what clients see and
+  what the server enforces cannot differ.
+- A local socket client that names itself (`client_id`) is a client like any
+  other: it appears in `list_clients` as `local`, can own a pane, and hands it
+  over when it leaves. A resize with a `client_id` takes ownership. A one-shot
+  resize without one does not.
+- A client opens a pane and takes its size only when the pane has no owner.
+
+**Why:** the Android client letterboxed against a size it did not know the
+cause of, and took the size from a desktop window each time it opened a pane.
+It needs to know who owns the size to decide.
+
+**Decided:** 2026-10-21.

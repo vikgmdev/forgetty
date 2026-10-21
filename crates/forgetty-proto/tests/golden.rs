@@ -146,7 +146,7 @@ fn golden_ev_cwd() {
 #[test]
 fn golden_ev_resized() {
     golden::<ControlMsg>(
-        ControlMsg::Event { seq: 5, event: ServerEvent::PaneResized { pane_id: id(3), rows: 24, cols: 80 } },
+        ControlMsg::Event { seq: 5, event: ServerEvent::PaneResized { pane_id: id(3), rows: 24, cols: 80, size_owner: None } },
         "81a54576656e7482a373657105a56576656e7481ab50616e65526573697a656483a770616e655f6964d92430333033303330332d303330332d303330332d303330332d303330333033303330333033a4726f777318a4636f6c7350",
     );
 }
@@ -424,4 +424,85 @@ fn snapshot_header_roundtrips_and_a_plain_one_has_no_snapshot_field() {
     assert!(b.len() > a.len());
     assert_eq!(rmp_serde::from_slice::<PaneStreamHeader>(&a).unwrap(), plain);
     assert_eq!(rmp_serde::from_slice::<PaneStreamHeader>(&b).unwrap(), snap);
+}
+
+fn owner() -> SizeOwner {
+    SizeOwner { client_id: id(4), client_kind: ClientKind::Local, client_name: "gtk".into() }
+}
+
+#[test]
+fn golden_ev_resized_with_owner() {
+    golden::<ControlMsg>(
+        ControlMsg::Event {
+            seq: 5,
+            event: ServerEvent::PaneResized { pane_id: id(3), rows: 24, cols: 80, size_owner: Some(owner()) },
+        },
+        "81a54576656e7482a373657105a56576656e7481ab50616e65526573697a656484a770616e655f6964d92430333033303330332d303330332d303330332d303330332d303330333033303330333033a4726f777318a4636f6c7350aa73697a655f6f776e657283a9636c69656e745f6964d92430343034303430342d303430342d303430342d303430342d303430343034303430343034ab636c69656e745f6b696e64a56c6f63616cab636c69656e745f6e616d65a367746b",
+    );
+}
+
+#[test]
+fn golden_ev_size_owner_changed() {
+    golden::<ControlMsg>(
+        ControlMsg::Event {
+            seq: 6,
+            event: ServerEvent::SizeOwnerChanged { pane_id: id(3), owner: Some(owner()) },
+        },
+        "81a54576656e7482a373657106a56576656e7481b053697a654f776e65724368616e67656482a770616e655f6964d92430333033303330332d303330332d303330332d303330332d303330333033303330333033a56f776e657283a9636c69656e745f6964d92430343034303430342d303430342d303430342d303430342d303430343034303430343034ab636c69656e745f6b696e64a56c6f63616cab636c69656e745f6e616d65a367746b",
+    );
+    golden::<ControlMsg>(
+        ControlMsg::Event { seq: 7, event: ServerEvent::SizeOwnerChanged { pane_id: id(3), owner: None } },
+        "81a54576656e7482a373657107a56576656e7481b053697a654f776e65724368616e67656482a770616e655f6964d92430333033303330332d303330332d303330332d303330332d303330333033303330333033a56f776e6572c0",
+    );
+}
+
+/// An old client decodes `PaneResized` from the new server: the `size_owner`
+/// key is unknown to it and is ignored.
+#[test]
+fn an_old_decoder_ignores_size_owner_on_pane_resized() {
+    #[derive(Debug, PartialEq, serde::Deserialize)]
+    enum OldEvent {
+        PaneResized {
+            #[serde(with = "uuid_str")]
+            pane_id: Uuid,
+            rows: u16,
+            cols: u16,
+        },
+    }
+    #[derive(Debug, PartialEq, serde::Deserialize)]
+    enum OldMsg {
+        Event { seq: u64, event: OldEvent },
+    }
+    let new = ControlMsg::Event {
+        seq: 5,
+        event: ServerEvent::PaneResized {
+            pane_id: id(3),
+            rows: 24,
+            cols: 80,
+            size_owner: Some(owner()),
+        },
+    };
+    let old: OldMsg = decode_msg(&encode_msg(&new).unwrap()).unwrap();
+    assert_eq!(
+        old,
+        OldMsg::Event {
+            seq: 5,
+            event: OldEvent::PaneResized { pane_id: id(3), rows: 24, cols: 80 }
+        }
+    );
+    // And the other way: an old server's event decodes with no owner.
+    let bytes = unhex("81a54576656e7482a373657105a56576656e7481ab50616e65526573697a656483a770616e655f6964d92430333033303330332d303330332d303330332d303330332d303330333033303330333033a4726f777318a4636f6c7350");
+    let back: ControlMsg = decode_msg(&bytes).unwrap();
+    assert_eq!(
+        back,
+        ControlMsg::Event {
+            seq: 5,
+            event: ServerEvent::PaneResized {
+                pane_id: id(3),
+                rows: 24,
+                cols: 80,
+                size_owner: None
+            }
+        }
+    );
 }

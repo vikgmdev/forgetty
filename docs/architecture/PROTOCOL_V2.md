@@ -67,7 +67,8 @@ server then calls `finish()` on the stream and waits up to 2 s for the client to
 close, so the error frame is not lost. `Hello` is a plain struct, not a
 `ControlMsg`. Each side ignores capability strings it does not know. A feature is used
 only if both sides list its capability. Initial capability names:
-`resume`, `layout_events`, `status_events`, `capture`, `size_policy_latest`.
+`resume`, `layout_events`, `status_events`, `capture`, `size_policy_latest`,
+`snapshot_catchup`, `input_flags`, `size_owner`.
 
 ## 3a. Encoding rules
 
@@ -110,11 +111,12 @@ New methods:
 | `detach_pane` | `pane_id` | `{ ok }`. The server finishes that stream. |
 | `subscribe_events` | none | `{ seq }`. Events then flow on Control. |
 | `capture` (cap `capture`) | `pane_id, trim: bool, last_lines: Option<u32>` | `{ text }` (P4) |
-| `list_clients` | none | `[{ client_id, client_kind, client_name, connected_at }]` |
+| `list_clients` | none | `[{ client_id, client_kind, client_name, connected_at }]` (`client_kind` `local` for a local socket client, see section 6) |
 
 `ServerEvent` (all carry ids as strings):
 `LayoutChanged { layout }`, `PaneClosed { pane_id }`, `TitleChanged { pane_id, title }`,
-`CwdChanged { pane_id, cwd }`, `PaneResized { pane_id, rows, cols }`,
+`CwdChanged { pane_id, cwd }`, `PaneResized { pane_id, rows, cols, size_owner? }`,
+`SizeOwnerChanged { pane_id, owner }` (cap `size_owner`, see section 6),
 `StatusChanged { pane_id, status, message }` (P4, cap `status_events`),
 `Notification { pane_id, title, body }` (OSC 9/99/777, cap `status_events`),
 `PaneExited { pane_id, exit_code }` (the pane stays listed only if `remain_on_exit`),
@@ -219,6 +221,33 @@ The server keeps, per pane, the last size each attached client asked for with
 `resize_pane`, and the latest active client (last input frame or `focus_tab`
 for that pane). The PTY size is the latest active client's size. A change
 emits `PaneResized`. Clients render at the PTY size and letterbox.
+
+**Size owner (AD-020, AD-025).** One client owns each pane: the latest active
+client while it has a stream on the pane, otherwise the first client attached.
+A pane nobody has a stream on has no owner. The owner is visible:
+
+- `get_pane_info` has `size_owner`: `{ client_id, client_kind, client_name }` or
+  `null`.
+- `PaneResized` has the same `size_owner` field. The field is absent when there
+  is no owner, and an older decoder ignores it. It needs no capability.
+- `SizeOwnerChanged { pane_id, owner }` (capability `size_owner`) is sent when
+  the owner changes, `owner` is `null` when the pane has none. It comes before
+  the `PaneResized` that the new owner's size causes. Events of one pane arrive
+  in the order the server made them.
+- A client that opens a pane takes the size (`resize_pane`) only when
+  `size_owner` is `null`. Otherwise it renders at the PTY size and letterboxes.
+
+A **local socket client** (the GTK app, tools) counts as a client. It names
+itself by passing `client_id` (a UUID) and `client_name` to `subscribe_layout`
+or `subscribe_output`. That connection is an attached client until it closes,
+and `list_clients` returns it with `client_kind: "local"` (one entry per
+`client_id`). Its `resize_pane` calls pass the same `client_id`. A resize with a
+`client_id` makes that client the owner at once, because a user at a local
+window is the active user. A `client_id` that is not an attached streaming
+client is an error (`invalid_params`). A one-shot `resize_pane` without
+`client_id` (the CLI) applies the size and does not change the owner. When the
+last connection of a local client closes, the owner passes on like any owner
+that leaves: to the attached client with the most recent user input.
 
 ## 7. Pairing (`forgetty/pair/2`, AD-021)
 

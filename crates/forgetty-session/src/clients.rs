@@ -36,7 +36,11 @@ struct State {
 struct Inner {
     next: AtomicU64,
     state: Mutex<State>,
+    /// Called with the client id when its last registration is dropped.
+    leave_hook: Mutex<Option<LeaveHook>>,
 }
+
+type LeaveHook = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// The server is shutting down and takes no new attachments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,6 +97,17 @@ impl ClientRegistry {
         self.inner.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Call `hook` with the client id each time the last registration of a
+    /// client id is dropped. The hook runs outside the registry lock.
+    pub fn set_leave_hook(&self, hook: impl Fn(&str) + Send + Sync + 'static) {
+        *self.inner.leave_hook.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(hook));
+    }
+
+    /// The oldest registration with this client id.
+    pub fn find(&self, client_id: &str) -> Option<ClientInfo> {
+        self.state().clients.values().find(|c| c.client_id == client_id).cloned()
+    }
+
     /// Snapshot of all attached clients, oldest first.
     pub fn list(&self) -> Vec<ClientInfo> {
         self.state().clients.values().cloned().collect()
@@ -145,7 +160,18 @@ pub struct ClientGuard {
 
 impl Drop for ClientGuard {
     fn drop(&mut self) {
-        self.registry.state().clients.remove(&self.key);
+        let left = {
+            let mut st = self.registry.state();
+            let removed = st.clients.remove(&self.key);
+            removed.filter(|c| !st.clients.values().any(|o| o.client_id == c.client_id))
+        };
+        if let Some(info) = left {
+            let hook =
+                self.registry.inner.leave_hook.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if let Some(hook) = hook {
+                hook(&info.client_id);
+            }
+        }
     }
 }
 
@@ -165,6 +191,27 @@ mod tests {
         assert_eq!(reg.count(), 1);
         drop(b);
         assert_eq!(reg.count(), 0);
+    }
+
+    /// The leave hook runs when the last registration of a client id goes, not
+    /// before, and `find` sees the client until then.
+    #[test]
+    fn leave_hook_fires_for_the_last_registration_of_an_id() {
+        use std::sync::Mutex;
+        let reg = ClientRegistry::new();
+        let left = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = left.clone();
+        reg.set_leave_hook(move |id| sink.lock().unwrap().push(id.to_string()));
+        let a1 = reg.register("a", "socket", "layout").unwrap();
+        let a2 = reg.register("a", "socket", "output").unwrap();
+        let b = reg.register("b", "socket", "other").unwrap();
+        assert_eq!(reg.find("a").unwrap().client_name, "layout");
+        drop(a1);
+        assert!(left.lock().unwrap().is_empty(), "a is still attached");
+        drop(b);
+        drop(a2);
+        assert_eq!(*left.lock().unwrap(), ["b", "a"]);
+        assert!(reg.find("a").is_none());
     }
 
     /// P1-QA item 7: `stop --if-idle` and an attach cannot both win.

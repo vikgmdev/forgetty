@@ -1175,6 +1175,11 @@ pub(crate) fn handle_get_pane_info(request: &Request, sm: &SessionManager) -> Re
             "exit_code": info.exit_code,
             "status": status_json(&info),
             "last_notification": notification_json(&info),
+            "size_owner": sm.size_owner(id).map(|o| serde_json::json!({
+                "client_id": o.client_id.to_string(),
+                "client_kind": o.client_kind,
+                "client_name": o.client_name,
+            })),
         }),
     )
 }
@@ -1216,7 +1221,30 @@ pub(crate) fn handle_resize_pane(request: &Request, sm: &SessionManager) -> Resp
 
     let size = PtySize { rows, cols, pixel_width: 0, pixel_height: 0 };
 
-    match sm.resize_pane(id, size) {
+    // AD-020: a registered streaming client names itself with `client_id` and
+    // may become the pane's size owner. A one-shot call has none: the size
+    // applies and ownership stays as it is.
+    let client = match request.params.get("client_id") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => {
+            let raw = v.as_str().unwrap_or_default();
+            let known = Uuid::parse_str(raw)
+                .ok()
+                .filter(|_| sm.clients().find(raw).is_some_and(|c| c.client_kind == "socket"));
+            match known {
+                Some(u) => Some(u),
+                None => {
+                    return Response::error(
+                        request.id.clone(),
+                        protocol::INVALID_PARAMS,
+                        "client_id is not an attached streaming client".to_string(),
+                    )
+                }
+            }
+        }
+    };
+
+    match sm.resize_pane_for(client, id, size) {
         Ok(()) => Response::success(request.id.clone(), serde_json::json!({ "ok": true })),
         Err(e) => Response::error(
             request.id.clone(),

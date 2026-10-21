@@ -740,7 +740,13 @@ fn handle_request(
             let seq = state.event_seq.fetch_add(1, Ordering::SeqCst) + 1;
             let _ = state.events.send((
                 seq,
-                ServerEvent::PaneResized { pane_id: p.pane_id, rows: p.rows, cols: p.cols },
+                ServerEvent::PaneResized {
+                    pane_id: p.pane_id,
+                    rows: p.rows,
+                    cols: p.cols,
+                    // The mock keeps no size owner (the real server does).
+                    size_owner: None,
+                },
             ));
             to_value(&OkResult { ok: true }).map_err(bad)
         }

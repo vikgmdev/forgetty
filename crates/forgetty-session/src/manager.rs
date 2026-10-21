@@ -83,6 +83,8 @@ const CLOSE_GRACE: std::time::Duration = std::time::Duration::from_millis(300);
 
 struct SessionManagerInner {
     panes: HashMap<PaneId, PaneState>,
+    /// The size owner of each pane that has one (AD-020).
+    size_owners: HashMap<PaneId, crate::sizes::SizeOwner>,
     /// Tracks insertion order so `list_panes()` returns panes in creation order.
     /// `HashMap` iteration is non-deterministic; preserving order ensures tabs
     /// are restored in the same visual position after a window reopen.
@@ -143,6 +145,8 @@ pub struct SessionManager {
     inner: Arc<Mutex<SessionManagerInner>>,
     /// Attached clients (AD-017). Shared by every clone.
     clients: crate::clients::ClientRegistry,
+    /// The size policy local clients go through (AD-020). Shared by every clone.
+    governor: Arc<std::sync::OnceLock<Arc<dyn crate::sizes::SizeGovernor>>>,
 }
 
 /// Largest rows or columns a pane takes. A client can ask for any `u16`; the
@@ -178,6 +182,7 @@ impl SessionManager {
         let event_tx = EventBus::new();
         Self {
             clients: crate::clients::ClientRegistry::new(),
+            governor: Arc::new(std::sync::OnceLock::new()),
             inner: Arc::new(Mutex::new(SessionManagerInner {
                 panes: HashMap::new(),
                 pane_order: Vec::new(),
@@ -191,6 +196,7 @@ impl SessionManager {
                 exit_history: std::collections::VecDeque::new(),
                 osc_scanning: true,
                 shutting_down: false,
+                size_owners: HashMap::new(),
             })),
         }
     }
@@ -227,6 +233,50 @@ impl SessionManager {
     /// Registry of attached clients (iroh connections and streaming sockets).
     pub fn clients(&self) -> &crate::clients::ClientRegistry {
         &self.clients
+    }
+
+    /// Install the size policy. Local clients go through it from now on. Only
+    /// the first call has an effect.
+    pub fn set_size_governor(&self, governor: Arc<dyn crate::sizes::SizeGovernor>) {
+        let _ = self.governor.set(governor);
+    }
+
+    /// The size owner of `id` (AD-020).
+    pub fn size_owner(&self, id: PaneId) -> Option<crate::sizes::SizeOwner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).size_owners.get(&id).cloned()
+    }
+
+    /// Record the size owner of `id`. Sends `SizeOwnerChanged` when it
+    /// differs from the recorded one. Returns whether it changed.
+    pub fn set_size_owner(&self, id: PaneId, owner: Option<crate::sizes::SizeOwner>) -> bool {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.size_owners.get(&id) == owner.as_ref() {
+            return false;
+        }
+        match &owner {
+            Some(o) => inner.size_owners.insert(id, o.clone()),
+            None => inner.size_owners.remove(&id),
+        };
+        let _ = inner.event_tx.send(SessionEvent::SizeOwnerChanged { pane_id: id, owner });
+        true
+    }
+
+    /// Drop the owner record of a pane that is gone. No event.
+    pub fn forget_size_owner(&self, id: PaneId) {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).size_owners.remove(&id);
+    }
+
+    /// A resize asked for by a local client. With a `client` the size policy
+    /// decides (the client may become the owner); without one the size is
+    /// applied and ownership stays as it is.
+    pub fn resize_pane_for(&self, client: Option<Uuid>, id: PaneId, size: PtySize) -> Result<()> {
+        match (client, self.governor.get()) {
+            (Some(client), Some(governor)) => {
+                governor.local_resize(client, id, size);
+                Ok(())
+            }
+            _ => self.resize_pane(id, size),
+        }
     }
 
     /// Configure byte-log sizes for subsequently-created panes (V2-007).
@@ -1810,10 +1860,12 @@ impl SessionManager {
         pane.rows = size.rows;
         pane.cols = size.cols;
         if changed {
+            let size_owner = inner.size_owners.get(&id).cloned();
             let _ = inner.event_tx.send(SessionEvent::PaneResized {
                 pane_id: id,
                 rows: size.rows,
                 cols: size.cols,
+                size_owner,
             });
         }
         Ok(())

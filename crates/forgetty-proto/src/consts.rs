@@ -107,6 +107,9 @@ pub mod cap {
     pub const SIZE_POLICY_LATEST: &str = "size_policy_latest";
     /// A slow pane stream catches up by a VT snapshot (AD-023).
     pub const SNAPSHOT_CATCHUP: &str = "snapshot_catchup";
+    /// `SizeOwnerChanged` events (AD-020). `size_owner` fields need no
+    /// capability.
+    pub const SIZE_OWNER: &str = "size_owner";
     /// Input frames carry a flags byte after `seq` (AD-025).
     pub const INPUT_FLAGS: &str = "input_flags";
 }

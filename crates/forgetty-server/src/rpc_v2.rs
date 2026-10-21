@@ -36,9 +36,10 @@ use forgetty_proto::{
 use forgetty_pty::PtySize;
 use forgetty_session::{
     read_disk, InputOutcome, LogPlan, LogShared, PaneTreeLayout, SessionEvent, SessionManager,
+    SizeGovernor, SizeOwner,
 };
 use forgetty_socket::protocol::{self, methods, Request};
-use forgetty_sync::registry::{iso8601_now, DeviceRegistry};
+use forgetty_sync::registry::{iso8601_from_secs, iso8601_now, DeviceRegistry};
 use forgetty_sync::SyncEndpoint;
 use iroh::endpoint::Connection;
 use tokio::sync::{broadcast, mpsc, watch};
@@ -145,7 +146,7 @@ const KEEPING_PACE_RATE: f64 = 1024.0 * 1024.0;
 const SNAPSHOT_SEND_OK: Duration = Duration::from_millis(500);
 
 /// Capabilities the server offers.
-pub const SERVER_CAPS: [&str; 7] = [
+pub const SERVER_CAPS: [&str; 8] = [
     cap::RESUME,
     cap::LAYOUT_EVENTS,
     cap::STATUS_EVENTS,
@@ -153,6 +154,7 @@ pub const SERVER_CAPS: [&str; 7] = [
     cap::SIZE_POLICY_LATEST,
     cap::SNAPSHOT_CATCHUP,
     cap::INPUT_FLAGS,
+    cap::SIZE_OWNER,
 ];
 
 /// Methods a v2 client may call through the shared socket dispatch table.
@@ -276,12 +278,17 @@ impl PaneSizes {
     /// May `client`'s `auto` input reach the PTY? Only the owner's may. A
     /// pane without an owner takes its first attached client as owner.
     fn auto_allowed(&self, client: Uuid) -> bool {
+        self.owner() == Some(client)
+    }
+
+    /// The size owner. The latest active client owns the pane while it has a
+    /// stream on it. One that does not (it focused a tab it never attached)
+    /// hands the pane to the first attached client. `None` when nobody has a
+    /// stream.
+    fn owner(&self) -> Option<Uuid> {
         match self.active {
-            // An owner counts only while it has a stream on the pane. One
-            // that does not (it focused a tab it never attached) hands the
-            // answer to the first attached client.
-            Some(owner) if self.attached.contains(&owner) => owner == client,
-            _ => self.attached.first() == Some(&client),
+            Some(owner) if self.attached.contains(&owner) => Some(owner),
+            _ => self.attached.first().copied(),
         }
     }
 }
@@ -398,6 +405,14 @@ impl RpcV2 {
             },
         });
         rpc.load_inputs();
+        // Local socket clients take part in the size policy (AD-020).
+        let governor = Arc::new(LocalSizes(Arc::downgrade(&rpc)));
+        rpc.sm.set_size_governor(governor.clone());
+        rpc.sm.clients().set_leave_hook(move |id| {
+            if let Ok(id) = Uuid::parse_str(id) {
+                governor.local_left(id);
+            }
+        });
         tokio::spawn(event_pump(rpc.clone()));
         let saver = rpc.clone();
         forgetty_socket::add_shutdown_hook(Box::new(move || saver.save_inputs()));
@@ -745,16 +760,7 @@ impl RpcV2 {
         };
         self.emit(ServerEvent::ClientDisconnected { client_id: hello.client_id });
         // Sizes asked for by a client that left no longer count.
-        let handed_over: Vec<(Uuid, (u16, u16))> = {
-            let mut sizes = lock(&self.sizes);
-            sizes
-                .iter_mut()
-                .filter_map(|(pane, ps)| ps.leave(hello.client_id, true).map(|sz| (*pane, sz)))
-                .collect()
-        };
-        for (pane, (rows, cols)) in handed_over {
-            self.apply_size(pane, rows, cols);
-        }
+        self.forget_client_sizes(hello.client_id);
         // Input `seq` state outlives the client by 10 minutes (section 5). One
         // deadline per departure, not a poll.
         let rpc = self.clone();
@@ -979,6 +985,7 @@ impl RpcV2 {
                 None
             }
         };
+        self.publish_owner(pane);
         if let Some((rows, cols)) = apply {
             self.apply_size(pane, rows, cols);
         }
@@ -987,6 +994,7 @@ impl RpcV2 {
     /// `client` detached its stream from `pane` and stays connected.
     fn note_detached(&self, client: Uuid, pane: Uuid) {
         let apply = lock(&self.sizes).get_mut(&pane).and_then(|ps| ps.leave(client, false));
+        self.publish_owner(pane);
         if let Some((rows, cols)) = apply {
             self.apply_size(pane, rows, cols);
         }
@@ -1019,6 +1027,8 @@ impl RpcV2 {
             ps.active = Some(client);
             ps.by_client.get(&client).copied()
         };
+        // The owner is announced before the size it causes.
+        self.publish_owner(pane);
         if let Some((rows, cols)) = apply {
             self.apply_size(pane, rows, cols);
         }
@@ -1050,9 +1060,83 @@ impl RpcV2 {
         } else {
             true
         };
+        if policy {
+            self.publish_owner(p.pane_id);
+        }
         if apply {
             self.apply_size(p.pane_id, p.rows, p.cols);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Size owner (AD-020)
+    // -----------------------------------------------------------------------
+
+    /// What clients are told about `client` as a size owner: a remote client
+    /// with its device kind, a local socket client as `local`.
+    fn size_owner_info(&self, client: Uuid) -> Option<SizeOwner> {
+        if let Some(r) = lock(&self.clients).get(&client) {
+            return Some(SizeOwner {
+                client_id: client,
+                client_kind: r.kind.as_str().to_string(),
+                client_name: r.name.clone(),
+            });
+        }
+        let info = self.sm.clients().find(&client.to_string())?;
+        (info.client_kind == "socket").then(|| SizeOwner {
+            client_id: client,
+            client_kind: ClientKind::Local.as_str().to_string(),
+            client_name: info.client_name,
+        })
+    }
+
+    /// Tell the session manager who owns `pane` now. It sends
+    /// `SizeOwnerChanged` when that changed. Call it before the resize the
+    /// owner's size causes, so the events arrive in that order.
+    fn publish_owner(&self, pane: Uuid) {
+        let owner = lock(&self.sizes).get(&pane).and_then(|ps| ps.owner());
+        let info = owner.and_then(|c| self.size_owner_info(c));
+        self.sm.set_size_owner(PaneId(pane), info);
+    }
+
+    /// A client left the server: its sizes no longer count and the panes it
+    /// owned go to the attached client that typed last.
+    fn forget_client_sizes(&self, client: Uuid) {
+        let (panes, handed_over) = {
+            let mut sizes = lock(&self.sizes);
+            let handed: Vec<(Uuid, (u16, u16))> = sizes
+                .iter_mut()
+                .filter_map(|(pane, ps)| ps.leave(client, true).map(|sz| (*pane, sz)))
+                .collect();
+            (sizes.keys().copied().collect::<Vec<Uuid>>(), handed)
+        };
+        for pane in panes {
+            self.publish_owner(pane);
+        }
+        for (pane, (rows, cols)) in handed_over {
+            self.apply_size(pane, rows, cols);
+        }
+    }
+
+    /// A registered local client resizes `pane`. A user at a local window is
+    /// the active user: the client takes the pane's size and ownership.
+    fn local_resize(&self, client: Uuid, pane: Uuid, rows: u16, cols: u16) {
+        let (rows, cols) =
+            (forgetty_session::clamp_pane_dim(rows), forgetty_session::clamp_pane_dim(cols));
+        // A remote client already uses this id: no ownership, the size applies.
+        if !lock(&self.clients).contains_key(&client) {
+            {
+                let mut sizes = lock(&self.sizes);
+                let ps = sizes.entry(pane).or_default();
+                if !ps.attached.contains(&client) {
+                    ps.attached.push(client);
+                }
+                ps.by_client.insert(client, (rows, cols));
+                ps.active = Some(client);
+            }
+            self.publish_owner(pane);
+        }
+        self.apply_size(pane, rows, cols);
     }
 
     // -----------------------------------------------------------------------
@@ -1071,6 +1155,20 @@ impl RpcV2 {
                 connected_at: r.connected_at.clone(),
             })
             .collect();
+        // Local socket clients that gave themselves an id (the streaming
+        // connections of one client share it, so it shows once).
+        for c in self.sm.clients().list() {
+            let Ok(id) = Uuid::parse_str(&c.client_id) else { continue };
+            if c.client_kind != "socket" || entries.iter().any(|e| e.client_id == id) {
+                continue;
+            }
+            entries.push(ClientEntry {
+                client_id: id,
+                client_kind: ClientKind::Local,
+                client_name: c.client_name,
+                connected_at: iso8601_from_secs(c.connected_at),
+            });
+        }
         entries.sort_by(|a, b| {
             a.connected_at.cmp(&b.connected_at).then(a.client_id.cmp(&b.client_id))
         });
@@ -1268,6 +1366,43 @@ async fn event_pump(rpc: Arc<RpcV2>) {
     }
 }
 
+/// The size policy for local socket clients. Holds the server weakly: the
+/// session manager outlives nothing it needs.
+struct LocalSizes(std::sync::Weak<RpcV2>);
+
+impl SizeGovernor for LocalSizes {
+    fn local_resize(&self, client: Uuid, pane: PaneId, size: PtySize) {
+        if let Some(rpc) = self.0.upgrade() {
+            rpc.local_resize(client, pane.0, size.rows, size.cols);
+        }
+    }
+
+    fn local_left(&self, client: Uuid) {
+        if let Some(rpc) = self.0.upgrade() {
+            // A remote client with this id is not a local one.
+            if !lock(&rpc.clients).contains_key(&client) {
+                rpc.forget_client_sizes(client);
+            }
+        }
+    }
+}
+
+/// The wire form of a size owner.
+fn wire_owner(o: &SizeOwner) -> forgetty_proto::SizeOwner {
+    let client_kind = match o.client_kind.as_str() {
+        "windows" => ClientKind::Windows,
+        "android" => ClientKind::Android,
+        "cli" => ClientKind::Cli,
+        "gtk" => ClientKind::Gtk,
+        _ => ClientKind::Local,
+    };
+    forgetty_proto::SizeOwner {
+        client_id: o.client_id,
+        client_kind,
+        client_name: o.client_name.clone(),
+    }
+}
+
 fn pump_event(rpc: &RpcV2, ev: SessionEvent, layout_dirty: &mut bool) {
     match ev {
         SessionEvent::TitleChanged { pane_id, title } => {
@@ -1293,11 +1428,23 @@ fn pump_event(rpc: &RpcV2, ev: SessionEvent, layout_dirty: &mut bool) {
         SessionEvent::PaneExited { pane_id, exit_code } => {
             rpc.emit(ServerEvent::PaneExited { pane_id: pane_id.0, exit_code })
         }
-        SessionEvent::PaneResized { pane_id, rows, cols } => {
-            rpc.emit(ServerEvent::PaneResized { pane_id: pane_id.0, rows, cols })
+        SessionEvent::PaneResized { pane_id, rows, cols, size_owner } => {
+            rpc.emit(ServerEvent::PaneResized {
+                pane_id: pane_id.0,
+                rows,
+                cols,
+                size_owner: size_owner.as_ref().map(wire_owner),
+            })
+        }
+        SessionEvent::SizeOwnerChanged { pane_id, owner } => {
+            rpc.emit(ServerEvent::SizeOwnerChanged {
+                pane_id: pane_id.0,
+                owner: owner.as_ref().map(wire_owner),
+            })
         }
         SessionEvent::PaneClosed { pane_id } => {
             lock(&rpc.sizes).remove(&pane_id.0);
+            rpc.sm.forget_size_owner(pane_id);
             RpcV2::forget_pane_pacing(&mut lock(&rpc.pacing), pane_id);
             rpc.snapshots.forget(pane_id);
             rpc.emit(ServerEvent::PaneClosed { pane_id: pane_id.0 });
@@ -1569,6 +1716,7 @@ impl Session {
     fn event_allowed(&self, event: &ServerEvent) -> bool {
         match event {
             ServerEvent::LayoutChanged { .. } => self.has(cap::LAYOUT_EVENTS),
+            ServerEvent::SizeOwnerChanged { .. } => self.has(cap::SIZE_OWNER),
             ServerEvent::StatusChanged { .. }
             | ServerEvent::Notification { .. }
             | ServerEvent::PaneExited { .. } => self.has(cap::STATUS_EVENTS),
@@ -2611,5 +2759,27 @@ mod owner_tests {
         ps.leave(b, false);
         ps.leave(c, false);
         assert_eq!(ps.active, None);
+    }
+
+    #[test]
+    fn the_reported_owner_is_the_one_whose_auto_input_counts() {
+        let (a, b, ghost) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let mut ps = PaneSizes::default();
+        assert_eq!(ps.owner(), None, "a pane nobody attached has no owner");
+        ps.attached = vec![a, b];
+        assert_eq!(ps.owner(), Some(a), "the first attached client, until someone is active");
+        ps.active = Some(b);
+        assert_eq!(ps.owner(), Some(b));
+        ps.active = Some(ghost);
+        assert_eq!(ps.owner(), Some(a), "an owner without a stream here is no owner");
+        for c in [a, b] {
+            assert_eq!(ps.owner() == Some(c), ps.auto_allowed(c));
+        }
+        // The owner detaches: the other attached client owns the pane.
+        ps.active = Some(a);
+        ps.leave(a, false);
+        assert_eq!(ps.owner(), Some(b));
+        ps.leave(b, false);
+        assert_eq!(ps.owner(), None);
     }
 }
