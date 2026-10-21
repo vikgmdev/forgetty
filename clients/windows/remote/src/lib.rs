@@ -10,4 +10,4 @@ mod source;
 pub mod store;
 
 pub use backend::{map_conn, map_err, RemoteBackend, RemoteParams};
-pub use source::RemotePaneSource;
+pub use source::{snapshot_marker, RemotePaneSource, SNAPSHOT_MARKER};

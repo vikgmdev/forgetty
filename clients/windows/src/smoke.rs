@@ -148,6 +148,7 @@ enum Phase {
     RKill,
     RRestart,
     RToast,
+    RServer,
 }
 
 impl Phase {
@@ -185,6 +186,7 @@ impl Phase {
             Phase::RKill => "w3-kill-server",
             Phase::RRestart => "w3-restart-server",
             Phase::RToast => "w3-toasts",
+            Phase::RServer => "w4-server-ops",
         }
     }
 }
@@ -1138,7 +1140,8 @@ impl ShellSmoke {
                     }
                     _ => {
                         let title = shell.active_tab().map(|t| shell.tab_title(t));
-                        if shell.rename.is_none() && title.as_deref() == Some("abc") {
+                        let labeled = shell.active_tab().is_some_and(|t| t.label == "abc");
+                        if shell.rename.is_none() && title.as_deref() == Some("abc") && labeled {
                             check("tab_rename", true);
                             self.goto(Phase::RSetup);
                         } else if self.sub_t0.elapsed() > Duration::from_secs(5) {
@@ -1149,7 +1152,7 @@ impl ShellSmoke {
                     }
                 }
             }
-            Phase::RSetup | Phase::RPair | Phase::REcho | Phase::RKeys | Phase::RKill | Phase::RRestart | Phase::RToast => {
+            Phase::RSetup | Phase::RPair | Phase::REcho | Phase::RKeys | Phase::RKill | Phase::RRestart | Phase::RToast | Phase::RServer => {
                 self.w3_step(shell, window, cx, now_t)
             }
             _ => {}

@@ -36,6 +36,12 @@ pub struct Tab {
     pub pane_tree: PaneTree,
     #[serde(default)]
     pub active_pane_id: Option<PaneId>,
+    /// User label (`set_label`). Empty when none.
+    #[serde(default)]
+    pub label: String,
+    /// Pane labels of this tab by pane id (`set_label`).
+    #[serde(default)]
+    pub pane_labels: std::collections::HashMap<String, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -96,6 +102,11 @@ impl Layout {
 }
 
 impl Tab {
+    /// The label of `pane`, if it has one.
+    pub fn pane_label(&self, pane: PaneId) -> Option<&str> {
+        self.pane_labels.get(&pane.0.to_string()).map(String::as_str).filter(|l| !l.is_empty())
+    }
+
     /// Focused pane: the stored one if it is still a leaf, else the first leaf.
     pub fn focused_pane(&self) -> PaneId {
         match self.active_pane_id {

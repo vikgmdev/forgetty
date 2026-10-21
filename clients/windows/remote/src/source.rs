@@ -20,6 +20,17 @@ const EVENT_BUFFER: usize = 256;
 /// Input bytes joined into one `send_input` call.
 const INPUT_COALESCE: usize = 16 * 1024;
 
+/// Text of the scrollback line above a snapshot.
+pub const SNAPSHOT_MARKER: &str = "-- earlier output not loaded --";
+
+/// VT bytes that put one dim line, [`SNAPSHOT_MARKER`], into the scrollback of
+/// a freshly reset terminal of `rows` rows: write it on the top row, then
+/// scroll the screen up by one line from the bottom row.
+pub fn snapshot_marker(rows: u16) -> Vec<u8> {
+    let rows = rows.max(1);
+    format!("\x1b[0m\x1b[1;1H\x1b[2;3m{SNAPSHOT_MARKER}\x1b[0m\x1b[{rows};1H\n\x1b[H").into_bytes()
+}
+
 pub struct RemotePaneSource {
     events: async_channel::Receiver<PaneEvent>,
     input: mpsc::UnboundedSender<Vec<u8>>,
@@ -32,9 +43,23 @@ impl RemotePaneSource {
     pub(crate) fn spawn(rt: &Handle, client: ClientHandle, pane: Uuid, mut stream: PaneStream) -> Self {
         let (ev_tx, ev_rx) = async_channel::bounded::<PaneEvent>(EVENT_BUFFER);
         let reader = rt.spawn(async move {
+            let mut rows = 24u16;
+            let mut marker_due = false;
             loop {
                 let ev = match stream.next().await {
-                    Some(PaneItem::Reset { rows, cols }) => PaneEvent::Reset { rows, cols },
+                    Some(PaneItem::Reset { rows: r, cols }) => {
+                        rows = r;
+                        marker_due = true;
+                        PaneEvent::Reset { rows: r, cols }
+                    }
+                    // AD-023: the client fell behind. The VT was just reset. A one line
+                    // marker goes into scrollback, then the snapshot paints the screen.
+                    Some(PaneItem::Snapshot { bytes, .. }) => {
+                        // A snapshot can arrive in several frames: one marker per reset.
+                        let mut out = if std::mem::take(&mut marker_due) { snapshot_marker(rows) } else { Vec::new() };
+                        out.extend_from_slice(&bytes);
+                        PaneEvent::Output(out)
+                    }
                     Some(PaneItem::Data { bytes, .. }) => PaneEvent::Output(bytes),
                     Some(PaneItem::Ended) => {
                         let _ = ev_tx.send(PaneEvent::Closed("pane ended".into())).await;

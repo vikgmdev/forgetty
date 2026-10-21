@@ -11,7 +11,7 @@ use forgetty_shell_core::keys::{Action, Chord, Keymap, ACTIONS};
 use forgetty_shell_core::layout::{neighbor, Divider, PaneGeometry, Rect, Side};
 use forgetty_shell_core::notify::ToastLimiter;
 use forgetty_shell_core::{
-    BackendEvent, BackendFuture, Layout, MachineInfo, NewTab, PaneId, PaneSource, PaneStatus, SessionBackend,
+    BackendEvent, BackendFuture, LabelTarget, Layout, MachineInfo, NewTab, PaneId, PaneSource, PaneStatus, SessionBackend,
     SplitDir, SplitPane, SplitRatio, Tab, Uuid,
 };
 use gpui::{AppContext as _,
@@ -61,6 +61,11 @@ pub struct Palette {
 }
 
 pub struct Rename {
+    /// What the label names.
+    pub target: LabelTarget,
+    /// Id of the workspace, tab or pane being named.
+    pub id: Uuid,
+    /// The tab that shows the editor (nil for a workspace).
     pub tab: Uuid,
     pub edit: LineEdit,
 }
@@ -121,7 +126,6 @@ pub struct AppShell {
     pub views: HashMap<PaneId, Entity<TerminalView>>,
     pub(crate) attaching: HashSet<PaneId>,
     pub meta: HashMap<PaneId, PaneMeta>,
-    pub title_override: HashMap<Uuid, String>,
     /// Active pane per tab (UI state; also reported to the backend).
     pub local_active: HashMap<Uuid, PaneId>,
     pub zoomed: HashMap<Uuid, PaneId>,
@@ -218,7 +222,6 @@ impl AppShell {
             views: HashMap::new(),
             attaching: HashSet::new(),
             meta: HashMap::new(),
-            title_override: HashMap::new(),
             local_active: HashMap::new(),
             zoomed: HashMap::new(),
             palette: None,
@@ -378,10 +381,13 @@ impl AppShell {
         self.views.retain(|id, _| panes.contains(id));
         self.meta.retain(|id, _| panes.contains(id));
         let tabs: HashSet<Uuid> = layout.workspaces.iter().flat_map(|w| w.tabs.iter().map(|t| t.id)).collect();
-        self.title_override.retain(|id, _| tabs.contains(id));
         self.local_active.retain(|id, p| tabs.contains(id) && panes.contains(p));
         self.zoomed.retain(|id, p| tabs.contains(id) && panes.contains(p));
-        if self.rename.as_ref().is_some_and(|r| !tabs.contains(&r.tab)) {
+        let workspaces: HashSet<Uuid> = layout.workspaces.iter().map(|w| w.id).collect();
+        if self.rename.as_ref().is_some_and(|r| match r.target {
+            LabelTarget::Workspace => !workspaces.contains(&r.id),
+            _ => !tabs.contains(&r.tab),
+        }) {
             self.rename = None;
         }
         if layout.tab_count() > 0 {
@@ -503,8 +509,12 @@ impl AppShell {
     }
 
     pub fn tab_title(&self, tab: &Tab) -> String {
-        if let Some(t) = self.title_override.get(&tab.id) {
-            return t.clone();
+        // A label the user set wins: the tab's, then the active pane's.
+        if !tab.label.is_empty() {
+            return tab.label.clone();
+        }
+        if let Some(l) = tab.pane_label(self.active_pane_of(tab)) {
+            return l.to_string();
         }
         if let Some(m) = self.meta.get(&self.active_pane_of(tab)) {
             if !m.title.is_empty() {
@@ -665,6 +675,9 @@ impl AppShell {
         self.zoomed.remove(&tab);
         self.call(cx, fut, move |s, new_pane, cx| {
             s.local_active.insert(tab, new_pane);
+            // The new pane has the focus: tell the server, so a restart restores it.
+            let focus = s.backend.set_active_pane(tab, Some(new_pane));
+            s.call(cx, focus, |_, _, _| {});
             s.request_sync(cx);
         });
     }
@@ -741,7 +754,22 @@ impl AppShell {
     pub fn begin_rename(&mut self, tab: Uuid, cx: &mut Context<Self>) {
         let Some((w, t)) = self.layout.find_tab(tab) else { return };
         let current = self.tab_title(&self.layout.workspaces[w].tabs[t]);
-        self.rename = Some(Rename { tab, edit: LineEdit::new(&current) });
+        self.rename = Some(Rename { target: LabelTarget::Tab, id: tab, tab, edit: LineEdit::new(&current) });
+        cx.notify();
+    }
+
+    /// Name the focused pane. The editor shows in its tab.
+    pub fn begin_rename_pane(&mut self, cx: &mut Context<Self>) {
+        let (Some(tab), Some(pane)) = (self.active_tab(), self.active_pane()) else { return };
+        let current = tab.pane_label(pane).unwrap_or_default().to_string();
+        self.rename = Some(Rename { target: LabelTarget::Pane, id: pane.0, tab: tab.id, edit: LineEdit::new(&current) });
+        cx.notify();
+    }
+
+    /// Rename a workspace in the sidebar.
+    pub fn begin_rename_workspace(&mut self, idx: usize, cx: &mut Context<Self>) {
+        let Some(ws) = self.layout.workspaces.get(idx) else { return };
+        self.rename = Some(Rename { target: LabelTarget::Workspace, id: ws.id, tab: Uuid::nil(), edit: LineEdit::new(&ws.name) });
         cx.notify();
     }
 
@@ -763,6 +791,8 @@ impl AppShell {
                     self.begin_rename(t, cx);
                 }
             }
+            Action::RenamePane => self.begin_rename_pane(cx),
+            Action::RenameWorkspace => self.begin_rename_workspace(self.layout.active_workspace, cx),
             Action::SplitRight => self.split(SplitDir::Horizontal, cx),
             Action::SplitDown => self.split(SplitDir::Vertical, cx),
             Action::ClosePane => self.close_pane(cx),
@@ -895,12 +925,12 @@ impl AppShell {
         match ks.key.as_str() {
             "escape" => self.rename = None,
             "enter" => {
-                let (tab, text) = (r.tab, r.edit.text.trim().to_string());
+                let (target, id, text) = (r.target, r.id, r.edit.text.trim().to_string());
                 self.rename = None;
-                if text.is_empty() {
-                    self.title_override.remove(&tab);
-                } else {
-                    self.title_override.insert(tab, text);
+                // A workspace keeps its name when the text is empty.
+                if !(target == LabelTarget::Workspace && text.is_empty()) {
+                    let fut = self.backend.set_label(target, id, text);
+                    self.call(cx, fut, |_, _, _| {});
                 }
             }
             _ => {

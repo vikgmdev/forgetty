@@ -4,10 +4,10 @@
 use std::time::Duration;
 
 use forgetty_shell_core::layout::SplitDir;
-use forgetty_shell_core::{PaneStatus, Tab};
+use forgetty_shell_core::{LabelTarget, PaneStatus, Tab};
 use gpui::{
     canvas, div, ease_out_quint, prelude::*, px, Animation, AnimationExt, AnyElement, Context, Div,
-    FontWeight, Hsla, IntoElement, MouseButton, Render, SharedString, Window, WindowControlArea,
+    FontWeight, Hsla, IntoElement, MouseButton, MouseDownEvent, Render, SharedString, Window, WindowControlArea,
 };
 
 use crate::shell::*;
@@ -64,7 +64,7 @@ impl AppShell {
     fn render_tab(&self, i: usize, tab: &Tab, active: bool, tw: f32, cx: &mut Context<Self>) -> AnyElement {
         let id = tab.id;
         let th = self.theme;
-        let renaming = self.rename.as_ref().filter(|r| r.tab == id);
+        let renaming = self.rename.as_ref().filter(|r| r.tab == id && r.target != LabelTarget::Workspace);
         let title = self.tab_title(tab);
         let cwd = self.tab_cwd(tab);
         let status = self.tab_status(tab);
@@ -340,9 +340,32 @@ impl AppShell {
                     .cursor_pointer()
                     .when(active, |d| d.bg(alpha(th.hover, 0.8)))
                     .hover(move |s| s.bg(hover))
-                    .on_mouse_down(MouseButton::Left, cx.listener(move |s, _e, _w, cx| s.set_workspace(i, cx)))
+                    .on_mouse_down(MouseButton::Left, cx.listener(move |s, ev: &MouseDownEvent, _w, cx| {
+                        if ev.click_count >= 2 {
+                            s.begin_rename_workspace(i, cx);
+                        } else {
+                            s.rename = None;
+                            s.set_workspace(i, cx);
+                        }
+                    }))
                     .child(div().w(px(3.0)).h(px(14.0)).rounded_full().bg(if active { hsla(th.accent) } else { alpha(th.border, 1.0) }))
-                    .child(div().flex_1().truncate().child(SharedString::from(ws.name.clone())))
+                    .child(match self.rename.as_ref().filter(|r| r.target == LabelTarget::Workspace && r.id == ws.id) {
+                        Some(r) => {
+                            let t = &r.edit.text;
+                            let split = t.char_indices().nth(r.edit.cursor).map(|x| x.0).unwrap_or(t.len());
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .flex()
+                                .flex_row()
+                                .whitespace_nowrap()
+                                .child(SharedString::from(t[..split].to_string()))
+                                .child(div().w(px(1.0)).h(px(14.0)).bg(hsla(th.accent)))
+                                .child(SharedString::from(t[split..].to_string()))
+                        }
+                        None => div().flex_1().truncate().child(SharedString::from(ws.name.clone())),
+                    })
                     .child(div().text_size(px(10.5)).text_color(hsla(th.dim)).child(SharedString::from(ws.tabs.len().to_string()))),
             );
         }

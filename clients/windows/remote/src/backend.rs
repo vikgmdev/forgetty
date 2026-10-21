@@ -13,7 +13,7 @@ use forgetty_client::{
     SecretKey,
 };
 use forgetty_shell_core::{
-    BackendError, BackendEvent, BackendFuture, BackendResult, ConnState, Layout, MachineInfo, MachineKind,
+    valid_label, BackendError, BackendEvent, BackendFuture, BackendResult, ConnState, LabelTarget, Layout, MachineInfo, MachineKind,
     NewTab, NewTabReply, NewWorkspaceReply, PaneId, PaneInfo, PaneSource, PaneStatus, SessionBackend,
     SplitDir, SplitPane, SplitRatio,
 };
@@ -118,15 +118,31 @@ impl RemoteBackend {
         let inner = self.inner.clone();
         self.inner.rt.spawn(async move {
             let mut rx = inner.client.watch_state();
+            let mut nudger: Option<tokio::task::JoinHandle<()>> = None;
             loop {
                 let st = rx.borrow_and_update().clone();
                 let _ = inner.tx.try_send(BackendEvent::ConnectionChanged(map_conn(&st)));
-                if matches!(st, ConnectionState::Closed | ConnectionState::Failed(_)) {
-                    // `Failed` is final; `Closed` too. Keep watching only to see the last change.
+                if let Some(n) = nudger.take() {
+                    n.abort();
+                }
+                if let ConnectionState::Reconnecting { since } = st {
+                    // The contract backoff grows to 2 s, so a server that comes back
+                    // can wait that long for the next dial. For the first minute of an
+                    // outage, cut each wait short; after that the plain backoff applies.
+                    let client = inner.client.clone();
+                    nudger = Some(tokio::spawn(async move {
+                        while since.elapsed() < NUDGE_FOR {
+                            tokio::time::sleep(NUDGE_EVERY).await;
+                            client.reconnect_now();
+                        }
+                    }));
                 }
                 if rx.changed().await.is_err() {
                     break;
                 }
+            }
+            if let Some(n) = nudger.take() {
+                n.abort();
             }
         });
 
@@ -181,6 +197,11 @@ impl RemoteBackend {
         Box::pin(async move { f.await.map(|_| ()) })
     }
 }
+
+/// While reconnecting, end each backoff wait after this long ...
+const NUDGE_EVERY: std::time::Duration = std::time::Duration::from_millis(400);
+/// ... for this long after the link broke.
+const NUDGE_FOR: std::time::Duration = std::time::Duration::from_secs(60);
 
 fn map_event(inner: &Arc<Inner>, ev: ServerEvent) -> Option<BackendEvent> {
     Some(match ev {
@@ -296,6 +317,14 @@ impl SessionBackend for RemoteBackend {
 
     fn set_active_workspace(&self, workspace_idx: usize) -> BackendFuture<()> {
         self.call_unit("set_active_workspace", json!({"workspace_idx": workspace_idx}))
+    }
+
+    fn set_label(&self, target: LabelTarget, id: Uuid, label: String) -> BackendFuture<()> {
+        let label = match valid_label(target, &label) {
+            Ok(l) => l,
+            Err(e) => return forgetty_shell_core::ready(Err(e)),
+        };
+        self.call_unit("set_label", json!({"target": target.wire(), "id": id.to_string(), "label": label}))
     }
 
     fn rename_workspace(&self, workspace_idx: usize, name: String) -> BackendFuture<()> {

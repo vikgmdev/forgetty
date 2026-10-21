@@ -61,7 +61,6 @@ pub struct MachineSlot {
     pub views: HashMap<PaneId, Entity<TerminalView>>,
     pub attaching: HashSet<PaneId>,
     pub meta: HashMap<PaneId, PaneMeta>,
-    pub title_override: HashMap<Uuid, String>,
     pub local_active: HashMap<Uuid, PaneId>,
     pub zoomed: HashMap<Uuid, PaneId>,
     pub had_tabs: bool,
@@ -76,7 +75,6 @@ impl MachineSlot {
             views: HashMap::new(),
             attaching: HashSet::new(),
             meta: HashMap::new(),
-            title_override: HashMap::new(),
             local_active: HashMap::new(),
             zoomed: HashMap::new(),
             had_tabs: false,
@@ -220,7 +218,7 @@ impl AppShell {
                     device,
                     env!("CARGO_PKG_VERSION"),
                 ),
-                opts: ClientOptions { addr_cache: cache, ..Default::default() },
+                opts: ClientOptions { dial_timeout: store::dial_timeout_for(&cache, &m), addr_cache: cache, ..Default::default() },
             };
             RemoteBackend::start(params).await.map_err(|e| e.to_string())
         });
@@ -391,7 +389,6 @@ impl AppShell {
         std::mem::swap(&mut self.views, &mut slot.views);
         std::mem::swap(&mut self.attaching, &mut slot.attaching);
         std::mem::swap(&mut self.meta, &mut slot.meta);
-        std::mem::swap(&mut self.title_override, &mut slot.title_override);
         std::mem::swap(&mut self.local_active, &mut slot.local_active);
         std::mem::swap(&mut self.zoomed, &mut slot.zoomed);
         std::mem::swap(&mut self.had_tabs, &mut slot.had_tabs);

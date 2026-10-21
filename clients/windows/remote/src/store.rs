@@ -24,8 +24,24 @@ pub struct StoredMachine {
     pub id: Uuid,
     pub name: String,
     pub node_id: String,
-    #[serde(default)]
-    pub relay: String,
+    /// Every relay of the pairing payload, in order. Older files held one
+    /// `relay` string; it reads as a one entry list.
+    #[serde(default, alias = "relay", deserialize_with = "relays_de")]
+    pub relays: Vec<String>,
+}
+
+fn relays_de<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum One {
+        Text(String),
+        List(Vec<String>),
+    }
+    Ok(match One::deserialize(d)? {
+        One::Text(t) if t.is_empty() => Vec::new(),
+        One::Text(t) => vec![t],
+        One::List(l) => l.into_iter().filter(|r| !r.is_empty()).collect(),
+    })
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -167,8 +183,11 @@ pub struct PairingOffer {
     pub machine: String,
     /// First 8 characters of the node id.
     pub node_short: String,
-    /// Relay URL as shown (at most 96 chars; empty means none).
+    /// Relay URLs as shown, joined with ", " (each at most 96 chars; empty
+    /// means none).
     pub relay: String,
+    /// Every relay URL of the payload, to store with the machine.
+    pub relays: Vec<String>,
 }
 
 fn clean(s: &str, max: usize) -> String {
@@ -199,9 +218,11 @@ pub fn parse_offer(text: &str) -> Result<PairingOffer, String> {
     if machine.is_empty() {
         return Err("The payload has no machine name.".into());
     }
+    let relays = qr.relay_urls();
     Ok(PairingOffer {
         node_short: qr.node_id.chars().take(8).collect(),
-        relay: clean(&qr.relay, 96),
+        relay: relays.iter().map(|r| clean(r, 96)).collect::<Vec<_>>().join(", "),
+        relays,
         machine,
         qr,
     })
@@ -232,9 +253,23 @@ pub async fn pair(
         id: Uuid::new_v4(),
         name: offer.machine.clone(),
         node_id: offer.qr.node_id.clone(),
-        relay: offer.qr.relay.clone(),
+        relays: offer.relays.clone(),
     };
     store.add(m).map_err(|e| ClientError::Setup(format!("machines.json: {e}")))
+}
+
+/// How long one dial attempt may take. A machine we reached directly before
+/// (the address cache has its address) answers a handshake in one round trip,
+/// so a short timeout makes the client send a fresh first packet often, and a
+/// server that restarts is found within about a second. Without a direct
+/// address the dial goes through a relay and gets the library default.
+pub fn dial_timeout_for(cache: &AddrCache, m: &StoredMachine) -> std::time::Duration {
+    let direct = m.node_id.parse::<forgetty_client::EndpointId>().ok().and_then(|id| cache.get(id)).is_some();
+    if direct {
+        std::time::Duration::from_secs(1)
+    } else {
+        ClientOptions::default().dial_timeout
+    }
 }
 
 /// Address of a stored machine (node id plus relay), for `Client::spawn`.
@@ -243,7 +278,8 @@ pub fn machine_addr(m: &StoredMachine) -> Result<forgetty_client::EndpointAddr, 
         v: QrPayload::VERSION,
         node_id: m.node_id.clone(),
         machine: m.name.clone(),
-        relay: m.relay.clone(),
+        relay: m.relays.first().cloned().unwrap_or_default(),
+        relays: m.relays.clone(),
         secret: String::new(),
     })
 }
@@ -281,6 +317,28 @@ mod tests {
     }
 
     #[test]
+    fn every_relay_is_kept() {
+        let n = node();
+        let j = serde_json::json!({"v": 2, "node_id": n, "machine": "m", "relay": "https://a.example.com/", "relays": ["https://a.example.com/", "https://b.example.com/"], "secret": "ABCDEF"});
+        let o = parse_offer(&j.to_string()).unwrap();
+        assert_eq!(o.relays, vec!["https://a.example.com/", "https://b.example.com/"]);
+        assert_eq!(o.relay, "https://a.example.com/, https://b.example.com/");
+        let dir = tempfile::tempdir().unwrap();
+        let s = MachineStore::open(dir.path());
+        let m = s.add(StoredMachine { id: Uuid::new_v4(), name: "m".into(), node_id: n.clone(), relays: o.relays.clone() }).unwrap();
+        assert_eq!(s.machines()[0].relays, o.relays);
+        let addr = machine_addr(&m).unwrap();
+        assert_eq!(addr.relay_urls().count(), 2);
+        // A file from W3 held one `relay` string.
+        std::fs::write(
+            s.machines_path(),
+            serde_json::json!({"version": 1, "machines": [{"id": m.id, "name": "m", "node_id": n, "relay": "https://a.example.com/"}]}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(s.machines()[0].relays, vec!["https://a.example.com/"]);
+    }
+
+    #[test]
     fn long_names_are_cut() {
         let o = parse_offer(&offer_json(&node(), &"m".repeat(200), "")).unwrap();
         assert_eq!(o.machine.chars().count(), 48 + 3);
@@ -297,7 +355,7 @@ mod tests {
         assert_eq!(c1, s.client_id().unwrap());
         assert!(s.machines().is_empty());
 
-        let m = StoredMachine { id: Uuid::new_v4(), name: "a".into(), node_id: node(), relay: String::new() };
+        let m = StoredMachine { id: Uuid::new_v4(), name: "a".into(), node_id: node(), relays: Vec::new() };
         let saved = s.add(m.clone()).unwrap();
         assert_eq!(s.machines(), vec![saved.clone()]);
         // Same node id again: replaced, local id kept.

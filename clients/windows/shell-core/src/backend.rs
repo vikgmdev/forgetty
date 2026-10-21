@@ -218,6 +218,37 @@ pub struct PaneInfo {
     pub exited: bool,
 }
 
+/// What `set_label` names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LabelTarget {
+    Workspace,
+    Tab,
+    Pane,
+}
+
+impl LabelTarget {
+    pub fn wire(self) -> &'static str {
+        match self {
+            LabelTarget::Workspace => "workspace",
+            LabelTarget::Tab => "tab",
+            LabelTarget::Pane => "pane",
+        }
+    }
+}
+
+/// Labels are at most 128 characters with no control characters. Only a
+/// tab or pane label may be empty (it clears the label).
+pub fn valid_label(target: LabelTarget, label: &str) -> BackendResult<String> {
+    let l = label.trim();
+    if l.chars().count() > 128 || l.chars().any(char::is_control) {
+        return Err(BackendError::Invalid("label is longer than 128 characters or has control characters".into()));
+    }
+    if l.is_empty() && target == LabelTarget::Workspace {
+        return Err(BackendError::Invalid("a workspace label cannot be empty".into()));
+    }
+    Ok(l.to_string())
+}
+
 pub trait SessionBackend: Send + Sync {
     /// The machine this backend serves, for the sidebar.
     fn machine(&self) -> MachineInfo;
@@ -242,6 +273,8 @@ pub trait SessionBackend: Send + Sync {
     fn create_workspace(&self, name: Option<String>, rows: u16, cols: u16) -> BackendFuture<NewWorkspaceReply>;
     fn set_active_workspace(&self, workspace_idx: usize) -> BackendFuture<()>;
     fn rename_workspace(&self, workspace_idx: usize, name: String) -> BackendFuture<()>;
+    /// Name a workspace, tab or pane (`set_label`, PROTOCOL_V2 section 13).
+    fn set_label(&self, target: LabelTarget, id: Uuid, label: String) -> BackendFuture<()>;
     fn split_pane(&self, req: SplitPane) -> BackendFuture<PaneId>;
     fn close_pane(&self, pane_id: PaneId) -> BackendFuture<()>;
     fn set_active_pane(&self, tab_id: Uuid, pane_id: Option<PaneId>) -> BackendFuture<()>;

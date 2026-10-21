@@ -85,7 +85,7 @@ impl Default for TestServerConfig {
 #[derive(Debug, Clone)]
 enum Tree {
     Leaf(Uuid),
-    Split { direction: String, first: Box<Tree>, second: Box<Tree> },
+    Split { direction: String, ratio: f32, first: Box<Tree>, second: Box<Tree> },
 }
 
 impl Tree {
@@ -102,6 +102,7 @@ impl Tree {
             Tree::Leaf(id) if *id == pane => {
                 *self = Tree::Split {
                     direction: direction.to_string(),
+                    ratio: 0.5,
                     first: Box::new(Tree::Leaf(pane)),
                     second: Box::new(Tree::Leaf(new_pane)),
                 };
@@ -120,10 +121,10 @@ impl Tree {
         match self {
             Tree::Leaf(id) if id == pane => None,
             Tree::Leaf(_) => Some(self),
-            Tree::Split { direction, first, second } => {
+            Tree::Split { direction, ratio, first, second } => {
                 match (first.remove(pane), second.remove(pane)) {
                     (Some(a), Some(b)) => {
-                        Some(Tree::Split { direction, first: Box::new(a), second: Box::new(b) })
+                        Some(Tree::Split { direction, ratio, first: Box::new(a), second: Box::new(b) })
                     }
                     (Some(only), None) | (None, Some(only)) => Some(only),
                     (None, None) => None,
@@ -142,14 +143,39 @@ impl Tree {
         }
     }
 
+    /// First leaf of the first-child chain: the key `update_split_ratios`
+    /// uses to name a split.
+    fn leftmost(&self) -> Uuid {
+        match self {
+            Tree::Leaf(id) => *id,
+            Tree::Split { first, .. } => first.leftmost(),
+        }
+    }
+
+    /// `update_split_ratios`: the outermost split whose first child starts
+    /// at `key` takes the ratio (clamped like the real server).
+    fn set_ratio(&mut self, key: Uuid, new: f32) -> bool {
+        match self {
+            Tree::Leaf(_) => false,
+            Tree::Split { ratio, first, second, .. } => {
+                if first.leftmost() == key {
+                    *ratio = new.clamp(0.05, 0.95);
+                    true
+                } else {
+                    first.set_ratio(key, new) || second.set_ratio(key, new)
+                }
+            }
+        }
+    }
+
     fn to_value(&self) -> Value {
         match self {
             Tree::Leaf(id) => map(&[("Leaf", map(&[("pane_id", str_val(&id.to_string()))]))]),
-            Tree::Split { direction, first, second } => map(&[(
+            Tree::Split { direction, ratio, first, second } => map(&[(
                 "Split",
                 map(&[
                     ("direction", str_val(direction)),
-                    ("ratio", Value::F32(0.5)),
+                    ("ratio", Value::F32(*ratio)),
                     ("first", first.to_value()),
                     ("second", second.to_value()),
                 ]),
@@ -167,6 +193,12 @@ struct TabNode {
 struct Layout {
     workspace: String,
     tabs: Vec<TabNode>,
+    /// Index of the active tab (`focus_tab`).
+    active_tab: usize,
+    /// Focused pane per tab id (`set_active_pane`).
+    active_pane: HashMap<Uuid, Uuid>,
+    /// Tab and pane labels by id (`set_label`).
+    labels: HashMap<Uuid, String>,
 }
 
 fn str_val(s: &str) -> Value {
@@ -186,6 +218,8 @@ struct PaneLog {
     cols: u16,
     /// Everything the clients typed into this pane, in arrival order.
     input: Vec<u8>,
+    /// VT snapshot the next `attach_pane` answers with (AD-023), once.
+    snapshot: Option<Vec<u8>>,
 }
 
 struct State {
@@ -277,7 +311,13 @@ impl TestServer {
             attaches: Mutex::new(Vec::new()),
             handshakes: AtomicU64::new(0),
             paused: AtomicBool::new(false),
-            layout: Mutex::new(Layout { workspace: "Default".into(), tabs: Vec::new() }),
+            layout: Mutex::new(Layout {
+                workspace: "Default".into(),
+                tabs: Vec::new(),
+                active_tab: 0,
+                active_pane: HashMap::new(),
+                labels: HashMap::new(),
+            }),
             cfg,
         });
         for (id, log) in &state.cfg.panes {
@@ -290,6 +330,7 @@ impl TestServer {
                     rows: 24,
                     cols: 80,
                     input: Vec::new(),
+                    snapshot: None,
                 },
             );
             lock(&state.layout).tabs.push(TabNode {
@@ -335,6 +376,7 @@ impl TestServer {
                 rows: 24,
                 cols: 80,
                 input: Vec::new(),
+                snapshot: None,
             },
         );
         id
@@ -374,6 +416,15 @@ impl TestServer {
             let n = ((offset - p.first) as usize).min(p.data.len());
             p.data.drain(..n);
             p.first += n as u64;
+        }
+    }
+
+    /// Answer the next `attach_pane` of `pane` with this VT snapshot
+    /// instead of the log (AD-023). Add `cap::SNAPSHOT_CATCHUP` to the
+    /// server capabilities so the client accepts it.
+    pub fn queue_snapshot(&self, pane: Uuid, bytes: &[u8]) {
+        if let Some(p) = lock(&self.state.panes).get_mut(&pane) {
+            p.snapshot = Some(bytes.to_vec());
         }
     }
 
@@ -665,9 +716,9 @@ fn handle_request(
         }
         method::ATTACH_PANE => {
             let p: AttachPaneParams = from_value(params).map_err(bad)?;
-            let (start, reset, rows, cols, notify) = {
-                let panes = lock(&state.panes);
-                let Some(log) = panes.get(&p.pane_id) else {
+            let (start, reset, rows, cols, notify, snapshot) = {
+                let mut panes = lock(&state.panes);
+                let Some(log) = panes.get_mut(&p.pane_id) else {
                     return Err((error_code::NOT_FOUND, "no such pane".into()));
                 };
                 let total = log.first + log.data.len() as u64;
@@ -678,7 +729,12 @@ fn handle_request(
                     Some(o) if o < log.first => (log.first, true),
                     Some(o) => (o, false),
                 };
-                (start, reset, log.rows, log.cols, log.notify.clone())
+                // A queued snapshot answers this attach: reset, then the snapshot,
+                // then live bytes from the end of the log.
+                match log.snapshot.take() {
+                    Some(snap) => (total, true, log.rows, log.cols, log.notify.clone(), snap),
+                    None => (start, reset, log.rows, log.cols, log.notify.clone(), Vec::new()),
+                }
             };
             lock(&state.attaches).push((p.pane_id, p.from_offset));
             if let Some(old) = streams.remove(&p.pane_id) {
@@ -694,8 +750,9 @@ fn handle_request(
                     reset,
                     rows,
                     cols,
-                    snapshot_len: 0,
+                    snapshot_len: snapshot.len() as u32,
                 },
+                snapshot,
             ));
             streams.insert(p.pane_id, handle);
             to_value(&OkResult { ok: true }).map_err(bad)
@@ -809,8 +866,102 @@ fn handle_request(
             Ok(map(&[("ok", Value::Boolean(true))]))
         }
         "focus_tab" => {
-            param_uuid(&params, "tab_id")?;
+            let tab = param_uuid(&params, "tab_id")?;
+            {
+                let mut layout = lock(&state.layout);
+                let Some(i) = layout.tabs.iter().position(|t| t.id == tab) else {
+                    return Err((error_code::NOT_FOUND, "no such tab".into()));
+                };
+                layout.active_tab = i;
+            }
+            layout_changed(state);
             Ok(map(&[("ok", Value::Boolean(true))]))
+        }
+        "set_active_pane" => {
+            let tab = param_uuid(&params, "tab_id")?;
+            let pane = match params_get(&params, "pane_id") {
+                Some(Value::Nil) | None => None,
+                Some(_) => Some(param_uuid(&params, "pane_id")?),
+            };
+            {
+                let mut layout = lock(&state.layout);
+                let Some(t) = layout.tabs.iter().find(|t| t.id == tab) else {
+                    return Err((error_code::NOT_FOUND, "no such tab".into()));
+                };
+                if pane.is_some_and(|p| !t.tree.contains(p)) {
+                    return Err((error_code::NOT_FOUND, "pane is not in that tab".into()));
+                }
+                match pane {
+                    Some(p) => layout.active_pane.insert(tab, p),
+                    None => layout.active_pane.remove(&tab),
+                };
+            }
+            layout_changed(state);
+            Ok(map(&[("ok", Value::Boolean(true))]))
+        }
+        "update_split_ratios" => {
+            // Entries that are malformed are skipped, like the real server.
+            let entries = match params_get(&params, "ratios") {
+                Some(Value::Array(a)) => a.clone(),
+                _ => Vec::new(),
+            };
+            let mut changed = false;
+            {
+                let mut layout = lock(&state.layout);
+                for e in &entries {
+                    let (Ok(pane), Some(r)) = (param_uuid(e, "pane_id"), params_get(e, "ratio").and_then(Value::as_f64)) else {
+                        continue;
+                    };
+                    if !r.is_finite() {
+                        continue;
+                    }
+                    for t in layout.tabs.iter_mut() {
+                        if t.tree.set_ratio(pane, r as f32) {
+                            changed = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if changed {
+                layout_changed(state);
+            }
+            Ok(map(&[("ok", Value::Boolean(true))]))
+        }
+        "set_label" => {
+            let id = param_uuid(&params, "id")?;
+            let label = param_str(&params, "label").unwrap_or("").trim().to_string();
+            if label.chars().count() > 128 || label.chars().any(char::is_control) {
+                return Err((error_code::BAD_REQUEST, "bad label".into()));
+            }
+            let changed = {
+                let mut layout = lock(&state.layout);
+                match param_str(&params, "target") {
+                    Some("workspace") => {
+                        if label.is_empty() {
+                            return Err((error_code::BAD_REQUEST, "a workspace label cannot be empty".into()));
+                        }
+                        std::mem::replace(&mut layout.workspace, label.clone()) != label
+                    }
+                    Some(t @ ("tab" | "pane")) => {
+                        let known = if t == "tab" {
+                            layout.tabs.iter().any(|x| x.id == id)
+                        } else {
+                            layout.tabs.iter().any(|x| x.tree.contains(id))
+                        };
+                        if !known {
+                            return Err((error_code::NOT_FOUND, format!("no such {t}")));
+                        }
+                        let old = if label.is_empty() { layout.labels.remove(&id) } else { layout.labels.insert(id, label.clone()) };
+                        old.unwrap_or_default() != label
+                    }
+                    _ => return Err((error_code::BAD_REQUEST, "target must be workspace, tab or pane".into())),
+                }
+            };
+            if changed {
+                layout_changed(state);
+            }
+            Ok(map(&[("ok", Value::Boolean(true)), ("changed", Value::Boolean(changed))]))
         }
         "rename_workspace" => {
             let name = param_str(&params, "name")
@@ -839,6 +990,13 @@ fn handle_request(
     }
 }
 
+fn params_get<'a>(params: &'a Value, key: &str) -> Option<&'a Value> {
+    match params {
+        Value::Map(m) => m.iter().find(|(k, _)| k.as_str() == Some(key)).map(|(_, v)| v),
+        _ => None,
+    }
+}
+
 fn param_str<'a>(params: &'a Value, key: &str) -> Option<&'a str> {
     params.as_map()?.iter().find(|(k, _)| k.as_str() == Some(key))?.1.as_str()
 }
@@ -860,6 +1018,7 @@ fn new_pane_log(state: &Arc<State>, rows: u16, cols: u16) -> Uuid {
             rows,
             cols,
             input: Vec::new(),
+            snapshot: None,
         },
     );
     id
@@ -873,6 +1032,8 @@ fn remove_pane(state: &Arc<State>, pane: Uuid) {
     }
     {
         let mut layout = lock(&state.layout);
+        layout.labels.remove(&pane);
+        layout.active_pane.retain(|_, p| *p != pane);
         let tabs = std::mem::take(&mut layout.tabs);
         layout.tabs = tabs
             .into_iter()
@@ -895,10 +1056,17 @@ fn layout_value(state: &Arc<State>) -> Value {
         .map(|t| {
             let mut ids = Vec::new();
             t.tree.panes(&mut ids);
-            let active = ids.first().map(|id| str_val(&id.to_string())).unwrap_or(Value::Nil);
+            let focused = layout.active_pane.get(&t.id).filter(|p| ids.contains(p)).or_else(|| ids.first());
+            let active = focused.map(|id| str_val(&id.to_string())).unwrap_or(Value::Nil);
+            let pane_labels: Vec<(Value, Value)> = ids
+                .iter()
+                .filter_map(|id| layout.labels.get(id).map(|l| (str_val(&id.to_string()), str_val(l))))
+                .collect();
             map(&[
                 ("id", str_val(&t.id.to_string())),
                 ("title", str_val(&t.title)),
+                ("label", str_val(layout.labels.get(&t.id).map(String::as_str).unwrap_or(""))),
+                ("pane_labels", Value::Map(pane_labels)),
                 ("pane_tree", t.tree.to_value()),
                 ("active_pane_id", active),
             ])
@@ -911,7 +1079,7 @@ fn layout_value(state: &Arc<State>) -> Value {
                 ("id", str_val("00000000-0000-0000-0000-000000000001")),
                 ("name", str_val(&layout.workspace)),
                 ("tabs", Value::Array(tabs)),
-                ("active_tab", Value::from(0u32)),
+                ("active_tab", Value::from(layout.active_tab.min(layout.tabs.len().saturating_sub(1)) as u32)),
                 ("color", Value::Nil),
             ])]),
         ),
@@ -931,9 +1099,13 @@ async fn pane_stream(
     state: Arc<State>,
     notify: Arc<Notify>,
     header: PaneStreamHeader,
+    snapshot: Vec<u8>,
 ) {
     let Ok(mut send) = conn.open_uni().await else { return };
     if write_msg(&mut send, &header).await.is_err() {
+        return;
+    }
+    if !snapshot.is_empty() && write_output_frame(&mut send, &snapshot).await.is_err() {
         return;
     }
     let mut next = header.start_offset;

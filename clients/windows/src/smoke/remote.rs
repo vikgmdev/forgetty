@@ -82,6 +82,8 @@ pub struct W3 {
     panes: Vec<PaneId>,
     t_start: Option<Instant>,
     t_kill: Option<Instant>,
+    t_spawn: Option<Instant>,
+    t_ready: Option<Instant>,
     since: Option<Instant>,
     resets_before: u64,
     fed_before: u64,
@@ -380,6 +382,7 @@ impl ShellSmoke {
                             let pokes = shell.net_pokes;
                             shell.poke_network(cx);
                             check("network_poke_reaches_backends", shell.net_pokes == pokes + 1);
+                            self.w3.t_spawn = Some(Instant::now());
                             match ServerProc::start(&self.w3.exe, &self.w3.args) {
                                 Ok(s) => self.w3.server = Some(s),
                                 Err(e) => fail(&format!("cannot restart the test server: {e}")),
@@ -396,8 +399,18 @@ impl ShellSmoke {
                 let Some(view) = self.remote_view(shell, 0) else { return };
                 match self.sub {
                     0 => {
-                        let up = self.w3.server.as_ref().is_some_and(|s| s.ready()) && shell.active_conn() == Some(&ConnState::Connected);
+                        let ready = self.w3.server.as_ref().is_some_and(|s| s.ready());
+                        if ready && self.w3.t_ready.is_none() {
+                            // READY is printed after the server bound its port and started accepting.
+                            self.w3.t_ready = Some(Instant::now());
+                            record("server_restart_ready_ms", json!(ms(self.w3.t_spawn.map(|t| t.elapsed()).unwrap_or_default())));
+                        }
+                        let up = ready && shell.active_conn() == Some(&ConnState::Connected);
                         if up {
+                            let after = self.w3.t_ready.map(|t| t.elapsed()).unwrap_or_default();
+                            record("reconnect_after_accept_ms", json!(ms(after)));
+                            // Measured at frame granularity, so allow a frame or two.
+                            check("reconnect_under_1500ms_after_accept", after < Duration::from_millis(1500));
                             if let Some(since) = self.w3.since {
                                 record("reconnect_ms", json!(ms(since.elapsed())));
                             }
@@ -429,6 +442,7 @@ impl ShellSmoke {
             }
             // ---- toasts -----------------------------------------------------------------------
             Phase::RToast => self.w3_toast(shell, window, cx),
+            Phase::RServer => self.w3_server_ops(shell, window, cx),
             _ => {}
         }
     }
@@ -595,8 +609,156 @@ impl ShellSmoke {
                 } else {
                     check("toast_requests_processed", false);
                 }
-                self.finish_w3(shell);
+                self.goto(Phase::RServer);
             }
+        }
+    }
+
+    /// The server side of what the shell does: snapshot catch-up, the real tab
+    /// switch, pane focus, split ratios and labels, each read back from the
+    /// layout the server owns.
+    fn w3_server_ops(&mut self, shell: &mut AppShell, window: &mut Window, cx: &mut Context<AppShell>) {
+        let stuck = |this: &Self, what: &str| {
+            if this.sub_t0.elapsed() > Duration::from_secs(15) {
+                fail(&format!("remote ops stuck: {what}"));
+            }
+        };
+        let Some(view) = self.remote_view(shell, 0) else { return };
+        match self.sub {
+            0 => {
+                self.w3.resets_before = view.read(cx).resets;
+                if let Some(srv) = self.w3.server.as_mut() {
+                    srv.send("snapshot SNAP-OK");
+                    srv.send("drop");
+                }
+                self.sub = 1;
+                self.sub_t0 = Instant::now();
+            }
+            1 => {
+                stuck(self, "snapshot");
+                let seen = snap(shell, cx, self.w3.panes[0]).is_some_and(|s| s.rows.iter().any(|r| r.contains("SNAP-OK")));
+                if view.read(cx).resets > self.w3.resets_before && seen {
+                    let top = view.update(cx, |v, _| {
+                        v.scroll_rows(-1000);
+                        let t = row_text(v.term.screen(), 0);
+                        v.term.scroll_viewport_bottom();
+                        t
+                    });
+                    record("remote_snapshot_top_of_scrollback", json!(top));
+                    check("remote_snapshot_resets_vt", true);
+                    check("remote_snapshot_marker_in_scrollback", top.contains("earlier output not loaded"));
+                    self.sub = 2;
+                    self.sub_t0 = Instant::now();
+                }
+            }
+            // focus_tab: the server moves the active tab.
+            2 => {
+                stuck(self, "reconnect after snapshot");
+                if shell.active_conn() != Some(&ConnState::Connected) {
+                    return;
+                }
+                let tabs: Vec<Uuid> = shell.layout.workspaces.iter().flat_map(|w| w.tabs.iter().map(|t| t.id)).collect();
+                if tabs.len() < 2 {
+                    return;
+                }
+                shell.focus_tab(tabs[1], cx);
+                self.sub = 3;
+                self.sub_t0 = Instant::now();
+            }
+            3 => {
+                stuck(self, "focus_tab");
+                let tabs: Vec<Uuid> = shell.layout.workspaces.iter().flat_map(|w| w.tabs.iter().map(|t| t.id)).collect();
+                if shell.active_tab().map(|t| t.id) == tabs.get(1).copied() {
+                    check("remote_focus_tab_switches", true);
+                    shell.focus_tab(tabs[0], cx);
+                    self.sub = 4;
+                    self.sub_t0 = Instant::now();
+                }
+            }
+            4 => {
+                stuck(self, "focus_tab back");
+                let first = shell.layout.workspaces[0].tabs[0].id;
+                if shell.active_tab().map(|t| t.id) == Some(first) {
+                    shell.split(forgetty_shell_core::SplitDir::Horizontal, cx);
+                    self.sub = 5;
+                    self.sub_t0 = Instant::now();
+                }
+            }
+            // set_active_pane: a split focuses the new pane, then focus the first one;
+            // both are read back from the layout the server owns.
+            5 => {
+                stuck(self, "split");
+                let Some(tab) = shell.active_tab() else { return };
+                let leaves = tab.pane_tree.leaves();
+                if leaves.len() == 2 && shell.views.contains_key(&leaves[1]) && tab.active_pane_id == Some(leaves[1]) {
+                    check("remote_split_focuses_new_pane", true);
+                    shell.focus_pane(leaves[0], window, cx);
+                    self.sub = 6;
+                    self.sub_t0 = Instant::now();
+                }
+            }
+            6 => {
+                stuck(self, "set_active_pane");
+                let Some(tab) = shell.active_tab() else { return };
+                let leaves = tab.pane_tree.leaves();
+                if tab.active_pane_id == leaves.first().copied() {
+                    check("remote_set_active_pane_roundtrip", true);
+                    let fut = shell.backend.update_split_ratios(vec![forgetty_shell_core::SplitRatio { pane_id: leaves[0], ratio: 0.3 }]);
+                    shell.call(cx, fut, |_, _, _| {});
+                    self.sub = 7;
+                    self.sub_t0 = Instant::now();
+                }
+            }
+            7 => {
+                stuck(self, "update_split_ratios");
+                let Some(tab) = shell.active_tab() else { return };
+                let r = match &tab.pane_tree {
+                    forgetty_shell_core::PaneTree::Split { ratio, .. } => *ratio,
+                    _ => 0.0,
+                };
+                if (r - 0.3).abs() < 1e-4 {
+                    check("remote_split_ratio_roundtrip", true);
+                    shell.begin_rename(tab.id, cx);
+                    self.sub = 8;
+                    self.sub_t0 = Instant::now();
+                }
+            }
+            // Labels: the tab rename editor, a pane label and a workspace label.
+            8 => {
+                if shell.rename.is_none() {
+                    return;
+                }
+                for _ in 0..64 {
+                    shell.handle_key(&key("backspace"), window, cx);
+                }
+                for ch in "rlab".chars() {
+                    shell.handle_key(&typed(ch), window, cx);
+                }
+                shell.handle_key(&key("enter"), window, cx);
+                let (Some(tab), Some(pane)) = (shell.active_tab().map(|t| t.id), shell.active_pane()) else { return };
+                let _ = tab;
+                let f1 = shell.backend.set_label(forgetty_shell_core::LabelTarget::Pane, pane.0, "plab".into());
+                shell.call(cx, f1, |_, _, _| {});
+                let ws = shell.layout.workspaces[0].id;
+                let f2 = shell.backend.set_label(forgetty_shell_core::LabelTarget::Workspace, ws, "wlab".into());
+                shell.call(cx, f2, |_, _, _| {});
+                self.sub = 9;
+                self.sub_t0 = Instant::now();
+            }
+            9 => {
+                stuck(self, "labels");
+                let Some(tab) = shell.active_tab() else { return };
+                let pane = shell.active_pane();
+                let title = shell.tab_title(tab);
+                let ok_tab = tab.label == "rlab" && title == "rlab";
+                let ok_pane = pane.is_some_and(|p| tab.pane_label(p) == Some("plab"));
+                let ok_ws = shell.layout.workspaces[0].name == "wlab";
+                if ok_tab && ok_pane && ok_ws {
+                    check("remote_labels_roundtrip", true);
+                    self.finish_w3(shell);
+                }
+            }
+            _ => {}
         }
     }
 

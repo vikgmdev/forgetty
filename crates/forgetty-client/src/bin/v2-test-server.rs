@@ -12,7 +12,9 @@
 //!
 //! Commands on stdin, one per line:
 //! `status <waiting|done|failed> [message]` sends `StatusChanged` for the
-//! first pane, `quit` stops the server.
+//! first pane, `quit` stops the server. `snapshot <text>` queues a VT snapshot
+//! (AD-023) for the first pane and `drop` closes every connection, so the
+//! client reconnects and gets the snapshot.
 
 use std::path::PathBuf;
 
@@ -49,6 +51,12 @@ async fn main() {
         secret_key: Some(key),
         pair_secret: Some(secret.clone()),
         echo_input: true,
+        capabilities: vec![
+            forgetty_client::proto::cap::RESUME.to_string(),
+            forgetty_client::proto::cap::LAYOUT_EVENTS.to_string(),
+            forgetty_client::proto::cap::SIZE_POLICY_LATEST.to_string(),
+            forgetty_client::proto::cap::SNAPSHOT_CATCHUP.to_string(),
+        ],
         own_runtime: false,
         panes: (1..=panes)
             .map(|n| (pane_id(n), format!("forgetty v2 test server, pane {n}\r\n$ ").into_bytes()))
@@ -79,6 +87,16 @@ async fn main() {
                 let message = parts.next().unwrap_or("");
                 server.push_status(pane_id(1), status, message);
                 println!("OK status {status}");
+            }
+            Some("snapshot") => {
+                let mut bytes = b"\x1b[2J\x1b[H".to_vec();
+                bytes.extend_from_slice(line.trim().strip_prefix("snapshot").unwrap_or("").trim().as_bytes());
+                server.queue_snapshot(pane_id(1), &bytes);
+                println!("OK snapshot");
+            }
+            Some("drop") => {
+                server.drop_connections();
+                println!("OK drop");
             }
             Some("quit") => {
                 server.shutdown().await;

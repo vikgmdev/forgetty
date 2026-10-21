@@ -368,6 +368,8 @@ impl SessionBackend for LocalBackend {
                 title: String::new(),
                 pane_tree: PaneTree::leaf(pane),
                 active_pane_id: Some(pane),
+                label: String::new(),
+                pane_labels: Default::default(),
             });
             ws.active_tab = ws.tabs.len() - 1;
             st.layout.active_workspace = req.workspace_idx;
@@ -439,6 +441,8 @@ impl SessionBackend for LocalBackend {
                     title: String::new(),
                     pane_tree: PaneTree::leaf(pane),
                     active_pane_id: Some(pane),
+                    label: String::new(),
+                    pane_labels: Default::default(),
                 }],
                 active_tab: 0,
                 color: None,
@@ -457,6 +461,39 @@ impl SessionBackend for LocalBackend {
         }
         st.layout.active_workspace = workspace_idx;
         self.inner.emit_layout(&st);
+        ready(Ok(()))
+    }
+
+    fn set_label(&self, target: LabelTarget, id: Uuid, label: String) -> BackendFuture<()> {
+        let label = match valid_label(target, &label) {
+            Ok(l) => l,
+            Err(e) => return ready(Err(e)),
+        };
+        let mut st = self.inner.lock();
+        let changed = match target {
+            LabelTarget::Workspace => match st.layout.workspaces.iter_mut().find(|w| w.id == id) {
+                None => return ready(Err(BackendError::NotFound(format!("workspace {id}")))),
+                Some(w) => std::mem::replace(&mut w.name, label.clone()) != label,
+            },
+            LabelTarget::Tab => match st.layout.workspaces.iter_mut().flat_map(|w| w.tabs.iter_mut()).find(|t| t.id == id) {
+                None => return ready(Err(BackendError::NotFound(format!("tab {id}")))),
+                Some(t) => std::mem::replace(&mut t.label, label.clone()) != label,
+            },
+            LabelTarget::Pane => {
+                let pane = PaneId(id);
+                match st.layout.workspaces.iter_mut().flat_map(|w| w.tabs.iter_mut()).find(|t| t.pane_tree.contains(pane)) {
+                    None => return ready(Err(BackendError::NotFound(format!("pane {id}")))),
+                    Some(t) => {
+                        let key = id.to_string();
+                        let old = if label.is_empty() { t.pane_labels.remove(&key) } else { t.pane_labels.insert(key, label.clone()) };
+                        old.unwrap_or_default() != label
+                    }
+                }
+            }
+        };
+        if changed {
+            self.inner.emit_layout(&st);
+        }
         ready(Ok(()))
     }
 
@@ -723,6 +760,31 @@ mod tests {
             out.push_str(&String::from_utf8_lossy(&b));
         }
         assert!(out.contains("PWD=/tmp=END"), "split cwd: {out:?}");
+        b.shutdown_all();
+    }
+
+    #[test]
+    fn labels() {
+        let b = backend();
+        let t = now(b.new_tab(NewTab { workspace_idx: 0, rows: 24, cols: 80, ..Default::default() })).unwrap();
+        let l = now(b.get_layout()).unwrap();
+        let ws = l.workspaces[0].id;
+        now(b.set_label(LabelTarget::Tab, t.tab_id, "build".into())).unwrap();
+        now(b.set_label(LabelTarget::Pane, t.pane_id.0, "logs".into())).unwrap();
+        now(b.set_label(LabelTarget::Workspace, ws, "main".into())).unwrap();
+        let l = now(b.get_layout()).unwrap();
+        assert_eq!(l.workspaces[0].name, "main");
+        assert_eq!(l.workspaces[0].tabs[0].label, "build");
+        assert_eq!(l.workspaces[0].tabs[0].pane_label(t.pane_id), Some("logs"));
+        // Empty clears a tab or pane label, never a workspace label.
+        now(b.set_label(LabelTarget::Tab, t.tab_id, " ".into())).unwrap();
+        now(b.set_label(LabelTarget::Pane, t.pane_id.0, "".into())).unwrap();
+        assert!(now(b.set_label(LabelTarget::Workspace, ws, "".into())).is_err());
+        assert!(now(b.set_label(LabelTarget::Tab, t.tab_id, "a\u{7}b".into())).is_err());
+        assert!(now(b.set_label(LabelTarget::Tab, Uuid::new_v4(), "x".into())).is_err());
+        let l = now(b.get_layout()).unwrap();
+        assert_eq!(l.workspaces[0].tabs[0].label, "");
+        assert_eq!(l.workspaces[0].tabs[0].pane_label(t.pane_id), None);
         b.shutdown_all();
     }
 
