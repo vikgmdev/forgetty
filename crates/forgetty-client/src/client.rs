@@ -1,0 +1,1301 @@
+//! Connection supervisor, request correlation, input queue and handle.
+//!
+//! Layout of one connection (a "session"):
+//!
+//! - Control bi stream: a writer task (frames from `Link::control_tx`) and a
+//!   reader task (Response / Failure / Event).
+//! - Input uni stream: a writer task draining the shared input queue.
+//! - Pane output uni streams: an acceptor task hands each stream to a
+//!   `pane_reader` task, which feeds the `PaneStream` channel and tracks the
+//!   absolute offset.
+//! - An init task re-subscribes events and re-attaches every live pane with
+//!   its last offset, then releases the input writer.
+//!
+//! The supervisor owns the sessions. When one ends it aborts and joins every
+//! task of that session before it redials, so no stale reader can touch pane
+//! offsets afterwards.
+
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
+
+use forgetty_proto::{
+    cap, close_code, decode_msg, encode_input_frame, encode_msg, error_code, from_value, method,
+    read_frame_into, read_msg, read_output_frame, to_value, write_frame, write_msg,
+    AttachPaneParams, ControlMsg, DetachPaneParams, HandshakeReply, Hello, PaneStreamHeader,
+    ResizePaneParams, ServerEvent, Value, Welcome, ALPN_RPC, INPUT_BUFFER_CAP,
+    NETWORK_CHANGE_PONG_MS, PING_INTERVAL_MS, PONG_DEAD_AFTER_MS, PROTO_MAJOR,
+    RECONNECT_BACKOFF_MS,
+};
+use iroh::endpoint::{Connection, ConnectionError, RecvStream, SendStream};
+use iroh::{Endpoint, EndpointAddr, SecretKey};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, Notify};
+use tokio::task::JoinSet;
+use tracing::{debug, info, warn};
+use uuid::Uuid;
+
+use crate::addr_cache::AddrCache;
+use crate::config::{transport_config, ClientInfo, ClientOptions};
+use crate::error::ClientError;
+use crate::state::ConnectionState;
+
+/// QUIC send priority of the control and input streams. Pane output uses the
+/// default 0, so a keystroke or a request is never queued behind output.
+const HIGH_PRIORITY: i32 = 100;
+
+/// Largest input slice per frame. With the 64 KiB cap that is exactly four
+/// frames.
+const INPUT_CHUNK: usize = 16 * 1024;
+
+/// A session shorter than this counts as a failed dial for backoff purposes.
+const MIN_HEALTHY_SESSION: Duration = Duration::from_secs(1);
+
+// ---------------------------------------------------------------------------
+// Public item types
+// ---------------------------------------------------------------------------
+
+/// One item of a [`PaneStream`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaneItem {
+    /// The server asked for a VT reset: first attach, or the offset was older
+    /// than the log. Reset the terminal state, then apply the bytes that
+    /// follow. `rows` and `cols` are the PTY size now.
+    Reset {
+        /// PTY rows.
+        rows: u16,
+        /// PTY columns.
+        cols: u16,
+    },
+    /// PTY bytes. `offset` is the absolute pane offset of `bytes[0]`.
+    Data {
+        /// Absolute offset of the first byte.
+        offset: u64,
+        /// The bytes.
+        bytes: Vec<u8>,
+    },
+    /// The server finished the stream: the pane closed (or no longer exists).
+    Ended,
+}
+
+/// One item of an [`EventStream`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum EventItem {
+    /// An event from the server.
+    Server {
+        /// Event sequence number.
+        seq: u64,
+        /// The event.
+        event: ServerEvent,
+    },
+    /// Events may have been missed (reconnect or lag). Refetch `get_layout`.
+    Resynced,
+}
+
+/// Stream of server events. Created by [`ClientHandle::events`].
+pub struct EventStream {
+    rx: broadcast::Receiver<EventItem>,
+}
+
+impl EventStream {
+    /// Next event. `None` after the client is closed.
+    pub async fn next(&mut self) -> Option<EventItem> {
+        match self.rx.recv().await {
+            Ok(item) => Some(item),
+            Err(broadcast::error::RecvError::Lagged(_)) => Some(EventItem::Resynced),
+            Err(broadcast::error::RecvError::Closed) => None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared state
+// ---------------------------------------------------------------------------
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+type Pending = Result<Value, ClientError>;
+
+/// One live connection, as seen by request callers.
+pub(crate) struct Link {
+    gen: u64,
+    control_tx: mpsc::UnboundedSender<Vec<u8>>,
+    pending: Mutex<HashMap<u64, oneshot::Sender<Pending>>>,
+    caps: HashSet<String>,
+    conn: Connection,
+    /// Set when `session_init` finished: events and panes are resumed.
+    resumed: AtomicBool,
+    /// When the last `Pong` arrived (session start counts as one).
+    last_pong: Mutex<Instant>,
+    /// Highest `Ping` nonce answered so far.
+    pong_tx: watch::Sender<u64>,
+}
+
+impl Link {
+    fn has_cap(&self, c: &str) -> bool {
+        self.caps.contains(c)
+    }
+
+    fn complete(&self, id: u64, result: Pending) {
+        if let Some(tx) = lock(&self.pending).remove(&id) {
+            let _ = tx.send(result);
+        }
+    }
+
+    fn fail_all(&self, err: ClientError) {
+        let drained: Vec<_> = lock(&self.pending).drain().collect();
+        for (_, tx) in drained {
+            let _ = tx.send(Err(err.clone()));
+        }
+    }
+}
+
+pub(crate) struct PaneState {
+    /// Session generation that owns the stream now.
+    gen: u64,
+    /// Next expected absolute offset. `None` until the first header.
+    offset: Option<u64>,
+}
+
+pub(crate) struct PaneShared {
+    id: Uuid,
+    tx: mpsc::Sender<PaneItem>,
+    state: Mutex<PaneState>,
+    /// Generation of the link this pane is attached on (0 = none). Held across
+    /// the attach request so two paths never attach twice.
+    attached_gen: Arc<tokio::sync::Mutex<u64>>,
+}
+
+/// One input frame kept until the server acks it.
+struct InFrame {
+    seq: u64,
+    /// Encoded payload `[uuid][seq][bytes]`.
+    payload: Arc<Vec<u8>>,
+    /// Input bytes inside (what the 64 KiB cap counts).
+    len: usize,
+}
+
+struct InputState {
+    /// Unacked frames in `seq` order.
+    frames: VecDeque<InFrame>,
+    /// Sum of `len` over `frames`.
+    bytes: usize,
+    next_seq: u64,
+}
+
+struct InputQueue {
+    state: Mutex<InputState>,
+    ready: Notify,
+    space: Notify,
+}
+
+impl InputQueue {
+    /// Drop every frame the server wrote to a PTY (`seq <= acked`).
+    fn ack(&self, acked: u64) {
+        let mut st = lock(&self.state);
+        let mut freed = false;
+        while st.frames.front().is_some_and(|f| f.seq <= acked) {
+            let f = st.frames.pop_front().expect("front checked");
+            st.bytes -= f.len;
+            freed = true;
+        }
+        drop(st);
+        if freed {
+            self.space.notify_waiters();
+        }
+    }
+}
+
+pub(crate) struct Shared {
+    endpoint: Endpoint,
+    server: EndpointAddr,
+    info: ClientInfo,
+    opts: ClientOptions,
+    state_tx: watch::Sender<ConnectionState>,
+    link_tx: watch::Sender<Option<Arc<Link>>>,
+    next_req: AtomicU64,
+    next_gen: AtomicU64,
+    panes: Mutex<HashMap<Uuid, Arc<PaneShared>>>,
+    input: InputQueue,
+    events_tx: broadcast::Sender<EventItem>,
+    events_wanted: AtomicBool,
+    events_gen: Arc<tokio::sync::Mutex<u64>>,
+    ever_connected: AtomicBool,
+    welcome: Mutex<Option<Welcome>>,
+    shutdown_tx: watch::Sender<bool>,
+    kick: Notify,
+    /// Wakes the liveness task for an immediate `Ping`.
+    ping_now: Notify,
+    next_nonce: AtomicU64,
+    /// Random per `spawn`: the `Hello.input_epoch`.
+    input_epoch: Uuid,
+}
+
+// ---------------------------------------------------------------------------
+// Public handle
+// ---------------------------------------------------------------------------
+
+/// Entry points of the crate.
+pub struct Client;
+
+impl Client {
+    /// Connect with default options and wait for the first handshake.
+    ///
+    /// Returns `Err` when the connection fails for good (`proto_mismatch`,
+    /// `not_authorized`). A server that is merely unreachable keeps the call
+    /// waiting while the supervisor retries: wrap the call in a timeout, or
+    /// use [`Client::spawn`] to get the handle at once.
+    pub async fn connect(
+        server: EndpointAddr,
+        identity: SecretKey,
+        info: ClientInfo,
+    ) -> Result<ClientHandle, ClientError> {
+        Self::connect_with(server, identity, info, ClientOptions::default()).await
+    }
+
+    /// [`Client::connect`] with explicit options.
+    pub async fn connect_with(
+        server: EndpointAddr,
+        identity: SecretKey,
+        info: ClientInfo,
+        opts: ClientOptions,
+    ) -> Result<ClientHandle, ClientError> {
+        let handle = Self::spawn(server, identity, info, opts).await?;
+        let mut rx = handle.watch_state();
+        loop {
+            let state = rx.borrow_and_update().clone();
+            match state {
+                ConnectionState::Connected => return Ok(handle),
+                ConnectionState::Failed(reason) => return Err(ClientError::Failed(reason)),
+                ConnectionState::Closed => return Err(ClientError::Closed),
+                ConnectionState::Reconnecting { .. } => {}
+            }
+            if rx.changed().await.is_err() {
+                return Err(ClientError::Closed);
+            }
+        }
+    }
+
+    /// Bind the endpoint, start the supervisor and return at once. The state
+    /// starts as `Reconnecting`; watch it with [`ClientHandle::watch_state`].
+    pub async fn spawn(
+        server: EndpointAddr,
+        identity: SecretKey,
+        info: ClientInfo,
+        opts: ClientOptions,
+    ) -> Result<ClientHandle, ClientError> {
+        let endpoint = Endpoint::empty_builder()
+            .secret_key(identity)
+            .relay_mode(opts.relay.mode(&server))
+            .transport_config(transport_config())
+            .bind()
+            .await
+            .map_err(|e| ClientError::Setup(e.to_string()))?;
+
+        let (state_tx, _) = watch::channel(ConnectionState::Reconnecting { since: Instant::now() });
+        let (link_tx, _) = watch::channel(None);
+        let (events_tx, _) = broadcast::channel(opts.event_buffer.max(16));
+        let (shutdown_tx, _) = watch::channel(false);
+        let shared = Arc::new(Shared {
+            endpoint,
+            server,
+            info,
+            opts,
+            state_tx,
+            link_tx,
+            next_req: AtomicU64::new(1),
+            next_gen: AtomicU64::new(0),
+            panes: Mutex::new(HashMap::new()),
+            input: InputQueue {
+                state: Mutex::new(InputState { frames: VecDeque::new(), bytes: 0, next_seq: 1 }),
+                ready: Notify::new(),
+                space: Notify::new(),
+            },
+            events_tx,
+            events_wanted: AtomicBool::new(false),
+            events_gen: Arc::new(tokio::sync::Mutex::new(0)),
+            ever_connected: AtomicBool::new(false),
+            welcome: Mutex::new(None),
+            shutdown_tx,
+            kick: Notify::new(),
+            ping_now: Notify::new(),
+            next_nonce: AtomicU64::new(1),
+            input_epoch: Uuid::new_v4(),
+        });
+        let supervisor = tokio::spawn(supervise(shared.clone()));
+        Ok(ClientHandle {
+            inner: Arc::new(HandleInner { shared, supervisor: Mutex::new(Some(supervisor)) }),
+        })
+    }
+}
+
+struct HandleInner {
+    shared: Arc<Shared>,
+    supervisor: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl Drop for HandleInner {
+    fn drop(&mut self) {
+        // Last handle gone: stop the supervisor, it closes the endpoint.
+        self.shared.shutdown_tx.send_replace(true);
+    }
+}
+
+/// Cheap, cloneable handle to a running client.
+#[derive(Clone)]
+pub struct ClientHandle {
+    inner: Arc<HandleInner>,
+}
+
+impl ClientHandle {
+    fn shared(&self) -> &Arc<Shared> {
+        &self.inner.shared
+    }
+
+    /// Current connection state.
+    pub fn state(&self) -> ConnectionState {
+        self.shared().state_tx.borrow().clone()
+    }
+
+    /// Observe connection state changes.
+    pub fn watch_state(&self) -> watch::Receiver<ConnectionState> {
+        self.shared().state_tx.subscribe()
+    }
+
+    /// `Welcome` of the latest handshake.
+    pub fn welcome(&self) -> Option<Welcome> {
+        lock(&self.shared().welcome).clone()
+    }
+
+    /// `true` when both sides listed the capability in the current session.
+    pub fn has_capability(&self, name: &str) -> bool {
+        self.shared().link_tx.borrow().as_ref().is_some_and(|l| l.has_cap(name))
+    }
+
+    /// The direct addresses learned so far. Persist the snapshot and pass it
+    /// back in `ClientOptions::addr_cache` on the next start.
+    pub fn addr_cache(&self) -> AddrCache {
+        self.shared().opts.addr_cache.clone()
+    }
+
+    /// The local iroh endpoint id (the device id the server registers).
+    pub fn endpoint_id(&self) -> iroh::EndpointId {
+        self.shared().endpoint.id()
+    }
+
+    /// Call a method and wait for the result, with the default timeout. Waits
+    /// for a connection if there is none, within the same timeout.
+    pub async fn request(&self, method: &str, params: Value) -> Result<Value, ClientError> {
+        self.request_with_timeout(method, params, self.shared().opts.request_timeout).await
+    }
+
+    /// [`ClientHandle::request`] with an explicit timeout.
+    pub async fn request_with_timeout(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, ClientError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let shared = self.shared();
+        let link = wait_link(shared, deadline).await?;
+        call(shared, &link, method, params, deadline).await
+    }
+
+    /// Typed variant of [`ClientHandle::request`].
+    pub async fn request_typed<P: serde::Serialize, R: serde::de::DeserializeOwned>(
+        &self,
+        method: &str,
+        params: &P,
+    ) -> Result<R, ClientError> {
+        let value = self.request(method, to_value(params)?).await?;
+        Ok(from_value(value)?)
+    }
+
+    /// Subscribe to server events. The first call sends `subscribe_events`.
+    /// After every reconnect the client subscribes again and yields
+    /// [`EventItem::Resynced`].
+    pub async fn events(&self) -> Result<EventStream, ClientError> {
+        let shared = self.shared();
+        let rx = shared.events_tx.subscribe();
+        shared.events_wanted.store(true, Ordering::SeqCst);
+        let link = shared.link_tx.borrow().clone();
+        if let Some(link) = link {
+            let deadline = tokio::time::Instant::now() + shared.opts.request_timeout;
+            match ensure_subscribed(shared, &link, deadline).await {
+                Ok(()) => {}
+                // The supervisor subscribes again on the next connection.
+                Err(ClientError::ConnectionLost | ClientError::Timeout) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(EventStream { rx })
+    }
+
+    /// Attach a pane output stream. The stream survives reconnects: the
+    /// client re-attaches it with the last offset.
+    ///
+    /// If there is no connection right now the call still succeeds and the
+    /// attach happens on the next connection.
+    pub async fn attach_pane(&self, pane_id: Uuid) -> Result<PaneStream, ClientError> {
+        let shared = self.shared();
+        let (tx, rx) = mpsc::channel(shared.opts.pane_buffer.max(2));
+        let pane = Arc::new(PaneShared {
+            id: pane_id,
+            tx,
+            state: Mutex::new(PaneState { gen: 0, offset: None }),
+            attached_gen: Arc::new(tokio::sync::Mutex::new(0)),
+        });
+        {
+            let mut panes = lock(&shared.panes);
+            if panes.contains_key(&pane_id) {
+                return Err(ClientError::PaneAlreadyAttached);
+            }
+            panes.insert(pane_id, pane.clone());
+        }
+        let stream = PaneStream { pane: pane.clone(), rx, client: self.clone(), ended: false };
+        let link = shared.link_tx.borrow().clone();
+        if let Some(link) = link {
+            let deadline = tokio::time::Instant::now() + shared.opts.request_timeout;
+            match ensure_attached(shared, &link, &pane, deadline).await {
+                Ok(()) => {}
+                Err(ClientError::ConnectionLost | ClientError::Timeout) => {}
+                Err(e) => return Err(e), // `stream` drops and unregisters the pane
+            }
+        }
+        Ok(stream)
+    }
+
+    /// Send keyboard input to a pane on the dedicated input stream.
+    ///
+    /// While disconnected the bytes are buffered (64 KiB cap) and sent in
+    /// order after the connection resumes. Returns `InputBufferFull` when the
+    /// cap would be exceeded while disconnected. While connected the call
+    /// waits for room instead.
+    pub async fn send_input(&self, pane_id: Uuid, bytes: &[u8]) -> Result<(), ClientError> {
+        let shared = self.shared();
+        if self.state() == ConnectionState::Closed {
+            return Err(ClientError::Closed);
+        }
+        let disconnected = !self.state().is_connected();
+        if disconnected && lock(&shared.input.state).bytes + bytes.len() > INPUT_BUFFER_CAP {
+            return Err(ClientError::InputBufferFull);
+        }
+        for chunk in bytes.chunks(INPUT_CHUNK) {
+            loop {
+                let space = shared.input.space.notified();
+                tokio::pin!(space);
+                space.as_mut().enable();
+                {
+                    let mut st = lock(&shared.input.state);
+                    if st.bytes + chunk.len() <= INPUT_BUFFER_CAP || st.frames.is_empty() {
+                        let seq = st.next_seq;
+                        st.next_seq += 1;
+                        st.bytes += chunk.len();
+                        st.frames.push_back(InFrame {
+                            seq,
+                            payload: Arc::new(encode_input_frame(pane_id, seq, chunk)),
+                            len: chunk.len(),
+                        });
+                        shared.input.ready.notify_one();
+                        break;
+                    }
+                }
+                if !self.state().is_connected() {
+                    return Err(ClientError::InputBufferFull);
+                }
+                // Full of unacked frames: ask for an ack now, then wait.
+                shared.ping_now.notify_one();
+                space.await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Input bytes sent or buffered but not yet acked by the server.
+    pub fn unacked_input_bytes(&self) -> usize {
+        lock(&self.shared().input.state).bytes
+    }
+
+    /// Tell the server the size this client wants for a pane (`resize_pane`).
+    pub async fn resize(&self, pane_id: Uuid, rows: u16, cols: u16) -> Result<(), ClientError> {
+        let params = to_value(&ResizePaneParams { pane_id, rows, cols })?;
+        self.request(method::RESIZE_PANE, params).await.map(|_| ())
+    }
+
+    /// Detach a pane (same as dropping its `PaneStream`).
+    pub async fn detach_pane(&self, pane_id: Uuid) -> Result<(), ClientError> {
+        let shared = self.shared();
+        lock(&shared.panes).remove(&pane_id);
+        let link = shared.link_tx.borrow().clone();
+        if let Some(link) = link {
+            let deadline = tokio::time::Instant::now() + shared.opts.request_timeout;
+            let params = to_value(&DetachPaneParams { pane_id })?;
+            call(shared, &link, method::DETACH_PANE, params, deadline).await?;
+        }
+        Ok(())
+    }
+
+    /// Call when the OS reports a network change (Wi-Fi to LTE). Tells iroh to
+    /// re-probe paths, sends a `Ping` at once and redials if no `Pong` comes
+    /// back within 1 s.
+    pub async fn network_changed(&self) {
+        let shared = self.shared();
+        // Probe first: `network_change` can take long on a dead network, and
+        // must not delay the Ping.
+        let link = shared.link_tx.borrow().clone();
+        let endpoint = shared.endpoint.clone();
+        tokio::spawn(async move { endpoint.network_change().await });
+        let Some(link) = link else { return };
+        let nonce = shared.next_nonce.fetch_add(1, Ordering::Relaxed);
+        let mut pong_rx = link.pong_tx.subscribe();
+        if send_ping(&link, nonce).is_err() {
+            return;
+        }
+        let wait = pong_rx.wait_for(|n| *n >= nonce);
+        let limit = Duration::from_millis(NETWORK_CHANGE_PONG_MS);
+        if !matches!(tokio::time::timeout(limit, wait).await, Ok(Ok(_))) {
+            info!("client: no Pong after network change, redialing");
+            link.conn.close(close_code::OK.into(), b"network changed");
+        }
+    }
+
+    /// Drop the current connection (if any) and redial at once.
+    pub fn reconnect_now(&self) {
+        let shared = self.shared();
+        let link = shared.link_tx.borrow().clone();
+        match link {
+            Some(link) => link.conn.close(close_code::OK.into(), b"reconnect"),
+            None => shared.kick.notify_one(),
+        }
+    }
+
+    /// Stop the client and close the endpoint.
+    pub async fn close(&self) {
+        let shared = self.shared();
+        shared.shutdown_tx.send_replace(true);
+        let join = lock(&self.inner.supervisor).take();
+        if let Some(join) = join {
+            let _ = join.await;
+        }
+        shared.state_tx.send_replace(ConnectionState::Closed);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PaneStream
+// ---------------------------------------------------------------------------
+
+/// Output of one pane, with resume. Created by [`ClientHandle::attach_pane`].
+///
+/// Dropping it detaches the pane.
+pub struct PaneStream {
+    pane: Arc<PaneShared>,
+    rx: mpsc::Receiver<PaneItem>,
+    client: ClientHandle,
+    ended: bool,
+}
+
+impl PaneStream {
+    /// The pane id.
+    pub fn pane_id(&self) -> Uuid {
+        self.pane.id
+    }
+
+    /// Next item. `None` after [`PaneItem::Ended`] or when the client closed.
+    pub async fn next(&mut self) -> Option<PaneItem> {
+        if self.ended {
+            return None;
+        }
+        let item = self.rx.recv().await;
+        if matches!(item, Some(PaneItem::Ended)) {
+            self.ended = true;
+        }
+        item
+    }
+
+    /// Absolute offset of the next byte this stream will yield. `None` before
+    /// the first stream header arrived.
+    pub fn offset(&self) -> Option<u64> {
+        lock(&self.pane.state).offset
+    }
+}
+
+impl Drop for PaneStream {
+    fn drop(&mut self) {
+        let shared = self.client.shared().clone();
+        let removed = {
+            let mut panes = lock(&shared.panes);
+            match panes.get(&self.pane.id) {
+                Some(p) if Arc::ptr_eq(p, &self.pane) => {
+                    panes.remove(&self.pane.id);
+                    true
+                }
+                _ => false,
+            }
+        };
+        if !removed || self.ended {
+            return;
+        }
+        let link = shared.link_tx.borrow().clone();
+        if let (Some(link), Ok(rt)) = (link, tokio::runtime::Handle::try_current()) {
+            let id = self.pane.id;
+            rt.spawn(async move {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                if let Ok(params) = to_value(&DetachPaneParams { pane_id: id }) {
+                    let _ = call(&shared, &link, method::DETACH_PANE, params, deadline).await;
+                }
+            });
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Requests
+// ---------------------------------------------------------------------------
+
+/// Wait until a link exists, the client failed, or the deadline passes.
+async fn wait_link(
+    shared: &Shared,
+    deadline: tokio::time::Instant,
+) -> Result<Arc<Link>, ClientError> {
+    let mut link_rx = shared.link_tx.subscribe();
+    let mut state_rx = shared.state_tx.subscribe();
+    loop {
+        let link = link_rx.borrow_and_update().clone();
+        if let Some(link) = link {
+            return Ok(link);
+        }
+        let state = state_rx.borrow_and_update().clone();
+        match state {
+            ConnectionState::Failed(reason) => return Err(ClientError::Failed(reason)),
+            ConnectionState::Closed => return Err(ClientError::Closed),
+            _ => {}
+        }
+        let changed = async {
+            tokio::select! {
+                _ = link_rx.changed() => {}
+                _ = state_rx.changed() => {}
+            }
+        };
+        if tokio::time::timeout_at(deadline, changed).await.is_err() {
+            return Err(ClientError::NotConnected);
+        }
+    }
+}
+
+/// Queue a request on `link`. The receiver resolves with the answer.
+fn send_request(
+    shared: &Shared,
+    link: &Link,
+    method: &str,
+    params: Value,
+) -> Result<(u64, oneshot::Receiver<Pending>), ClientError> {
+    let id = shared.next_req.fetch_add(1, Ordering::Relaxed);
+    let frame = encode_msg(&ControlMsg::Request { id, method: method.to_string(), params })?;
+    let (tx, rx) = oneshot::channel();
+    lock(&link.pending).insert(id, tx);
+    if link.control_tx.send(frame).is_err() {
+        lock(&link.pending).remove(&id);
+        return Err(ClientError::ConnectionLost);
+    }
+    Ok((id, rx))
+}
+
+async fn await_answer(
+    link: &Link,
+    id: u64,
+    rx: oneshot::Receiver<Pending>,
+    deadline: tokio::time::Instant,
+) -> Result<Value, ClientError> {
+    match tokio::time::timeout_at(deadline, rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err(ClientError::ConnectionLost),
+        Err(_) => {
+            lock(&link.pending).remove(&id);
+            Err(ClientError::Timeout)
+        }
+    }
+}
+
+async fn call(
+    shared: &Shared,
+    link: &Link,
+    method: &str,
+    params: Value,
+    deadline: tokio::time::Instant,
+) -> Result<Value, ClientError> {
+    let (id, rx) = send_request(shared, link, method, params)?;
+    await_answer(link, id, rx, deadline).await
+}
+
+async fn ensure_subscribed(
+    shared: &Shared,
+    link: &Arc<Link>,
+    deadline: tokio::time::Instant,
+) -> Result<(), ClientError> {
+    let mut guard = shared.events_gen.lock().await;
+    if *guard == link.gen {
+        return Ok(());
+    }
+    call(shared, link, method::SUBSCRIBE_EVENTS, Value::Map(vec![]), deadline).await?;
+    *guard = link.gen;
+    Ok(())
+}
+
+async fn ensure_attached(
+    shared: &Shared,
+    link: &Arc<Link>,
+    pane: &Arc<PaneShared>,
+    deadline: tokio::time::Instant,
+) -> Result<(), ClientError> {
+    let mut guard = pane.attached_gen.lock().await;
+    if *guard == link.gen {
+        return Ok(());
+    }
+    let params = attach_params(link, pane)?;
+    call(shared, link, method::ATTACH_PANE, params, deadline).await?;
+    *guard = link.gen;
+    Ok(())
+}
+
+fn attach_params(link: &Link, pane: &PaneShared) -> Result<Value, ClientError> {
+    let from_offset = if link.has_cap(cap::RESUME) { lock(&pane.state).offset } else { None };
+    Ok(to_value(&AttachPaneParams { pane_id: pane.id, from_offset })?)
+}
+
+// ---------------------------------------------------------------------------
+// Supervisor
+// ---------------------------------------------------------------------------
+
+enum DialError {
+    Transient(String),
+    Fatal(String),
+}
+
+struct Established {
+    conn: Connection,
+    send: SendStream,
+    recv: RecvStream,
+    welcome: Welcome,
+}
+
+enum SessionEnd {
+    Lost(String),
+    Fatal(String),
+    Shutdown,
+}
+
+enum TaskEnd {
+    Done,
+    Lost(String),
+}
+
+fn backoff(failures: usize) -> Duration {
+    Duration::from_millis(RECONNECT_BACKOFF_MS[failures.min(RECONNECT_BACKOFF_MS.len() - 1)])
+}
+
+async fn supervise(shared: Arc<Shared>) {
+    let mut shutdown = shared.shutdown_tx.subscribe();
+    let mut failures = 0usize;
+    let mut final_state = ConnectionState::Closed;
+    loop {
+        if *shutdown.borrow() {
+            break;
+        }
+        let attempt = tokio::time::timeout(shared.opts.dial_timeout, dial(&shared));
+        let result = tokio::select! {
+            r = attempt => r,
+            _ = shutdown.changed() => continue,
+        };
+        let delay = match result {
+            Ok(Ok(est)) => {
+                let started = Instant::now();
+                let (end, resumed) = run_session(&shared, est, &mut shutdown).await;
+                match end {
+                    SessionEnd::Shutdown => break,
+                    SessionEnd::Fatal(reason) => {
+                        warn!("client: connection failed for good: {reason}");
+                        final_state = ConnectionState::Failed(reason);
+                        break;
+                    }
+                    SessionEnd::Lost(reason) => {
+                        info!("client: connection lost ({reason}), redialing");
+                    }
+                }
+                shared
+                    .state_tx
+                    .send_replace(ConnectionState::Reconnecting { since: Instant::now() });
+                // A session that resumed (or lasted) counts as healthy, so the
+                // redial is immediate. One that died before it resumed backs
+                // off, so a broken server is not hammered.
+                if resumed || started.elapsed() >= MIN_HEALTHY_SESSION {
+                    failures = 0;
+                    None
+                } else {
+                    failures += 1;
+                    Some(backoff(failures - 1))
+                }
+            }
+            Ok(Err(DialError::Fatal(reason))) => {
+                warn!("client: dial failed for good: {reason}");
+                final_state = ConnectionState::Failed(reason);
+                break;
+            }
+            Ok(Err(DialError::Transient(reason))) => {
+                debug!("client: dial failed: {reason}");
+                let d = backoff(failures);
+                failures += 1;
+                Some(d)
+            }
+            Err(_) => {
+                debug!("client: dial timed out");
+                let d = backoff(failures);
+                failures += 1;
+                Some(d)
+            }
+        };
+        if let Some(delay) = delay {
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                _ = shutdown.changed() => {}
+                _ = shared.kick.notified() => {}
+            }
+        }
+    }
+    shared.link_tx.send_replace(None);
+    shared.endpoint.close().await;
+    shared.state_tx.send_replace(final_state);
+}
+
+async fn dial(shared: &Shared) -> Result<Established, DialError> {
+    // Cached direct address first; the relay in the server address runs in
+    // parallel (iroh tries every address).
+    let mut target = shared.server.clone();
+    if let Some(ip) = shared.opts.addr_cache.get(target.id) {
+        target = target.with_ip_addr(ip);
+    }
+    let conn = shared
+        .endpoint
+        .connect(target, ALPN_RPC)
+        .await
+        .map_err(|e| DialError::Transient(e.to_string()))?;
+    match handshake(shared, &conn).await {
+        Ok((send, recv, welcome)) => Ok(Established { conn, send, recv, welcome }),
+        Err(e) => {
+            conn.close(close_code::OK.into(), b"handshake failed");
+            Err(e)
+        }
+    }
+}
+
+/// Did the peer close the connection with `not_authorized`?
+async fn closed_not_authorized(conn: &Connection) -> bool {
+    let reason = match conn.close_reason() {
+        Some(r) => Some(r),
+        None => tokio::time::timeout(Duration::from_millis(500), conn.closed()).await.ok(),
+    };
+    matches!(
+        reason,
+        Some(ConnectionError::ApplicationClosed(c))
+            if u64::from(c.error_code) == u64::from(close_code::NOT_AUTHORIZED)
+    )
+}
+
+async fn handshake(
+    shared: &Shared,
+    conn: &Connection,
+) -> Result<(SendStream, RecvStream, Welcome), DialError> {
+    let transient = |e: String| DialError::Transient(e);
+    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| transient(e.to_string()))?;
+    let _ = send.set_priority(HIGH_PRIORITY);
+    let info = &shared.info;
+    let hello = Hello::new(
+        info.client_id,
+        shared.input_epoch,
+        info.kind,
+        info.name.clone(),
+        info.version.clone(),
+        info.capabilities.clone(),
+    );
+    if let Err(e) = write_msg(&mut send, &hello).await {
+        return Err(if closed_not_authorized(conn).await {
+            DialError::Fatal("not_authorized: pair this device first".into())
+        } else {
+            transient(e.to_string())
+        });
+    }
+    match read_msg::<_, HandshakeReply>(&mut recv).await {
+        Ok(Some(HandshakeReply::Welcome(w))) => {
+            if w.proto_major != PROTO_MAJOR {
+                return Err(DialError::Fatal(format!(
+                    "{}: server speaks protocol {}",
+                    error_code::PROTO_MISMATCH,
+                    w.proto_major
+                )));
+            }
+            Ok((send, recv, w))
+        }
+        Ok(Some(HandshakeReply::Error(e))) => {
+            Err(DialError::Fatal(format!("{}: {}", e.code, e.message)))
+        }
+        Ok(None) | Err(_) => Err(if closed_not_authorized(conn).await {
+            DialError::Fatal("not_authorized: pair this device first".into())
+        } else {
+            transient("handshake stream closed".into())
+        }),
+    }
+}
+
+async fn run_session(
+    shared: &Arc<Shared>,
+    est: Established,
+    shutdown: &mut watch::Receiver<bool>,
+) -> (SessionEnd, bool) {
+    let Established { conn, send, recv, welcome } = est;
+    let gen = shared.next_gen.fetch_add(1, Ordering::SeqCst) + 1;
+
+    let caps: HashSet<String> = welcome
+        .capabilities
+        .iter()
+        .filter(|c| shared.info.capabilities.contains(c))
+        .cloned()
+        .collect();
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let link = Arc::new(Link {
+        gen,
+        control_tx,
+        pending: Mutex::new(HashMap::new()),
+        caps,
+        conn: conn.clone(),
+        resumed: AtomicBool::new(false),
+        last_pong: Mutex::new(Instant::now()),
+        pong_tx: watch::channel(0).0,
+    });
+
+    let input_send = match conn.open_uni().await {
+        Ok(s) => {
+            let _ = s.set_priority(HIGH_PRIORITY);
+            s
+        }
+        Err(e) => {
+            conn.close(close_code::OK.into(), b"no input stream");
+            return (SessionEnd::Lost(e.to_string()), false);
+        }
+    };
+
+    let (stream_tx, mut stream_rx) = mpsc::unbounded_channel::<RecvStream>();
+    let (resumed_tx, resumed_rx) = oneshot::channel();
+    let mut tasks: JoinSet<TaskEnd> = JoinSet::new();
+    tasks.spawn(control_writer(send, control_rx));
+    tasks.spawn(control_reader(link.clone(), shared.clone(), recv));
+    tasks.spawn(input_writer(shared.clone(), input_send, resumed_rx));
+    tasks.spawn(accept_streams(conn.clone(), stream_tx));
+    tasks.spawn(session_init(shared.clone(), link.clone(), resumed_tx));
+    tasks.spawn(liveness(shared.clone(), link.clone()));
+
+    *lock(&shared.welcome) = Some(welcome);
+    shared.link_tx.send_replace(Some(link.clone()));
+    shared.state_tx.send_replace(ConnectionState::Connected);
+    shared.ever_connected.store(true, Ordering::SeqCst);
+
+    let end = loop {
+        tokio::select! {
+            Some(recv) = stream_rx.recv() => {
+                tasks.spawn(pane_reader(shared.clone(), gen, recv));
+            }
+            res = tasks.join_next() => match res {
+                Some(Ok(TaskEnd::Done)) => {}
+                Some(Ok(TaskEnd::Lost(reason))) => break SessionEnd::Lost(reason),
+                Some(Err(e)) => break SessionEnd::Lost(format!("task failed: {e}")),
+                None => break SessionEnd::Lost("no tasks left".into()),
+            },
+            reason = conn.closed() => break SessionEnd::Lost(reason.to_string()),
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    break SessionEnd::Shutdown;
+                }
+            }
+        }
+    };
+
+    // Tear down: nothing of this session may run after this point.
+    shared.link_tx.send_replace(None);
+    link.fail_all(ClientError::ConnectionLost);
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
+    let resumed = link.resumed.load(Ordering::SeqCst);
+    let not_authorized = matches!(
+        conn.close_reason(),
+        Some(ConnectionError::ApplicationClosed(c))
+            if u64::from(c.error_code) == u64::from(close_code::NOT_AUTHORIZED)
+    );
+    conn.close(close_code::OK.into(), b"bye");
+    if not_authorized {
+        let reason = "not_authorized: this device was revoked or not paired".to_string();
+        return (SessionEnd::Fatal(reason), resumed);
+    }
+    (end, resumed)
+}
+
+// ---------------------------------------------------------------------------
+// Session tasks
+// ---------------------------------------------------------------------------
+
+async fn control_writer(mut send: SendStream, mut rx: mpsc::UnboundedReceiver<Vec<u8>>) -> TaskEnd {
+    while let Some(frame) = rx.recv().await {
+        if let Err(e) = write_frame(&mut send, &frame).await {
+            return TaskEnd::Lost(format!("control write: {e}"));
+        }
+    }
+    TaskEnd::Done
+}
+
+async fn control_reader(link: Arc<Link>, shared: Arc<Shared>, mut recv: RecvStream) -> TaskEnd {
+    let mut buf = Vec::new();
+    loop {
+        match read_frame_into(&mut recv, &mut buf).await {
+            Ok(true) => match decode_msg::<ControlMsg>(&buf) {
+                Ok(ControlMsg::Response { id, result }) => link.complete(id, Ok(result)),
+                Ok(ControlMsg::Failure { id, code, message }) => {
+                    link.complete(id, Err(ClientError::Server { code, message }))
+                }
+                Ok(ControlMsg::Event { seq, event }) => {
+                    let _ = shared.events_tx.send(EventItem::Server { seq, event });
+                }
+                Ok(ControlMsg::Pong { nonce, input_acked }) => {
+                    *lock(&link.last_pong) = Instant::now();
+                    link.pong_tx.send_modify(|n| *n = (*n).max(nonce));
+                    shared.input.ack(input_acked);
+                }
+                Ok(ControlMsg::Request { .. } | ControlMsg::Ping { .. }) => {
+                    warn!("client: server sent a client-only message, ignored")
+                }
+                // An event type this version does not know. The frame is
+                // length delimited, so skipping it is safe.
+                Err(e) => warn!("client: undecodable control frame skipped: {e}"),
+            },
+            Ok(false) => return TaskEnd::Lost("control stream closed".into()),
+            Err(e) => return TaskEnd::Lost(format!("control read: {e}")),
+        }
+    }
+}
+
+async fn accept_streams(conn: Connection, tx: mpsc::UnboundedSender<RecvStream>) -> TaskEnd {
+    loop {
+        match conn.accept_uni().await {
+            Ok(stream) => {
+                if tx.send(stream).is_err() {
+                    return TaskEnd::Done;
+                }
+            }
+            Err(e) => return TaskEnd::Lost(format!("accept_uni: {e}")),
+        }
+    }
+}
+
+/// Resume after a (re)connect: events first, then every live pane with its
+/// last offset, then release the input writer (PROTOCOL_V2 section 9).
+async fn session_init(
+    shared: Arc<Shared>,
+    link: Arc<Link>,
+    resumed: oneshot::Sender<()>,
+) -> TaskEnd {
+    let deadline = tokio::time::Instant::now() + shared.opts.request_timeout;
+    let first = link.gen == 1;
+
+    if shared.events_wanted.load(Ordering::SeqCst) {
+        match ensure_subscribed(&shared, &link, deadline).await {
+            Ok(()) => {
+                if !first {
+                    let _ = shared.events_tx.send(EventItem::Resynced);
+                }
+            }
+            Err(e) => return TaskEnd::Lost(format!("subscribe_events: {e}")),
+        }
+    }
+
+    let panes: Vec<Arc<PaneShared>> = lock(&shared.panes).values().cloned().collect();
+    let mut inflight = Vec::new();
+    for pane in panes {
+        let guard = pane.attached_gen.clone().lock_owned().await;
+        if *guard == link.gen {
+            continue;
+        }
+        let sent = attach_params(&link, &pane)
+            .and_then(|params| send_request(&shared, &link, method::ATTACH_PANE, params));
+        match sent {
+            Ok((id, rx)) => inflight.push((pane, guard, id, rx)),
+            Err(e) => return TaskEnd::Lost(format!("attach_pane: {e}")),
+        }
+    }
+    for (pane, mut guard, id, rx) in inflight {
+        match await_answer(&link, id, rx, deadline).await {
+            Ok(_) => *guard = link.gen,
+            Err(ClientError::Server { code, message }) => {
+                warn!("client: pane {} cannot be re-attached: {code} {message}", pane.id);
+                lock(&shared.panes).remove(&pane.id);
+                let tx = pane.tx.clone();
+                tokio::spawn(async move {
+                    let _ = tx.send(PaneItem::Ended).await;
+                });
+            }
+            Err(e) => return TaskEnd::Lost(format!("attach_pane: {e}")),
+        }
+    }
+    link.resumed.store(true, Ordering::SeqCst);
+    let _ = resumed.send(());
+    TaskEnd::Done
+}
+
+/// Send every unacked frame in `seq` order. After a reconnect `sent` starts
+/// at 0, so all unacked frames go out again; the server drops the ones it
+/// already wrote (exactly-once input, PROTOCOL_V2 section 5).
+async fn input_writer(
+    shared: Arc<Shared>,
+    mut send: SendStream,
+    resumed: oneshot::Receiver<()>,
+) -> TaskEnd {
+    if resumed.await.is_err() {
+        return TaskEnd::Done; // init failed, the session is ending
+    }
+    let q = &shared.input;
+    let mut sent = 0u64;
+    loop {
+        let ready = q.ready.notified();
+        tokio::pin!(ready);
+        ready.as_mut().enable();
+        let next = {
+            let st = lock(&q.state);
+            let i = st.frames.partition_point(|f| f.seq <= sent);
+            st.frames.get(i).map(|f| (f.seq, f.payload.clone()))
+        };
+        let Some((seq, payload)) = next else {
+            ready.await;
+            continue;
+        };
+        if let Err(e) = write_frame(&mut send, &payload).await {
+            return TaskEnd::Lost(format!("input write: {e}"));
+        }
+        sent = seq;
+    }
+}
+
+/// Ping every second; declare the connection dead after 3 s without a Pong.
+async fn liveness(shared: Arc<Shared>, link: Arc<Link>) -> TaskEnd {
+    let interval = Duration::from_millis(PING_INTERVAL_MS);
+    let dead_after = Duration::from_millis(PONG_DEAD_AFTER_MS);
+    let mut last_ping: Option<Instant> = None;
+    loop {
+        let due = last_ping.is_none_or(|t| t.elapsed() >= interval);
+        if due {
+            let nonce = shared.next_nonce.fetch_add(1, Ordering::Relaxed);
+            if send_ping(&link, nonce).is_err() {
+                return TaskEnd::Lost("control closed".into());
+            }
+            last_ping = Some(Instant::now());
+            note_direct_addr(&shared, &link.conn);
+        }
+        if lock(&link.last_pong).elapsed() > dead_after {
+            return TaskEnd::Lost("no Pong in 3 s".into());
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+            _ = shared.ping_now.notified() => { last_ping = None; }
+        }
+    }
+}
+
+/// Remember the direct address of the selected path, for the next dial.
+fn note_direct_addr(shared: &Shared, conn: &Connection) {
+    let direct = conn.to_info().paths().into_iter().find_map(|p| match p.remote_addr() {
+        iroh::TransportAddr::Ip(addr) if p.is_selected() => Some(*addr),
+        _ => None,
+    });
+    if let Some(addr) = direct {
+        shared.opts.addr_cache.insert(shared.server.id, addr);
+    }
+}
+
+fn send_ping(link: &Link, nonce: u64) -> Result<(), ClientError> {
+    let frame = encode_msg(&ControlMsg::Ping { nonce })?;
+    link.control_tx.send(frame).map_err(|_| ClientError::ConnectionLost)
+}
+
+/// Feed one pane output stream into its `PaneStream`.
+async fn pane_reader(shared: Arc<Shared>, gen: u64, mut recv: RecvStream) -> TaskEnd {
+    let header: PaneStreamHeader = match read_msg(&mut recv).await {
+        Ok(Some(h)) => h,
+        Ok(None) => return TaskEnd::Done,
+        Err(e) => return TaskEnd::Lost(format!("pane header: {e}")),
+    };
+    let pane = lock(&shared.panes).get(&header.pane_id).cloned();
+    let Some(pane) = pane else {
+        debug!("client: stream for unknown pane {}, stopped", header.pane_id);
+        let _ = recv.stop(0u8.into());
+        return TaskEnd::Done;
+    };
+
+    // Claim the pane for this session. A reset item must reach the consumer
+    // before any byte, so reserve the channel slot first.
+    let Ok(permit) = pane.tx.reserve().await else {
+        return TaskEnd::Done; // PaneStream dropped
+    };
+    {
+        let mut st = lock(&pane.state);
+        if header.reset {
+            st.offset = Some(header.start_offset);
+        } else if st.offset.is_some_and(|o| o != header.start_offset) {
+            return TaskEnd::Lost(format!(
+                "pane {} resumed at {} but expected {:?}",
+                pane.id, header.start_offset, st.offset
+            ));
+        } else {
+            st.offset = Some(header.start_offset);
+        }
+        st.gen = gen;
+        if header.reset {
+            permit.send(PaneItem::Reset { rows: header.rows, cols: header.cols });
+        }
+    }
+
+    let mut buf = Vec::new();
+    loop {
+        match read_output_frame(&mut recv, &mut buf).await {
+            Ok(true) => {
+                let Ok(permit) = pane.tx.reserve().await else {
+                    return TaskEnd::Done;
+                };
+                let mut st = lock(&pane.state);
+                if st.gen != gen {
+                    return TaskEnd::Done; // a newer session owns the pane
+                }
+                let offset = st.offset.unwrap_or(0);
+                st.offset = Some(offset + buf.len() as u64);
+                permit.send(PaneItem::Data { offset, bytes: std::mem::take(&mut buf) });
+            }
+            Ok(false) => {
+                // Clean FIN: the pane closed.
+                if lock(&pane.state).gen == gen {
+                    lock(&shared.panes).remove(&pane.id);
+                    let _ = pane.tx.send(PaneItem::Ended).await;
+                }
+                return TaskEnd::Done;
+            }
+            Err(e) => return TaskEnd::Lost(format!("pane {} read: {e}", pane.id)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_follows_the_contract() {
+        let ms: Vec<u128> = (0..9).map(|i| backoff(i).as_millis()).collect();
+        assert_eq!(ms, [100, 250, 500, 1000, 2000, 2000, 2000, 2000, 2000]);
+    }
+}
