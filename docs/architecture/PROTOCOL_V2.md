@@ -38,9 +38,11 @@ Hello {
 }
 ```
 
-Server answers:
+Server answers with a `HandshakeReply`:
 
 ```
+HandshakeReply = Welcome { ... } | Error { code: String, message: String }
+
 Welcome {
   proto_major: 2, proto_minor: u16,
   server_id: Uuid, server_version: String, hostname: String,
@@ -48,10 +50,21 @@ Welcome {
 }
 ```
 
-Rules: a different `proto_major` gets `Error { code: "proto_mismatch" }` and
-close. Each side ignores capability strings it does not know. A feature is used
+Rules: a different `proto_major` gets `Error { code: "proto_mismatch" }`. The
+server then calls `finish()` on the stream and waits up to 2 s for the client to
+close, so the error frame is not lost. `Hello` is a plain struct, not a
+`ControlMsg`. Each side ignores capability strings it does not know. A feature is used
 only if both sides list its capability. Initial capability names:
 `resume`, `layout_events`, `status_events`, `capture`, `size_policy_latest`.
+
+## 3a. Encoding rules
+
+- MessagePack with named fields (`rmp-serde` `to_vec_named`).
+- Enums are externally tagged: `{"Request": {...}}`.
+- Uuids are 36-char strings everywhere except the input frame header.
+- Timestamps are RFC 3339 strings.
+- A frame a peer cannot decode (for example an event from a newer server) is
+  skipped with a warning, never fatal.
 
 ## 4. Control messages
 
@@ -61,7 +74,14 @@ ControlMsg =
   | Response { id: u64, result: Value }                   // server to client
   | Failure  { id: u64, code: String, message: String }   // server to client
   | Event    { seq: u64, event: ServerEvent }             // server to client
+  | Ping     { nonce: u64 }                               // client to server
+  | Pong     { nonce: u64, input_acked: u64 }             // server to client
 ```
+
+Liveness: the client sends `Ping` every 1 s while connected. The server answers
+`Pong` at once with the highest input sequence it has written to a PTY for this
+`client_id`. If no `Pong` arrives within 3 s, the client treats the connection as
+dead and redials at once. It does not wait for the QUIC idle timeout.
 
 `Value` is a MessagePack map. `method` and `params` use the same names and
 shapes as the local socket API (`docs/socket-api.md`): `list_tabs`,
@@ -84,12 +104,20 @@ New methods:
 `LayoutChanged { layout }`, `PaneClosed { pane_id }`, `TitleChanged { pane_id, title }`,
 `CwdChanged { pane_id, cwd }`, `PaneResized { pane_id, rows, cols }`,
 `StatusChanged { pane_id, status, message }` (P4, cap `status_events`),
-`ClientConnected { client_id, ... }`, `ClientDisconnected { client_id }`.
+`ClientConnected { client_id, client_kind, client_name, connected_at }`,
+`ClientDisconnected { client_id }`.
 
 ## 5. Input stream
 
-Each frame payload: `[16 bytes pane uuid][input bytes]`. No MessagePack, no
-base64. The server writes the bytes to the PTY in arrival order. Input from a
+Each frame payload: `[16 bytes pane uuid][u64 BE seq][input bytes]`. No
+MessagePack, no base64. `seq` starts at 1 per `client_id` and increases by 1 per
+frame, across reconnects. The server keeps the last written `seq` per
+`client_id` (in memory, kept 10 min after the client leaves) and drops any frame
+with `seq <=` that value, so a resent frame is never written twice. The server
+writes the bytes to the PTY in arrival order.
+
+The client keeps every frame until a `Pong.input_acked` covers it (cap 64 KiB).
+After a reconnect it resends all unacked frames in order. Input is exactly-once. Input from a
 client also marks that client as the pane's latest active client (section 6).
 
 ## 6. Size policy (AD-020)
@@ -134,6 +162,12 @@ stream to the subscriber's own next offset from the log.
 - After `Welcome`: re-send `subscribe_events`, then `attach_pane` with the last
   known offset for every pane the UI shows.
 - The UI shows "reconnecting" after 1 s without a connection, never sooner.
+- Initial state is `Reconnecting { since }`. States: `Connected`,
+  `Reconnecting { since }`, `Failed(reason)`, `Closed` (after `close()`).
+- `ClientHandle::network_changed()`: the app calls it on an OS network change
+  (Android `ConnectivityManager` callback, Windows `NotifyIpInterfaceChange`).
+  The client tells iroh about the change and sends an immediate `Ping`. Without
+  a `Pong` in 1 s it redials.
 - Input typed while disconnected is buffered (cap 64 KiB) and sent after resume.
 
 ## 10. Crates
