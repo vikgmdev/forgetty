@@ -87,3 +87,88 @@ jobs:
             clients/windows/target/release/*.dll
             clients/windows/target/release/v2-test-server.exe
             clients/windows/target/release/smoke.json
+
+  # The real Linux server, built here, for the WSL end-to-end test below.
+  linux-server:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-server
+
+      - name: Build forgetty (release) and the server tarball
+        run: scripts/build-server-dist.sh --target x86_64-unknown-linux-gnu --no-zigbuild --skip-deb --skip-rpm --out dist-out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: forgetty-server-linux
+          path: dist-out/*.tar.gz
+          if-no-files-found: error
+
+  # W4: the Windows client against the real `forgetty server run` inside WSL.
+  # WSL1 is what a GitHub-hosted Windows runner can run (no nested
+  # virtualization). If WSL cannot host the server, the step output says why.
+  wsl-e2e:
+    needs: [build-and-smoke, linux-server]
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: forgetty-win
+          path: win
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: forgetty-server-linux
+          path: srv
+
+      - uses: Vampire/setup-wsl@v6
+        with:
+          distribution: Ubuntu-24.04
+          wsl-version: 1
+
+      - name: Install the server in WSL
+        shell: pwsh
+        run: |
+          $d = "Ubuntu-24.04"
+          wsl --status
+          wsl -l -v
+          $srv = (Resolve-Path srv).Path -replace '\\','/'
+          $u = (wsl -d $d -u root --exec wslpath -u "$srv").Trim()
+          wsl -d $d -u root --exec bash -c "set -e; mkdir -p /opt/fg; tar -xzf $u/*.tar.gz -C /opt/fg --strip-components=1; install -m755 /opt/fg/bin/forgetty /usr/local/bin/forgetty; install -m644 /opt/fg/lib/libghostty-vt.so.0 /usr/local/lib/; ldconfig; ldd /usr/local/bin/forgetty | grep -i ghostty; /usr/local/bin/forgetty --version; uname -a; id"
+
+      - name: Smoke against the real server
+        shell: pwsh
+        working-directory: win
+        run: |
+          $env:FORGETTY_REAL_WSL_DISTRO = "Ubuntu-24.04"
+          .\forgetty-win.exe --smoke | Tee-Object -FilePath real-smoke.json
+          $code = $LASTEXITCODE
+          Write-Host "forgetty-win real smoke exit code: $code"
+          exit $code
+
+      - name: Server log
+        if: always()
+        shell: pwsh
+        run: |
+          wsl -d Ubuntu-24.04 -u root --exec bash -c "ls -la /root/.local/share/forgetty 2>&1 | head -20; tail -n 60 /root/.local/share/forgetty/server.log 2>&1" 
+
+      - name: Upload real-server smoke result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: forgetty-win-real
+          if-no-files-found: warn
+          path: win/real-smoke.json

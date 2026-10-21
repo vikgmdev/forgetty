@@ -22,11 +22,23 @@ use crate::config::Config;
 use crate::shell::{AppShell, BAR};
 use crate::view::TerminalView;
 
+mod real;
 mod remote;
 
 pub const KEYSTROKES: usize = 100;
-pub const TOTAL_TIMEOUT: Duration = Duration::from_secs(420);
+const TOTAL_TIMEOUT: Duration = Duration::from_secs(420);
 const PHASE_TIMEOUT: Duration = Duration::from_secs(60);
+/// The real-server run (WSL start, a 20 MB burst) gets more time.
+const REAL_TOTAL_TIMEOUT: Duration = Duration::from_secs(900);
+const REAL_PHASE_TIMEOUT: Duration = Duration::from_secs(240);
+
+pub fn total_timeout() -> Duration {
+    if real::distro().is_some() {
+        REAL_TOTAL_TIMEOUT
+    } else {
+        TOTAL_TIMEOUT
+    }
+}
 const CONPTY_LINES: u32 = 25_000;
 const CONPTY_BYTES: f64 = CONPTY_LINES as f64 * 90.0;
 const SYNTH_LINES: u32 = 250_000;
@@ -92,6 +104,9 @@ pub fn hard_exit(code: i32) -> ! {
             let _ = std::process::Command::new("taskkill").args(["/F", "/T", "/PID", &pid.to_string()]).output();
         }
     }
+    if let Some(d) = real::distro() {
+        real::stop_server(&d);
+    }
     #[cfg(windows)]
     unsafe {
         use windows::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
@@ -149,6 +164,15 @@ enum Phase {
     RRestart,
     RToast,
     RServer,
+    // W4: the real Linux server in WSL.
+    RealSetup,
+    RealPair,
+    RealEcho,
+    RealKeys,
+    RealKill,
+    RealRestart,
+    RealBurst,
+    RealFinal,
 }
 
 impl Phase {
@@ -187,6 +211,14 @@ impl Phase {
             Phase::RRestart => "w3-restart-server",
             Phase::RToast => "w3-toasts",
             Phase::RServer => "w4-server-ops",
+            Phase::RealSetup => "w4-real-setup",
+            Phase::RealPair => "w4-real-pair",
+            Phase::RealEcho => "w4-real-echo",
+            Phase::RealKeys => "w4-real-keys",
+            Phase::RealKill => "w4-real-kill",
+            Phase::RealRestart => "w4-real-restart",
+            Phase::RealBurst => "w4-real-burst",
+            Phase::RealFinal => "w4-real-final",
         }
     }
 }
@@ -233,6 +265,7 @@ pub struct ShellSmoke {
     shot_frames: u32,
     frames_seen: u64,
     w3: remote::W3,
+    real: real::Real,
 }
 
 /// Snapshot of one pane's screen.
@@ -280,10 +313,16 @@ impl ShellSmoke {
     pub fn new(start: Instant, local: LocalBackend) -> Self {
         run_direct_checks();
         let t = Instant::now();
+        let mut real_distro = String::new();
         ShellSmoke {
             start,
             local,
-            phase: Phase::WaitPrompt,
+            phase: if let Some(d) = real::distro() {
+                real_distro = d;
+                Phase::RealSetup
+            } else {
+                Phase::WaitPrompt
+            },
             phase_t0: t,
             first_frame_seen: false,
             probe: None,
@@ -314,6 +353,7 @@ impl ShellSmoke {
             shot_frames: 0,
             frames_seen: 0,
             w3: remote::W3::default(),
+            real: real::Real::new(real_distro),
         }
     }
 
@@ -393,11 +433,12 @@ impl ShellSmoke {
             record(&format!("window_active_at_frame_{}", self.frames_seen), json!(window.is_window_active()));
         }
         self.frames_seen += 1;
-        if self.phase_t0.elapsed() > PHASE_TIMEOUT {
+        let phase_limit = if real::distro().is_some() { REAL_PHASE_TIMEOUT } else { PHASE_TIMEOUT };
+        if self.phase_t0.elapsed() > phase_limit {
             if !is_w1(self.phase) {
                 *SCREEN_DUMP.lock().unwrap() = self.diag(shell, cx);
             }
-            fail(&format!("phase {} stuck for {:?}", self.phase.name(), PHASE_TIMEOUT));
+            fail(&format!("phase {} stuck for {:?}", self.phase.name(), phase_limit));
         }
 
         if is_w1(self.phase) {
@@ -1155,6 +1196,14 @@ impl ShellSmoke {
             Phase::RSetup | Phase::RPair | Phase::REcho | Phase::RKeys | Phase::RKill | Phase::RRestart | Phase::RToast | Phase::RServer => {
                 self.w3_step(shell, window, cx, now_t)
             }
+            Phase::RealSetup
+            | Phase::RealPair
+            | Phase::RealEcho
+            | Phase::RealKeys
+            | Phase::RealKill
+            | Phase::RealRestart
+            | Phase::RealBurst
+            | Phase::RealFinal => self.real_step(shell, window, cx, now_t),
             _ => {}
         }
     }
@@ -1215,11 +1264,12 @@ impl ShellSmoke {
             )
         };
         record("checks_run", json!(n_checks));
-        let all = all && n_checks >= 30;
+        let all = all && n_checks >= if real::distro().is_some() { 10 } else { 30 };
         println!("{}", snapshot(all));
         let _ = std::io::stdout().flush();
         self.local.shutdown_all();
         self.w3_kill_server();
+        self.real_kill();
         hard_exit(if all { 0 } else { 1 });
     }
 }

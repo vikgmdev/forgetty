@@ -31,7 +31,7 @@ fn main() {
     if smoke {
         // Watchdog: independent of the GPUI loop so a hung window still exits 1.
         std::thread::spawn(|| {
-            std::thread::sleep(smoke::TOTAL_TIMEOUT);
+            std::thread::sleep(smoke::total_timeout());
             smoke::fail("timeout");
         });
     }
