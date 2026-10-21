@@ -71,22 +71,30 @@ pub struct Terminal {
 // handles are exclusively owned.
 unsafe impl Send for Terminal {}
 
+/// Default scrollback budget: 10 MiB of libghostty page memory.
+///
+/// libghostty-vt counts `max_scrollback` in BYTES, not lines. 10 MiB holds
+/// roughly 5000 rows of 80 columns of plain text, more for sparse rows, fewer
+/// for heavily styled ones.
+pub const DEFAULT_MAX_SCROLLBACK_BYTES: usize = 10 * 1024 * 1024;
+
 impl Terminal {
-    /// Create a new terminal with the given dimensions and ANSI palette.
+    /// Create a new terminal with the given dimensions and ANSI palette and the
+    /// default scrollback of [`DEFAULT_MAX_SCROLLBACK_BYTES`] (10 MiB).
     ///
     /// `ansi_palette` supplies the theme's 16-color ANSI palette used during
     /// `sync_screen` to resolve palette color indices 0–15.  Indices 16–255
     /// always use the standard xterm 256-color formula.
     pub fn new(rows: usize, cols: usize, ansi_palette: [forgetty_core::Rgba; 16]) -> Self {
-        Self::with_scrollback(rows, cols, ansi_palette, 10_000)
+        Self::with_scrollback(rows, cols, ansi_palette, DEFAULT_MAX_SCROLLBACK_BYTES)
     }
 
     /// Like [`Terminal::new`] with an explicit scrollback limit.
     ///
     /// NOTE: libghostty-vt counts `max_scrollback` in BYTES of page memory
     /// (the C header says "lines" but Ghostty's PageList limit is a byte size).
-    /// The default 10_000 keeps only about 1000 rows of 80 columns. Budget
-    /// roughly `lines * cols * 16` bytes for a line-count target.
+    /// [`Terminal::new`] uses [`DEFAULT_MAX_SCROLLBACK_BYTES`] (10 MiB).
+    /// Budget roughly `lines * cols * 16` bytes for a line-count target.
     pub fn with_scrollback(
         rows: usize,
         cols: usize,

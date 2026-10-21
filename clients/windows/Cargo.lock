@@ -1446,6 +1446,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "forgetty-shell-core"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "async-channel",
+ "forgetty-core",
+ "portable-pty",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "forgetty-vt"
 version = "0.1.0-beta"
 dependencies = [
@@ -1460,6 +1473,7 @@ dependencies = [
  "anyhow",
  "async-channel",
  "forgetty-core",
+ "forgetty-shell-core",
  "forgetty-vt",
  "gpui",
  "gpui_platform",

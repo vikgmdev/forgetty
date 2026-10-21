@@ -51,3 +51,20 @@ fn scroll_up_1000_rows_reads_exact_line() {
     let line: String = t.screen().row(row).iter().map(|c| c.grapheme.as_str()).collect();
     assert!(line.starts_with("0004999"));
 }
+
+/// `Terminal::new` must keep a useful history by default (10 MiB of libghostty bytes).
+#[test]
+fn default_scrollback_keeps_5000_lines() {
+    assert_eq!(forgetty_vt::DEFAULT_MAX_SCROLLBACK_BYTES, 10 * 1024 * 1024);
+    let mut t = Terminal::new(24, 80, [ANSI_PALETTE_BLACK; 16]);
+    let mut text = String::new();
+    for i in 0..5000 {
+        text.push_str(&format!("{i:07} line\r\n"));
+    }
+    t.feed(text.as_bytes());
+    let (total, _, _) = t.scrollbar_state();
+    assert!(total as usize >= 5000, "default scrollback kept only {total} rows");
+    t.scroll_viewport_delta(-4000);
+    let first: String = t.screen().row(0).iter().map(|c| c.grapheme.as_str()).collect();
+    assert!(first.starts_with("0000"), "row after scrolling up 4000: {first:?}");
+}

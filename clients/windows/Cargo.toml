@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 forgetty-vt = { path = "../../crates/forgetty-vt" }
 forgetty-core = { path = "../../crates/forgetty-core" }
+forgetty-shell-core = { path = "shell-core" }
 # Newest stable Zed release tag at spike time: v1.24.4. See README.md.
 gpui = { git = "https://github.com/zed-industries/zed", rev = "aed37547d8543000494fb69101c05daec5891068" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "aed37547d8543000494fb69101c05daec5891068" }
