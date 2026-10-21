@@ -76,6 +76,7 @@ fn handle(
                 "udp_port": port,
                 "dedup_drops": rpc.qa.dedup_drops.load(Ordering::SeqCst),
                 "handshakes": rpc.qa.handshakes.load(Ordering::SeqCst),
+                "stopping_refusals": rpc.qa.stopping_refusals.load(Ordering::SeqCst),
                 "connections": rpc.connection_count(),
                 "attaches": attaches,
                 "panes": panes,
@@ -231,6 +232,16 @@ fn handle(
                 Some(Err(e)) => Some(bad(req, &format!("bad event: {e}"))),
                 None => Some(bad(req, "event is required")),
             }
+        }
+        "qa_fire_events" => {
+            // `count` LayoutChanged events with the current layout, as fast as
+            // the hub takes them (load for the stalled-reader test).
+            let count = req.params.get("count").and_then(|v| v.as_u64()).unwrap_or(1);
+            let layout = rpc.layout_value();
+            for _ in 0..count {
+                rpc.emit(ServerEvent::LayoutChanged { layout: layout.clone() });
+            }
+            ok(json!({ "ok": true, "fired": count }))
         }
         "qa_push_status" => {
             let pane = match pane_param(req) {

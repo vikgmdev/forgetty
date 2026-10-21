@@ -46,7 +46,8 @@ pub struct RunArgs {
 
     /// UDP port of the iroh endpoint (default 47297). The port stays the same
     /// across restarts, so clients can redial the last direct address. `0`
-    /// picks a free port.
+    /// picks a free port. Also read from `FORGETTY_PORT` (the gates set it to
+    /// `0` so they do not fight over the fixed port).
     #[arg(long)]
     pub port: Option<u16>,
 }
@@ -620,7 +621,10 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
     // specific behaviour out of the transport crate.
     let sm_for_alpn = Arc::clone(&session_manager);
     let rpc_v2 = RpcV2::new(Arc::clone(&session_manager), session_id);
-    let port = args.port.unwrap_or(DEFAULT_PORT);
+    let port = args
+        .port
+        .or_else(|| std::env::var("FORGETTY_PORT").ok().and_then(|v| v.parse().ok()))
+        .unwrap_or(DEFAULT_PORT);
     let sync_endpoint = match SyncEndpoint::builder(secret_key)
         .bind_port(port)
         .transport_config(quic_config())

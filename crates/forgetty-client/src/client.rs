@@ -938,6 +938,10 @@ async fn handshake(
             }
             Ok((send, recv, w))
         }
+        // A stopping server will be back: retry with the normal backoff.
+        Ok(Some(HandshakeReply::Error(e))) if e.code == error_code::SERVER_STOPPING => {
+            Err(transient(format!("{}: {}", e.code, e.message)))
+        }
         Ok(Some(HandshakeReply::Error(e))) => {
             Err(DialError::Fatal(format!("{}: {}", e.code, e.message)))
         }

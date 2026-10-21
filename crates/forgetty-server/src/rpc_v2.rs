@@ -57,6 +57,16 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const INPUT_KEEP: Duration = Duration::from_secs(600);
 /// Events buffered per connection before it is told to resync.
 const EVENT_BUFFER: usize = 1024;
+/// Messages queued for one connection's Control stream.
+const CONTROL_QUEUE: usize = 1024;
+/// A connection whose Control queue stays (half) full this long with no write
+/// completing is closed. The client
+/// reconnects and gets the state again.
+const STALL_LIMIT: Duration = Duration::from_secs(10);
+/// At most one lag resync (`LayoutChanged`) per connection in this time.
+const RESYNC_MIN: Duration = Duration::from_millis(250);
+/// Application close code for a connection whose Control queue stalled.
+pub const STALLED_CODE: u32 = 0x12;
 
 /// Capabilities the server offers.
 pub const SERVER_CAPS: [&str; 5] =
@@ -137,6 +147,8 @@ pub struct Qa {
     pub hold_acks: AtomicBool,
     /// Completed handshakes.
     pub handshakes: AtomicU64,
+    /// Handshakes answered `server_stopping`.
+    pub stopping_refusals: AtomicU64,
     /// While true, handshakes stall before the reply.
     pub paused: watch::Sender<bool>,
     /// `(pane, from_offset)` of every `attach_pane`.
@@ -195,6 +207,7 @@ impl RpcV2 {
                 dedup_drops: AtomicU64::new(0),
                 hold_acks: AtomicBool::new(false),
                 handshakes: AtomicU64::new(0),
+                stopping_refusals: AtomicU64::new(0),
                 paused,
                 attaches: Mutex::new(Vec::new()),
                 #[cfg(feature = "qa-tools")]
@@ -336,7 +349,7 @@ impl RpcV2 {
     }
 
     /// `get_layout` as a MessagePack value.
-    fn layout_value(&self) -> Value {
+    pub(crate) fn layout_value(&self) -> Value {
         let req = Request {
             jsonrpc: "2.0".into(),
             method: methods::GET_LAYOUT.into(),
@@ -402,7 +415,7 @@ impl RpcV2 {
 
         // AD-017: this connection is an attached client until it ends. The
         // guard drops on every exit path. A stopping server takes no new
-        // clients: close without a reply, so the client retries later.
+        // clients: answer `server_stopping`, which the client retries.
         let kind = hello.client_kind;
         let Ok(_guard) = self.sm.clients().register(
             hello.client_id.to_string(),
@@ -410,6 +423,15 @@ impl RpcV2 {
             &hello.client_name,
         ) else {
             info!("rpc2: client {} refused, server is stopping", hello.client_name);
+            self.qa.stopping_refusals.fetch_add(1, Ordering::SeqCst);
+            let reply = HandshakeReply::Error(ErrorMsg {
+                code: error_code::SERVER_STOPPING.into(),
+                message: "the server is stopping".into(),
+            });
+            let _ = write_msg(&mut send, &reply).await;
+            let _ = send.finish();
+            // Let the client read the error before the connection goes away.
+            let _ = tokio::time::timeout(Duration::from_secs(2), conn.closed()).await;
             conn.close(close_code::OK.into(), b"server-stopping");
             return;
         };
@@ -899,17 +921,23 @@ impl Session {
 
     async fn run(self, mut send: iroh::endpoint::SendStream, mut recv: iroh::endpoint::RecvStream) {
         let session = Arc::new(self);
-        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ControlMsg>();
+        let (out_tx, mut out_rx) = mpsc::channel::<ControlMsg>(CONTROL_QUEUE);
         let mut tasks: JoinSet<()> = JoinSet::new();
 
-        // Control writer.
-        tasks.spawn(async move {
-            while let Some(msg) = out_rx.recv().await {
-                if write_msg(&mut send, &msg).await.is_err() {
-                    break;
+        // Control writer. `written` counts completed writes, so a slow reader
+        // can be told from one that reads nothing.
+        let written = Arc::new(AtomicU64::new(0));
+        {
+            let written = written.clone();
+            tasks.spawn(async move {
+                while let Some(msg) = out_rx.recv().await {
+                    if write_msg(&mut send, &msg).await.is_err() {
+                        break;
+                    }
+                    written.fetch_add(1, Ordering::Relaxed);
                 }
-            }
-        });
+            });
+        }
 
         // Input reader: the client's first uni stream.
         {
@@ -933,7 +961,25 @@ impl Session {
         // Control request loop.
         let mut streams: HashMap<Uuid, AbortHandle> = HashMap::new();
         let mut events: Option<broadcast::Receiver<(u64, ServerEvent)>> = None;
+        // When the Control queue became (half) full with no write completing
+        // since, and the write count then.
+        let mut full_since: Option<(tokio::time::Instant, u64)> = None;
+        // A lag resync is owed at this time (coalesced, section 7).
+        let mut resync_due: Option<tokio::time::Instant> = None;
+        let mut last_resync: Option<tokio::time::Instant> = None;
         loop {
+            let stalled = async {
+                match full_since {
+                    Some((t, _)) => tokio::time::sleep_until(t + STALL_LIMIT).await,
+                    None => std::future::pending().await,
+                }
+            };
+            let resync = async {
+                match resync_due {
+                    Some(t) => tokio::time::sleep_until(t).await,
+                    None => std::future::pending().await,
+                }
+            };
             tokio::select! {
                 msg = read_msg::<_, ControlMsg>(&mut recv) => {
                     let msg = match msg {
@@ -961,7 +1007,10 @@ impl Session {
                     match msg {
                         ControlMsg::Ping { nonce } => {
                             let input_acked = session.rpc.acked(session.client_id, session.epoch);
-                            let _ = out_tx.send(ControlMsg::Pong { nonce, input_acked });
+                            // A Pong is never dropped: wait for room, up to the stall limit.
+                            if !push(&out_tx, &session.conn, ControlMsg::Pong { nonce, input_acked }).await {
+                                break;
+                            }
                         }
                         ControlMsg::Request { id, method: m, params } => {
                             session.on_request(
@@ -971,27 +1020,107 @@ impl Session {
                         _ => {} // Response, Failure, Event, Pong come from the server only.
                     }
                 }
-                ev = next_event(&mut events) => {
+                // Take the next event only when the queue has room for it. A
+                // client that does not read leaves the events in the hub's ring
+                // (it lags, it does not grow a queue).
+                (permit, ev) = async {
+                    let permit = out_tx.reserve().await;
+                    (permit, next_event(&mut events).await)
+                } => {
+                    let Ok(permit) = permit else { break };
                     match ev {
                         Ok((seq, event)) => {
-                            if session.event_allowed(&event) {
-                                let _ = out_tx.send(ControlMsg::Event { seq, event });
+                            if !session.event_allowed(&event) {
+                                // not for this peer
+                            } else if matches!(event, ServerEvent::LayoutChanged { .. })
+                                && out_tx.capacity() < CONTROL_QUEUE / 2
+                            {
+                                // A layout is a full snapshot: with the queue
+                                // half full, one later resync replaces any
+                                // number of these.
+                                drop(permit);
+                                let now = tokio::time::Instant::now();
+                                let due = last_resync.map_or(now, |t| (t + RESYNC_MIN).max(now));
+                                resync_due = Some(resync_due.map_or(due, |d| d.min(due)));
+                            } else {
+                                permit.send(ControlMsg::Event { seq, event });
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(n)) => {
+                            drop(permit);
                             warn!("rpc2: client {} lagged by {n} events", session.client_id);
-                            session.rpc.emit(ServerEvent::LayoutChanged { layout: session.rpc.layout_value() });
+                            // Skip to the head and owe one resync, at most one
+                            // per RESYNC_MIN however many lags happen.
+                            let (_, rx) = session.rpc.subscribe();
+                            events = Some(rx);
+                            let now = tokio::time::Instant::now();
+                            let due = last_resync.map_or(now, |t| (t + RESYNC_MIN).max(now));
+                            resync_due = Some(resync_due.map_or(due, |d| d.min(due)));
                         }
                         Err(broadcast::error::RecvError::Closed) => events = None,
                     }
                 }
+                _ = resync => {
+                    resync_due = None;
+                    if session.has(cap::LAYOUT_EVENTS) {
+                        let seq = session.rpc.current_seq();
+                        let event = ServerEvent::LayoutChanged { layout: session.rpc.layout_value() };
+                        match out_tx.try_send(ControlMsg::Event { seq, event }) {
+                            Ok(()) => last_resync = Some(tokio::time::Instant::now()),
+                            // No room: try again in a moment.
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                resync_due = Some(tokio::time::Instant::now() + RESYNC_MIN);
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => break,
+                        }
+                    }
+                }
+                _ = stalled => {
+                    let now_written = written.load(Ordering::Relaxed);
+                    if full_since.is_some_and(|(_, w)| w != now_written) {
+                        // Slow, not stalled: the writer moved. Measure again.
+                        full_since = Some((tokio::time::Instant::now(), now_written));
+                        continue;
+                    }
+                    warn!(
+                        "rpc2: client {} did not read Control for {:?}, closing",
+                        session.client_id, STALL_LIMIT
+                    );
+                    session.conn.close(STALLED_CODE.into(), b"control-stalled");
+                    break;
+                }
             }
+            // "Full" is the half mark: past it layouts are coalesced, so the
+            // queue does not get fuller while the writer is stuck.
+            let now_written = written.load(Ordering::Relaxed);
+            full_since = if out_tx.capacity() < CONTROL_QUEUE / 2 {
+                match full_since {
+                    Some((_, w)) if w == now_written => full_since,
+                    _ => Some((tokio::time::Instant::now(), now_written)),
+                }
+            } else {
+                None
+            };
         }
         for (_, h) in streams {
             h.abort();
         }
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
+    }
+
+    /// Queue a message from the request loop without waiting. When the queue
+    /// is full the message waits on its own task: an answer is never dropped.
+    fn send_now(&self, out: &mpsc::Sender<ControlMsg>, tasks: &mut JoinSet<()>, msg: ControlMsg) {
+        match out.try_send(msg) {
+            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Err(mpsc::error::TrySendError::Full(msg)) => {
+                let (out, conn) = (out.clone(), self.conn.clone());
+                tasks.spawn(async move {
+                    push(&out, &conn, msg).await;
+                });
+            }
+        }
     }
 
     fn event_allowed(&self, event: &ServerEvent) -> bool {
@@ -1012,7 +1141,7 @@ impl Session {
         id: u64,
         m: String,
         params: Value,
-        out: &mpsc::UnboundedSender<ControlMsg>,
+        out: &mpsc::Sender<ControlMsg>,
         tasks: &mut JoinSet<()>,
         streams: &mut HashMap<Uuid, AbortHandle>,
         events: &mut Option<broadcast::Receiver<(u64, ServerEvent)>>,
@@ -1031,13 +1160,13 @@ impl Session {
                     *events = Some(rx);
                     seq
                 };
-                let _ = out.send(reply(to_value(&SubscribeResult { seq }).map_err(bad)));
+                self.send_now(out, tasks, reply(to_value(&SubscribeResult { seq }).map_err(bad)));
             }
             method::ATTACH_PANE => {
                 let r = from_value::<AttachPaneParams>(params)
                     .map_err(bad)
                     .and_then(|p| self.attach(p, tasks, streams));
-                let _ = out.send(reply(r));
+                self.send_now(out, tasks, reply(r));
             }
             method::DETACH_PANE => {
                 let r = from_value::<DetachPaneParams>(params).map_err(bad).and_then(|p| {
@@ -1046,7 +1175,7 @@ impl Session {
                     }
                     to_value(&OkResult { ok: true }).map_err(bad)
                 });
-                let _ = out.send(reply(r));
+                self.send_now(out, tasks, reply(r));
             }
             method::RESIZE_PANE => {
                 let s = self.clone();
@@ -1076,19 +1205,23 @@ impl Session {
                         }
                         Err(e) => Err(e),
                     };
-                    let _ = out.send(reply(r));
+                    push(&out, &s.conn, reply(r)).await;
                 });
             }
             method::LIST_CLIENTS => {
-                let _ = out.send(reply(self.rpc.list_clients()));
+                self.send_now(out, tasks, reply(self.rpc.list_clients()));
             }
             other => {
                 if other == method::CAPTURE && !self.has(cap::CAPTURE) {
-                    let _ = out.send(ControlMsg::Failure {
-                        id,
-                        code: error_code::CAPABILITY_MISSING.into(),
-                        message: "capture needs the capture capability".into(),
-                    });
+                    self.send_now(
+                        out,
+                        tasks,
+                        ControlMsg::Failure {
+                            id,
+                            code: error_code::CAPABILITY_MISSING.into(),
+                            message: "capture needs the capture capability".into(),
+                        },
+                    );
                     return;
                 }
                 let s = self.clone();
@@ -1108,7 +1241,7 @@ impl Session {
                     .unwrap_or_else(|e| {
                         Err((error_code::INTERNAL, format!("handler failed: {e}")))
                     });
-                    let _ = out.send(reply(r));
+                    push(&out, &s.conn, reply(r)).await;
                 });
             }
         }
@@ -1154,6 +1287,20 @@ impl Session {
     }
 }
 
+/// Queue a message that must not be dropped (a response or a Pong). Waits for
+/// room. A connection that leaves the queue full for [`STALL_LIMIT`] is closed
+/// and `false` is returned.
+async fn push(out: &mpsc::Sender<ControlMsg>, conn: &Connection, msg: ControlMsg) -> bool {
+    match tokio::time::timeout(STALL_LIMIT, out.send(msg)).await {
+        Ok(Ok(())) => true,
+        Ok(Err(_)) => false,
+        Err(_) => {
+            conn.close(STALLED_CODE.into(), b"control-stalled");
+            false
+        }
+    }
+}
+
 async fn next_event(
     rx: &mut Option<broadcast::Receiver<(u64, ServerEvent)>>,
 ) -> Result<(u64, ServerEvent), broadcast::error::RecvError> {
@@ -1182,6 +1329,9 @@ async fn pane_stream(
         return;
     }
     let mut next = header.start_offset;
+    // While this stream lives, the PTY is not read more than half a ring ahead
+    // of it, so it is served from the ring and is not reset.
+    let reader = shared.register_reader(next);
     loop {
         // Arm both wake-ups before looking at the log, so nothing is missed.
         let wake = shared.wake.notified();
@@ -1203,6 +1353,7 @@ async fn pane_stream(
                     return;
                 }
                 next += bytes.len() as u64;
+                reader.advance(next);
             }
             Some(LogPlan::Disk { disk, len }) => match read_disk(&shared, disk, next, len).await {
                 Ok(Some(bytes)) if !bytes.is_empty() => {
@@ -1210,13 +1361,13 @@ async fn pane_stream(
                         return;
                     }
                     next += bytes.len() as u64;
+                    reader.advance(next);
                 }
                 // The file has not caught up yet: wait for the appender.
-                Ok(Some(_)) => {
-                    tokio::select! { _ = &mut progress => {}, _ = &mut wake => {} }
-                }
-                // The file moved under the read: plan again.
-                Ok(None) => {}
+                Ok(Some(_)) => progress.await,
+                // The file moved under the read: wait for the appender to
+                // publish the new extent, then plan again.
+                Ok(None) => progress.await,
                 Err(e) => {
                     warn!("rpc2: pane {pane} log read failed: {e}");
                     let _ = send.reset(LOG_LOST_CODE.into());

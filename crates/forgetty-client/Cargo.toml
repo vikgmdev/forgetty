@@ -17,6 +17,7 @@ required-features = ["test-util"]
 
 [dependencies]
 forgetty-proto = { path = "../forgetty-proto" }
+forgetty-core = { path = "../forgetty-core" }
 iroh = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }

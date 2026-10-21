@@ -33,15 +33,52 @@ pub fn load_or_generate_client_id(path: &Path) -> io::Result<Uuid> {
     Ok(id)
 }
 
+/// Write a private file. Unix: mode 0600 at creation, atomic rename, parent
+/// directory created 0700. Elsewhere the app layer sets user-only ACLs, so this
+/// is a plain write.
 fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, bytes)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        forgetty_core::fsutil::write_private_atomic(path, bytes)
     }
-    Ok(())
+    #[cfg(not(unix))]
+    {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, bytes)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn mode(p: &Path) -> u32 {
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn a_fresh_key_file_is_0600_in_a_0700_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The dir does not exist yet: it is created here, whatever the umask.
+        let path = tmp.path().join("state/client/identity.key");
+        let key = load_or_generate_identity(&path).unwrap();
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(path.parent().unwrap()), 0o700);
+        // Loading again returns the same key and leaves no temp file behind.
+        assert_eq!(load_or_generate_identity(&path).unwrap().to_bytes(), key.to_bytes());
+        assert_eq!(std::fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_fresh_client_id_file_is_private_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cid/client_id");
+        let id = load_or_generate_client_id(&path).unwrap();
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(path.parent().unwrap()), 0o700);
+        assert_eq!(load_or_generate_client_id(&path).unwrap(), id);
+    }
 }

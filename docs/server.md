@@ -89,8 +89,21 @@ stream) and the `qa_*` test methods are not reachable over v2.
 - Every pane has an absolute byte offset. The ring and the disk log know the
   offset of their first byte. The first offset is stored in
   `logs/<pane>.log.off`, so a client resumes at its offset after a server
-  restart. A client that is behind the ring reads from the disk log. A client
-  behind the whole log is reset to the first available byte.
+  restart. The ring is 8 MiB per pane (`byte_log_ring_kb`). A client that is
+  behind the ring reads from the disk log by offset. A client behind the whole
+  log (ring plus file) is reset to the first available byte.
+- The byte log never drops output. When more than 4 MiB wait for the disk
+  writer, the server stops reading that PTY until the queue drains, so the
+  program blocks on its write (PTY flow control). The wait is event driven, no
+  polling. Output that arrives after shutdown starts is not logged, so the log
+  on disk is exactly what clients saw.
+- A stopping server answers `Hello` with `Error { code: "server_stopping" }`.
+  The client retries it with its normal backoff.
+- Each v2 connection queues at most 1024 Control messages. When a client does
+  not read, the server stops pulling events for it, merges layout events into
+  one `LayoutChanged` (at most one per 250 ms), and closes the connection with
+  code 0x12 after 10 s without a completed write. Responses and Pongs wait for
+  room and are never dropped.
 - Input is deduplicated by `(client_id, input_epoch)` and `seq`. The server
   writes the dedup table to `input_seq.json` in the state dir when it stops
   and loads it at start, so a frame the client did not see acked is not written

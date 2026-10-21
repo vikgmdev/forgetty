@@ -1094,6 +1094,7 @@ version = "0.1.0-beta"
 dependencies = [
  "base64",
  "forgetty-client",
+ "forgetty-core",
  "forgetty-proto",
  "iroh",
  "libc",
