@@ -14,8 +14,11 @@
 //!   `total_written = disk_first + file_len`.
 //! - after an unclean stop (kill -9, power cut) the file can end before the
 //!   last offset a client saw: bytes were still in the disk queue. The next
-//!   start therefore jumps the offset past anything a client can hold, and
-//!   the jumped range is a hole that nothing is served from (`LogPlan::Lost`).
+//!   start therefore moves the whole file forward in offset space, to a first
+//!   offset past anything a client can hold. The content is intact and the
+//!   ring is preloaded as after a clean stop, so the pane replays. A client
+//!   that kept an offset from before the crash is older than the log and
+//!   gets a reset, never other bytes under that offset.
 //!
 //! Readers (the v2 pane output streams) pull by offset ([`ByteLog::plan`],
 //! `SessionManager::read_log`). A slow reader therefore never loses bytes
@@ -111,9 +114,6 @@ pub struct LogShared {
     /// Odd while the appender replaces the file (rotation, restart). A reader
     /// that saw the same even value before and after its read got one file.
     epoch: AtomicU64,
-    /// `[start, end)` of offsets that never held data: the jump over bytes an
-    /// unclean stop may have lost. Nothing is served from it.
-    hole: Option<(u64, u64)>,
     /// Test hook: fail this many appender writes (after writing half).
     #[cfg(test)]
     fail_writes: AtomicU64,
@@ -326,31 +326,30 @@ impl ByteLog {
         let unclean = disk_enabled
             && (file_len_on_disk > 0 || sidecar.is_some())
             && sidecar.and_then(|s| s.sealed) != Some(file_end);
-        let jump = if unclean {
+        // The file keeps its content. Its first byte moves to an offset past
+        // anything a client can hold: what was queued when the process died
+        // is at most the ring, the disk queue and one coalesced write.
+        let shift = if unclean {
             ring_capacity as u64 + DISK_HIGH_WATER + COALESCE_MAX as u64 + 64 * 1024
         } else {
             0
         };
-        let hole = unclean.then_some((file_end, file_end + jump));
+        let disk_first = if unclean { file_end + shift } else { disk_first };
         if unclean {
-            // The hole is sparse zeros in the file, so file position stays
-            // `offset - first`.
-            std::fs::OpenOptions::new()
-                .write(true)
-                .open(&log_path)?
-                .set_len(file_len_on_disk + jump)?;
+            // Write it down before anything is appended, so a second crash
+            // sees the same file under the new offsets.
+            write_sidecar(&log_path, disk_first);
             warn!(
                 path = %log_path.display(),
-                "byte log: unclean stop, offsets jump from {file_end} to {}",
-                file_end + jump
+                "byte log: unclean stop, offsets move from {file_end} to {disk_first}"
             );
         }
-        let file_len = file_len_on_disk + jump;
+        let file_len = file_len_on_disk;
 
-        // Pre-load the tail into the ring (AC-17), after a clean stop only: the
-        // ring must end at the newest offset.
+        // Pre-load the tail into the ring (AC-17 cold-start replay). The ring
+        // ends at the newest offset, which is the end of the file.
         let mut ring: VecDeque<u8> = VecDeque::with_capacity(ring_capacity.min(1 << 20));
-        if !unclean && ring_capacity > 0 && file_len_on_disk > 0 {
+        if ring_capacity > 0 && file_len_on_disk > 0 {
             let to_read = std::cmp::min(file_len_on_disk as usize, ring_capacity);
             let mut buf = vec![0u8; to_read];
             use std::io::{Read, Seek, SeekFrom};
@@ -379,7 +378,6 @@ impl ByteLog {
             total: AtomicU64::new(total_bytes_written),
             ring_capacity,
             epoch: AtomicU64::new(0),
-            hole,
             #[cfg(test)]
             fail_writes: AtomicU64::new(0),
         });
@@ -465,6 +463,12 @@ impl ByteLog {
         self.total_bytes_written
     }
 
+    /// Offset of the first byte of the file (tests).
+    #[cfg(test)]
+    fn disk_first(&self) -> u64 {
+        self.shared.disk_state().first
+    }
+
     /// Absolute offset of the first byte in the ring.
     pub fn ring_first(&self) -> u64 {
         self.total_bytes_written - self.ring.len() as u64
@@ -504,22 +508,11 @@ impl ByteLog {
             }
             return LogPlan::Ring(out);
         }
-        // The jump over what an unclean stop may have lost holds no data.
-        if let Some((hole_start, hole_end)) = self.shared.hole {
-            if next >= hole_start && next < hole_end {
-                return LogPlan::Lost { first: hole_end };
-            }
-        }
         // Older than the ring: the file, if it still reaches back that far.
         if self.shared.disk_enabled {
             let disk = self.shared.disk_state();
             if next >= disk.first {
-                let mut len = (ring_first - next).min(max as u64);
-                if let Some((hole_start, _)) = self.shared.hole {
-                    if next < hole_start {
-                        len = len.min(hole_start - next);
-                    }
-                }
+                let len = (ring_first - next).min(max as u64);
                 return LogPlan::Disk { disk, len: len as usize };
             }
             return LogPlan::Lost { first: disk.first.min(ring_first) };
@@ -1306,10 +1299,10 @@ mod tests {
         cleanup(pane_id);
     }
 
-    /// After an unclean stop the offsets jump past anything a client can hold,
-    /// and nothing is served from the jump.
+    /// After an unclean stop the file moves to offsets past anything a client
+    /// can hold. The content is still served, and the pane replays.
     #[tokio::test]
-    async fn an_unclean_start_jumps_the_offsets() {
+    async fn an_unclean_start_moves_the_offsets_and_keeps_the_content() {
         let pane_id = Uuid::new_v4();
         {
             let mut log = ByteLog::new(pane_id, 4096, 1024 * 1024).unwrap();
@@ -1317,34 +1310,47 @@ mod tests {
             log.flush_signal().await.unwrap();
             // dropped without a seal: a kill -9
         }
-        let log = ByteLog::new(pane_id, 4096, 1024 * 1024).unwrap();
-        let total = log.total_written();
-        assert!(total >= 100 + 4096 + DISK_HIGH_WATER, "total {total}");
-        match log.plan(10, 1000) {
-            LogPlan::Disk { len, .. } => assert_eq!(len, 90, "a read stops at the hole"),
-            other => panic!("{other:?}"),
+        let mut log = ByteLog::new(pane_id, 4096, 1024 * 1024).unwrap();
+        let (first, total) = (log.disk_first(), log.total_written());
+        assert!(first >= 100 + 4096 + DISK_HIGH_WATER, "first {first}");
+        assert_eq!(total, first + 100);
+        // Offsets a client held before the crash are older than the log.
+        for old in [0u64, 10, 99, 100, 5000] {
+            assert!(matches!(log.plan(old, 1000), LogPlan::Lost { .. }), "offset {old}");
         }
-        match log.plan(100, 1000) {
-            LogPlan::Lost { first } => assert_eq!(first, total),
-            other => panic!("{other:?}"),
-        }
-        match log.plan(total - 1, 1000) {
-            LogPlan::Lost { first } => assert_eq!(first, total),
+        // The content is there under the new offsets (from the ring).
+        match log.plan(first, 1000) {
+            LogPlan::Ring(b) => assert_eq!(b, vec![7u8; 100]),
             other => panic!("{other:?}"),
         }
         assert!(matches!(log.plan(total, 10), LogPlan::Caught));
-        // New bytes go after the jump, and a later clean restart keeps them.
-        let mut log = log;
+        // New bytes follow, and a later clean restart keeps everything.
         log.append(b"after");
         log.flush_signal().await.unwrap();
         log.make_seal_future().await.unwrap();
         drop(log);
         let log = ByteLog::new(pane_id, 4096, 1024 * 1024).unwrap();
-        assert_eq!(log.total_written(), total + 5);
+        assert_eq!((log.disk_first(), log.total_written()), (first, total + 5));
         match log.plan(total, 10) {
             LogPlan::Ring(b) => assert_eq!(b, b"after"),
             other => panic!("{other:?}"),
         }
+        cleanup(pane_id);
+    }
+
+    /// A second crash before the first start sealed anything moves the file
+    /// again: offsets never go back.
+    #[tokio::test]
+    async fn two_unclean_starts_in_a_row_keep_moving_forward() {
+        let pane_id = Uuid::new_v4();
+        {
+            let mut log = ByteLog::new(pane_id, 4096, 1024 * 1024).unwrap();
+            log.append(&[1u8; 50]);
+            log.flush_signal().await.unwrap();
+        }
+        let first_a = ByteLog::new(pane_id, 4096, 1024 * 1024).unwrap().disk_first();
+        let first_b = ByteLog::new(pane_id, 4096, 1024 * 1024).unwrap().disk_first();
+        assert!(first_b > first_a + 50, "{first_a} then {first_b}");
         cleanup(pane_id);
     }
 

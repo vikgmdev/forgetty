@@ -229,11 +229,12 @@ known gap, section 12).
     of the client that sends to it and nothing else. `Pong.input_acked` covers
     a frame only after the PTY took its bytes.
 12. The byte log survives a failed disk write by retrying with backoff. After a
-    crash (the log was not sealed by a graceful stop) the server starts the
-    pane's offsets past everything the old log could have held. An offset a
-    client kept from before the crash then falls in the lost range: the client
-    gets `reset = true` (attach) or `0x11 log_lost` (a stream that was reading
-    it), never other bytes under that offset.
+    crash (the log was not sealed by a graceful stop) the server moves the
+    retained log forward in offset space, to a first offset past anything the
+    old process could have sent. The content and the replay of a restored pane
+    stay intact. An offset a client kept from before the crash is older than
+    the log: an attach gets `reset = true`, a stream that was reading it gets
+    `0x11 log_lost`, never other bytes under that offset.
 
 ## 12. Snapshot catch-up (AD-023, capability `snapshot_catchup`)
 
