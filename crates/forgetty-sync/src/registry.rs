@@ -88,22 +88,25 @@ impl DeviceRegistry {
     /// Add a new device entry and persist atomically.
     ///
     /// The name is sanitised here too ([`crate::sanitize::untrusted`]), so no
-    /// caller can store a hostile name.
+    /// caller can store a hostile name. A failed save leaves the registry as
+    /// it was: the list is saved first and swapped in after.
     pub fn add(&mut self, mut entry: DeviceEntry) -> Result<(), RegistryError> {
         entry.name = crate::sanitize::untrusted(&entry.name);
-        self.devices.push(entry);
-        self.save()
+        let mut next = self.devices.clone();
+        next.push(entry);
+        self.commit(next)
     }
 
     /// Remove a device by its `device_id` string. Returns `true` if found.
+    /// A failed save leaves the device in memory too.
     pub fn remove(&mut self, device_id: &str) -> Result<bool, RegistryError> {
-        let before = self.devices.len();
-        self.devices.retain(|d| d.device_id != device_id);
-        let removed = self.devices.len() < before;
-        if removed {
-            self.save()?;
+        let next: Vec<DeviceEntry> =
+            self.devices.iter().filter(|d| d.device_id != device_id).cloned().collect();
+        if next.len() == self.devices.len() {
+            return Ok(false);
         }
-        Ok(removed)
+        self.commit(next)?;
+        Ok(true)
     }
 
     /// Return all current entries (read-only).
@@ -114,21 +117,30 @@ impl DeviceRegistry {
     /// Update the `last_seen` timestamp for a device by its `device_id`.
     pub fn update_last_seen(&mut self, device_id: &str) -> Result<(), RegistryError> {
         let now = iso8601_now();
-        for d in &mut self.devices {
+        let mut next = self.devices.clone();
+        for d in &mut next {
             if d.device_id == device_id {
                 d.last_seen = Some(now);
                 break;
             }
         }
-        self.save()
+        self.commit(next)
     }
 
-    /// Atomically write the registry to disk: unique temp file created 0600,
+    /// Save `next`, then make it the in-memory list. Memory never runs ahead
+    /// of the disk: a failed save changes nothing.
+    fn commit(&mut self, next: Vec<DeviceEntry>) -> Result<(), RegistryError> {
+        Self::save(&self.path, &next)?;
+        self.devices = next;
+        Ok(())
+    }
+
+    /// Atomically write `devices` to `path`: unique temp file created 0600,
     /// fsync, rename, fsync of the directory. No shared temp name, no
     /// non-atomic fallback.
-    fn save(&self) -> Result<(), RegistryError> {
-        let json = serde_json::to_string_pretty(&self.devices)?;
-        forgetty_core::fsutil::write_private_atomic(&self.path, json.as_bytes())?;
+    fn save(path: &std::path::Path, devices: &[DeviceEntry]) -> Result<(), RegistryError> {
+        let json = serde_json::to_string_pretty(devices)?;
+        forgetty_core::fsutil::write_private_atomic(path, json.as_bytes())?;
         Ok(())
     }
 }
@@ -220,5 +232,23 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, vec!["authorized_devices.json".to_string()], "{names:?}");
+    }
+
+    #[test]
+    fn a_failed_save_leaves_memory_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut reg = DeviceRegistry::empty_at(tmp.path().join("state/authorized_devices.json"));
+        reg.add(entry("a")).unwrap();
+        // Make saving fail: the directory path becomes a regular file.
+        let dir = tmp.path().join("state");
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::write(&dir, b"not a directory").unwrap();
+
+        assert!(reg.add(entry("b")).is_err());
+        assert_eq!(reg.list().len(), 1, "a device that was not saved is in memory");
+        assert!(reg.remove("a").is_err());
+        assert!(reg.list().iter().any(|d| d.device_id == "a"), "a removal that was not saved took effect");
+        assert!(reg.update_last_seen("a").is_err());
+        assert!(reg.list()[0].last_seen.is_none(), "last_seen changed without a save");
     }
 }
