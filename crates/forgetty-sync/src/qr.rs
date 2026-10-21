@@ -7,9 +7,8 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// The default iroh EU relay used in the QR payload.
-///
-/// Hardcoded for T-052 per spec. Custom relay configuration is out of scope.
+/// The default iroh EU relay used in the QR payload when the server has no
+/// relay of its own (`relay_urls` / `--relay-url`).
 pub const DEFAULT_RELAY: &str = "https://euw1-1.relay.iroh.network/";
 
 /// QR payload as encoded in the QR code.
@@ -21,8 +20,12 @@ pub struct QrPayload {
     pub node_id: String,
     /// The machine hostname.
     pub machine: String,
-    /// The iroh relay URL.
+    /// The iroh relay URL. With several relays this is the first one.
     pub relay: String,
+    /// All relay URLs of the server including `relay`. Left out of the JSON
+    /// when empty, so a server without own relays writes the v2 payload as before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relays: Vec<String>,
     /// One-time pairing secret, 16 random bytes in base32 (AD-021).
     pub secret: String,
 }
@@ -34,7 +37,27 @@ impl QrPayload {
         let machine = hostname::get()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|_| "unknown".to_string());
-        QrPayload { v: 2, node_id: node_id_str, machine, relay: DEFAULT_RELAY.to_string(), secret }
+        QrPayload {
+            v: 2,
+            node_id: node_id_str,
+            machine,
+            relay: DEFAULT_RELAY.to_string(),
+            relays: Vec::new(),
+            secret,
+        }
+    }
+
+    /// Like [`new`](Self::new), with the relays the server was configured with
+    /// (`--relay-url`, `relay_urls`). An empty list keeps the default relay.
+    pub fn with_relays(node_id_str: String, secret: String, relays: &[String]) -> Self {
+        let mut p = Self::new(node_id_str, secret);
+        if let Some(first) = relays.first() {
+            p.relay = first.clone();
+            if relays.len() > 1 {
+                p.relays = relays.to_vec();
+            }
+        }
+        p
     }
 
     /// Serialise the payload to a compact JSON string (used as QR data).
@@ -101,4 +124,35 @@ pub fn qr_to_png(payload: &QrPayload, module_size: u32) -> Result<Vec<u8>, QrErr
         .write_image(rgba.as_raw(), rgba.width(), rgba.height(), image::ColorType::Rgba8.into())
         .map_err(|e| QrError::Png(e.to_string()))?;
     Ok(png_bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_payload_is_unchanged() {
+        let p = QrPayload::with_relays("n".into(), "S".into(), &[]);
+        assert_eq!(p.relay, DEFAULT_RELAY);
+        assert!(!p.to_json().unwrap().contains("relays"));
+    }
+
+    #[test]
+    fn one_relay_replaces_the_default() {
+        let p = QrPayload::with_relays("n".into(), "S".into(), &["https://r.example.org/".into()]);
+        assert_eq!(p.relay, "https://r.example.org/");
+        assert!(!p.to_json().unwrap().contains("relays"));
+    }
+
+    #[test]
+    fn several_relays_are_listed_in_order() {
+        let urls = vec!["https://a.example.org/".to_string(), "https://b.example.org/".to_string()];
+        let p = QrPayload::with_relays("n".into(), "S".into(), &urls);
+        assert_eq!(p.relay, urls[0]);
+        assert_eq!(p.relays, urls);
+        assert!(p
+            .to_json()
+            .unwrap()
+            .contains(r#""relays":["https://a.example.org/","https://b.example.org/"]"#));
+    }
 }

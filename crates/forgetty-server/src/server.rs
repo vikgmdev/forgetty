@@ -49,6 +49,30 @@ pub struct RunArgs {
     /// picks a free port.
     #[arg(long)]
     pub port: Option<u16>,
+
+    /// Relay server of the iroh endpoint, for example
+    /// `https://relay.example.org`. Repeat for several. Replaces `relay_urls`
+    /// in the config file. Without either, iroh's default relays stay in use.
+    /// The pairing QR carries these URLs.
+    #[arg(long = "relay-url", value_name = "URL")]
+    pub relay_url: Vec<String>,
+}
+
+/// Parse relay URLs from `--relay-url` or the config file.
+pub fn parse_relay_urls(urls: &[String]) -> anyhow::Result<Vec<iroh::RelayUrl>> {
+    let mut out: Vec<iroh::RelayUrl> = Vec::new();
+    for u in urls {
+        let parsed: iroh::RelayUrl =
+            u.trim().parse().map_err(|e| anyhow::anyhow!("invalid relay URL {u:?}: {e}"))?;
+        let scheme = parsed.scheme();
+        if scheme != "http" && scheme != "https" {
+            anyhow::bail!("invalid relay URL {u:?}: scheme must be http or https");
+        }
+        if !out.contains(&parsed) {
+            out.push(parsed);
+        }
+    }
+    Ok(out)
 }
 
 /// Default UDP port of the iroh endpoint (PROTOCOL_V2 section 1).
@@ -621,8 +645,20 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
     let sm_for_alpn = Arc::clone(&session_manager);
     let rpc_v2 = RpcV2::new(Arc::clone(&session_manager), session_id);
     let port = args.port.unwrap_or(DEFAULT_PORT);
+    // Relays: --relay-url replaces the config file list. None: iroh defaults.
+    let relay_source = if args.relay_url.is_empty() { &config.relay_urls } else { &args.relay_url };
+    let relay_urls = parse_relay_urls(relay_source)?;
+    if relay_urls.is_empty() {
+        info!("relays: iroh defaults");
+    } else {
+        info!(
+            "relays: {}",
+            relay_urls.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(", ")
+        );
+    }
     let sync_endpoint = match SyncEndpoint::builder(secret_key)
         .bind_port(port)
+        .relay_urls(relay_urls)
         .transport_config(quic_config())
         .register_alpn(forgetty_proto::ALPN_RPC, rpc_v2.alpn_handler())
         .register_alpn(
@@ -834,6 +870,27 @@ fn restore_subtree(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn relay_urls_parse_and_dedupe() {
+        let urls = vec![
+            "https://relay.example.org".to_string(),
+            "https://relay.example.org/".to_string(),
+            " http://127.0.0.1:3340 ".to_string(),
+        ];
+        let parsed = parse_relay_urls(&urls).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].to_string(), "https://relay.example.org/");
+        assert_eq!(parsed[1].to_string(), "http://127.0.0.1:3340/");
+        assert!(parse_relay_urls(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn bad_relay_urls_are_refused() {
+        assert!(parse_relay_urls(&["not a url".to_string()]).is_err());
+        let e = parse_relay_urls(&["ftp://relay.example.org".to_string()]).unwrap_err();
+        assert!(e.to_string().contains("http or https"), "{e}");
+    }
     use super::*;
 
     /// One test mutates XDG_DATA_HOME; keep the mutations in a single test.

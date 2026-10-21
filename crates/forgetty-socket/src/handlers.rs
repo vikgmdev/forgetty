@@ -1364,7 +1364,11 @@ fn handle_pair_open(request: &Request, se: Option<&SyncEndpoint>) -> Response {
         .unwrap_or(forgetty_sync::PAIRING_WINDOW_SECS)
         .clamp(1, 600);
     let window = se.open_pairing(std::time::Duration::from_secs(ttl));
-    let payload = forgetty_sync::QrPayload::new(se.node_id().to_string(), window.secret.clone());
+    let payload = forgetty_sync::QrPayload::with_relays(
+        se.node_id().to_string(),
+        window.secret.clone(),
+        se.relay_urls(),
+    );
     Response::success(
         request.id.clone(),
         serde_json::json!({
@@ -1407,7 +1411,8 @@ fn handle_get_pairing_info(request: &Request, se: Option<&SyncEndpoint>) -> Resp
     // AD-021: the QR carries a one-time secret, so showing it opens a window.
     let window =
         se.open_pairing(std::time::Duration::from_secs(forgetty_sync::PAIRING_WINDOW_SECS));
-    let payload = forgetty_sync::QrPayload::new(node_id.clone(), window.secret);
+    let payload =
+        forgetty_sync::QrPayload::with_relays(node_id.clone(), window.secret, se.relay_urls());
     let png_bytes = match forgetty_sync::qr::qr_to_png(&payload, 8) {
         Ok(b) => b,
         Err(e) => {

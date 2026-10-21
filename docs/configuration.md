@@ -151,6 +151,19 @@ Custom keybindings using GTK4 accelerator format.
 # Default shortcuts are listed in the README and viewable via F1 in-app.
 ```
 
+### `relay_urls`
+
+**Type:** List of URLs
+**Default:** empty (iroh's default relays)
+
+Relay servers of the server's iroh endpoint (`forgetty server run`). The pairing
+QR carries them, and the apps keep them per paired machine. `forgetty server run
+--relay-url URL` (repeatable) replaces this list. See `relay.md`.
+
+```toml
+relay_urls = ["https://relay.example.org"]
+```
+
 ## Custom theme format
 
 Create a `.toml` file in `~/.config/forgetty/themes/`:

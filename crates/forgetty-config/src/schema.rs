@@ -165,6 +165,12 @@ pub struct Config {
     /// `byte_log_max_mb / 2` on rotation (V2-007 / AD-013). Default: `10`.
     /// `0` disables disk appending (warm-restart replay only covers the ring).
     pub byte_log_max_mb: u32,
+
+    /// Relay servers of the iroh endpoint (`forgetty server run`), for example
+    /// `["https://relay.example.org"]`. Empty (default) keeps iroh's default
+    /// relays. The pairing QR carries these URLs. `--relay-url` on the command
+    /// line replaces this list.
+    pub relay_urls: Vec<String>,
 }
 
 impl Default for Config {
@@ -253,6 +259,9 @@ impl Serialize for Config {
         if self.byte_log_max_mb != 10 {
             map.serialize_entry("byte_log_max_mb", &self.byte_log_max_mb)?;
         }
+        if !self.relay_urls.is_empty() {
+            map.serialize_entry("relay_urls", &self.relay_urls)?;
+        }
 
         map.end()
     }
@@ -325,6 +334,9 @@ impl<'de> Deserialize<'de> for Config {
 
             #[serde(default = "default_byte_log_max_mb")]
             byte_log_max_mb: u32,
+
+            #[serde(default)]
+            relay_urls: Vec<String>,
         }
 
         let raw = RawConfig::deserialize(deserializer)?;
@@ -400,6 +412,7 @@ impl<'de> Deserialize<'de> for Config {
             session_trash_days: raw.session_trash_days,
             byte_log_ring_kb: raw.byte_log_ring_kb,
             byte_log_max_mb: raw.byte_log_max_mb,
+            relay_urls: raw.relay_urls,
         })
     }
 }
@@ -434,4 +447,27 @@ fn default_byte_log_ring_kb() -> u32 {
 
 fn default_byte_log_max_mb() -> u32 {
     10
+}
+
+#[cfg(test)]
+mod relay_urls_tests {
+    use super::Config;
+
+    #[test]
+    fn relay_urls_default_is_empty_and_not_written() {
+        let c: Config = toml::from_str("").unwrap();
+        assert!(c.relay_urls.is_empty());
+        let text = toml::to_string(&c).unwrap();
+        assert!(!text.contains("relay_urls"));
+    }
+
+    #[test]
+    fn relay_urls_round_trip() {
+        let c: Config =
+            toml::from_str(r#"relay_urls = ["https://a.example.org", "https://b.example.org"]"#)
+                .unwrap();
+        assert_eq!(c.relay_urls, vec!["https://a.example.org", "https://b.example.org"]);
+        let again: Config = toml::from_str(&toml::to_string(&c).unwrap()).unwrap();
+        assert_eq!(again.relay_urls, c.relay_urls);
+    }
 }

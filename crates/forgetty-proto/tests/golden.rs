@@ -229,6 +229,7 @@ fn golden_qr_payload() {
         node_id: "abc".into(),
         machine: "ovh".into(),
         relay: "https://r/".into(),
+        relays: Vec::new(),
         secret: "S".into(),
     };
     assert_eq!(

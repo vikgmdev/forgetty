@@ -340,8 +340,12 @@ pub struct QrPayload {
     pub node_id: String,
     /// Host name of the machine.
     pub machine: String,
-    /// Relay URL.
+    /// Relay URL. With several relays this is the first one.
     pub relay: String,
+    /// All relay URLs of the server, in order, including `relay`. Absent in
+    /// payloads from servers with one relay and in older payloads.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relays: Vec<String>,
     /// One-time secret, 16 random bytes as base32.
     pub secret: String,
 }
@@ -364,6 +368,18 @@ impl QrPayload {
     /// Compact JSON for the QR code.
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).expect("QrPayload serializes")
+    }
+
+    /// Every relay URL in the payload: `relays`, or `relay` when `relays` is
+    /// empty. Empty strings and duplicates are dropped.
+    pub fn relay_urls(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for r in std::iter::once(&self.relay).chain(self.relays.iter()) {
+            if !r.is_empty() && !out.contains(r) {
+                out.push(r.clone());
+            }
+        }
+        out
     }
 
     /// Parse and check the version.
