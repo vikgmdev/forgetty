@@ -3,7 +3,20 @@
 `forgetty` is one binary. It is the durable per-user terminal server (AD-017)
 and its CLI. It needs no GTK, no display server and no `pkg-config`.
 
-## Build and install
+## Install
+
+From a release (no Rust needed): see `packaging.md`.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/vikgmdev/forgetty/main/scripts/install.sh | bash
+```
+
+It installs the deb or rpm on a machine that has dpkg or rpm, or the tarball
+into `~/.local` with `--tarball` (no root). The packages put the user unit at
+`/usr/lib/systemd/user/forgetty-server.service` and print the two commands
+that enable it. Nothing runs as root.
+
+## Build and install from source
 
 ```sh
 cargo build --release -p forgetty-server
@@ -195,3 +208,12 @@ scripts/p2b_gate.sh  # protocol v2: client suites against the real server, exact
 
 Both run a server in a temp state dir as the current user and need outbound
 internet for iroh relay and discovery.
+
+## Relay
+
+Without a relay of your own the server uses iroh's default relays. To use your
+own `iroh-relay`, pass `--relay-url URL` (repeatable) to `forgetty server run`
+or set `relay_urls = ["https://relay.example.org"]` in
+`~/.config/forgetty/config.toml`. The pairing QR then carries the relay and the
+apps use it. How to run `iroh-relay` as a user service, with HTTPS and the
+firewall ports: `relay.md`.
