@@ -108,6 +108,8 @@ New methods:
 `LayoutChanged { layout }`, `PaneClosed { pane_id }`, `TitleChanged { pane_id, title }`,
 `CwdChanged { pane_id, cwd }`, `PaneResized { pane_id, rows, cols }`,
 `StatusChanged { pane_id, status, message }` (P4, cap `status_events`),
+`Notification { pane_id, title, body }` (OSC 9/99/777, cap `status_events`),
+`PaneExited { pane_id, exit_code }` (the pane stays listed only if `remain_on_exit`),
 `ClientConnected { client_id, client_kind, client_name, connected_at }`,
 `ClientDisconnected { client_id }`.
 
