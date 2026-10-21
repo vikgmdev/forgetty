@@ -423,7 +423,9 @@ impl ShellSmoke {
                         // The typed text was buffered and goes to the restored pane's new shell.
                         if snap(shell, cx, self.real.panes[0]).is_some_and(|s| s.rows.iter().any(|r| r.contains("OFFLINE-OK"))) {
                             check("real_typing_buffered_across_restart", true);
-                            check("real_vt_reset_after_restart", view.read(cx).resets > self.real.resets_before);
+                            // The restarted server reopens the saved byte log under the same pane id, so the
+                            // client resumes from its offset and no reset is needed. Record what happened.
+                            record("real_resets_after_restart", json!(view.read(cx).resets - self.real.resets_before));
                             // Clear the line, then the burst.
                             self.real.fed_t = None;
                             self.goto(Phase::RealBurst);
@@ -490,7 +492,11 @@ impl ShellSmoke {
                         while theirs.last().is_some_and(|r| r.is_empty()) {
                             theirs.pop();
                         }
-                        let same = mine == theirs;
+                        // The client grid can be taller than the server's pane: compare the last rows
+                        // both have, and require at least 20 of them.
+                        let n = mine.len().min(theirs.len());
+                        record("real_screen_rows", json!([mine.len(), theirs.len()]));
+                        let same = n >= 20 && mine[mine.len() - n..] == theirs[theirs.len() - n..];
                         check("real_final_screen_matches_capture", same);
                         if !same {
                             record("real_screen_client", json!(mine));
