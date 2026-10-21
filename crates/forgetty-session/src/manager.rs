@@ -1885,6 +1885,22 @@ impl SessionManager {
         }
     }
 
+    /// Seal every pane's byte log for a graceful stop: the next start then
+    /// keeps the offsets exactly, where after a crash it jumps over what the
+    /// disk queue may have lost. Call it after [`Self::begin_shutdown`] and
+    /// [`Self::flush_all_byte_logs`], when nothing appends any more.
+    pub async fn seal_all_byte_logs(&self) {
+        let futures: Vec<(PaneId, _)> = {
+            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            inner.byte_logs.iter().map(|(id, log)| (*id, log.make_seal_future())).collect()
+        };
+        for (id, fut) in futures {
+            if let Err(e) = fut.await {
+                warn!(%id, "seal_all_byte_logs: seal failed: {e}");
+            }
+        }
+    }
+
     /// Drop the pane's `ByteLog`, closing its disk appender channel and ending
     /// the appender task.
     pub fn close_pane_byte_log(&self, pane_id: PaneId) {

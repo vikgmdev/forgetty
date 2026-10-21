@@ -1088,6 +1088,7 @@ pub async fn graceful_exit(
     // dying with the server, a late PaneClosed) may rewrite the saved layout.
     sm.begin_shutdown();
     sm.flush_all_byte_logs().await;
+    sm.seal_all_byte_logs().await;
     info!("byte logs flushed");
     for hook in SHUTDOWN_HOOKS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
         hook();
