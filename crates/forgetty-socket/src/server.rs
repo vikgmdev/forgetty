@@ -71,7 +71,7 @@ impl SocketServer {
     ///
     /// Removes any stale socket file and creates the parent directory if
     /// needed. Use this when the caller needs to override the default path
-    /// (e.g., `forgetty-daemon --socket-path`).
+    /// (e.g., `forgetty-server --socket-path`).
     pub fn new_with_path(socket_path: PathBuf) -> std::io::Result<Self> {
         // Remove stale socket file if it exists.
         if socket_path.exists() {

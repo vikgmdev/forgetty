@@ -1,0 +1,21 @@
+[Unit]
+Description=Forgetty durable terminal server
+Documentation=https://forgetty.dev
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/forgetty-server
+Restart=on-failure
+RestartSec=5s
+
+# Logs go to the user journal. Read with: journalctl --user -u forgetty-server -f
+StandardOutput=journal
+StandardError=journal
+
+# XDG_RUNTIME_DIR is set by systemd for user services.
+# Sessions are PTY children of this process, so stop the whole cgroup on exit.
+KillMode=control-group
+
+[Install]
+WantedBy=default.target

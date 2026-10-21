@@ -1,0 +1,61 @@
+[package]
+name = "forgetty-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Forgetty durable headless terminal server (no GTK, no display server)"
+build = "build.rs"
+default-run = "forgetty-server"
+
+[lib]
+name = "forgetty_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "forgetty-server"
+path = "src/main.rs"
+
+[[bin]]
+name = "forgetty-pair-test"
+path = "src/pair_test.rs"
+required-features = ["qa-tools"]
+
+[[bin]]
+name = "forgetty-stream-test"
+path = "src/stream_test.rs"
+required-features = ["qa-tools"]
+
+[features]
+qa-tools = []
+
+[[bench]]
+# V2-013: in-process hot-path micro-bench (PTY -> broadcast subscriber).
+name = "daemon_hotpath"
+harness = false
+
+[dev-dependencies]
+# Bench-only, never compiled into release binaries.
+criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+bytes = "1"
+
+[dependencies]
+forgetty-core = { path = "../forgetty-core" }
+forgetty-config = { path = "../forgetty-config" }
+forgetty-pty = { path = "../forgetty-pty" }
+forgetty-session = { path = "../forgetty-session" }
+forgetty-socket = { path = "../forgetty-socket" }
+forgetty-sync = { path = "../forgetty-sync" }
+forgetty-workspace = { path = "../forgetty-workspace" }
+tokio = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde_json = { workspace = true }
+anyhow = "1"
+dirs = { workspace = true }
+iroh = { workspace = true }
+rand = { workspace = true }
+uuid = { workspace = true }
+rmp-serde = "1"
+serde = { workspace = true }
+serde_bytes = "0.11"

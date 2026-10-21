@@ -1,6 +1,6 @@
 //! `forgetty-pair-test` — minimal iroh dialer for manual QA testing.
 //!
-//! Connects to a running `forgetty-daemon --allow-pairing` instance and
+//! Connects to a running `forgetty-server --allow-pairing` instance and
 //! completes the pairing handshake. Used to test AC-6 and AC-14 without
 //! an Android device.
 //!
@@ -8,10 +8,10 @@
 //!
 //! ```text
 //! # Start daemon with pairing enabled:
-//! forgetty-daemon --foreground --allow-pairing &
+//! forgetty-server --foreground --allow-pairing &
 //!
 //! # Get node_id from daemon output or:
-//! forgetty-daemon --show-pairing-qr
+//! forgetty-server --show-pairing-qr
 //!
 //! # Dial and pair:
 //! forgetty-pair-test --dial <node_id>
@@ -31,7 +31,7 @@ const FORGETTY_PAIRING_ALPN: &[u8] = b"forgetty/pair/1";
 struct Args {
     /// The node ID (iroh EndpointId) of the daemon to pair with.
     ///
-    /// Obtain by running: `forgetty-daemon --show-pairing-qr`
+    /// Obtain by running: `forgetty-server --show-pairing-qr`
     #[arg(long)]
     dial: String,
 }

@@ -21,8 +21,8 @@ info() { printf "${GREEN}[-]${RESET} %s\n" "$1"; }
 info "Removing /usr/local/bin/forgetty"
 sudo rm -f /usr/local/bin/forgetty
 
-info "Removing /usr/local/bin/forgetty-daemon"
-sudo rm -f /usr/local/bin/forgetty-daemon
+info "Removing /usr/local/bin/forgetty-server"
+sudo rm -f /usr/local/bin/forgetty-server
 
 # ── Remove shared library (requires sudo) ───────────────────────────
 info "Removing libghostty-vt.so from /usr/local/lib/"

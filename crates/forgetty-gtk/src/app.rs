@@ -245,13 +245,13 @@ fn ensure_daemon(session_id: uuid::Uuid) -> Arc<DaemonClient> {
     // 2. Daemon not running — find the binary.
     let daemon_binary: Option<PathBuf> = std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join("forgetty-daemon")))
+        .and_then(|exe| exe.parent().map(|dir| dir.join("forgetty-server")))
         .filter(|p| p.exists())
         .or_else(|| {
             // PATH fallback
             std::env::var("PATH").ok().and_then(|path_var| {
                 path_var.split(':').find_map(|dir| {
-                    let p = PathBuf::from(dir).join("forgetty-daemon");
+                    let p = PathBuf::from(dir).join("forgetty-server");
                     if p.exists() {
                         Some(p)
                     } else {
@@ -263,7 +263,7 @@ fn ensure_daemon(session_id: uuid::Uuid) -> Arc<DaemonClient> {
 
     let Some(daemon_path) = daemon_binary else {
         tracing::error!(
-            "ensure_daemon: forgetty-daemon binary not found on PATH or alongside forgetty; cannot continue"
+            "ensure_daemon: forgetty-server binary not found on PATH or alongside forgetty; cannot continue"
         );
         std::process::exit(1);
     };

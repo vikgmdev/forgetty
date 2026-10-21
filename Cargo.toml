@@ -11,6 +11,24 @@ members = [
     "crates/forgetty-socket",
     "crates/forgetty-session",
     "crates/forgetty-sync",
+    "crates/forgetty-server",
+]
+
+# V3 (AD-022): the GTK client is paused. Default members exclude the root
+# `forgetty` GTK package and `forgetty-gtk`, so plain `cargo build/test/clippy`
+# needs no GTK/pkg-config. Build the GTK app explicitly with
+# `cargo build -p forgetty -p forgetty-gtk`.
+default-members = [
+    "crates/forgetty-core",
+    "crates/forgetty-vt",
+    "crates/forgetty-pty",
+    "crates/forgetty-config",
+    "crates/forgetty-watcher",
+    "crates/forgetty-workspace",
+    "crates/forgetty-socket",
+    "crates/forgetty-session",
+    "crates/forgetty-sync",
+    "crates/forgetty-server",
 ]
 
 [workspace.package]
@@ -54,65 +72,20 @@ description.workspace = true
 build = "build.rs"
 default-run = "forgetty"
 
-[lib]
-name = "forgetty_daemon"
-path = "src/lib.rs"
-
+# GTK client (paused, AD-022). The headless server lives in crates/forgetty-server.
 [[bin]]
 name = "forgetty"
 path = "src/main.rs"
-
-[[bin]]
-name = "forgetty-daemon"
-path = "src/daemon.rs"
-
-[[bin]]
-name = "forgetty-pair-test"
-path = "src/pair_test.rs"
-required-features = ["qa-tools"]
-
-[[bin]]
-name = "forgetty-stream-test"
-path = "src/stream_test.rs"
-required-features = ["qa-tools"]
-
-[features]
-qa-tools = []
-
-[dev-dependencies]
-# V2-013: Criterion micro-benchmark suite for the daemon hot path.
-# Bench-only — never compiled into release binaries (R-3 in V2-013 SPEC).
-criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
-tokio = { workspace = true }
-forgetty-core = { path = "crates/forgetty-core" }
-forgetty-pty = { path = "crates/forgetty-pty" }
-forgetty-session = { path = "crates/forgetty-session" }
-bytes = "1"
-
-[[bench]]
-# V2-013: in-process daemon hot-path micro-bench (PTY → broadcast subscriber).
-name = "daemon_hotpath"
-harness = false
 
 [dependencies]
 forgetty-core = { path = "crates/forgetty-core" }
 forgetty-config = { path = "crates/forgetty-config" }
 forgetty-gtk = { path = "crates/forgetty-gtk" }
-forgetty-pty = { path = "crates/forgetty-pty" }
-forgetty-session = { path = "crates/forgetty-session" }
-forgetty-socket = { path = "crates/forgetty-socket" }
-forgetty-sync = { path = "crates/forgetty-sync" }
 forgetty-workspace = { path = "crates/forgetty-workspace" }
 tokio = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde_json = { workspace = true }
-anyhow = "1"
 dirs = { workspace = true }
-iroh = { workspace = true }
-rand = { workspace = true }
 uuid = { workspace = true }
-rmp-serde = "1"
-serde = { workspace = true }
-serde_bytes = "0.11"

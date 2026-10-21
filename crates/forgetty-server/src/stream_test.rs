@@ -1,6 +1,6 @@
 //! `forgetty-stream-test` — terminal stream QA test client.
 //!
-//! Connects to a running `forgetty-daemon` instance via iroh QUIC using the
+//! Connects to a running `forgetty-server` instance via iroh QUIC using the
 //! `forgetty/stream/1` ALPN. Sends a `Subscribe` message for a given pane,
 //! reads the `FullSnapshot` response, and then reads live `PtyBytes` frames.
 //!
@@ -10,10 +10,10 @@
 //!
 //! ```text
 //! # Terminal 1: start daemon (with a pane already open or --allow-pairing for first pair)
-//! forgetty-daemon --foreground --allow-pairing &
+//! forgetty-server --foreground --allow-pairing &
 //!
 //! # Get node_id
-//! forgetty-daemon --show-pairing-qr
+//! forgetty-server --show-pairing-qr
 //!
 //! # Terminal 2: pair first (uses the pair-test.key identity)
 //! forgetty-pair-test --dial <node_id>
@@ -42,11 +42,11 @@ use clap::Parser;
 use iroh::{endpoint::presets, Endpoint, EndpointAddr, SecretKey};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use forgetty_daemon::iroh_terminal::{ClientMsg, DaemonMsg, FORGETTY_STREAM_ALPN};
+use forgetty_server::iroh_terminal::{ClientMsg, DaemonMsg, FORGETTY_STREAM_ALPN};
 use forgetty_sync::FORGETTY_PAIRING_ALPN;
 
 /// Maximum frame size accepted from the daemon (must match the
-/// `MAX_FRAME_SIZE` constant in `forgetty_daemon::iroh_terminal`).
+/// `MAX_FRAME_SIZE` constant in `forgetty_server::iroh_terminal`).
 const MAX_FRAME_SIZE: usize = 4 * 1024 * 1024;
 
 #[derive(Parser, Debug)]
@@ -55,13 +55,13 @@ const MAX_FRAME_SIZE: usize = 4 * 1024 * 1024;
 struct Args {
     /// The iroh node ID (EndpointId) of the daemon to connect to.
     ///
-    /// Obtain by running: `forgetty-daemon --show-pairing-qr`
+    /// Obtain by running: `forgetty-server --show-pairing-qr`
     #[arg(long)]
     dial: String,
 
     /// Pane UUID to subscribe to.
     ///
-    /// Obtain from `forgetty-daemon` logs or via socket `list_tabs`.
+    /// Obtain from `forgetty-server` logs or via socket `list_tabs`.
     #[arg(long)]
     pane_id: Option<String>,
 
@@ -92,6 +92,21 @@ struct Args {
     /// of PTY local-echo per hyperfine iteration; waiting for 5 would hang.
     #[arg(long, default_value_t = 5)]
     max_msgs: usize,
+
+    /// After subscribing, send this text plus a newline to the pane as
+    /// keyboard input (`SendInput`). Used by `scripts/p0_gate.sh`.
+    #[arg(long)]
+    send_line: Option<String>,
+
+    /// Wait until this substring shows up in the pane output (snapshot lines
+    /// or `PtyBytes`). Prints `PASS: expected output found` and exits 0 when
+    /// seen, exits 1 on `--timeout-secs`. Overrides `--max-msgs`.
+    #[arg(long)]
+    expect: Option<String>,
+
+    /// Give up after this many seconds when `--expect` is set.
+    #[arg(long, default_value_t = 30)]
+    timeout_secs: u64,
 }
 
 fn main() {
@@ -128,7 +143,7 @@ async fn run() -> anyhow::Result<()> {
     // Optionally pair first.
     if args.pair_first {
         eprintln!("stream-test: pairing first with --pair-first ...");
-        pair_with_daemon(&ep, endpoint_id.clone()).await?;
+        pair_with_daemon(&ep, endpoint_id).await?;
         eprintln!("stream-test: paired ok, now connecting for streaming");
     }
 
@@ -164,6 +179,16 @@ async fn run() -> anyhow::Result<()> {
         send.write_all(&payload).await?;
         send.flush().await?;
         eprintln!("stream-test: sent Subscribe {{ pane_id: {} }}", pid);
+
+        if let Some(line) = &args.send_line {
+            let mut data = line.clone().into_bytes();
+            data.push(b'\n');
+            let payload = rmp_serde::to_vec_named(&ClientMsg::SendInput { pane_id: pid, data })?;
+            send.write_all(&(payload.len() as u32).to_be_bytes()).await?;
+            send.write_all(&payload).await?;
+            send.flush().await?;
+            eprintln!("stream-test: sent SendInput {line:?}");
+        }
     }
 
     // Read messages from daemon.
@@ -172,9 +197,24 @@ async fn run() -> anyhow::Result<()> {
     let start = std::time::Instant::now();
     let mut last_report = std::time::Instant::now();
 
+    let deadline = start + Duration::from_secs(args.timeout_secs);
+    let mut seen = String::new();
+    let mut expect_found = false;
+
     loop {
         // Read frame length.
-        let msg = read_frame(&mut recv).await?;
+        let msg = if args.expect.is_some() {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match tokio::time::timeout(left, read_frame(&mut recv)).await {
+                Ok(m) => m?,
+                Err(_) => {
+                    println!("FAIL: expected output not seen within {}s", args.timeout_secs);
+                    anyhow::bail!("timeout waiting for {:?}", args.expect);
+                }
+            }
+        } else {
+            read_frame(&mut recv).await?
+        };
 
         match &msg {
             DaemonMsg::FullSnapshot { rows, cols, lines, cursor_row, cursor_col, .. } => {
@@ -193,7 +233,11 @@ async fn run() -> anyhow::Result<()> {
                         eprintln!("  row {:2}: {:?}", i, trimmed);
                     }
                 }
-                if !args.stress {
+                for line in lines {
+                    seen.push_str(line);
+                    seen.push('\n');
+                }
+                if !args.stress && args.expect.is_none() {
                     // In non-stress mode, one snapshot is enough for validation.
                     println!("PASS: FullSnapshot received ({}x{})", rows, cols);
                 }
@@ -204,6 +248,9 @@ async fn run() -> anyhow::Result<()> {
 
                 if args.print_output {
                     print!("{}", String::from_utf8_lossy(data));
+                }
+                if args.expect.is_some() {
+                    seen.push_str(&String::from_utf8_lossy(data));
                 }
 
                 if args.stress {
@@ -217,13 +264,13 @@ async fn run() -> anyhow::Result<()> {
                         );
                         last_report = std::time::Instant::now();
                     }
-                } else if msg_count == 1 {
+                } else if msg_count == 1 && args.expect.is_none() {
                     println!("PASS: first PtyBytes received ({} bytes)", data.len());
                 }
 
                 // In non-stress mode, exit after receiving the configured
                 // number of PtyBytes messages (default 5; typometer passes 1).
-                if !args.stress && msg_count >= args.max_msgs {
+                if !args.stress && args.expect.is_none() && msg_count >= args.max_msgs {
                     println!("PASS: received {} PtyBytes messages", msg_count);
                     break;
                 }
@@ -258,6 +305,14 @@ async fn run() -> anyhow::Result<()> {
                 break;
             }
         }
+
+        if let Some(want) = &args.expect {
+            if seen.contains(want.as_str()) {
+                println!("PASS: expected output found ({want:?})");
+                expect_found = true;
+                break;
+            }
+        }
     }
 
     // Send Unsubscribe before closing.
@@ -270,6 +325,10 @@ async fn run() -> anyhow::Result<()> {
 
     conn.close(0u8.into(), b"done");
     ep.close().await;
+
+    if args.expect.is_some() && !expect_found {
+        anyhow::bail!("stream ended before the expected output appeared");
+    }
 
     if args.stress {
         let secs = start.elapsed().as_secs_f64();

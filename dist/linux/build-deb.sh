@@ -4,7 +4,7 @@ umask 022
 
 # ── Forgetty DEB package builder ───────────────────────────────────
 # Builds a .deb package from the release artifacts.
-# Prerequisites: cargo build --release
+# Prerequisites: cargo build --release -p forgetty -p forgetty-server
 # Output: forgetty_<version>_amd64.deb in the project root
 # ────────────────────────────────────────────────────────────────────
 
@@ -26,24 +26,24 @@ error() { printf "${RED}[!]${RESET} %s\n" "$1" >&2; }
 
 # ── Pre-flight checks ──────────────────────────────────────────────
 BINARY="$PROJECT_ROOT/target/release/forgetty"
-DAEMON_BINARY="$PROJECT_ROOT/target/release/forgetty-daemon"
+DAEMON_BINARY="$PROJECT_ROOT/target/release/forgetty-server"
 SO_FILE="$PROJECT_ROOT/target/release/lib/libghostty-vt.so.0.1.0"
 
 if [ ! -f "$BINARY" ]; then
     error "Release binary not found: $BINARY"
-    error "Run 'cargo build --release' first."
+    error "Run 'cargo build --release -p forgetty -p forgetty-server' first."
     exit 1
 fi
 
 if [ ! -f "$DAEMON_BINARY" ]; then
     error "Daemon binary not found: $DAEMON_BINARY"
-    error "Run 'cargo build --release --bin forgetty-daemon' first."
+    error "Run 'cargo build --release -p forgetty -p forgetty-server' first."
     exit 1
 fi
 
 if [ ! -f "$SO_FILE" ]; then
     error "Shared library not found: $SO_FILE"
-    error "Run 'cargo build --release' first."
+    error "Run 'cargo build --release -p forgetty -p forgetty-server' first."
     exit 1
 fi
 
@@ -84,7 +84,7 @@ info "Copying GTK binary"
 install -Dm755 "$BINARY" "$STAGING/usr/bin/forgetty"
 
 info "Copying daemon binary"
-install -Dm755 "$DAEMON_BINARY" "$STAGING/usr/bin/forgetty-daemon"
+install -Dm755 "$DAEMON_BINARY" "$STAGING/usr/bin/forgetty-server"
 
 info "Copying shared library"
 install -Dm755 "$SO_FILE" "$STAGING/usr/lib/forgetty/libghostty-vt.so.0.1.0"

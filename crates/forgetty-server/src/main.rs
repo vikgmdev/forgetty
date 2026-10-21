@@ -1,4 +1,4 @@
-//! `forgetty-daemon` — headless session daemon.
+//! `forgetty-server` — headless session daemon.
 //!
 //! Starts `SessionManager` and the JSON-RPC socket server without any GTK or
 //! display-server dependency. Intended to run as a systemd user service so
@@ -7,7 +7,7 @@
 //! # Usage
 //!
 //! ```text
-//! forgetty-daemon [OPTIONS]
+//! forgetty-server [OPTIONS]
 //!
 //! Options:
 //!   --foreground           Stay in foreground; compact log to stderr
@@ -17,6 +17,7 @@
 //!   --revoke <DEVICE_ID>   Revoke a paired device by device_id and exit
 //!   --socket-path <PATH>   Override the Unix socket path
 //!   --config-file <PATH>   Override the config file path
+//!   --state-dir <DIR>      Keep all state under DIR (data, config, runtime socket)
 //! ```
 
 use std::path::PathBuf;
@@ -38,14 +39,14 @@ use forgetty_sync::{
     identity::load_or_generate, qr::qr_to_ascii, registry::DeviceRegistry, SyncEndpoint,
 };
 
-use forgetty_daemon::iroh_terminal::{handle_terminal_stream, FORGETTY_STREAM_ALPN};
+use forgetty_server::iroh_terminal::{handle_terminal_stream, FORGETTY_STREAM_ALPN};
 
 // ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 
 #[derive(Parser, Debug)]
-#[command(name = "forgetty-daemon")]
+#[command(name = "forgetty-server")]
 #[command(about = "Forgetty headless daemon — keeps sessions alive, runs socket server")]
 #[command(version)]
 struct DaemonArgs {
@@ -101,21 +102,63 @@ struct DaemonArgs {
     /// exist the daemon warns and continues with built-in defaults.
     #[arg(long)]
     config_file: Option<PathBuf>,
+
+    /// Keep all server state under this directory.
+    ///
+    /// Sets `XDG_DATA_HOME=<DIR>/data`, `XDG_CONFIG_HOME=<DIR>/config` and
+    /// `XDG_RUNTIME_DIR=<DIR>/run` for this process before anything else
+    /// reads them. Identity, paired devices, sessions and byte logs then
+    /// live under DIR, never in the user's real `~/.local/share/forgetty`.
+    /// Used by `scripts/p0_gate.sh` and for throwaway instances.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
+/// Point the XDG base directories at `dir` (see `--state-dir`).
+///
+/// Must run before the tokio runtime starts: `set_var` is not safe once other
+/// threads read the environment.
+fn apply_state_dir(dir: &std::path::Path) -> anyhow::Result<()> {
+    let dir = std::fs::canonicalize(dir).or_else(|_| {
+        std::fs::create_dir_all(dir)?;
+        std::fs::canonicalize(dir)
+    })?;
+    for (var, sub) in
+        [("XDG_DATA_HOME", "data"), ("XDG_CONFIG_HOME", "config"), ("XDG_RUNTIME_DIR", "run")]
+    {
+        let path = dir.join(sub);
+        std::fs::create_dir_all(&path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+        }
+        std::env::set_var(var, &path);
+    }
+    Ok(())
+}
+
 fn main() {
+    let args = DaemonArgs::parse();
+    if let Some(dir) = &args.state_dir {
+        if let Err(e) = apply_state_dir(dir) {
+            eprintln!("forgetty-server error: --state-dir {}: {e}", dir.display());
+            std::process::exit(1);
+        }
+    }
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
         .expect("failed to build tokio runtime");
 
-    if let Err(e) = runtime.block_on(main_async()) {
-        eprintln!("forgetty-daemon error: {e}");
+    if let Err(e) = runtime.block_on(main_async(args)) {
+        eprintln!("forgetty-server error: {e}");
         std::process::exit(1);
     }
 }
@@ -124,9 +167,7 @@ fn main() {
 // Async main
 // ---------------------------------------------------------------------------
 
-async fn main_async() -> anyhow::Result<()> {
-    let args = DaemonArgs::parse();
-
+async fn main_async(args: DaemonArgs) -> anyhow::Result<()> {
     // --- Early-exit modes that don't need logging or session state ---
 
     // --list-devices: print and exit.
@@ -497,7 +538,7 @@ async fn main_async() -> anyhow::Result<()> {
     // no concurrent writer to `active/{session_id}.json` here.
     save_session_from_layout(&session_manager, session_id);
 
-    info!("forgetty-daemon started, socket at {}", socket_path.display());
+    info!("forgetty-server started, socket at {}", socket_path.display());
 
     // Per-pane drain tasks are spawned by the SessionManager automatically
     // when each pane is created (via spawn_drain_task inside create_pane /
@@ -591,7 +632,7 @@ async fn main_async() -> anyhow::Result<()> {
     //
     // `forgetty-sync` owns only the pairing ALPN. The terminal streaming ALPN
     // is registered here with a closure that forwards to the terminal-side
-    // handler in `forgetty_daemon::iroh_terminal`, keeping all terminal-
+    // handler in `forgetty_server::iroh_terminal`, keeping all terminal-
     // specific behaviour out of the transport crate.
     let secret_key = load_or_generate()?;
     let sm_for_alpn = Arc::clone(&session_manager);
@@ -650,7 +691,7 @@ async fn main_async() -> anyhow::Result<()> {
         _ = sigint.recv()  => { info!("Received SIGINT");  }
     }
 
-    info!("forgetty-daemon shutting down");
+    info!("forgetty-server shutting down");
     sync_endpoint.close().await;
     // V2-007 / AD-013: flush per-pane byte-log ring to disk so reconnecting
     // clients (and next cold-start) see up-to-date scrollback.

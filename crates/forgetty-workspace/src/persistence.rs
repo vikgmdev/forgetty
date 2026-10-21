@@ -1455,8 +1455,7 @@ mod tests {
     fn p018_move_active_to_sessions_pinned_path() {
         let _g = XdgGuard::new();
         let id = Uuid::new_v4();
-        let mut state = WorkspaceState::default();
-        state.pinned = true;
+        let state = WorkspaceState { pinned: true, ..Default::default() };
         move_to_active(id, &state).unwrap();
         move_active_to_sessions(id).unwrap();
 

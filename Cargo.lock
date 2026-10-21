@@ -1075,24 +1075,12 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 name = "forgetty"
 version = "0.1.0-beta"
 dependencies = [
- "anyhow",
- "bytes",
  "clap",
- "criterion",
  "dirs",
  "forgetty-config",
  "forgetty-core",
  "forgetty-gtk",
- "forgetty-pty",
- "forgetty-session",
- "forgetty-socket",
- "forgetty-sync",
  "forgetty-workspace",
- "iroh",
- "rand",
- "rmp-serde",
- "serde",
- "serde_bytes",
  "serde_json",
  "tokio",
  "tracing",
@@ -1155,6 +1143,34 @@ dependencies = [
  "libc",
  "portable-pty",
  "tracing",
+]
+
+[[package]]
+name = "forgetty-server"
+version = "0.1.0-beta"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "clap",
+ "criterion",
+ "dirs",
+ "forgetty-config",
+ "forgetty-core",
+ "forgetty-pty",
+ "forgetty-session",
+ "forgetty-socket",
+ "forgetty-sync",
+ "forgetty-workspace",
+ "iroh",
+ "rand",
+ "rmp-serde",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

@@ -8,7 +8,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BINARY="$SCRIPT_DIR/target/release/forgetty"
-DAEMON_BINARY="$SCRIPT_DIR/target/release/forgetty-daemon"
+DAEMON_BINARY="$SCRIPT_DIR/target/release/forgetty-server"
 
 # ── Colours (no-op when piped) ──────────────────────────────────────
 if [ -t 1 ]; then
@@ -25,7 +25,7 @@ error() { printf "${RED}[!]${RESET} %s\n" "$1" >&2; }
 
 # ── Build release binary ───────────────────────────────────────────
 info "Building release binary..."
-(cd "$SCRIPT_DIR" && cargo build --release)
+(cd "$SCRIPT_DIR" && cargo build --release -p forgetty -p forgetty-server)
 
 if [ ! -f "$BINARY" ]; then
     error "Build failed: release binary not found at $BINARY"
@@ -33,7 +33,7 @@ if [ ! -f "$BINARY" ]; then
 fi
 
 if [ ! -f "$DAEMON_BINARY" ]; then
-    error "Build failed: forgetty-daemon binary not found at $DAEMON_BINARY"
+    error "Build failed: forgetty-server binary not found at $DAEMON_BINARY"
     exit 1
 fi
 
@@ -63,7 +63,7 @@ fi
 
 if [ -z "$SO_DIR" ]; then
     error "Could not find $SO_NAME in build output."
-    error "Run 'cargo build --release' first."
+    error "Run 'cargo build --release -p forgetty -p forgetty-server' first."
     exit 1
 fi
 
@@ -73,8 +73,8 @@ info "Found shared library in: $SO_DIR"
 info "Installing binary to /usr/local/bin/forgetty"
 sudo install -Dm755 "$BINARY" /usr/local/bin/forgetty
 
-info "Installing daemon to /usr/local/bin/forgetty-daemon"
-sudo install -Dm755 "$DAEMON_BINARY" /usr/local/bin/forgetty-daemon
+info "Installing daemon to /usr/local/bin/forgetty-server"
+sudo install -Dm755 "$DAEMON_BINARY" /usr/local/bin/forgetty-server
 
 # ── Install shared library (requires sudo) ──────────────────────────
 info "Installing $SO_NAME to /usr/local/lib/"
@@ -107,7 +107,7 @@ gtk-update-icon-cache -f -t "$HOME/.local/share/icons/hicolor/" 2>/dev/null || t
 printf "\n${BOLD}${GREEN}Forgetty installed successfully!${RESET}\n"
 echo ""
 echo "  Binary:   /usr/local/bin/forgetty"
-echo "  Daemon:   /usr/local/bin/forgetty-daemon"
+echo "  Daemon:   /usr/local/bin/forgetty-server"
 echo "  Library:  /usr/local/lib/$SO_NAME"
 echo "  Desktop:  $DESKTOP_DST"
 echo "  Icon:     $ICON_DST"
