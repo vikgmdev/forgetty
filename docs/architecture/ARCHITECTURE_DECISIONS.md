@@ -304,6 +304,90 @@ below human perception threshold and eliminates the stale-daemon failure mode
 
 ---
 
+## AD-017: One durable server per user (supersedes AD-001, AD-012, AD-016)
+
+**Decision:** `forgetty-server` is one long-lived process per Linux user, run by
+`systemd --user` with linger. It holds every workspace, tab and pane for that
+user. A client disconnect never ends a session. A session ends only when a
+client closes it or the server stops.
+
+- Clients (Windows, Android, CLI) attach and detach freely. Many clients can
+  attach at the same time.
+- The pinned/trash lifecycle of AD-016 no longer applies to live sessions.
+- Server restart: layout is restored and byte logs are replayed. Processes do
+  not survive a server restart.
+- The stale-daemon problem (FIX-007) is solved by AD-018 version negotiation,
+  not by killing the server.
+
+**Decided:** 2026-10-21.
+
+---
+
+## AD-018: Protocol v2 with version and capability negotiation (amends AD-010)
+
+**Decision:** Remote clients speak protocol v2 on iroh ALPN `forgetty/rpc/2`.
+The first message on a connection is `Hello { proto_version, capabilities }`
+from each side. A peer ignores capabilities it does not know and degrades.
+An unknown major version gets a clear error, never a silent failure.
+
+- One QUIC bi-stream carries control (every socket method plus layout events).
+- Each pane subscription gets its own QUIC stream. Input goes on its own stream.
+- Framing stays `[u32 BE len][payload]`, 4 MiB cap. Payload is MessagePack.
+- Every pane stream carries a byte offset. Reconnect resumes from the client's
+  last offset (see V3_PLAN 7.2).
+- Messages live in the `forgetty-proto` crate, shared by server and clients.
+- `forgetty/stream/1` stays for one release for old Android builds, then goes.
+
+**Decided:** 2026-10-21.
+
+---
+
+## AD-019: Server may parse on the cold path and scan OSC status on the hot path (amends AD-007)
+
+**Decision:** The hot path stays a byte pipe with no VT state. Two exceptions:
+
+- An OSC scanner (a byte-level state machine, not a VT parser) runs on PTY
+  output and extracts OSC 7501 / 9 / 99 / 777 / 0 / 2 / 7. Cost target: under
+  1 % of drain time.
+- `capture` builds a VT instance from the byte-log ring on request only, then
+  drops it.
+
+**Decided:** 2026-10-21.
+
+---
+
+## AD-020: PTY size policy is "latest active client wins"
+
+**Decision:** The PTY size follows the client that sent input or focus most
+recently. Other attached clients render the pane at that size and letterbox.
+
+**Decided:** 2026-10-21.
+
+---
+
+## AD-021: Pairing needs a one-time secret (amends AD-004)
+
+**Decision:** The pairing QR carries a random 128-bit one-time secret. The
+pairing window is 60 s and accepts one device that presents the secret. A
+pairing request without the right secret is refused. The server logs the
+paired device name and id.
+
+**Decided:** 2026-10-21.
+
+---
+
+## AD-022: Windows client is Rust native on GPUI; GTK client is paused
+
+**Decision:** The Windows client is a Rust application on GPUI, pinned to one
+git revision, sharing `forgetty-proto`, `forgetty-vt` and `forgetty-client`
+with Android. Compose Multiplatform Desktop is rejected (see V3_PLAN 7.1).
+The GTK client is paused: it leaves the default workspace build and gets no
+new work.
+
+**Decided:** 2026-10-21.
+
+---
+
 ## Superseded / rejected decisions
 
 The following concepts are **explicitly rejected**. Do not reintroduce without a new AD that supersedes the rejection.
