@@ -1740,39 +1740,82 @@ impl SessionManager {
     // I/O
     // -----------------------------------------------------------------------
 
-    /// The byte the kernel's line discipline turns into SIGINT for this
-    /// pane's PTY right now (`c_cc[VINTR]`).
-    ///
-    /// `None` if the pane is unknown, the termios read fails, `ISIG` is off
-    /// (an editor in raw mode takes Ctrl+C as input) or VINTR is disabled.
-    /// The caller then sends no interrupt byte and signals nothing for a
-    /// plain byte. Users who remap VINTR (`stty intr ^X`) and ssh sessions
-    /// that forward it through pty-modes are covered (FIX-017).
-    pub fn intr_byte(&self, id: PaneId) -> Option<u8> {
+    /// The pane's interrupt setting, `(isig, c_cc[VINTR])`. `None` if the
+    /// pane is unknown or the termios read fails.
+    fn intr_setting(&self, id: PaneId) -> Option<(bool, u8)> {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let pane = inner.panes.get(&id)?;
-        pane.pty_bridge.pty.vintr()
+        pane.pty_bridge.pty.intr_setting()
     }
 
-    /// Interrupt the pane's foreground program once. The interrupt byte goes
-    /// into the PTY and the line discipline turns it into SIGINT (cooked
-    /// mode), which also reaches programs that forward the byte (ssh, mosh).
-    /// The group is signalled directly only when no byte was queued: `ISIG`
-    /// is off (a raw-mode program that swallows Ctrl+C, BUG-001), VINTR is
-    /// disabled or the queue is full. Both together would deliver SIGINT
-    /// twice to a cooked-mode program, and terraform or docker compose skip
-    /// their graceful stop on the second one.
+    /// The byte the kernel's line discipline turns into SIGINT for this pane
+    /// right now (`c_cc[VINTR]`, FIX-017: users who remap it with
+    /// `stty intr ^X`, and ssh sessions that forward it, are covered).
     ///
-    /// Returns `true` when the byte was queued. The caller drops the stale
+    /// `None` if the pane is unknown, the termios read fails, `ISIG` is off or
+    /// VINTR is disabled. With `ISIG` off a program in raw mode takes every
+    /// byte, 0x03 included, as plain input: a caller that scans typed input
+    /// for an interrupt must not treat it as one.
+    pub fn intr_byte(&self, id: PaneId) -> Option<u8> {
+        match self.intr_setting(id)? {
+            (true, v) if v != 0 => Some(v),
+            _ => None,
+        }
+    }
+
+    /// Is the pane's foreground process a signal forwarder (ssh, mosh-client,
+    /// telnet, rsh)? `false` if it cannot be told.
+    fn foreground_is_forwarder(&self, id: PaneId) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let pgid = inner.panes.get(&id).and_then(|p| p.pty_bridge.pty.foreground_pgrp());
+            pgid.is_some_and(|g| g > 0 && pgid_is_signal_forwarder(g))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = id;
+            false
+        }
+    }
+
+    /// Interrupt the pane's foreground program once.
+    ///
+    /// A key goes into the PTY:
+    /// - `ISIG` on: `c_cc[VINTR]`, which the line discipline turns into
+    ///   SIGINT. It also reaches programs that forward the byte (ssh, mosh).
+    ///   With VINTR disabled the key is 0x03, plain input, and nothing is
+    ///   signalled.
+    /// - `ISIG` off (raw mode: ssh, mosh, emacs, ink TUIs): 0x03, which every
+    ///   such program reads as Ctrl+C. Only when the foreground process is a
+    ///   forwarder is the remapped VINTR written instead: the far side's
+    ///   terminal uses the setting that ssh forwarded (pty-modes). Nothing is
+    ///   signalled: a kill would take down a forwarder whose far end wanted
+    ///   the key.
+    ///
+    /// The group is signalled directly only with `ISIG` on, VINTR set and no
+    /// key queued (queue full), or when the termios read fails. Key and
+    /// signal together would deliver SIGINT twice to a cooked-mode program,
+    /// and terraform or docker compose skip their graceful stop on the second
+    /// one.
+    ///
+    /// Returns `true` when the key was queued. The caller drops the stale
     /// input first ([`Self::discard_queued_input`]).
     pub fn interrupt(&self, id: PaneId) -> bool {
-        if let Some(b) = self.intr_byte(id) {
+        // One read of the termios, so the key and the decision to signal
+        // agree even if the program changes mode meanwhile.
+        let setting = self.intr_setting(id);
+        let forwarder =
+            matches!(setting, Some((false, v)) if v != 0) && self.foreground_is_forwarder(id);
+        if let Some(b) = setting.map(|s| intr_key(s, forwarder)) {
             match self.write_pty(id, &[b]) {
                 Ok(()) => return true,
-                Err(e) => debug!(%id, "interrupt: byte not queued: {e}"),
+                Err(e) => debug!(%id, "interrupt: key not queued: {e}"),
             }
         }
-        self.send_sigint(id);
+        if setting.is_none_or(|(isig, vintr)| isig && vintr != 0) {
+            self.send_sigint(id);
+        }
         false
     }
 
@@ -2500,15 +2543,12 @@ impl SessionManager {
 
     /// Send SIGINT to the foreground process group of a pane.
     ///
-    /// Daemon-side implementation of the Ctrl+C signal path. Call it through
-    /// [`Self::interrupt`], which runs it only when no interrupt byte went in.
-    /// 1. The caller wrote no byte (or it failed).
-    /// 2. This method calls kill(-pgid, SIGINT) UNLESS the foreground pgrp
-    ///    leader is a known signal-forwarder (ssh, mosh-client, telnet, rsh).
-    ///    Forwarders read 0x03 from stdin and pass it through; killing them
-    ///    kills the local end of the forward (FIX-017).
-    /// 3. For non-forwarders, the kill catches raw-mode apps that swallow
-    ///    0x03 without acting on it (Node.js, pm2 — BUG-001).
+    /// Call it through [`Self::interrupt`], which runs it only with `ISIG` on,
+    /// VINTR set and no interrupt key queued (queue full). A pane with `ISIG`
+    /// off is in raw mode and is never signalled: it reads the key.
+    /// The kill skips a known signal forwarder (ssh, mosh-client, telnet,
+    /// rsh) as a safeguard: killing it kills the local end of the forward
+    /// (FIX-017).
     pub fn send_sigint(&self, id: PaneId) {
         #[cfg(target_os = "linux")]
         {
@@ -2901,6 +2941,19 @@ impl std::fmt::Display for LabelError {
 }
 
 impl std::error::Error for LabelError {}
+
+/// The key an interrupt writes for a terminal with this `(isig, VINTR)`; see
+/// [`SessionManager::interrupt`]. 0x03 unless `ISIG` is on (the tty turns
+/// `c_cc[VINTR]` into SIGINT) or the program is a forwarder in raw mode (it
+/// passes the remapped key on).
+fn intr_key((isig, vintr): (bool, u8), forwarder: bool) -> u8 {
+    match (isig, vintr) {
+        (_, 0) => 0x03,
+        (true, v) => v,
+        (false, v) if forwarder => v,
+        (false, _) => 0x03,
+    }
+}
 
 /// Trim a label and check it: at most [`MAX_LABEL_CHARS`] characters, no
 /// control characters.

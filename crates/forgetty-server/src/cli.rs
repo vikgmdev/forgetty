@@ -621,6 +621,13 @@ pub fn send_key(target: &str, key: &str) -> Result<()> {
     })?;
     let (mut client, _) = Client::connect()?;
     let pane = resolve_pane(&mut client, target)?;
+    if bytes == b"\x03" {
+        // Ctrl+C is an interrupt, not text: the server writes the terminal's
+        // interrupt key (or 0x03 in raw mode), drops stale queued input, and
+        // never signals a program that handles the key itself.
+        client.call("send_sigint", json!({ "pane_id": pane }))?;
+        return Ok(());
+    }
     send_bytes(&mut client, &pane, bytes)
 }
 

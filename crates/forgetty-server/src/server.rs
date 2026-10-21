@@ -717,9 +717,9 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
             FORGETTY_STREAM_ALPN,
             Arc::new(move |conn, registry| {
                 let sm = Arc::clone(&sm_for_alpn);
-                tokio::spawn(async move {
+                Box::pin(async move {
                     handle_terminal_stream(conn, sm, registry).await;
-                });
+                })
             }),
         )
         .build()
