@@ -781,6 +781,19 @@ impl ShellSmoke {
                     }
                     return;
                 }
+                // A probe that never lands (lost key, cursor race) must not hang the run.
+                if let Some(p) = &self.probe {
+                    if p.t0.elapsed() > Duration::from_millis(2500) {
+                        if let Some(s) = snap(shell, cx, p0) {
+                            record("keys4_stall_row", json!(s.rows.get(p.row).cloned().unwrap_or_default()));
+                            record("keys4_stall_cursor", json!([s.cr, s.cc, p.row, p.col]));
+                        }
+                        self.probe = None;
+                        view.update(cx, |v, _| v.send_bytes(&[0x1b]));
+                        self.sub = 2;
+                        return;
+                    }
+                }
                 // Every frame: rows re-shaped in panes that did not get the key.
                 let others: usize = self.panes4[1..]
                     .iter()

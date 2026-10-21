@@ -237,10 +237,21 @@ impl AppShell {
 
         if smoke_mode {
             // The smoke state machine advances per painted frame: keep frames coming.
+            let mut n = 0u32;
             cx.spawn(async move |this, cx| loop {
                 cx.background_executor().timer(std::time::Duration::from_millis(60)).await;
-                // Not while a latency phase runs: it must see only real frames.
-                if this.update(cx, |s, cx| if s.smoke.as_ref().map_or(true, |m| m.wants_ticks()) { cx.notify() }).is_err() {
+                n = n.wrapping_add(1);
+                // Latency phases get only a slow heartbeat (every 600 ms) so a
+                // stalled probe can still be noticed, but real frames dominate.
+                if this
+                    .update(cx, |s, cx| {
+                        let full = s.smoke.as_ref().map_or(true, |m| m.wants_ticks());
+                        if full || n % 10 == 0 {
+                            cx.notify()
+                        }
+                    })
+                    .is_err()
+                {
                     break;
                 }
             })
