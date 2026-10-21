@@ -98,6 +98,7 @@ pub struct W5 {
     tx: Option<async_channel::Sender<PaneEvent>>,
     log: Arc<Mutex<Vec<(bool, Vec<u8>)>>>,
     win: (usize, usize),
+    small: (usize, usize),
     case_i: usize,
     target: Option<gpui::Entity<TerminalView>>,
 }
@@ -856,8 +857,12 @@ impl ShellSmoke {
             // Another client owns a smaller PTY: the VT follows it and is centered.
             0 => {
                 self.w5.win = view.read(cx).win_grid;
+                // Another client owns a PTY of about half the window grid.
+                let small = ((self.w5.win.0 / 2).max(3), (self.w5.win.1 / 2).max(10));
+                self.w5.small = small;
+                record("letterbox_grids", json!({"window": [self.w5.win.0, self.w5.win.1], "pty": [small.0, small.1]}));
                 if let Some(srv) = self.w3.server.as_mut() {
-                    srv.send("size 12 40");
+                    srv.send(&format!("size {} {}", small.0, small.1));
                 }
                 self.sub = 1;
                 self.sub_t0 = Instant::now();
@@ -867,12 +872,12 @@ impl ShellSmoke {
                     let v = view.read(cx);
                     (v.rows, v.cols, v.letterbox_pad(), v.win_grid)
                 };
-                if (rows, cols) != (12, 40) {
+                if (rows, cols) != self.w5.small {
                     return;
                 }
                 record("letterbox_pad_px", json!([pad.0, pad.1]));
                 check("letterbox_vt_follows_pty", true);
-                check("letterbox_window_grid_kept", resizes_win.0 > 12 && resizes_win.1 > 40);
+                check("letterbox_window_grid_kept", resizes_win == self.w5.win && resizes_win.0 > rows && resizes_win.1 > cols);
                 check("letterbox_centered", pad.0 > 0.0 && pad.1 > 0.0);
                 // The owner gives it back at the window size.
                 if let Some(srv) = self.w3.server.as_mut() {
