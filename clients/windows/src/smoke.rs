@@ -604,6 +604,11 @@ fn selection_check(v: &mut TerminalView, rows: &[String]) {
     v.sel = Some(Sel { mode: SelMode::Line, a0: (abs, 0), a1: (abs + 1, last), h0: (abs, 0), h1: (abs + 1, last) });
     let two = v.selection_text().unwrap_or_default();
     v.sel = None;
+    let wrapped = v.term.screen().is_row_wrapped(fr);
+    record(
+        "selection_debug",
+        json!({"fr": fr, "word": [word.0, word.1], "line": line, "two": two, "wrapped": wrapped, "offset": v.term.scrollbar_state().1}),
+    );
     check(
         "selection",
         word == (0, 8) && line.as_deref() == Some("THRU-DONE") && two.starts_with("THRU-DONE\n") && two.ends_with('>'),
