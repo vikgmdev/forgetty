@@ -408,6 +408,14 @@ impl TestServer {
         matches!(self.inner, Inner::Real(_))
     }
 
+    /// The real server's `--state-dir` (`None` for the mock).
+    pub fn state_dir(&self) -> Option<PathBuf> {
+        match &self.inner {
+            Inner::Real(r) => Some(r.dir.path().join("state")),
+            Inner::Mock { .. } => None,
+        }
+    }
+
     pub fn node_id(&self) -> EndpointId {
         match &self.inner {
             Inner::Mock { server, .. } => server.addr().id,

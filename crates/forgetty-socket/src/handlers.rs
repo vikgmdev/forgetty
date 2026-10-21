@@ -1334,17 +1334,23 @@ pub(crate) fn handle_revoke_device(request: &Request, se: Option<&SyncEndpoint>)
     // Registry removal AND closing every live connection of the device, on
     // every ALPN. Removing only the registry entry would leave an open
     // session running (the registry is checked once, at connect).
-    match se.revoke_device(&device_id) {
-        Ok((found, closed)) => Response::success(
-            request.id.clone(),
-            serde_json::json!({ "ok": found, "closed_connections": closed }),
-        ),
-        Err(e) => Response::error(
+    let out = se.revoke_device(&device_id);
+    if let Some(e) = &out.save_error {
+        // Revoked and cut all the same. Only the device list file is stale.
+        return Response::error(
             request.id.clone(),
             protocol::INTERNAL_ERROR,
-            format!("failed to revoke device: {e}"),
-        ),
+            format!(
+                "device revoked and {} connection(s) closed, but the device list could not be \
+                 saved: {e}. The device stays denied until the next successful save.",
+                out.closed
+            ),
+        );
     }
+    Response::success(
+        request.id.clone(),
+        serde_json::json!({ "ok": out.found, "closed_connections": out.closed }),
+    )
 }
 
 pub(crate) fn handle_pair_open(request: &Request, se: Option<&SyncEndpoint>) -> Response {

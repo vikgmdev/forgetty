@@ -282,6 +282,63 @@ async fn revoke_closes_a_v2_connection_and_the_client_registry_counts_it() {
     server.shutdown().await;
 }
 
+/// A revoke whose save fails still cuts the connection and still denies the
+/// device (fail closed), and the caller gets the save error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revoke_that_cannot_be_saved_still_cuts_and_denies_the_device() {
+    if !real_only() {
+        return;
+    }
+    let server = TestServer::start(TestServerConfig {
+        authorized: Some(Default::default()),
+        ..Default::default()
+    })
+    .await;
+    let k = key();
+    forgetty_client::pair_with_addr(
+        server.addr(),
+        &server.pair_secret(),
+        k.clone(),
+        "revoke-unsaved",
+        ClientKind::Cli,
+        &Default::default(),
+    )
+    .await
+    .unwrap();
+    let h = Client::connect(server.addr(), k.clone(), info("revoke-unsaved")).await.unwrap();
+    assert!(h.state().is_connected());
+
+    // Make the next save fail: a directory sits where the file goes, so the
+    // rename of the temp file onto it is refused.
+    let file = server.state_dir().unwrap().join("data/forgetty/authorized_devices.json");
+    std::fs::remove_file(&file).expect("the registry file exists after pairing");
+    std::fs::create_dir(&file).unwrap();
+    std::fs::write(file.join("keep"), b"x").unwrap();
+
+    let err = server
+        .socket_call("revoke_device", json!({"device_id": k.public().to_string()}))
+        .expect_err("the revoke should report the failed save");
+    assert!(err.contains("revoked") && err.contains("could not be saved"), "{err}");
+
+    wait_for("the client to lose the connection", Duration::from_secs(2), || {
+        !h.state().is_connected()
+    })
+    .await;
+    // The redial is refused: the device is denied although the file was not written.
+    wait_for("the client to fail for good", Duration::from_secs(10), || {
+        matches!(h.state(), ConnectionState::Failed(_))
+    })
+    .await;
+    let again = tokio::time::timeout(
+        Duration::from_secs(5),
+        Client::connect(server.addr(), k.clone(), info("revoke-unsaved-2")),
+    )
+    .await;
+    assert!(!matches!(again, Ok(Ok(_))), "a revoked device connected again");
+    h.close().await;
+    server.shutdown().await;
+}
+
 /// A stopping server takes no new v2 client (AD-017).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stopping_server_refuses_v2_attaches() {

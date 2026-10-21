@@ -23,7 +23,7 @@ pub mod registry;
 pub use forgetty_core::sanitize;
 
 pub use endpoint::{
-    AlpnHandler, SyncEndpoint, SyncEndpointBuilder, SyncEvent, FORGETTY_PAIRING_ALPN,
+    AlpnHandler, RevokeOutcome, SyncEndpoint, SyncEndpointBuilder, SyncEvent, FORGETTY_PAIRING_ALPN,
     FORGETTY_PAIRING_ALPN_V1,
 };
 pub use identity::load_or_generate;

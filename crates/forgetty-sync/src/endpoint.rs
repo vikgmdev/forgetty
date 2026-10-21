@@ -80,6 +80,19 @@ pub enum SyncError {
     Registry(#[from] crate::registry::RegistryError),
 }
 
+/// What [`SyncEndpoint::revoke_device`] did.
+#[derive(Debug)]
+pub struct RevokeOutcome {
+    /// The device was in the registry (or its removal was started).
+    pub found: bool,
+    /// Live connections closed.
+    pub closed: usize,
+    /// Set when the registry file could not be saved. The device is revoked
+    /// anyway (denied in memory) and the next successful save persists it.
+    pub save_error: Option<crate::registry::RegistryError>,
+}
+
+
 /// Builder for [`SyncEndpoint`].
 ///
 /// Construct via [`SyncEndpoint::builder`], chain zero or more
@@ -266,21 +279,26 @@ impl SyncEndpoint {
     }
 
     /// Revoke a device: remove it from the registry AND close every open
-    /// connection it has, on every ALPN. Returns `(was_registered, closed)`.
+    /// connection it has, on every ALPN.
     ///
-    /// The connections are closed even when the device was not in the registry
+    /// A revoke fails closed. The connections are closed and the event is sent
+    /// whatever the save result is, and a device whose removal could not be
+    /// saved stays denied in memory (see [`DeviceRegistry::remove`]). The
+    /// connections are closed even when the device was not in the registry
     /// (for example it was removed by hand-editing the file).
-    pub fn revoke_device(
-        &self,
-        device_id: &str,
-    ) -> Result<(bool, usize), crate::registry::RegistryError> {
-        let found = self.registry.lock().unwrap_or_else(|e| e.into_inner()).remove(device_id)?;
+    pub fn revoke_device(&self, device_id: &str) -> RevokeOutcome {
+        let removed = self.registry.lock().unwrap_or_else(|e| e.into_inner()).remove(device_id);
         let closed = self.live.revoke(device_id);
+        // Removed in memory counts as found even when the save failed.
+        let (found, save_error) = match removed {
+            Ok(found) => (found, None),
+            Err(e) => (true, Some(e)),
+        };
         if found {
             let _ =
                 self.event_tx.send(SyncEvent::DeviceRevoked { device_id: device_id.to_string() });
         }
-        Ok((found, closed))
+        RevokeOutcome { found, closed, save_error }
     }
 
     /// Returns a clone of the shared device registry.

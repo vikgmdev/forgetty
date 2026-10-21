@@ -39,6 +39,9 @@ pub enum RegistryError {
 pub struct DeviceRegistry {
     path: PathBuf,
     devices: Vec<DeviceEntry>,
+    /// Devices removed in memory whose removal is not on disk yet (the save
+    /// failed). Never authorized. Cleared by the next successful save.
+    revoked_unsaved: std::collections::HashSet<String>,
 }
 
 impl DeviceRegistry {
@@ -70,26 +73,28 @@ impl DeviceRegistry {
             d.name = crate::sanitize::untrusted(&d.name);
         }
 
-        Ok(Self { path, devices })
+        Ok(Self { path, devices, revoked_unsaved: Default::default() })
     }
 
     /// An empty registry persisted at `path` (tests).
     #[cfg(test)]
     pub(crate) fn empty_at(path: PathBuf) -> Self {
-        Self { path, devices: Vec::new() }
+        Self { path, devices: Vec::new(), revoked_unsaved: Default::default() }
     }
 
-    /// Check whether an iroh `EndpointId` is in the authorized list.
+    /// Check whether an iroh `EndpointId` is in the authorized list. A device
+    /// whose revoke could not be saved is not authorized (fail closed).
     pub fn is_authorized(&self, endpoint_id: &EndpointId) -> bool {
         let id_str = endpoint_id.to_string();
-        self.devices.iter().any(|d| d.device_id == id_str)
+        !self.revoked_unsaved.contains(&id_str) && self.devices.iter().any(|d| d.device_id == id_str)
     }
 
     /// Add a new device entry and persist atomically.
     ///
     /// The name is sanitised here too ([`crate::sanitize::untrusted`]), so no
     /// caller can store a hostile name. A failed save leaves the registry as
-    /// it was: the list is saved first and swapped in after.
+    /// it was (the list is saved first and swapped in after), so a device whose
+    /// pairing could not be saved is not authorized.
     pub fn add(&mut self, mut entry: DeviceEntry) -> Result<(), RegistryError> {
         entry.name = crate::sanitize::untrusted(&entry.name);
         let mut next = self.devices.clone();
@@ -98,15 +103,22 @@ impl DeviceRegistry {
     }
 
     /// Remove a device by its `device_id` string. Returns `true` if found.
-    /// A failed save leaves the device in memory too.
+    ///
+    /// A revoke fails closed. The device leaves the in-memory list first. If
+    /// the save then fails, the error is returned, the device id stays on an
+    /// in-memory denylist that [`Self::is_authorized`] checks, and the next
+    /// successful registry write (any `add`, `remove` or `update_last_seen`)
+    /// saves the list without it.
     pub fn remove(&mut self, device_id: &str) -> Result<bool, RegistryError> {
-        let next: Vec<DeviceEntry> =
-            self.devices.iter().filter(|d| d.device_id != device_id).cloned().collect();
-        if next.len() == self.devices.len() {
-            return Ok(false);
+        let before = self.devices.len();
+        self.devices.retain(|d| d.device_id != device_id);
+        let removed = self.devices.len() < before;
+        if removed {
+            self.revoked_unsaved.insert(device_id.to_string());
+            let list = self.devices.clone();
+            self.commit(list)?;
         }
-        self.commit(next)?;
-        Ok(true)
+        Ok(removed)
     }
 
     /// Return all current entries (read-only).
@@ -127,11 +139,13 @@ impl DeviceRegistry {
         self.commit(next)
     }
 
-    /// Save `next`, then make it the in-memory list. Memory never runs ahead
-    /// of the disk: a failed save changes nothing.
+    /// Save `next`, then make it the in-memory list. A failed save changes
+    /// nothing in `devices`. A save that works also persists every removal
+    /// that was waiting, so the denylist is empty after it.
     fn commit(&mut self, next: Vec<DeviceEntry>) -> Result<(), RegistryError> {
         Self::save(&self.path, &next)?;
         self.devices = next;
+        self.revoked_unsaved.clear();
         Ok(())
     }
 
@@ -246,9 +260,38 @@ mod tests {
 
         assert!(reg.add(entry("b")).is_err());
         assert_eq!(reg.list().len(), 1, "a device that was not saved is in memory");
-        assert!(reg.remove("a").is_err());
-        assert!(reg.list().iter().any(|d| d.device_id == "a"), "a removal that was not saved took effect");
         assert!(reg.update_last_seen("a").is_err());
         assert!(reg.list()[0].last_seen.is_none(), "last_seen changed without a save");
+    }
+
+    #[test]
+    fn a_revoke_that_cannot_be_saved_still_denies_the_device() {
+        let key = iroh::SecretKey::from_bytes(&[7u8; 32]);
+        let id = key.public();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut reg = DeviceRegistry::empty_at(tmp.path().join("state/authorized_devices.json"));
+        reg.add(entry(&id.to_string())).unwrap();
+        assert!(reg.is_authorized(&id));
+
+        // Make saving fail: the state directory becomes a regular file.
+        let dir = tmp.path().join("state");
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::write(&dir, b"not a directory").unwrap();
+        assert!(reg.remove(&id.to_string()).is_err(), "the save should fail");
+        assert!(!reg.is_authorized(&id), "a revoked device must not stay authorized");
+        assert!(reg.list().is_empty());
+
+        // A pairing that cannot be saved does not authorize the device.
+        let other = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
+        assert!(reg.add(entry(&other.to_string())).is_err());
+        assert!(!reg.is_authorized(&other), "an unsaved pairing must not authorize");
+
+        // The next successful write persists the removal and clears the denial.
+        std::fs::remove_file(&dir).unwrap();
+        reg.add(entry(&other.to_string())).unwrap();
+        assert!(reg.is_authorized(&other));
+        assert!(!reg.is_authorized(&id));
+        let on_disk = std::fs::read_to_string(dir.join("authorized_devices.json")).unwrap();
+        assert!(!on_disk.contains(&id.to_string()), "the revoked device is back on disk");
     }
 }
