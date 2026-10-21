@@ -456,10 +456,25 @@ impl TestServer {
     /// Stop the server for `duration` without closing anything: it neither
     /// reads nor writes a packet, like a dead network or a hung process. Needs
     /// `own_runtime`. Queued packets are handled when it thaws.
+    ///
+    /// Returns only when both worker threads are blocked. `Runtime::spawn`
+    /// returns at once, and on a busy box the blocking tasks may not run for a
+    /// while: a packet that arrives meanwhile is answered, and a caller that
+    /// counts on the silence (a Ping with no Pong) is wrong.
     pub fn freeze(&self, duration: Duration) {
         let rt = self.rt.as_ref().expect("freeze needs TestServerConfig::own_runtime");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
         for _ in 0..2 {
-            rt.spawn(async move { std::thread::sleep(duration) });
+            let started = started_tx.clone();
+            rt.spawn(async move {
+                let _ = started.send(());
+                std::thread::sleep(duration);
+            });
+        }
+        for _ in 0..2 {
+            if started_rx.recv_timeout(Duration::from_secs(10)).is_err() {
+                break; // the runtime is not scheduling: nothing more to wait for
+            }
         }
     }
 }

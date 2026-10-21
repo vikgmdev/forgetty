@@ -39,6 +39,11 @@ fi
 STATE="$(mktemp -d /tmp/p4agate.XXXXXX)"
 BG_PIDS=()
 fg() { "$BIN/forgetty" --state-dir "$STATE" "$@"; }
+# `grep -q` leaves at the first match. A writer that still has output to send
+# then gets SIGPIPE, and under `pipefail` the pipeline fails (the CLI died this
+# way when the box was busy: 17 % of `server status | grep -q` under load).
+# `qgrep` reads all its input, so the writer always finishes.
+qgrep() { grep "$@" >/dev/null; }
 
 cleanup() {
   for p in "${BG_PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done
@@ -142,7 +147,7 @@ step "capture, also after a restart"
 CPANE="$(fg new -- bash --norc --noprofile)" || fail "new (capture pane)"
 sleep 1
 fg send -p "$CPANE" 'echo CAPTURE_$((20+22))' --enter
-cap_has() { fg capture -p "$CPANE" --trim 2>/dev/null | grep -q "^CAPTURE_42$"; }
+cap_has() { fg capture -p "$CPANE" --trim 2>/dev/null | qgrep "^CAPTURE_42$"; }
 poll_until "CAPTURE_42 on screen" 50 cap_has
 [ "$(fg capture -p "$CPANE" --trim --lines 1 | wc -l)" = 1 ] || fail "capture --lines 1 is not one line"
 fg capture -p "$CPANE" --trim --json | python3 -I -c 'import json,sys; d=json.load(sys.stdin); assert "CAPTURE_42" in d["text"]' \
@@ -152,7 +157,7 @@ pass "capture --trim shows CAPTURE_42"
 fg server stop || fail "server stop"
 kill "${BG_PIDS[0]}" 2>/dev/null; wait "${BG_PIDS[0]}" 2>/dev/null; BG_PIDS=()
 fg server start || fail "server start (2)"
-fg ls | grep -q "$CPANE" || { fg ls; fail "capture pane not listed after restart"; }
+fg ls | qgrep "$CPANE" || { fg ls; fail "capture pane not listed after restart"; }
 poll_until "CAPTURE_42 after restart" 50 cap_has
 pass "capture --trim shows CAPTURE_42 after a server restart"
 
@@ -165,11 +170,11 @@ fg run --keep --wait -- sh -c 'echo kept-out; exit 3' >"$STATE/keep.out" 2>&1
 RC=$?
 [ "$RC" = 3 ] || { cat "$STATE/keep.out"; fail "run --keep --wait exited $RC, wanted 3"; }
 KPANE="$(head -1 "$STATE/keep.out")"
-fg ls | grep "$KPANE" | grep -q "exited 3" || { fg ls; fail "kept pane not listed as exited 3"; }
-fg capture -p "$KPANE" --trim | grep -q kept-out || fail "kept pane capture lacks its output"
+fg ls | grep "$KPANE" | qgrep "exited 3" || { fg ls; fail "kept pane not listed as exited 3"; }
+fg capture -p "$KPANE" --trim | qgrep kept-out || fail "kept pane capture lacks its output"
 fg close -p "$KPANE" || fail "close"
-fg ls | grep -q "$KPANE" && fail "pane still listed after close"
-poll_until "PaneClosed event" 25 grep -q "\"PaneClosed\".*$KPANE\|$KPANE.*\"PaneClosed\"" "$STATE/events2.out"
+fg ls | qgrep "$KPANE" && fail "pane still listed after close"
+poll_until "PaneClosed event" 25 qgrep "\"PaneClosed\".*$KPANE\|$KPANE.*\"PaneClosed\"" "$STATE/events2.out"
 fg close -p ffffff >/dev/null 2>&1
 [ "$?" = 3 ] || fail "close of an unknown pane should exit 3"
 pass "close removed the kept pane; PaneClosed event seen; unknown pane exits 3"
@@ -183,7 +188,7 @@ else
   BRC=$?
   echo "$BENCH_OUT" | grep -E "scanner alone|scanner adds|drain saw|SCANNER OVERHEAD"
   [ "$BRC" = 0 ] || fail "scanner benchmark failed or is at 1 % or more"
-  echo "$BENCH_OUT" | grep -q "SCANNER OVERHEAD" || fail "benchmark printed no number"
+  echo "$BENCH_OUT" | qgrep "SCANNER OVERHEAD" || fail "benchmark printed no number"
   pass "benchmark number printed, under 1 %"
 fi
 

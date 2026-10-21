@@ -72,12 +72,17 @@ expect_rc() {
   local rc=$?
   if [ "$rc" = "$want" ]; then ok "$what (exit $rc)"; else bad "$what: exit $rc, wanted $want"; sed 's/^/        /' "$WORK/rc.out" | head -5; fi
 }
-has() { grep -qE -- "$2" <<<"$1"; }
+has() { qgrep -E -- "$2" <<<"$1"; }
 
 say "build"
 cargo build -p forgetty-server --features qa-tools >"$WORK/build.log" 2>&1 || { tail -20 "$WORK/build.log"; exit 2; }
 BIN="$ROOT/target/debug"
 fg() { "$BIN/forgetty" --state-dir "$STATE" "$@"; }
+# `grep -q` leaves at the first match. A writer that still has output to send
+# then gets SIGPIPE, and under `pipefail` the pipeline fails (the CLI died this
+# way when the box was busy: 17 % of `server status | grep -q` under load).
+# `qgrep` reads all its input, so the writer always finishes.
+qgrep() { grep "$@" >/dev/null; }
 
 # ------------------------------------------------------------------ 1. cargo tests
 say "1. cargo tests"
@@ -123,7 +128,7 @@ assert d["request_example"] is not None and d["response_example"] is not None
 PY
 done
 [ -z "$DESC_BAD" ] && ok "api describe works for each of $NN methods" || bad "api describe failed for:$DESC_BAD"
-check "api describe prints text" bash -c "'$BIN/forgetty' --state-dir '$STATE' api describe set_label | grep -q 'params schema'"
+check "api describe prints text" bash -c "'$BIN/forgetty' --state-dir '$STATE' api describe set_label | grep 'params schema' >/dev/null"
 
 INFO="$(fg api call server_info)"
 SPID="$(fg server status --json | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["pid"])')"
@@ -182,7 +187,7 @@ expect_rc 2 "label over 128 characters exits 2" fg label -t pane "$P1" "$(printf
 fg label -t pane "$P1" build >/dev/null; fg label -t pane "$P2" logs >/dev/null; fg label -t pane "$P3" "" >/dev/null
 [ "$(fg ls --json | python3 -I -c 'import json,sys; print({t["pane_id"]: t["label"] for t in json.load(sys.stdin)["tabs"]}[sys.argv[1]])' "$P3")" = "" ] \
   && ok "empty label clears" || bad "empty label should clear"
-fg ls | grep -q "build" && ok "ls shows the label column" || bad "ls lacks the label"
+fg ls | qgrep "build" && ok "ls shows the label column" || bad "ls lacks the label"
 
 # tab and workspace labels
 fg label -t tab 1 maintab >/dev/null && ok "tab label by position" || bad "tab label"
@@ -207,9 +212,9 @@ fg events --json >"$WORK/events.out" 2>/dev/null &
 EV=$!; PIDS+=("$EV")
 sleep 0.7
 fg label -t pane "$P3" streamed >/dev/null
-for _ in $(seq 1 30); do grep -q '"LabelChanged"' "$WORK/events.out" && break; sleep 0.2; done
+for _ in $(seq 1 30); do qgrep '"LabelChanged"' "$WORK/events.out" && break; sleep 0.2; done
 kill "$EV" 2>/dev/null
-grep '"LabelChanged"' "$WORK/events.out" | grep -q '"label":"streamed"' && ok "events shows LabelChanged" || bad "no LabelChanged event: $(head -c 300 "$WORK/events.out")"
+grep '"LabelChanged"' "$WORK/events.out" | qgrep '"label":"streamed"' && ok "events shows LabelChanged" || bad "no LabelChanged event: $(head -c 300 "$WORK/events.out")"
 fg label -t pane "$P3" "" >/dev/null
 
 # persistence across a restart
@@ -239,7 +244,7 @@ cp "$DOC_BACKUP" docs/socket-api.md; DOC_BACKUP=""
 
 # ------------------------------------------------------------------ 5. protocol v2
 say "5. protocol v2 (real server)"
-if FORGETTY_REAL_SERVER="$BIN/forgetty" cargo test -p forgetty-client --test p5 -- --nocapture >"$WORK/v2.log" 2>&1 && grep -q "1 passed" "$WORK/v2.log"; then
+if FORGETTY_REAL_SERVER="$BIN/forgetty" cargo test -p forgetty-client --test p5 -- --nocapture >"$WORK/v2.log" 2>&1 && qgrep "1 passed" "$WORK/v2.log"; then
   ok "v2: api.list, api.describe, set_label, LayoutChanged with the label, refused methods"
 else bad "v2 test"; tail -15 "$WORK/v2.log"; fi
 
@@ -253,7 +258,7 @@ for combo in "claude user $SH/.claude/skills/forgetty/SKILL.md" \
   set -- $combo
   agent="$1"; scope="$2"; path="$3"
   env -u CODEX_HOME bash -c "cd '$SP' && HOME='$SH' '$BIN/forgetty' --state-dir '$STATE' skill setup --agent $agent --scope $scope" >/dev/null 2>&1
-  if [ -f "$path" ] && head -2 "$path" | grep -q '^name: forgetty'; then ok "setup --agent $agent --scope $scope wrote $path"; else bad "setup $agent $scope: $path missing"; fi
+  if [ -f "$path" ] && head -2 "$path" | qgrep '^name: forgetty'; then ok "setup --agent $agent --scope $scope wrote $path"; else bad "setup $agent $scope: $path missing"; fi
   ST="$(env -u CODEX_HOME bash -c "cd '$SP' && HOME='$SH' '$BIN/forgetty' --state-dir '$STATE' skill status --agent $agent --scope $scope --json")"
   has "$ST" '"state": "current"' && ok "status says current ($agent $scope)" || bad "status ($agent $scope): $ST"
 done
@@ -308,11 +313,11 @@ EOF
   FOUND=0
   for p in $(fg ls --json | python3 -I -c 'import json,sys
 for t in json.load(sys.stdin)["tabs"]: print(t["pane_id"])'); do
-    fg capture -p "$p" --trim 2>/dev/null | grep -qx 'skill-ok' && FOUND=1
+    fg capture -p "$p" --trim 2>/dev/null | qgrep -x 'skill-ok' && FOUND=1
   done
   [ "$AFTER" -gt "$BEFORE" ] && ok "the agent opened a pane ($BEFORE -> $AFTER panes)" || bad "the agent opened no pane"
   [ "$FOUND" = 1 ] && ok "a pane shows the line skill-ok (echo ran)" || bad "no pane shows skill-ok"
-  grep -q 'skill-ok' "$WORK/agent.out" && ok "the agent reported the captured text" || { bad "the agent's answer lacks skill-ok"; head -c 600 "$WORK/agent.out"; }
+  qgrep 'skill-ok' "$WORK/agent.out" && ok "the agent reported the captured text" || { bad "the agent's answer lacks skill-ok"; head -c 600 "$WORK/agent.out"; }
 fi
 
 # ------------------------------------------------------------------ 8. earlier gates
