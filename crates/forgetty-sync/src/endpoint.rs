@@ -19,6 +19,7 @@
 //! by ALPN into the registered handler map.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -51,11 +52,19 @@ pub const FORGETTY_PAIRING_ALPN: &[u8] = b"forgetty/pair/2";
 /// authorization policy (the registry is shared across ALPNs; updates made
 /// by the pairing handler are visible here without further plumbing).
 ///
-/// The handler is called **synchronously** inside the per-connection tokio
-/// task. If it needs to run long-lived work (e.g. a subscribe-forever stream),
-/// it must spawn its own task — otherwise it blocks the task that would
-/// otherwise return to the accept loop's spawn for the next connection.
-pub type AlpnHandler = Arc<dyn Fn(Connection, Arc<Mutex<DeviceRegistry>>) + Send + Sync + 'static>;
+/// The handler returns a future that lives as long as the connection is in
+/// use: the accept task awaits it and then closes the connection, so a handler
+/// that returns early (or forgets to close) does not leave it open. A handler
+/// that wants to keep the connection past its return must not return.
+pub type AlpnHandler = Arc<
+    dyn Fn(
+            Connection,
+            Arc<Mutex<DeviceRegistry>>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync
+        + 'static,
+>;
 
 /// Events emitted by the sync endpoint to signal pairing and connection state
 /// changes. Consumed by the socket RPC handlers for GTK polling.
@@ -236,6 +245,8 @@ impl SyncEndpointBuilder {
             relay_urls: self.relay_urls.iter().map(|u| u.to_string()).collect(),
             n0_discovery: self.n0_discovery,
             live: crate::connections::LiveConnections::new(),
+            quic_open: Arc::new(AtomicUsize::new(0)),
+            handshake_failures: Arc::new(AtomicUsize::new(0)),
             event_tx,
         })
     }
@@ -252,6 +263,11 @@ pub struct SyncEndpoint {
     extra_alpns: Arc<HashMap<Vec<u8>, AlpnHandler>>,
     /// Every open connection by device id, so a revoke can close them all.
     live: crate::connections::LiveConnections,
+    /// Incoming QUIC connections, from the first packet until they close: the
+    /// handshakes in progress plus the open connections.
+    quic_open: Arc<AtomicUsize>,
+    /// Incoming QUIC handshakes that failed: the peer went away half way.
+    handshake_failures: Arc<AtomicUsize>,
     /// Configured relay URLs (empty: iroh's default relays).
     relay_urls: Vec<String>,
     /// Whether the n0 DNS discovery service is in use.
@@ -262,6 +278,18 @@ pub struct SyncEndpoint {
 }
 
 impl SyncEndpoint {
+    /// Incoming QUIC connections that are not closed yet, handshakes in
+    /// progress included. A client that gave up half way through a handshake
+    /// must not leave one behind.
+    pub fn quic_open(&self) -> usize {
+        self.quic_open.load(Ordering::SeqCst)
+    }
+
+    /// Incoming QUIC handshakes that failed so far (the peer gave up half way).
+    pub fn handshake_failures(&self) -> usize {
+        self.handshake_failures.load(Ordering::SeqCst)
+    }
+
     /// Start configuring a new `SyncEndpoint`.
     pub fn builder(secret_key: SecretKey) -> SyncEndpointBuilder {
         SyncEndpointBuilder {
@@ -404,23 +432,28 @@ impl SyncEndpoint {
             let event_tx = self.event_tx.clone();
             let extras = Arc::clone(&self.extra_alpns);
             let live = self.live.clone();
+            let open = OpenGuard::new(&self.quic_open);
+            let failures = self.handshake_failures.clone();
 
             // Everything that waits on the peer happens in the spawned task:
             // a peer that stalls its handshake (up to the 30 s idle timeout)
             // must not hold up the next one.
             tokio::spawn(async move {
+                let _open = open;
                 // Read the negotiated ALPN before completing the handshake.
                 // `Accepting::alpn()` is async and takes `&mut self`; after it
                 // returns the `Accepting` can still be awaited for the Connection.
                 let alpn = match accepting.alpn().await {
                     Ok(a) => a,
                     Err(e) => {
+                        failures.fetch_add(1, Ordering::SeqCst);
                         warn!("totem-sync: failed to read ALPN: {e}");
                         return;
                     }
                 };
                 match accepting.await {
                     Ok(conn) => {
+                        let watch = conn.clone();
                         // Track before dispatch: a revoke that lands while the
                         // handler starts still finds this connection.
                         live.track(conn.remote_id().to_string(), conn.clone());
@@ -429,17 +462,38 @@ impl SyncEndpoint {
                         } else if alpn == FORGETTY_PAIRING_ALPN_V1 {
                             pairing::handle_pair_v1(conn, registry, event_tx).await;
                         } else if let Some(handler) = extras.get(alpn.as_slice()) {
-                            handler(conn, registry);
+                            handler(conn, registry).await;
                         } else {
                             warn!("totem-sync: unknown ALPN {:?}, closing connection", alpn);
                             conn.close(1u8.into(), b"unknown-alpn");
                         }
+                        // The handler is done: close, whatever it did. A
+                        // close after the handler's own is a no-op.
+                        watch.close(0u8.into(), b"done");
+                        watch.closed().await;
                     }
                     Err(e) => {
+                        failures.fetch_add(1, Ordering::SeqCst);
                         warn!("totem-sync: connection handshake error: {e}");
                     }
                 }
             });
         }
+    }
+}
+
+/// Counts one incoming QUIC connection while it lives.
+struct OpenGuard(Arc<AtomicUsize>);
+
+impl OpenGuard {
+    fn new(counter: &Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        OpenGuard(counter.clone())
+    }
+}
+
+impl Drop for OpenGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }

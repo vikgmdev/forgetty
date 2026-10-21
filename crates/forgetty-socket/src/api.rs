@@ -327,7 +327,7 @@ static METHODS: &[MethodSpec] = &[
         Call,
         true,
         "Send Ctrl+C to the foreground process of a pane.",
-        "Signals the foreground process group of the PTY with SIGINT.",
+        "Drops input queued for the pane, then sends the interrupt key. With ISIG on the tty turns c_cc[VINTR] into one SIGINT (the group is signalled directly only when the key could not be queued). With VINTR disabled the key is 0x03, plain input, and nothing is signalled. With ISIG off the program is in raw mode: it gets 0x03 (the remapped VINTR only if the foreground process is ssh or mosh) and nothing is signalled.",
         t::PaneParams,
         t::OkResult,
         concat!(r#"{"pane_id":""#, pane!(), r#""}"#),

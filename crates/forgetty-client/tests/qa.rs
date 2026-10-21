@@ -1085,17 +1085,138 @@ async fn ctrl_c_is_data_when_isig_is_off() {
     tokio::time::sleep(Duration::from_secs(1)).await;
     let info = server.socket_call("get_pane_info", json!({"pane_id": pane.to_string()})).unwrap();
     assert!(info["exit_code"].is_null(), "Ctrl+C signalled a pane with ISIG off: {info}");
-    // The local `send_sigint` still signals, as asked.
+    // The local `send_sigint` does not signal either: the program is in raw
+    // mode and gets the key.
     server.socket_call("send_sigint", json!({"pane_id": pane.to_string()})).unwrap();
-    wait_for("send_sigint to end the program", || {
-        match server.socket_call("get_pane_info", json!({"pane_id": pane.to_string()})) {
-            Err(_) => true,
-            Ok(v) => !v["exit_code"].is_null(),
-        }
-    })
-    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let info = server.socket_call("get_pane_info", json!({"pane_id": pane.to_string()})).unwrap();
+    assert!(info["exit_code"].is_null(), "send_sigint killed a raw-mode program: {info}");
     c.close().await;
     server.shutdown().await;
+}
+
+/// A raw-mode program (`cfmakeraw`, as ssh, mosh, emacs and ink TUIs do) that
+/// prints every byte it reads and counts its SIGINTs. `$1` sets VINTR: `d`
+/// leaves the default, a number sets `c_cc[VINTR]`, `off` disables it.
+const RAW_PROBE: &str = r#"
+d=$(mktemp -d)
+cat > "$d/r.c" <<'EOF'
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <termios.h>
+#include <unistd.h>
+static volatile sig_atomic_t n;
+static void h(int s) { (void)s; n++; }
+int main(int argc, char **argv) {
+    struct termios t;
+    tcgetattr(0, &t);
+    if (argc > 1 && !strcmp(argv[1], "cooked")) {
+        /* ISIG stays on, VINTR is disabled: no byte can signal. */
+        t.c_lflag &= ~(ICANON | ECHO);
+        t.c_lflag |= ISIG;
+        t.c_cc[VMIN] = 1;
+        t.c_cc[VTIME] = 0;
+        t.c_cc[VINTR] = 0;
+    } else cfmakeraw(&t);
+    if (argc > 1 && !strcmp(argv[1], "off")) t.c_cc[VINTR] = 0;
+    else if (argc > 1 && strcmp(argv[1], "d") && strcmp(argv[1], "cooked")) t.c_cc[VINTR] = (cc_t)atoi(argv[1]);
+    tcsetattr(0, TCSANOW, &t);
+    struct sigaction a = {0};
+    a.sa_handler = h;
+    sigaction(SIGINT, &a, 0);
+    setvbuf(stdout, 0, _IONBF, 0);
+    puts("READY\r");
+    int last = 0;
+    for (;;) {
+        unsigned char b;
+        ssize_t r = read(0, &b, 1);
+        if (n != last) { last = n; printf("SIGINT=%d\r\n", last); }
+        if (r == 1) printf("BYTE=%d\r\n", b);
+    }
+}
+EOF
+cc -o "$d/r" "$d/r.c" && exec "$d/r" "#;
+
+fn count(hay: &[u8], needle: &str) -> usize {
+    hay.windows(needle.len()).filter(|w| *w == needle.as_bytes()).count()
+}
+
+/// With ISIG off the program reads Ctrl+C as a key and nothing signals it. The
+/// key is 0x03 whatever VINTR is: a remapped VINTR is written only for a
+/// forwarder. With ISIG on and VINTR disabled the key is 0x03 as well, plain
+/// input, and nothing signals either. Every way to send Ctrl+C gets the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ctrl_c_in_raw_mode_is_the_interrupt_key_and_never_a_signal() {
+    if !real_only() {
+        return;
+    }
+    let server = TestServer::start(TestServerConfig::default()).await;
+    for (arg, key) in [("d", 3u8), ("24", 3), ("off", 3), ("cooked", 3)] {
+        let pane = server.add_script_pane(&format!("{RAW_PROBE}{arg}\n"));
+        let logged = |needle: &str| contains(&server.log(pane), needle.as_bytes());
+        wait_for("the program to start", || logged("READY")).await;
+        let want = format!("BYTE={key}\r");
+        let seen = || count(&server.log(pane), &want);
+        let id = pane.to_string();
+
+        server.socket_call("send_sigint", json!({"pane_id": id})).unwrap();
+        wait_for("the key from send_sigint", || seen() == 1).await;
+        server.cli(&["send-key", "-p", &id, "ctrl+c"]).unwrap();
+        wait_for("the key from send-key", || seen() == 2).await;
+
+        // A typed Ctrl+C (rpc v2) is plain input here as well.
+        let c = connect(&server, "typist").await;
+        c.send_input(pane, &[key]).await.unwrap();
+        wait_for("the key from a typed Ctrl+C", || seen() == 3).await;
+        c.close().await;
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!logged("SIGINT="), "arg {arg}: a raw-mode program was signalled");
+        assert_eq!(seen(), 3, "arg {arg}: one key per Ctrl+C");
+    }
+    server.shutdown().await;
+}
+
+/// A signal forwarder (ssh, mosh-client) in raw mode gets 0x03 as input and
+/// no signal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_raw_mode_forwarder_gets_the_interrupt_key() {
+    use std::os::unix::fs::PermissionsExt;
+    if !real_only() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("forgetty-rawfwd-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("got");
+    let prog = dir.join("ssh");
+    // Raw mode, one byte at a time, like ssh with a pty on the far side.
+    std::fs::write(
+        &prog,
+        format!(
+            "#!/bin/sh\ntrap 'echo GOT_INT >> {l}' INT\nstty raw -echo\n\
+             while :; do b=$(dd bs=1 count=1 2>/dev/null | od -An -tu1); echo \"GOT:$b\" >> {l}; done\n",
+            l = log.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&prog, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let server = TestServer::start(TestServerConfig::default()).await;
+    let pane = server.add_script_pane(&format!("exec {}", prog.display()));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    server.socket_call("send_sigint", json!({"pane_id": pane.to_string()})).unwrap();
+    wait_for("the forwarder to read 0x03", || {
+        std::fs::read_to_string(&log).is_ok_and(|t| {
+            t.lines().any(|l| l.strip_prefix("GOT:").is_some_and(|b| b.trim() == "3"))
+        })
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let got = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(!got.contains("GOT_INT"), "the forwarder was signalled: {got}");
+    server.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The pane stream header says where replay ends (section 8).
@@ -1492,28 +1613,192 @@ async fn one_ctrl_c_on_a_busy_cooked_pane_is_one_sigint() {
     server.shutdown().await;
 }
 
-/// `local` and `unknown` name the server's own socket clients and a kind the
-/// decoder does not know. A remote `Hello` with either is refused.
+/// A forwarder in raw mode whose VINTR was remapped gets the remapped key: the
+/// far side's terminal uses the setting ssh forwarded.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_remote_hello_cannot_claim_to_be_local() {
+async fn a_raw_mode_forwarder_with_a_remapped_vintr_gets_that_key() {
+    use std::os::unix::fs::PermissionsExt;
+    if !real_only() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("forgetty-rawfwd2-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("got");
+    let prog = dir.join("ssh");
+    std::fs::write(
+        &prog,
+        format!(
+            "#!/bin/sh\nstty intr '^X' raw -echo\n\
+             while :; do b=$(dd bs=1 count=1 2>/dev/null | od -An -tu1); echo \"GOT:$b\" >> {l}; done\n",
+            l = log.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&prog, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let server = TestServer::start(TestServerConfig::default()).await;
+    let pane = server.add_script_pane(&format!("exec {}", prog.display()));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    server.socket_call("send_sigint", json!({"pane_id": pane.to_string()})).unwrap();
+    wait_for("the forwarder to read ^X", || {
+        std::fs::read_to_string(&log).is_ok_and(|t| {
+            t.lines().any(|l| l.strip_prefix("GOT:").is_some_and(|b| b.trim() == "24"))
+        })
+    })
+    .await;
+    server.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Input typed just before `close()` reaches the program: the client waits
+/// (up to 300 ms) for the server to ack it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn input_sent_just_before_close_is_not_lost() {
     if !real_only() {
         return;
     }
     let server = TestServer::start(TestServerConfig::default()).await;
-    for kind in [ClientKind::Local, ClientKind::Unknown] {
-        let endpoint = raw_endpoint(&server).await;
-        let conn = endpoint.connect(server.addr(), ALPN_RPC).await.unwrap();
-        let (mut send, mut recv) = conn.open_bi().await.unwrap();
-        let hello = Hello::new(Uuid::new_v4(), Uuid::new_v4(), kind, "liar", "0.0.0", Vec::new());
-        write_msg(&mut send, &hello).await.unwrap();
-        match read_msg::<_, HandshakeReply>(&mut recv).await.unwrap() {
-            Some(HandshakeReply::Error(e)) => {
-                assert_eq!(e.code, "bad_request");
-                assert!(e.message.contains("bad_hello"), "{}", e.message);
-            }
-            other => panic!("{kind:?}: expected a refusal, got {other:?}"),
-        }
-        endpoint.close().await;
+    let pane = server.add_script_pane("stty raw -echo; exec cat");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    for i in 0..15 {
+        let c = connect(&server, "closer").await;
+        let marker = format!("<m{i:02}>");
+        c.send_input(pane, marker.as_bytes()).await.unwrap();
+        c.close().await;
+        wait_for(&format!("marker {i}"), || contains(&pty_input(&server, pane), marker.as_bytes()))
+            .await;
     }
+    server.shutdown().await;
+}
+
+/// The local socket `send_sigint` and `forgetty send-key ctrl+c` signal a
+/// cooked-mode program once each, as a typed Ctrl+C does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_local_interrupts_are_one_sigint_each_in_cooked_mode() {
+    if !real_only() {
+        return;
+    }
+    let server = TestServer::start(TestServerConfig::default()).await;
+    let pane = server.add_script_pane(SIGINT_COUNTER);
+    let logged = |needle: &str| contains(&server.log(pane), needle.as_bytes());
+    wait_for("the program to start", || logged("READY")).await;
+    let id = pane.to_string();
+
+    server.socket_call("send_sigint", json!({"pane_id": id})).unwrap();
+    wait_for("the first SIGINT", || logged("SIGINT=1")).await;
+    server.cli(&["send-key", "-p", &id, "ctrl+c"]).unwrap();
+    wait_for("the second SIGINT", || logged("SIGINT=2")).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!logged("SIGINT=3"), "one interrupt signalled the program twice");
+    server.shutdown().await;
+}
+
+/// `local` names the server's own socket clients: a remote `Hello` with it is
+/// refused. `unknown` is a kind the decoder does not know: it is accepted and
+/// listed as it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_remote_hello_cannot_claim_to_be_local_but_an_unknown_kind_connects() {
+    if !real_only() {
+        return;
+    }
+    let server = TestServer::start(TestServerConfig::default()).await;
+    let endpoint = raw_endpoint(&server).await;
+    let conn = endpoint.connect(server.addr(), ALPN_RPC).await.unwrap();
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    let hello =
+        Hello::new(Uuid::new_v4(), Uuid::new_v4(), ClientKind::Local, "liar", "0.0.0", Vec::new());
+    write_msg(&mut send, &hello).await.unwrap();
+    match read_msg::<_, HandshakeReply>(&mut recv).await.unwrap() {
+        Some(HandshakeReply::Error(e)) => {
+            assert_eq!(e.code, "bad_request");
+            assert!(e.message.contains("bad_hello"), "{}", e.message);
+        }
+        other => panic!("local: expected a refusal, got {other:?}"),
+    }
+    endpoint.close().await;
+
+    let endpoint = raw_endpoint(&server).await;
+    let conn = endpoint.connect(server.addr(), ALPN_RPC).await.unwrap();
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    let hello = Hello::new(
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        ClientKind::Unknown,
+        "newcomer",
+        "0.0.0",
+        Vec::new(),
+    );
+    write_msg(&mut send, &hello).await.unwrap();
+    match read_msg::<_, HandshakeReply>(&mut recv).await.unwrap() {
+        Some(HandshakeReply::Welcome(_)) => {}
+        other => panic!("unknown: expected a Welcome, got {other:?}"),
+    }
+    let listed = server.socket_call("list_clients", json!({})).unwrap();
+    let kinds: Vec<_> = listed["clients"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["client_name"] == "newcomer")
+        .map(|c| c["client_kind"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(kinds, ["unknown"], "list_clients: {listed}");
+    endpoint.close().await;
+    server.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Aborted dials leave nothing behind
+// ---------------------------------------------------------------------------
+
+/// A dial that is cut off (here by its timeout, while the server does not run)
+/// must not leave half-open connections on the server. Its connect attempts
+/// are retired, not dropped: they finish their handshake once the server is
+/// back and are closed. Dropped half way, the server sees a handshake that the
+/// peer abandons, and keeps the connection draining for seconds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_aborted_dial_leaves_no_connection_on_the_server() {
+    use forgetty_client::ClientOptions;
+    if !real_only() {
+        return;
+    }
+    let server = TestServer::start(TestServerConfig::default()).await;
+    let pid = server.pid().expect("real server");
+    let k = SecretKey::generate(&mut rand::rng());
+    server.authorize(k.public());
+    let count = |name: &str| qa_state(&server)[name].as_u64().unwrap();
+    let (base_conns, base_quic) = (count("connections"), count("quic_open"));
+
+    // The server does not run: attempts at 0, 400 and 800 ms get no answer,
+    // and the 1 s dial timeout cuts the dial off.
+    unsafe { libc::kill(pid, libc::SIGSTOP) };
+    let opts = ClientOptions { dial_timeout: Duration::from_secs(1), ..Default::default() };
+    let info = ClientInfo::new(Uuid::new_v4(), ClientKind::Cli, "aborted", "0.0.0");
+    let h = Client::spawn(server.addr(), k, info, opts).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    assert!(!h.state().is_connected());
+    unsafe { libc::kill(pid, libc::SIGCONT) };
+    // The client finds the server again; then it goes away on purpose.
+    let t0 = Instant::now();
+    while !h.state().is_connected() {
+        assert!(t0.elapsed() < Duration::from_secs(5), "never reconnected: {:?}", h.state());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    h.close().await;
+
+    let t0 = Instant::now();
+    loop {
+        let (conns, quic) = (count("connections"), count("quic_open"));
+        if conns <= base_conns && quic <= base_quic {
+            println!("connections back to baseline after {:?}", t0.elapsed());
+            break;
+        }
+        assert!(
+            t0.elapsed() < Duration::from_secs(4),
+            "after 4 s the server still holds {conns} connections ({base_conns} before) \
+             and {quic} QUIC connections ({base_quic} before)"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // No handshake was abandoned half way.
+    assert_eq!(count("handshake_failures"), 0, "a connect attempt was dropped mid-handshake");
     server.shutdown().await;
 }
