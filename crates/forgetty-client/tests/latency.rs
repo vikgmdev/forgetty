@@ -17,6 +17,9 @@ async fn connect(server: &TestServer) -> ClientHandle {
         .expect("connect failed")
 }
 
+// Timing budget is set for optimized builds. Debug builds on a loaded box
+// exceed it without any real regression, so CI runs this with --release.
+#[cfg_attr(debug_assertions, ignore = "latency budget needs --release")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn keystroke_not_delayed_by_concurrent_50mb_output_burst() {
     const BURST: usize = 50 * 1024 * 1024;

@@ -46,6 +46,9 @@ jobs:
       - name: Test
         run: cargo test
 
+      - name: Latency budget (release)
+        run: cargo test --release -p forgetty-client --test latency
+
       - name: Build QA tools
         run: cargo build -p forgetty-server --features qa-tools
 
