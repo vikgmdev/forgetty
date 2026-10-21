@@ -84,6 +84,9 @@ impl Element for TerminalElement {
             // One resize per frame: this runs once per frame.
             v.apply_bounds(bounds);
             v.prepare_rows(window);
+            // A smaller PTY grid sits in the middle of the pane (letterbox).
+            let pad = v.letterbox_pad();
+            let bounds = Bounds::new(bounds.origin + point(px(pad.0), px(pad.1)), bounds.size);
 
             let m = &v.metrics;
             let cursor = if v.term.cursor_visible() && (v.cursor_on || !focused) {
@@ -123,6 +126,8 @@ impl Element for TerminalElement {
         window: &mut Window,
         cx: &mut App,
     ) {
+        let pad = self.view.read(cx).letterbox_pad();
+        let bounds = Bounds::new(bounds.origin + point(px(pad.0), px(pad.1)), bounds.size);
         let (cw, lh, font, font_size, fg, bg, cur_col, sel_col, focus, marked, cursor_cell) = {
             let v = self.view.read(cx);
             let k = 1.0 - v.dim;

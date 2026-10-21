@@ -74,12 +74,12 @@ pub const ACTIONS: &[ActionInfo] = &[
     info!(Action::SplitRight, "split_right", "Split pane right", ["alt+shift+plus"]),
     info!(Action::SplitDown, "split_down", "Split pane down", ["alt+shift+minus"]),
     info!(Action::ClosePane, "close_pane", "Close pane", ["ctrl+shift+w"]),
-    info!(Action::FocusLeft, "focus_left", "Focus pane left", ["alt+left"]),
-    info!(Action::FocusRight, "focus_right", "Focus pane right", ["alt+right"]),
-    info!(Action::FocusUp, "focus_up", "Focus pane up", ["alt+up"]),
-    info!(Action::FocusDown, "focus_down", "Focus pane down", ["alt+down"]),
+    info!(Action::FocusLeft, "focus_left", "Focus pane left", ["ctrl+alt+left"]),
+    info!(Action::FocusRight, "focus_right", "Focus pane right", ["ctrl+alt+right"]),
+    info!(Action::FocusUp, "focus_up", "Focus pane up", ["ctrl+alt+up"]),
+    info!(Action::FocusDown, "focus_down", "Focus pane down", ["ctrl+alt+down"]),
     info!(Action::ZoomPane, "zoom_pane", "Toggle pane zoom", ["ctrl+shift+z"]),
-    info!(Action::ToggleSidebar, "toggle_sidebar", "Toggle sidebar", ["ctrl+b"]),
+    info!(Action::ToggleSidebar, "toggle_sidebar", "Toggle sidebar", ["ctrl+shift+b"]),
     info!(Action::CommandPalette, "command_palette", "Command palette", ["ctrl+shift+p"]),
     info!(Action::NewWorkspace, "new_workspace", "New workspace", ["ctrl+shift+n"]),
     info!(Action::NextWorkspace, "next_workspace", "Next workspace", []),
@@ -294,17 +294,17 @@ mod tests {
         assert_eq!(km.lookup(&Chord::new(false, true, true, false, "=")), Some(Action::SplitRight));
         assert_eq!(km.lookup(&Chord::new(false, true, true, false, "-")), Some(Action::SplitDown));
         assert_eq!(km.lookup(&Chord::new(true, false, false, false, "3")), Some(Action::GotoTab(3)));
-        assert_eq!(km.shortcut(Action::ToggleSidebar), "Ctrl+B");
+        assert_eq!(km.shortcut(Action::ToggleSidebar), "Ctrl+Shift+B");
         let mut o = HashMap::new();
-        o.insert("toggle_sidebar".to_string(), vec!["ctrl+shift+b".to_string()]);
+        o.insert("toggle_sidebar".to_string(), vec!["ctrl+shift+k".to_string()]);
         o.insert("new_tab".to_string(), vec!["none".to_string()]);
-        o.insert("split_right".to_string(), vec!["ctrl+shift+b".to_string()]);
+        o.insert("split_right".to_string(), vec!["ctrl+shift+k".to_string()]);
         o.insert("nonsense".to_string(), vec!["x".to_string()]);
         let km = Keymap::new(&o);
-        assert!(km.lookup(&Chord::new(true, false, false, false, "b")).is_none());
+        assert!(km.lookup(&Chord::new(true, false, true, false, "b")).is_none());
         assert!(km.chords(Action::NewTab).is_empty());
         // Conflict: both user-bound, last inserted wins, but only one owner remains.
-        let owner = km.lookup(&Chord::new(true, false, true, false, "b")).unwrap();
+        let owner = km.lookup(&Chord::new(true, false, true, false, "k")).unwrap();
         assert!(owner == Action::SplitRight || owner == Action::ToggleSidebar);
         assert_eq!(km.warnings.len(), 1);
         let names: std::collections::HashSet<_> = ACTIONS.iter().map(|a| a.name).collect();

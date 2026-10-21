@@ -22,6 +22,7 @@ use crate::config::Config;
 use crate::shell::{AppShell, BAR};
 use crate::view::TerminalView;
 
+mod inject;
 mod real;
 mod remote;
 
@@ -164,6 +165,7 @@ enum Phase {
     RRestart,
     RToast,
     RServer,
+    W5View,
     // W4: the real Linux server in WSL.
     RealSetup,
     RealPair,
@@ -212,6 +214,7 @@ impl Phase {
             Phase::RRestart => "w3-restart-server",
             Phase::RToast => "w3-toasts",
             Phase::RServer => "w4-server-ops",
+            Phase::W5View => "w5-view",
             Phase::RealSetup => "w4-real-setup",
             Phase::RealPair => "w4-real-pair",
             Phase::RealEcho => "w4-real-echo",
@@ -270,6 +273,7 @@ pub struct ShellSmoke {
     step_gaps: Vec<f64>,
     last_step: Option<Instant>,
     w3: remote::W3,
+    w5: remote::W5,
     real: real::Real,
 }
 
@@ -360,6 +364,7 @@ impl ShellSmoke {
             step_gaps: Vec::new(),
             last_step: None,
             w3: remote::W3::default(),
+            w5: remote::W5::default(),
             real: real::Real::new(real_distro),
         }
     }
@@ -793,9 +798,9 @@ impl ShellSmoke {
                 // (shortcut, Some(side) = focus move, None = split), panes wanted after
                 const OPS: [(&str, Option<Side>, usize); 5] = [
                     ("alt+shift+=", None, 2),
-                    ("alt+left", Some(Side::Left), 2),
+                    ("ctrl+alt+left", Some(Side::Left), 2),
                     ("alt+shift+-", None, 3),
-                    ("alt+right", Some(Side::Right), 3),
+                    ("ctrl+alt+right", Some(Side::Right), 3),
                     ("alt+shift+-", None, 4),
                 ];
                 let i = self.sub / 2;
@@ -1083,7 +1088,7 @@ impl ShellSmoke {
                 self.shot_frames += 1;
                 if self.sub == 0 {
                     if !shell.sidebar_open {
-                        self.press(shell, window, cx, "ctrl+b");
+                        self.press(shell, window, cx, "ctrl+shift+b");
                     }
                     self.sub = 1;
                     self.shot_frames = 0;
@@ -1231,7 +1236,7 @@ impl ShellSmoke {
                     }
                 }
             }
-            Phase::RSetup | Phase::RPair | Phase::REcho | Phase::RKeys | Phase::RKill | Phase::RRestart | Phase::RToast | Phase::RServer => {
+            Phase::RSetup | Phase::RPair | Phase::REcho | Phase::RKeys | Phase::RKill | Phase::RRestart | Phase::RToast | Phase::RServer | Phase::W5View => {
                 self.w3_step(shell, window, cx, now_t)
             }
             Phase::RealSetup
@@ -1320,6 +1325,35 @@ fn scratch(rows: usize, cols: usize) -> Terminal {
 }
 
 fn run_direct_checks() {
+    // W5: mouse columns at 8.6 px cells, Alt with non-ASCII letters.
+    match crate::view::mouse_selftest() {
+        Ok(()) => check("mouse_col_at_fractional_cell_width", true),
+        Err(e) => {
+            record("mouse_selftest_error", json!(e));
+            check("mouse_col_at_fractional_cell_width", false);
+        }
+    }
+    {
+        let t = scratch(5, 40);
+        let mut input = crate::encoder::Input::new();
+        let ks = |alt: bool, key: &str| Keystroke {
+            modifiers: Modifiers { alt, ..Modifiers::default() },
+            key: key.into(),
+            key_char: Some(key.into()),
+        };
+        let press = forgetty_vt::ffi::GHOSTTY_KEY_ACTION_PRESS;
+        let alt_a = input.encode_key(&ks(true, "\u{e4}"), press, t.raw_handle());
+        let alt_n = input.encode_key(&ks(true, "\u{f1}"), press, t.raw_handle());
+        let plain_e = input.encode_key(&ks(false, "\u{e9}"), press, t.raw_handle());
+        record("alt_umlaut_bytes", json!([alt_a, alt_n, plain_e]));
+        check(
+            "alt_and_plain_non_ascii_encoded",
+            alt_a.as_deref() == Some("\u{1b}\u{e4}".as_bytes())
+                && alt_n.as_deref() == Some("\u{1b}\u{f1}".as_bytes())
+                && plain_e.as_deref() == Some("\u{e9}".as_bytes()),
+        );
+    }
+
     // Wide chars and grapheme clusters straight through the VT.
     let mut t = scratch(5, 40);
     t.feed("A日本😀B e\u{301} 👨\u{200d}👩\u{200d}👧\r\n".as_bytes());

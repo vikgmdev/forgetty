@@ -201,6 +201,10 @@ struct InFrame {
     payload: Arc<Vec<u8>>,
     /// Input bytes inside (what the 64 KiB cap counts).
     len: usize,
+    /// AD-025: a terminal reply or focus report, not typing. The wire flag is sent only
+    /// when both sides list `input_flags` (`ClientHandle::has_capability`).
+    #[allow(dead_code)]
+    auto: bool,
 }
 
 struct InputState {
@@ -504,13 +508,43 @@ impl ClientHandle {
     /// cap would be exceeded while disconnected. While connected the call
     /// waits for room instead.
     pub async fn send_input(&self, pane_id: Uuid, bytes: &[u8]) -> Result<(), ClientError> {
+        self.send_input_flagged(pane_id, bytes, false).await
+    }
+
+    /// Like [`send_input`](Self::send_input) with the AD-025 flag: `auto` marks terminal
+    /// replies (DA, CPR, kitty answers) and focus reports. An `auto` frame never counts as
+    /// typing. The flag goes on the wire only when the server lists `input_flags`.
+    ///
+    /// A buffer is accepted whole or refused whole while it fits the 64 KiB buffer.
+    pub async fn send_input_flagged(&self, pane_id: Uuid, bytes: &[u8], auto: bool) -> Result<(), ClientError> {
         let shared = self.shared();
         if self.state() == ConnectionState::Closed {
             return Err(ClientError::Closed);
         }
         let disconnected = !self.state().is_connected();
-        if disconnected && lock(&shared.input.state).bytes + bytes.len() > INPUT_BUFFER_CAP {
-            return Err(ClientError::InputBufferFull);
+        // Fast path: every chunk fits, so all of them are queued under one lock.
+        {
+            let mut st = lock(&shared.input.state);
+            let fits = st.bytes + bytes.len() <= INPUT_BUFFER_CAP || st.frames.is_empty();
+            if fits {
+                for chunk in bytes.chunks(INPUT_CHUNK) {
+                    let seq = st.next_seq;
+                    st.next_seq += 1;
+                    st.bytes += chunk.len();
+                    st.frames.push_back(InFrame {
+                        seq,
+                        payload: Arc::new(encode_input_frame(pane_id, seq, chunk)),
+                        len: chunk.len(),
+                        auto,
+                    });
+                }
+                drop(st);
+                shared.input.ready.notify_one();
+                return Ok(());
+            }
+            if disconnected {
+                return Err(ClientError::InputBufferFull);
+            }
         }
         for chunk in bytes.chunks(INPUT_CHUNK) {
             loop {
@@ -527,6 +561,7 @@ impl ClientHandle {
                             seq,
                             payload: Arc::new(encode_input_frame(pane_id, seq, chunk)),
                             len: chunk.len(),
+                            auto,
                         });
                         shared.input.ready.notify_one();
                         break;
@@ -1306,7 +1341,9 @@ async fn pane_reader(shared: Arc<Shared>, gen: u64, mut recv: RecvStream) -> Tas
             return TaskEnd::Done; // an even newer stream already took over
         }
         if header.reset {
-            st.offset = Some(header.start_offset);
+            // A snapshot is not complete until its last byte arrived: a drop before that
+            // must reattach from scratch, not resume at an offset the VT never reached.
+            st.offset = if header.snapshot_len > 0 { None } else { Some(header.start_offset) };
         } else if st.offset.is_some_and(|o| o != header.start_offset) {
             return TaskEnd::Lost(format!(
                 "pane {} resumed at {} but expected {:?}",
@@ -1336,7 +1373,7 @@ async fn pane_reader(shared: Arc<Shared>, gen: u64, mut recv: RecvStream) -> Tas
                 if st.gen != gen || st.stream != mine {
                     return TaskEnd::Done; // a newer stream owns the pane
                 }
-                let offset = st.offset.unwrap_or(0);
+                let offset = st.offset.unwrap_or(header.start_offset);
                 if snapshot_left > 0 {
                     if buf.len() > snapshot_left || !header.reset {
                         return TaskEnd::Lost(format!(
@@ -1345,6 +1382,10 @@ async fn pane_reader(shared: Arc<Shared>, gen: u64, mut recv: RecvStream) -> Tas
                         ));
                     }
                     snapshot_left -= buf.len();
+                    if snapshot_left == 0 {
+                        // Complete: from here a reconnect may resume at the pane offset.
+                        st.offset = Some(header.start_offset);
+                    }
                     permit.send(Tagged {
                         stream: mine,
                         item: PaneItem::Snapshot { offset, bytes: std::mem::take(&mut buf) },

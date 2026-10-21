@@ -14,7 +14,7 @@ use forgetty_client::{pair_with_addr, qr_to_addr, AddrCache, AddrCacheSnapshot, 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::acl::write_private;
+use crate::acl::{self, write_private};
 
 const MAX_MACHINES: usize = 32;
 const MAX_OFFER_BYTES: usize = 4096;
@@ -88,23 +88,38 @@ impl MachineStore {
         self.dir.join("addr_cache.json")
     }
 
-    /// Load the device key, or create it. The file is written user-only.
+    /// Load the device key, or create it. The file is created user-only in one step
+    /// (`CREATE_NEW`), so two first runs at once cannot overwrite each other: the loser reads
+    /// the winner's key. A key file that other users could read is locked down on load.
     pub fn identity(&self) -> io::Result<SecretKey> {
         let path = self.identity_path();
-        match std::fs::read(&path) {
-            Ok(bytes) => {
-                let arr: [u8; 32] = bytes
-                    .try_into()
-                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "identity.key is not 32 bytes"))?;
-                Ok(SecretKey::from_bytes(&arr))
+        let mut last = io::Error::new(io::ErrorKind::InvalidData, "identity.key is not 32 bytes");
+        for _ in 0..50 {
+            match std::fs::read(&path) {
+                Ok(bytes) => match <[u8; 32]>::try_from(bytes) {
+                    Ok(arr) => {
+                        if matches!(acl::is_user_only(&path), Ok(false)) {
+                            eprintln!("forgetty-win: identity.key was readable by others, restricting it");
+                            acl::restrict_to_user(&path)?;
+                        }
+                        return Ok(SecretKey::from_bytes(&arr));
+                    }
+                    // Another process is writing it right now.
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+                },
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    let key = SecretKey::generate(&mut rand::rng());
+                    match acl::create_private_new(&path, &key.to_bytes()) {
+                        Ok(()) => return Ok(key),
+                        // Lost the race: read the other process's key.
+                        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+                Err(e) => last = e,
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                let key = SecretKey::generate(&mut rand::rng());
-                write_private(&path, &key.to_bytes())?;
-                Ok(key)
-            }
-            Err(e) => Err(e),
         }
+        Err(last)
     }
 
     /// Load the stable `client_id`, or create it.
@@ -190,15 +205,9 @@ pub struct PairingOffer {
     pub relays: Vec<String>,
 }
 
+/// Text from a QR payload is untrusted: no control or bidi characters, bounded length.
 fn clean(s: &str, max: usize) -> String {
-    let text: String = s.chars().filter(|c| !c.is_control()).collect();
-    let text = text.trim();
-    if text.chars().count() > max {
-        let cut: String = text.chars().take(max).collect();
-        format!("{cut}...")
-    } else {
-        text.to_string()
-    }
+    forgetty_shell_core::notify::sanitize(s, max)
 }
 
 /// Parse the text `forgetty pair` prints (the QR payload JSON, possibly with
@@ -341,7 +350,7 @@ mod tests {
     #[test]
     fn long_names_are_cut() {
         let o = parse_offer(&offer_json(&node(), &"m".repeat(200), "")).unwrap();
-        assert_eq!(o.machine.chars().count(), 48 + 3);
+        assert_eq!(o.machine.chars().count(), 48);
     }
 
     #[test]
@@ -386,5 +395,29 @@ mod tests {
         assert!(s.identity().is_ok());
         std::fs::write(s.identity_path(), b"short").unwrap();
         assert!(s.identity().is_err());
+    }
+
+    #[test]
+    fn two_first_runs_share_one_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let keys: Vec<_> = (0..8)
+            .map(|_| {
+                let p = path.clone();
+                std::thread::spawn(move || MachineStore::open(p).identity().unwrap().to_bytes())
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect();
+        assert!(keys.windows(2).all(|w| w[0] == w[1]), "every first run got the key that is on disk");
+        let on_disk = std::fs::read(MachineStore::open(&path).identity_path()).unwrap();
+        assert_eq!(on_disk, keys[0]);
+    }
+
+    #[test]
+    fn machine_names_lose_bidi_and_control_characters() {
+        let o = parse_offer(&offer_json(&node(), "ok\u{202e}\u{7}na\u{200b}me\u{2066}", "")).unwrap();
+        assert_eq!(o.machine, "okname");
     }
 }

@@ -97,6 +97,8 @@ pub mod cap {
     pub const SIZE_POLICY_LATEST: &str = "size_policy_latest";
     /// A slow pane stream catches up by a VT snapshot (AD-023).
     pub const SNAPSHOT_CATCHUP: &str = "snapshot_catchup";
+    /// Input frames carry a `user` or `auto` flag (AD-025).
+    pub const INPUT_FLAGS: &str = "input_flags";
 }
 
 /// Method names that are new in v2 (section 4).

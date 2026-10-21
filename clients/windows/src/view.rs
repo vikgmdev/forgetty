@@ -30,6 +30,11 @@ use crate::encoder::{self, Input};
 
 const SHAPE_CACHE_MAX: usize = 4096;
 const FEED_CHUNK: usize = 256 * 1024;
+/// Replies to queries in replayed output are dropped, but never for longer than this: under
+/// constant output the replay never "drains", and a program waiting for an answer must get it.
+const REPLAY_MAX: Duration = Duration::from_secs(2);
+/// How long the "input dropped" notice shows.
+const DROP_NOTICE: Duration = Duration::from_secs(4);
 
 /// Scale brightness (same as a black overlay of alpha 1-k).
 pub fn shade(c: Hsla, k: f32) -> Hsla {
@@ -154,8 +159,21 @@ pub struct TerminalView {
     pub dim: f32,
     /// Set after a VT reset: the next resize is sent even if the size is unchanged.
     pub force_size: bool,
-    /// True from a reset until the replay has drained.
+    /// True from a reset until the replay has drained (or `REPLAY_MAX` passed).
     pub replaying: bool,
+    replay_since: Option<Instant>,
+    /// The source's PTY belongs to whichever client typed last (AD-020): the VT keeps the
+    /// size the server reports and is centered in the pane.
+    letterbox: bool,
+    /// What fits the window, in rows and columns. Equals `(rows, cols)` unless letterboxed.
+    pub win_grid: (usize, usize),
+    /// A dead key was pressed: the next key goes to the OS so it can compose (WM_CHAR).
+    dead_pending: bool,
+    /// Touchpad wheel pixels not yet turned into mouse-mode notches.
+    wheel_accum: f32,
+    /// Input bytes the source dropped, as last seen, and until when the notice shows.
+    dropped_seen: u64,
+    drop_notice_until: Option<Instant>,
     pub resets: u64,
     pub fed_bytes: u64,
     pub feed_time: Duration,
@@ -197,6 +215,7 @@ impl TerminalView {
         let metrics = Metrics::measure(cx, &cfg);
         let (rows, cols) = (rows.clamp(1, 500), cols.clamp(2, 1000));
         let term = make_term(&cfg, rows, cols);
+        let letterbox = source.letterbox();
 
         // Pump source output into the VT on the UI thread. Batches are capped
         // and the task yields between them so frames keep flowing while a
@@ -287,6 +306,13 @@ impl TerminalView {
             dim: 0.0,
             force_size: false,
             replaying: false,
+            replay_since: None,
+            letterbox,
+            win_grid: (rows, cols),
+            dead_pending: false,
+            wheel_accum: 0.0,
+            dropped_seen: 0,
+            drop_notice_until: None,
             resets: 0,
             fed_bytes: 0,
             feed_time: Duration::ZERO,
@@ -324,6 +350,7 @@ impl TerminalView {
         if let Some((rows, cols)) = reset {
             self.reset_term(rows, cols);
             self.replaying = true;
+            self.replay_since = Some(Instant::now());
         }
         if !bytes.is_empty() {
             let t0 = Instant::now();
@@ -336,14 +363,18 @@ impl TerminalView {
             // A replay after a reset re-runs old queries: their answers would reach
             // the program a second time, so they are dropped.
             for resp in self.term.drain_write_pty() {
+                if self.replaying && self.replay_since.is_some_and(|t| t.elapsed() > REPLAY_MAX) {
+                    self.replaying = false;
+                }
                 if !self.replaying {
-                    self.source.write_input(&resp);
+                    // AD-025: not typing. The server does not count it as activity.
+                    self.source.write_auto(&resp);
                 }
             }
             // Titles and cwd come from the backend (it scans the same bytes).
             drop(self.term.drain_events());
         }
-        if caught_up {
+        if caught_up || self.replay_since.is_some_and(|t| t.elapsed() > REPLAY_MAX) {
             self.replaying = false;
         }
         if let Some(reason) = closed {
@@ -365,7 +396,7 @@ impl TerminalView {
         self.cursor_on = true;
         if self.term.is_focus_reporting() {
             if let Some(b) = Input::encode_focus(focused) {
-                self.send_bytes(&b);
+                self.send_auto(&b);
             }
         }
         cx.notify();
@@ -423,6 +454,18 @@ impl TerminalView {
 
         let cols = ((f32::from(bounds.size.width) / f32::from(self.metrics.cell_w) + 0.1).floor() as usize).clamp(2, 1000);
         let rows = ((f32::from(bounds.size.height) / f32::from(self.metrics.line_h) + 0.1).floor() as usize).clamp(1, 500);
+        if self.letterbox {
+            // The VT keeps the PTY's size (the latest active client owns it, AD-020). Only
+            // tell the server what fits here: it applies this when we are the active client.
+            self.win_grid = (rows, cols);
+            let again = std::mem::take(&mut self.force_size);
+            if again {
+                self.source.reassert_size(rows as u16, cols as u16);
+            } else {
+                self.source.resize(rows as u16, cols as u16);
+            }
+            return;
+        }
         if rows == self.rows && cols == self.cols {
             if std::mem::take(&mut self.force_size) {
                 self.source.reassert_size(rows as u16, cols as u16);
@@ -442,6 +485,39 @@ impl TerminalView {
         self.rows_shaped = vec![None; rows];
         self.last_gen = 0;
         self.sel = None;
+    }
+
+    /// The server reported a new PTY size for this pane (`PaneResized`). A letterboxed view
+    /// follows it, whoever asked for it.
+    pub fn set_pty_size(&mut self, rows: u16, cols: u16, cx: &mut Context<Self>) {
+        if !self.letterbox {
+            return;
+        }
+        let (rows, cols) = ((rows as usize).clamp(1, 500), (cols as usize).clamp(2, 1000));
+        if rows == self.rows && cols == self.cols {
+            return;
+        }
+        self.rows = rows;
+        self.cols = cols;
+        self.resizes += 1;
+        self.term.resize(rows, cols);
+        self.row_hash = vec![0; rows];
+        self.rows_shaped = vec![None; rows];
+        self.last_gen = 0;
+        self.sel = None;
+        cx.notify();
+    }
+
+    /// Offset of the (smaller) PTY grid inside the pane: it sits in the middle. Zero when the
+    /// grid fills the pane, or is larger than it, or the pane is not letterboxed.
+    pub fn letterbox_pad(&self) -> (f32, f32) {
+        if !self.letterbox {
+            return (0.0, 0.0);
+        }
+        let (w, h) = (f32::from(self.bounds.size.width), f32::from(self.bounds.size.height));
+        let gw = f32::from(self.metrics.cell_w) * self.cols as f32;
+        let gh = f32::from(self.metrics.line_h) * self.rows as f32;
+        (((w - gw) / 2.0).max(0.0).floor(), ((h - gh) / 2.0).max(0.0).floor())
     }
 
     /// Re-shape only rows whose content changed. Rows the VT did not touch are
@@ -501,10 +577,19 @@ impl TerminalView {
 
     // ---- keyboard ---------------------------------------------------------
 
+    /// Bytes the user typed, pasted or clicked.
     pub fn send_bytes(&mut self, bytes: &[u8]) {
         match self.capture_input.as_mut() {
             Some(buf) => buf.extend_from_slice(bytes),
             None => self.source.write_input(bytes),
+        }
+    }
+
+    /// Bytes the program did not get from the user: focus reports (AD-025).
+    pub fn send_auto(&mut self, bytes: &[u8]) {
+        match self.capture_input.as_mut() {
+            Some(buf) => buf.extend_from_slice(bytes),
+            None => self.source.write_auto(bytes),
         }
     }
 
@@ -570,6 +655,17 @@ impl TerminalView {
                 }
                 _ => {}
             }
+        }
+        // Dead keys (US-International ', ^ in French, ´ in Spanish): the OS composes. The dead
+        // key press itself and the key after it go to TranslateMessage (we do not stop the
+        // event), and the finished text arrives through WM_CHAR and `replace_text_in_range`.
+        // A key that "prefers character input" with no ctrl or alt held is a dead key.
+        if std::mem::take(&mut self.dead_pending) {
+            return;
+        }
+        if ev.prefer_character_input && !m.control && !m.alt && !m.platform && ks.key_char.is_some() {
+            self.dead_pending = true;
+            return;
         }
         // AltGr layouts report ctrl+alt with the composed character: send the text.
         if ev.prefer_character_input {
@@ -637,6 +733,36 @@ impl TerminalView {
         }
     }
 
+    /// A line at the bottom while input is being dropped (no link and the buffer is full).
+    fn drop_overlay(&mut self) -> Option<gpui::Div> {
+        let dropped = self.source.dropped_input_bytes();
+        if dropped > self.dropped_seen {
+            self.dropped_seen = dropped;
+            self.drop_notice_until = Some(Instant::now() + DROP_NOTICE);
+        }
+        if !self.drop_notice_until.is_some_and(|t| Instant::now() < t) {
+            return None;
+        }
+        Some(
+            div()
+                .absolute()
+                .bottom_0()
+                .left_0()
+                .right_0()
+                .p_1()
+                .bg(hsla(0x5a1d1d))
+                .text_color(hsla(0xffffff))
+                .font_family(self.metrics.font.family.clone())
+                .text_size(self.metrics.font_size)
+                .child(format!("Input dropped ({dropped} bytes in all): the link is down and the buffer is full")),
+        )
+    }
+
+    /// Bytes of input this pane dropped so far (smoke and status).
+    pub fn dropped_input(&self) -> u64 {
+        self.source.dropped_input_bytes()
+    }
+
     fn paste_overlay(&self) -> Option<gpui::Div> {
         let p = self.pending_paste.as_ref()?;
         let mut d = div()
@@ -678,9 +804,10 @@ impl TerminalView {
     // ---- mouse ----------------------------------------------------------------
 
     fn local(&self, p: Point<Pixels>) -> (f32, f32) {
+        let (px_, py_) = self.letterbox_pad();
         (
-            (f32::from(p.x) - f32::from(self.bounds.origin.x)).max(0.0),
-            (f32::from(p.y) - f32::from(self.bounds.origin.y)).max(0.0),
+            (f32::from(p.x) - f32::from(self.bounds.origin.x) - px_).max(0.0),
+            (f32::from(p.y) - f32::from(self.bounds.origin.y) - py_).max(0.0),
         )
     }
 
@@ -691,14 +818,11 @@ impl TerminalView {
         (row, col)
     }
 
-    fn grid_px(&self) -> ((u32, u32), (u32, u32)) {
-        (
-            (
-                (f32::from(self.metrics.cell_w) * self.cols as f32) as u32,
-                (f32::from(self.metrics.line_h) * self.rows as f32) as u32,
-            ),
-            (f32::from(self.metrics.cell_w) as u32, f32::from(self.metrics.line_h) as u32),
-        )
+    /// Pointer position and grid geometry for the mouse encoder.
+    fn mouse_args(&self, p: Point<Pixels>) -> ((f32, f32), (u32, u32), (u32, u32)) {
+        let pos = self.local(p);
+        let pixels = self.term.dec_mode(1016);
+        mouse_geom(pos, f32::from(self.metrics.cell_w), f32::from(self.metrics.line_h), self.cols, self.rows, pixels)
     }
 
     fn wants_mouse(&self, shift: bool) -> bool {
@@ -712,8 +836,7 @@ impl TerminalView {
     fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus, cx);
         if self.wants_mouse(ev.modifiers.shift) {
-            let (g, c) = self.grid_px();
-            let pos = self.local(ev.position);
+            let (pos, g, c) = self.mouse_args(ev.position);
             let handle = self.term.raw_handle();
             let b = encoder::mouse_button_to_ghostty(ev.button);
             if let Some(bytes) = self.input.encode_mouse_button(b, true, pos, &ev.modifiers, handle, g, c) {
@@ -754,8 +877,7 @@ impl TerminalView {
 
     fn on_mouse_move(&mut self, ev: &MouseMoveEvent, _w: &mut Window, cx: &mut Context<Self>) {
         if self.wants_mouse(ev.modifiers.shift) {
-            let (g, c) = self.grid_px();
-            let pos = self.local(ev.position);
+            let (pos, g, c) = self.mouse_args(ev.position);
             let handle = self.term.raw_handle();
             if let Some(bytes) = self.input.encode_mouse_motion(pos, &ev.modifiers, handle, g, c) {
                 self.send_bytes(&bytes);
@@ -786,8 +908,7 @@ impl TerminalView {
     fn on_mouse_up(&mut self, ev: &MouseUpEvent, _w: &mut Window, cx: &mut Context<Self>) {
         if self.mouse_reporting {
             self.mouse_reporting = false;
-            let (g, c) = self.grid_px();
-            let pos = self.local(ev.position);
+            let (pos, g, c) = self.mouse_args(ev.position);
             let handle = self.term.raw_handle();
             let b = encoder::mouse_button_to_ghostty(ev.button);
             if let Some(bytes) = self.input.encode_mouse_button(b, false, pos, &ev.modifiers, handle, g, c) {
@@ -816,12 +937,19 @@ impl TerminalView {
             return;
         }
         if self.wants_mouse(ev.modifiers.shift) {
-            let (g, c) = self.grid_px();
-            let pos = self.local(ev.position);
+            let (pos, g, c) = self.mouse_args(ev.position);
             let handle = self.term.raw_handle();
-            let notches = ((dy.abs() / (3.0 * lh)).ceil() as usize).max(1);
+            // Touchpads send many small deltas: add them up and send one notch per 3 rows.
+            self.wheel_accum += dy;
+            let step = 3.0 * lh;
+            let notches = (self.wheel_accum.abs() / step).trunc() as usize;
+            if notches == 0 {
+                return;
+            }
+            let up = self.wheel_accum > 0.0;
+            self.wheel_accum -= self.wheel_accum.signum() * notches as f32 * step;
             for _ in 0..notches {
-                if let Some(bytes) = self.input.encode_mouse_wheel(dy > 0.0, pos, &ev.modifiers, handle, g, c) {
+                if let Some(bytes) = self.input.encode_mouse_wheel(up, pos, &ev.modifiers, handle, g, c) {
                     self.send_bytes(&bytes);
                 }
             }
@@ -883,27 +1011,50 @@ impl TerminalView {
         out
     }
 
-    pub fn selection_text(&self) -> Option<String> {
-        let spans = self.selection_spans();
-        if spans.is_empty() {
+    /// The selected text, including rows that scrolled out of the viewport. Selection rows are
+    /// absolute, so the viewport is moved over them one page at a time and put back after.
+    pub fn selection_text(&mut self) -> Option<String> {
+        let ((r0, c0), (r1, c1)) = self.sel.as_ref()?.range();
+        let (total, off0, len) = self.term.scrollbar_state();
+        let (total, len) = (total as usize, (len as usize).max(1));
+        let at_bottom = off0 as usize + len >= total;
+        let r1 = r1.min(total.saturating_sub(1));
+        if r0 > r1 {
             return None;
         }
-        let screen = self.term.screen();
+        let cols = self.cols;
         let mut out = String::new();
-        let n = spans.len();
-        for (i, (v, a, b)) in spans.into_iter().enumerate() {
-            let cells = screen.row(v);
+        for ar in r0..=r1 {
+            let mut off = self.term.scrollbar_state().1 as usize;
+            if ar < off || ar >= off + len {
+                self.term.scroll_viewport_delta(ar as isize - off as isize);
+                off = self.term.scrollbar_state().1 as usize;
+            }
+            if ar < off || ar >= off + len {
+                continue; // the row is gone (scrollback was trimmed)
+            }
+            let v = ar - off;
+            let a = if ar == r0 { c0 } else { 0 };
+            let b = if ar == r1 { c1 } else { cols.saturating_sub(1) };
+            let screen = self.term.screen();
             let mut line = String::new();
-            for c in cells.iter().take(b + 1).skip(a) {
+            for c in screen.row(v).iter().take(b + 1).skip(a) {
                 if !c.attrs.spacer {
                     line.push_str(&c.grapheme);
                 }
             }
             let wrapped = screen.is_row_wrapped(v);
             out.push_str(if wrapped { &line } else { line.trim_end() });
-            if i + 1 < n && !wrapped {
+            if ar < r1 && !wrapped {
                 out.push('\n');
             }
+        }
+        // Put the viewport back.
+        if at_bottom {
+            self.term.scroll_viewport_bottom();
+        } else {
+            let now = self.term.scrollbar_state().1 as isize;
+            self.term.scroll_viewport_delta(off0 as isize - now);
         }
         Some(out)
     }
@@ -925,6 +1076,68 @@ impl TerminalView {
             .map(|m| m.chars().map(|c| if (c as u32) >= 0x1100 { 2 } else { 1 }).sum())
             .unwrap_or(0)
     }
+}
+
+/// Pixel geometry for the libghostty-vt mouse encoder. Its cell size is a whole number of
+/// pixels, but a cell is 8.6 px wide, so it would count columns wrong (at column 100 it is off
+/// by 5). The column and row are worked out here from the float cell size, and the encoder is
+/// given a grid of 64x64 "virtual pixel" cells with the pointer at the same place inside the
+/// same cell. In pixel mode (DECSET 1016) the encoder reports real pixels, so those go through.
+pub fn mouse_geom(
+    pos: (f32, f32),
+    cell_w: f32,
+    line_h: f32,
+    cols: usize,
+    rows: usize,
+    pixels: bool,
+) -> ((f32, f32), (u32, u32), (u32, u32)) {
+    const V: f32 = 64.0;
+    let (cols, rows) = (cols.max(1), rows.max(1));
+    if pixels {
+        return (
+            pos,
+            ((cell_w * cols as f32).round() as u32, (line_h * rows as f32).round() as u32),
+            (cell_w.round() as u32, line_h.round() as u32),
+        );
+    }
+    let axis = |p: f32, cell: f32, n: usize| -> f32 {
+        let cells = (p / cell).max(0.0);
+        let idx = cells.floor() as usize;
+        if idx >= n {
+            return (n as f32 - 0.5) * V;
+        }
+        (idx as f32 + (cells - idx as f32).clamp(0.0, 0.99)) * V
+    };
+    (
+        (axis(pos.0, cell_w, cols), axis(pos.1, line_h, rows)),
+        (cols as u32 * V as u32, rows as u32 * V as u32),
+        (V as u32, V as u32),
+    )
+}
+
+/// Smoke: the mouse report for a click in column `c` is `c + 1` at 8.6 px cells, wide grid.
+pub fn mouse_selftest() -> Result<(), String> {
+    let palette: [CoreRgba; 16] = std::array::from_fn(|_| CoreRgba::rgb(0, 0, 0));
+    let mut term = Terminal::with_scrollback(40, 200, palette, 1 << 20);
+    term.feed(b"\x1b[?1000h\x1b[?1006h");
+    let mut input = Input::new();
+    let (cw, lh) = (8.6_f32, 19.3_f32);
+    for (col, row) in [(0usize, 0usize), (1, 1), (57, 3), (100, 5), (150, 20), (199, 39)] {
+        for frac in [0.05_f32, 0.5, 0.95] {
+            let pos = ((col as f32 + frac) * cw, (row as f32 + frac) * lh);
+            let (p, g, c) = mouse_geom(pos, cw, lh, 200, 40, false);
+            let bytes = input
+                .encode_mouse_button(ffi::GHOSTTY_MOUSE_BUTTON_LEFT, true, p, &gpui::Modifiers::default(), term.raw_handle(), g, c)
+                .ok_or("no mouse report")?;
+            let want = format!("\x1b[<0;{};{}M", col + 1, row + 1);
+            if bytes != want.as_bytes() {
+                return Err(format!("col {col} row {row} frac {frac}: got {:?}, want {:?}", String::from_utf8_lossy(&bytes), want));
+            }
+            // release, so the next press is a fresh press
+            let _ = input.encode_mouse_button(ffi::GHOSTTY_MOUSE_BUTTON_LEFT, false, p, &gpui::Modifiers::default(), term.raw_handle(), g, c);
+        }
+    }
+    Ok(())
 }
 
 /// Make control characters visible in the confirm preview.
@@ -1174,6 +1387,10 @@ impl Render for TerminalView {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up(MouseButton::Right, cx.listener(Self::on_mouse_up))
             .on_mouse_up(MouseButton::Middle, cx.listener(Self::on_mouse_up))
+            // Released outside the pane (the pointer is captured while a button is held).
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .on_mouse_up_out(MouseButton::Right, cx.listener(Self::on_mouse_up))
+            .on_mouse_up_out(MouseButton::Middle, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_scroll_wheel(cx.listener(Self::on_scroll))
             .child(
@@ -1184,5 +1401,6 @@ impl Render for TerminalView {
                     .child(TerminalElement::new(cx.entity())),
             )
             .children(self.paste_overlay())
+            .children(self.drop_overlay())
     }
 }

@@ -302,7 +302,7 @@ impl AppShell {
                     .hover(move |s| s.bg(hover))
                     .on_mouse_down(MouseButton::Left, cx.listener(move |s, _e, _w, cx| s.switch_machine(id, cx)))
                     .child(div().w(px(7.0)).h(px(7.0)).flex_none().rounded_full().bg(hsla(dot)))
-                    .child(div().flex_1().truncate().child(SharedString::from(e.name.clone())))
+                    .child(div().flex_1().truncate().child(SharedString::from(forgetty_shell_core::notify::sanitize(&e.name, 48))))
                     .child(div().flex_none().text_size(px(10.5)).text_color(hsla(th.dim)).child(label)),
             );
         }
@@ -364,7 +364,7 @@ impl AppShell {
                                 .child(div().w(px(1.0)).h(px(14.0)).bg(hsla(th.accent)))
                                 .child(SharedString::from(t[split..].to_string()))
                         }
-                        None => div().flex_1().truncate().child(SharedString::from(ws.name.clone())),
+                        None => div().flex_1().truncate().child(SharedString::from(forgetty_shell_core::notify::sanitize(&ws.name, 80))),
                     })
                     .child(div().text_size(px(10.5)).text_color(hsla(th.dim)).child(SharedString::from(ws.tabs.len().to_string()))),
             );

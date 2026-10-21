@@ -13,7 +13,8 @@
 //! Commands on stdin, one per line:
 //! `status <waiting|done|failed> [message]` sends `StatusChanged` for the
 //! first pane, `quit` stops the server. `snapshot <text>` queues a VT snapshot
-//! (AD-023) for the first pane and `drop` closes every connection, so the
+//! (AD-023) for the first pane, `size <rows> <cols>` makes another client own the
+//! PTY size of the first pane (AD-020) and `drop` closes every connection, so the
 //! client reconnects and gets the snapshot.
 
 use std::path::PathBuf;
@@ -93,6 +94,12 @@ async fn main() {
                 bytes.extend_from_slice(line.trim().strip_prefix("snapshot").unwrap_or("").trim().as_bytes());
                 server.queue_snapshot(pane_id(1), &bytes);
                 println!("OK snapshot");
+            }
+            Some("size") => {
+                let rows: u16 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(24);
+                let cols: u16 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(80);
+                server.force_size(pane_id(1), rows, cols);
+                println!("OK size {rows} {cols}");
             }
             Some("drop") => {
                 server.drop_connections();

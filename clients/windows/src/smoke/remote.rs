@@ -16,6 +16,7 @@ use forgetty_remote::acl;
 use forgetty_shell_core::{BackendEvent, ConnState, MachineKind, PaneStatus};
 
 use super::*;
+use gpui::AppContext as _;
 use crate::machines::PairStage;
 
 const SECRET: &str = "TESTSECRET0000000000000000";
@@ -70,6 +71,57 @@ impl ServerProc {
         let _ = self.child.wait();
     }
 }
+
+/// A `PaneSource` that records what the view writes: `(auto, bytes)`.
+struct Spy {
+    rx: async_channel::Receiver<PaneEvent>,
+    log: Arc<Mutex<Vec<(bool, Vec<u8>)>>>,
+}
+
+impl forgetty_shell_core::PaneSource for Spy {
+    fn events(&self) -> async_channel::Receiver<PaneEvent> {
+        self.rx.clone()
+    }
+    fn write_input(&self, bytes: &[u8]) {
+        self.log.lock().unwrap().push((false, bytes.to_vec()));
+    }
+    fn write_auto(&self, bytes: &[u8]) {
+        self.log.lock().unwrap().push((true, bytes.to_vec()));
+    }
+    fn resize(&self, _rows: u16, _cols: u16) {}
+    fn shutdown(&self) {}
+}
+
+#[derive(Default)]
+pub struct W5 {
+    spy: Option<gpui::Entity<TerminalView>>,
+    tx: Option<async_channel::Sender<PaneEvent>>,
+    log: Arc<Mutex<Vec<(bool, Vec<u8>)>>>,
+    win: (usize, usize),
+    case_i: usize,
+    target: Option<gpui::Entity<TerminalView>>,
+}
+
+use super::inject::{self, Step};
+
+struct KeyCase {
+    name: &'static str,
+    klid: &'static str,
+    steps: &'static [Step],
+    want: &'static str,
+}
+
+/// Dead keys compose through WM_CHAR, and AltGr gives the layout's own character. Keyboard
+/// layout ids (KLID): 0409 US, 20409 US-International, 40C French, 40A Spanish, 407 German.
+const KEY_CASES: &[KeyCase] = &[
+    KeyCase { name: "intl_acute_e", klid: "00020409", steps: &[Step::Tap(inject::VK_OEM_7), Step::Tap(inject::VK_E)], want: "\u{e9}" },
+    KeyCase { name: "intl_acute_space", klid: "00020409", steps: &[Step::Tap(inject::VK_OEM_7), Step::Tap(inject::VK_SPACE)], want: "'" },
+    KeyCase { name: "fr_circumflex_e", klid: "0000040C", steps: &[Step::Tap(inject::VK_OEM_6), Step::Tap(inject::VK_E)], want: "\u{ea}" },
+    KeyCase { name: "es_acute_a", klid: "0000040A", steps: &[Step::Tap(inject::VK_OEM_7), Step::Tap(inject::VK_A)], want: "\u{e1}" },
+    KeyCase { name: "de_acute_a", klid: "00000407", steps: &[Step::Tap(inject::VK_OEM_6), Step::Tap(inject::VK_A)], want: "\u{e1}" },
+    KeyCase { name: "de_altgr_q", klid: "00000407", steps: &[Step::AltGr(inject::VK_Q)], want: "@" },
+    KeyCase { name: "es_altgr_2", klid: "0000040A", steps: &[Step::AltGr(inject::VK_2)], want: "@" },
+];
 
 #[derive(Default)]
 pub struct W3 {
@@ -443,6 +495,7 @@ impl ShellSmoke {
             // ---- toasts -----------------------------------------------------------------------
             Phase::RToast => self.w3_toast(shell, window, cx),
             Phase::RServer => self.w3_server_ops(shell, window, cx),
+            Phase::W5View => self.w5_view(shell, window, cx),
             _ => {}
         }
     }
@@ -773,7 +826,7 @@ impl ShellSmoke {
                 }
                 record("update_check_result", json!(format!("{:?}", shell.update)));
                 check("update_check_finishes", true);
-                self.finish_w3(shell);
+                self.goto(Phase::W5View);
             }
             _ => {}
         }
@@ -782,5 +835,293 @@ impl ShellSmoke {
     fn finish_w3(&mut self, shell: &mut AppShell) -> ! {
         kill_server(&mut self.w3);
         self.finish(shell)
+    }
+}
+
+// ---- W5: letterbox, AD-025 flags, replay replies, copy with scrollback ---------------------
+
+impl ShellSmoke {
+    fn w5_view(&mut self, shell: &mut AppShell, window: &mut Window, cx: &mut Context<AppShell>) {
+        let Some(view) = self.remote_view(shell, 0) else { return };
+        if self.sub_t0.elapsed() > Duration::from_secs(20) {
+            fail(&format!("w5 view checks stuck at step {}", self.sub));
+        }
+        let spy_view = self.w5.spy.clone();
+        let send = |w5: &W5, ev: PaneEvent| {
+            if let Some(tx) = &w5.tx {
+                let _ = tx.try_send(ev);
+            }
+        };
+        match self.sub {
+            // Another client owns a smaller PTY: the VT follows it and is centered.
+            0 => {
+                self.w5.win = view.read(cx).win_grid;
+                if let Some(srv) = self.w3.server.as_mut() {
+                    srv.send("size 12 40");
+                }
+                self.sub = 1;
+                self.sub_t0 = Instant::now();
+            }
+            1 => {
+                let (rows, cols, pad, resizes_win) = {
+                    let v = view.read(cx);
+                    (v.rows, v.cols, v.letterbox_pad(), v.win_grid)
+                };
+                if (rows, cols) != (12, 40) {
+                    return;
+                }
+                record("letterbox_pad_px", json!([pad.0, pad.1]));
+                check("letterbox_vt_follows_pty", true);
+                check("letterbox_window_grid_kept", resizes_win.0 > 12 && resizes_win.1 > 40);
+                check("letterbox_centered", pad.0 > 0.0 && pad.1 > 0.0);
+                // The owner gives it back at the window size.
+                if let Some(srv) = self.w3.server.as_mut() {
+                    srv.send(&format!("size {} {}", self.w5.win.0, self.w5.win.1));
+                }
+                self.sub = 2;
+                self.sub_t0 = Instant::now();
+            }
+            2 => {
+                let (rows, cols, pad) = {
+                    let v = view.read(cx);
+                    (v.rows, v.cols, v.letterbox_pad())
+                };
+                if (rows, cols) != self.w5.win {
+                    return;
+                }
+                check("letterbox_fills_when_sizes_match", pad.0 < 8.0 && pad.1 < 20.0);
+                // A spy view: what does the view write, and as which kind?
+                let (tx, rx) = async_channel::unbounded();
+                let cfg = shell.cfg.clone();
+                let log = self.w5.log.clone();
+                let spy = cx.new(|cx| TerminalView::new(cfg, PaneId::new(), Box::new(Spy { rx, log }), 10, 40, true, cx));
+                self.w5.spy = Some(spy);
+                self.w5.tx = Some(tx);
+                send(&self.w5, PaneEvent::Output(b"\x1b[c".to_vec()));
+                self.sub = 3;
+                self.sub_t0 = Instant::now();
+            }
+            // AD-025: a terminal reply is `auto`, never typing.
+            3 => {
+                let log = self.w5.log.lock().unwrap().clone();
+                if log.is_empty() {
+                    return;
+                }
+                record("vt_reply_bytes", json!(String::from_utf8_lossy(&log[0].1).to_string()));
+                check("vt_reply_is_auto", log.len() == 1 && log[0].0);
+                // A reset starts a replay: the reply to a query inside it is dropped.
+                send(&self.w5, PaneEvent::Reset { rows: 10, cols: 40 });
+                send(&self.w5, PaneEvent::Output(b"\x1b[c".to_vec()));
+                self.sub = 4;
+                self.sub_t0 = Instant::now();
+            }
+            4 => {
+                if self.sub_t0.elapsed() < Duration::from_millis(400) {
+                    return;
+                }
+                let n = self.w5.log.lock().unwrap().len();
+                check("replay_reply_suppressed", n == 1);
+                // After the replay, the next query is answered again.
+                send(&self.w5, PaneEvent::Output(b"\x1b[c".to_vec()));
+                self.sub = 5;
+                self.sub_t0 = Instant::now();
+            }
+            5 => {
+                let n = self.w5.log.lock().unwrap().len();
+                if n < 2 {
+                    return;
+                }
+                check("live_reply_after_replay", n == 2 && self.w5.log.lock().unwrap()[1].0);
+                // Focus reports are `auto` too.
+                send(&self.w5, PaneEvent::Output(b"\x1b[?1004h".to_vec()));
+                self.sub = 6;
+                self.sub_t0 = Instant::now();
+            }
+            6 => {
+                if self.sub_t0.elapsed() < Duration::from_millis(300) {
+                    return;
+                }
+                if let Some(v) = &spy_view {
+                    v.update(cx, |v, cx| v.set_focused(true, cx));
+                }
+                self.sub = 7;
+                self.sub_t0 = Instant::now();
+            }
+            7 => {
+                let log = self.w5.log.lock().unwrap().clone();
+                if log.len() < 3 {
+                    return;
+                }
+                check("focus_report_is_auto", log[2].0 && log[2].1 == b"\x1b[I");
+                check("no_reply_counted_as_typing", log.iter().all(|(auto, _)| *auto));
+                // 40 numbered lines through a 10 row VT, then copy rows that are in scrollback.
+                let mut text = Vec::new();
+                for i in 1..=40 {
+                    text.extend_from_slice(format!("L{i:02}\r\n").as_bytes());
+                }
+                send(&self.w5, PaneEvent::Output(text));
+                self.sub = 8;
+                self.sub_t0 = Instant::now();
+            }
+            8 => {
+                let Some(v) = &spy_view else { return };
+                let ready = v.read(cx).fed_bytes > 160;
+                if !ready || self.sub_t0.elapsed() < Duration::from_millis(300) {
+                    return;
+                }
+                let (text, before, after) = v.update(cx, |v, _| {
+                    use crate::view::{Sel, SelMode};
+                    let before = v.term.scrollbar_state().1;
+                    // Absolute rows 2..=20: row 0 is the first line.
+                    v.sel = Some(Sel { mode: SelMode::Normal, a0: (2, 0), a1: (20, 3), h0: (2, 0), h1: (20, 3) });
+                    let t = v.selection_text().unwrap_or_default();
+                    let after = v.term.scrollbar_state().1;
+                    v.sel = None;
+                    (t, before, after)
+                });
+                record("copy_scrollback_text", json!(text));
+                let lines: Vec<&str> = text.lines().collect();
+                check("copy_includes_scrollback", lines.len() == 19 && lines[0] == "L03" && lines[18] == "L21");
+                check("copy_restores_viewport", before == after);
+                check("no_input_dropped", view.read(cx).dropped_input() == 0);
+                self.w5.spy = None;
+                self.w5.tx = None;
+                self.sub = 9;
+                self.sub_t0 = Instant::now();
+            }
+            // Real keys through SendInput: does the injection reach the pane at all?
+            9 => {
+                let Some(pane) = shell.active_pane() else { return };
+                let Some(target) = shell.views.get(&pane).cloned() else { return };
+                if !window.is_window_active() && self.sub_t0.elapsed() < Duration::from_secs(5) {
+                    return;
+                }
+                target.update(cx, |v, _| v.capture_input = Some(Vec::new()));
+                self.w5.target = Some(target);
+                let ok = inject::activate_layout("00000409").map(|hkl| inject::send_keys(hkl, &[Step::Tap(inject::VK_A)])).unwrap_or(false);
+                record("sendinput_sent", json!(ok));
+                self.sub = 10;
+                self.sub_t0 = Instant::now();
+            }
+            10 => {
+                let Some(t) = self.w5.target.clone() else { return };
+                let got = t.read(cx).capture_input.clone().unwrap_or_default();
+                if got == b"a" {
+                    record("sendinput_works", json!(true));
+                    self.w5.case_i = 0;
+                    self.sub = 11;
+                    self.sub_t0 = Instant::now();
+                } else if self.sub_t0.elapsed() > Duration::from_secs(3) {
+                    // The runner's desktop does not deliver injected keys: say so, skip the rest.
+                    record("sendinput_works", json!(false));
+                    record("sendinput_probe_bytes", json!(String::from_utf8_lossy(&got).to_string()));
+                    t.update(cx, |v, _| v.capture_input = None);
+                    self.sub = 20;
+                    self.sub_t0 = Instant::now();
+                }
+            }
+            11 => {
+                let Some(t) = self.w5.target.clone() else { return };
+                let Some(case) = KEY_CASES.get(self.w5.case_i) else {
+                    t.update(cx, |v, _| v.capture_input = None);
+                    inject::activate_layout("00000409");
+                    self.sub = 20;
+                    self.sub_t0 = Instant::now();
+                    return;
+                };
+                t.update(cx, |v, _| v.capture_input = Some(Vec::new()));
+                match inject::activate_layout(case.klid) {
+                    Some(hkl) => {
+                        inject::send_keys(hkl, case.steps);
+                        self.sub = 12;
+                    }
+                    None => {
+                        record(&format!("dead_key_{}_skipped", case.name), json!("layout not installed"));
+                        self.w5.case_i += 1;
+                    }
+                }
+                self.sub_t0 = Instant::now();
+            }
+            12 => {
+                if self.sub_t0.elapsed() < Duration::from_millis(500) {
+                    return;
+                }
+                let Some(t) = self.w5.target.clone() else { return };
+                let case = &KEY_CASES[self.w5.case_i];
+                let got = t.read(cx).capture_input.clone().unwrap_or_default();
+                let ok = got == case.want.as_bytes();
+                record(&format!("key_case_{}_bytes", case.name), json!(String::from_utf8_lossy(&got).to_string()));
+                check(&format!("layout_{}", case.name), ok);
+                if !ok {
+                    // Flush a dead key that is still waiting for its letter.
+                    if let Some(hkl) = inject::activate_layout(case.klid) {
+                        inject::send_keys(hkl, &[Step::Tap(inject::VK_SPACE)]);
+                    }
+                }
+                self.w5.case_i += 1;
+                self.sub = 11;
+                self.sub_t0 = Instant::now();
+            }
+            // A button released outside the pane still ends the selection.
+            20 => {
+                shell.sidebar_open = true;
+                if self.sub_t0.elapsed() < Duration::from_millis(400) {
+                    return;
+                }
+                let Some(t) = self.w5.target.clone() else { self.finish_w3(shell) };
+                let origin = inject::hwnd(window).and_then(inject::client_origin);
+                let scale = window.scale_factor();
+                let b = t.read(cx).bounds;
+                let ok = origin.is_some_and(|(ox, oy)| {
+                    let x = ox as f32 + (f32::from(b.origin.x) + f32::from(b.size.width) / 2.0) * scale;
+                    let y = oy as f32 + (f32::from(b.origin.y) + f32::from(b.size.height) / 2.0) * scale;
+                    inject::move_cursor(x as i32, y as i32) && inject::left_down()
+                });
+                record("mouse_press_sent", json!(ok));
+                self.sub = 21;
+                self.sub_t0 = Instant::now();
+            }
+            21 => {
+                if self.sub_t0.elapsed() < Duration::from_millis(300) {
+                    return;
+                }
+                let Some(t) = self.w5.target.clone() else { self.finish_w3(shell) };
+                if !t.read(cx).selecting {
+                    // The press did not land in the pane: no verdict.
+                    record("mouse_injection_works", json!(false));
+                    inject::left_up();
+                    self.finish_w3(shell);
+                }
+                record("mouse_injection_works", json!(true));
+                // Release over the sidebar, outside the pane.
+                if let Some((ox, oy)) = inject::hwnd(window).and_then(inject::client_origin) {
+                    let scale = window.scale_factor();
+                    let b = t.read(cx).bounds;
+                    let x = ox as f32 + (crate::shell::SIDEBAR_W / 2.0) * scale;
+                    let y = oy as f32 + (f32::from(b.origin.y) + f32::from(b.size.height) / 2.0) * scale;
+                    inject::move_cursor(x as i32, y as i32);
+                }
+                self.sub = 22;
+                self.sub_t0 = Instant::now();
+            }
+            22 => {
+                if self.sub_t0.elapsed() < Duration::from_millis(200) {
+                    return;
+                }
+                inject::left_up();
+                self.sub = 23;
+                self.sub_t0 = Instant::now();
+            }
+            23 => {
+                if self.sub_t0.elapsed() < Duration::from_millis(400) {
+                    return;
+                }
+                if let Some(t) = self.w5.target.clone() {
+                    check("mouse_up_outside_pane_ends_selection", !t.read(cx).selecting);
+                }
+                self.finish_w3(shell);
+            }
+            _ => {}
+        }
     }
 }

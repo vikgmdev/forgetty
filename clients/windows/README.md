@@ -107,7 +107,7 @@ Notes and decisions:
 Default keys (all in `[keybindings]` of `config.toml`, action name = value; `"none"` unbinds):
 Ctrl+Shift+T new tab, Ctrl+Shift+Q close tab, Ctrl+Tab / Ctrl+Shift+Tab cycle, Ctrl+1..9 go to tab,
 Ctrl+Shift+PageUp/Down move tab, Ctrl+Shift+R rename tab (also double-click), Alt+Shift+Plus / Minus split,
-Ctrl+Shift+W close pane, Alt+Arrows focus, Ctrl+Shift+Z zoom, Ctrl+B sidebar, Ctrl+Shift+P palette,
+Ctrl+Shift+W close pane, Ctrl+Alt+Arrows focus, Ctrl+Shift+Z zoom, Ctrl+Shift+B sidebar, Ctrl+Shift+P palette,
 Ctrl+Shift+N new workspace. Middle-click closes a tab; tabs and dividers drag.
 
 W2 smoke checks (on top of the W1 list): `tabs_4`, `tab_nav`, `split_4_panes`, `zoom_toggle`,

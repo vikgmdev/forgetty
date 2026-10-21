@@ -5,18 +5,23 @@
 //! wins). Dropping or shutting down the source aborts them, which drops the
 //! `PaneStream` and detaches the pane.
 
-use std::sync::Mutex;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use forgetty_client::{ClientHandle, PaneItem, PaneStream};
 use forgetty_shell_core::{PaneEvent, PaneSource};
 use tokio::runtime::Handle;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{watch, Notify};
 use tokio::task::AbortHandle;
 use uuid::Uuid;
 
 /// Output events buffered between the reader and the view. A full channel
 /// back-pressures the QUIC stream (the client buffers `pane_buffer` items).
 const EVENT_BUFFER: usize = 256;
+/// Input waiting for the writer task. A full queue (the server or the link is stuck) refuses
+/// whole buffers: user input is counted as dropped, `auto` replies just go.
+const INPUT_QUEUE_CAP: usize = 256 * 1024;
 /// Input bytes joined into one `send_input` call.
 const INPUT_COALESCE: usize = 16 * 1024;
 
@@ -31,9 +36,57 @@ pub fn snapshot_marker(rows: u16) -> Vec<u8> {
     format!("\x1b[0m\x1b[1;1H\x1b[2;3m{SNAPSHOT_MARKER}\x1b[0m\x1b[{rows};1H\n\x1b[H").into_bytes()
 }
 
+/// Bounded input queue between the UI thread (never blocks) and the writer task.
+#[derive(Default)]
+struct InputQueue {
+    state: Mutex<QueueState>,
+    ready: Notify,
+    /// Bytes refused or dropped for good. Only grows.
+    dropped: AtomicU64,
+}
+
+#[derive(Default)]
+struct QueueState {
+    /// `(auto, bytes)` in arrival order.
+    items: VecDeque<(bool, Vec<u8>)>,
+    bytes: usize,
+}
+
+impl InputQueue {
+    /// Queue `bytes` whole, or refuse them whole when the queue is full.
+    fn push(&self, auto: bool, bytes: &[u8]) -> bool {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.bytes + bytes.len() > INPUT_QUEUE_CAP {
+            drop(st);
+            self.dropped.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            return false;
+        }
+        st.bytes += bytes.len();
+        match st.items.back_mut() {
+            Some((a, b)) if *a == auto && b.len() < INPUT_COALESCE => b.extend_from_slice(bytes),
+            _ => st.items.push_back((auto, bytes.to_vec())),
+        }
+        drop(st);
+        self.ready.notify_one();
+        true
+    }
+
+    /// The oldest item, joined with the items after it that have the same kind.
+    fn pop(&self) -> Option<(bool, Vec<u8>)> {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let (auto, mut buf) = st.items.pop_front()?;
+        while buf.len() < INPUT_COALESCE && st.items.front().is_some_and(|(a, _)| *a == auto) {
+            let (_, more) = st.items.pop_front().expect("front checked");
+            buf.extend_from_slice(&more);
+        }
+        st.bytes -= buf.len();
+        Some((auto, buf))
+    }
+}
+
 pub struct RemotePaneSource {
     events: async_channel::Receiver<PaneEvent>,
-    input: mpsc::UnboundedSender<Vec<u8>>,
+    input: Arc<InputQueue>,
     size: watch::Sender<(u64, u16, u16)>,
     last_size: Mutex<Option<(u16, u16)>>,
     tasks: Vec<AbortHandle>,
@@ -76,19 +129,19 @@ impl RemotePaneSource {
             }
         });
 
-        let (in_tx, mut in_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let queue = Arc::new(InputQueue::default());
+        let q = queue.clone();
         let c = client.clone();
         let writer = rt.spawn(async move {
-            while let Some(mut buf) = in_rx.recv().await {
-                while buf.len() < INPUT_COALESCE {
-                    match in_rx.try_recv() {
-                        Ok(more) => buf.extend_from_slice(&more),
-                        Err(_) => break,
-                    }
-                }
-                // While disconnected the client buffers up to 64 KiB and sends
-                // the bytes in order after the connection resumes.
-                if let Err(e) = c.send_input(pane, &buf).await {
+            loop {
+                let Some((auto, buf)) = q.pop() else {
+                    q.ready.notified().await;
+                    continue;
+                };
+                // While disconnected the client buffers up to 64 KiB and sends the bytes in
+                // order after the connection resumes. It takes a buffer whole or refuses it.
+                if let Err(e) = c.send_input_flagged(pane, &buf, auto).await {
+                    q.dropped.fetch_add(buf.len() as u64, Ordering::Relaxed);
                     eprintln!("forgetty-win: remote input dropped ({} bytes): {e}", buf.len());
                 }
             }
@@ -106,7 +159,7 @@ impl RemotePaneSource {
 
         RemotePaneSource {
             events: ev_rx,
-            input: in_tx,
+            input: queue,
             size: size_tx,
             last_size: Mutex::new(None),
             tasks: vec![reader.abort_handle(), writer.abort_handle(), sizer.abort_handle()],
@@ -125,8 +178,22 @@ impl PaneSource for RemotePaneSource {
 
     fn write_input(&self, bytes: &[u8]) {
         if !bytes.is_empty() {
-            let _ = self.input.send(bytes.to_vec());
+            self.input.push(false, bytes);
         }
+    }
+
+    fn write_auto(&self, bytes: &[u8]) {
+        if !bytes.is_empty() {
+            self.input.push(true, bytes);
+        }
+    }
+
+    fn letterbox(&self) -> bool {
+        true
+    }
+
+    fn dropped_input_bytes(&self) -> u64 {
+        self.input.dropped.load(Ordering::Relaxed)
     }
 
     fn resize(&self, rows: u16, cols: u16) {
@@ -154,5 +221,39 @@ impl PaneSource for RemotePaneSource {
 impl Drop for RemotePaneSource {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_input_queue_is_bounded_and_counts_what_it_refuses() {
+        let q = InputQueue::default();
+        let chunk = vec![b'x'; 64 * 1024];
+        for _ in 0..4 {
+            assert!(q.push(false, &chunk));
+        }
+        // Full: the next buffer is refused whole, user or auto.
+        assert!(!q.push(false, b"typed"));
+        assert!(!q.push(true, b"\x1b[?6c"));
+        assert_eq!(q.dropped.load(Ordering::Relaxed), (b"typed".len() + b"\x1b[?6c".len()) as u64);
+        // Draining makes room again.
+        while q.pop().is_some() {}
+        assert!(q.push(false, b"typed"));
+    }
+
+    #[test]
+    fn user_and_auto_bytes_are_not_mixed_in_one_frame() {
+        let q = InputQueue::default();
+        q.push(false, b"ab");
+        q.push(false, b"cd");
+        q.push(true, b"\x1b[I");
+        q.push(false, b"ef");
+        assert_eq!(q.pop(), Some((false, b"abcd".to_vec())));
+        assert_eq!(q.pop(), Some((true, b"\x1b[I".to_vec())));
+        assert_eq!(q.pop(), Some((false, b"ef".to_vec())));
+        assert_eq!(q.pop(), None);
     }
 }

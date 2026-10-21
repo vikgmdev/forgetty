@@ -361,6 +361,10 @@ impl AppShell {
                 }
                 BackendEvent::PaneResized { pane_id, rows, cols } => {
                     self.meta.entry(pane_id).or_default().size = Some((rows, cols));
+                    // A remote pane follows the PTY size, whoever set it (AD-020).
+                    if let Some(v) = self.views.get(&pane_id) {
+                        v.update(cx, |v, cx| v.set_pty_size(rows, cols, cx));
+                    }
                 }
                 BackendEvent::StatusChanged { pane_id, status, message } => {
                     let m = self.meta.entry(pane_id).or_default();
@@ -539,7 +543,13 @@ impl AppShell {
         (rows, cols)
     }
 
+    /// The tab's title for display. Titles come from programs and from other clients, so
+    /// control and bidi characters go and the length is capped.
     pub fn tab_title(&self, tab: &Tab) -> String {
+        forgetty_shell_core::notify::sanitize(&self.tab_title_raw(tab), 80)
+    }
+
+    fn tab_title_raw(&self, tab: &Tab) -> String {
         // A label the user set wins: the tab's, then the active pane's.
         if !tab.label.is_empty() {
             return tab.label.clone();

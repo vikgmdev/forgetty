@@ -27,8 +27,23 @@ pub trait PaneSource: Send {
     fn events(&self) -> async_channel::Receiver<PaneEvent>;
     /// Bytes typed or pasted by the user, already encoded for the PTY.
     fn write_input(&self, bytes: &[u8]);
+    /// A terminal reply (DA, CPR, kitty answers) or a focus report: bytes the program did
+    /// not get from the user (AD-025). Never counts as typing. Defaults to plain input.
+    fn write_auto(&self, bytes: &[u8]) {
+        self.write_input(bytes);
+    }
     /// New grid size in cells.
     fn resize(&self, rows: u16, cols: u16);
+    /// True when the PTY size belongs to whichever client typed last (AD-020): the view
+    /// renders at the size the server reports and centers it, and only tells the server
+    /// what fits its window. False for a local PTY the window owns.
+    fn letterbox(&self) -> bool {
+        false
+    }
+    /// Input bytes this source had to drop (full buffer, no connection). Only grows.
+    fn dropped_input_bytes(&self) -> u64 {
+        0
+    }
     /// Send the size again even if it did not change. A window that becomes
     /// the active client again uses this to win the size policy back (AD-020).
     fn reassert_size(&self, rows: u16, cols: u16) {

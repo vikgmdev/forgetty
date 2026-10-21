@@ -26,6 +26,20 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
+/// Create `path` new (it must not exist: `AlreadyExists` otherwise) with `bytes`, readable by
+/// the current user only from the first moment: the security descriptor is part of the create
+/// call. Two processes racing to create the same file cannot both win.
+#[cfg(unix)]
+pub fn create_private_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?;
+    f.write_all(bytes)
+}
+
 #[cfg(unix)]
 pub fn restrict_to_user(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -46,7 +60,7 @@ pub fn is_user_only(path: &Path) -> io::Result<bool> {
 }
 
 #[cfg(windows)]
-pub use win::{current_user_sid, describe, is_user_only, restrict_to_user};
+pub use win::{create_private_new, current_user_sid, describe, is_user_only, restrict_to_user};
 
 #[cfg(windows)]
 mod win {
@@ -58,6 +72,10 @@ mod win {
     use windows::core::{PCWSTR, PWSTR};
     use windows::core::BOOL;
     use windows::Win32::Foundation::{CloseHandle, LocalFree, ERROR_SUCCESS, HANDLE, HLOCAL};
+    use windows::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, WriteFile, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_WRITE, FILE_SHARE_READ,
+    };
     use windows::Win32::Security::Authorization::{
         ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
         ConvertStringSecurityDescriptorToSecurityDescriptorW, ConvertStringSidToSidW, GetNamedSecurityInfoW, SetNamedSecurityInfoW,
@@ -100,6 +118,55 @@ mod win {
                 out
             })();
             let _ = CloseHandle(token);
+            result
+        }
+    }
+
+    /// Create `path` new with `bytes`, readable by the current user only from the first moment
+    /// (`CreateFileW` with `CREATE_NEW` and a security descriptor). `AlreadyExists` when the
+    /// file is there, so two first runs cannot overwrite each other's key.
+    pub fn create_private_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let sid = current_user_sid()?;
+        let sddl: Vec<u16> = format!("D:P(A;;FA;;;{sid})").encode_utf16().chain(std::iter::once(0)).collect();
+        let name = wide(path.as_os_str());
+        unsafe {
+            let mut sd = PSECURITY_DESCRIPTOR::default();
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(PCWSTR(sddl.as_ptr()), SDDL_REVISION_1, &mut sd, None)
+                .map_err(err)?;
+            let sa = SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: sd.0,
+                bInheritHandle: BOOL(0),
+            };
+            let h = CreateFileW(
+                PCWSTR(name.as_ptr()),
+                FILE_GENERIC_WRITE.0,
+                FILE_SHARE_READ,
+                Some(&sa),
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL,
+                None,
+            );
+            let result = match h {
+                Err(_) => Err(io::Error::last_os_error()),
+                Ok(h) => {
+                    let mut written = 0u32;
+                    let w = WriteFile(h, Some(bytes), Some(&mut written), None);
+                    let _ = CloseHandle(h);
+                    match w {
+                        Ok(()) if written as usize == bytes.len() => Ok(()),
+                        Ok(()) => Err(io::Error::other("short write")),
+                        Err(e) => Err(err(e)),
+                    }
+                }
+            };
+            let _ = LocalFree(Some(HLOCAL(sd.0)));
+            if result.is_err() {
+                let _ = std::fs::remove_file(path);
+            }
             result
         }
     }

@@ -324,7 +324,7 @@ impl ShellSmoke {
                 let Some(view) = shell.views.get(&p0).cloned() else { return };
                 let (grid, visible) = {
                     let v = view.read(cx);
-                    ((v.rows as u16, v.cols as u16), v.visible)
+                    ((v.win_grid.0 as u16, v.win_grid.1 as u16), v.visible)
                 };
                 match self.sub {
                     0 => {
@@ -544,7 +544,7 @@ impl ShellSmoke {
                     return;
                 }
                 // After a restart and a resume the server pane must have the client's grid again.
-                let grid = shell.views.get(&p0).map(|v| (v.read(cx).rows as u16, v.read(cx).cols as u16)).unwrap_or((0, 0));
+                let grid = shell.views.get(&p0).map(|v| (v.read(cx).win_grid.0 as u16, v.read(cx).win_grid.1 as u16)).unwrap_or((0, 0));
                 let got = *self.real.size_probe.lock().unwrap();
                 match got {
                     Some(sz) if sz == grid => {}
@@ -560,13 +560,29 @@ impl ShellSmoke {
                 }
                 record("real_size_after_restart", json!({"server": got.map(|g| [g.0, g.1]), "client": [grid.0, grid.1]}));
                 check("real_server_size_equals_client_grid_after_restart", got == Some(grid));
+                // The client renders at the PTY size the server reports (letterbox), so both agree.
+                let vt = shell.views.get(&p0).map(|v| (v.read(cx).rows as u16, v.read(cx).cols as u16));
+                check("real_client_vt_is_pty_size", vt == got);
                 let Some(s) = snap(shell, cx, p0) else { fail("real pane view vanished") };
                 let mut mine: Vec<String> = s.rows.iter().map(|r| r.trim_end().to_string()).collect();
                 while mine.last().is_some_and(|r| r.is_empty()) {
                     mine.pop();
                 }
                 let id = p0.0.to_string();
-                let out = wsl(&self.real.distro, &[BIN, "capture", "-p", &id, "--trim"]).stdin(Stdio::null()).output();
+                // The capture CLI can lose its socket right after the burst on WSL1, so retry a few times and
+                // keep every attempt's error for the report.
+                let mut errs: Vec<String> = Vec::new();
+                let mut out = wsl(&self.real.distro, &[BIN, "capture", "-p", &id, "--trim"]).stdin(Stdio::null()).output();
+                for _ in 0..3 {
+                    match &out {
+                        Ok(o) if o.status.success() => break,
+                        Ok(o) => errs.push(String::from_utf8_lossy(&o.stderr).trim().to_string()),
+                        Err(e) => errs.push(e.to_string()),
+                    }
+                    std::thread::sleep(Duration::from_secs(2));
+                    out = wsl(&self.real.distro, &[BIN, "capture", "-p", &id, "--trim"]).stdin(Stdio::null()).output();
+                }
+                record("real_capture_attempt_errors", json!(errs));
                 match out {
                     Ok(o) if o.status.success() => {
                         let text = String::from_utf8_lossy(&o.stdout).to_string();
@@ -593,6 +609,22 @@ impl ShellSmoke {
                     }
                 }
                 record("real_server_log_tail", json!(self.real.server_log.lock().unwrap().iter().rev().take(15).collect::<Vec<_>>()));
+                // Panics and errors, without the iroh relay probe noise that fills the tail.
+                let key: Vec<String> = self
+                    .real
+                    .server_log
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|l| {
+                        let l = l.to_ascii_lowercase();
+                        (l.contains("panic") || l.contains(" error") || l.contains("capture") || l.contains("rpc") || l.contains("socket")) && !l.contains("reportgen")
+                    })
+                    .rev()
+                    .take(30)
+                    .cloned()
+                    .collect();
+                record("real_server_log_key_lines", json!(key));
                 kill_children(&mut self.real);
                 self.finish(shell)
             }

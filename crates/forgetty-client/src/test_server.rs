@@ -408,6 +408,15 @@ impl TestServer {
         });
     }
 
+    /// Another client took the PTY size (AD-020): set the pane size and send `PaneResized`.
+    pub fn force_size(&self, pane: Uuid, rows: u16, cols: u16) {
+        if let Some(p) = lock(&self.state.panes).get_mut(&pane) {
+            p.rows = rows;
+            p.cols = cols;
+        }
+        self.push_event(ServerEvent::PaneResized { pane_id: pane, rows, cols });
+    }
+
     /// Forget log bytes before `offset` (the log now starts there).
     pub fn truncate_log_before(&self, pane: Uuid, offset: u64) {
         let mut panes = lock(&self.state.panes);

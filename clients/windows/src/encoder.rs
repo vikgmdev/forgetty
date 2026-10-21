@@ -53,11 +53,14 @@ impl Input {
         terminal: ffi::GhosttyTerminal,
     ) -> Option<Vec<u8>> {
         let gkey = gpui_key_to_ghostty(&ks.key);
-        if gkey == ffi::GHOSTTY_KEY_UNIDENTIFIED {
+        // A key outside the table that makes one character (ä, ñ, é with Alt or Ctrl held):
+        // the encoder still gets the text and the unshifted codepoint.
+        let letter = single_char(&ks.key).filter(|c| !c.is_ascii());
+        if gkey == ffi::GHOSTTY_KEY_UNIDENTIFIED && letter.is_none() {
             return None;
         }
         let mods = mods_to_ghostty(&ks.modifiers);
-        let ucp = unshifted_codepoint(&ks.key);
+        let ucp = letter.map(|c| c as u32).unwrap_or_else(|| unshifted_codepoint(&ks.key));
 
         // Text the key produces (only printable, only on press/repeat).
         let text: Vec<u8> = if action != ffi::GHOSTTY_KEY_ACTION_RELEASE {
@@ -105,8 +108,14 @@ impl Input {
         if rc == ffi::GHOSTTY_SUCCESS && written > 0 {
             return Some(buf[..written].to_vec());
         }
-        // Encoder had nothing but the key makes text: send it raw.
+        // Encoder had nothing but the key makes text: send it raw. Alt puts an ESC in front
+        // (Alt+ä is ESC ä), as the legacy encoding does for ASCII.
         if action != ffi::GHOSTTY_KEY_ACTION_RELEASE && !text.is_empty() && mods & (ffi::GHOSTTY_MODS_CTRL | ffi::GHOSTTY_MODS_SUPER) == 0 {
+            if mods & ffi::GHOSTTY_MODS_ALT != 0 {
+                let mut out = vec![0x1b];
+                out.extend_from_slice(&text);
+                return Some(out);
+            }
             return Some(text);
         }
         None
@@ -299,6 +308,14 @@ pub fn mouse_button_to_ghostty(b: gpui::MouseButton) -> i32 {
         gpui::MouseButton::Right => ffi::GHOSTTY_MOUSE_BUTTON_RIGHT,
         gpui::MouseButton::Middle => ffi::GHOSTTY_MOUSE_BUTTON_MIDDLE,
         _ => ffi::GHOSTTY_MOUSE_BUTTON_UNKNOWN,
+    }
+}
+
+fn single_char(key: &str) -> Option<char> {
+    let mut it = key.chars();
+    match (it.next(), it.next()) {
+        (Some(c), None) => Some(c),
+        _ => None,
     }
 }
 

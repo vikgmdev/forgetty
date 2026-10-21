@@ -52,7 +52,15 @@ pub fn sanitize(s: &str, max: usize) -> String {
     let mut last_space = true;
     for c in s.chars() {
         let bad = c.is_control() && !c.is_whitespace()
-            || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{200e}' | '\u{200f}');
+            || matches!(
+                c,
+                '\u{202a}'..='\u{202e}'
+                    | '\u{2066}'..='\u{2069}'
+                    | '\u{200b}'..='\u{200f}'
+                    | '\u{061c}'
+                    | '\u{2060}'..='\u{2064}'
+                    | '\u{feff}'
+            );
         let c = if bad {
             continue;
         } else if c.is_whitespace() {
@@ -166,6 +174,13 @@ mod tests {
 
     const AWAY: Visibility = Visibility { window_active: false, machine_active: true, pane_focused: true };
     const LOOKING: Visibility = Visibility { window_active: true, machine_active: true, pane_focused: true };
+
+    #[test]
+    fn sanitize_drops_bidi_zero_width_and_controls() {
+        assert_eq!(sanitize("a\u{202e}b\u{200b}c\u{feff}d\u{7}e\u{2066}f", 40), "abcdef");
+        assert_eq!(sanitize("  two   words\tand\nlines ", 40), "two words and lines");
+        assert_eq!(sanitize(&"x".repeat(100), 10).chars().count(), 10);
+    }
 
     #[test]
     fn status_rules() {
