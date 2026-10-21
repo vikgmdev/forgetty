@@ -1600,3 +1600,8 @@ fn scrollback_shell_check(v: &mut TerminalView, rows: &[String]) {
     check("scrollback_shell", ok);
     v.term.scroll_viewport_bottom();
 }
+
+/// `N` of "Server restarted, N bytes of input not sent", when `notice` is that line.
+pub(crate) fn input_lost_bytes(notice: Option<&str>) -> Option<u64> {
+    notice?.strip_prefix("Server restarted, ")?.strip_suffix(" bytes of input not sent")?.parse().ok()
+}

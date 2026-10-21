@@ -482,7 +482,8 @@ impl ShellSmoke {
                         // A new server run drops what was typed while the link was down (`boot_id`): the
                         // pane shows a notice and the text never reaches the new shell.
                         let notice = view.read(cx).notice_text();
-                        if notice.as_deref() == Some("Server restarted, 10 bytes of input not sent") {
+                        if super::input_lost_bytes(notice.as_deref()).is_some_and(|n| n >= 10) {
+                            record("real_input_lost_notice", json!(notice));
                             check("real_input_lost_notice_after_restart", true);
                             let typed = snap(shell, cx, self.real.panes[0]).is_some_and(|s| s.rows.iter().any(|r| r.contains("OFFLINE-OK")));
                             check("real_typing_during_restart_not_replayed", !typed);
@@ -493,7 +494,7 @@ impl ShellSmoke {
                             self.real.fed_t = None;
                             self.goto(Phase::RealBurst);
                         } else if self.sub_t0.elapsed() > Duration::from_secs(30) {
-                            fail("real: no input-lost notice after the restart");
+                            fail(&format!("real: no input-lost notice after the restart (notice: {notice:?})"));
                         }
                     }
                 }

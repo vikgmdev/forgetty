@@ -478,7 +478,11 @@ impl ShellSmoke {
                         // A new server run (`boot_id`) drops what was typed while the link was down: the
                         // programs it was for are gone. The pane says so, without a modal.
                         let notice = view.read(cx).notice_text();
-                        if notice.as_deref() == Some("Server restarted, 10 bytes of input not sent") {
+                        if let Some(n) = &notice {
+                            record("restart_notice_seen", json!(n));
+                        }
+                        // N counts every unacked byte (the 10 typed offline, and any key not acked yet).
+                        if super::input_lost_bytes(notice.as_deref()).is_some_and(|n| n >= 10) {
                             record("input_lost_notice_restart", json!(notice));
                             check("input_lost_notice_after_restart", true);
                             let typed_again = snap(shell, cx, self.w3.panes[0]).is_some_and(|s| s.rows.iter().any(|r| r.contains("OFFLINE-OK")));
