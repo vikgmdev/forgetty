@@ -9,7 +9,7 @@
 //! - `Option::None` is MessagePack `nil`.
 //! - Base64 fields of the JSON socket API are raw `bin` inside [`Value`].
 
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
 
 use crate::consts::{PROTO_MAJOR, PROTO_MINOR};
@@ -71,6 +71,11 @@ pub enum ClientKind {
     /// A local socket client of the server itself (GTK, tools), listed by
     /// `list_clients` and named as a size owner. Never sent in `Hello`.
     Local,
+    /// A kind this version does not know (a newer peer). Decoding never
+    /// fails on a new kind: it becomes `Unknown`, so one new kind cannot make
+    /// a whole `list_clients` or event unreadable.
+    #[serde(other)]
+    Unknown,
 }
 
 impl ClientKind {
@@ -82,6 +87,7 @@ impl ClientKind {
             ClientKind::Cli => "cli",
             ClientKind::Gtk => "gtk",
             ClientKind::Local => "local",
+            ClientKind::Unknown => "unknown",
         }
     }
 }
@@ -178,6 +184,42 @@ pub enum HandshakeReply {
     Error(ErrorMsg),
 }
 
+/// Decode an event, turning a variant this version does not know into
+/// [`ServerEvent::Unknown`]. A known variant that does not decode stays an
+/// error, so a corrupt frame is not hidden.
+fn tolerant_event<'de, D: Deserializer<'de>>(d: D) -> Result<ServerEvent, D::Error> {
+    let v = Value::deserialize(d)?;
+    match from_value::<ServerEvent>(v.clone()) {
+        Ok(e) => Ok(e),
+        // An externally tagged variant is a map with one entry, the tag.
+        Err(_) if matches!(&v, Value::Map(m) if m.len() == 1 && m[0].0.is_str()) => {
+            let tag = v.as_map().and_then(|m| m[0].0.as_str()).unwrap_or_default();
+            if KNOWN_EVENTS.contains(&tag) {
+                Err(serde::de::Error::custom(format!("malformed {tag} event")))
+            } else {
+                Ok(ServerEvent::Unknown)
+            }
+        }
+        Err(e) => Err(serde::de::Error::custom(e.to_string())),
+    }
+}
+
+/// Tags of the events this version knows.
+const KNOWN_EVENTS: &[&str] = &[
+    "LayoutChanged",
+    "PaneClosed",
+    "TitleChanged",
+    "CwdChanged",
+    "PaneResized",
+    "SizeOwnerChanged",
+    "StatusChanged",
+    "Notification",
+    "PaneExited",
+    "ClientConnected",
+    "ClientDisconnected",
+    "InputDropped",
+];
+
 /// Control stream message (section 4).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ControlMsg {
@@ -210,7 +252,8 @@ pub enum ControlMsg {
     Event {
         /// Event sequence number.
         seq: u64,
-        /// The event.
+        /// The event. An unknown event becomes [`ServerEvent::Unknown`].
+        #[serde(deserialize_with = "tolerant_event")]
         event: ServerEvent,
     },
     /// Client to server liveness probe, every 1 s while connected.
@@ -352,6 +395,11 @@ pub enum ServerEvent {
         #[serde(with = "uuid_str")]
         client_id: Uuid,
     },
+    /// An event this version does not know (a newer server). Only decoding
+    /// makes it: inside `ControlMsg::Event` an unknown variant becomes
+    /// `Unknown`, so the frame and its `seq` still count. Never sent.
+    #[serde(skip_deserializing)]
+    Unknown,
 }
 
 /// First frame of a Pane output stream (section 8).

@@ -506,3 +506,79 @@ fn an_old_decoder_ignores_size_owner_on_pane_resized() {
         }
     );
 }
+
+/// What an old client decodes. `ClientKind` and the events are strict in a
+/// decoder that has no `Unknown` (the shape of the pre-`local` Android code).
+mod old_shape {
+    use serde::Deserialize;
+
+    #[derive(Debug, PartialEq, Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    pub enum OldKind {
+        Windows,
+        Android,
+        Cli,
+        Gtk,
+        #[serde(other)]
+        Unknown,
+    }
+
+    #[derive(Debug, Deserialize)]
+    pub struct OldEntry {
+        pub client_name: String,
+        pub client_kind: OldKind,
+    }
+}
+
+/// `list_clients` from a newer server has a kind this version does not know.
+/// The other entries still decode, and the unknown one becomes `Unknown`.
+#[test]
+fn a_list_clients_with_an_unknown_kind_still_decodes() {
+    #[derive(serde::Serialize)]
+    struct Raw {
+        client_id: String,
+        client_kind: &'static str,
+        client_name: &'static str,
+        connected_at: &'static str,
+    }
+    let raw = |kind, name| Raw {
+        client_id: id(5).to_string(),
+        client_kind: kind,
+        client_name: name,
+        connected_at: "2026-10-21T00:00:00Z",
+    };
+    let list = vec![raw("android", "phone"), raw("hologram", "future"), raw("local", "gtk")];
+    let bytes = encode_msg(&list).unwrap();
+    let back: Vec<ClientEntry> = decode_msg(&bytes).unwrap();
+    let kinds: Vec<ClientKind> = back.iter().map(|c| c.client_kind).collect();
+    assert_eq!(kinds, [ClientKind::Android, ClientKind::Unknown, ClientKind::Local]);
+    assert_eq!(back[1].client_name, "future");
+    // The same holds for a decoder that predates `local`.
+    let old: Vec<old_shape::OldEntry> = decode_msg(&bytes).unwrap();
+    assert_eq!(old[0].client_kind, old_shape::OldKind::Android);
+    assert_eq!(old[1].client_kind, old_shape::OldKind::Unknown);
+    assert_eq!(old[2].client_kind, old_shape::OldKind::Unknown);
+    assert_eq!(old[2].client_name, "gtk");
+}
+
+/// An event this version does not know does not break the frame: it decodes
+/// as `Unknown` with its `seq`. A known event with a bad payload is still an
+/// error.
+#[test]
+fn an_unknown_event_decodes_as_unknown_and_keeps_its_seq() {
+    #[derive(serde::Serialize)]
+    enum Future {
+        BrandNew { pane_id: String, x: u32 },
+        PaneResized { pane_id: String },
+    }
+    #[derive(serde::Serialize)]
+    enum FutureMsg {
+        Event { seq: u64, event: Future },
+    }
+    let msg = FutureMsg::Event { seq: 9, event: Future::BrandNew { pane_id: "p".into(), x: 1 } };
+    let got: ControlMsg = decode_msg(&encode_msg(&msg).unwrap()).unwrap();
+    assert_eq!(got, ControlMsg::Event { seq: 9, event: ServerEvent::Unknown });
+
+    let bad = FutureMsg::Event { seq: 10, event: Future::PaneResized { pane_id: "p".into() } };
+    assert!(decode_msg::<ControlMsg>(&encode_msg(&bad).unwrap()).is_err());
+}

@@ -66,7 +66,10 @@ Rules: a different `proto_major` gets `Error { code: "proto_mismatch" }`. The
 server then calls `finish()` on the stream and waits up to 2 s for the client to
 close, so the error frame is not lost. `Hello` is a plain struct, not a
 `ControlMsg`. Each side ignores capability strings it does not know. A feature is used
-only if both sides list its capability. Initial capability names:
+only if both sides list its capability. A decoder must also accept values it does not
+know: an unknown `client_kind` is `unknown` (one entry of a `list_clients` must not
+make the list unreadable), and an unknown event inside `Event` is skipped but its
+`seq` counts. Initial capability names:
 `resume`, `layout_events`, `status_events`, `capture`, `size_policy_latest`,
 `snapshot_catchup`, `input_flags`, `size_owner`.
 
