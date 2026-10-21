@@ -28,6 +28,10 @@ pub struct LocalConPty {
     exited: Arc<AtomicBool>,
 }
 
+/// Diagnostics: when enabled, the reader thread logs (read returned, bytes, sent).
+pub static READ_TRACE: AtomicBool = AtomicBool::new(false);
+pub static READ_LOG: Mutex<Vec<(std::time::Instant, usize, std::time::Instant)>> = Mutex::new(Vec::new());
+
 impl LocalConPty {
     pub fn spawn(argv: &[String], cwd: Option<&str>, rows: u16, cols: u16, hooks: Hooks) -> Result<Self> {
         let (shell, args) = argv.split_first().context("empty command")?;
@@ -82,6 +86,7 @@ impl LocalConPty {
                     match reader.read(&mut buf) {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
+                            let t_read = std::time::Instant::now();
                             // A bad sequence must never kill the reader: log and drop.
                             let chunk = &buf[..n];
                             if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| on_output(chunk))).is_err() {
@@ -89,6 +94,13 @@ impl LocalConPty {
                             }
                             if tx.send_blocking(PaneEvent::Output(buf[..n].to_vec())).is_err() {
                                 return;
+                            }
+                            if READ_TRACE.load(Ordering::Relaxed) {
+                                if let Ok(mut g) = READ_LOG.lock() {
+                                    if g.len() < 600 {
+                                        g.push((t_read, n, std::time::Instant::now()));
+                                    }
+                                }
                             }
                         }
                     }
