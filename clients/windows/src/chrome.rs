@@ -392,7 +392,7 @@ impl AppShell {
                 .top(px(r.y))
                 .w(px(r.w))
                 .h(px(r.h))
-                .overflow_hidden()
+                .when(!(self.smoke_mode && crate::smoke::ab() == 3), |d| d.overflow_hidden())
                 .bg(hsla(th.bg))
                 .on_mouse_down(MouseButton::Left, cx.listener(move |s, _e, w, cx| s.focus_pane(pane, w, cx)));
             d = match self.views.get(&pane) {
@@ -627,7 +627,7 @@ impl Render for AppShell {
             }))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
-            .child(self.render_titlebar(window, cx))
+            .child(if self.smoke_mode && crate::smoke::ab() == 2 { div().h(px(36.0)).w_full() } else { self.render_titlebar(window, cx) })
             .child(body)
             .children(self.render_palette())
             .child(

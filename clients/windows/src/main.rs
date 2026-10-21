@@ -77,13 +77,13 @@ fn main() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
                     title: Some("Forgetty".into()),
-                    appears_transparent: true,
+                    appears_transparent: !(smoke && smoke::ab() == 1),
                     traffic_light_position: None,
                 }),
                 window_background: background,
                 window_min_size: Some(size(px(480.0), px(300.0))),
                 // The smoke measures key-to-frame latency: no inactive-window frame cap on CI.
-                inactive_frame_interval: if smoke { None } else { Some(std::time::Duration::from_micros(33_333)) },
+                inactive_frame_interval: if smoke && smoke::ab() != 4 { None } else { Some(std::time::Duration::from_micros(33_333)) },
                 ..Default::default()
             },
             move |window, cx| {

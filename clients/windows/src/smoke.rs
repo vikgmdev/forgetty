@@ -24,6 +24,12 @@ use crate::view::TerminalView;
 
 pub const KEYSTROKES: usize = 100;
 pub const TOTAL_TIMEOUT: Duration = Duration::from_secs(300);
+/// Diagnostic A/B switch for frame-rate experiments (env FORGETTY_AB). 0 = normal.
+pub fn ab() -> u32 {
+    static AB: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *AB.get_or_init(|| std::env::var("FORGETTY_AB").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+}
+
 const PHASE_TIMEOUT: Duration = Duration::from_secs(60);
 const CONPTY_LINES: u32 = 25_000;
 const CONPTY_BYTES: f64 = CONPTY_LINES as f64 * 90.0;
@@ -332,6 +338,9 @@ impl ShellSmoke {
             view.update(cx, |v, _| {
                 finished = self.w1_step(v, window, now_t, frames);
             });
+            if finished && ab() != 0 {
+                self.finish(shell);
+            }
             if finished {
                 self.goto(Phase::Restore);
             }
