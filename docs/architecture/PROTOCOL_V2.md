@@ -230,3 +230,11 @@ stream to the subscriber's own next offset from the log.
   without the capability gets `0x11 log_lost` and re-attaches.
 - Connection close codes: `0x12` control writer stalled 10 s, `0x14` more than
   64 requests in flight.
+
+## 13. Methods added by P5
+
+- `api.list`, `api.describe { method }`: self-describing API (name,
+  description, input/output JSON Schema, examples). Allowed over v2.
+- `set_label { target: "workspace"|"tab"|"pane", id, label }`: emits
+  `LayoutChanged`. Layout values carry `label` on tabs and a `pane_labels` map.
+  Clients show the label when set, else the title.
