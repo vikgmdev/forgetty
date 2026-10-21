@@ -151,7 +151,13 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// Last input `seq` written for one `(client_id, input_epoch)`.
 #[derive(Default)]
 struct InputRec {
-    last: u64,
+    /// Last `seq` the PTY has taken (what `Pong.input_acked` says).
+    last: AtomicU64,
+    /// Held across dedup and the real write, so frames of one client epoch
+    /// stay in order and are written once, even on overlapping connections.
+    /// An async lock: a write that waits on a full pane queue holds up this
+    /// client's input and nothing else.
+    gate: tokio::sync::Mutex<()>,
 }
 
 /// One connected client, by `client_id` (several connections can overlap
@@ -214,7 +220,7 @@ pub struct RpcV2 {
     hostname: String,
     events: broadcast::Sender<(u64, ServerEvent)>,
     event_seq: Mutex<u64>,
-    inputs: Mutex<HashMap<(Uuid, Uuid), InputRec>>,
+    inputs: Mutex<HashMap<(Uuid, Uuid), Arc<InputRec>>>,
     clients: Mutex<HashMap<Uuid, ClientRec>>,
     sizes: Mutex<HashMap<Uuid, PaneSizes>>,
     live: Mutex<Vec<(u64, Connection)>>,
@@ -295,7 +301,11 @@ impl RpcV2 {
         let entries: Vec<serde_json::Value> = lock(&self.inputs)
             .iter()
             .map(
-                |((c, e), r)| serde_json::json!({"client_id": c, "input_epoch": e, "last": r.last}),
+                |((c, e), r)| {
+                    serde_json::json!({
+                        "client_id": c, "input_epoch": e, "last": r.last.load(Ordering::SeqCst)
+                    })
+                },
             )
             .collect();
         let saved_at = std::time::SystemTime::now()
@@ -337,7 +347,7 @@ impl RpcV2 {
                 ) else {
                     continue;
                 };
-                inputs.insert((c, ep), InputRec { last });
+                inputs.insert((c, ep), Arc::new(InputRec { last: AtomicU64::new(last), ..Default::default() }));
                 loaded += 1;
             }
         }
@@ -615,34 +625,41 @@ impl RpcV2 {
     // -----------------------------------------------------------------------
 
     /// Write one input frame to its PTY unless it was written before.
-    /// Dedup and write happen under one lock, so a frame resent on a new
-    /// connection can never overtake or double an earlier one.
-    fn handle_input(
+    /// Dedup and write happen under one per-client lock, so a frame resent on
+    /// a new connection can never overtake or double an earlier one. The write
+    /// goes through the pane's input queue and no server lock is held while it
+    /// waits: a program that does not read stalls this client's input stream
+    /// and nothing else. `seq` counts as written (and acked) only after the
+    /// PTY took the bytes.
+    async fn handle_input(
         &self,
         client: Uuid,
         epoch: Uuid,
         pane: Uuid,
         seq: u64,
-        bytes: &[u8],
+        bytes: Vec<u8>,
         policy: bool,
     ) {
+        let rec = lock(&self.inputs).entry((client, epoch)).or_default().clone();
         {
-            let mut inputs = lock(&self.inputs);
+            let _gate = rec.gate.lock().await;
             if self.inputs_frozen.load(Ordering::SeqCst) {
                 return; // shutting down: not written, so not acked, so resent
             }
-            let rec = inputs.entry((client, epoch)).or_default();
-            if seq <= rec.last {
+            if seq <= rec.last.load(Ordering::SeqCst) {
                 self.qa.dedup_drops.fetch_add(1, Ordering::SeqCst);
                 return;
             }
-            rec.last = seq;
-            match self.sm.write_pty(PaneId(pane), bytes) {
+            #[cfg(feature = "qa-tools")]
+            let copy = bytes.clone();
+            match self.sm.write_pty_wait(PaneId(pane), bytes).await {
                 Ok(()) => {}
                 Err(e) => debug!("rpc2: input for pane {pane}: {e}"),
             }
+            // A pane that is gone takes no more input; the frame is spent.
+            rec.last.store(seq, Ordering::SeqCst);
             #[cfg(feature = "qa-tools")]
-            lock(&self.qa.input_log).entry(pane).or_default().extend_from_slice(bytes);
+            lock(&self.qa.input_log).entry(pane).or_default().extend_from_slice(&copy);
         }
         if policy {
             self.touch_active(client, pane);
@@ -653,7 +670,10 @@ impl RpcV2 {
         if self.qa.hold_acks.load(Ordering::SeqCst) {
             return 0;
         }
-        lock(&self.inputs).get(&(client, epoch)).map(|r| r.last).unwrap_or(0)
+        lock(&self.inputs)
+            .get(&(client, epoch))
+            .map(|r| r.last.load(Ordering::SeqCst))
+            .unwrap_or(0)
     }
 
     // -----------------------------------------------------------------------
@@ -1048,14 +1068,9 @@ impl Session {
                 let Ok(mut input) = s.conn.accept_uni().await else { return };
                 let policy = s.has(cap::SIZE_POLICY_LATEST);
                 while let Ok(Some((pane, seq, bytes))) = read_input_frame(&mut input).await {
-                    let rpc = s.rpc.clone();
-                    let (client, epoch) = (s.client_id, s.epoch);
-                    // The PTY write can block; keep it off the async threads.
                     // Awaited here, so the frames of one client stay in order.
-                    let _ = tokio::task::spawn_blocking(move || {
-                        rpc.handle_input(client, epoch, pane, seq, &bytes, policy)
-                    })
-                    .await;
+                    // A pane that does not read holds this loop and nothing else.
+                    s.rpc.handle_input(s.client_id, s.epoch, pane, seq, bytes, policy).await;
                 }
             });
         }

@@ -485,7 +485,7 @@ async fn handle_subscribe_stream(
                         let target = Uuid::parse_str(&pid_str)
                             .map(PaneId)
                             .unwrap_or(pane_id);
-                        if let Err(e) = sm.write_pty(target, &data) {
+                        if let Err(e) = sm.write_pty_queued(target, data).await {
                             warn!("stream: write_pty failed for pane {target}: {e}");
                         }
                     }

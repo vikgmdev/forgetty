@@ -41,7 +41,7 @@ pub struct PtyProcess {
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
     reader: Option<Box<dyn IoRead + Send>>,
-    writer: Box<dyn IoWrite + Send>,
+    writer: Option<Box<dyn IoWrite + Send>>,
 }
 
 impl PtyProcess {
@@ -133,7 +133,7 @@ impl PtyProcess {
             .take_writer()
             .map_err(|e| ForgettyError::Pty(format!("failed to take PTY writer: {e}")))?;
 
-        Ok(Self { master: pair.master, child, reader: Some(reader), writer })
+        Ok(Self { master: pair.master, child, reader: Some(reader), writer: Some(writer) })
     }
 
     /// Read bytes from the PTY. This is a blocking call.
@@ -157,9 +157,24 @@ impl PtyProcess {
     }
 
     /// Write bytes to the PTY.
+    ///
+    /// Blocks while the PTY is full (a program that does not read). Callers
+    /// that must not block take the writer out with [`Self::take_writer`] and
+    /// drive it from a thread of their own.
     pub fn write(&mut self, data: &[u8]) -> Result<()> {
-        self.writer.write_all(data).map_err(ForgettyError::Io)?;
-        self.writer.flush().map_err(ForgettyError::Io)
+        let w = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| ForgettyError::Pty("PTY writer has been taken".to_string()))?;
+        w.write_all(data).map_err(ForgettyError::Io)?;
+        w.flush().map_err(ForgettyError::Io)
+    }
+
+    /// Take the writer out of this PtyProcess, for a writer thread.
+    ///
+    /// After this, [`Self::write`] fails.
+    pub fn take_writer(&mut self) -> Option<Box<dyn IoWrite + Send>> {
+        self.writer.take()
     }
 
     /// Resize the PTY.

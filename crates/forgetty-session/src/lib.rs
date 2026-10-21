@@ -31,6 +31,7 @@ pub mod layout;
 pub mod manager;
 pub mod osc;
 pub mod pane;
+pub mod pane_writer;
 pub mod pty_bridge;
 pub mod snapshot;
 pub mod status;
@@ -44,6 +45,7 @@ pub use events::{LabelTarget, SessionEvent};
 pub use layout::{SessionLayout, SessionTab, SessionWorkspace};
 pub use manager::{LabelError, PaneSnapshot, SessionManager, MAX_LABEL_CHARS};
 pub use pane::{DuplicatedTab, NotificationInfo, PaneInfo, PaneOsc, PaneState};
+pub use pane_writer::{PaneWriter, QueueError, INPUT_QUEUE_BYTES};
 pub use pty_bridge::PtyBridge;
 pub use status::{PaneStatus, StatusSnapshot};
 pub use workspace::{

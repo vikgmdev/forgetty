@@ -1642,14 +1642,43 @@ impl SessionManager {
         pane.pty_bridge.pty.vintr()
     }
 
-    /// Write raw bytes to the PTY master for the given pane.
+    /// The pane's input queue. Takes `inner` only to find it.
+    pub fn pane_writer(&self, id: PaneId) -> Option<crate::pane_writer::PaneWriter> {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.panes.get(&id).map(|p| p.pty_bridge.writer.handle())
+    }
+
+    /// Queue raw bytes for the PTY of the given pane. Does not wait for the
+    /// write and never holds a lock while a program that does not read blocks
+    /// it. Fails with "queue full" when the pane has a backlog (try again).
     pub fn write_pty(&self, id: PaneId, data: &[u8]) -> Result<()> {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let pane = inner
-            .panes
-            .get_mut(&id)
+        let w = self
+            .pane_writer(id)
             .ok_or_else(|| forgetty_core::ForgettyError::Pty(format!("pane {id} not found")))?;
-        pane.pty_bridge.pty.write(data)
+        w.try_queue(data.to_vec())
+            .map_err(|e| forgetty_core::ForgettyError::Pty(format!("pane {id}: {e}")))
+    }
+
+    /// Like [`Self::write_pty`], but waits for room in the queue (the caller's
+    /// own task waits, nothing else) and returns once the bytes are queued.
+    pub async fn write_pty_queued(&self, id: PaneId, data: Vec<u8>) -> Result<()> {
+        let w = self
+            .pane_writer(id)
+            .ok_or_else(|| forgetty_core::ForgettyError::Pty(format!("pane {id} not found")))?;
+        w.queue(data)
+            .await
+            .map_err(|e| forgetty_core::ForgettyError::Pty(format!("pane {id}: {e}")))
+    }
+
+    /// Like [`Self::write_pty_queued`], but returns only when the PTY has
+    /// taken every byte. Input acks follow this.
+    pub async fn write_pty_wait(&self, id: PaneId, data: Vec<u8>) -> Result<()> {
+        let w = self
+            .pane_writer(id)
+            .ok_or_else(|| forgetty_core::ForgettyError::Pty(format!("pane {id} not found")))?;
+        w.write(data)
+            .await
+            .map_err(|e| forgetty_core::ForgettyError::Pty(format!("pane {id}: {e}")))
     }
 
     /// Resize a pane's PTY to new dimensions.
