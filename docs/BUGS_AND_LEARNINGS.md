@@ -61,6 +61,10 @@ if let Some(pgid) = s.pty.foreground_pgrp() {
 }
 ```
 
+### Update (v3 qa7)
+
+The direct `kill(-pgid, SIGINT)` for raw-mode programs is gone. A program with `ISIG` off (ssh, mosh, emacs, ink TUIs) handles Ctrl+C itself, and a kill takes down a forwarder whose far side wanted the key. `SessionManager::interrupt` now writes `c_cc[VINTR]` (or 0x03 when VINTR is disabled) in both modes and signals the group only with `ISIG` on and no byte queued. Node.js and pm2 read the byte as a key.
+
 ### Cross-platform notes
 
 - **Windows (ConPTY):** ConPTY handles Ctrl+C natively via `GenerateConsoleCtrlEvent(CTRL_C_EVENT, pgid)`. The same two-path pattern applies: send the byte AND the signal explicitly.

@@ -1740,39 +1740,60 @@ impl SessionManager {
     // I/O
     // -----------------------------------------------------------------------
 
-    /// The byte the kernel's line discipline turns into SIGINT for this
-    /// pane's PTY right now (`c_cc[VINTR]`).
-    ///
-    /// `None` if the pane is unknown, the termios read fails, `ISIG` is off
-    /// (an editor in raw mode takes Ctrl+C as input) or VINTR is disabled.
-    /// The caller then sends no interrupt byte and signals nothing for a
-    /// plain byte. Users who remap VINTR (`stty intr ^X`) and ssh sessions
-    /// that forward it through pty-modes are covered (FIX-017).
-    pub fn intr_byte(&self, id: PaneId) -> Option<u8> {
+    /// The pane's interrupt setting, `(isig, c_cc[VINTR])`. `None` if the
+    /// pane is unknown or the termios read fails.
+    fn intr_setting(&self, id: PaneId) -> Option<(bool, u8)> {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let pane = inner.panes.get(&id)?;
-        pane.pty_bridge.pty.vintr()
+        pane.pty_bridge.pty.intr_setting()
     }
 
-    /// Interrupt the pane's foreground program once. The interrupt byte goes
-    /// into the PTY and the line discipline turns it into SIGINT (cooked
-    /// mode), which also reaches programs that forward the byte (ssh, mosh).
-    /// The group is signalled directly only when no byte was queued: `ISIG`
-    /// is off (a raw-mode program that swallows Ctrl+C, BUG-001), VINTR is
-    /// disabled or the queue is full. Both together would deliver SIGINT
-    /// twice to a cooked-mode program, and terraform or docker compose skip
-    /// their graceful stop on the second one.
+    /// The byte the kernel's line discipline turns into SIGINT for this pane
+    /// right now (`c_cc[VINTR]`, FIX-017: users who remap it with
+    /// `stty intr ^X`, and ssh sessions that forward it, are covered).
+    ///
+    /// `None` if the pane is unknown, the termios read fails, `ISIG` is off or
+    /// VINTR is disabled. With `ISIG` off a program in raw mode takes every
+    /// byte, 0x03 included, as plain input: a caller that scans typed input
+    /// for an interrupt must not treat it as one.
+    pub fn intr_byte(&self, id: PaneId) -> Option<u8> {
+        match self.intr_setting(id)? {
+            (true, v) if v != 0 => Some(v),
+            _ => None,
+        }
+    }
+
+    /// Interrupt the pane's foreground program once.
+    ///
+    /// The interrupt key goes into the PTY: `c_cc[VINTR]`, or 0x03 when VINTR
+    /// is disabled and `ISIG` is off. With `ISIG` on the line discipline turns
+    /// it into SIGINT, which also reaches programs that forward the byte (ssh,
+    /// mosh). With `ISIG` off the program gets it as a key and nothing is
+    /// signalled: it is in raw mode and handles Ctrl+C itself, and a kill
+    /// would take down an ssh or mosh whose remote end wanted the key.
+    ///
+    /// The group is signalled directly only with `ISIG` on and no byte
+    /// queued (VINTR disabled, queue full, or the termios read failed). Byte
+    /// and signal together would deliver SIGINT twice to a cooked-mode
+    /// program, and terraform or docker compose skip their graceful stop on
+    /// the second one.
     ///
     /// Returns `true` when the byte was queued. The caller drops the stale
     /// input first ([`Self::discard_queued_input`]).
     pub fn interrupt(&self, id: PaneId) -> bool {
-        if let Some(b) = self.intr_byte(id) {
+        // One read of the termios, so the byte and the decision to signal
+        // agree even if the program changes mode meanwhile.
+        let setting = self.intr_setting(id);
+        let isig = setting.is_none_or(|(isig, _)| isig);
+        if let Some(b) = setting.and_then(intr_key) {
             match self.write_pty(id, &[b]) {
                 Ok(()) => return true,
                 Err(e) => debug!(%id, "interrupt: byte not queued: {e}"),
             }
         }
-        self.send_sigint(id);
+        if isig {
+            self.send_sigint(id);
+        }
         false
     }
 
@@ -2500,15 +2521,12 @@ impl SessionManager {
 
     /// Send SIGINT to the foreground process group of a pane.
     ///
-    /// Daemon-side implementation of the Ctrl+C signal path. Call it through
-    /// [`Self::interrupt`], which runs it only when no interrupt byte went in.
-    /// 1. The caller wrote no byte (or it failed).
-    /// 2. This method calls kill(-pgid, SIGINT) UNLESS the foreground pgrp
-    ///    leader is a known signal-forwarder (ssh, mosh-client, telnet, rsh).
-    ///    Forwarders read 0x03 from stdin and pass it through; killing them
-    ///    kills the local end of the forward (FIX-017).
-    /// 3. For non-forwarders, the kill catches raw-mode apps that swallow
-    ///    0x03 without acting on it (Node.js, pm2 — BUG-001).
+    /// Call it through [`Self::interrupt`], which runs it only with `ISIG` on
+    /// and no interrupt byte queued (VINTR disabled, queue full). A pane with
+    /// `ISIG` off is in raw mode and is never signalled: it reads the byte.
+    /// The kill skips a known signal forwarder (ssh, mosh-client, telnet,
+    /// rsh) as a safeguard: killing it kills the local end of the forward
+    /// (FIX-017).
     pub fn send_sigint(&self, id: PaneId) {
         #[cfg(target_os = "linux")]
         {
@@ -2901,6 +2919,18 @@ impl std::fmt::Display for LabelError {
 }
 
 impl std::error::Error for LabelError {}
+
+/// The key an interrupt writes for a terminal with this `(isig, VINTR)`:
+/// `c_cc[VINTR]`, or 0x03 when VINTR is disabled and `ISIG` is off (the
+/// program reads it as a key). `None` with `ISIG` on and VINTR disabled: no
+/// byte makes the tty signal.
+fn intr_key((isig, vintr): (bool, u8)) -> Option<u8> {
+    match (isig, vintr) {
+        (true, 0) => None,
+        (false, 0) => Some(0x03),
+        (_, v) => Some(v),
+    }
+}
 
 /// Trim a label and check it: at most [`MAX_LABEL_CHARS`] characters, no
 /// control characters.

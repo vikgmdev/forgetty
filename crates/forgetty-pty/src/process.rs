@@ -247,41 +247,39 @@ impl PtyProcess {
         self.master.process_group_leader()
     }
 
-    /// Get the `VINTR` character (the byte the kernel's line discipline
-    /// translates to `SIGINT` when `ISIG` is enabled).
-    ///
-    /// Reads `c_cc[VINTR]` via `tcgetattr` on the master PTY fd. Returns
-    /// `None` if the master fd is unavailable, `tcgetattr` fails, `ISIG` is
-    /// off, or VINTR is disabled (0). `None` means the terminal does not turn
-    /// any input byte into SIGINT right now.
-    ///
-    /// Used by the daemon's Ctrl+C path (FIX-017) to write a byte that
-    /// matches the current `VINTR` setting rather than hardcoded `0x03`.
-    /// This makes Ctrl+C work for users who have remapped `VINTR` (via
-    /// `stty intr <char>` or shell init) and for SSH sessions where the
-    /// remote PTY inherits the local `VINTR` through ssh's `pty-modes`.
+    /// The terminal's interrupt setting: `(isig, c_cc[VINTR])`, read with
+    /// `tcgetattr` on the master. `None` if the master fd is unavailable or
+    /// `tcgetattr` fails. `isig` false means the line discipline signals
+    /// nothing and a program in raw mode (ssh, mosh, emacs, ink TUIs) reads
+    /// the byte as a key. VINTR 0 means no interrupt character.
     #[cfg(unix)]
-    pub fn vintr(&self) -> Option<u8> {
+    pub fn intr_setting(&self) -> Option<(bool, u8)> {
         use std::os::unix::io::RawFd;
         let fd: RawFd = self.master.as_raw_fd()?;
         let mut termios = unsafe { std::mem::zeroed::<libc::termios>() };
         if unsafe { libc::tcgetattr(fd, &mut termios) } != 0 {
             return None;
         }
-        // With ISIG off (vim, an editor in raw mode) the byte is plain input,
-        // and 0 (_POSIX_VDISABLE) means no interrupt character at all.
-        let intr = termios.c_cc[libc::VINTR];
-        if termios.c_lflag & libc::ISIG == 0 || intr == 0 {
-            return None;
-        }
-        Some(intr)
+        Some((termios.c_lflag & libc::ISIG != 0, termios.c_cc[libc::VINTR]))
     }
 
-    /// Non-Unix stub: VINTR is a POSIX termios concept and not meaningful
-    /// off Unix. Returns `None` so callers use the POSIX default `0x03`.
+    /// Non-Unix stub: VINTR is a POSIX termios concept.
     #[cfg(not(unix))]
-    pub fn vintr(&self) -> Option<u8> {
+    pub fn intr_setting(&self) -> Option<(bool, u8)> {
         None
+    }
+
+    /// Get the `VINTR` character (the byte the kernel's line discipline
+    /// translates to `SIGINT` when `ISIG` is enabled).
+    ///
+    /// `None` if the master fd is unavailable, `tcgetattr` fails, `ISIG` is
+    /// off, or VINTR is disabled (0). `None` means the terminal does not turn
+    /// any input byte into SIGINT right now.
+    pub fn vintr(&self) -> Option<u8> {
+        match self.intr_setting()? {
+            (true, intr) if intr != 0 => Some(intr),
+            _ => None,
+        }
     }
 
     /// Throw away input that was written to the terminal and not read by the
