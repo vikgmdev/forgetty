@@ -1141,6 +1141,12 @@ impl ShellSmoke {
                 .map(|(a, n, b)| format!("r{:.1}({n})>{:.1}", a.saturating_duration_since(base).as_secs_f64() * 1000.0, b.saturating_duration_since(base).as_secs_f64() * 1000.0))
                 .collect();
             record("read_trace", json!(txt.join(" ")));
+            let w = forgetty_shell_core::conpty::WRITE_LOG.lock().unwrap();
+            let wt: Vec<String> = w
+                .iter()
+                .map(|(a, b)| format!("w{:.1}:{}", a.saturating_duration_since(base).as_secs_f64() * 1000.0, b.iter().map(|x| format!("{x:02x}")).collect::<String>()))
+                .collect();
+            record("write_trace", json!(wt.join(" ")));
         }
         for (name, v) in [("frame_cpu", &mut shell.cpu_ms), ("frame_idle", &mut shell.idle_ms)] {
             if !v.is_empty() {

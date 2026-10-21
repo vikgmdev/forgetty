@@ -30,6 +30,7 @@ pub struct LocalConPty {
 
 /// Diagnostics: when enabled, the reader thread logs (read returned, bytes, sent).
 pub static READ_TRACE: AtomicBool = AtomicBool::new(false);
+pub static WRITE_LOG: Mutex<Vec<(std::time::Instant, Vec<u8>)>> = Mutex::new(Vec::new());
 pub static READ_LOG: Mutex<Vec<(std::time::Instant, usize, std::time::Instant)>> = Mutex::new(Vec::new());
 
 impl LocalConPty {
@@ -155,6 +156,13 @@ impl LocalConPty {
     }
 
     pub fn write_input(&self, bytes: &[u8]) {
+        if READ_TRACE.load(Ordering::Relaxed) {
+            if let Ok(mut g) = WRITE_LOG.lock() {
+                if g.len() < 300 {
+                    g.push((std::time::Instant::now(), bytes.iter().take(24).copied().collect()));
+                }
+            }
+        }
         let _ = self.input_tx.send(bytes.to_vec());
     }
 
