@@ -406,6 +406,32 @@ build or the laptop's view of it.
 
 ---
 
+## AD-024: Input is ordered per pane; a hung pane never blocks other panes (amends protocol v2 sections 5 and 8)
+
+**Decision:**
+- Each pane has its own bounded writer queue (256 KiB) and writer thread.
+- The server records a frame's `seq` as done when the frame enters that
+  pane's queue. It does not wait for the PTY write. `input_acked` follows the
+  enqueue.
+- Order is kept per pane, in arrival order. There is no ordering across panes.
+- When a pane's queue is full, the server drops new frames for that pane and
+  counts and logs them. If a dropped frame holds the pane's VINTR byte, the
+  server sends SIGINT to the pane's foreground process group.
+- One pane that does not read never delays a client's input to other panes,
+  Control or Pong.
+- Graceful stop closes the queues, waits up to 2 s for them to drain, and then
+  saves the dedup state.
+- A fresh attach (`from_offset = None`) to a pane whose log holds more than
+  half a ring starts with a snapshot (AD-023), not at the oldest byte.
+
+**Why:** a client must not lose typing in every pane because one pane runs a
+program that never reads stdin. A program that does not read 256 KiB of input
+is hung, and Ctrl+C must still reach it. A fresh attach must paint fast.
+
+**Decided:** 2026-10-21.
+
+---
+
 ## Superseded / rejected decisions
 
 The following concepts are **explicitly rejected**. Do not reintroduce without a new AD that supersedes the rejection.
