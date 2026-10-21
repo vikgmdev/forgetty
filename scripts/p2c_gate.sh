@@ -47,7 +47,15 @@ LOGS="$TMP/logs"
 mkdir -p "$LOGS"
 FAIL=0
 SUMMARY=()
-trap '[ "${KEEP:-0}" = "1" ] || rm -rf "$TMP"' EXIT
+# A failed run keeps its logs (and those of the nested gates inside them).
+cleanup() {
+  if [ "${KEEP:-0}" = "1" ] || [ "$FAIL" != "0" ]; then
+    echo "logs kept in $LOGS"
+  else
+    rm -rf "$TMP"
+  fi
+}
+trap cleanup EXIT
 
 want() { [ -z "${ONLY:-}" ] || [[ " $ONLY " == *" $1 "* ]]; }
 step() { echo "--- $*"; }
@@ -85,7 +93,7 @@ fi
 
 # ---------------------------------------------------------------------------
 if want 3 || want 4 || want 5 || want 7; then
-  FORGETTY_REAL_SERVER="$REAL" $CT_REL p2c -- --nocapture --test-threads=1 >"$LOGS/p2c.log" 2>&1
+  FORGETTY_REQUIRE_REAL=1 FORGETTY_REAL_SERVER="$REAL" $CT_REL p2c -- --nocapture --test-threads=1 >"$LOGS/p2c.log" 2>&1
   grep -E "^test result|^test " "$LOGS/p2c.log" | sed 's/^/    /'
 fi
 
@@ -145,7 +153,7 @@ if want 7; then
     pass "100k unread requests: flat tasks and RSS, connection closed"
   fi
   for n in 5 30; do
-    STALL_PANES=$n FORGETTY_REAL_SERVER="$REAL" $CT_REL p2b stops_reading -- --nocapture --test-threads=1 \
+    STALL_PANES=$n FORGETTY_REQUIRE_REAL=1 FORGETTY_REAL_SERVER="$REAL" $CT_REL p2b stops_reading -- --nocapture --test-threads=1 \
       >"$LOGS/stall-$n.log" 2>&1
     l=$(grep -h "stalled control reader (" "$LOGS/stall-$n.log" | head -1 | sed 's/^test [a-z_]* \.\.\. //')
     if [ -n "$l" ] && ok_result "$LOGS/stall-$n.log"; then
@@ -159,7 +167,7 @@ fi
 # ---------------------------------------------------------------------------
 if want 8; then
   step "8. cat 200 MiB through the server"
-  FORGETTY_REAL_SERVER="$REAL" $CT_REL p2b cat_200mb -- --nocapture --test-threads=1 >"$LOGS/cat.log" 2>&1
+  FORGETTY_REQUIRE_REAL=1 FORGETTY_REAL_SERVER="$REAL" $CT_REL p2b cat_200mb -- --nocapture --test-threads=1 >"$LOGS/cat.log" 2>&1
   l=$(grep -h "cat 200 MiB:" "$LOGS/cat.log" | head -1 | sed 's/^test [a-z_0-9]* \.\.\. //')
   if [ -n "$l" ] && ok_result "$LOGS/cat.log"; then
     pass "$l"; SUMMARY+=("$l")

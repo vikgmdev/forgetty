@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 /// A JSON-RPC 2.0 request.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Request {
     pub jsonrpc: String,
     pub method: String,

@@ -318,7 +318,7 @@ pub async fn handle_terminal_stream(
 
     // --- Authorization check ---
     let is_authorized = {
-        let reg = registry.lock().unwrap();
+        let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
         reg.is_authorized(&remote_id)
     };
 
@@ -339,7 +339,7 @@ pub async fn handle_terminal_stream(
     // AD-017: this connection is an attached client until it ends. The guard
     // drops on every exit path of this function.
     let device_name = {
-        let reg = registry.lock().unwrap();
+        let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
         reg.list().iter().find(|d| d.device_id == device_id).map(|d| d.name.clone())
     };
     let Ok(_client) =
@@ -485,7 +485,7 @@ async fn handle_subscribe_stream(
                         let target = Uuid::parse_str(&pid_str)
                             .map(PaneId)
                             .unwrap_or(pane_id);
-                        if let Err(e) = sm.write_pty(target, &data) {
+                        if let Err(e) = sm.write_pty_queued(target, data).await {
                             warn!("stream: write_pty failed for pane {target}: {e}");
                         }
                     }

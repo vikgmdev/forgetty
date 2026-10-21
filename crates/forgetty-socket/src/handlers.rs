@@ -13,7 +13,10 @@ use forgetty_core::PaneId;
 use forgetty_pty::PtySize;
 use forgetty_session::layout::{SessionLayout, SessionTab};
 use forgetty_session::workspace::PaneTreeLayout;
-use forgetty_session::SessionManager;
+use forgetty_session::{SessionManager, MAX_PANE_DIM};
+
+/// How long a local `send_input` waits for room in a pane's input queue.
+const LOCAL_INPUT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 use forgetty_sync::SyncEndpoint;
 use uuid::Uuid;
 
@@ -192,11 +195,8 @@ pub(crate) fn handle_new_tab(request: &Request, sm: &SessionManager) -> Response
         }
     };
 
-    let rows =
-        request.params.get("rows").and_then(|v| v.as_u64()).unwrap_or(DEFAULT_ROWS as u64) as u16;
-
-    let cols =
-        request.params.get("cols").and_then(|v| v.as_u64()).unwrap_or(DEFAULT_COLS as u64) as u16;
+    let rows = dim_param(request, "rows", DEFAULT_ROWS as u64);
+    let cols = dim_param(request, "cols", DEFAULT_COLS as u64);
 
     let size = PtySize { rows, cols, pixel_width: 0, pixel_height: 0 };
 
@@ -988,11 +988,8 @@ pub(crate) fn handle_split_pane(request: &Request, sm: &SessionManager) -> Respo
         );
     }
 
-    let rows =
-        request.params.get("rows").and_then(|v| v.as_u64()).unwrap_or(DEFAULT_ROWS as u64) as u16;
-
-    let cols =
-        request.params.get("cols").and_then(|v| v.as_u64()).unwrap_or(DEFAULT_COLS as u64) as u16;
+    let rows = dim_param(request, "rows", DEFAULT_ROWS as u64);
+    let cols = dim_param(request, "cols", DEFAULT_COLS as u64);
 
     let size = PtySize { rows, cols, pixel_width: 0, pixel_height: 0 };
 
@@ -1133,7 +1130,10 @@ pub(crate) fn handle_send_input(request: &Request, sm: &SessionManager) -> Respo
         }
     };
 
-    match sm.write_pty(id, &bytes) {
+    // A local caller is trusted: wait for room in the pane's queue instead of
+    // dropping (GTK VT replies must not be lost). The wait is bounded, so a
+    // hung pane cannot hold the handler thread for good.
+    match sm.write_pty_blocking(id, &bytes, LOCAL_INPUT_WAIT) {
         Ok(()) => Response::success(request.id.clone(), serde_json::json!({ "ok": true })),
         Err(e) => Response::error(
             request.id.clone(),
@@ -1175,8 +1175,20 @@ pub(crate) fn handle_get_pane_info(request: &Request, sm: &SessionManager) -> Re
             "exit_code": info.exit_code,
             "status": status_json(&info),
             "last_notification": notification_json(&info),
+            "size_owner": sm.size_owner(id).map(|o| serde_json::json!({
+                "client_id": o.client_id.to_string(),
+                "client_kind": o.client_kind,
+                "client_name": o.client_name,
+            })),
         }),
     )
+}
+
+/// A `rows` or `cols` param, clamped to `1..=MAX_PANE_DIM` before it becomes a
+/// `u16` (a bare `as u16` wraps 65537 to 1).
+fn dim_param(request: &Request, key: &str, default: u64) -> u16 {
+    let n = request.params.get(key).and_then(|v| v.as_u64()).unwrap_or(default);
+    n.clamp(1, u64::from(MAX_PANE_DIM)) as u16
 }
 
 pub(crate) fn handle_resize_pane(request: &Request, sm: &SessionManager) -> Response {
@@ -1186,7 +1198,7 @@ pub(crate) fn handle_resize_pane(request: &Request, sm: &SessionManager) -> Resp
     };
 
     let rows = match request.params.get("rows").and_then(|v| v.as_u64()) {
-        Some(r) => r as u16,
+        Some(r) => r.clamp(1, u64::from(MAX_PANE_DIM)) as u16,
         None => {
             return Response::error(
                 request.id.clone(),
@@ -1197,7 +1209,7 @@ pub(crate) fn handle_resize_pane(request: &Request, sm: &SessionManager) -> Resp
     };
 
     let cols = match request.params.get("cols").and_then(|v| v.as_u64()) {
-        Some(c) => c as u16,
+        Some(c) => c.clamp(1, u64::from(MAX_PANE_DIM)) as u16,
         None => {
             return Response::error(
                 request.id.clone(),
@@ -1209,7 +1221,30 @@ pub(crate) fn handle_resize_pane(request: &Request, sm: &SessionManager) -> Resp
 
     let size = PtySize { rows, cols, pixel_width: 0, pixel_height: 0 };
 
-    match sm.resize_pane(id, size) {
+    // AD-020: a registered streaming client names itself with `client_id` and
+    // may become the pane's size owner. A one-shot call has none: the size
+    // applies and ownership stays as it is.
+    let client = match request.params.get("client_id") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => {
+            let raw = v.as_str().unwrap_or_default();
+            let known = Uuid::parse_str(raw)
+                .ok()
+                .filter(|_| sm.clients().find(raw).is_some_and(|c| c.client_kind == "socket"));
+            match known {
+                Some(u) => Some(u),
+                None => {
+                    return Response::error(
+                        request.id.clone(),
+                        protocol::INVALID_PARAMS,
+                        "client_id is not an attached streaming client".to_string(),
+                    )
+                }
+            }
+        }
+    };
+
+    match sm.resize_pane_for(client, id, size) {
         Ok(()) => Response::success(request.id.clone(), serde_json::json!({ "ok": true })),
         Err(e) => Response::error(
             request.id.clone(),
@@ -1225,29 +1260,17 @@ pub(crate) fn handle_send_sigint(request: &Request, sm: &SessionManager) -> Resp
         Err(e) => return e,
     };
 
-    // Resolve the byte the kernel's line discipline treats as the interrupt
-    // character (c_cc[VINTR]). Falls back to 0x03 (POSIX default) if the
-    // termios read fails. Writing this byte — instead of hardcoded 0x03 —
-    // makes Ctrl+C work for local users who have remapped VINTR (e.g.,
-    // `stty intr ^X`), and for ssh sessions where the remote PTY inherits
-    // the local VINTR via ssh's pty-modes payload (FIX-017).
-    let intr_byte = sm.intr_byte(id).unwrap_or(0x03);
+    // Input queued before the interrupt is stale once the program it was
+    // for is gone: a paste behind Ctrl+C must not run in the shell after it.
+    sm.discard_queued_input(id);
 
-    match sm.write_pty(id, &[intr_byte]) {
-        Ok(()) => {
-            // For non-forwarder foreground processes (e.g., Node.js, pm2 in
-            // raw mode that swallow the byte), also kill(-pgid, SIGINT) so
-            // the signal reaches them via the kernel directly (BUG-001).
-            // Forwarders (ssh, mosh) are skipped — see `send_sigint`.
-            sm.send_sigint(id);
-            Response::success(request.id.clone(), serde_json::json!({ "ok": true }))
-        }
-        Err(e) => Response::error(
-            request.id.clone(),
-            protocol::INTERNAL_ERROR,
-            format!("failed to send SIGINT: {e}"),
-        ),
-    }
+    // One SIGINT: the interrupt byte through the tty when ISIG is on and the
+    // queue takes it, else the signal to the foreground group (a raw-mode
+    // program that swallows the byte, BUG-001, or a full queue). Never both:
+    // a cooked-mode program would get SIGINT twice. Forwarders (ssh, mosh)
+    // are never signalled directly, see `SessionManager::send_sigint`.
+    sm.interrupt(id);
+    Response::success(request.id.clone(), serde_json::json!({ "ok": true }))
 }
 
 // ---------------------------------------------------------------------------
@@ -1301,7 +1324,7 @@ fn sync_unavailable(request: &Request) -> Response {
 pub(crate) fn handle_list_devices(request: &Request, se: Option<&SyncEndpoint>) -> Response {
     let Some(se) = se else { return sync_unavailable(request) };
     let registry = se.registry();
-    let reg = registry.lock().unwrap();
+    let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
     let devices: Vec<serde_json::Value> = reg
         .list()
         .iter()
@@ -1334,17 +1357,41 @@ pub(crate) fn handle_revoke_device(request: &Request, se: Option<&SyncEndpoint>)
     // Registry removal AND closing every live connection of the device, on
     // every ALPN. Removing only the registry entry would leave an open
     // session running (the registry is checked once, at connect).
-    match se.revoke_device(&device_id) {
-        Ok((found, closed)) => Response::success(
-            request.id.clone(),
-            serde_json::json!({ "ok": found, "closed_connections": closed }),
-        ),
-        Err(e) => Response::error(
+    let out = se.revoke_device(&device_id);
+    if !out.durable {
+        // Revoked and cut all the same, but only in memory: a restart before
+        // the retry succeeds could allow the device again. Say so.
+        let why = out.save_error.as_ref().map(|e| e.to_string()).unwrap_or_default();
+        return Response::error(
             request.id.clone(),
             protocol::INTERNAL_ERROR,
-            format!("failed to revoke device: {e}"),
-        ),
+            format!(
+                "device revoked and {} connection(s) closed, but NOT durable: neither the \
+                 device list nor revoked.pending could be written ({why}). The device stays \
+                 denied while the server runs, and the server retries the save every 5 s. \
+                 Free disk space and run the revoke again to be sure.",
+                out.closed
+            ),
+        );
     }
+    if let Some(e) = &out.save_error {
+        // Durable through revoked.pending, the device list file is stale.
+        return Response::success(
+            request.id.clone(),
+            serde_json::json!({
+                "ok": out.found,
+                "closed_connections": out.closed,
+                "warning": format!(
+                    "recorded in revoked.pending; the device list could not be saved yet ({e}), \
+                     the server retries every 5 s"
+                ),
+            }),
+        );
+    }
+    Response::success(
+        request.id.clone(),
+        serde_json::json!({ "ok": out.found, "closed_connections": out.closed }),
+    )
 }
 
 pub(crate) fn handle_pair_open(request: &Request, se: Option<&SyncEndpoint>) -> Response {

@@ -14,7 +14,7 @@ use forgetty_client::{
 };
 use forgetty_shell_core::{
     valid_label, BackendError, BackendEvent, BackendFuture, BackendResult, ConnState, LabelTarget, Layout, MachineInfo, MachineKind,
-    NewTab, NewTabReply, NewWorkspaceReply, PaneId, PaneInfo, PaneSource, PaneStatus, SessionBackend,
+    NewTab, NewTabReply, NewWorkspaceReply, PaneId, PaneInfo, PaneSource, PaneStatus, SessionBackend, SizeOwnerInfo,
     SplitDir, SplitPane, SplitRatio,
 };
 use serde_json::{json, Value as Json};
@@ -168,9 +168,13 @@ impl RemoteBackend {
                         }
                     }
                     EventItem::Server { event, .. } => {
-                        if let Some(ev) = map_event(&inner, event) {
+                        for ev in map_event(&inner, event) {
                             let _ = inner.tx.try_send(ev);
                         }
+                    }
+                    // The server restarted and the input still queued was dropped.
+                    EventItem::InputLost { bytes } => {
+                        let _ = inner.tx.try_send(BackendEvent::InputLost { bytes });
                     }
                 }
             }
@@ -203,18 +207,36 @@ const NUDGE_EVERY: std::time::Duration = std::time::Duration::from_millis(400);
 /// ... for this long after the link broke.
 const NUDGE_FOR: std::time::Duration = std::time::Duration::from_secs(60);
 
-fn map_event(inner: &Arc<Inner>, ev: ServerEvent) -> Option<BackendEvent> {
-    Some(match ev {
+fn owner_info(o: forgetty_client::proto::SizeOwner) -> SizeOwnerInfo {
+    SizeOwnerInfo { client_id: o.client_id, kind: o.client_kind.as_str().to_string(), name: o.client_name }
+}
+
+/// `size_owner` of a `get_pane_info` reply: an object, or null/absent.
+fn owner_from_json(v: &Json) -> Option<SizeOwnerInfo> {
+    let o = v.get("size_owner")?;
+    let text = |k: &str| o.get(k).and_then(Json::as_str).map(str::to_string);
+    Some(SizeOwnerInfo {
+        client_id: text("client_id").and_then(|s| s.parse().ok())?,
+        kind: text("client_kind").unwrap_or_else(|| "unknown".into()),
+        name: text("client_name").unwrap_or_default(),
+    })
+}
+
+fn map_event(inner: &Arc<Inner>, ev: ServerEvent) -> Vec<BackendEvent> {
+    vec![match ev {
         ServerEvent::LayoutChanged { layout } => {
-            let l = parse_layout(&layout).ok()?;
+            let Ok(l) = parse_layout(&layout) else { return Vec::new() };
             *inner.layout.lock().unwrap_or_else(|e| e.into_inner()) = l.clone();
             BackendEvent::LayoutChanged(l)
         }
         ServerEvent::PaneClosed { pane_id } => BackendEvent::PaneClosed { pane_id: PaneId(pane_id) },
         ServerEvent::TitleChanged { pane_id, title } => BackendEvent::TitleChanged { pane_id: PaneId(pane_id), title },
         ServerEvent::CwdChanged { pane_id, cwd } => BackendEvent::CwdChanged { pane_id: PaneId(pane_id), cwd },
-        ServerEvent::PaneResized { pane_id, rows, cols } => {
-            BackendEvent::PaneResized { pane_id: PaneId(pane_id), rows, cols }
+        ServerEvent::PaneResized { pane_id, rows, cols, size_owner } => {
+            BackendEvent::PaneResized { pane_id: PaneId(pane_id), rows, cols, owner: size_owner.map(owner_info) }
+        }
+        ServerEvent::SizeOwnerChanged { pane_id, owner } => {
+            BackendEvent::SizeOwnerChanged { pane_id: PaneId(pane_id), owner: owner.map(owner_info) }
         }
         ServerEvent::StatusChanged { pane_id, status, message } => BackendEvent::StatusChanged {
             pane_id: PaneId(pane_id),
@@ -225,10 +247,12 @@ fn map_event(inner: &Arc<Inner>, ev: ServerEvent) -> Option<BackendEvent> {
             BackendEvent::Notification { pane_id: PaneId(pane_id), title, body }
         }
         // The pane stays listed only with `remain_on_exit`; `PaneClosed` removes it.
-        ServerEvent::PaneExited { .. } | ServerEvent::ClientConnected { .. } | ServerEvent::ClientDisconnected { .. } => {
-            return None
-        }
-    })
+        ServerEvent::InputDropped { pane_id, bytes } => BackendEvent::InputDropped { pane_id: PaneId(pane_id), bytes },
+        ServerEvent::PaneExited { .. }
+        | ServerEvent::ClientConnected { .. }
+        | ServerEvent::ClientDisconnected { .. }
+        | ServerEvent::Unknown => return Vec::new(),
+    }]
 }
 
 fn dir_str(d: SplitDir) -> &'static str {
@@ -399,6 +423,7 @@ impl SessionBackend for RemoteBackend {
                 cwd: text("cwd"),
                 status: v.get("status").and_then(Json::as_str).map(PaneStatus::parse).unwrap_or_default(),
                 exited: v.get("exited").and_then(Json::as_bool).unwrap_or(false),
+                size_owner: owner_from_json(&v),
             })
         })
     }

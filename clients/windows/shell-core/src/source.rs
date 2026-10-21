@@ -16,8 +16,14 @@ pub enum PaneEvent {
     /// Clear the pane's VT state and use this PTY size. The output that follows
     /// is a replay from the server, not new typing (first attach, or the
     /// server's log no longer holds the offset we asked for).
-    Reset { rows: u16, cols: u16 },
+    ///
+    /// `exact_replay` is true when the source also sends `ReplayEnd` where the replay stops,
+    /// so the view does not guess it.
+    Reset { rows: u16, cols: u16, exact_replay: bool },
     Output(Vec<u8>),
+    /// The replay after the last `Reset` is over: the bytes from here on are live. Only sent
+    /// when that `Reset` had `exact_replay`.
+    ReplayEnd,
     /// The pane ended (shell exited, connection lost for good).
     Closed(String),
 }

@@ -9,8 +9,16 @@
 //! - the ring holds `[total_written - ring.len(), total_written)`.
 //! - the file holds `[disk_first, disk_first + file_len)`. `disk_first` is
 //!   persisted in the sidecar `{pane_uuid}.log.off` (written when the file is
-//!   rotated or restarted), so offsets survive a server restart: at start
+//!   rotated or restarted), so offsets survive a server restart: after a
+//!   graceful stop (the sidecar is sealed with the file's end) at start
 //!   `total_written = disk_first + file_len`.
+//! - after an unclean stop (kill -9, power cut) the file can end before the
+//!   last offset a client saw: bytes were still in the disk queue. The next
+//!   start therefore moves the whole file forward in offset space, to a first
+//!   offset past anything a client can hold. The content is intact and the
+//!   ring is preloaded as after a clean stop, so the pane replays. A client
+//!   that kept an offset from before the crash is older than the log and
+//!   gets a reset, never other bytes under that offset.
 //!
 //! Readers (the v2 pane output streams) pull by offset ([`ByteLog::plan`],
 //! `SessionManager::read_log`). A slow reader therefore never loses bytes
@@ -54,10 +62,6 @@ pub const DISK_HIGH_WATER: u64 = 4 * 1024 * 1024;
 /// The appender merges queued chunks up to about this size into one write.
 const COALESCE_MAX: usize = 1024 * 1024;
 
-/// The appender publishes the file extent at least this often during a burst,
-/// so readers behind the ring can be served from the file while it runs.
-const FLUSH_EVERY: u64 = 1024 * 1024;
-
 /// Private message type: chunks to append + flush-signal with oneshot reply.
 enum DiskMsg {
     /// `start` is the absolute pane offset of `data[0]`.
@@ -66,6 +70,9 @@ enum DiskMsg {
         data: Bytes,
     },
     Flush(oneshot::Sender<()>),
+    /// Graceful stop: flush, fsync and seal the sidecar with the file's end,
+    /// so the next start knows nothing was lost.
+    Seal(oneshot::Sender<()>),
     /// Restart the file at absolute offset `first` holding `data` (test hook).
     Restart {
         first: u64,
@@ -100,6 +107,10 @@ pub struct LogShared {
     room: Notify,
     /// Set when the `ByteLog` is dropped (the pane is gone).
     closed: AtomicBool,
+    /// Set when the server is stopping: a disk write that keeps failing is
+    /// given up, so a full disk cannot hold the stop (the log stays unsealed,
+    /// and the next start treats it as a crash).
+    stopping: AtomicBool,
     /// Absolute offset one past the newest byte (mirror of the log's total).
     total: AtomicU64,
     /// Ring size in bytes.
@@ -107,6 +118,9 @@ pub struct LogShared {
     /// Odd while the appender replaces the file (rotation, restart). A reader
     /// that saw the same even value before and after its read got one file.
     epoch: AtomicU64,
+    /// Test hook: fail this many appender writes (after writing half).
+    #[cfg(test)]
+    fail_writes: AtomicU64,
 }
 
 /// Held by the appender while it replaces the file. Drop it after the new
@@ -211,6 +225,8 @@ impl Drop for ByteLog {
         self.shared.closed.store(true, Ordering::Release);
         self.shared.room.notify_waiters();
         self.shared.wake.notify_waiters();
+        // A stream waiting for the file to catch up must see the pane is gone.
+        self.shared.disk_progress.notify_waiters();
     }
 }
 
@@ -221,19 +237,51 @@ pub fn offset_sidecar_path(log_path: &Path) -> PathBuf {
     log_path.with_file_name(name)
 }
 
-fn read_sidecar(log_path: &Path) -> u64 {
-    std::fs::read_to_string(offset_sidecar_path(log_path))
-        .ok()
-        .and_then(|t| t.trim().parse::<u64>().ok())
-        .unwrap_or(0)
+/// What the sidecar says about the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Sidecar {
+    /// Absolute offset of the file's first byte.
+    first: u64,
+    /// The file's end when the server stopped gracefully. A file that still
+    /// ends there lost nothing since.
+    sealed: Option<u64>,
+}
+
+/// Read the sidecar of a log file that is `file_len` bytes long.
+///
+/// Forms: `<first>` (normal operation), `<first> sealed=<end>` (graceful
+/// stop), `R <old_first> <new_first> <new_len>` (a rotation was under way: it
+/// is done exactly when the file is `new_len` long, because the file is
+/// renamed into place after this line is written and nothing is appended
+/// before the next line replaces it).
+fn read_sidecar(log_path: &Path, file_len: u64) -> Option<Sidecar> {
+    let text = std::fs::read_to_string(offset_sidecar_path(log_path)).ok()?;
+    parse_sidecar(&text, file_len)
+}
+
+fn parse_sidecar(text: &str, file_len: u64) -> Option<Sidecar> {
+    let mut it = text.split_whitespace();
+    let head = it.next()?;
+    if head == "R" {
+        let old: u64 = it.next()?.parse().ok()?;
+        let new: u64 = it.next()?.parse().ok()?;
+        let new_len: u64 = it.next()?.parse().ok()?;
+        return Some(Sidecar { first: if file_len == new_len { new } else { old }, sealed: None });
+    }
+    let first: u64 = head.parse().ok()?;
+    let sealed = it.next().and_then(|t| t.strip_prefix("sealed=")).and_then(|t| t.parse().ok());
+    Some(Sidecar { first, sealed })
+}
+
+fn write_sidecar_text(log_path: &Path, text: &str) {
+    let path = offset_sidecar_path(log_path);
+    if let Err(e) = forgetty_core::fsutil::write_private_atomic(&path, text.as_bytes()) {
+        warn!(path = %path.display(), "byte log: could not write the offset sidecar: {e}");
+    }
 }
 
 fn write_sidecar(log_path: &Path, first: u64) {
-    let path = offset_sidecar_path(log_path);
-    if let Err(e) = forgetty_core::fsutil::write_private_atomic(&path, first.to_string().as_bytes())
-    {
-        warn!(path = %path.display(), "byte log: could not write the offset sidecar: {e}");
-    }
+    write_sidecar_text(log_path, &first.to_string());
 }
 
 impl ByteLog {
@@ -267,27 +315,60 @@ impl ByteLog {
             }
         }
 
-        // Pre-load the tail into the ring (AC-17).
+        let disk_enabled = max_disk_bytes > 0;
+
+        // What the file and the sidecar say about the offsets.
+        let existing_len = std::fs::metadata(&log_path).map(|m| m.len()).ok();
+        let file_len_on_disk = existing_len.unwrap_or(0);
+        let sidecar =
+            if existing_len.is_some() { read_sidecar(&log_path, file_len_on_disk) } else { None };
+        let disk_first = sidecar.map(|s| s.first).unwrap_or(0);
+        let file_end = disk_first + file_len_on_disk;
+        // A file that does not end where the last graceful stop left it may
+        // be short of what clients saw (bytes were queued when the process
+        // died). Jump past anything a client can hold.
+        let unclean = disk_enabled
+            && (file_len_on_disk > 0 || sidecar.is_some())
+            && sidecar.and_then(|s| s.sealed) != Some(file_end);
+        // The file keeps its content. Its first byte moves to an offset past
+        // anything a client can hold: what was queued when the process died
+        // is at most the ring, the disk queue and one coalesced write.
+        let shift = if unclean {
+            ring_capacity as u64 + DISK_HIGH_WATER + COALESCE_MAX as u64 + 64 * 1024
+        } else {
+            0
+        };
+        let disk_first = if unclean { file_end + shift } else { disk_first };
+        if unclean {
+            // Write it down before anything is appended, so a second crash
+            // sees the same file under the new offsets.
+            write_sidecar(&log_path, disk_first);
+            warn!(
+                path = %log_path.display(),
+                "byte log: unclean stop, offsets move from {file_end} to {disk_first}"
+            );
+        }
+        let file_len = file_len_on_disk;
+        // A clean start: the seal has done its job. Unseal the sidecar (plain
+        // `<first>`, fsynced) before anything is appended. Left sealed, output
+        // lost in a later crash would leave the file ending exactly where the
+        // seal says, and the next start would take it for clean and reuse the
+        // offsets of the lost bytes.
+        if disk_enabled && !unclean && sidecar.is_some_and(|s| s.sealed.is_some()) {
+            write_sidecar(&log_path, disk_first);
+        }
+
+        // Pre-load the tail into the ring (AC-17 cold-start replay). The ring
+        // ends at the newest offset, which is the end of the file.
         let mut ring: VecDeque<u8> = VecDeque::with_capacity(ring_capacity.min(1 << 20));
-        let mut file_len: u64 = 0;
-        let disk_first = if log_path.exists() { read_sidecar(&log_path) } else { 0 };
-        if log_path.exists() {
-            match std::fs::metadata(&log_path) {
-                Ok(meta) => {
-                    let size = meta.len();
-                    file_len = size;
-                    if ring_capacity > 0 && size > 0 {
-                        let to_read = std::cmp::min(size as usize, ring_capacity);
-                        let mut buf = vec![0u8; to_read];
-                        use std::io::{Read, Seek, SeekFrom};
-                        let mut f = std::fs::File::open(&log_path)?;
-                        f.seek(SeekFrom::End(-(to_read as i64)))?;
-                        f.read_exact(&mut buf)?;
-                        ring.extend(buf);
-                    }
-                }
-                Err(e) => warn!(path = %log_path.display(), "ByteLog::new: stat failed: {e}"),
-            }
+        if ring_capacity > 0 && file_len_on_disk > 0 {
+            let to_read = std::cmp::min(file_len_on_disk as usize, ring_capacity);
+            let mut buf = vec![0u8; to_read];
+            use std::io::{Read, Seek, SeekFrom};
+            let mut f = std::fs::File::open(&log_path)?;
+            f.seek(SeekFrom::End(-(to_read as i64)))?;
+            f.read_exact(&mut buf)?;
+            ring.extend(buf);
         }
         let total_bytes_written = disk_first + file_len;
 
@@ -297,7 +378,6 @@ impl ByteLog {
         forgetty_core::fsutil::fix_file_mode(&log_path)?;
         let tokio_file = tokio::fs::File::from_std(std_file);
 
-        let disk_enabled = max_disk_bytes > 0;
         let shared = Arc::new(LogShared {
             path: log_path.clone(),
             disk_enabled,
@@ -307,9 +387,12 @@ impl ByteLog {
             queued: AtomicU64::new(0),
             room: Notify::new(),
             closed: AtomicBool::new(false),
+            stopping: AtomicBool::new(false),
             total: AtomicU64::new(total_bytes_written),
             ring_capacity,
             epoch: AtomicU64::new(0),
+            #[cfg(test)]
+            fail_writes: AtomicU64::new(0),
         });
 
         // Disk queue. Chunks are never dropped: the caller of `append` waits
@@ -384,6 +467,11 @@ impl ByteLog {
     }
 
     /// Shared state for readers: wake-ups and the file extent.
+    /// The server is stopping: stop retrying failed disk writes.
+    pub fn set_stopping(&self) {
+        self.shared.stopping.store(true, Ordering::Release);
+    }
+
     pub fn shared(&self) -> Arc<LogShared> {
         self.shared.clone()
     }
@@ -391,6 +479,12 @@ impl ByteLog {
     /// Absolute offset one past the newest byte.
     pub fn total_written(&self) -> u64 {
         self.total_bytes_written
+    }
+
+    /// Offset of the first byte of the file (tests).
+    #[cfg(test)]
+    fn disk_first(&self) -> u64 {
+        self.shared.disk_state().first
     }
 
     /// Absolute offset of the first byte in the ring.
@@ -436,8 +530,8 @@ impl ByteLog {
         if self.shared.disk_enabled {
             let disk = self.shared.disk_state();
             if next >= disk.first {
-                let len = (ring_first - next).min(max as u64) as usize;
-                return LogPlan::Disk { disk, len };
+                let len = (ring_first - next).min(max as u64);
+                return LogPlan::Disk { disk, len: len as usize };
             }
             return LogPlan::Lost { first: disk.first.min(ring_first) };
         }
@@ -488,6 +582,20 @@ impl ByteLog {
             let (reply_tx, reply_rx) = oneshot::channel();
             tx_clone
                 .send(DiskMsg::Flush(reply_tx))
+                .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
+            reply_rx.await.map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
+            Ok(())
+        }
+    }
+
+    /// Return an owned future that seals this log for a graceful stop (see
+    /// [`DiskMsg::Seal`]). Call it once, after the last append.
+    pub fn make_seal_future(&self) -> impl std::future::Future<Output = io::Result<()>> + 'static {
+        let tx_clone = self.disk_tx.clone();
+        async move {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            tx_clone
+                .send(DiskMsg::Seal(reply_tx))
                 .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
             reply_rx.await.map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
             Ok(())
@@ -571,7 +679,6 @@ async fn disk_appender_task(
     // BufWriter amortises the cost of small PTY chunks.
     let mut writer = BufWriter::new(file);
     let log_path = shared.path.clone();
-    let mut unflushed: u64 = 0;
 
     // A message read while coalescing chunks, handled on the next turn.
     let mut stash: Option<DiskMsg> = None;
@@ -586,6 +693,8 @@ async fn disk_appender_task(
                 // Sender dropped — ByteLog is being closed. Flush and exit.
                 let _ = writer.flush().await;
                 debug!(pane = %pane_id, "disk appender: channel closed, exiting");
+                // Streams waiting for the file see the pane is gone.
+                shared.disk_progress.notify_waiters();
                 return;
             }
             Some(DiskMsg::Chunk { start, data }) => {
@@ -644,35 +753,29 @@ async fn disk_appender_task(
                         }
                     }
                 }
-                if let Err(e) = writer.write_all(&data).await {
-                    warn!(pane = %pane_id, "disk appender: write_all failed: {e}");
-                    continue;
+                // The write. A failure (disk full, a hiccup) never drops the
+                // chunk and never lets the next one open a gap: the appender
+                // waits, finds out how much of the chunk reached the file, and
+                // writes the rest. The PTY is held by the queue filling up
+                // meanwhile (AD-023), as it is for a slow disk.
+                if !write_with_retry(&pane_id, &shared, &log_path, &mut writer, file_len, &data)
+                    .await
+                {
+                    return; // the pane closed while the disk was failing
                 }
                 file_len = file_len.saturating_add(data.len() as u64);
-                unflushed += data.len() as u64;
 
-                // End of this drain wake: nothing else is queued, so hand the
-                // buffered bytes to the kernel now. A kill -9 or a crash then
-                // loses nothing the pane already printed (the page cache
-                // outlives the process). Event driven, no timer (AD-009). A
-                // burst is written as one flush at its end.
-                if shared.queued.load(Ordering::Acquire) == 0 || unflushed >= FLUSH_EVERY {
-                    unflushed = 0;
-                    if let Err(e) = writer.flush().await {
-                        warn!(pane = %pane_id, "disk appender: flush failed: {e}");
-                    } else {
-                        shared.set_disk(DiskState {
-                            first: file_first,
-                            flushed_to: file_first + file_len,
-                        });
-                        shared.disk_progress.notify_waiters();
-                    }
-                }
+                // Hand the batch to the kernel now (it is already flushed by
+                // the write), so a kill -9 loses nothing the pane already
+                // printed (the page cache outlives the process), and publish
+                // the extent to readers behind the ring.
+                shared.set_disk(DiskState { first: file_first, flushed_to: file_first + file_len });
+                shared.disk_progress.notify_waiters();
 
                 if file_len >= max_disk_bytes {
                     // Rotation: keep newest max_disk_bytes / 2 (SPEC §10.6).
                     let _change = FileChange::begin(&shared);
-                    match rotate_log(&log_path, &mut writer, max_disk_bytes / 2).await {
+                    match rotate_log(&log_path, &mut writer, max_disk_bytes / 2, file_first).await {
                         Ok(kept) => {
                             let new_first = file_first + (file_len - kept);
                             file_first = new_first;
@@ -725,6 +828,80 @@ async fn disk_appender_task(
                 shared.disk_progress.notify_waiters();
                 let _ = reply.send(());
             }
+            Some(DiskMsg::Seal(reply)) => {
+                let _ = writer.flush().await;
+                let synced = writer.get_ref().sync_data().await.is_ok();
+                if synced {
+                    write_sidecar_text(
+                        &log_path,
+                        &format!("{file_first} sealed={}", file_first + file_len),
+                    );
+                } else {
+                    warn!(pane = %pane_id, "disk appender: fsync failed, log not sealed");
+                }
+                let _ = reply.send(());
+            }
+        }
+    }
+}
+
+/// Write `data` (the bytes at file position `file_len`) and flush, retrying
+/// until all of it is in the file. Returns `false` if the pane closed first.
+async fn write_with_retry(
+    pane_id: &Uuid,
+    shared: &LogShared,
+    log_path: &Path,
+    writer: &mut BufWriter<tokio::fs::File>,
+    file_len: u64,
+    data: &[u8],
+) -> bool {
+    let mut done = 0usize;
+    let mut wait = std::time::Duration::from_millis(50);
+    loop {
+        let res = async {
+            #[cfg(test)]
+            if shared.fail_writes.load(Ordering::SeqCst) > 0 {
+                shared.fail_writes.fetch_sub(1, Ordering::SeqCst);
+                // A short write, then the error: the hard case.
+                let half = (data.len() - done) / 2;
+                writer.write_all(&data[done..done + half]).await?;
+                writer.flush().await?;
+                return Err(io::Error::other("injected write failure"));
+            }
+            writer.write_all(&data[done..]).await?;
+            writer.flush().await
+        }
+        .await;
+        let Err(e) = res else { return true };
+        warn!(pane = %pane_id, "disk appender: write failed, will retry: {e}");
+        loop {
+            if shared.closed.load(Ordering::Acquire) || shared.stopping.load(Ordering::Acquire) {
+                return false;
+            }
+            tokio::time::sleep(wait).await;
+            wait = (wait * 2).min(std::time::Duration::from_secs(2));
+            // How much of this chunk is in the file? A fresh handle drops
+            // whatever the failed writer still buffers.
+            let reopened = (|| -> io::Result<(tokio::fs::File, u64)> {
+                let f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .mode(0o600)
+                    .open(log_path)?;
+                let len = f.metadata()?.len();
+                Ok((tokio::fs::File::from_std(f), len))
+            })();
+            match reopened {
+                Ok((f, len)) => {
+                    done = (len.saturating_sub(file_len) as usize).min(data.len());
+                    *writer = BufWriter::new(f);
+                    break;
+                }
+                Err(e) => warn!(pane = %pane_id, "disk appender: reopen failed: {e}"),
+            }
+        }
+        if done == data.len() {
+            return true;
         }
     }
 }
@@ -753,6 +930,7 @@ async fn rotate_log(
     log_path: &PathBuf,
     writer: &mut BufWriter<tokio::fs::File>,
     keep_bytes: u64,
+    file_first: u64,
 ) -> io::Result<u64> {
     // Flush and close (via drop) the current writer before reading the file.
     writer.flush().await?;
@@ -795,6 +973,12 @@ async fn rotate_log(
         dst.flush().await?;
         dst.sync_all().await?; // rotation cross-flush: durability on the new tail
     }
+
+    // The sidecar learns about the rotation before the file changes, so a
+    // crash between the rename and the next sidecar write still finds the
+    // right first offset (see `read_sidecar`).
+    let new_first = file_first + (current_size - to_keep);
+    write_sidecar_text(log_path, &format!("R {file_first} {new_first} {to_keep}"));
 
     // Rename tmp over original (atomic on same filesystem).
     tokio::fs::rename(&tmp_path, log_path).await?;
@@ -1006,6 +1190,8 @@ mod tests {
         let sidecar =
             std::fs::read_to_string(offset_sidecar_path(&pane_log_path(pane_id))).unwrap();
         assert_eq!(sidecar.trim().parse::<u64>().unwrap(), disk.first);
+        // A graceful stop seals the sidecar, so the offsets carry over exactly.
+        log.make_seal_future().await.unwrap();
         drop(log);
 
         let log2 = ByteLog::new(pane_id, 1024, max_disk).unwrap();
@@ -1110,6 +1296,186 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert_eq!(std::fs::read(pane_log_path(pane_id)).unwrap(), b"456789");
+        cleanup(pane_id);
+    }
+
+    /// A failing disk write (ENOSPC, a hiccup) keeps the chunk, retries, and
+    /// never opens a gap that would make the appender truncate the file.
+    #[tokio::test]
+    async fn write_failures_keep_the_chunk_and_the_file() {
+        let pane_id = Uuid::new_v4();
+        let mut log = ByteLog::new(pane_id, 4096, 1024 * 1024).unwrap();
+        log.append(b"aaaa");
+        log.flush_signal().await.unwrap();
+        log.shared().fail_writes.store(3, Ordering::SeqCst);
+        log.append(b"bbbbbbbb");
+        log.append(b"cccc");
+        log.flush_signal().await.unwrap();
+        assert_eq!(log.shared().fail_writes.load(Ordering::SeqCst), 0, "the failures were used");
+        assert_eq!(std::fs::read(pane_log_path(pane_id)).unwrap(), b"aaaabbbbbbbbcccc");
+        assert_eq!(log.shared().disk_state(), DiskState { first: 0, flushed_to: 16 });
+        cleanup(pane_id);
+    }
+
+    /// After an unclean stop the file moves to offsets past anything a client
+    /// can hold. The content is still served, and the pane replays.
+    #[tokio::test]
+    async fn an_unclean_start_moves_the_offsets_and_keeps_the_content() {
+        let pane_id = Uuid::new_v4();
+        {
+            let mut log = ByteLog::new(pane_id, 4096, 1024 * 1024).unwrap();
+            log.append(&[7u8; 100]);
+            log.flush_signal().await.unwrap();
+            // dropped without a seal: a kill -9
+        }
+        let mut log = ByteLog::new(pane_id, 4096, 1024 * 1024).unwrap();
+        let (first, total) = (log.disk_first(), log.total_written());
+        assert!(first >= 100 + 4096 + DISK_HIGH_WATER, "first {first}");
+        assert_eq!(total, first + 100);
+        // Offsets a client held before the crash are older than the log.
+        for old in [0u64, 10, 99, 100, 5000] {
+            assert!(matches!(log.plan(old, 1000), LogPlan::Lost { .. }), "offset {old}");
+        }
+        // The content is there under the new offsets (from the ring).
+        match log.plan(first, 1000) {
+            LogPlan::Ring(b) => assert_eq!(b, vec![7u8; 100]),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(log.plan(total, 10), LogPlan::Caught));
+        // New bytes follow, and a later clean restart keeps everything.
+        log.append(b"after");
+        log.flush_signal().await.unwrap();
+        log.make_seal_future().await.unwrap();
+        drop(log);
+        let log = ByteLog::new(pane_id, 4096, 1024 * 1024).unwrap();
+        assert_eq!((log.disk_first(), log.total_written()), (first, total + 5));
+        match log.plan(total, 10) {
+            LogPlan::Ring(b) => assert_eq!(b, b"after"),
+            other => panic!("{other:?}"),
+        }
+        cleanup(pane_id);
+    }
+
+    /// A second crash before the first start sealed anything moves the file
+    /// again: offsets never go back.
+    #[tokio::test]
+    async fn two_unclean_starts_in_a_row_keep_moving_forward() {
+        let pane_id = Uuid::new_v4();
+        {
+            let mut log = ByteLog::new(pane_id, 4096, 1024 * 1024).unwrap();
+            log.append(&[1u8; 50]);
+            log.flush_signal().await.unwrap();
+        }
+        let first_a = ByteLog::new(pane_id, 4096, 1024 * 1024).unwrap().disk_first();
+        let first_b = ByteLog::new(pane_id, 4096, 1024 * 1024).unwrap().disk_first();
+        assert!(first_b > first_a + 50, "{first_a} then {first_b}");
+        cleanup(pane_id);
+    }
+
+    /// A graceful stop keeps the offsets exactly and replays the tail.
+    #[tokio::test]
+    async fn a_sealed_log_restarts_at_the_same_offsets() {
+        let pane_id = Uuid::new_v4();
+        {
+            let mut log = ByteLog::new(pane_id, 4096, 1024 * 1024).unwrap();
+            log.append(b"hello world");
+            log.flush_signal().await.unwrap();
+            log.make_seal_future().await.unwrap();
+        }
+        let log = ByteLog::new(pane_id, 4096, 1024 * 1024).unwrap();
+        assert_eq!(log.total_written(), 11);
+        match log.plan(6, 100) {
+            LogPlan::Ring(b) => assert_eq!(b, b"world"),
+            other => panic!("{other:?}"),
+        }
+        cleanup(pane_id);
+    }
+
+    /// The sidecar of a rotation that was under way names the right first
+    /// offset whether or not the rename happened.
+    #[test]
+    fn a_rotation_in_flight_resolves_by_the_file_length() {
+        assert_eq!(parse_sidecar("R 100 600 400", 900), Some(Sidecar { first: 100, sealed: None }));
+        assert_eq!(parse_sidecar("R 100 600 400", 400), Some(Sidecar { first: 600, sealed: None }));
+        assert_eq!(parse_sidecar("42", 7), Some(Sidecar { first: 42, sealed: None }));
+        assert_eq!(parse_sidecar("42 sealed=49", 7), Some(Sidecar { first: 42, sealed: Some(49) }));
+        assert_eq!(parse_sidecar("garbage", 7), None);
+    }
+
+    /// A stream parked on the file's progress wakes when the pane goes away.
+    #[tokio::test]
+    async fn closing_the_log_wakes_the_readers_waiting_on_the_disk() {
+        let pane_id = Uuid::new_v4();
+        let log = ByteLog::new(pane_id, 1024, 1024 * 1024).unwrap();
+        let shared = log.shared();
+        let progress = shared.disk_progress.notified();
+        tokio::pin!(progress);
+        progress.as_mut().enable();
+        drop(log);
+        tokio::time::timeout(std::time::Duration::from_secs(2), progress)
+            .await
+            .expect("no wake-up when the log closed");
+        cleanup(pane_id);
+    }
+
+    /// A sealed log that restarts cleanly is unsealed before output starts:
+    /// bytes lost in a later crash must not let the next start reuse their
+    /// offsets for different bytes.
+    #[tokio::test]
+    async fn output_lost_after_a_clean_start_does_not_reuse_offsets() {
+        let pane_id = Uuid::new_v4();
+        {
+            let mut log = ByteLog::new(pane_id, 4096, 1024 * 1024).unwrap();
+            log.append(b"AAAA");
+            log.flush_signal().await.unwrap();
+            log.make_seal_future().await.unwrap();
+        }
+        // Clean start: offsets continue at 4, and the sidecar is no longer sealed.
+        {
+            let mut log = ByteLog::new(pane_id, 4096, 1024 * 1024).unwrap();
+            assert_eq!(log.total_written(), 4);
+            let sidecar =
+                std::fs::read_to_string(offset_sidecar_path(&pane_log_path(pane_id))).unwrap();
+            assert_eq!(sidecar.trim(), "0", "sidecar after a clean start: {sidecar:?}");
+            log.append(b"BBBB"); // offsets 4..8, a client may have seen them
+            log.flush_signal().await.unwrap();
+        }
+        // kill -9: the queue never reached the file.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(pane_log_path(pane_id))
+            .unwrap()
+            .set_len(4)
+            .unwrap();
+        let mut log = ByteLog::new(pane_id, 4096, 1024 * 1024).unwrap();
+        assert!(
+            log.total_written() >= 8,
+            "offsets 4..8 were handed out: total {}",
+            log.total_written()
+        );
+        log.append(b"CCCC");
+        log.flush_signal().await.unwrap();
+        // No offset below the old total answers with other bytes.
+        for off in 0..8u64 {
+            let plan = log.plan(off, 8);
+            assert!(matches!(plan, LogPlan::Lost { .. }), "offset {off} is still served: {plan:?}");
+        }
+        cleanup(pane_id);
+    }
+
+    /// A disk that keeps failing does not hold a stop: with `stopping` set the
+    /// appender gives up and the flush returns.
+    #[tokio::test]
+    async fn a_failing_disk_does_not_hold_the_stop() {
+        let pane_id = Uuid::new_v4();
+        let mut log = ByteLog::new(pane_id, 4096, 1024 * 1024).unwrap();
+        log.shared().fail_writes.store(1_000_000, Ordering::SeqCst);
+        log.append(b"stuck");
+        let flush = log.make_flush_future();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        log.set_stopping();
+        let r = tokio::time::timeout(std::time::Duration::from_secs(5), flush).await;
+        assert!(r.is_ok(), "the flush is still waiting on a failing disk");
         cleanup(pane_id);
     }
 }

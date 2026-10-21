@@ -14,6 +14,8 @@ use forgetty_pty::{PtyProcess, PtySize};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tracing::{debug, warn};
 
+use crate::pane_writer::PaneWriterOwner;
+
 /// Chunks (up to 64 KiB each) the reader thread may queue before it blocks.
 const PTY_QUEUE_CHUNKS: usize = 16;
 
@@ -31,6 +33,9 @@ pub struct PtyBridge {
     /// `Some` on construction; taken to `None` by `SessionManager::take_pane_output_rx`
     /// when the per-pane drain task is spawned.
     pub pty_rx: Option<Receiver<Vec<u8>>>,
+    /// Input queue and writer thread. Writes go here, never to `pty`, so a
+    /// program that does not read cannot hold a lock (see [`crate::pane_writer`]).
+    pub writer: PaneWriterOwner,
 }
 
 impl PtyBridge {
@@ -70,6 +75,12 @@ impl PtyBridge {
             .take_reader()
             .ok_or_else(|| "PTY reader should be available on fresh PtyProcess".to_string())?;
 
+        let out = pty
+            .take_writer()
+            .ok_or_else(|| "PTY writer should be available on fresh PtyProcess".to_string())?;
+        let writer =
+            PaneWriterOwner::spawn(out).map_err(|e| format!("spawn PTY writer thread: {e}"))?;
+
         let (tx, rx) = channel::<Vec<u8>>(PTY_QUEUE_CHUNKS);
 
         thread::Builder::new()
@@ -79,7 +90,7 @@ impl PtyBridge {
             })
             .map_err(|e| format!("failed to spawn PTY reader thread: {e}"))?;
 
-        Ok(Self { pty, pty_rx: Some(rx) })
+        Ok(Self { pty, pty_rx: Some(rx), writer })
     }
 }
 

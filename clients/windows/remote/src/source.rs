@@ -98,12 +98,19 @@ impl RemotePaneSource {
         let reader = rt.spawn(async move {
             let mut rows = 24u16;
             let mut marker_due = false;
+            // Where the replay after the last reset ends, while it is still going on.
+            let mut replay_end: Option<u64> = None;
+            let mut replay_open = false;
             loop {
-                let ev = match stream.next().await {
+                let mut evs: Vec<PaneEvent> = Vec::with_capacity(2);
+                let mut last = false;
+                match stream.next().await {
                     Some(PaneItem::Reset { rows: r, cols }) => {
                         rows = r;
                         marker_due = true;
-                        PaneEvent::Reset { rows: r, cols }
+                        replay_end = stream.replay_end();
+                        replay_open = replay_end.is_some();
+                        evs.push(PaneEvent::Reset { rows: r, cols, exact_replay: replay_open });
                     }
                     // AD-023: the client fell behind. The VT was just reset. A one line
                     // marker goes into scrollback, then the snapshot paints the screen.
@@ -111,20 +118,37 @@ impl RemotePaneSource {
                         // A snapshot can arrive in several frames: one marker per reset.
                         let mut out = if std::mem::take(&mut marker_due) { snapshot_marker(rows) } else { Vec::new() };
                         out.extend_from_slice(&bytes);
-                        PaneEvent::Output(out)
+                        evs.push(PaneEvent::Output(out));
                     }
-                    Some(PaneItem::Data { bytes, .. }) => PaneEvent::Output(bytes),
+                    Some(PaneItem::Data { offset, bytes }) => {
+                        // Bytes from `replay_end` on are live: end the replay before them.
+                        if replay_open && replay_end.is_some_and(|e| offset >= e) {
+                            replay_open = false;
+                            evs.push(PaneEvent::ReplayEnd);
+                        }
+                        let end = offset + bytes.len() as u64;
+                        evs.push(PaneEvent::Output(bytes));
+                        if replay_open && replay_end.is_some_and(|e| end >= e) {
+                            replay_open = false;
+                            evs.push(PaneEvent::ReplayEnd);
+                        }
+                    }
                     Some(PaneItem::Ended) => {
-                        let _ = ev_tx.send(PaneEvent::Closed("pane ended".into())).await;
-                        break;
+                        evs.push(PaneEvent::Closed("pane ended".into()));
+                        last = true;
                     }
                     None => {
-                        let _ = ev_tx.send(PaneEvent::Closed("connection closed".into())).await;
-                        break;
+                        evs.push(PaneEvent::Closed("connection closed".into()));
+                        last = true;
                     }
-                };
-                if ev_tx.send(ev).await.is_err() {
-                    break; // the view is gone
+                }
+                for ev in evs {
+                    if ev_tx.send(ev).await.is_err() {
+                        return; // the view is gone
+                    }
+                }
+                if last {
+                    break;
                 }
             }
         });

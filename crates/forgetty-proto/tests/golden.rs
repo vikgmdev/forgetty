@@ -38,9 +38,25 @@ fn golden_hello() {
 #[test]
 fn golden_welcome() {
     golden::<HandshakeReply>(
-        HandshakeReply::Welcome(Welcome { proto_major: 2, proto_minor: 0, server_id: id(2), server_version: "3.0.0".into(), hostname: "ovh".into(), capabilities: vec!["resume".into()] }),
+        HandshakeReply::Welcome(Welcome { proto_major: 2, proto_minor: 0, server_id: id(2), server_version: "3.0.0".into(), hostname: "ovh".into(), capabilities: vec!["resume".into()], boot_id: None }),
         "81a757656c636f6d6586ab70726f746f5f6d616a6f7202ab70726f746f5f6d696e6f7200a97365727665725f6964d92430323032303230322d303230322d303230322d303230322d303230323032303230323032ae7365727665725f76657273696f6ea5332e302e30a8686f73746e616d65a36f7668ac6361706162696c697469657391a6726573756d65",
     );
+}
+
+#[test]
+fn golden_welcome_with_boot_id() {
+    let w = Welcome {
+        proto_major: 2,
+        proto_minor: 0,
+        server_id: id(2),
+        server_version: "3.0.0".into(),
+        hostname: "ovh".into(),
+        capabilities: vec!["resume".into()],
+        boot_id: Some(id(7)),
+    };
+    // The new field is the last key. `golden_welcome` (no `boot_id`) is
+    // unchanged, so a server that sends none decodes with `None`.
+    golden::<HandshakeReply>(HandshakeReply::Welcome(w), "81a757656c636f6d6587ab70726f746f5f6d616a6f7202ab70726f746f5f6d696e6f7200a97365727665725f6964d92430323032303230322d303230322d303230322d303230322d303230323032303230323032ae7365727665725f76657273696f6ea5332e302e30a8686f73746e616d65a36f7668ac6361706162696c697469657391a6726573756d65a7626f6f745f6964d92430373037303730372d303730372d303730372d303730372d303730373037303730373037");
 }
 
 #[test]
@@ -130,7 +146,7 @@ fn golden_ev_cwd() {
 #[test]
 fn golden_ev_resized() {
     golden::<ControlMsg>(
-        ControlMsg::Event { seq: 5, event: ServerEvent::PaneResized { pane_id: id(3), rows: 24, cols: 80 } },
+        ControlMsg::Event { seq: 5, event: ServerEvent::PaneResized { pane_id: id(3), rows: 24, cols: 80, size_owner: None } },
         "81a54576656e7482a373657105a56576656e7481ab50616e65526573697a656483a770616e655f6964d92430333033303330332d303330332d303330332d303330332d303330333033303330333033a4726f777318a4636f6c7350",
     );
 }
@@ -176,9 +192,49 @@ fn golden_ev_cdisc() {
 }
 
 #[test]
+fn golden_header_with_replay_end() {
+    let h = PaneStreamHeader {
+        pane_id: id(3),
+        start_offset: 65536,
+        reset: false,
+        rows: 24,
+        cols: 80,
+        snapshot_len: 0,
+        replay_end: Some(70000),
+    };
+    // The new field is the last key. The header without it is unchanged
+    // (`golden_header`), and a decoder that does not know the field skips it.
+    let bytes = rmp_serde::to_vec_named(&h).unwrap();
+    golden::<PaneStreamHeader>(h.clone(), "86a770616e655f6964d92430333033303330332d303330332d303330332d303330332d303330333033303330333033ac73746172745f6f6666736574ce00010000a57265736574c2a4726f777318a4636f6c7350aa7265706c61795f656e64ce00011170");
+    // Old header (no field) decodes with `None`.
+    let old = unhex("85a770616e655f6964d92430333033303330332d303330332d303330332d303330332d303330333033303330333033ac73746172745f6f6666736574ce00010000a57265736574c2a4726f777318a4636f6c7350");
+    let d = rmp_serde::from_slice::<PaneStreamHeader>(&old).unwrap();
+    assert_eq!(d.replay_end, None);
+    // A decoder from before the field reads the new header: it is a plain
+    // map with one more key. Mimic it with a struct that lacks the field.
+    #[derive(serde::Deserialize, Debug, PartialEq)]
+    struct Old {
+        start_offset: u64,
+        reset: bool,
+        rows: u16,
+        cols: u16,
+    }
+    let o = rmp_serde::from_slice::<Old>(&bytes).unwrap();
+    assert_eq!((o.start_offset, o.reset, o.rows, o.cols), (65536, false, 24, 80));
+}
+
+#[test]
+fn golden_ev_input_dropped() {
+    golden::<ControlMsg>(
+        ControlMsg::Event { seq: 11, event: ServerEvent::InputDropped { pane_id: id(3), bytes: 4096 } },
+        "81a54576656e7482a37365710ba56576656e7481ac496e70757444726f7070656482a770616e655f6964d92430333033303330332d303330332d303330332d303330332d303330333033303330333033a56279746573cd1000",
+    );
+}
+
+#[test]
 fn golden_header() {
     golden::<PaneStreamHeader>(
-        PaneStreamHeader { pane_id: id(3), start_offset: 65536, reset: false, rows: 24, cols: 80, snapshot_len: 0 },
+        PaneStreamHeader { pane_id: id(3), start_offset: 65536, reset: false, rows: 24, cols: 80, snapshot_len: 0, replay_end: None },
         "85a770616e655f6964d92430333033303330332d303330332d303330332d303330332d303330333033303330333033ac73746172745f6f6666736574ce00010000a57265736574c2a4726f777318a4636f6c7350",
     );
 }
@@ -326,6 +382,7 @@ fn uuids_are_strings_not_bin() {
         rows: 1,
         cols: 1,
         snapshot_len: 0,
+        replay_end: None,
     };
     let bytes = encode_msg(&h).unwrap();
     assert!(bytes.windows(2).any(|w| w == [0xd9, 0x24]));
@@ -359,6 +416,7 @@ fn snapshot_header_roundtrips_and_a_plain_one_has_no_snapshot_field() {
         rows: 24,
         cols: 80,
         snapshot_len: 0,
+        replay_end: None,
     };
     let snap = PaneStreamHeader { reset: true, snapshot_len: 5000, ..plain.clone() };
     let a = rmp_serde::to_vec_named(&plain).unwrap();
@@ -366,4 +424,161 @@ fn snapshot_header_roundtrips_and_a_plain_one_has_no_snapshot_field() {
     assert!(b.len() > a.len());
     assert_eq!(rmp_serde::from_slice::<PaneStreamHeader>(&a).unwrap(), plain);
     assert_eq!(rmp_serde::from_slice::<PaneStreamHeader>(&b).unwrap(), snap);
+}
+
+fn owner() -> SizeOwner {
+    SizeOwner { client_id: id(4), client_kind: ClientKind::Local, client_name: "gtk".into() }
+}
+
+#[test]
+fn golden_ev_resized_with_owner() {
+    golden::<ControlMsg>(
+        ControlMsg::Event {
+            seq: 5,
+            event: ServerEvent::PaneResized { pane_id: id(3), rows: 24, cols: 80, size_owner: Some(owner()) },
+        },
+        "81a54576656e7482a373657105a56576656e7481ab50616e65526573697a656484a770616e655f6964d92430333033303330332d303330332d303330332d303330332d303330333033303330333033a4726f777318a4636f6c7350aa73697a655f6f776e657283a9636c69656e745f6964d92430343034303430342d303430342d303430342d303430342d303430343034303430343034ab636c69656e745f6b696e64a56c6f63616cab636c69656e745f6e616d65a367746b",
+    );
+}
+
+#[test]
+fn golden_ev_size_owner_changed() {
+    golden::<ControlMsg>(
+        ControlMsg::Event {
+            seq: 6,
+            event: ServerEvent::SizeOwnerChanged { pane_id: id(3), owner: Some(owner()) },
+        },
+        "81a54576656e7482a373657106a56576656e7481b053697a654f776e65724368616e67656482a770616e655f6964d92430333033303330332d303330332d303330332d303330332d303330333033303330333033a56f776e657283a9636c69656e745f6964d92430343034303430342d303430342d303430342d303430342d303430343034303430343034ab636c69656e745f6b696e64a56c6f63616cab636c69656e745f6e616d65a367746b",
+    );
+    golden::<ControlMsg>(
+        ControlMsg::Event { seq: 7, event: ServerEvent::SizeOwnerChanged { pane_id: id(3), owner: None } },
+        "81a54576656e7482a373657107a56576656e7481b053697a654f776e65724368616e67656482a770616e655f6964d92430333033303330332d303330332d303330332d303330332d303330333033303330333033a56f776e6572c0",
+    );
+}
+
+/// An old client decodes `PaneResized` from the new server: the `size_owner`
+/// key is unknown to it and is ignored.
+#[test]
+fn an_old_decoder_ignores_size_owner_on_pane_resized() {
+    #[derive(Debug, PartialEq, serde::Deserialize)]
+    enum OldEvent {
+        PaneResized {
+            #[serde(with = "uuid_str")]
+            pane_id: Uuid,
+            rows: u16,
+            cols: u16,
+        },
+    }
+    #[derive(Debug, PartialEq, serde::Deserialize)]
+    enum OldMsg {
+        Event { seq: u64, event: OldEvent },
+    }
+    let new = ControlMsg::Event {
+        seq: 5,
+        event: ServerEvent::PaneResized {
+            pane_id: id(3),
+            rows: 24,
+            cols: 80,
+            size_owner: Some(owner()),
+        },
+    };
+    let old: OldMsg = decode_msg(&encode_msg(&new).unwrap()).unwrap();
+    assert_eq!(
+        old,
+        OldMsg::Event {
+            seq: 5,
+            event: OldEvent::PaneResized { pane_id: id(3), rows: 24, cols: 80 }
+        }
+    );
+    // And the other way: an old server's event decodes with no owner.
+    let bytes = unhex("81a54576656e7482a373657105a56576656e7481ab50616e65526573697a656483a770616e655f6964d92430333033303330332d303330332d303330332d303330332d303330333033303330333033a4726f777318a4636f6c7350");
+    let back: ControlMsg = decode_msg(&bytes).unwrap();
+    assert_eq!(
+        back,
+        ControlMsg::Event {
+            seq: 5,
+            event: ServerEvent::PaneResized {
+                pane_id: id(3),
+                rows: 24,
+                cols: 80,
+                size_owner: None
+            }
+        }
+    );
+}
+
+/// What an old client decodes. `ClientKind` and the events are strict in a
+/// decoder that has no `Unknown` (the shape of the pre-`local` Android code).
+mod old_shape {
+    use serde::Deserialize;
+
+    #[derive(Debug, PartialEq, Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    pub enum OldKind {
+        Windows,
+        Android,
+        Cli,
+        Gtk,
+        #[serde(other)]
+        Unknown,
+    }
+
+    #[derive(Debug, Deserialize)]
+    pub struct OldEntry {
+        pub client_name: String,
+        pub client_kind: OldKind,
+    }
+}
+
+/// `list_clients` from a newer server has a kind this version does not know.
+/// The other entries still decode, and the unknown one becomes `Unknown`.
+#[test]
+fn a_list_clients_with_an_unknown_kind_still_decodes() {
+    #[derive(serde::Serialize)]
+    struct Raw {
+        client_id: String,
+        client_kind: &'static str,
+        client_name: &'static str,
+        connected_at: &'static str,
+    }
+    let raw = |kind, name| Raw {
+        client_id: id(5).to_string(),
+        client_kind: kind,
+        client_name: name,
+        connected_at: "2026-10-21T00:00:00Z",
+    };
+    let list = vec![raw("android", "phone"), raw("hologram", "future"), raw("local", "gtk")];
+    let bytes = encode_msg(&list).unwrap();
+    let back: Vec<ClientEntry> = decode_msg(&bytes).unwrap();
+    let kinds: Vec<ClientKind> = back.iter().map(|c| c.client_kind).collect();
+    assert_eq!(kinds, [ClientKind::Android, ClientKind::Unknown, ClientKind::Local]);
+    assert_eq!(back[1].client_name, "future");
+    // The same holds for a decoder that predates `local`.
+    let old: Vec<old_shape::OldEntry> = decode_msg(&bytes).unwrap();
+    assert_eq!(old[0].client_kind, old_shape::OldKind::Android);
+    assert_eq!(old[1].client_kind, old_shape::OldKind::Unknown);
+    assert_eq!(old[2].client_kind, old_shape::OldKind::Unknown);
+    assert_eq!(old[2].client_name, "gtk");
+}
+
+/// An event this version does not know does not break the frame: it decodes
+/// as `Unknown` with its `seq`. A known event with a bad payload is still an
+/// error.
+#[test]
+fn an_unknown_event_decodes_as_unknown_and_keeps_its_seq() {
+    #[derive(serde::Serialize)]
+    enum Future {
+        BrandNew { pane_id: String, x: u32 },
+        PaneResized { pane_id: String },
+    }
+    #[derive(serde::Serialize)]
+    enum FutureMsg {
+        Event { seq: u64, event: Future },
+    }
+    let msg = FutureMsg::Event { seq: 9, event: Future::BrandNew { pane_id: "p".into(), x: 1 } };
+    let got: ControlMsg = decode_msg(&encode_msg(&msg).unwrap()).unwrap();
+    assert_eq!(got, ControlMsg::Event { seq: 9, event: ServerEvent::Unknown });
+
+    let bad = FutureMsg::Event { seq: 10, event: Future::PaneResized { pane_id: "p".into() } };
+    assert!(decode_msg::<ControlMsg>(&encode_msg(&bad).unwrap()).is_err());
 }

@@ -12,10 +12,9 @@
 //!
 //! Commands on stdin, one per line:
 //! `status <waiting|done|failed> [message]` sends `StatusChanged` for the
-//! first pane, `quit` stops the server. `snapshot <text>` queues a VT snapshot
-//! (AD-023) for the first pane, `size <rows> <cols>` makes another client own the
-//! PTY size of the first pane (AD-020) and `drop` closes every connection, so the
-//! client reconnects and gets the snapshot.
+//! first pane, `snapshot <text>` queues a VT snapshot (AD-023) for the first pane,
+//! `size <rows> <cols> [name]` makes another client own the PTY size of the first pane
+//! (AD-020), `drop` closes every connection and `quit` stops the server.
 
 use std::path::PathBuf;
 
@@ -52,12 +51,11 @@ async fn main() {
         secret_key: Some(key),
         pair_secret: Some(secret.clone()),
         echo_input: true,
-        capabilities: vec![
-            forgetty_client::proto::cap::RESUME.to_string(),
-            forgetty_client::proto::cap::LAYOUT_EVENTS.to_string(),
-            forgetty_client::proto::cap::SIZE_POLICY_LATEST.to_string(),
-            forgetty_client::proto::cap::SNAPSHOT_CATCHUP.to_string(),
-        ],
+        capabilities: {
+            let mut caps = TestServerConfig::default().capabilities;
+            caps.push(forgetty_client::proto::cap::SNAPSHOT_CATCHUP.to_string());
+            caps
+        },
         own_runtime: false,
         panes: (1..=panes)
             .map(|n| (pane_id(n), format!("forgetty v2 test server, pane {n}\r\n$ ").into_bytes()))
@@ -96,9 +94,11 @@ async fn main() {
                 println!("OK snapshot");
             }
             Some("size") => {
+                // size <rows> <cols> [owner name]: another client takes the PTY size (AD-020).
                 let rows: u16 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(24);
                 let cols: u16 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(80);
-                server.force_size(pane_id(1), rows, cols);
+                let owner = parts.next().unwrap_or("other-client");
+                server.force_size(pane_id(1), rows, cols, owner);
                 println!("OK size {rows} {cols}");
             }
             Some("drop") => {

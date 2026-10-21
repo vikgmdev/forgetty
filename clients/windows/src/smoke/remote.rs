@@ -462,8 +462,9 @@ impl ShellSmoke {
                         if up {
                             let after = self.w3.t_ready.map(|t| t.elapsed()).unwrap_or_default();
                             record("reconnect_after_accept_ms", json!(ms(after)));
-                            // Measured at frame granularity, so allow a frame or two.
-                            check("reconnect_under_1500ms_after_accept", after < Duration::from_millis(1500));
+                            // Target 1 s (the client aborts a dial in flight on a network change and races
+                            // attempts). Measured at frame granularity.
+                            check("reconnect_under_1s_after_accept", after < Duration::from_millis(1000));
                             if let Some(since) = self.w3.since {
                                 record("reconnect_ms", json!(ms(since.elapsed())));
                             }
@@ -862,7 +863,7 @@ impl ShellSmoke {
                 self.w5.small = small;
                 record("letterbox_grids", json!({"window": [self.w5.win.0, self.w5.win.1], "pty": [small.0, small.1]}));
                 if let Some(srv) = self.w3.server.as_mut() {
-                    srv.send(&format!("size {} {}", small.0, small.1));
+                    srv.send(&format!("size {} {} Victor Phone", small.0, small.1));
                 }
                 self.sub = 1;
                 self.sub_t0 = Instant::now();
@@ -877,6 +878,10 @@ impl ShellSmoke {
                 }
                 record("letterbox_pad_px", json!([pad.0, pad.1]));
                 check("letterbox_vt_follows_pty", true);
+                // AD-026: the client that set the size is named in the letterbox area.
+                let label = view.read(cx).size_owner_label();
+                record("size_owner_label", json!(label));
+                check("size_owner_label_shown", label.as_deref() == Some("Size set by Victor Phone (Windows)"));
                 check("letterbox_window_grid_kept", resizes_win == self.w5.win && resizes_win.0 > rows && resizes_win.1 > cols);
                 check("letterbox_centered", pad.0 > 0.0 && pad.1 > 0.0);
                 // The owner gives it back at the window size.
@@ -895,6 +900,11 @@ impl ShellSmoke {
                     return;
                 }
                 check("letterbox_fills_when_sizes_match", pad.0 < 8.0 && pad.1 < 20.0);
+                // The server restarted and input was dropped: a notice in the pane, no modal.
+                shell.on_events(vec![forgetty_shell_core::BackendEvent::InputLost { bytes: 7 }], cx);
+                let notice = view.read(cx).notice_text();
+                record("input_lost_notice", json!(notice));
+                check("input_lost_notice_shown", notice.as_deref() == Some("Server restarted, 7 bytes of input not sent"));
                 // A spy view: what does the view write, and as which kind?
                 let (tx, rx) = async_channel::unbounded();
                 let cfg = shell.cfg.clone();
@@ -915,7 +925,7 @@ impl ShellSmoke {
                 record("vt_reply_bytes", json!(String::from_utf8_lossy(&log[0].1).to_string()));
                 check("vt_reply_is_auto", log.len() == 1 && log[0].0);
                 // A reset starts a replay: the reply to a query inside it is dropped.
-                send(&self.w5, PaneEvent::Reset { rows: 10, cols: 40 });
+                send(&self.w5, PaneEvent::Reset { rows: 10, cols: 40, exact_replay: false });
                 send(&self.w5, PaneEvent::Output(b"\x1b[c".to_vec()));
                 self.sub = 4;
                 self.sub_t0 = Instant::now();
@@ -937,6 +947,38 @@ impl ShellSmoke {
                     return;
                 }
                 check("live_reply_after_replay", n == 2 && self.w5.log.lock().unwrap()[1].0);
+                // A server that sends `replay_end` ends the replay exactly there, not by timer.
+                send(&self.w5, PaneEvent::Reset { rows: 10, cols: 40, exact_replay: true });
+                send(&self.w5, PaneEvent::Output(b"\x1b[c".to_vec()));
+                self.sub = 40;
+                self.sub_t0 = Instant::now();
+            }
+            40 => {
+                // Past the 2 s of the heuristic the replay is still on: the server did not end it.
+                if self.sub_t0.elapsed() < Duration::from_millis(2600) {
+                    return;
+                }
+                check("replay_end_exact_ignores_timer", self.w5.log.lock().unwrap().len() == 2);
+                send(&self.w5, PaneEvent::Output(b"\x1b[c".to_vec()));
+                self.sub = 41;
+                self.sub_t0 = Instant::now();
+            }
+            41 => {
+                if self.sub_t0.elapsed() < Duration::from_millis(300) {
+                    return;
+                }
+                check("replay_end_exact_still_replaying", self.w5.log.lock().unwrap().len() == 2);
+                send(&self.w5, PaneEvent::ReplayEnd);
+                send(&self.w5, PaneEvent::Output(b"\x1b[c".to_vec()));
+                self.sub = 42;
+                self.sub_t0 = Instant::now();
+            }
+            42 => {
+                if self.w5.log.lock().unwrap().len() < 3 {
+                    return;
+                }
+                check("replay_end_from_server_ends_replay", self.w5.log.lock().unwrap().len() == 3);
+                self.w5.log.lock().unwrap().clear();
                 // Focus reports are `auto` too.
                 send(&self.w5, PaneEvent::Output(b"\x1b[?1004h".to_vec()));
                 self.sub = 6;
@@ -954,10 +996,10 @@ impl ShellSmoke {
             }
             7 => {
                 let log = self.w5.log.lock().unwrap().clone();
-                if log.len() < 3 {
+                if log.is_empty() {
                     return;
                 }
-                check("focus_report_is_auto", log[2].0 && log[2].1 == b"\x1b[I");
+                check("focus_report_is_auto", log[0].0 && log[0].1 == b"\x1b[I");
                 check("no_reply_counted_as_typing", log.iter().all(|(auto, _)| *auto));
                 // 40 numbered lines through a 10 row VT, then copy rows that are in scrollback.
                 let mut text = Vec::new();

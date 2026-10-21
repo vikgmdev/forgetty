@@ -122,8 +122,20 @@ stream) and the `qa_*` test methods are not reachable over v2.
 - Snapshot work is bounded. All streams share one build per pane (a build in
   progress is joined, a result younger than 250 ms is reused), at most 2
   builds run at once server wide, and a build nobody waits for any more is
-  dropped before it starts. One stream takes a catch-up at most once per
-  second, and waits twice as long each time it needs another soon, up to 10 s.
+  dropped before it starts. A result is reused only while the log has not
+  moved more than an eighth of the ring past it. One stream takes a catch-up
+  at most once per second, and waits twice as long each time it needs another
+  soon, up to 10 s. A stream that keeps pace with the program is exempt from
+  the backoff and waits 100 ms at most: since its last snapshot it took live
+  bytes at 4 MiB/s or more, or the log ran past that snapshot before any live
+  byte went out although the snapshot reached the peer within 500 ms (the
+  build alone took longer than the ring holds at the program's speed). A write
+  that stalls for 2 s never counts as keeping pace. Bytes accepted into the
+  QUIC send buffer prove nothing about a peer that never reads, so the
+  exception is capped: 6 per (client, pane) in a burst, then one per 10 s;
+  after that the normal backoff applies. The pacing state is kept per
+  (client_id, pane) across attaches and connections, so attaching again does
+  not reset it.
   A pane has one live stream per connection: a new `attach_pane` replaces the
   old one. An attach counts as a request in flight until its stream is open.
 - A stopping server answers `Hello` with `Error { code: "server_stopping" }`.
@@ -132,10 +144,14 @@ stream) and the `qa_*` test methods are not reachable over v2.
   bytes, with a fixed cost per message). It holds at most one `LayoutChanged`,
   and a newer one replaces the pending one in place. Past the budget the
   connection stops reading requests (QUIC flow control pushes back on the
-  client) and pulls no more events. After 10 s with no completed write the
+  client) and pulls no more events. A request that runs on its own task sets
+  bytes aside against the budget until its answer is queued (64 KiB, 4 MiB for
+  `capture`), so requests in flight cannot owe more than the budget. When the
+  queue is half full and the client drains less than 32 KiB/s over 10 s, the
   server closes the connection with code 0x12. At most 64 requests run per
-  connection, one more closes it with code 0x14. Responses and Pongs are never
-  dropped, and nothing spawns a task per queued message.
+  connection, one more closes it with code 0x14. A device holds at most 4
+  connections: a fifth closes the oldest with code 0x15. Responses and Pongs
+  are never dropped, and nothing spawns a task per queued message.
 - Input is deduplicated by `(client_id, input_epoch)` and `seq`. The server
   writes the dedup table to `input_seq.json` in the state dir when it stops
   and loads it at start, so a frame the client did not see acked is not written

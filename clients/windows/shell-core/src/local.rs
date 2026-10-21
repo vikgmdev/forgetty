@@ -326,7 +326,7 @@ fn do_resize(inner: &Arc<Inner>, id: PaneId, rows: u16, cols: u16) -> bool {
         }
     };
     if changed {
-        inner.emit(BackendEvent::PaneResized { pane_id: id, rows, cols });
+        inner.emit(BackendEvent::PaneResized { pane_id: id, rows, cols, owner: None });
     }
     true
 }
@@ -596,6 +596,7 @@ impl SessionBackend for LocalBackend {
                 cwd: p.cwd.clone(),
                 status: p.status,
                 exited: p.pty.has_exited(),
+                size_owner: None,
             })),
         }
     }

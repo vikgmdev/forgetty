@@ -35,6 +35,11 @@ fi
 STATE="$(mktemp -d /tmp/p0gate.XXXXXX)"
 SOCK="$STATE/run/forgetty/forgetty.sock"
 fg() { "$BIN/forgetty" --state-dir "$STATE" "$@"; }
+# `grep -q` leaves at the first match. A writer that still has output to send
+# then gets SIGPIPE, and under `pipefail` the pipeline fails (the CLI died this
+# way when the box was busy: 17 % of `server status | grep -q` under load).
+# `qgrep` reads all its input, so the writer always finishes.
+qgrep() { grep "$@" >/dev/null; }
 PAIR_PID=""
 cleanup() {
   [ -n "$PAIR_PID" ] && kill "$PAIR_PID" 2>/dev/null
@@ -132,7 +137,7 @@ IROH_RESULT=0
 pair_with_secret() {
   fg pair >"$STATE/pair.out" 2>&1 &
   PAIR_PID=$!
-  for _ in $(seq 1 50); do grep -q '^payload: ' "$STATE/pair.out" 2>/dev/null && break; sleep 0.1; done
+  for _ in $(seq 1 50); do qgrep '^payload: ' "$STATE/pair.out" 2>/dev/null && break; sleep 0.1; done
   local payload
   payload="$(sed -n 's/^payload: //p' "$STATE/pair.out")"
   XDG_DATA_HOME="$CLIENT_DATA" "$BIN/forgetty-pair-test" --payload "$payload" 2>&1 | tail -3
@@ -149,14 +154,14 @@ else
     pair_with_secret \
       && echo "--- list panes" \
       && qa forgetty-stream-test --dial "$NODE_ID" --list-panes 2>&1 | tee "$STATE/list.out" | tail -5 \
-      && grep -q "$PANE_ID" "$STATE/list.out" \
+      && qgrep "$PANE_ID" "$STATE/list.out" \
       && echo "PASS iroh: pane $PANE_ID listed" \
       && echo "--- subscribe + send + expect" \
       && qa forgetty-stream-test --dial "$NODE_ID" --pane-id "$PANE_ID" \
            --send-line "$IROH_SEND" --expect "$IROH_EXPECT" --timeout-secs 40 2>&1 | tail -5
   } > "$STATE/iroh.out" 2>&1
   cat "$STATE/iroh.out"
-  grep -q "PASS: expected output found" "$STATE/iroh.out" && grep -q "PASS iroh: pane" "$STATE/iroh.out" || IROH_RESULT=1
+  qgrep "PASS: expected output found" "$STATE/iroh.out" && qgrep "PASS iroh: pane" "$STATE/iroh.out" || IROH_RESULT=1
 fi
 
 if [ "$SOCKET_RESULT" = 0 ] && [ "$IROH_RESULT" = 0 ]; then

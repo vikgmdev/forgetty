@@ -300,7 +300,9 @@ static METHODS: &[MethodSpec] = &[
         false,
         "Set the PTY size of a pane.",
         "Sends the new size to the PTY. A size change is reported to subscribers as a \
-         `pane_resized` event.",
+         `pane_resized` event. With `client_id` (a streaming client's own id) the caller \
+         takes the pane's size ownership when it has a `subscribe_output` on that pane \
+         (AD-020). Without either, the size applies and ownership stays as it is.",
         t::ResizePaneParams,
         t::OkResult,
         concat!(r#"{"pane_id":""#, pane!(), r#"","rows":40,"cols":120}"#),
@@ -639,7 +641,7 @@ static METHODS: &[MethodSpec] = &[
         "After the JSON ack the connection switches to frames: a 4-byte big-endian length \
          followed by the payload. The connection ends when the pane closes. Input and \
          resize go on other connections.",
-        t::PaneParams,
+        t::SubscribeOutputParams,
         t::OkResult,
         concat!(r#"{"pane_id":""#, pane!(), r#""}"#),
         OK,
@@ -656,8 +658,9 @@ static METHODS: &[MethodSpec] = &[
          `tab_closed`, `pane_split`, `tab_moved`, `active_tab_changed`, \
          `active_workspace_changed`, `workspace_created`, `workspace_renamed`, \
          `workspace_deleted`, `workspace_color_changed`, `workspaces_reordered`, \
-         `active_pane_changed`).",
-        t::NoParams,
+         `active_pane_changed`). `client_id` and `client_name` name the connection in \
+         `list_clients` and make it a client that can own a pane's size.",
+        t::SubscribeLayoutParams,
         t::OkResult,
         EMPTY,
         OK,

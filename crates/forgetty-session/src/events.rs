@@ -80,7 +80,17 @@ pub enum SessionEvent {
 
     /// The pane's PTY size changed (AD-020). Sent only when rows or cols
     /// actually changed.
-    PaneResized { pane_id: PaneId, rows: u16, cols: u16 },
+    PaneResized {
+        pane_id: PaneId,
+        rows: u16,
+        cols: u16,
+        /// The pane's size owner when the size changed.
+        size_owner: Option<crate::sizes::SizeOwner>,
+    },
+
+    /// The pane's size owner changed (AD-020). Sent before the
+    /// `PaneResized` the new owner's size causes.
+    SizeOwnerChanged { pane_id: PaneId, owner: Option<crate::sizes::SizeOwner> },
 
     // -----------------------------------------------------------------------
     // Layout mutation events (T-063)

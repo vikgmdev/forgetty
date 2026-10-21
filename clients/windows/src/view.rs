@@ -35,6 +35,7 @@ const FEED_CHUNK: usize = 256 * 1024;
 const REPLAY_MAX: Duration = Duration::from_secs(2);
 /// How long the "input dropped" notice shows.
 const DROP_NOTICE: Duration = Duration::from_secs(4);
+const NOTICE_FOR: Duration = Duration::from_secs(8);
 
 /// Scale brightness (same as a black overlay of alpha 1-k).
 pub fn shade(c: Hsla, k: f32) -> Hsla {
@@ -162,6 +163,12 @@ pub struct TerminalView {
     /// True from a reset until the replay has drained (or `REPLAY_MAX` passed).
     pub replaying: bool,
     replay_since: Option<Instant>,
+    /// The source sends `ReplayEnd`, so the replay ends there and not by timer or drain.
+    replay_exact: bool,
+    /// A line shown for a few seconds (server restarted and input was lost).
+    notice: Option<(String, Instant)>,
+    /// "Size set by <name>" while another client owns the PTY size (AD-026).
+    size_owner: Option<String>,
     /// The source's PTY belongs to whichever client typed last (AD-020): the VT keeps the
     /// size the server reports and is centered in the pane.
     letterbox: bool,
@@ -235,14 +242,18 @@ impl TerminalView {
                 let mut batch = Vec::new();
                 let mut closed = None;
                 let mut reset = None;
+                let mut replay_end = false;
                 match first {
-                    PaneEvent::Reset { rows, cols } => reset = Some((rows, cols)),
+                    PaneEvent::Reset { rows, cols, exact_replay } => reset = Some((rows, cols, exact_replay)),
                     PaneEvent::Output(b) => batch = b,
+                    PaneEvent::ReplayEnd => replay_end = true,
                     PaneEvent::Closed(r) => closed = Some(r),
                 }
-                while reset.is_none() && closed.is_none() && batch.len() < FEED_CHUNK {
+                while reset.is_none() && closed.is_none() && !replay_end && batch.len() < FEED_CHUNK {
                     match rx.try_recv() {
                         Ok(PaneEvent::Output(b)) => batch.extend_from_slice(&b),
+                        // The batch so far is replay; what follows is live.
+                        Ok(PaneEvent::ReplayEnd) => replay_end = true,
                         Ok(PaneEvent::Closed(r)) => closed = Some(r),
                         Ok(r @ PaneEvent::Reset { .. }) => {
                             pending = Some(r);
@@ -252,7 +263,7 @@ impl TerminalView {
                     }
                 }
                 let caught_up = pending.is_none() && rx.is_empty();
-                if this.update(cx, |v, cx| v.feed(reset, &batch, closed, caught_up, cx)).is_err() {
+                if this.update(cx, |v, cx| v.feed(reset, &batch, closed, caught_up, replay_end, cx)).is_err() {
                     break;
                 }
                 YieldNow(false).await;
@@ -307,6 +318,9 @@ impl TerminalView {
             force_size: false,
             replaying: false,
             replay_since: None,
+            replay_exact: false,
+            notice: None,
+            size_owner: None,
             letterbox,
             win_grid: (rows, cols),
             dead_pending: false,
@@ -341,15 +355,17 @@ impl TerminalView {
 
     fn feed(
         &mut self,
-        reset: Option<(u16, u16)>,
+        reset: Option<(u16, u16, bool)>,
         bytes: &[u8],
         closed: Option<String>,
         caught_up: bool,
+        replay_end: bool,
         cx: &mut Context<Self>,
     ) {
-        if let Some((rows, cols)) = reset {
+        if let Some((rows, cols, exact)) = reset {
             self.reset_term(rows, cols);
             self.replaying = true;
+            self.replay_exact = exact;
             self.replay_since = Some(Instant::now());
         }
         if !bytes.is_empty() {
@@ -363,7 +379,7 @@ impl TerminalView {
             // A replay after a reset re-runs old queries: their answers would reach
             // the program a second time, so they are dropped.
             for resp in self.term.drain_write_pty() {
-                if self.replaying && self.replay_since.is_some_and(|t| t.elapsed() > REPLAY_MAX) {
+                if self.replaying && !self.replay_exact && self.replay_since.is_some_and(|t| t.elapsed() > REPLAY_MAX) {
                     self.replaying = false;
                 }
                 if !self.replaying {
@@ -374,7 +390,9 @@ impl TerminalView {
             // Titles and cwd come from the backend (it scans the same bytes).
             drop(self.term.drain_events());
         }
-        if caught_up || self.replay_since.is_some_and(|t| t.elapsed() > REPLAY_MAX) {
+        // With `replay_end` from the server the replay ends exactly there. Without it, the
+        // replay is over when the channel drains or after `REPLAY_MAX`.
+        if replay_end || (!self.replay_exact && (caught_up || self.replay_since.is_some_and(|t| t.elapsed() > REPLAY_MAX))) {
             self.replaying = false;
         }
         if let Some(reason) = closed {
@@ -740,7 +758,18 @@ impl TerminalView {
             self.dropped_seen = dropped;
             self.drop_notice_until = Some(Instant::now() + DROP_NOTICE);
         }
-        if !self.drop_notice_until.is_some_and(|t| Instant::now() < t) {
+        let now = Instant::now();
+        let mut lines: Vec<String> = Vec::new();
+        if let Some((text, until)) = &self.notice {
+            if now < *until {
+                lines.push(text.clone());
+            }
+        }
+        if self.drop_notice_until.is_some_and(|t| now < t) {
+            lines.push(format!("Input dropped ({dropped} bytes in all): the link is down and the buffer is full"));
+        }
+        if lines.is_empty() {
+            self.notice = None;
             return None;
         }
         Some(
@@ -754,8 +783,63 @@ impl TerminalView {
                 .text_color(hsla(0xffffff))
                 .font_family(self.metrics.font.family.clone())
                 .text_size(self.metrics.font_size)
-                .child(format!("Input dropped ({dropped} bytes in all): the link is down and the buffer is full")),
+                .children(lines),
         )
+    }
+
+    /// Show `text` at the bottom of the pane for a few seconds. It does not take the focus or
+    /// block input.
+    pub fn show_notice(&mut self, text: String, cx: &mut Context<Self>) {
+        self.notice = Some((text, Instant::now() + NOTICE_FOR));
+        cx.notify();
+        // Repaint when it expires, even if nothing else happens.
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(NOTICE_FOR + Duration::from_millis(100)).await;
+            let _ = this.update(cx, |_, cx| cx.notify());
+        })
+        .detach();
+    }
+
+    /// The notice on screen now (smoke).
+    pub fn notice_text(&self) -> Option<String> {
+        self.notice.as_ref().filter(|(_, t)| Instant::now() < *t).map(|(s, _)| s.clone())
+    }
+
+    /// The client that owns the PTY size changed (AD-026). `None` clears the label.
+    pub fn set_size_owner(&mut self, label: Option<String>, cx: &mut Context<Self>) {
+        if self.size_owner != label {
+            self.size_owner = label;
+            cx.notify();
+        }
+    }
+
+    /// "Size set by <client>" in the letterbox area. Only shown where there is a margin: when
+    /// the PTY grid fills the pane (this client owns the size) there is nothing to explain.
+    fn owner_label(&self) -> Option<gpui::Div> {
+        let label = self.size_owner.as_ref()?;
+        let (px_, py_) = self.letterbox_pad();
+        if px_ < 1.0 && py_ < 1.0 {
+            return None;
+        }
+        // The bigger margin holds it: below the grid when there is room above and below,
+        // otherwise at the top of the pane.
+        let mut d = div()
+            .absolute()
+            .left_0()
+            .right_0()
+            .flex()
+            .justify_center()
+            .text_color(hsla(0x8a8f98))
+            .font_family(self.metrics.font.family.clone())
+            .text_size(self.metrics.font_size * 0.85)
+            .child(label.clone());
+        d = if py_ >= self.metrics.line_h.into() { d.bottom(px((py_ - f32::from(self.metrics.line_h)).max(0.0) / 2.0)) } else { d.top_0() };
+        Some(d)
+    }
+
+    /// The owner label on screen (smoke).
+    pub fn size_owner_label(&self) -> Option<String> {
+        self.size_owner.clone()
     }
 
     /// Bytes of input this pane dropped so far (smoke and status).
@@ -1401,6 +1485,7 @@ impl Render for TerminalView {
                     .child(TerminalElement::new(cx.entity())),
             )
             .children(self.paste_overlay())
+            .children(self.owner_label())
             .children(self.drop_overlay())
     }
 }

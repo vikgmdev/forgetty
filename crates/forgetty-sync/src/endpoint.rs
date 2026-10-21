@@ -80,6 +80,22 @@ pub enum SyncError {
     Registry(#[from] crate::registry::RegistryError),
 }
 
+/// What [`SyncEndpoint::revoke_device`] did.
+#[derive(Debug)]
+pub struct RevokeOutcome {
+    /// The device was in the registry (or its removal was started).
+    pub found: bool,
+    /// Live connections closed.
+    pub closed: usize,
+    /// Set when the registry file could not be saved. The device is revoked
+    /// anyway (denied in memory) and the next successful save persists it.
+    pub save_error: Option<crate::registry::RegistryError>,
+    /// A restart cannot bring the device back: the revoke record in
+    /// `revoked.pending` or the registry file has it on disk. `false` means
+    /// the device is denied in memory only.
+    pub durable: bool,
+}
+
 /// Builder for [`SyncEndpoint`].
 ///
 /// Construct via [`SyncEndpoint::builder`], chain zero or more
@@ -285,21 +301,30 @@ impl SyncEndpoint {
     }
 
     /// Revoke a device: remove it from the registry AND close every open
-    /// connection it has, on every ALPN. Returns `(was_registered, closed)`.
+    /// connection it has, on every ALPN.
     ///
-    /// The connections are closed even when the device was not in the registry
+    /// A revoke fails closed. The connections are closed and the event is sent
+    /// whatever the save result is, and a device whose removal could not be
+    /// saved stays denied in memory (see [`DeviceRegistry::remove`]). The
+    /// connections are closed even when the device was not in the registry
     /// (for example it was removed by hand-editing the file).
-    pub fn revoke_device(
-        &self,
-        device_id: &str,
-    ) -> Result<(bool, usize), crate::registry::RegistryError> {
-        let found = self.registry.lock().unwrap_or_else(|e| e.into_inner()).remove(device_id)?;
+    pub fn revoke_device(&self, device_id: &str) -> RevokeOutcome {
+        let removed = self.registry.lock().unwrap_or_else(|e| e.into_inner()).revoke(device_id);
         let closed = self.live.revoke(device_id);
+        // Removed in memory counts as found even when the save failed.
+        let (found, save_error, durable) = (removed.found, removed.save_error, removed.durable);
         if found {
             let _ =
                 self.event_tx.send(SyncEvent::DeviceRevoked { device_id: device_id.to_string() });
         }
-        Ok((found, closed))
+        if save_error.is_some() {
+            // Denied in memory meanwhile. Keep trying to put it on disk.
+            crate::registry::spawn_save_retry(
+                Arc::clone(&self.registry),
+                std::time::Duration::from_secs(5),
+            );
+        }
+        RevokeOutcome { found, closed, save_error, durable }
     }
 
     /// Returns a clone of the shared device registry.
@@ -329,8 +354,16 @@ impl SyncEndpoint {
     ///
     /// Must be called before dropping the endpoint to avoid the iroh error:
     /// `ERROR Endpoint dropped without calling Endpoint::close. Aborting ungracefully.`
+    ///
+    /// Bounded to 2 s: a peer that gave up mid-handshake leaves a half-open
+    /// connection that would otherwise hold up shutdown.
     pub async fn close(&self) {
-        self.endpoint.close().await;
+        if tokio::time::timeout(std::time::Duration::from_secs(2), self.endpoint.close())
+            .await
+            .is_err()
+        {
+            tracing::warn!("iroh endpoint close timed out after 2 s");
+        }
     }
 
     /// Run the accept loop.
@@ -366,24 +399,26 @@ impl SyncEndpoint {
                 }
             };
 
-            // Read the negotiated ALPN before completing the handshake.
-            // `Accepting::alpn()` is async and takes `&mut self`; after it
-            // returns the `Accepting` can still be awaited for the Connection.
-            let alpn = match accepting.alpn().await {
-                Ok(a) => a,
-                Err(e) => {
-                    warn!("totem-sync: failed to read ALPN: {e}");
-                    continue;
-                }
-            };
-
             let registry = Arc::clone(&self.registry);
             let pairing_state = Arc::clone(&self.pairing);
             let event_tx = self.event_tx.clone();
             let extras = Arc::clone(&self.extra_alpns);
             let live = self.live.clone();
 
+            // Everything that waits on the peer happens in the spawned task:
+            // a peer that stalls its handshake (up to the 30 s idle timeout)
+            // must not hold up the next one.
             tokio::spawn(async move {
+                // Read the negotiated ALPN before completing the handshake.
+                // `Accepting::alpn()` is async and takes `&mut self`; after it
+                // returns the `Accepting` can still be awaited for the Connection.
+                let alpn = match accepting.alpn().await {
+                    Ok(a) => a,
+                    Err(e) => {
+                        warn!("totem-sync: failed to read ALPN: {e}");
+                        return;
+                    }
+                };
                 match accepting.await {
                     Ok(conn) => {
                         // Track before dispatch: a revoke that lands while the

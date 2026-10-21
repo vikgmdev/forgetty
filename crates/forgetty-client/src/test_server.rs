@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use forgetty_proto::{
-    cap, close_code, error_code, from_value, method, read_input_frame, read_input_frame_flags, read_msg, to_value, INPUT_FLAG_AUTO,
+    cap, close_code, error_code, from_value, method, read_input_frame, read_input_frame_flags, read_msg, to_value, ClientKind, SizeOwner, INPUT_FLAG_AUTO,
     write_msg, write_output_frame, AttachPaneParams, ClientEntry, ControlMsg, DetachPaneParams,
     ErrorMsg, HandshakeReply, Hello, OkResult, PairRequest, PairResult, PaneStreamHeader,
     ResizePaneParams, ServerEvent, SubscribeResult, Value, Welcome, ALPN_PAIR, ALPN_RPC,
@@ -70,6 +70,7 @@ impl Default for TestServerConfig {
                 cap::LAYOUT_EVENTS.to_string(),
                 cap::SIZE_POLICY_LATEST.to_string(),
                 cap::INPUT_FLAGS.to_string(),
+                cap::SIZE_OWNER.to_string(),
             ],
             pair_secret: None,
             echo_input: true,
@@ -225,6 +226,8 @@ struct PaneLog {
     snapshot_total: Option<u32>,
     /// Input frames flagged `auto` (AD-025), in arrival order. They are not in `input`.
     auto_input: Vec<u8>,
+    /// Who owns the pane's size (AD-020).
+    size_owner: Option<SizeOwner>,
 }
 
 struct State {
@@ -234,6 +237,8 @@ struct State {
     dedup_drops: AtomicU64,
     hold_acks: AtomicBool,
     server_id: Uuid,
+    /// New for each start of the server, like the real one's.
+    boot_id: Uuid,
     panes: Mutex<HashMap<Uuid, PaneLog>>,
     conns: Mutex<Vec<Connection>>,
     events: broadcast::Sender<(u64, ServerEvent)>,
@@ -306,6 +311,7 @@ impl TestServer {
             dedup_drops: AtomicU64::new(0),
             hold_acks: AtomicBool::new(false),
             server_id: Uuid::new_v4(),
+            boot_id: Uuid::new_v4(),
             panes: Mutex::new(HashMap::new()),
             conns: Mutex::new(Vec::new()),
             events,
@@ -337,6 +343,7 @@ impl TestServer {
                     input: Vec::new(),
                     snapshot: None,
                     snapshot_total: None,
+                    size_owner: None,
                     auto_input: Vec::new(),
                 },
             );
@@ -385,6 +392,7 @@ impl TestServer {
                 input: Vec::new(),
                 snapshot: None,
                 snapshot_total: None,
+                size_owner: None,
                 auto_input: Vec::new(),
             },
         );
@@ -418,12 +426,15 @@ impl TestServer {
     }
 
     /// Another client took the PTY size (AD-020): set the pane size and send `PaneResized`.
-    pub fn force_size(&self, pane: Uuid, rows: u16, cols: u16) {
+    pub fn force_size(&self, pane: Uuid, rows: u16, cols: u16, owner: &str) {
+        let who = SizeOwner { client_id: Uuid::new_v4(), client_kind: ClientKind::Windows, client_name: owner.into() };
         if let Some(p) = lock(&self.state.panes).get_mut(&pane) {
             p.rows = rows;
             p.cols = cols;
+            p.size_owner = Some(who.clone());
         }
-        self.push_event(ServerEvent::PaneResized { pane_id: pane, rows, cols });
+        self.push_event(ServerEvent::SizeOwnerChanged { pane_id: pane, owner: Some(who.clone()) });
+        self.push_event(ServerEvent::PaneResized { pane_id: pane, rows, cols, size_owner: Some(who) });
     }
 
     /// Forget log bytes before `offset` (the log now starts there).
@@ -536,10 +547,25 @@ impl TestServer {
     /// Stop the server for `duration` without closing anything: it neither
     /// reads nor writes a packet, like a dead network or a hung process. Needs
     /// `own_runtime`. Queued packets are handled when it thaws.
+    ///
+    /// Returns only when both worker threads are blocked. `Runtime::spawn`
+    /// returns at once, and on a busy box the blocking tasks may not run for a
+    /// while: a packet that arrives meanwhile is answered, and a caller that
+    /// counts on the silence (a Ping with no Pong) is wrong.
     pub fn freeze(&self, duration: Duration) {
         let rt = self.rt.as_ref().expect("freeze needs TestServerConfig::own_runtime");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
         for _ in 0..2 {
-            rt.spawn(async move { std::thread::sleep(duration) });
+            let started = started_tx.clone();
+            rt.spawn(async move {
+                let _ = started.send(());
+                std::thread::sleep(duration);
+            });
+        }
+        for _ in 0..2 {
+            if started_rx.recv_timeout(Duration::from_secs(10)).is_err() {
+                break; // the runtime is not scheduling: nothing more to wait for
+            }
         }
     }
 }
@@ -625,6 +651,7 @@ async fn handle_rpc(conn: Connection, state: Arc<State>) {
         server_version: "test".into(),
         hostname: "test-host".into(),
         capabilities: state.cfg.capabilities.clone(),
+        boot_id: Some(state.boot_id),
     };
     if write_msg(&mut send, &HandshakeReply::Welcome(welcome)).await.is_err() {
         return;
@@ -760,7 +787,7 @@ fn handle_request(
         }
         method::ATTACH_PANE => {
             let p: AttachPaneParams = from_value(params).map_err(bad)?;
-            let (start, reset, rows, cols, notify, snapshot, snapshot_total) = {
+            let (start, reset, rows, cols, notify, total, snapshot, snapshot_total) = {
                 let mut panes = lock(&state.panes);
                 let Some(log) = panes.get_mut(&p.pane_id) else {
                     return Err((error_code::NOT_FOUND, "no such pane".into()));
@@ -778,9 +805,9 @@ fn handle_request(
                 match log.snapshot.take() {
                     Some(snap) => {
                         let announced = log.snapshot_total.take().unwrap_or(snap.len() as u32);
-                        (total, true, log.rows, log.cols, log.notify.clone(), snap, announced)
+                        (total, true, log.rows, log.cols, log.notify.clone(), total, snap, announced)
                     }
-                    None => (start, reset, log.rows, log.cols, log.notify.clone(), Vec::new(), 0),
+                    None => (start, reset, log.rows, log.cols, log.notify.clone(), total, Vec::new(), 0),
                 }
             };
             lock(&state.attaches).push((p.pane_id, p.from_offset));
@@ -798,6 +825,7 @@ fn handle_request(
                     rows,
                     cols,
                     snapshot_len: snapshot_total,
+                    replay_end: Some(total),
                 },
                 snapshot,
             ));
@@ -819,12 +847,18 @@ fn handle_request(
             };
             log.rows = p.rows;
             log.cols = p.cols;
+            let owner = log.size_owner.clone();
             drop(panes);
             // AD-020: the latest client's size is the PTY size.
             let seq = state.event_seq.fetch_add(1, Ordering::SeqCst) + 1;
             let _ = state.events.send((
                 seq,
-                ServerEvent::PaneResized { pane_id: p.pane_id, rows: p.rows, cols: p.cols },
+                ServerEvent::PaneResized {
+                    pane_id: p.pane_id,
+                    rows: p.rows,
+                    cols: p.cols,
+                    size_owner: owner,
+                },
             ));
             to_value(&OkResult { ok: true }).map_err(bad)
         }
@@ -1024,7 +1058,16 @@ fn handle_request(
             let Some(p) = panes.get(&pane) else {
                 return Err((error_code::NOT_FOUND, "no such pane".into()));
             };
+            let owner = match &p.size_owner {
+                Some(o) => map(&[
+                    ("client_id", str_val(&o.client_id.to_string())),
+                    ("client_kind", str_val(o.client_kind.as_str())),
+                    ("client_name", str_val(&o.client_name)),
+                ]),
+                None => Value::Nil,
+            };
             Ok(map(&[
+                ("size_owner", owner),
                 ("pane_id", str_val(&pane.to_string())),
                 ("rows", Value::from(p.rows)),
                 ("cols", Value::from(p.cols)),
@@ -1067,6 +1110,7 @@ fn new_pane_log(state: &Arc<State>, rows: u16, cols: u16) -> Uuid {
             input: Vec::new(),
             snapshot: None,
             snapshot_total: None,
+            size_owner: None,
             auto_input: Vec::new(),
         },
     );

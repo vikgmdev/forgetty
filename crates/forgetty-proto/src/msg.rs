@@ -9,7 +9,7 @@
 //! - `Option::None` is MessagePack `nil`.
 //! - Base64 fields of the JSON socket API are raw `bin` inside [`Value`].
 
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
 
 use crate::consts::{PROTO_MAJOR, PROTO_MINOR};
@@ -33,6 +33,29 @@ pub mod uuid_str {
     }
 }
 
+/// Optional UUID as a string, for fields an old peer does not send.
+pub mod uuid_str_opt {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use uuid::Uuid;
+
+    /// Serialize `Some` as the hyphenated string (`None` is skipped by the
+    /// field's `skip_serializing_if`).
+    pub fn serialize<S: Serializer>(id: &Option<Uuid>, s: S) -> Result<S::Ok, S::Error> {
+        match id {
+            Some(id) => s.collect_str(&id.hyphenated()),
+            None => s.serialize_none(),
+        }
+    }
+
+    /// Parse the string form, or `None`.
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Uuid>, D::Error> {
+        match Option::<String>::deserialize(d)? {
+            Some(s) => Uuid::parse_str(&s).map(Some).map_err(serde::de::Error::custom),
+            None => Ok(None),
+        }
+    }
+}
+
 /// Kind of client, sent in `Hello` and `PairRequest`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -45,6 +68,14 @@ pub enum ClientKind {
     Cli,
     /// GTK client.
     Gtk,
+    /// A local socket client of the server itself (GTK, tools), listed by
+    /// `list_clients` and named as a size owner. Never sent in `Hello`.
+    Local,
+    /// A kind this version does not know (a newer peer). Decoding never
+    /// fails on a new kind: it becomes `Unknown`, so one new kind cannot make
+    /// a whole `list_clients` or event unreadable.
+    #[serde(other)]
+    Unknown,
 }
 
 impl ClientKind {
@@ -55,6 +86,8 @@ impl ClientKind {
             ClientKind::Android => "android",
             ClientKind::Cli => "cli",
             ClientKind::Gtk => "gtk",
+            ClientKind::Local => "local",
+            ClientKind::Unknown => "unknown",
         }
     }
 }
@@ -122,6 +155,13 @@ pub struct Welcome {
     pub hostname: String,
     /// Capability names the server supports.
     pub capabilities: Vec<String>,
+    /// New for every run of the server process (not stable across a restart,
+    /// unlike `server_id`). A client that sees a different value than on its
+    /// last connection knows the server restarted: its programs are gone, so
+    /// it drops the input it had not seen acked. `None` from a server that
+    /// does not send it (an old decoder ignores the field).
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "uuid_str_opt")]
+    pub boot_id: Option<Uuid>,
 }
 
 /// `Error { code, message }` of the handshake and pairing paths.
@@ -143,6 +183,45 @@ pub enum HandshakeReply {
     /// Handshake refused.
     Error(ErrorMsg),
 }
+
+/// Decode an event, turning a variant this version does not know into
+/// [`ServerEvent::Unknown`]. A known variant that does not decode stays an
+/// error, so a corrupt frame is not hidden.
+fn tolerant_event<'de, D: Deserializer<'de>>(d: D) -> Result<ServerEvent, D::Error> {
+    let v = Value::deserialize(d)?;
+    match from_value::<ServerEvent>(v.clone()) {
+        Ok(e) => Ok(e),
+        Err(e) => {
+            // An externally tagged variant is a map with one entry, the tag.
+            // A variant without fields is the bare tag string.
+            let tag = match &v {
+                Value::Map(m) if m.len() == 1 => m[0].0.as_str(),
+                Value::String(_) => v.as_str(),
+                _ => None,
+            };
+            match tag {
+                Some(tag) if !KNOWN_EVENTS.contains(&tag) => Ok(ServerEvent::Unknown),
+                _ => Err(serde::de::Error::custom(e.to_string())),
+            }
+        }
+    }
+}
+
+/// Tags of the events this version knows.
+const KNOWN_EVENTS: &[&str] = &[
+    "LayoutChanged",
+    "PaneClosed",
+    "TitleChanged",
+    "CwdChanged",
+    "PaneResized",
+    "SizeOwnerChanged",
+    "StatusChanged",
+    "Notification",
+    "PaneExited",
+    "ClientConnected",
+    "ClientDisconnected",
+    "InputDropped",
+];
 
 /// Control stream message (section 4).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -176,7 +255,8 @@ pub enum ControlMsg {
     Event {
         /// Event sequence number.
         seq: u64,
-        /// The event.
+        /// The event. An unknown event becomes [`ServerEvent::Unknown`].
+        #[serde(deserialize_with = "tolerant_event")]
         event: ServerEvent,
     },
     /// Client to server liveness probe, every 1 s while connected.
@@ -244,6 +324,19 @@ pub enum ServerEvent {
         rows: u16,
         /// Columns.
         cols: u16,
+        /// Who owns the pane's size now. Absent when nobody does, and from
+        /// servers that do not send it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        size_owner: Option<SizeOwner>,
+    },
+    /// The pane's size owner changed (AD-020, cap `size_owner`). Sent before
+    /// the `PaneResized` the new owner's size causes.
+    SizeOwnerChanged {
+        /// Pane id.
+        #[serde(with = "uuid_str")]
+        pane_id: Uuid,
+        /// The new owner, `None` when the pane has none.
+        owner: Option<SizeOwner>,
     },
     /// Agent status change (P4, cap `status_events`).
     StatusChanged {
@@ -274,6 +367,18 @@ pub enum ServerEvent {
         /// Exit code, `None` when unknown.
         exit_code: Option<i32>,
     },
+    /// Input this client sent to a pane was dropped because the pane did not
+    /// read it (AD-024). Sent once the pane's queue is empty again, to the
+    /// client that lost the input only, with the current event `seq`. Only
+    /// with capability `input_flags`. Anything the client typed before this
+    /// event may be missing in part.
+    InputDropped {
+        /// Pane id.
+        #[serde(with = "uuid_str")]
+        pane_id: Uuid,
+        /// Bytes dropped.
+        bytes: u64,
+    },
     /// Another client attached.
     ClientConnected {
         /// Client id.
@@ -293,6 +398,11 @@ pub enum ServerEvent {
         #[serde(with = "uuid_str")]
         client_id: Uuid,
     },
+    /// An event this version does not know (a newer server). Only decoding
+    /// makes it: inside `ControlMsg::Event` an unknown variant becomes
+    /// `Unknown`, so the frame and its `seq` still count. Never sent.
+    #[serde(skip_deserializing)]
+    Unknown,
 }
 
 /// First frame of a Pane output stream (section 8).
@@ -315,6 +425,13 @@ pub struct PaneStreamHeader {
     /// that follow start at `start_offset`. `0` for a normal stream.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub snapshot_len: u32,
+    /// The pane offset at which the replay ends: the log's `total_written` at
+    /// the moment the stream starts. Bytes before it are history the client
+    /// is catching up on, bytes from it on are live. A snapshot stream sets it
+    /// to the snapshot's offset, so all its pane bytes are live. `None` from a
+    /// server that does not send it (an old decoder ignores the field).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_end: Option<u64>,
 }
 
 /// Client to server, first frame on a `forgetty/pair/2` bi stream (section 7).
@@ -446,6 +563,19 @@ pub struct SubscribeResult {
     pub seq: u64,
 }
 
+/// The client that owns a pane's size (AD-020): the PTY has its size and its
+/// `auto` input reaches the PTY.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SizeOwner {
+    /// Client id.
+    #[serde(with = "uuid_str")]
+    pub client_id: Uuid,
+    /// Kind of client. `local` for a socket client of the server.
+    pub client_kind: ClientKind,
+    /// Device name.
+    pub client_name: String,
+}
+
 /// One element of the `list_clients` result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientEntry {
@@ -475,4 +605,38 @@ pub fn to_value<T: Serialize>(v: &T) -> Result<Value, FrameError> {
 
 fn is_zero_u32(n: &u32) -> bool {
     *n == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `KNOWN_EVENTS` must list every variant a client can decode, or a
+    /// malformed known event would pass for an unknown one. serde's own
+    /// "expected one of" list for a bogus tag is generated from the enum, so a
+    /// variant added without a `KNOWN_EVENTS` entry fails here.
+    #[test]
+    fn known_events_lists_every_server_event_variant() {
+        let bogus = Value::Map(vec![(Value::from("NoSuchEvent"), Value::Nil)]);
+        let err = from_value::<ServerEvent>(bogus).unwrap_err().to_string();
+        let list = err.split("expected one of").nth(1).unwrap_or_else(|| panic!("no list: {err}"));
+        let mut generated: Vec<&str> = list.split('`').skip(1).step_by(2).collect();
+        generated.sort_unstable();
+        let mut known = KNOWN_EVENTS.to_vec();
+        known.sort_unstable();
+        assert_eq!(known, generated, "KNOWN_EVENTS and the ServerEvent variants differ");
+    }
+
+    /// A bare tag string (an event without fields in a newer server) is an
+    /// unknown event too.
+    #[test]
+    fn a_bare_unknown_tag_is_an_unknown_event() {
+        let ev = Value::Map(vec![
+            (Value::from("seq"), Value::from(3)),
+            (Value::from("event"), Value::from("FutureThing")),
+        ]);
+        let msg = Value::Map(vec![(Value::from("Event"), ev)]);
+        let got: ControlMsg = from_value(msg).unwrap();
+        assert_eq!(got, ControlMsg::Event { seq: 3, event: ServerEvent::Unknown });
+    }
 }

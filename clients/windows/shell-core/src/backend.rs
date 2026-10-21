@@ -142,7 +142,14 @@ pub enum BackendEvent {
     PaneClosed { pane_id: PaneId },
     TitleChanged { pane_id: PaneId, title: String },
     CwdChanged { pane_id: PaneId, cwd: String },
-    PaneResized { pane_id: PaneId, rows: u16, cols: u16 },
+    PaneResized { pane_id: PaneId, rows: u16, cols: u16, owner: Option<SizeOwnerInfo> },
+    /// The client that owns the pane's size changed (AD-020/AD-026).
+    SizeOwnerChanged { pane_id: PaneId, owner: Option<SizeOwnerInfo> },
+    /// The server restarted while this client held input it had not seen acked. The input was
+    /// dropped (its programs are gone): `bytes` bytes were not sent.
+    InputLost { bytes: u64 },
+    /// The server dropped input for this pane because the program did not read it (AD-024).
+    InputDropped { pane_id: PaneId, bytes: u64 },
     StatusChanged { pane_id: PaneId, status: PaneStatus, message: String },
     /// A desktop notification from the pane (OSC 9/99/777).
     Notification { pane_id: PaneId, title: String, body: String },
@@ -206,6 +213,41 @@ pub struct SplitRatio {
     pub ratio: f32,
 }
 
+/// The client that set a pane's PTY size (AD-026).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SizeOwnerInfo {
+    pub client_id: Uuid,
+    /// `windows`, `android`, `cli`, `gtk`, `local` or `unknown`.
+    pub kind: String,
+    pub name: String,
+}
+
+impl SizeOwnerInfo {
+    /// Words for a kind of client. A kind this build does not know reads as "another client".
+    pub fn kind_label(kind: &str) -> &'static str {
+        match kind {
+            "windows" => "Windows",
+            "android" => "Android",
+            "cli" => "terminal CLI",
+            "gtk" => "Linux desktop",
+            "local" => "local terminal",
+            _ => "another client",
+        }
+    }
+
+    /// The line shown in the letterbox area: "Size set by <name> (<kind>)".
+    pub fn label(&self) -> String {
+        let clean = crate::notify::sanitize(&self.name, 64);
+        let name = clean.trim();
+        let kind = Self::kind_label(&self.kind);
+        if name.is_empty() {
+            format!("Size set by {kind}")
+        } else {
+            format!("Size set by {name} ({kind})")
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct PaneInfo {
     pub pane_id: PaneId,
@@ -216,6 +258,8 @@ pub struct PaneInfo {
     pub status: PaneStatus,
     /// True once the process ended (the pane is about to be removed).
     pub exited: bool,
+    /// Who owns the PTY size now (`size_owner` of `get_pane_info`).
+    pub size_owner: Option<SizeOwnerInfo>,
 }
 
 /// What `set_label` names.
@@ -293,5 +337,23 @@ pub fn now<T>(fut: impl Future<Output = T>) -> T {
     match fut.as_mut().poll(&mut cx) {
         std::task::Poll::Ready(v) => v,
         std::task::Poll::Pending => panic!("future was not ready"),
+    }
+}
+
+#[cfg(test)]
+mod owner_tests {
+    use super::*;
+
+    fn owner(kind: &str, name: &str) -> SizeOwnerInfo {
+        SizeOwnerInfo { client_id: Uuid::nil(), kind: kind.into(), name: name.into() }
+    }
+
+    #[test]
+    fn the_size_owner_line_names_the_client_and_its_kind() {
+        assert_eq!(owner("android", "Pixel").label(), "Size set by Pixel (Android)");
+        assert_eq!(owner("local", "box").label(), "Size set by box (local terminal)");
+        // A kind from a newer server, and a name with bidi and control characters.
+        assert_eq!(owner("unknown", "x\u{202e}y\u{7}").label(), "Size set by xy (another client)");
+        assert_eq!(owner("hologram", "").label(), "Size set by another client");
     }
 }

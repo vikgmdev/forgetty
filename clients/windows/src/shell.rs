@@ -45,6 +45,8 @@ pub struct PaneMeta {
     pub message: String,
     /// PTY size the backend last reported (`PaneResized`).
     pub size: Option<(u16, u16)>,
+    /// The client that owns the PTY size (AD-026).
+    pub owner: Option<forgetty_shell_core::SizeOwnerInfo>,
 }
 
 pub struct PaletteItem {
@@ -359,11 +361,41 @@ impl AppShell {
                 BackendEvent::CwdChanged { pane_id, cwd } => {
                     self.meta.entry(pane_id).or_default().cwd = cwd;
                 }
-                BackendEvent::PaneResized { pane_id, rows, cols } => {
-                    self.meta.entry(pane_id).or_default().size = Some((rows, cols));
+                BackendEvent::PaneResized { pane_id, rows, cols, owner } => {
+                    let m = self.meta.entry(pane_id).or_default();
+                    m.size = Some((rows, cols));
+                    // The event carries the owner it was caused by. Absent means "unchanged
+                    // or unknown", the owner events and `get_pane_info` say the rest.
+                    if owner.is_some() {
+                        m.owner = owner.clone();
+                    }
                     // A remote pane follows the PTY size, whoever set it (AD-020).
                     if let Some(v) = self.views.get(&pane_id) {
-                        v.update(cx, |v, cx| v.set_pty_size(rows, cols, cx));
+                        let label = m.owner.as_ref().map(|o| o.label());
+                        v.update(cx, |v, cx| {
+                            v.set_pty_size(rows, cols, cx);
+                            v.set_size_owner(label, cx);
+                        });
+                    }
+                }
+                BackendEvent::SizeOwnerChanged { pane_id, owner } => {
+                    self.meta.entry(pane_id).or_default().owner = owner.clone();
+                    if let Some(v) = self.views.get(&pane_id) {
+                        let label = owner.map(|o| o.label());
+                        v.update(cx, |v, cx| v.set_size_owner(label, cx));
+                    }
+                }
+                BackendEvent::InputDropped { pane_id, bytes } => {
+                    if let Some(v) = self.views.get(&pane_id) {
+                        let text = format!("The program did not read its input, {bytes} bytes were dropped");
+                        v.update(cx, |v, cx| v.show_notice(text, cx));
+                    }
+                }
+                BackendEvent::InputLost { bytes } => {
+                    let text = format!("Server restarted, {bytes} bytes of input not sent");
+                    for v in self.views.values() {
+                        let text = text.clone();
+                        v.update(cx, |v, cx| v.show_notice(text, cx));
                     }
                 }
                 BackendEvent::StatusChanged { pane_id, status, message } => {
@@ -486,10 +518,15 @@ impl AppShell {
             if m.status == PaneStatus::None {
                 m.status = i.status;
             }
+            m.owner = i.size_owner;
         }
         let cfg = self.cfg.clone();
         let smoke_mode = self.smoke_mode;
         let view = cx.new(|cx| TerminalView::new(cfg, pane, src, rows, cols, smoke_mode, cx));
+        if let Some(o) = self.meta.get(&pane).and_then(|m| m.owner.as_ref()) {
+            let label = o.label();
+            view.update(cx, |v, cx| v.set_size_owner(Some(label), cx));
+        }
         self.views.insert(pane, view);
         self.sync_dirty = true;
         cx.notify();

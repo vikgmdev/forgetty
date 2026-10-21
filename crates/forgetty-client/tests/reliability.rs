@@ -298,6 +298,10 @@ fn addr_cache_snapshot_round_trips_through_serde() {
 /// and the cached direct address (no relay, no other address).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn server_restart_on_the_cached_port_reconnects_every_time() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
     const RESTARTS: usize = 10;
     let first = TestServer::start(TestServerConfig {
         panes: vec![(Uuid::new_v4(), Vec::new())],
@@ -406,7 +410,7 @@ async fn server_restart_on_the_cached_port_reconnects_every_time() {
     println!("server restarts: reconnect after B up: {reconnect_times:?}");
     let slowest = reconnect_times.iter().max().unwrap();
     assert!(
-        *slowest < Duration::from_millis(1500),
+        *slowest < Duration::from_millis(1000),
         "slowest reconnect after a restart was {slowest:?}"
     );
     assert_eq!(resets, 1, "restarts with restored logs must resume, not reset");
@@ -418,4 +422,52 @@ async fn server_restart_on_the_cached_port_reconnects_every_time() {
     if let Some(s) = last {
         s.shutdown().await;
     }
+}
+
+/// The network comes back while a dial to a dead cached address hangs.
+/// `network_changed` must abort that dial and dial again at once, with no
+/// backoff, so the client is Connected well under a second later.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn network_changed_aborts_a_hung_dial_and_connects_at_once() {
+    let first = TestServer::start(TestServerConfig::default()).await;
+    let node_id = first.node_id();
+    let port = first.udp_addr().port();
+    let addr = first.udp_addr();
+    let key = SecretKey::generate(&mut rand::rng());
+    first.authorize(key.public());
+    // The server is down: the cached address answers nothing.
+    let saved: Saved = first.stop_for_restart().await;
+
+    let cache = AddrCache::from_snapshot(&AddrCacheSnapshot {
+        entries: vec![CachedAddr { node_id: node_id.to_string(), addr }],
+    });
+    let opts = ClientOptions { addr_cache: cache, ..Default::default() };
+    let info = ClientInfo::new(Uuid::new_v4(), ClientKind::Cli, "net-change", "0");
+    let h = Client::spawn(EndpointAddr::new(node_id), key, info, opts).await.unwrap();
+
+    // Let the dial hang, and the first failures push the backoff up.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert!(!h.state().is_connected());
+
+    // The network returns: a live server on the cached address.
+    let server = TestServer::start_again(saved, port).await;
+    let t0 = Instant::now();
+    h.network_changed().await;
+    loop {
+        if server.handshakes() > 0 && h.state().is_connected() {
+            break;
+        }
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "not connected {:?} after network_changed, state {:?}",
+            t0.elapsed(),
+            h.state()
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    let took = t0.elapsed();
+    println!("network_changed during a hung dial: Connected after {took:?}");
+    assert!(took < Duration::from_millis(300), "redial took {took:?}");
+    h.close().await;
+    server.shutdown().await;
 }

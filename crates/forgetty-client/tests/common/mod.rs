@@ -30,6 +30,27 @@ pub fn is_real() -> bool {
     std::env::var_os("FORGETTY_REAL_SERVER").is_some()
 }
 
+/// First line of a test that needs the real server: `if !real_only() { return; }`.
+///
+/// Without `FORGETTY_REAL_SERVER` the test cannot run. It then prints
+/// `SKIPPED (FORGETTY_REAL_SERVER unset)` (shown with `--nocapture`, or when
+/// the run fails) and returns `false`. A bare `ok` after 0.00 s proves
+/// nothing, so with `FORGETTY_REQUIRE_REAL=1` (the gates set it) the test
+/// fails instead.
+pub fn real_only() -> bool {
+    if is_real() {
+        return true;
+    }
+    if std::env::var("FORGETTY_REQUIRE_REAL").is_ok_and(|v| v == "1") {
+        panic!(
+            "FORGETTY_REQUIRE_REAL=1 but FORGETTY_REAL_SERVER is unset: \
+             this test needs the real server and would have been skipped"
+        );
+    }
+    println!("SKIPPED (FORGETTY_REAL_SERVER unset)");
+    false
+}
+
 fn b64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
@@ -188,23 +209,37 @@ impl Real {
         log_mb: Option<u32>,
         open_access_override: Option<bool>,
     ) -> Real {
-        let child = Self::spawn(&dir, port, log_mb);
+        let mut child = Self::spawn(&dir, port, log_mb);
         let pid = child.id() as i32;
         let sock = Self::socket(dir.path());
         let t0 = std::time::Instant::now();
+        let mut last;
         let (rpc, state) = loop {
-            if let Ok(rpc) = Rpc::connect(&sock) {
-                if let Ok(state) = rpc.call("qa_state", json!({})) {
-                    if state.get("udp_port").is_some_and(|p| !p.is_null()) {
-                        break (rpc, state);
+            match Rpc::connect(&sock) {
+                Ok(rpc) => match rpc.call("qa_state", json!({})) {
+                    Ok(state) if state.get("udp_port").is_some_and(|p| !p.is_null()) => {
+                        break (rpc, state)
                     }
-                }
+                    Ok(state) => last = format!("qa_state without a UDP port: {state}"),
+                    Err(e) => last = format!("qa_state failed: {e}"),
+                },
+                Err(e) => last = format!("socket connect failed: {e}"),
             }
-            assert!(
-                t0.elapsed() < Duration::from_secs(30),
-                "real server did not start; see {}",
-                dir.path().join("server.log").display()
-            );
+            if t0.elapsed() >= Duration::from_secs(30) {
+                // The temp dir (and the log with it) goes when this panics, so
+                // say what the server wrote, and do not leave it running.
+                let log =
+                    std::fs::read_to_string(dir.path().join("server.log")).unwrap_or_default();
+                let tail: Vec<&str> = log.lines().rev().take(40).collect();
+                let exited = child.try_wait().ok().flatten();
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "real server did not start in 30 s (last try: {last}; process exit: \
+                     {exited:?}); server.log tail:\n{}",
+                    tail.into_iter().rev().collect::<Vec<_>>().join("\n")
+                );
+            }
             tokio::time::sleep(Duration::from_millis(5)).await;
         };
         let node_id: EndpointId = state["node_id"].as_str().unwrap().parse().expect("node id");
@@ -392,6 +427,14 @@ impl TestServer {
 
     pub fn is_real(&self) -> bool {
         matches!(self.inner, Inner::Real(_))
+    }
+
+    /// The real server's `--state-dir` (`None` for the mock).
+    pub fn state_dir(&self) -> Option<PathBuf> {
+        match &self.inner {
+            Inner::Real(r) => Some(r.dir.path().join("state")),
+            Inner::Mock { .. } => None,
+        }
     }
 
     pub fn node_id(&self) -> EndpointId {
@@ -722,6 +765,14 @@ impl TestServer {
         match &self.inner {
             Inner::Real(r) => Some(r.pid),
             Inner::Mock { .. } => None,
+        }
+    }
+
+    /// Path of the real server's local socket.
+    pub fn socket_path(&self) -> PathBuf {
+        match &self.inner {
+            Inner::Real(r) => Real::socket(r.dir.path()),
+            Inner::Mock { .. } => panic!("mock server has no socket"),
         }
     }
 

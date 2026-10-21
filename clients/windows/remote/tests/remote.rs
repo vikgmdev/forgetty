@@ -81,6 +81,7 @@ async fn read_until(rx: &async_channel::Receiver<PaneEvent>, needle: &str) -> (S
                 text.clear();
             }
             PaneEvent::Output(b) => text.push_str(&String::from_utf8_lossy(&b)),
+            PaneEvent::ReplayEnd => {}
             PaneEvent::Closed(r) => panic!("closed: {r}"),
         }
     }

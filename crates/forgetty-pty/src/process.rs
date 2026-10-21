@@ -41,7 +41,7 @@ pub struct PtyProcess {
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
     reader: Option<Box<dyn IoRead + Send>>,
-    writer: Box<dyn IoWrite + Send>,
+    writer: Option<Box<dyn IoWrite + Send>>,
 }
 
 impl PtyProcess {
@@ -128,12 +128,39 @@ impl PtyProcess {
             .try_clone_reader()
             .map_err(|e| ForgettyError::Pty(format!("failed to clone PTY reader: {e}")))?;
 
-        let writer = pair
-            .master
-            .take_writer()
-            .map_err(|e| ForgettyError::Pty(format!("failed to take PTY writer: {e}")))?;
+        let writer = Self::plain_writer(&*pair.master)?;
 
-        Ok(Self { master: pair.master, child, reader: Some(reader), writer })
+        Ok(Self { master: pair.master, child, reader: Some(reader), writer: Some(writer) })
+    }
+
+    /// A writer for the master side that is a plain duplicate of the fd.
+    ///
+    /// Not `MasterPty::take_writer`: portable-pty's writer writes `\n` and
+    /// VEOF to the terminal when it is dropped, which makes the shell run
+    /// whatever is half typed at its prompt. Nothing here writes on drop.
+    #[cfg(unix)]
+    fn plain_writer(master: &dyn MasterPty) -> Result<Box<dyn IoWrite + Send>> {
+        use std::os::fd::FromRawFd;
+        let fd = master
+            .as_raw_fd()
+            .ok_or_else(|| ForgettyError::Pty("PTY master has no fd".to_string()))?;
+        // SAFETY: `fd` is the open master fd; the duplicate is ours alone.
+        let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+        if dup < 0 {
+            return Err(ForgettyError::Pty(format!(
+                "failed to duplicate the PTY master: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        // SAFETY: `dup` is a fresh fd that nothing else owns.
+        Ok(Box::new(unsafe { std::fs::File::from_raw_fd(dup) }))
+    }
+
+    #[cfg(not(unix))]
+    fn plain_writer(master: &dyn MasterPty) -> Result<Box<dyn IoWrite + Send>> {
+        master
+            .take_writer()
+            .map_err(|e| ForgettyError::Pty(format!("failed to take PTY writer: {e}")))
     }
 
     /// Read bytes from the PTY. This is a blocking call.
@@ -157,9 +184,24 @@ impl PtyProcess {
     }
 
     /// Write bytes to the PTY.
+    ///
+    /// Blocks while the PTY is full (a program that does not read). Callers
+    /// that must not block take the writer out with [`Self::take_writer`] and
+    /// drive it from a thread of their own.
     pub fn write(&mut self, data: &[u8]) -> Result<()> {
-        self.writer.write_all(data).map_err(ForgettyError::Io)?;
-        self.writer.flush().map_err(ForgettyError::Io)
+        let w = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| ForgettyError::Pty("PTY writer has been taken".to_string()))?;
+        w.write_all(data).map_err(ForgettyError::Io)?;
+        w.flush().map_err(ForgettyError::Io)
+    }
+
+    /// Take the writer out of this PtyProcess, for a writer thread.
+    ///
+    /// After this, [`Self::write`] fails.
+    pub fn take_writer(&mut self) -> Option<Box<dyn IoWrite + Send>> {
+        self.writer.take()
     }
 
     /// Resize the PTY.
@@ -209,8 +251,9 @@ impl PtyProcess {
     /// translates to `SIGINT` when `ISIG` is enabled).
     ///
     /// Reads `c_cc[VINTR]` via `tcgetattr` on the master PTY fd. Returns
-    /// `None` if the master fd is unavailable or `tcgetattr` fails — callers
-    /// fall back to the POSIX default `0x03`.
+    /// `None` if the master fd is unavailable, `tcgetattr` fails, `ISIG` is
+    /// off, or VINTR is disabled (0). `None` means the terminal does not turn
+    /// any input byte into SIGINT right now.
     ///
     /// Used by the daemon's Ctrl+C path (FIX-017) to write a byte that
     /// matches the current `VINTR` setting rather than hardcoded `0x03`.
@@ -225,7 +268,13 @@ impl PtyProcess {
         if unsafe { libc::tcgetattr(fd, &mut termios) } != 0 {
             return None;
         }
-        Some(termios.c_cc[libc::VINTR])
+        // With ISIG off (vim, an editor in raw mode) the byte is plain input,
+        // and 0 (_POSIX_VDISABLE) means no interrupt character at all.
+        let intr = termios.c_cc[libc::VINTR];
+        if termios.c_lflag & libc::ISIG == 0 || intr == 0 {
+            return None;
+        }
+        Some(intr)
     }
 
     /// Non-Unix stub: VINTR is a POSIX termios concept and not meaningful
@@ -234,6 +283,30 @@ impl PtyProcess {
     pub fn vintr(&self) -> Option<u8> {
         None
     }
+
+    /// Throw away input that was written to the terminal and not read by the
+    /// program yet (`tcflush(TCIFLUSH)` on the slave side). What Ctrl+C does
+    /// through the line discipline, for an interrupt that is sent as a signal
+    /// because the byte could not be written. Best effort.
+    #[cfg(unix)]
+    pub fn flush_pending_input(&self) {
+        use std::os::unix::ffi::OsStrExt;
+        let Some(name) = self.master.tty_name() else { return };
+        let Ok(c) = std::ffi::CString::new(name.as_os_str().as_bytes()) else { return };
+        // SAFETY: opening a path and flushing a tty we own; the fd is closed
+        // below. O_NOCTTY: this must not become a controlling terminal.
+        unsafe {
+            let fd = libc::open(c.as_ptr(), libc::O_RDWR | libc::O_NOCTTY | libc::O_NONBLOCK);
+            if fd >= 0 {
+                libc::tcflush(fd, libc::TCIFLUSH);
+                libc::close(fd);
+            }
+        }
+    }
+
+    /// Non-Unix stub.
+    #[cfg(not(unix))]
+    pub fn flush_pending_input(&self) {}
 
     /// Kill the child process.
     pub fn kill(&mut self) -> Result<()> {
