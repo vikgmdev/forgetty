@@ -228,7 +228,8 @@ impl AppShell {
             // The smoke state machine advances per painted frame: keep frames coming.
             cx.spawn(async move |this, cx| loop {
                 cx.background_executor().timer(std::time::Duration::from_millis(60)).await;
-                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                // Not while a latency phase runs: it must see only real frames.
+                if this.update(cx, |s, cx| if s.smoke.as_ref().map_or(true, |m| m.wants_ticks()) { cx.notify() }).is_err() {
                     break;
                 }
             })

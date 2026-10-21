@@ -82,6 +82,8 @@ fn main() {
                 }),
                 window_background: background,
                 window_min_size: Some(size(px(480.0), px(300.0))),
+                // The smoke measures key-to-frame latency: no inactive-window frame cap on CI.
+                inactive_frame_interval: if smoke { None } else { Some(std::time::Duration::from_micros(33_333)) },
                 ..Default::default()
             },
             move |window, cx| {

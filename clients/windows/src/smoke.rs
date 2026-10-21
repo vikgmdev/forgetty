@@ -184,6 +184,7 @@ pub struct ShellSmoke {
     count_before: usize,
     nav_ok: bool,
     shot_frames: u32,
+    frames_seen: u64,
 }
 
 /// Snapshot of one pane's screen.
@@ -262,7 +263,13 @@ impl ShellSmoke {
             count_before: 0,
             nav_ok: true,
             shot_frames: 0,
+            frames_seen: 0,
         }
+    }
+
+    /// Phases that measure latency or throughput must not get extra frames.
+    pub fn wants_ticks(&self) -> bool {
+        !matches!(self.phase, Phase::Keys | Phase::Throughput | Phase::Synth | Phase::Keys4)
     }
 
     fn goto(&mut self, p: Phase) {
@@ -307,6 +314,10 @@ impl ShellSmoke {
             record("time_to_first_frame_ms", json!(ms(now_t - self.start)));
             set_phase(Phase::WaitPrompt.name());
         }
+        if self.frames_seen % 200 == 0 {
+            record(&format!("window_active_at_frame_{}", self.frames_seen), json!(window.is_window_active()));
+        }
+        self.frames_seen += 1;
         if self.phase_t0.elapsed() > PHASE_TIMEOUT {
             fail(&format!("phase {} stuck for {:?}", self.phase.name(), PHASE_TIMEOUT));
         }
