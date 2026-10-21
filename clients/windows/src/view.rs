@@ -136,8 +136,6 @@ pub struct TerminalView {
     /// Smoke only: dry-run key encoding writes here instead of the source.
     pub capture_input: Option<Vec<u8>>,
     pub pending_paste: Option<PendingPaste>,
-    /// Glyph-atlas prewarm progress: one subpixel variant of printable ASCII per frame.
-    pub prewarm: u8,
     pub fed_bytes: u64,
     pub feed_time: Duration,
     pub max_feed: Duration,
@@ -256,7 +254,6 @@ impl TerminalView {
             capture_input: None,
             pending_paste: None,
             fed_bytes: 0,
-            prewarm: 0,
             feed_time: Duration::ZERO,
             max_feed: Duration::ZERO,
         }
