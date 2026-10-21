@@ -204,7 +204,8 @@ if want 6; then
   for t in revoke_closes_a_v2_connection_and_the_client_registry_counts_it \
            stopping_server_refuses_v2_attaches \
            log_offsets_persist_across_rotation_and_restart \
-           input_typed_during_a_restart_arrives_once \
+           input_typed_during_a_restart_is_dropped_and_input_after_it_arrives_once \
+           unacked_input_is_dropped_and_reported_when_the_server_restarts \
            restart_under_load_with_a_client_connecting_in_the_stop_window \
            a_client_that_stops_reading_control_costs_no_memory_and_is_closed \
            cat_200mb_through_the_server; do
