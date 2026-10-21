@@ -22,8 +22,10 @@ use crate::config::Config;
 use crate::shell::{AppShell, BAR};
 use crate::view::TerminalView;
 
+mod remote;
+
 pub const KEYSTROKES: usize = 100;
-pub const TOTAL_TIMEOUT: Duration = Duration::from_secs(300);
+pub const TOTAL_TIMEOUT: Duration = Duration::from_secs(420);
 const PHASE_TIMEOUT: Duration = Duration::from_secs(60);
 const CONPTY_LINES: u32 = 25_000;
 const CONPTY_BYTES: f64 = CONPTY_LINES as f64 * 90.0;
@@ -115,6 +117,14 @@ enum Phase {
     PaletteOpen,
     PaletteRun,
     Rename,
+    // W3: remote machines.
+    RSetup,
+    RPair,
+    REcho,
+    RKeys,
+    RKill,
+    RRestart,
+    RToast,
 }
 
 impl Phase {
@@ -145,6 +155,13 @@ impl Phase {
             Phase::PaletteOpen => "w2-palette-open",
             Phase::PaletteRun => "w2-palette-run",
             Phase::Rename => "w2-rename",
+            Phase::RSetup => "w3-start-server-and-pair",
+            Phase::RPair => "w3-wait-for-panes",
+            Phase::REcho => "w3-remote-echo",
+            Phase::RKeys => "w3-remote-keystrokes",
+            Phase::RKill => "w3-kill-server",
+            Phase::RRestart => "w3-restart-server",
+            Phase::RToast => "w3-toasts",
         }
     }
 }
@@ -189,6 +206,7 @@ pub struct ShellSmoke {
     nav_ok: bool,
     shot_frames: u32,
     frames_seen: u64,
+    w3: remote::W3,
 }
 
 /// Snapshot of one pane's screen.
@@ -268,12 +286,13 @@ impl ShellSmoke {
             nav_ok: true,
             shot_frames: 0,
             frames_seen: 0,
+            w3: remote::W3::default(),
         }
     }
 
     /// Phases that measure latency or throughput must not get extra frames.
     pub fn wants_ticks(&self) -> bool {
-        !matches!(self.phase, Phase::Keys | Phase::Throughput | Phase::Synth | Phase::Keys4)
+        !matches!(self.phase, Phase::Keys | Phase::Throughput | Phase::Synth | Phase::Keys4 | Phase::RKeys)
     }
 
     fn goto(&mut self, p: Phase) {
@@ -899,7 +918,7 @@ impl ShellSmoke {
                 let ok = st[0] == PaneStatus::Working
                     && st[1] == PaneStatus::Done
                     && st[2] == PaneStatus::Failed
-                    && st[3] == PaneStatus::Waiting
+                    && st[3] == PaneStatus::Idle
                     && shell.tab_title(&tabs[0]) == "make all"
                     && shell.tab_cwd(&tabs[0]) == "forgetty";
                 if ok {
@@ -1046,21 +1065,24 @@ impl ShellSmoke {
                             self.sub = 2;
                         } else if self.sub_t0.elapsed() > Duration::from_secs(5) {
                             check("tab_rename", false);
-                            self.finish(shell);
+                            self.goto(Phase::RSetup);
                         }
                     }
                     _ => {
                         let title = shell.active_tab().map(|t| shell.tab_title(t));
                         if shell.rename.is_none() && title.as_deref() == Some("abc") {
                             check("tab_rename", true);
-                            self.finish(shell);
+                            self.goto(Phase::RSetup);
                         } else if self.sub_t0.elapsed() > Duration::from_secs(5) {
                             record("rename_debug", json!(title));
                             check("tab_rename", false);
-                            self.finish(shell);
+                            self.goto(Phase::RSetup);
                         }
                     }
                 }
+            }
+            Phase::RSetup | Phase::RPair | Phase::REcho | Phase::RKeys | Phase::RKill | Phase::RRestart | Phase::RToast => {
+                self.w3_step(shell, window, cx, now_t)
             }
             _ => {}
         }
@@ -1126,6 +1148,7 @@ impl ShellSmoke {
         println!("{}", snapshot(all));
         let _ = std::io::stdout().flush();
         self.local.shutdown_all();
+        self.w3_kill_server();
         std::process::exit(if all { 0 } else { 1 });
     }
 }

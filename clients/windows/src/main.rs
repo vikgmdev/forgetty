@@ -7,10 +7,12 @@ mod config;
 mod element;
 mod encoder;
 mod lineedit;
+mod machines;
 mod screenshot;
 mod shell;
 mod smoke;
 mod view;
+mod winsys;
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -35,6 +37,24 @@ fn main() {
     }
 
     raise_timer_resolution(smoke);
+
+    // Runtime for everything that talks to remote machines (iroh needs tokio).
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("forgetty-net")
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let rt_handle = rt.handle().clone();
+    // Where machines, the device key and the address cache live. The smoke uses
+    // a fresh directory so it never touches the user's paired machines.
+    let data_dir = if smoke {
+        let d = std::env::temp_dir().join(format!("forgetty-smoke-{}", std::process::id()));
+        std::env::set_var("FORGETTY_DATA_DIR", &d);
+        Some(d)
+    } else {
+        forgetty_remote::store::MachineStore::default_dir()
+    };
 
     let (mut cfg, cfg_err) = if smoke { (Config::default(), None) } else { Config::load() };
     // Mica needs Windows 11 22H2 (build 22621). Older systems get a solid background.
@@ -90,9 +110,26 @@ fn main() {
             },
             move |window, cx| {
                 let shell = cx.new(|cx| AppShell::new(cfg, backend, smoke_state, window, cx));
-                shell.update(cx, |_, cx| {
+                shell.update(cx, |s, cx| {
                     cx.observe_window_activation(window, |s, window, cx| s.on_window_activation(window, cx))
                         .detach();
+                    match data_dir {
+                        Some(dir) => {
+                            let store = forgetty_remote::store::MachineStore::open(dir);
+                            let addr_cache = store.addr_cache();
+                            s.init_remote(
+                                machines::RemoteCtx {
+                                    rt: rt_handle,
+                                    store,
+                                    device_name: std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows PC".into()),
+                                    addr_cache,
+                                },
+                                winsys::start(),
+                                cx,
+                            );
+                        }
+                        None => eprintln!("forgetty-win: no %APPDATA%, remote machines are off"),
+                    }
                 });
                 shell
             },
@@ -102,6 +139,7 @@ fn main() {
         }
         cx.activate(true);
     });
+    drop(rt);
 }
 
 fn fatal(smoke: bool, msg: &str) -> ! {

@@ -5,6 +5,8 @@
 //! scrollback_bytes = 10485760   # libghostty bytes per pane (default 10 MiB)
 //! backdrop = "mica"             # mica | mica_alt | blur | none
 //! sidebar = false               # start with the sidebar open
+//! pane_padding_x = 6.0          # px between a pane border and its text (default 6)
+//! pane_padding_y = 4.0          # default 4
 //! [font]
 //! family = "Cascadia Mono"
 //! size = 11.0            # points
@@ -37,6 +39,8 @@ struct FileConfig {
     scrollback_bytes: Option<usize>,
     backdrop: Option<String>,
     sidebar: Option<bool>,
+    pane_padding_x: Option<f32>,
+    pane_padding_y: Option<f32>,
     keybindings: HashMap<String, KeyValue>,
     font: FontSection,
     theme: ThemeSection,
@@ -82,6 +86,9 @@ pub struct Config {
     pub scrollback_bytes: usize,
     pub backdrop: Backdrop,
     pub sidebar_open: bool,
+    /// Space between a pane's border and its cell grid, in px.
+    pub pane_padding_x: f32,
+    pub pane_padding_y: f32,
     /// Action name to chords, from `[keybindings]`. Overrides the defaults.
     pub keybindings: HashMap<String, Vec<String>>,
     pub accent: u32,
@@ -108,6 +115,8 @@ impl Default for Config {
             scrollback_bytes: DEFAULT_MAX_SCROLLBACK_BYTES,
             backdrop: Backdrop::Mica,
             sidebar_open: false,
+            pane_padding_x: 6.0,
+            pane_padding_y: 4.0,
             keybindings: HashMap::new(),
             accent: 0x60cdff,
             font_family: "Cascadia Mono".into(),
@@ -169,6 +178,12 @@ impl Config {
         }
         if let Some(v) = f.sidebar {
             c.sidebar_open = v;
+        }
+        if let Some(v) = f.pane_padding_x.filter(|v| (0.0..=64.0).contains(v)) {
+            c.pane_padding_x = v;
+        }
+        if let Some(v) = f.pane_padding_y.filter(|v| (0.0..=64.0).contains(v)) {
+            c.pane_padding_y = v;
         }
         for (name, v) in f.keybindings {
             let keys = match v {

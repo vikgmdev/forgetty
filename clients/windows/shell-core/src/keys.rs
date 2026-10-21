@@ -28,6 +28,9 @@ pub enum Action {
     NewWorkspace,
     NextWorkspace,
     PrevWorkspace,
+    PairMachine,
+    NextMachine,
+    PrevMachine,
 }
 
 pub struct ActionInfo {
@@ -75,6 +78,9 @@ pub const ACTIONS: &[ActionInfo] = &[
     info!(Action::NewWorkspace, "new_workspace", "New workspace", ["ctrl+shift+n"]),
     info!(Action::NextWorkspace, "next_workspace", "Next workspace", []),
     info!(Action::PrevWorkspace, "prev_workspace", "Previous workspace", []),
+    info!(Action::PairMachine, "pair_machine", "Pair machine...", []),
+    info!(Action::NextMachine, "next_machine", "Next machine", []),
+    info!(Action::PrevMachine, "prev_machine", "Previous machine", []),
 ];
 
 impl Action {

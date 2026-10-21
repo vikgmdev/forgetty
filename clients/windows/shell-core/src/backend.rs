@@ -54,11 +54,13 @@ pub fn ready<T: Send + 'static>(r: BackendResult<T>) -> BackendFuture<T> {
 }
 
 /// Program status shown on a tab. Wire strings of `StatusChanged.status`:
-/// `working`, `waiting`, `done`, `failed`. Anything else is `None`.
+/// `idle`, `working`, `waiting`, `done`, `failed`. Anything else is `None`.
+/// `Idle` (a shell at its prompt) shows no icon and never raises a toast.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum PaneStatus {
     #[default]
     None,
+    Idle,
     Working,
     Waiting,
     Done,
@@ -68,8 +70,9 @@ pub enum PaneStatus {
 impl PaneStatus {
     pub fn parse(s: &str) -> Self {
         match s.trim().to_ascii_lowercase().as_str() {
+            "idle" => PaneStatus::Idle,
             "working" | "running" | "busy" => PaneStatus::Working,
-            "waiting" | "input" | "idle" => PaneStatus::Waiting,
+            "waiting" => PaneStatus::Waiting,
             "done" | "ok" | "success" => PaneStatus::Done,
             "failed" | "error" | "fail" => PaneStatus::Failed,
             _ => PaneStatus::None,
@@ -79,6 +82,7 @@ impl PaneStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             PaneStatus::None => "none",
+            PaneStatus::Idle => "idle",
             PaneStatus::Working => "working",
             PaneStatus::Waiting => "waiting",
             PaneStatus::Done => "done",
@@ -93,7 +97,41 @@ impl PaneStatus {
             PaneStatus::Waiting => 3,
             PaneStatus::Failed => 2,
             PaneStatus::Done => 1,
-            PaneStatus::None => 0,
+            PaneStatus::Idle | PaneStatus::None => 0,
+        }
+    }
+
+    /// Statuses that call for the user: a program asks for input, or ended.
+    pub fn wants_attention(self) -> bool {
+        matches!(self, PaneStatus::Waiting | PaneStatus::Done | PaneStatus::Failed)
+    }
+}
+
+/// State of the link to a machine. A local backend is always `Connected`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConnState {
+    Connected,
+    /// No connection. `since` is when it was lost (or when the client started).
+    Reconnecting { since: std::time::Instant },
+    /// The link stopped for good (`proto_mismatch`, `not_authorized`).
+    Failed(String),
+    Closed,
+}
+
+impl ConnState {
+    pub fn is_connected(&self) -> bool {
+        matches!(self, ConnState::Connected)
+    }
+
+    /// The "reconnecting" overlay shows only after this long without a
+    /// connection (PROTOCOL_V2 section 9), never sooner.
+    pub const OVERLAY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+
+    pub fn show_overlay(&self, now: std::time::Instant) -> bool {
+        match self {
+            ConnState::Reconnecting { since } => now.saturating_duration_since(*since) >= Self::OVERLAY_DELAY,
+            ConnState::Failed(_) => true,
+            _ => false,
         }
     }
 }
@@ -106,6 +144,10 @@ pub enum BackendEvent {
     CwdChanged { pane_id: PaneId, cwd: String },
     PaneResized { pane_id: PaneId, rows: u16, cols: u16 },
     StatusChanged { pane_id: PaneId, status: PaneStatus, message: String },
+    /// A desktop notification from the pane (OSC 9/99/777).
+    Notification { pane_id: PaneId, title: String, body: String },
+    /// The link to the machine changed state.
+    ConnectionChanged(ConnState),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -182,6 +224,15 @@ pub trait SessionBackend: Send + Sync {
 
     /// Event stream (`subscribe_events`). One consumer: the app shell.
     fn subscribe(&self) -> async_channel::Receiver<BackendEvent>;
+
+    /// Current link state. A local backend is always connected.
+    fn connection(&self) -> ConnState {
+        ConnState::Connected
+    }
+
+    /// The OS reported a network change or the PC woke from sleep. A remote
+    /// backend probes its connection and redials when it is dead.
+    fn network_changed(&self) {}
 
     fn get_layout(&self) -> BackendFuture<Layout>;
     fn new_tab(&self, req: NewTab) -> BackendFuture<NewTabReply>;

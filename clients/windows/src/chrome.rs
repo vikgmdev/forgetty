@@ -51,7 +51,7 @@ impl AppShell {
 
     pub fn status_icon(&self, st: PaneStatus) -> Option<AnyElement> {
         Some(match st {
-            PaneStatus::None => return None,
+            PaneStatus::None | PaneStatus::Idle => return None,
             PaneStatus::Working => self.spinner(),
             PaneStatus::Waiting => div().w(px(12.0)).h(px(12.0)).flex_none().flex().items_center().justify_center()
                 .child(div().w(px(7.0)).h(px(7.0)).rounded_full().bg(hsla(WARN)))
@@ -271,23 +271,55 @@ impl AppShell {
             .text_size(px(12.5))
             .text_color(hsla(th.fg));
 
-        // Machines.
+        // Machines: the local one and every paired remote, with the state of each link.
         sb = sb.child(header("MACHINES"));
-        let m = &self.machine;
+        let now = std::time::Instant::now();
+        for (i, e) in self.machines.iter().enumerate() {
+            let active = e.id == self.machine.id;
+            let id = e.id;
+            let (dot, label) = match (e.kind, &e.conn) {
+                (forgetty_shell_core::MachineKind::Local, _) => (OK, "local"),
+                (_, forgetty_shell_core::ConnState::Connected) => (OK, "connected"),
+                (_, c @ forgetty_shell_core::ConnState::Reconnecting { .. }) => {
+                    (WARN, if c.show_overlay(now) { "reconnecting" } else { "connecting" })
+                }
+                (_, forgetty_shell_core::ConnState::Failed(_)) => (BAD, "offline"),
+                (_, forgetty_shell_core::ConnState::Closed) => (BAD, "closed"),
+            };
+            sb = sb.child(
+                div()
+                    .id(("machine", i))
+                    .mx(px(8.0))
+                    .px(px(8.0))
+                    .h(px(28.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .rounded(px(5.0))
+                    .cursor_pointer()
+                    .when(active, |d| d.bg(alpha(th.hover, 0.8)))
+                    .hover(move |s| s.bg(hover))
+                    .on_mouse_down(MouseButton::Left, cx.listener(move |s, _e, _w, cx| s.switch_machine(id, cx)))
+                    .child(div().w(px(7.0)).h(px(7.0)).flex_none().rounded_full().bg(hsla(dot)))
+                    .child(div().flex_1().truncate().child(SharedString::from(e.name.clone())))
+                    .child(div().flex_none().text_size(px(10.5)).text_color(hsla(th.dim)).child(label)),
+            );
+        }
         sb = sb.child(
             div()
+                .id("machine-pair")
                 .mx(px(8.0))
                 .px(px(8.0))
-                .h(px(28.0))
+                .h(px(26.0))
                 .flex()
-                .flex_row()
                 .items_center()
-                .gap(px(8.0))
                 .rounded(px(5.0))
-                .bg(alpha(th.hover, 0.8))
-                .child(div().w(px(7.0)).h(px(7.0)).rounded_full().bg(hsla(if m.connected { OK } else { WARN })))
-                .child(div().flex_1().truncate().child(SharedString::from(m.name.clone())))
-                .child(div().text_size(px(10.5)).text_color(hsla(th.dim)).child("local")),
+                .cursor_pointer()
+                .text_color(hsla(th.dim))
+                .hover(move |s| s.bg(hover))
+                .on_mouse_down(MouseButton::Left, cx.listener(|s, _e, _w, cx| s.open_pair(cx)))
+                .child("+ Pair machine..."),
         );
 
         // Workspaces.
@@ -383,6 +415,7 @@ impl AppShell {
         let active = self.active_pane();
         let multi = self.active_tab().is_some_and(|t| t.pane_tree.pane_count() > 1);
         let zoomed = self.zoomed.contains_key(&tab_id);
+        let overlay = self.overlay_text(std::time::Instant::now());
         for (pane, r) in &geo.panes {
             let pane = *pane;
             let focused = Some(pane) == active;
@@ -408,6 +441,23 @@ impl AppShell {
                     .child(bar().bottom_0().left_0().w_full().h(px(1.0)))
                     .child(bar().top_0().left_0().h_full().w(px(1.0)))
                     .child(bar().top_0().right_0().h_full().w(px(1.0)));
+            }
+            if let Some(text) = &overlay {
+                // Only this machine's panes, only after the link has been down for 1 s.
+                d = d.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(alpha(th.bg, 0.72))
+                        .text_color(hsla(th.fg))
+                        .text_size(px(13.0))
+                        .child(SharedString::from(text.clone())),
+                );
             }
             if zoomed {
                 d = d.child(
@@ -583,6 +633,125 @@ impl AppShell {
     }
 }
 
+impl AppShell {
+    /// The pairing dialog: paste, confirm (machine, node id, relay), pair.
+    fn render_pair(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let d = self.pair.as_ref()?;
+        let th = self.theme;
+        let line = |t: String, strong: bool| {
+            div()
+                .text_size(px(13.0))
+                .text_color(hsla(if strong { th.fg } else { th.dim }))
+                .child(SharedString::from(t))
+        };
+        let row = |k: &str, v: String| {
+            div()
+                .flex()
+                .flex_row()
+                .gap(px(10.0))
+                .child(div().w(px(76.0)).flex_none().text_size(px(12.5)).text_color(hsla(th.dim)).child(SharedString::from(k.to_string())))
+                .child(div().flex_1().min_w_0().truncate().text_size(px(13.0)).font_family("Cascadia Mono").child(SharedString::from(v)))
+        };
+        let button = |id: &'static str, label: &'static str, primary: bool| {
+            div()
+                .id(id)
+                .px(px(14.0))
+                .h(px(30.0))
+                .flex()
+                .items_center()
+                .rounded(px(5.0))
+                .cursor_pointer()
+                .text_size(px(13.0))
+                .border_1()
+                .border_color(alpha(th.border, 1.0))
+                .when(primary, |b| b.bg(alpha(th.accent, 0.25)).border_color(hsla(th.accent)))
+                .hover(move |s| s.bg(alpha(th.hover, 1.0)))
+                .child(label)
+        };
+        let mut body = div().flex().flex_col().gap(px(10.0)).p(px(18.0));
+        body = body.child(div().text_size(px(15.0)).font_weight(FontWeight::SEMIBOLD).child("Pair machine"));
+        match &d.stage {
+            crate::machines::PairStage::Input => {
+                body = body
+                    .child(line("Run `forgetty pair` on the other machine, copy the text it prints and paste it here.".into(), false))
+                    .child(
+                        div()
+                            .h(px(34.0))
+                            .px(px(10.0))
+                            .flex()
+                            .items_center()
+                            .rounded(px(5.0))
+                            .border_1()
+                            .border_color(alpha(th.border, 1.0))
+                            .text_color(hsla(th.dim))
+                            .text_size(px(12.5))
+                            .child("Press Ctrl+V to paste"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap(px(8.0))
+                            .justify_end()
+                            .child(button("pair-cancel", "Cancel", false).on_mouse_down(MouseButton::Left, cx.listener(|s, _e, _w, cx| s.pair_cancel(cx)))),
+                    );
+            }
+            crate::machines::PairStage::Confirm(o) => {
+                body = body
+                    .child(line("Pair with this machine?".into(), true))
+                    .child(row("Machine", o.machine.clone()))
+                    .child(row("Node ID", format!("{}...", o.node_short)))
+                    .child(row("Relay", if o.relay.is_empty() { "none".to_string() } else { o.relay.clone() }))
+                    .child(line("Pairing gives this PC full access to the sessions on that machine.".into(), false))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap(px(8.0))
+                            .justify_end()
+                            .child(button("pair-cancel", "Cancel", false).on_mouse_down(MouseButton::Left, cx.listener(|s, _e, _w, cx| s.pair_cancel(cx))))
+                            .child(button("pair-confirm", "Confirm", true).on_mouse_down(MouseButton::Left, cx.listener(|s, _e, _w, cx| s.pair_confirm(cx)))),
+                    );
+            }
+            crate::machines::PairStage::Working(o) => {
+                body = body.child(line(format!("Pairing with {}...", o.machine), true));
+            }
+            crate::machines::PairStage::Failed(msg) => {
+                body = body.child(line(msg.clone(), true)).child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap(px(8.0))
+                        .justify_end()
+                        .child(button("pair-cancel", "Close", false).on_mouse_down(MouseButton::Left, cx.listener(|s, _e, _w, cx| s.pair_cancel(cx)))),
+                );
+            }
+        }
+        let panel = div()
+            .w(px(520.0).min(px(self.viewport.0 - 40.0)))
+            .rounded(px(10.0))
+            .border_1()
+            .border_color(alpha(th.border, 1.0))
+            .bg(alpha(blend(th.chrome, th.bg, 0.2), 0.98))
+            .shadow_lg()
+            .text_color(hsla(th.fg))
+            .child(body);
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .pt(px(TITLEBAR_H + 60.0))
+                .occlude()
+                .child(panel),
+        )
+    }
+}
+
 impl Render for AppShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.smoke_mode {
@@ -624,6 +793,7 @@ impl Render for AppShell {
             .child(self.render_titlebar(window, cx))
             .child(body)
             .children(self.render_palette())
+            .children(self.render_pair(cx))
             .child(
                 canvas(
                     |_, _, _| (),

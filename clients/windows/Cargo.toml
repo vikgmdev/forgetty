@@ -17,6 +17,8 @@ path = "src/main.rs"
 forgetty-vt = { path = "../../crates/forgetty-vt" }
 forgetty-core = { path = "../../crates/forgetty-core" }
 forgetty-shell-core = { path = "shell-core" }
+forgetty-remote = { path = "remote" }
+forgetty-client = { path = "../../crates/forgetty-client" }
 # Newest stable Zed release tag at spike time: v1.24.4. See README.md.
 gpui = { git = "https://github.com/zed-industries/zed", rev = "aed37547d8543000494fb69101c05daec5891068" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "aed37547d8543000494fb69101c05daec5891068" }
@@ -28,6 +30,24 @@ toml = "0.8"
 anyhow = "1"
 png = "0.17"
 raw-window-handle = "0.6"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_System_Power",
+    "Win32_System_Registry",
+    "Win32_System_WinRT",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "UI_Notifications",
+    "Data_Xml_Dom",
+    "Foundation",
+] }
 
 # Zed patches crates.io crates in its own workspace root. Patches do not apply
 # to dependents, so the ones gpui needs are repeated here (same revs as v1.24.4).

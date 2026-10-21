@@ -118,11 +118,68 @@ unfocused panes must stay 0), `divider_drag_ratios`, `divider_pty_follow`, `stat
 `config_w2`, `vt_default_scrollback`. Shortcuts in the smoke go through `AppShell::handle_key`, the same
 function the window's key handler calls.
 
+## Remote machines (W3)
+
+The same shell now talks to real servers over protocol v2 (`docs/architecture/PROTOCOL_V2.md`).
+
+- `remote/` (crate `forgetty-remote`): `RemoteBackend` implements `SessionBackend` on
+  `forgetty-client`. Each trait method is the request of the same name. `attach_pane` yields a
+  `PaneSource` over a `PaneStream` (resume offsets are the client's job); a server VT reset becomes
+  `PaneEvent::Reset`, and the view starts a fresh `Terminal` and drops terminal replies while the
+  replay drains (they would answer old queries a second time). Input goes through the client's input
+  stream (64 KiB buffer while disconnected). Resize is `resize_pane`; per AD-020 the latest active
+  client wins, so the view sends its size when it changes and again when the window is activated.
+  Futures run on a private tokio runtime (2 threads); the UI awaits their `JoinHandle`s.
+- Machines: the sidebar lists the local machine and every paired remote with the link state
+  (`connected`, `connecting`, `reconnecting` after 1 s, `offline`). The shell keeps the machine on
+  screen in its own fields and parks the others (`machines.rs`), so every machine keeps receiving
+  events (status, notifications, layout) while it is not shown.
+- Pairing: command palette "Pair machine..." (or the sidebar link) opens a dialog. Paste the text
+  `forgetty pair` prints (the QR payload JSON may sit among other lines). A confirm step shows the
+  machine name, the first 8 characters of the node id and the relay. Nothing is contacted before
+  Confirm. `store::parse_offer` strips control characters and bounds lengths.
+- Storage in `%APPDATA%\forgetty\` (`FORGETTY_DATA_DIR` overrides): `identity.key`, `client_id`,
+  `machines.json`, `addr_cache.json` (the `AddrCacheSnapshot`). Every file is written to a temporary
+  name, restricted, then renamed. On Windows "restricted" is a protected DACL with one entry (the
+  current user, full access); on Unix mode 0600. The pairing secret is never stored.
+- Reliability: the reconnecting overlay covers the machine's panes only after 1 s without a
+  connection (`ConnState::show_overlay`). Typing meanwhile is buffered by the client. A
+  `NotifyIpInterfaceChange` callback and a `PowerRegisterSuspendResumeNotification` callback (the
+  `PBT_APMRESUMEAUTOMATIC` event of `WM_POWERBROADCAST`, without subclassing the GPUI window) call
+  `network_changed()` on every remote backend after a 400 ms quiet period (`winsys.rs`).
+- Toasts: a WinRT toast for `StatusChanged` waiting, done, failed and for `Notification` when the user
+  is not looking at the pane (window in the background, other machine, or other pane). Policy and text
+  cleaning are in `shell-core/src/notify.rs` (pane text is untrusted: control and bidi characters are
+  removed, length is bounded, at most 1 toast per pane per 3 s and 10 per 30 s). A click focuses the
+  machine, tab and pane (the launch argument is `forgetty:focus?m=<uuid>&p=<uuid>`, parsed strictly). The app registers
+  `HKCU\Software\Classes\AppUserModelId\Forgetty.Windows` so an unpackaged exe can show toasts.
+- Statuses are the server's: `idle`, `working`, `waiting`, `done`, `failed`. A local shell prompt (OSC 133)
+  is `idle`: no icon, no toast.
+- Pane padding: `pane_padding_x = 6`, `pane_padding_y = 4` in `config.toml` (px between the pane border and the
+  text).
+
+W3 smoke (after the W2 phases): the CI starts `v2-test-server.exe` as its own process. The smoke pairs through
+`pair_submit_text` + `pair_confirm` (the dialog's code), opens 2 remote panes, types and reads the echo, measures
+key-to-frame over localhost (`key_to_frame_p50_ms_remote`), kills the server (overlay after 1 s, typing
+buffered), restarts it (same port and key), checks the buffered input arrives and input continues, then drives
+the toast paths and checks the Windows hooks registered. Checks: `pane_padding`, `pair_rejects_garbage`,
+`pair_dialog_shows_offer`, `pair_waits_for_confirm`, `sidebar_lists_machines`, `remote_two_panes`,
+`machine_stored`, `store_files_user_only`, `remote_echo_2_panes`, `remote_echo_isolated`,
+`remote_vt_reset_on_attach`, `key_p50_remote_le_25ms`, `remote_resize_reaches_server`, `no_overlay_before_1s`,
+`overlay_after_1s`, `sidebar_shows_reconnecting`, `network_poke_reaches_backends`, `reconnected_after_restart`,
+`overlay_gone_after_reconnect`, `typing_during_reconnect_buffered`, `vt_reset_after_restart`,
+`input_continues_after_restart`, `toast_*`, `no_toast_when_focused`, `net_change_hook_registered`,
+`power_resume_hook_registered`, `toast_requests_processed`.
+
+Known limits: the server has no `set_label` yet, so tab rename stays client-side. The in-process test
+server answers only part of the method set (no `move_tab`, `set_active_pane`, `update_split_ratios`);
+the real server answers all of them.
+
 ## Smoke mode
 
 `--smoke` opens the window, drives `cmd.exe` through ConPTY and prints one JSON object. Exit 0
 only if every check in `checks` is true. 10 s is no longer the budget (the throughput test needs
-more): hard timeout 300 s, 60 s per phase. On failure the JSON carries the last screen dump.
+more): hard timeout 420 s, 60 s per phase. On failure the JSON carries the last screen dump.
 
 Checks: `echo_found`, `key_p50_le_18ms`, `damage_only_redraw`, `key_encoder`, `kitty_encoder`,
 `wide_direct`, `wide_shell`, `scrollback_direct`, `scrollback_shell`, `resize`, `throughput`,

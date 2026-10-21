@@ -9,6 +9,7 @@ use std::time::Instant;
 use forgetty_shell_core::fuzzy;
 use forgetty_shell_core::keys::{Action, Chord, Keymap, ACTIONS};
 use forgetty_shell_core::layout::{neighbor, Divider, PaneGeometry, Rect, Side};
+use forgetty_shell_core::notify::ToastLimiter;
 use forgetty_shell_core::{
     BackendEvent, BackendFuture, Layout, MachineInfo, NewTab, PaneId, PaneSource, PaneStatus, SessionBackend,
     SplitDir, SplitPane, SplitRatio, Tab, Uuid,
@@ -20,6 +21,7 @@ use gpui::{AppContext as _,
 
 use crate::config::{Backdrop, Config};
 use crate::lineedit::{EditResult, LineEdit};
+use crate::machines::{MachineEntry, MachineSlot, PairDialog, RemoteCtx, ToastRecord};
 use crate::smoke::ShellSmoke;
 use crate::view::{Metrics, TerminalView};
 
@@ -41,6 +43,8 @@ pub struct PaneMeta {
     pub cwd: String,
     pub status: PaneStatus,
     pub message: String,
+    /// PTY size the backend last reported (`PaneResized`).
+    pub size: Option<(u16, u16)>,
 }
 
 pub struct PaletteItem {
@@ -115,7 +119,7 @@ pub struct AppShell {
     pub machine: MachineInfo,
     pub layout: Layout,
     pub views: HashMap<PaneId, Entity<TerminalView>>,
-    attaching: HashSet<PaneId>,
+    pub(crate) attaching: HashSet<PaneId>,
     pub meta: HashMap<PaneId, PaneMeta>,
     pub title_override: HashMap<Uuid, String>,
     /// Active pane per tab (UI state; also reported to the backend).
@@ -129,10 +133,10 @@ pub struct AppShell {
     pub metrics: Metrics,
     pub viewport: (f32, f32),
     pub spin: usize,
-    sync_dirty: bool,
+    pub(crate) sync_dirty: bool,
     pub window_active: bool,
     applied_title: String,
-    had_tabs: bool,
+    pub(crate) had_tabs: bool,
     pub frames: u64,
     /// Frame timing probes: render start to end of paint (CPU), and end of
     /// paint to the next render start (present + wait).
@@ -143,6 +147,25 @@ pub struct AppShell {
     pub smoke_mode: bool,
     pub smoke: Option<Box<ShellSmoke>>,
     pub mica: bool,
+    // ---- machines (W3) ----
+    /// Every machine in the sidebar, the local one first.
+    pub machines: Vec<MachineEntry>,
+    /// State of the machines that are not on screen. The fields above hold the
+    /// active machine's state.
+    pub(crate) parked: HashMap<Uuid, MachineSlot>,
+    pub remote: Option<RemoteCtx>,
+    pub hooks: Option<crate::winsys::Hooks>,
+    pub pair: Option<PairDialog>,
+    pub toast_limiter: ToastLimiter,
+    pub toast_log: Vec<ToastRecord>,
+    /// While false, `apply_layout` does not attach panes (a machine that is not on screen).
+    pub(crate) attach_enabled: bool,
+    pub win_handle: gpui::AnyWindowHandle,
+    /// Times a network change or a resume poked the remote backends.
+    pub net_pokes: u64,
+    /// Extra direct address for the next pairing (CI smoke, LAN).
+    pub pair_hint: Option<std::net::SocketAddr>,
+    pub(crate) switch_to: Option<Uuid>,
 }
 
 pub fn basename(path: &str) -> String {
@@ -218,22 +241,24 @@ impl AppShell {
             smoke,
             mica,
             cfg,
+            machines: Vec::new(),
+            parked: HashMap::new(),
+            remote: None,
+            hooks: None,
+            pair: None,
+            toast_limiter: ToastLimiter::default(),
+            toast_log: Vec::new(),
+            attach_enabled: true,
+            win_handle: window.window_handle(),
+            net_pokes: 0,
+            pair_hint: None,
+            switch_to: None,
         };
-
-        // Backend events -> shell state.
-        let rx = backend.subscribe();
-        cx.spawn(async move |this, cx| {
-            while let Ok(first) = rx.recv().await {
-                let mut evs = vec![first];
-                while let Ok(e) = rx.try_recv() {
-                    evs.push(e);
-                }
-                if this.update(cx, |s, cx| s.on_events(evs, cx)).is_err() {
-                    break;
-                }
-            }
-        })
-        .detach();
+        let mut shell = shell;
+        // The local machine is on screen first; its events feed the same
+        // per-machine pump the remote machines use.
+        shell.machines.push(MachineEntry::new(backend.clone()));
+        Self::spawn_event_pump(backend.clone(), cx);
 
         if smoke_mode {
             // The smoke state machine advances per painted frame: keep frames coming.
@@ -310,7 +335,7 @@ impl AppShell {
         .detach();
     }
 
-    fn on_events(&mut self, evs: Vec<BackendEvent>, cx: &mut Context<Self>) {
+    pub(crate) fn on_events(&mut self, evs: Vec<BackendEvent>, cx: &mut Context<Self>) {
         let mut layout = None;
         for ev in evs {
             match ev {
@@ -324,12 +349,16 @@ impl AppShell {
                 BackendEvent::CwdChanged { pane_id, cwd } => {
                     self.meta.entry(pane_id).or_default().cwd = cwd;
                 }
-                BackendEvent::PaneResized { .. } => {}
+                BackendEvent::PaneResized { pane_id, rows, cols } => {
+                    self.meta.entry(pane_id).or_default().size = Some((rows, cols));
+                }
                 BackendEvent::StatusChanged { pane_id, status, message } => {
                     let m = self.meta.entry(pane_id).or_default();
                     m.status = status;
                     m.message = message;
                 }
+                // Handled per machine in `machine_events`.
+                BackendEvent::Notification { .. } | BackendEvent::ConnectionChanged(_) => {}
             }
         }
         if let Some(l) = layout {
@@ -357,20 +386,23 @@ impl AppShell {
         }
         if layout.tab_count() > 0 {
             self.had_tabs = true;
-        } else if self.had_tabs {
+        } else if self.had_tabs && self.machine.kind == forgetty_shell_core::MachineKind::Local {
+            // The last local tab closed: the app ends. A remote machine just shows no tabs.
             cx.quit();
             return;
         }
         self.layout = layout;
-        let ids: Vec<PaneId> = panes.into_iter().collect();
-        for p in ids {
-            self.attach(p, cx);
+        if self.attach_enabled {
+            let ids: Vec<PaneId> = panes.into_iter().collect();
+            for p in ids {
+                self.attach(p, cx);
+            }
         }
         self.sync_dirty = true;
         cx.notify();
     }
 
-    fn attach(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+    pub(crate) fn attach(&mut self, pane: PaneId, cx: &mut Context<Self>) {
         if self.views.contains_key(&pane) || !self.attaching.insert(pane) {
             return;
         }
@@ -463,6 +495,8 @@ impl AppShell {
     }
 
     pub fn grid_for(&self, w: f32, h: f32) -> (u16, u16) {
+        // A pane's text area is inset by the configured padding.
+        let (w, h) = ((w - 2.0 * self.cfg.pane_padding_x).max(1.0), (h - 2.0 * self.cfg.pane_padding_y).max(1.0));
         let cols = (w / f32::from(self.metrics.cell_w)).floor().clamp(2.0, 1000.0) as u16;
         let rows = (h / f32::from(self.metrics.line_h)).floor().clamp(1.0, 500.0) as u16;
         (rows, cols)
@@ -545,6 +579,13 @@ impl AppShell {
 
     pub fn on_window_activation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sync(window, cx);
+        if window.is_window_active() {
+            // The window is the active client again: send each visible pane's
+            // size so the server's size policy (latest active client) picks it.
+            for v in self.views.values() {
+                v.read(cx).reassert_size();
+            }
+        }
         cx.notify();
     }
 
@@ -735,6 +776,9 @@ impl AppShell {
             Action::NewWorkspace => self.new_workspace(cx),
             Action::NextWorkspace => self.cycle_workspace(1, cx),
             Action::PrevWorkspace => self.cycle_workspace(-1, cx),
+            Action::PairMachine => self.open_pair(cx),
+            Action::NextMachine => self.cycle_machine(1, cx),
+            Action::PrevMachine => self.cycle_machine(-1, cx),
         }
         cx.notify();
     }
@@ -784,6 +828,10 @@ impl AppShell {
     /// Returns true when the shell consumed the key (the terminal must not see it).
     pub fn handle_key(&mut self, ks: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let chord = Self::chord_of(ks);
+        if self.pair.is_some() {
+            self.pair_key(ks, cx);
+            return true;
+        }
         if self.palette.is_some() {
             self.palette_key(ks, &chord, window, cx);
             return true;

@@ -425,6 +425,35 @@ mod tests {
         assert_eq!(back, t);
     }
 
+    /// `update_split_ratios` as the server defines it (`docs/socket-api.md`,
+    /// `SessionManager::update_split_ratios`): the key is the leftmost leaf of
+    /// the split's first child, the outermost match wins, ratios clamp to
+    /// 0.05..0.95, unknown panes change nothing.
+    #[test]
+    fn split_ratio_keys_match_the_server() {
+        let (a, b, c) = (p(), p(), p());
+        let inner = PaneTree::Split {
+            direction: SplitDir::Vertical,
+            ratio: 0.5,
+            first: Box::new(PaneTree::leaf(a)),
+            second: Box::new(PaneTree::leaf(b)),
+        };
+        let mut t = PaneTree::Split {
+            direction: SplitDir::Horizontal,
+            ratio: 0.5,
+            first: Box::new(inner),
+            second: Box::new(PaneTree::leaf(c)),
+        };
+        // `a` is the leftmost leaf of both splits' first child: the outer one wins.
+        assert!(t.set_ratio(a, 0.3));
+        assert_eq!(t.ratio_at(&[]), Some(0.3));
+        assert_eq!(t.ratio_at(&[false]), Some(0.5));
+        // `b` is the first leaf of no split.
+        assert!(!t.set_ratio(b, 0.7));
+        assert!(!t.set_ratio(PaneId::new(), 0.7));
+        assert_eq!(t.ratio_at(&[false]), Some(0.5));
+    }
+
     #[test]
     fn split_remove_focus() {
         let (a, b, c) = (p(), p(), p());

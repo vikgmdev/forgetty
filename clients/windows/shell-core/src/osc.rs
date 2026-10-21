@@ -110,9 +110,10 @@ impl OscScanner {
                 let mut parts = rest.split(';');
                 match parts.next().unwrap_or("") {
                     "A" | "B" => {
+                        // A prompt is `idle`: it neither shows an icon nor raises a toast.
                         if self.last == PaneStatus::None || self.last == PaneStatus::Working {
-                            self.last = PaneStatus::Waiting;
-                            out.push(OscEvent::Status(PaneStatus::Waiting, String::new()));
+                            self.last = PaneStatus::Idle;
+                            out.push(OscEvent::Status(PaneStatus::Idle, String::new()));
                         }
                     }
                     "C" => {
@@ -223,7 +224,7 @@ mod tests {
         assert_eq!(
             ev,
             vec![
-                OscEvent::Status(PaneStatus::Waiting, "".into()),
+                OscEvent::Status(PaneStatus::Idle, "".into()),
                 OscEvent::Status(PaneStatus::Working, "".into()),
                 OscEvent::Status(PaneStatus::Failed, "exit 2".into()),
             ]

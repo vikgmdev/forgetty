@@ -105,6 +105,15 @@ impl Sel {
     }
 }
 
+fn make_term(cfg: &Config, rows: usize, cols: usize) -> Terminal {
+    let palette: [CoreRgba; 16] = std::array::from_fn(|i| {
+        let h = cfg.ansi[i];
+        CoreRgba::rgb((h >> 16) as u8, (h >> 8) as u8, h as u8)
+    });
+    // libghostty-vt budgets scrollback in bytes (default 10 MiB per pane).
+    Terminal::with_scrollback(rows, cols, palette, cfg.scrollback_bytes)
+}
+
 pub struct TerminalView {
     pub cfg: Config,
     pub term: Terminal,
@@ -143,6 +152,11 @@ pub struct TerminalView {
     pub pending_paste: Option<PendingPaste>,
     /// 0.0 normal, otherwise the share of brightness removed (unfocused pane in a split).
     pub dim: f32,
+    /// Set after a VT reset: the next resize is sent even if the size is unchanged.
+    pub force_size: bool,
+    /// True from a reset until the replay has drained.
+    pub replaying: bool,
+    pub resets: u64,
     pub fed_bytes: u64,
     pub feed_time: Duration,
     pub max_feed: Duration,
@@ -181,35 +195,45 @@ impl TerminalView {
         cx: &mut Context<Self>,
     ) -> Self {
         let metrics = Metrics::measure(cx, &cfg);
-        let palette: [CoreRgba; 16] = std::array::from_fn(|i| {
-            let h = cfg.ansi[i];
-            CoreRgba::rgb((h >> 16) as u8, (h >> 8) as u8, h as u8)
-        });
-        // libghostty-vt budgets scrollback in bytes (default 10 MiB per pane).
         let (rows, cols) = (rows.clamp(1, 500), cols.clamp(2, 1000));
-        let term = Terminal::with_scrollback(rows, cols, palette, cfg.scrollback_bytes);
+        let term = make_term(&cfg, rows, cols);
 
         // Pump source output into the VT on the UI thread. Batches are capped
         // and the task yields between them so frames keep flowing while a
         // multi-megabyte burst drains.
         let rx = source.events();
         cx.spawn(async move |this, cx| {
+            // A `Reset` is applied alone; whatever follows is a replay.
+            let mut pending: Option<PaneEvent> = None;
             loop {
-                let Ok(first) = rx.recv().await else { break };
+                let first = match pending.take() {
+                    Some(e) => e,
+                    None => match rx.recv().await {
+                        Ok(e) => e,
+                        Err(_) => break,
+                    },
+                };
                 let mut batch = Vec::new();
                 let mut closed = None;
+                let mut reset = None;
                 match first {
+                    PaneEvent::Reset { rows, cols } => reset = Some((rows, cols)),
                     PaneEvent::Output(b) => batch = b,
                     PaneEvent::Closed(r) => closed = Some(r),
                 }
-                while closed.is_none() && batch.len() < FEED_CHUNK {
+                while reset.is_none() && closed.is_none() && batch.len() < FEED_CHUNK {
                     match rx.try_recv() {
                         Ok(PaneEvent::Output(b)) => batch.extend_from_slice(&b),
                         Ok(PaneEvent::Closed(r)) => closed = Some(r),
+                        Ok(r @ PaneEvent::Reset { .. }) => {
+                            pending = Some(r);
+                            break;
+                        }
                         Err(_) => break,
                     }
                 }
-                if this.update(cx, |v, cx| v.feed(&batch, closed, cx)).is_err() {
+                let caught_up = pending.is_none() && rx.is_empty();
+                if this.update(cx, |v, cx| v.feed(reset, &batch, closed, caught_up, cx)).is_err() {
                     break;
                 }
                 YieldNow(false).await;
@@ -261,6 +285,9 @@ impl TerminalView {
             capture_input: None,
             pending_paste: None,
             dim: 0.0,
+            force_size: false,
+            replaying: false,
+            resets: 0,
             fed_bytes: 0,
             feed_time: Duration::ZERO,
             max_feed: Duration::ZERO,
@@ -269,7 +296,35 @@ impl TerminalView {
 
     // ---- output ---------------------------------------------------------
 
-    fn feed(&mut self, bytes: &[u8], closed: Option<String>, cx: &mut Context<Self>) {
+    /// Start over with an empty VT at the PTY's size (a remote pane attached,
+    /// or the server's log no longer holds our offset). The next frame sees the
+    /// size mismatch with the window and resizes the VT and the PTY.
+    fn reset_term(&mut self, rows: u16, cols: u16) {
+        let (rows, cols) = ((rows as usize).clamp(1, 500), (cols as usize).clamp(2, 1000));
+        self.term = make_term(&self.cfg, rows, cols);
+        self.rows = rows;
+        self.cols = cols;
+        self.row_hash = vec![0; rows];
+        self.rows_shaped = vec![None; rows];
+        self.last_gen = 0;
+        self.sel = None;
+        self.scroll_accum = 0.0;
+        self.force_size = true;
+        self.resets += 1;
+    }
+
+    fn feed(
+        &mut self,
+        reset: Option<(u16, u16)>,
+        bytes: &[u8],
+        closed: Option<String>,
+        caught_up: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((rows, cols)) = reset {
+            self.reset_term(rows, cols);
+            self.replaying = true;
+        }
         if !bytes.is_empty() {
             let t0 = Instant::now();
             self.term.feed(bytes);
@@ -278,11 +333,18 @@ impl TerminalView {
             self.feed_time += dt;
             self.max_feed = self.max_feed.max(dt);
             // Terminal replies (DA, CPR, mode queries). ConPTY waits on these.
+            // A replay after a reset re-runs old queries: their answers would reach
+            // the program a second time, so they are dropped.
             for resp in self.term.drain_write_pty() {
-                self.source.write_input(&resp);
+                if !self.replaying {
+                    self.source.write_input(&resp);
+                }
             }
             // Titles and cwd come from the backend (it scans the same bytes).
             drop(self.term.drain_events());
+        }
+        if caught_up {
+            self.replaying = false;
         }
         if let Some(reason) = closed {
             self.closed = Some(reason);
@@ -344,22 +406,38 @@ impl TerminalView {
         }
     }
 
+    /// This window became the active client again: send the grid size once more
+    /// so the server's size policy (latest active client wins) picks ours.
+    pub fn reassert_size(&self) {
+        if self.visible && self.rows > 0 && self.cols > 0 {
+            self.source.reassert_size(self.rows as u16, self.cols as u16);
+        }
+    }
+
     // ---- frame preparation (called from the element's prepaint) -----------
 
     /// Follow the window: at most one resize per frame, since this runs once
     /// per prepaint.
     pub fn apply_bounds(&mut self, bounds: Bounds<Pixels>) {
         self.bounds = bounds;
+
         let cols = ((f32::from(bounds.size.width) / f32::from(self.metrics.cell_w) + 0.1).floor() as usize).clamp(2, 1000);
         let rows = ((f32::from(bounds.size.height) / f32::from(self.metrics.line_h) + 0.1).floor() as usize).clamp(1, 500);
         if rows == self.rows && cols == self.cols {
+            if std::mem::take(&mut self.force_size) {
+                self.source.reassert_size(rows as u16, cols as u16);
+            }
             return;
         }
         self.rows = rows;
         self.cols = cols;
         self.resizes += 1;
         self.term.resize(rows, cols);
-        self.source.resize(rows as u16, cols as u16);
+        if std::mem::take(&mut self.force_size) {
+            self.source.reassert_size(rows as u16, cols as u16);
+        } else {
+            self.source.resize(rows as u16, cols as u16);
+        }
         self.row_hash = vec![0; rows];
         self.rows_shaped = vec![None; rows];
         self.last_gen = 0;
@@ -1098,7 +1176,13 @@ impl Render for TerminalView {
             .on_mouse_up(MouseButton::Middle, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_scroll_wheel(cx.listener(Self::on_scroll))
-            .child(TerminalElement::new(cx.entity()))
+            .child(
+                div()
+                    .size_full()
+                    .px(px(self.cfg.pane_padding_x))
+                    .py(px(self.cfg.pane_padding_y))
+                    .child(TerminalElement::new(cx.entity())),
+            )
             .children(self.paste_overlay())
     }
 }

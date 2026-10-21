@@ -1,8 +1,10 @@
 name: windows-client
 
-# V3 Windows client: GPUI app shell + libghostty-vt + ConPTY. Builds clients/windows,
-# runs the headless smoke mode (W1 + W2 checks), uploads the exe, DLLs, smoke.json
-# and a screenshot of the 4-pane layout.
+# V3 Windows client: GPUI app shell + libghostty-vt + ConPTY + protocol v2 client.
+# Builds clients/windows and the v2-test-server, runs the headless smoke mode
+# (W1, W2 and W3 checks; W3 pairs with the test server running as a separate
+# process, kills and restarts it), uploads the exe, DLLs, smoke.json and a
+# screenshot of the 4-pane layout.
 on:
   push:
     branches: [v3/win-spike]
@@ -10,6 +12,8 @@ on:
       - "clients/windows/**"
       - "crates/forgetty-vt/**"
       - "crates/forgetty-core/**"
+      - "crates/forgetty-client/**"
+      - "crates/forgetty-proto/**"
       - ".github/workflows/windows-client.yml"
   workflow_dispatch:
 
@@ -33,11 +37,26 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: clients/windows
+          workspaces: |
+            clients/windows
+            .
 
       - name: Build (release)
         working-directory: clients/windows
         run: cargo build --release
+
+      - name: Build the protocol v2 test server (separate process for the W3 smoke)
+        run: |
+          cargo build --release -p forgetty-client --features test-util --bin v2-test-server
+          Copy-Item target/release/v2-test-server.exe clients/windows/target/release/
+        shell: pwsh
+
+      - name: Unit tests (shell core, remote backend)
+        working-directory: clients/windows
+        run: |
+          # The ConPTY tests in shell-core's local module are covered by the smoke.
+          cargo test --release -p forgetty-shell-core --lib -- notify:: layout:: keys:: osc:: fuzzy::
+          cargo test --release -p forgetty-remote
 
       - name: Smoke
         shell: pwsh
@@ -66,4 +85,5 @@ jobs:
           path: |
             clients/windows/target/release/forgetty-win.exe
             clients/windows/target/release/*.dll
+            clients/windows/target/release/v2-test-server.exe
             clients/windows/target/release/smoke.json

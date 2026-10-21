@@ -531,6 +531,9 @@ impl SessionBackend for LocalBackend {
         let mut st = self.inner.lock();
         let mut changed = false;
         for r in ratios {
+            if !r.ratio.is_finite() {
+                continue; // the server skips entries it cannot read
+            }
             let clamped = r.ratio.clamp(0.05, 0.95);
             for ws in st.layout.workspaces.iter_mut() {
                 for tab in ws.tabs.iter_mut() {
