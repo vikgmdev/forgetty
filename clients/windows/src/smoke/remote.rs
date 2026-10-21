@@ -458,7 +458,15 @@ impl ShellSmoke {
                 if shell.toast_log.len() <= self.w3.toasts_before {
                     if self.sub_t0.elapsed() > Duration::from_secs(10) {
                         check("toast_waiting_off_screen_machine", false);
-                        record("toast_debug", json!({"log": shell.toast_log.len()}));
+                        record(
+                            "toast_debug",
+                            json!({
+                                "log": shell.toast_log.iter().map(|r| format!("{} {:?} {:?}", r.machine, r.pane, r.text.lines)).collect::<Vec<_>>(),
+                                "before": self.w3.toasts_before,
+                                "active_machine": shell.machine.id.to_string(),
+                                "window_active": shell.window_active,
+                            }),
+                        );
                         self.finish_w3(shell);
                     }
                     return;
