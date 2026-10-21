@@ -413,3 +413,35 @@ async fn resize_is_clamped_to_1000() {
     c.close().await;
     server.shutdown().await;
 }
+
+/// `Hello.client_name` is peer text: control characters go, length is capped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_client_name_is_sanitised() {
+    if !real_only() {
+        return;
+    }
+    let server = TestServer::start(TestServerConfig::default()).await;
+    let name = format!("\u{1b}[31mevil\u{7}{}", "n".repeat(200));
+    let c = connect(&server, &name).await;
+    let list = c.request("list_clients", Value::Nil).await.expect("list_clients");
+    let text = format!("{list:?}");
+    assert!(!text.contains('\u{1b}') && !text.contains('\u{7}'), "control characters kept: {text}");
+    let Value::Array(items) = list else { panic!("not an array: {text}") };
+    let names: Vec<String> = items
+        .iter()
+        .filter_map(|e| match e {
+            Value::Map(m) => m.iter().find_map(|(k, v)| match (k, v) {
+                (Value::String(k), Value::String(v)) if k.as_str() == Some("client_name") => {
+                    v.as_str().map(str::to_string)
+                }
+                _ => None,
+            }),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(names.len(), 1, "{text}");
+    assert!(names[0].chars().count() <= 64, "name of {} chars", names[0].chars().count());
+    assert!(names[0].starts_with("evil"), "{:?}", names[0]);
+    c.close().await;
+    server.shutdown().await;
+}

@@ -79,6 +79,10 @@ const MIN_DRAIN_RATE: u64 = 32 * 1024;
 const ANSWER_RESERVE: usize = 64 * 1024;
 /// The same for `capture`, whose answer can fill a whole frame.
 const CAPTURE_RESERVE: usize = forgetty_proto::MAX_FRAME_LEN;
+/// Attach records the harness keeps (the oldest are dropped).
+const QA_ATTACHES_KEPT: usize = 1024;
+/// Longest `Hello.client_name` kept, in characters.
+const MAX_CLIENT_NAME_CHARS: usize = 64;
 /// Connections one device may hold. A new one past this closes the oldest.
 const MAX_CONNS_PER_DEVICE: usize = 4;
 /// Application close code for the oldest connection of a device that opened
@@ -471,10 +475,14 @@ impl RpcV2 {
             Some((send, recv, hello))
         })
         .await;
-        let Ok(Some((mut send, recv, hello))) = hs else {
+        let Ok(Some((mut send, recv, mut hello))) = hs else {
             conn.close(close_code::OK.into(), b"bad hello");
             return;
         };
+        // The name is peer text that reaches logs, `list_clients` and the
+        // client events: strip control characters and cap the length.
+        hello.client_name =
+            forgetty_core::sanitize::untrusted_max(&hello.client_name, MAX_CLIENT_NAME_CHARS);
 
         if hello.proto_major != PROTO_MAJOR {
             let reply = HandshakeReply::Error(ErrorMsg {
@@ -1412,7 +1420,14 @@ impl Session {
             Some(o) if o < first => (first, true),
             Some(o) => (o, false),
         };
-        lock(&self.rpc.qa.attaches).push((p.pane_id, p.from_offset));
+        {
+            // Harness record. Bounded: it only has to show recent attaches.
+            let mut attaches = lock(&self.rpc.qa.attaches);
+            if attaches.len() >= QA_ATTACHES_KEPT {
+                attaches.remove(0);
+            }
+            attaches.push((p.pane_id, p.from_offset));
+        }
         if let Some(old) = streams.remove(&p.pane_id) {
             old.abort();
         }
