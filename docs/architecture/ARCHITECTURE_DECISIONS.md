@@ -388,6 +388,24 @@ new work.
 
 ---
 
+## AD-023: A slow client never slows a program; it catches up by snapshot
+
+**Decision:** Only the server's own byte-log writer may hold a PTY (disk queue
+full). A remote client's speed never holds a PTY. A client that falls behind
+more than half the ring (or stays stalled for 2 s) gets its pane stream
+replaced by a snapshot catch-up: the server builds a VT instance from the log
+on the cold path (AD-019), formats the current screen and modes as VT bytes,
+and sends them with `reset = true` at the current offset, then live bytes. The
+client resets that pane and feeds the snapshot. Scrollback older than the
+snapshot is fetched on demand.
+
+**Why:** a phone on a weak network attached to a build pane must not slow the
+build or the laptop's view of it.
+
+**Decided:** 2026-10-21.
+
+---
+
 ## Superseded / rejected decisions
 
 The following concepts are **explicitly rejected**. Do not reintroduce without a new AD that supersedes the rejection.

@@ -1578,10 +1578,7 @@ impl SessionManager {
     /// Take ownership of a pane's output receiver for the drain task.
     ///
     /// Returns `None` if the pane doesn't exist or the receiver was already taken.
-    pub fn take_pane_output_rx(
-        &self,
-        id: PaneId,
-    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>> {
+    pub fn take_pane_output_rx(&self, id: PaneId) -> Option<tokio::sync::mpsc::Receiver<Vec<u8>>> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.panes.get_mut(&id)?.pty_bridge.pty_rx.take()
     }
@@ -1608,6 +1605,14 @@ impl SessionManager {
 
         refresh_cwd(pane);
         let pty_exited = !pane.pty_bridge.pty.is_alive();
+
+        // Shutdown has begun: the byte logs are about to be flushed for good.
+        // Output after that point would reach clients but not the disk, and a
+        // resume after the restart would find the log shorter than what the
+        // client saw. The children die with the server, so stop here.
+        if inner.shutting_down {
+            return Ok(DrainResult { pty_exited });
+        }
 
         // AD-019: scan for OSC 0/2/7/9/99/777/7501/133. Byte-level state
         // machine, no allocation unless a sequence of interest is found.
@@ -1771,8 +1776,15 @@ impl SessionManager {
 
         if let Some(mut rx) = self.take_pane_output_rx(pane_id) {
             let sm = self.clone();
+            let shared = self.log_shared(pane_id);
             tokio::spawn(async move {
-                while let Some(bytes) = rx.recv().await {
+                loop {
+                    // Flow control: with a full disk queue, stop reading the
+                    // PTY until the appender catches up. Event driven.
+                    if let Some(shared) = &shared {
+                        shared.wait_room().await;
+                    }
+                    let Some(bytes) = rx.recv().await else { break };
                     if let Ok(result) = sm.process_pane_bytes(pane_id, &bytes) {
                         if result.pty_exited {
                             sm.finish_pane(pane_id).await;

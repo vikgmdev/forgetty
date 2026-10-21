@@ -439,13 +439,31 @@ impl TestServer {
         }
     }
 
+    /// A pane running `script` (`sh -c`) in the real server. The test server has
+    /// no processes, so it gets a plain pane.
+    pub fn add_script_pane(&self, script: &str) -> Uuid {
+        match &self.inner {
+            Inner::Mock { server, .. } => server.add_pane(),
+            Inner::Real(r) => {
+                let v = r
+                    .rpc
+                    .call(
+                        "new_tab",
+                        json!({"workspace_idx": 0, "command": ["/bin/sh", "-c", script]}),
+                    )
+                    .expect("new_tab");
+                Uuid::parse_str(v["pane_id"].as_str().unwrap()).unwrap()
+            }
+        }
+    }
+
     /// A pane that writes `bytes` of output when it gets one line of input.
     pub fn add_burst_pane(&self, bytes: usize) -> Uuid {
         match &self.inner {
             Inner::Mock { server, .. } => server.add_pane(),
             Inner::Real(r) => {
                 let script = format!(
-                    "stty raw -echo; read -r l; head -c {bytes} /dev/zero | tr '\\000' A; exec cat"
+                    "stty raw -echo; read -r l; yes 0123456789abcdef | head -c {bytes}; exec cat"
                 );
                 let v = r
                     .rpc
@@ -462,7 +480,10 @@ impl TestServer {
     /// Start the output of a burst pane.
     pub fn start_burst(&self, pane: Uuid, bytes: usize) {
         match &self.inner {
-            Inner::Mock { server, .. } => server.append(pane, &vec![0x41u8; bytes]),
+            Inner::Mock { server, .. } => {
+                let data: Vec<u8> = (0..bytes as u64).map(burst_byte).collect();
+                server.append(pane, &data)
+            }
             Inner::Real(r) => {
                 let mut arg = Real::pane_arg(pane);
                 arg["data"] = json!(b64(b"\n"));
@@ -582,6 +603,14 @@ impl TestServer {
         }
     }
 
+    /// Handshakes the server answered with `server_stopping` (real server).
+    pub fn stopping_refusals(&self) -> u64 {
+        match &self.inner {
+            Inner::Mock { .. } => 0,
+            Inner::Real(r) => r.state()["stopping_refusals"].as_u64().unwrap(),
+        }
+    }
+
     pub fn dedup_drops(&self) -> u64 {
         match &self.inner {
             Inner::Mock { server, .. } => server.dedup_drops(),
@@ -625,6 +654,24 @@ impl TestServer {
                     .unwrap();
             }
         }
+    }
+
+    /// Emit `count` LayoutChanged events at the server (real server only).
+    pub fn fire_layout_events(&self, count: u64) {
+        if let Inner::Real(r) = &self.inner {
+            r.rpc.call("qa_fire_events", json!({"count": count})).unwrap();
+        }
+    }
+
+    /// Resident memory of the real server process, in KiB.
+    pub fn rss_kib(&self) -> u64 {
+        let pid = self.pid().expect("real server");
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix("VmRSS:"))
+            .and_then(|v| v.split_whitespace().next()?.parse().ok())
+            .unwrap_or(0)
     }
 
     pub fn truncate_log_before(&self, pane: Uuid, offset: u64) {
@@ -679,4 +726,9 @@ impl TestServer {
             Inner::Mock { .. } => Err("mock server has no socket".into()),
         }
     }
+}
+
+/// Byte `i` of a burst pane's output: the line `0123456789abcdef\n` repeated.
+pub fn burst_byte(i: u64) -> u8 {
+    b"0123456789abcdef\n"[(i % 17) as usize]
 }

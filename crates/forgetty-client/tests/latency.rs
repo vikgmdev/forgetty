@@ -26,9 +26,9 @@ async fn connect(server: &TestServer) -> ClientHandle {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn keystroke_not_delayed_by_concurrent_50mb_output_burst() {
     const BURST: usize = 50 * 1024 * 1024;
-    // The byte log keeps the whole burst, so a reader that is a little behind
-    // is served from the log and never has to reset.
-    let server = TestServer::start_with(TestServerConfig::default(), Some(256)).await;
+    // Default byte log (8 MiB ring, 10 MiB file). A reader that is behind is
+    // served from the log by offset and never has to reset.
+    let server = TestServer::start(TestServerConfig::default()).await;
     let echo_pane = server.add_pane();
     let burst_pane = server.add_burst_pane(BURST);
     let h = connect(&server).await;
@@ -39,12 +39,23 @@ async fn keystroke_not_delayed_by_concurrent_50mb_output_burst() {
     let drain = tokio::spawn(async move {
         let mut total = 0usize;
         let mut resets = 0usize;
+        let mut corrupt = false;
         let mut done_at = None;
         let deadline = Instant::now() + Duration::from_secs(60);
         while total < BURST && Instant::now() < deadline {
             match tokio::time::timeout(Duration::from_secs(5), burst.next()).await {
-                Ok(Some(PaneItem::Data { bytes, .. })) => total += bytes.len(),
-                Ok(Some(PaneItem::Reset { .. })) => resets += 1,
+                Ok(Some(PaneItem::Data { offset, bytes })) => {
+                    if !bytes
+                        .iter()
+                        .enumerate()
+                        .all(|(i, b)| *b == common::burst_byte(offset + i as u64))
+                    {
+                        corrupt = true;
+                    }
+                    total += bytes.len()
+                }
+                // The first attach opens with a reset at the first offset.
+                Ok(Some(PaneItem::Reset { .. })) => resets += usize::from(total > 0),
                 Ok(Some(PaneItem::Ended)) | Ok(None) => break,
                 Err(_) => break,
             }
@@ -55,7 +66,7 @@ async fn keystroke_not_delayed_by_concurrent_50mb_output_burst() {
         if total >= BURST {
             done_at = Some(Instant::now());
         }
-        (total, done_at)
+        (total, resets, corrupt, done_at)
     });
 
     // One 1 KiB keystroke frame, echoed on its own pane stream.
@@ -91,8 +102,10 @@ async fn keystroke_not_delayed_by_concurrent_50mb_output_burst() {
         n += 1;
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
-    let (total, done_at) = drain.await.unwrap();
+    let (total, resets, corrupt, done_at) = drain.await.unwrap();
     assert_eq!(total, BURST, "burst bytes lost");
+    assert_eq!(resets, 0, "the burst must not reset the stream");
+    assert!(!corrupt, "burst bytes differ from the pattern");
     let burst_time = done_at.unwrap().duration_since(burst_start);
 
     during.sort();

@@ -14,6 +14,11 @@
 #   6. revoke cuts a v2 connection, `client ls` counts v2 clients, a stopping
 #      server refuses v2 attaches, byte log offsets survive rotation + restart,
 #      input typed during a restart arrives once
+#      Also in step 6: lossless byte log: the 50 MiB burst with the default ring has 0 resets and
+#      byte-identical output (asserted in the latency test); `cat` of 200 MiB
+#      reports MB/s; a stopping server answers `server_stopping` and the client
+#      retries it (restart under load); a client that stops reading Control for
+#      15 s while 100k layout events fire costs < 20 MB and is closed
 #   7. the server binds UDP 47297 by default and a second server on the same
 #      port fails with a clear error
 #   8. the earlier gates still pass: p0, p1, p4a, p1qa
@@ -66,9 +71,9 @@ ct() { # name, env-prefix-var, args...
 
 CT_REL="cargo test --release -p forgetty-client"
 
-# All six p2b scenarios passed against the real server. Test output is
+# All p2b scenarios passed against the real server. Test output is
 # interleaved with the tests' own println!, so check the result line.
-p2b_real_ok() { grep -q "^test result: ok. 6 passed" "$LOGS/real-p2b.log" 2>/dev/null; }
+p2b_real_ok() { grep -qE "^test result: ok\. [0-9]+ passed; 0 failed" "$LOGS/real-p2b.log" 2>/dev/null; }
 
 # ---------------------------------------------------------------------------
 if want 1; then
@@ -122,6 +127,7 @@ if want 4; then
   step "4. release build: input RTT p95 during a 50 MiB burst < 20 ms"
   for mode in mock real; do
     line=$(grep -h "burst of 50 MiB" "$LOGS/$mode-latency.log" | head -1)
+    # the test also asserts 0 resets and byte-identical output (both modes)
     p95=$(echo "$line" | sed -E 's/.*during burst n=[0-9]+ p50=[^ ]+ p95=([0-9.]+)(µs|ms|s).*/\1 \2/')
     if [ -z "$line" ]; then fail "$mode: no latency line"; continue; fi
     echo "    [$mode] $line"
@@ -167,17 +173,23 @@ fi
 
 # ---------------------------------------------------------------------------
 if want 6; then
-  step "6. revoke, client registry, stopping state, log offsets, input across a restart"
+  step "6. revoke, client registry, stopping state, log offsets, restart under load, stalled reader, throughput"
   ok=1
   for t in revoke_closes_a_v2_connection_and_the_client_registry_counts_it \
            stopping_server_refuses_v2_attaches \
            log_offsets_persist_across_rotation_and_restart \
-           input_typed_during_a_restart_arrives_once; do
+           input_typed_during_a_restart_arrives_once \
+           restart_under_load_with_a_client_connecting_in_the_stop_window \
+           a_client_that_stops_reading_control_costs_no_memory_and_is_closed \
+           cat_200mb_through_the_server; do
     grep -q "^test $t " "$LOGS/real-p2b.log" || { ok=0; echo "    missing: $t"; }
   done
-  grep -h "revoke: v2 connection ended" "$LOGS/real-p2b.log" | head -1 | sed 's/^/    /'
+  for pat in "revoke: v2 connection ended" "cat 200 MiB:" "stop window:" "stalled control reader:"; do
+    l=$(grep -h "$pat" "$LOGS/real-p2b.log" | head -1)
+    [ -n "$l" ] && { echo "    $l"; SUMMARY+=("$l"); }
+  done
   p2b_real_ok || ok=0
-  [ $ok = 1 ] && { pass "v2 revoke, registry, stopping, offsets, restart input"; SUMMARY+=("revoke/registry/stopping/offsets/restart-input: pass"); } || fail "step 6"
+  [ $ok = 1 ] && { pass "v2 revoke, registry, stopping, offsets, restart under load, stalled reader"; SUMMARY+=("revoke/registry/stopping/offsets/restart-under-load/stalled-reader: pass"); } || fail "step 6"
 fi
 
 # ---------------------------------------------------------------------------

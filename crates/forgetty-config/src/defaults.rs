@@ -32,7 +32,7 @@ pub fn default_config() -> Config {
         paste_warn_size: 5120,
         paste_warn_newline: true,
         session_trash_days: 7,
-        byte_log_ring_kb: 1024,
+        byte_log_ring_kb: 8192,
         byte_log_max_mb: 10,
         relay_urls: Vec::new(),
     }

@@ -158,7 +158,7 @@ pub struct Config {
 
     /// Per-pane in-memory byte-log ring buffer size, in KiB.
     /// Used for replay on `subscribe_output` (V2-007 / AD-013).
-    /// Default: `1024` (1 MiB). `0` disables ring buffering (no replay).
+    /// Default: `8192` (8 MiB). `0` disables ring buffering (no replay).
     pub byte_log_ring_kb: u32,
 
     /// Per-pane on-disk byte-log cap, in MiB. The appender keeps newest
@@ -253,7 +253,7 @@ impl Serialize for Config {
 
         // Byte-log tuning (V2-007). Only write when non-default to keep
         // config.toml clean for the common case.
-        if self.byte_log_ring_kb != 1024 {
+        if self.byte_log_ring_kb != 8192 {
             map.serialize_entry("byte_log_ring_kb", &self.byte_log_ring_kb)?;
         }
         if self.byte_log_max_mb != 10 {
@@ -442,7 +442,7 @@ fn default_session_trash_days() -> u32 {
 }
 
 fn default_byte_log_ring_kb() -> u32 {
-    1024
+    8192
 }
 
 fn default_byte_log_max_mb() -> u32 {

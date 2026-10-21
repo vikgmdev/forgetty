@@ -67,6 +67,9 @@ pub mod error_code {
     pub const NOT_FOUND: &str = "not_found";
     /// `Failure` for a method that needs a capability the peer did not list.
     pub const CAPABILITY_MISSING: &str = "capability_missing";
+    /// The server is stopping and takes no new connections (handshake `Error`).
+    /// The only handshake error the client retries.
+    pub const SERVER_STOPPING: &str = "server_stopping";
     /// Any other server side error.
     pub const INTERNAL: &str = "internal";
 }
