@@ -99,6 +99,7 @@ async fn exactly_once_across_five_drops_and_one_restart() {
                         data.extend_from_slice(&bytes);
                         echoed.store(data.len() as u64, Ordering::SeqCst);
                     }
+                    PaneItem::Snapshot { .. } => panic!("unexpected snapshot catch-up"),
                     PaneItem::Ended => panic!("pane ended"),
                 }
             }
@@ -348,6 +349,7 @@ async fn restart_under_load_with_a_client_connecting_in_the_stop_window() {
                         resets
                             .fetch_add(u64::from(got.load(Ordering::SeqCst) > 0), Ordering::SeqCst);
                     }
+                    PaneItem::Snapshot { .. } => {}
                     PaneItem::Ended => break,
                 }
             }
@@ -402,9 +404,11 @@ async fn restart_under_load_with_a_client_connecting_in_the_stop_window() {
 }
 
 /// A client that stops reading Control while layout events fire. The server
-/// queues at most 1024 messages for it, pulls no more events while that is
-/// full, closes the connection after 10 s, and its memory stays flat. A
-/// client that reconnects gets the right layout and live events.
+/// keeps at most one pending `LayoutChanged` for it and pulls no more events
+/// while its queue is over budget, so its memory stays flat. If the queue
+/// fills anyway the connection is closed after 10 s. When the peer reads
+/// again it finds a handful of layouts, not 100k. A client that reconnects
+/// gets the right layout and live events.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_client_that_stops_reading_control_costs_no_memory_and_is_closed() {
     if !real_only() {
@@ -417,8 +421,10 @@ async fn a_client_that_stops_reading_control_costs_no_memory_and_is_closed() {
 
     let server = TestServer::start(TestServerConfig::default()).await;
     let pane = server.add_pane();
-    // A layout of six panes, so each event is several KiB.
-    for _ in 0..5 {
+    // A layout of six panes, so each event is several KiB. The P2c gate also
+    // runs 31 (`STALL_PANES=30`).
+    let extra: usize = std::env::var("STALL_PANES").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+    for _ in 0..extra {
         server.add_pane();
     }
 
@@ -481,21 +487,38 @@ async fn a_client_that_stops_reading_control_costs_no_memory_and_is_closed() {
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
     let grew_mb = peak.saturating_sub(rss0) as f64 / 1024.0;
-    let (at, why) =
-        closed_at.lock().unwrap().take().expect("the stalled connection was never closed");
+    let closed = closed_at.lock().unwrap().take();
     println!(
-        "stalled control reader: 100000 events in 15 s, server RSS {:.1} MiB -> peak {:.1} MiB (+{grew_mb:.1}), \
-         connection closed after {:?} ({why:?})",
+        "stalled control reader ({} panes): 100000 events in 15 s, server RSS {:.1} MiB -> peak {:.1} MiB (+{grew_mb:.1}), {}",
+        extra + 1,
         rss0 as f64 / 1024.0,
         peak as f64 / 1024.0,
-        at.duration_since(t0)
+        match &closed {
+            Some((at, why)) => format!("connection closed after {:?} ({why:?})", at.duration_since(t0)),
+            None => "connection kept open with one pending layout".to_string(),
+        }
     );
     assert!(grew_mb < 20.0, "server RSS grew by {grew_mb:.1} MiB");
-    assert!(
-        matches!(&why, ConnectionError::ApplicationClosed(c) if u64::from(c.error_code) == 0x12),
-        "closed for another reason: {why:?}"
-    );
-    assert!(at.duration_since(t0) < Duration::from_secs(15), "closed too late");
+    if let Some((_, why)) = &closed {
+        assert!(
+            matches!(why, ConnectionError::ApplicationClosed(c) if u64::from(c.error_code) == 0x12),
+            "closed for another reason: {why:?}"
+        );
+    } else {
+        // Still open: the peer reads now and finds the QUIC window's worth of
+        // layouts plus one, never the 100k that were fired.
+        let mut seen = 0usize;
+        while let Ok(Ok(Some(msg))) =
+            tokio::time::timeout(Duration::from_millis(500), read_msg::<_, ControlMsg>(&mut recv))
+                .await
+        {
+            if matches!(msg, ControlMsg::Event { .. }) {
+                seen += 1;
+            }
+        }
+        println!("stalled control reader: the peer then read {seen} events");
+        assert!(seen < 2000, "the server queued {seen} events for a peer that did not read");
+    }
     endpoint.close().await;
 
     // The same device reconnects: right layout, live events.
@@ -554,27 +577,27 @@ async fn log_offsets_persist_across_rotation_and_restart() {
     assert_eq!(t, total);
     assert!(first > 0 && first <= total - 512 * 1024, "first offset {first}");
 
-    // Attach from an offset older than the log: reset at the first byte.
+    // A fresh attach starts at the oldest byte. The oldest byte is more than
+    // half the 1 MiB ring behind, so (AD-023) the server sends a snapshot of
+    // the screen at the head instead of replaying the log.
     let h = connect(&server, "offsets").await;
     let mut s = h.attach_pane(pane).await.unwrap();
-    let mut got_first = None;
+    let mut snap_at = None;
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             match s.next().await.unwrap() {
-                PaneItem::Reset { .. } => {}
-                PaneItem::Data { offset, bytes } => {
-                    got_first.get_or_insert(offset);
-                    if offset + bytes.len() as u64 >= total {
-                        return;
-                    }
+                PaneItem::Reset { .. } | PaneItem::Data { .. } => {}
+                PaneItem::Snapshot { offset, .. } => {
+                    snap_at = Some(offset);
+                    return;
                 }
                 PaneItem::Ended => panic!("ended"),
             }
         }
     })
     .await
-    .expect("replay");
-    assert_eq!(got_first, Some(first), "a fresh attach starts at the oldest byte");
+    .expect("snapshot");
+    assert_eq!(snap_at, Some(total), "the snapshot stands at the head of the log");
     drop(s);
     h.close().await;
 
@@ -681,7 +704,7 @@ async fn cat_200mb_through_the_server() {
             t0.elapsed()
         })
     };
-    let (mut got, mut resets, mut bad, mut end) = (0u64, 0u32, false, 0u64);
+    let (mut got, mut resets, mut snapshots, mut bad, mut end) = (0u64, 0u32, 0u32, false, 0u64);
     let deadline = Instant::now() + Duration::from_secs(180);
     while end < N && Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_secs(10), s.next()).await {
@@ -696,7 +719,11 @@ async fn cat_200mb_through_the_server() {
                 got += bytes.len() as u64;
                 end = end.max(offset + bytes.len() as u64);
             }
-            Ok(Some(PaneItem::Reset { .. })) => resets += u32::from(got > 0),
+            Ok(Some(PaneItem::Reset { .. })) => resets += u32::from(end > 0),
+            Ok(Some(PaneItem::Snapshot { offset, .. })) => {
+                snapshots += 1;
+                end = end.max(offset);
+            }
             _ => break,
         }
     }
@@ -708,13 +735,14 @@ async fn cat_200mb_through_the_server() {
     let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
     println!(
         "cat 200 MiB: server ingest {:.0} MiB/s ({ingest_time:?}); client {:.0} MiB/s \
-         ({client_time:?}, {:.0} MiB received, {resets} resets, bad bytes: {bad})",
+         ({client_time:?}, {:.0} MiB received, {resets} resets, {snapshots} snapshot catch-ups, bad bytes: {bad})",
         mb(N) / ingest_time.as_secs_f64(),
         mb(got) / client_time.as_secs_f64(),
         mb(got),
     );
-    // A reader slower than the PTY can fall past the log (8 MiB ring plus the
-    // file) and gets a reset: that is counted, not an error. A wrong byte is.
+    // The program runs at full speed (AD-023). A reader slower than the PTY
+    // falls behind and catches up by snapshot: that is counted, not an error.
+    // A wrong byte is.
     assert!(!bad, "bytes differ from the pattern");
     assert!(end >= N, "the stream stopped at {end} of {N}");
     h.close().await;

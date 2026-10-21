@@ -67,6 +67,17 @@ pub enum PaneItem {
         /// PTY columns.
         cols: u16,
     },
+    /// Snapshot catch-up (AD-023). The client fell behind and the server sent
+    /// the current screen as VT bytes instead of the bytes it missed. It
+    /// always follows a `Reset`. Apply `bytes` to the reset terminal. They are
+    /// not pane bytes: `offset` is where the pane stood, and the next `Data`
+    /// starts there.
+    Snapshot {
+        /// Pane offset the snapshot stands at.
+        offset: u64,
+        /// VT bytes.
+        bytes: Vec<u8>,
+    },
     /// PTY bytes. `offset` is the absolute pane offset of `bytes[0]`.
     Data {
         /// Absolute offset of the first byte.
@@ -157,11 +168,26 @@ pub(crate) struct PaneState {
     gen: u64,
     /// Next expected absolute offset. `None` until the first header.
     offset: Option<u64>,
+    /// Number of the newest stream that opened with a reset. Items of older
+    /// streams still queued for the consumer are stale and are dropped.
+    reset_stream: u64,
+    /// Counts the pane streams read so far. A newer stream (snapshot
+    /// catch-up, re-attach) takes the pane over from an older one.
+    stream: u64,
 }
+
+/// A queued item with the number of the stream it came from.
+pub(crate) struct Tagged {
+    stream: u64,
+    item: PaneItem,
+}
+
+/// Tag of items that are never stale (`Ended`).
+const ALWAYS: u64 = u64::MAX;
 
 pub(crate) struct PaneShared {
     id: Uuid,
-    tx: mpsc::Sender<PaneItem>,
+    tx: mpsc::Sender<Tagged>,
     state: Mutex<PaneState>,
     /// Generation of the link this pane is attached on (0 = none). Held across
     /// the attach request so two paths never attach twice.
@@ -445,7 +471,7 @@ impl ClientHandle {
         let pane = Arc::new(PaneShared {
             id: pane_id,
             tx,
-            state: Mutex::new(PaneState { gen: 0, offset: None }),
+            state: Mutex::new(PaneState { gen: 0, offset: None, stream: 0, reset_stream: 0 }),
             attached_gen: Arc::new(tokio::sync::Mutex::new(0)),
         });
         {
@@ -593,7 +619,7 @@ impl ClientHandle {
 /// Dropping it detaches the pane.
 pub struct PaneStream {
     pane: Arc<PaneShared>,
-    rx: mpsc::Receiver<PaneItem>,
+    rx: mpsc::Receiver<Tagged>,
     client: ClientHandle,
     ended: bool,
 }
@@ -609,11 +635,18 @@ impl PaneStream {
         if self.ended {
             return None;
         }
-        let item = self.rx.recv().await;
-        if matches!(item, Some(PaneItem::Ended)) {
-            self.ended = true;
+        loop {
+            let tagged = self.rx.recv().await?;
+            // A newer stream started with a reset (snapshot catch-up): what an
+            // older stream queued would only be wiped by that reset.
+            if tagged.stream != ALWAYS && tagged.stream < lock(&self.pane.state).reset_stream {
+                continue;
+            }
+            if matches!(tagged.item, PaneItem::Ended) {
+                self.ended = true;
+            }
+            return Some(tagged.item);
         }
-        item
     }
 
     /// Absolute offset of the next byte this stream will yield. `None` before
@@ -1143,7 +1176,7 @@ async fn session_init(
                 lock(&shared.panes).remove(&pane.id);
                 let tx = pane.tx.clone();
                 tokio::spawn(async move {
-                    let _ = tx.send(PaneItem::Ended).await;
+                    let _ = tx.send(Tagged { stream: ALWAYS, item: PaneItem::Ended }).await;
                 });
             }
             Err(e) => return TaskEnd::Lost(format!("attach_pane: {e}")),
@@ -1233,6 +1266,8 @@ async fn pane_reader(shared: Arc<Shared>, gen: u64, mut recv: RecvStream) -> Tas
     let header: PaneStreamHeader = match read_msg(&mut recv).await {
         Ok(Some(h)) => h,
         Ok(None) => return TaskEnd::Done,
+        // Replaced by a snapshot catch-up before its header was read.
+        Err(e) if is_superseded(&e) => return TaskEnd::Done,
         Err(e) => return TaskEnd::Lost(format!("pane header: {e}")),
     };
     let pane = lock(&shared.panes).get(&header.pane_id).cloned();
@@ -1242,13 +1277,31 @@ async fn pane_reader(shared: Arc<Shared>, gen: u64, mut recv: RecvStream) -> Tas
         return TaskEnd::Done;
     };
 
-    // Claim the pane for this session. A reset item must reach the consumer
-    // before any byte, so reserve the channel slot first.
+    // Claim the pane before reserving a slot: from here an older stream of
+    // this pane sends nothing more, so its bytes cannot land after a reset.
+    let mine = {
+        let mut st = lock(&pane.state);
+        st.stream += 1;
+        if header.reset {
+            // From here the consumer drops what older streams queued.
+            st.reset_stream = st.stream;
+        }
+        st.stream
+    };
+    debug!(
+        "client: pane {} stream {mine}: reset={} start={} snapshot_len={}",
+        pane.id, header.reset, header.start_offset, header.snapshot_len
+    );
+    // A reset item must reach the consumer before any byte, so reserve the
+    // channel slot first.
     let Ok(permit) = pane.tx.reserve().await else {
         return TaskEnd::Done; // PaneStream dropped
     };
     {
         let mut st = lock(&pane.state);
+        if st.stream != mine {
+            return TaskEnd::Done; // an even newer stream already took over
+        }
         if header.reset {
             st.offset = Some(header.start_offset);
         } else if st.offset.is_some_and(|o| o != header.start_offset) {
@@ -1261,10 +1314,14 @@ async fn pane_reader(shared: Arc<Shared>, gen: u64, mut recv: RecvStream) -> Tas
         }
         st.gen = gen;
         if header.reset {
-            permit.send(PaneItem::Reset { rows: header.rows, cols: header.cols });
+            permit.send(Tagged {
+                stream: mine,
+                item: PaneItem::Reset { rows: header.rows, cols: header.cols },
+            });
         }
     }
 
+    let mut snapshot_left = header.snapshot_len as usize;
     let mut buf = Vec::new();
     loop {
         match read_output_frame(&mut recv, &mut buf).await {
@@ -1273,24 +1330,63 @@ async fn pane_reader(shared: Arc<Shared>, gen: u64, mut recv: RecvStream) -> Tas
                     return TaskEnd::Done;
                 };
                 let mut st = lock(&pane.state);
-                if st.gen != gen {
-                    return TaskEnd::Done; // a newer session owns the pane
+                if st.gen != gen || st.stream != mine {
+                    return TaskEnd::Done; // a newer stream owns the pane
                 }
                 let offset = st.offset.unwrap_or(0);
-                st.offset = Some(offset + buf.len() as u64);
-                permit.send(PaneItem::Data { offset, bytes: std::mem::take(&mut buf) });
+                if snapshot_left > 0 {
+                    if buf.len() > snapshot_left || !header.reset {
+                        return TaskEnd::Lost(format!(
+                            "pane {} snapshot frame does not fit the header",
+                            pane.id
+                        ));
+                    }
+                    snapshot_left -= buf.len();
+                    permit.send(Tagged {
+                        stream: mine,
+                        item: PaneItem::Snapshot { offset, bytes: std::mem::take(&mut buf) },
+                    });
+                } else {
+                    st.offset = Some(offset + buf.len() as u64);
+                    permit.send(Tagged {
+                        stream: mine,
+                        item: PaneItem::Data { offset, bytes: std::mem::take(&mut buf) },
+                    });
+                }
             }
             Ok(false) => {
                 // Clean FIN: the pane closed.
-                if lock(&pane.state).gen == gen {
+                let current = {
+                    let st = lock(&pane.state);
+                    st.gen == gen && st.stream == mine
+                };
+                if current {
                     lock(&shared.panes).remove(&pane.id);
-                    let _ = pane.tx.send(PaneItem::Ended).await;
+                    let _ = pane.tx.send(Tagged { stream: ALWAYS, item: PaneItem::Ended }).await;
                 }
                 return TaskEnd::Done;
             }
-            Err(e) => return TaskEnd::Lost(format!("pane {} read: {e}", pane.id)),
+            Err(e) => {
+                if is_superseded(&e) {
+                    // The server replaced this stream with a snapshot catch-up.
+                    // The new stream is on its way, this one is over.
+                    return TaskEnd::Done;
+                }
+                return TaskEnd::Lost(format!("pane {} read: {e}", pane.id));
+            }
         }
     }
+}
+
+/// `true` when a pane stream was reset with `stream_code::SUPERSEDED`.
+fn is_superseded(e: &forgetty_proto::FrameError) -> bool {
+    let forgetty_proto::FrameError::Io(io) = e else { return false };
+    io.get_ref().and_then(|inner| inner.downcast_ref::<iroh::endpoint::ReadError>()).is_some_and(
+        |r| {
+            matches!(r, iroh::endpoint::ReadError::Reset(code)
+                if code.into_inner() == u64::from(forgetty_proto::stream_code::SUPERSEDED))
+        },
+    )
 }
 
 #[cfg(test)]

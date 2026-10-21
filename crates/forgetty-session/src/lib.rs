@@ -32,16 +32,17 @@ pub mod manager;
 pub mod osc;
 pub mod pane;
 pub mod pty_bridge;
+pub mod snapshot;
 pub mod status;
 pub mod workspace;
 
 // Convenient top-level re-exports for downstream crates.
-pub use byte_log::{read_disk, ByteLog, DiskState, LogPlan, LogShared, ReaderGuard};
+pub use byte_log::{read_disk, ByteLog, DiskState, LogPlan, LogShared};
 pub use clients::{ClientGuard, ClientInfo, ClientRegistry};
 pub use drain_result::DrainResult;
 pub use events::SessionEvent;
 pub use layout::{SessionLayout, SessionTab, SessionWorkspace};
-pub use manager::SessionManager;
+pub use manager::{PaneSnapshot, SessionManager};
 pub use pane::{DuplicatedTab, NotificationInfo, PaneInfo, PaneOsc, PaneState};
 pub use pty_bridge::PtyBridge;
 pub use status::{PaneStatus, StatusSnapshot};

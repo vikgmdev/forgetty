@@ -77,6 +77,12 @@ fn handle(
                 "dedup_drops": rpc.qa.dedup_drops.load(Ordering::SeqCst),
                 "handshakes": rpc.qa.handshakes.load(Ordering::SeqCst),
                 "stopping_refusals": rpc.qa.stopping_refusals.load(Ordering::SeqCst),
+                "catchups": rpc.qa.catchups.load(Ordering::SeqCst),
+                "last_snapshot_us": rpc.qa.last_snapshot_us.load(Ordering::SeqCst),
+                "last_snapshot_bytes": rpc.qa.last_snapshot_bytes.load(Ordering::SeqCst),
+                "too_many_closes": rpc.qa.too_many_closes.load(Ordering::SeqCst),
+                "stall_closes": rpc.qa.stall_closes.load(Ordering::SeqCst),
+                "alive_tasks": tokio::runtime::Handle::current().metrics().num_alive_tasks(),
                 "connections": rpc.connection_count(),
                 "attaches": attaches,
                 "panes": panes,
@@ -242,6 +248,18 @@ fn handle(
                 rpc.emit(ServerEvent::LayoutChanged { layout: layout.clone() });
             }
             ok(json!({ "ok": true, "fired": count }))
+        }
+        "qa_force_catchup" => {
+            // Every stream of the pane takes a snapshot catch-up now.
+            let pane = match pane_param(req) {
+                Ok(p) => p,
+                Err(r) => return Some(r),
+            };
+            rpc.qa.force_catchup.send_modify(|(p, n)| {
+                *p = pane;
+                *n += 1;
+            });
+            ok(json!({ "ok": true }))
         }
         "qa_push_status" => {
             let pane = match pane_param(req) {

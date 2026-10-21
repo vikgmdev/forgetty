@@ -53,6 +53,15 @@ pub mod close_code {
     pub const FRAME_TOO_LARGE: u32 = 0x02;
 }
 
+/// Stream reset codes on a Pane output stream (section 8).
+pub mod stream_code {
+    /// The log no longer holds the bytes (rotated or lost).
+    pub const LOG_LOST: u32 = 0x11;
+    /// The server ended this stream and opened a newer one for the same pane
+    /// (snapshot catch-up). Not an error: the client reads the new stream.
+    pub const SUPERSEDED: u32 = 0x13;
+}
+
 /// String error codes used in `Error` and `Failure` messages.
 pub mod error_code {
     /// Different `proto_major` (section 3).
@@ -86,6 +95,8 @@ pub mod cap {
     pub const CAPTURE: &str = "capture";
     /// PTY size follows the latest active client (AD-020).
     pub const SIZE_POLICY_LATEST: &str = "size_policy_latest";
+    /// A slow pane stream catches up by a VT snapshot (AD-023).
+    pub const SNAPSHOT_CATCHUP: &str = "snapshot_catchup";
 }
 
 /// Method names that are new in v2 (section 4).

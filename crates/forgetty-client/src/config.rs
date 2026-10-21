@@ -41,6 +41,7 @@ impl ClientInfo {
                 cap::LAYOUT_EVENTS.to_string(),
                 cap::STATUS_EVENTS.to_string(),
                 cap::SIZE_POLICY_LATEST.to_string(),
+                cap::SNAPSHOT_CATCHUP.to_string(),
             ],
         }
     }

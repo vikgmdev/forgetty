@@ -309,6 +309,12 @@ pub struct PaneStreamHeader {
     pub rows: u16,
     /// PTY columns now.
     pub cols: u16,
+    /// Snapshot catch-up (AD-023, capability `snapshot_catchup`): the first
+    /// `snapshot_len` bytes after the header are a VT snapshot of the screen,
+    /// not pane bytes. They do not advance the pane offset. The pane bytes
+    /// that follow start at `start_offset`. `0` for a normal stream.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub snapshot_len: u32,
 }
 
 /// Client to server, first frame on a `forgetty/pair/2` bi stream (section 7).
@@ -449,4 +455,8 @@ pub fn from_value<T: DeserializeOwned>(v: Value) -> Result<T, FrameError> {
 pub fn to_value<T: Serialize>(v: &T) -> Result<Value, FrameError> {
     let bytes = rmp_serde::to_vec_named(v).map_err(|e| FrameError::Encode(e.to_string()))?;
     rmp_serde::from_slice(&bytes).map_err(|e| FrameError::Decode(e.to_string()))
+}
+
+fn is_zero_u32(n: &u32) -> bool {
+    *n == 0
 }

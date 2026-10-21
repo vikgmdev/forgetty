@@ -167,9 +167,10 @@ impl Real {
             .open(root.join("server.log"))
             .unwrap();
         cmd.env("SHELL", &wrapper)
-            .env("RUST_LOG", "warn")
+            .env("RUST_LOG", std::env::var("QA_RUST_LOG").unwrap_or_else(|_| "warn".into()))
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            // tracing writes to stdout
+            .stdout(log.try_clone().map(Stdio::from).unwrap_or_else(|_| Stdio::null()))
             .stderr(log);
         cmd.spawn().expect("spawn forgetty")
     }
@@ -289,6 +290,11 @@ impl Drop for Real {
         if let Some(mut child) = self.child.lock().unwrap().take() {
             let _ = child.kill();
             let _ = child.wait();
+        }
+        if std::env::var_os("QA_SHOW_SERVER_LOG").is_some() {
+            let log =
+                std::fs::read_to_string(self.dir.path().join("server.log")).unwrap_or_default();
+            eprintln!("--- server.log ---\n{log}");
         }
     }
 }

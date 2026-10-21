@@ -89,21 +89,33 @@ stream) and the `qa_*` test methods are not reachable over v2.
 - Every pane has an absolute byte offset. The ring and the disk log know the
   offset of their first byte. The first offset is stored in
   `logs/<pane>.log.off`, so a client resumes at its offset after a server
-  restart. The ring is 8 MiB per pane (`byte_log_ring_kb`). A client that is
-  behind the ring reads from the disk log by offset. A client behind the whole
-  log (ring plus file) is reset to the first available byte.
-- The byte log never drops output. When more than 4 MiB wait for the disk
-  writer, the server stops reading that PTY until the queue drains, so the
-  program blocks on its write (PTY flow control). The wait is event driven, no
-  polling. Output that arrives after shutdown starts is not logged, so the log
-  on disk is exactly what clients saw.
+  restart. The ring is 8 MiB per pane (`byte_log_ring_kb`).
+- The byte log never drops output. Only the server's own disk writer can hold a
+  PTY: when more than 4 MiB wait for it, the server stops reading that PTY
+  until the queue drains (event driven, no polling). No client stream, however
+  slow, ever holds a program (AD-023). Output that arrives after shutdown
+  starts is not logged, so the log on disk is exactly what clients saw.
+- A slow client catches up by snapshot (capability `snapshot_catchup`). A pane
+  stream that falls more than half the ring behind, or makes no write progress
+  for 2 s, is reset (stream code 0x13) and replaced by a new stream with
+  `reset: true`, `start_offset` at the head and `snapshot_len` bytes of VT
+  first: the screen, cursor, modes (alternate screen, bracketed paste, mouse,
+  keypad, cursor visibility), scroll region, tab stops, pwd, keyboard modes and
+  title, built from the ring on the cold path. Then live bytes follow. The
+  snapshot has no scrollback and no palette (cells keep palette indexes), and
+  only covers what the ring holds. A client without the capability keeps the
+  old rule: it reads from the disk log, and a client behind the whole log is
+  reset with code 0x11 and resumes with a reset.
 - A stopping server answers `Hello` with `Error { code: "server_stopping" }`.
   The client retries it with its normal backoff.
-- Each v2 connection queues at most 1024 Control messages. When a client does
-  not read, the server stops pulling events for it, merges layout events into
-  one `LayoutChanged` (at most one per 250 ms), and closes the connection with
-  code 0x12 after 10 s without a completed write. Responses and Pongs wait for
-  room and are never dropped.
+- Each v2 connection queues at most 8 MiB of Control messages (counted in
+  bytes, with a fixed cost per message). It holds at most one `LayoutChanged`,
+  and a newer one replaces the pending one in place. Past the budget the
+  connection stops reading requests (QUIC flow control pushes back on the
+  client) and pulls no more events. After 10 s with no completed write the
+  server closes the connection with code 0x12. At most 64 requests run per
+  connection, one more closes it with code 0x14. Responses and Pongs are never
+  dropped, and nothing spawns a task per queued message.
 - Input is deduplicated by `(client_id, input_epoch)` and `seq`. The server
   writes the dedup table to `input_seq.json` in the state dir when it stops
   and loads it at start, so a frame the client did not see acked is not written
@@ -204,6 +216,8 @@ scripts/p4a_gate.sh  # OSC scanner, status, capture, agent CLI
 scripts/p1qa_gate.sh # revoke, concurrent start, SIGTERM, kill -9, session file, modes
 scripts/p2b_gate.sh  # protocol v2: client suites against the real server, exactly-once,
                      # size policy, 50 MiB burst latency, restart reconnect, port 47297
+scripts/p2c_gate.sh  # AD-023: slow client never slows a program, snapshot catch-up,
+                     # request flood, stalled Control reader, then all earlier gates
 ```
 
 Both run a server in a temp state dir as the current user and need outbound

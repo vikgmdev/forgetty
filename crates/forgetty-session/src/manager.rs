@@ -120,6 +120,19 @@ struct SessionManagerInner {
 // Public handle
 // ---------------------------------------------------------------------------
 
+/// Result of [`SessionManager::snapshot_pane`].
+#[derive(Debug, Clone)]
+pub struct PaneSnapshot {
+    /// Absolute pane offset the snapshot stands at.
+    pub offset: u64,
+    /// PTY rows the snapshot was built for.
+    pub rows: u16,
+    /// PTY columns the snapshot was built for.
+    pub cols: u16,
+    /// The VT bytes.
+    pub bytes: Vec<u8>,
+}
+
 /// Platform-agnostic session manager.
 ///
 /// Owns all PTY processes and per-pane byte logs (AD-007 / AD-013). Compiles
@@ -1943,6 +1956,24 @@ impl SessionManager {
             (rows, cols, replay)
         };
         Some(crate::capture::capture_text(&replay, rows, cols, trim, last_lines))
+    }
+
+    /// Snapshot catch-up (AD-023): the pane's current screen as VT bytes, built
+    /// from the byte-log ring at the pane's size.
+    ///
+    /// Cold path. The manager lock is held only to copy the ring. The VT work
+    /// runs after it is released, so call this from `spawn_blocking`. The
+    /// snapshot stands for every byte below `offset`, so a stream continues at
+    /// `offset`.
+    pub fn snapshot_pane(&self, id: PaneId) -> Option<PaneSnapshot> {
+        let (rows, cols, replay, offset) = {
+            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let pane = inner.panes.get(&id)?;
+            let (replay, offset) = inner.byte_logs.get(&id)?.ring_copy();
+            (pane.rows, pane.cols, replay, offset)
+        };
+        let bytes = crate::snapshot::build_snapshot(&replay, rows, cols);
+        Some(PaneSnapshot { offset, rows, cols, bytes })
     }
 
     /// List all live pane IDs.

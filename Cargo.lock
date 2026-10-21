@@ -1096,6 +1096,7 @@ dependencies = [
  "forgetty-client",
  "forgetty-core",
  "forgetty-proto",
+ "forgetty-vt",
  "iroh",
  "libc",
  "rand",

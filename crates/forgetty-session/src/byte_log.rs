@@ -37,7 +37,6 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt, BufWriter};
@@ -51,9 +50,6 @@ use forgetty_workspace::{logs_dir, pane_log_path};
 /// (flow control). Above this, `LogShared::wait_room` blocks. A program that
 /// writes faster than the disk blocks on its PTY write: nothing is dropped.
 pub const DISK_HIGH_WATER: u64 = 4 * 1024 * 1024;
-
-/// A pane stream that has not moved for this long no longer holds the PTY back.
-const READER_STALL: Duration = Duration::from_secs(2);
 
 /// The appender merges queued chunks up to about this size into one write.
 const COALESCE_MAX: usize = 1024 * 1024;
@@ -106,14 +102,8 @@ pub struct LogShared {
     closed: AtomicBool,
     /// Absolute offset one past the newest byte (mirror of the log's total).
     total: AtomicU64,
-    /// Ring size in bytes. A live reader may lag at most half of it.
+    /// Ring size in bytes.
     ring_capacity: usize,
-    /// Live pane streams and how far each has read.
-    readers: Mutex<Vec<Arc<ReaderPos>>>,
-    /// Woken when a reader moved, joined or left.
-    reader_progress: Notify,
-    /// Zero point of `ReaderPos::moved_ms`.
-    started: Instant,
     /// Odd while the appender replaces the file (rotation, restart). A reader
     /// that saw the same even value before and after its read got one file.
     epoch: AtomicU64,
@@ -144,72 +134,34 @@ impl LogShared {
         *self.disk.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn now_ms(&self) -> u64 {
-        self.started.elapsed().as_millis() as u64
-    }
-
-    /// Register a pane stream that will send from `start`.
-    pub fn register_reader(self: &Arc<Self>, start: u64) -> ReaderGuard {
-        let pos = Arc::new(ReaderPos {
-            next: AtomicU64::new(start),
-            moved_ms: AtomicU64::new(self.now_ms()),
-        });
-        self.readers.lock().unwrap_or_else(|e| e.into_inner()).push(pos.clone());
-        self.reader_progress.notify_waiters();
-        ReaderGuard { shared: self.clone(), pos }
-    }
-
-    /// Is the PTY held back, and until when? `Some(None)`: held, no deadline.
-    /// `Some(Some(t))`: held until `t` unless a reader moves first.
-    /// `None`: free to read.
-    fn held_back(&self) -> Option<Option<Instant>> {
-        if self.closed.load(Ordering::Acquire) {
-            return None;
-        }
-        if self.disk_enabled && self.queued.load(Ordering::Acquire) >= DISK_HIGH_WATER {
-            return Some(None);
-        }
-        if self.ring_capacity == 0 {
-            return None;
-        }
-        let total = self.total.load(Ordering::Acquire);
-        let limit = (self.ring_capacity / 2) as u64;
-        let now = self.now_ms();
-        let stall = READER_STALL.as_millis() as u64;
-        let mut deadline: Option<u64> = None;
-        for r in self.readers.lock().unwrap_or_else(|e| e.into_inner()).iter() {
-            let lag = total.saturating_sub(r.next.load(Ordering::Acquire));
-            let moved = r.moved_ms.load(Ordering::Acquire);
-            if lag > limit && now.saturating_sub(moved) < stall {
-                let d = moved + stall;
-                deadline = Some(deadline.map_or(d, |x| x.min(d)));
-            }
-        }
-        deadline.map(|d| Some(self.started + Duration::from_millis(d)))
-    }
-
-    /// Wait until the PTY may be read: the disk queue is below
-    /// [`DISK_HIGH_WATER`] and no live pane stream is more than half a ring
-    /// behind. A stream that has not moved for [`READER_STALL`] is not waited
-    /// for. Event driven: the appender and the streams wake this, and the
-    /// stall limit is one one-shot deadline.
+    /// Wait until the disk queue is below [`DISK_HIGH_WATER`]. Only the
+    /// server's own disk writer can hold a PTY (AD-023): a client's speed
+    /// never does. Event driven: the appender wakes this when it takes a
+    /// chunk.
     pub async fn wait_room(&self) {
         loop {
             let room = self.room.notified();
-            let moved = self.reader_progress.notified();
-            tokio::pin!(room, moved);
+            tokio::pin!(room);
             room.as_mut().enable();
-            moved.as_mut().enable();
-            match self.held_back() {
-                None => return,
-                Some(None) => tokio::select! { _ = &mut room => {}, _ = &mut moved => {} },
-                Some(Some(t)) => tokio::select! {
-                    _ = &mut room => {},
-                    _ = &mut moved => {},
-                    _ = tokio::time::sleep_until(t.into()) => {},
-                },
+            if self.closed.load(Ordering::Acquire)
+                || !self.disk_enabled
+                || self.queued.load(Ordering::Acquire) < DISK_HIGH_WATER
+            {
+                return;
             }
+            room.await;
         }
+    }
+
+    /// Absolute offset one past the newest byte, readable without the log's
+    /// lock.
+    pub fn total(&self) -> u64 {
+        self.total.load(Ordering::Acquire)
+    }
+
+    /// Ring size in bytes.
+    pub fn ring_capacity(&self) -> usize {
+        self.ring_capacity
     }
 
     /// Bytes waiting for the disk appender.
@@ -219,42 +171,6 @@ impl LogShared {
 
     fn set_disk(&self, state: DiskState) {
         *self.disk.lock().unwrap_or_else(|e| e.into_inner()) = state;
-    }
-}
-
-/// Where one pane stream is in the log.
-struct ReaderPos {
-    /// Next offset the stream will send.
-    next: AtomicU64,
-    /// When it last moved, in ms since `LogShared::started`.
-    moved_ms: AtomicU64,
-}
-
-/// A pane stream registered with its log. While registered, the PTY is not
-/// read further than half a ring ahead of the stream, so a live reader is
-/// always served from the ring and is not reset. Dropping it unregisters.
-pub struct ReaderGuard {
-    shared: Arc<LogShared>,
-    pos: Arc<ReaderPos>,
-}
-
-impl ReaderGuard {
-    /// The stream sent bytes up to (not including) `next`.
-    pub fn advance(&self, next: u64) {
-        self.pos.next.store(next, Ordering::Release);
-        self.pos.moved_ms.store(self.shared.now_ms(), Ordering::Release);
-        self.shared.reader_progress.notify_waiters();
-    }
-}
-
-impl Drop for ReaderGuard {
-    fn drop(&mut self) {
-        self.shared
-            .readers
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|r| !Arc::ptr_eq(r, &self.pos));
-        self.shared.reader_progress.notify_waiters();
     }
 }
 
@@ -393,9 +309,6 @@ impl ByteLog {
             closed: AtomicBool::new(false),
             total: AtomicU64::new(total_bytes_written),
             ring_capacity,
-            readers: Mutex::new(Vec::new()),
-            reader_progress: Notify::new(),
-            started: Instant::now(),
             epoch: AtomicU64::new(0),
         });
 
@@ -538,6 +451,17 @@ impl ByteLog {
     pub fn ring_snapshot(&mut self) -> (Bytes, u64) {
         let slice = self.ring.make_contiguous();
         (Bytes::copy_from_slice(slice), self.total_bytes_written)
+    }
+
+    /// Copy the ring without rearranging it, with the absolute offset of its
+    /// end. Unlike [`Self::ring_snapshot`] this takes `&self` and never moves
+    /// the ring's bytes, so it is cheap under the manager lock.
+    pub fn ring_copy(&self) -> (Vec<u8>, u64) {
+        let (a, b) = self.ring.as_slices();
+        let mut out = Vec::with_capacity(a.len() + b.len());
+        out.extend_from_slice(a);
+        out.extend_from_slice(b);
+        (out, self.total_bytes_written)
     }
 
     /// Send a flush signal to the disk appender and await its completion.
@@ -1168,38 +1092,6 @@ mod tests {
         let file = std::fs::read(pane_log_path(pane_id)).unwrap();
         assert_eq!(file.len() as u64, total);
         assert!(file.chunks(chunk.len()).all(|c| c == &chunk[..]));
-        cleanup(pane_id);
-    }
-
-    /// A live reader more than half a ring behind holds the PTY back until it
-    /// moves, leaves, or stops moving for READER_STALL.
-    #[tokio::test]
-    async fn a_lagging_reader_holds_the_pty_back() {
-        use std::time::Duration;
-        let pane_id = Uuid::new_v4();
-        let mut log = ByteLog::new(pane_id, 64 * 1024, 64 * 1024 * 1024).unwrap();
-        let shared = log.shared();
-        let reader = shared.register_reader(0);
-        log.append(&vec![1u8; 48 * 1024]); // 48 KiB ahead, limit is 32 KiB
-        let held = |s: Arc<LogShared>| async move {
-            tokio::time::timeout(Duration::from_millis(150), s.wait_room()).await.is_err()
-        };
-        assert!(held(shared.clone()).await, "a lagging reader must hold the PTY");
-        reader.advance(24 * 1024); // now 24 KiB behind
-        assert!(!held(shared.clone()).await, "a reader within the limit must not");
-        reader.advance(0);
-        assert!(held(shared.clone()).await);
-        // A reader that stops moving is not waited for.
-        let t0 = std::time::Instant::now();
-        shared.wait_room().await;
-        assert!(t0.elapsed() >= READER_STALL - Duration::from_millis(300));
-        // A reader that leaves frees the PTY at once.
-        reader.advance(0);
-        let s2 = shared.clone();
-        let waiter = tokio::spawn(async move { s2.wait_room().await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        drop(reader);
-        tokio::time::timeout(Duration::from_secs(1), waiter).await.unwrap().unwrap();
         cleanup(pane_id);
     }
 
