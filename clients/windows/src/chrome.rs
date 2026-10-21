@@ -598,6 +598,7 @@ impl Render for AppShell {
                 }
             }
             self.render_t0 = Some(now);
+            crate::smoke::trace("R", 0);
         }
         let vp = window.viewport_size();
         self.viewport = (f32::from(vp.width), f32::from(vp.height));

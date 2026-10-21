@@ -24,6 +24,22 @@ use crate::view::TerminalView;
 
 pub const KEYSTROKES: usize = 100;
 pub const TOTAL_TIMEOUT: Duration = Duration::from_secs(300);
+/// Frame/feed trace for a short window (diagnostics only).
+pub static TRACE_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static TRACE: Mutex<Vec<String>> = Mutex::new(Vec::new());
+pub fn trace(tag: &str, extra: usize) {
+    use std::sync::atomic::Ordering;
+    if !TRACE_ON.load(Ordering::Relaxed) {
+        return;
+    }
+    static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let t0 = *T0.get_or_init(Instant::now);
+    let mut g = TRACE.lock().unwrap();
+    if g.len() < 700 {
+        g.push(format!("{tag}{:.1}{}", t0.elapsed().as_secs_f64() * 1000.0, if extra > 0 { format!("({extra})") } else { String::new() }));
+    }
+}
+
 /// Diagnostic A/B switch for frame-rate experiments (env FORGETTY_AB). 0 = normal.
 pub fn ab() -> u32 {
     static AB: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
@@ -467,6 +483,7 @@ impl ShellSmoke {
                         v.send_bytes(format!("type {BIG_FILE} & echo THRU-DONE\r").as_bytes());
                         self.thr_t0 = Instant::now();
                         self.thr_last = None;
+                        TRACE_ON.store(true, std::sync::atomic::Ordering::Relaxed);
                         self.goto(Phase::Throughput);
                     }
                 }
@@ -480,6 +497,7 @@ impl ShellSmoke {
                 if let Some(fr) = find_exact("THRU-DONE") {
                     if at_prompt && cr > fr {
                         let secs = (now - self.thr_t0).as_secs_f64();
+                        TRACE_ON.store(false, std::sync::atomic::Ordering::Relaxed);
                         record("conpty_drain_s", json!((secs * 1000.0).round() / 1000.0));
                         record("conpty_mb_per_s", json!(((CONPTY_BYTES / 1e6 / secs) * 100.0).round() / 100.0));
                         record("conpty_max_frame_gap_ms", json!(self.thr_max_gap));
@@ -1108,6 +1126,7 @@ impl ShellSmoke {
     fn finish(&mut self, shell: &mut AppShell) -> ! {
         record("total_s", json!(ms(self.start.elapsed()) / 1000.0));
         record("frames_drawn", json!(shell.frames));
+        record("trace", json!(TRACE.lock().unwrap().join(" ")));
         for (name, v) in [("frame_cpu", &mut shell.cpu_ms), ("frame_idle", &mut shell.idle_ms)] {
             if !v.is_empty() {
                 v.sort_by(|a, b| a.partial_cmp(b).unwrap());

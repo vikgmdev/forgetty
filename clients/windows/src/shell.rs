@@ -984,7 +984,9 @@ impl AppShell {
             self.applied_title = title;
         }
         if let Some(mut sm) = self.smoke.take() {
+            crate::smoke::trace("P", 0);
             sm.step(self, window, cx);
+            crate::smoke::trace("S", 0);
             self.smoke = Some(sm);
         }
     }
