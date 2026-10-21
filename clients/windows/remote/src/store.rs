@@ -313,7 +313,7 @@ mod tests {
         assert_eq!(s.addr_cache().get(id), Some("127.0.0.1:47297".parse().unwrap()));
 
         for p in [s.identity_path(), s.client_id_path(), s.machines_path(), s.addr_cache_path()] {
-            assert!(crate::acl::is_user_only(&p).unwrap(), "{p:?}");
+            assert!(crate::acl::is_user_only(&p).unwrap(), "{p:?} {:?}", crate::acl::describe(&p));
         }
         s.remove(saved.id).unwrap();
         assert!(s.machines().is_empty());

@@ -60,12 +60,12 @@ mod win {
     use windows::Win32::Foundation::{CloseHandle, LocalFree, ERROR_SUCCESS, HANDLE, HLOCAL};
     use windows::Win32::Security::Authorization::{
         ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW, SetNamedSecurityInfoW,
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, ConvertStringSidToSidW, GetNamedSecurityInfoW, SetNamedSecurityInfoW,
         SDDL_REVISION_1, SE_FILE_OBJECT,
     };
     use windows::Win32::Security::{
-        GetSecurityDescriptorDacl, GetTokenInformation, TokenUser, ACL, DACL_SECURITY_INFORMATION,
-        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, TOKEN_QUERY, TOKEN_USER,
+        EqualSid, GetSecurityDescriptorDacl, GetTokenInformation, TokenUser, ACL, DACL_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, TOKEN_QUERY, TOKEN_USER, PSID,
     };
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -180,6 +180,28 @@ mod win {
         }
     }
 
+    fn parse_sid(text: &str) -> Option<PSID> {
+        let w: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut sid = PSID::default();
+        unsafe { ConvertStringSidToSidW(PCWSTR(w.as_ptr()), &mut sid).ok()? };
+        Some(sid)
+    }
+
+    /// SDDL prints some SIDs as two letter aliases (the built in administrator
+    /// account is `LA`), so compare as SIDs and not as text.
+    fn same_sid(a: &str, b: &str) -> bool {
+        if a == b {
+            return true;
+        }
+        let (Some(x), Some(y)) = (parse_sid(a), parse_sid(b)) else { return false };
+        let eq = unsafe { EqualSid(x, y).is_ok() };
+        unsafe {
+            let _ = LocalFree(Some(HLOCAL(x.0)));
+            let _ = LocalFree(Some(HLOCAL(y.0)));
+        }
+        eq
+    }
+
     /// `D:` header with the P (protected) flag, exactly one ACE, an allow entry
     /// for `sid`.
     pub(super) fn sddl_is_user_only(sddl: &str, sid: &str) -> bool {
@@ -188,7 +210,11 @@ mod win {
             Some(i) => rest.split_at(i),
             None => return false,
         };
-        flags.contains('P') && aces.matches('(').count() == 1 && aces.starts_with("(A;") && aces.contains(&format!(";{sid})"))
+        if !(flags.contains('P') && aces.matches('(').count() == 1 && aces.starts_with("(A;") && aces.ends_with(')')) {
+            return false;
+        }
+        let fields: Vec<&str> = aces[1..aces.len() - 1].split(';').collect();
+        fields.len() >= 6 && same_sid(fields[5], sid)
     }
 
     /// True when the DACL is protected and holds exactly one allow entry for
