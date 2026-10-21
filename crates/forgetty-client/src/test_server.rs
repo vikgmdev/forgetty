@@ -46,6 +46,15 @@ pub struct TestServerConfig {
     pub echo_input: bool,
     /// Bytes per output frame.
     pub chunk: usize,
+    /// Fixed UDP port on 127.0.0.1 (a restarted server reuses it).
+    pub port: Option<u16>,
+    /// Fixed identity (a restarted server keeps its node id).
+    pub secret_key: Option<SecretKey>,
+    /// Panes that exist from the start, with their initial log.
+    pub panes: Vec<(Uuid, Vec<u8>)>,
+    /// Run the server on its own 2-thread runtime, so [`TestServer::freeze`]
+    /// can stop it without closing anything.
+    pub own_runtime: bool,
 }
 
 impl Default for TestServerConfig {
@@ -61,6 +70,10 @@ impl Default for TestServerConfig {
             pair_secret: None,
             echo_input: true,
             chunk: 64 * 1024,
+            port: None,
+            secret_key: None,
+            panes: Vec::new(),
+            own_runtime: false,
         }
     }
 }
@@ -79,7 +92,7 @@ struct PaneLog {
 struct State {
     cfg: TestServerConfig,
     /// Last input `seq` written per `client_id` (exactly-once input).
-    input_seq: Mutex<HashMap<Uuid, u64>>,
+    input_seq: Mutex<HashMap<(Uuid, Uuid), u64>>,
     dedup_drops: AtomicU64,
     hold_acks: AtomicBool,
     server_id: Uuid,
@@ -102,6 +115,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// A running test server.
 pub struct TestServer {
+    rt: Option<Arc<tokio::runtime::Runtime>>,
     endpoint: Endpoint,
     state: Arc<State>,
     addr: EndpointAddr,
@@ -111,17 +125,34 @@ pub struct TestServer {
 impl TestServer {
     /// Bind on localhost without relay and start accepting.
     pub async fn start(cfg: TestServerConfig) -> TestServer {
-        Self::start_inner(cfg, SecretKey::generate(&mut rand::rng())).await
+        let key = cfg.secret_key.clone().unwrap_or_else(|| SecretKey::generate(&mut rand::rng()));
+        if !cfg.own_runtime {
+            return Self::start_inner(cfg, key).await;
+        }
+        let rt = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("server runtime"),
+        );
+        let mut server = rt.spawn(Self::start_inner(cfg, key)).await.expect("server start");
+        server.rt = Some(rt);
+        server
     }
 
     async fn start_inner(cfg: TestServerConfig, key: SecretKey) -> TestServer {
-        let endpoint = Endpoint::empty_builder()
+        let mut builder = Endpoint::empty_builder()
             .secret_key(key)
             .alpns(vec![ALPN_RPC.to_vec(), ALPN_PAIR.to_vec()])
-            .transport_config(transport_config())
-            .bind()
-            .await
-            .expect("bind test server");
+            .transport_config(transport_config());
+        if let Some(port) = cfg.port {
+            builder = builder
+                .clear_ip_transports()
+                .bind_addr(format!("127.0.0.1:{port}").as_str())
+                .expect("valid bind address");
+        }
+        let endpoint = builder.bind().await.expect("bind test server");
         let port = endpoint
             .bound_sockets()
             .into_iter()
@@ -148,8 +179,21 @@ impl TestServer {
             paused: AtomicBool::new(false),
             cfg,
         });
+        for (id, log) in &state.cfg.panes {
+            lock(&state.panes).insert(
+                *id,
+                PaneLog {
+                    first: 0,
+                    data: log.clone(),
+                    notify: Arc::new(Notify::new()),
+                    rows: 24,
+                    cols: 80,
+                    input: Vec::new(),
+                },
+            );
+        }
         let accept = tokio::spawn(accept_loop(endpoint.clone(), state.clone()));
-        TestServer { endpoint, state, addr, accept }
+        TestServer { rt: None, endpoint, state, addr, accept }
     }
 
     /// Address clients dial (direct localhost address, no relay).
@@ -287,6 +331,21 @@ impl TestServer {
         self.accept.abort();
         self.drop_connections();
         self.endpoint.close().await;
+        if let Some(rt) = self.rt {
+            if let Ok(rt) = Arc::try_unwrap(rt) {
+                rt.shutdown_background();
+            }
+        }
+    }
+
+    /// Stop the server for `duration` without closing anything: it neither
+    /// reads nor writes a packet, like a dead network or a hung process. Needs
+    /// `own_runtime`. Queued packets are handled when it thaws.
+    pub fn freeze(&self, duration: Duration) {
+        let rt = self.rt.as_ref().expect("freeze needs TestServerConfig::own_runtime");
+        for _ in 0..2 {
+            rt.spawn(async move { std::thread::sleep(duration) });
+        }
     }
 }
 
@@ -402,13 +461,14 @@ async fn handle_rpc(conn: Connection, state: Arc<State>) {
         let conn = conn.clone();
         let state = state.clone();
         let client_id = hello.client_id;
+        let input_epoch = hello.input_epoch;
         tasks.spawn(async move {
             let Ok(mut input) = conn.accept_uni().await else { return };
             while let Ok(Some((pane, seq, bytes))) = read_input_frame(&mut input).await {
                 // Dedup and write under one lock, so a resend on a new
                 // connection can never overtake or double a frame.
                 let mut seqs = lock(&state.input_seq);
-                let last = seqs.entry(client_id).or_insert(0);
+                let last = seqs.entry((client_id, input_epoch)).or_insert(0);
                 if seq <= *last {
                     state.dedup_drops.fetch_add(1, Ordering::SeqCst);
                     continue;
@@ -441,7 +501,10 @@ async fn handle_rpc(conn: Connection, state: Arc<State>) {
                     let input_acked = if state.hold_acks.load(Ordering::SeqCst) {
                         0
                     } else {
-                        lock(&state.input_seq).get(&hello.client_id).copied().unwrap_or(0)
+                        lock(&state.input_seq)
+                            .get(&(hello.client_id, hello.input_epoch))
+                            .copied()
+                            .unwrap_or(0)
                     };
                     let _ = out_tx.send(ControlMsg::Pong { nonce, input_acked });
                     continue;
@@ -598,110 +661,5 @@ async fn pane_stream(
             }
             Some(_) => wake.await,
         }
-    }
-}
-
-/// A UDP forwarder between clients and a server, used to blackhole a
-/// connection silently (no packets, no QUIC close), as a dead network would.
-pub struct UdpProxy {
-    addr: std::net::SocketAddr,
-    inner: Arc<ProxyInner>,
-    task: tokio::task::JoinHandle<()>,
-}
-
-struct ProxyInner {
-    upstream: Mutex<std::net::SocketAddr>,
-    /// `Some(next_upstream)` while blackholed.
-    blackhole: Mutex<Option<std::net::SocketAddr>>,
-    /// When the last blackhole was lifted by a redial.
-    lifted_at: Mutex<Option<std::time::Instant>>,
-}
-
-impl UdpProxy {
-    /// Listen on a free localhost port and forward to `upstream`.
-    pub async fn start(upstream: std::net::SocketAddr) -> UdpProxy {
-        let front = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.expect("bind proxy"));
-        let addr = front.local_addr().expect("proxy addr");
-        let inner = Arc::new(ProxyInner {
-            upstream: Mutex::new(upstream),
-            blackhole: Mutex::new(None),
-            lifted_at: Mutex::new(None),
-        });
-        let task = tokio::spawn(proxy_loop(front, inner.clone()));
-        UdpProxy { addr, inner, task }
-    }
-
-    /// Address clients dial, for a server with node id `id`.
-    pub fn addr_for(&self, id: EndpointId) -> EndpointAddr {
-        EndpointAddr::new(id).with_ip_addr(self.addr)
-    }
-
-    /// Drop every packet in both directions, silently. The network comes
-    /// back at the first new QUIC Initial packet from a client (a redial),
-    /// and from then on traffic goes to `next_upstream`.
-    pub fn blackhole_until_redial(&self, next_upstream: std::net::SocketAddr) {
-        *lock(&self.inner.blackhole) = Some(next_upstream);
-    }
-
-    /// When the blackhole was lifted by a redial: the moment the client gave
-    /// up on the dead connection.
-    pub fn lifted_at(&self) -> Option<std::time::Instant> {
-        *lock(&self.inner.lifted_at)
-    }
-
-    /// `true` once the blackhole was lifted by a redial.
-    pub fn blackhole_lifted(&self) -> bool {
-        lock(&self.inner.blackhole).is_none()
-    }
-
-    /// Stop the proxy.
-    pub fn stop(self) {
-        self.task.abort();
-    }
-}
-
-async fn proxy_loop(front: Arc<tokio::net::UdpSocket>, inner: Arc<ProxyInner>) {
-    use tokio::net::UdpSocket;
-    // client address -> socket towards the upstream, plus its reply pump
-    let mut flows: HashMap<std::net::SocketAddr, (Arc<UdpSocket>, tokio::task::JoinHandle<()>)> =
-        HashMap::new();
-    let mut buf = vec![0u8; 65536];
-    loop {
-        let Ok((n, client)) = front.recv_from(&mut buf).await else { return };
-        // QUIC long header and a padded datagram: a new connection's Initial.
-        let initial = n >= 1200 && buf[0] & 0x80 != 0;
-        {
-            let mut bh = lock(&inner.blackhole);
-            match *bh {
-                Some(next) if initial => {
-                    *bh = None;
-                    *lock(&inner.lifted_at) = Some(std::time::Instant::now());
-                    *lock(&inner.upstream) = next;
-                    for (_, (_, pump)) in flows.drain() {
-                        pump.abort();
-                    }
-                }
-                Some(_) => continue, // blackholed: drop
-                None => {}
-            }
-        }
-        if let std::collections::hash_map::Entry::Vacant(slot) = flows.entry(client) {
-            let up = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind upstream"));
-            let target = *lock(&inner.upstream);
-            let (front, inner2, up2) = (front.clone(), inner.clone(), up.clone());
-            let pump = tokio::spawn(async move {
-                let mut b = vec![0u8; 65536];
-                while let Ok((m, from)) = up2.recv_from(&mut b).await {
-                    if from != target || lock(&inner2.blackhole).is_some() {
-                        continue;
-                    }
-                    let _ = front.send_to(&b[..m], client).await;
-                }
-            });
-            slot.insert((up, pump));
-        }
-        let (up, _) = &flows[&client];
-        let target = *lock(&inner.upstream);
-        let _ = up.send_to(&buf[..n], target).await;
     }
 }

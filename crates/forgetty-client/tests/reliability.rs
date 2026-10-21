@@ -5,9 +5,10 @@
 use std::time::{Duration, Instant};
 
 use forgetty_client::proto::ClientKind;
-use forgetty_client::test_server::{TestServer, TestServerConfig, UdpProxy};
+use forgetty_client::test_server::{TestServer, TestServerConfig};
 use forgetty_client::{
-    Client, ClientHandle, ClientInfo, EndpointAddr, PaneItem, PaneStream, SecretKey,
+    AddrCache, AddrCacheSnapshot, CachedAddr, Client, ClientHandle, ClientInfo, ClientOptions,
+    EndpointAddr, PaneItem, PaneStream, SecretKey,
 };
 use uuid::Uuid;
 
@@ -49,15 +50,27 @@ async fn read_bytes(stream: &mut PaneStream, total: usize, timeout: Duration) ->
     out
 }
 
-/// Wait until `server` completed a handshake after `before` and the client is
-/// Connected again. Returns when that happened. (State changes are not
-/// watched: a fast redial would coalesce `Reconnecting` away.)
-async fn wait_reconnected(h: &ClientHandle, server: &TestServer, before: u64) -> Instant {
-    wait_until("reconnect", Duration::from_secs(10), || {
-        server.handshakes() > before && h.state().is_connected()
-    })
-    .await;
-    Instant::now()
+/// Poll until the client left `Connected` (detect) and is `Connected` again
+/// after a new handshake (recover). Returns both instants.
+async fn observe_reconnect(
+    h: &ClientHandle,
+    server: &TestServer,
+    before: u64,
+) -> (Instant, Instant) {
+    let mut detect = None;
+    let t0 = Instant::now();
+    loop {
+        if detect.is_none() && !h.state().is_connected() {
+            detect = Some(Instant::now());
+        }
+        if let Some(d) = detect {
+            if server.handshakes() > before && h.state().is_connected() {
+                return (d, Instant::now());
+            }
+        }
+        assert!(t0.elapsed() < Duration::from_secs(12), "no reconnect, state {:?}", h.state());
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
 }
 
 async fn wait_until(what: &str, limit: Duration, mut f: impl FnMut() -> bool) {
@@ -70,10 +83,9 @@ async fn wait_until(what: &str, limit: Duration, mut f: impl FnMut() -> bool) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn silent_blackhole_is_detected_and_resumed_on_a_fresh_server() {
-    let a = TestServer::start(TestServerConfig::default()).await;
-    let proxy = UdpProxy::start(a.udp_addr()).await;
+    let a = TestServer::start(TestServerConfig { own_runtime: true, ..Default::default() }).await;
     let pane = a.add_pane();
-    let h = connect_to(proxy.addr_for(a.addr().id)).await;
+    let h = connect_to(a.addr()).await;
     let mut stream = h.attach_pane(pane).await.unwrap();
     // Output keeps flowing, and the client keeps typing, across the blackhole.
     const CHUNKS: u64 = 2400;
@@ -93,32 +105,25 @@ async fn silent_blackhole_is_detected_and_resumed_on_a_fresh_server() {
             tokio::time::sleep(Duration::from_millis(6)).await;
         }
     };
-    let blackhole_at = std::sync::Mutex::new(None);
-    let handshakes_before = std::sync::atomic::AtomicU64::new(0);
-    let reconnected_at = std::sync::Mutex::new(None);
+    // The server hangs for 3.4 s: it reads and writes nothing, closes nothing.
+    let outage = std::sync::Mutex::new(None);
     let saboteur = async {
         tokio::time::sleep(Duration::from_millis(1000)).await;
         let before = a.handshakes();
-        handshakes_before.store(before, std::sync::atomic::Ordering::SeqCst);
-        *blackhole_at.lock().unwrap() = Some(Instant::now());
-        proxy.blackhole_until_redial(a.udp_addr());
-        let back = wait_reconnected(&h, &a, before).await;
-        *reconnected_at.lock().unwrap() = Some(back);
+        let t0 = Instant::now();
+        a.freeze(Duration::from_millis(3400));
+        let (detected, recovered) = observe_reconnect(&h, &a, before).await;
+        *outage.lock().unwrap() = Some((detected - t0, recovered - t0));
     };
     let total_expected = (CHUNKS * CHUNK) as usize + 800 * 4;
     let consumer = read_bytes(&mut stream, total_expected, Duration::from_secs(30));
     let ((), (), (), got) = tokio::join!(producer, typist, saboteur, consumer);
 
-    let t0 = blackhole_at.lock().unwrap().unwrap();
-    let detect = proxy.lifted_at().expect("client never redialed").duration_since(t0);
-    let recover = reconnected_at.lock().unwrap().unwrap().duration_since(t0);
-    println!(
-        "blackhole: detected after {detect:?}, Connected again on fresh server after {recover:?}"
-    );
-    assert!(proxy.blackhole_lifted(), "client never redialed");
+    let (detect, recover) = outage.lock().unwrap().unwrap();
+    println!("hung server: dead link detected after {detect:?}, Connected again after {recover:?}");
     assert!(
-        detect >= Duration::from_millis(1500) && detect <= Duration::from_millis(3600),
-        "{detect:?}"
+        detect >= Duration::from_millis(1500) && detect <= Duration::from_millis(3300),
+        "detected after {detect:?}"
     );
     assert!(recover < Duration::from_secs(4), "recovered after {recover:?}");
 
@@ -132,7 +137,6 @@ async fn silent_blackhole_is_detected_and_resumed_on_a_fresh_server() {
     wait_until("input acks", Duration::from_secs(5), || h.unacked_input_bytes() == 0).await;
 
     h.close().await;
-    proxy.stop();
     a.shutdown().await;
 }
 
@@ -211,9 +215,8 @@ async fn resend_after_dedup_hit_is_dropped() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn network_changed_redials_after_one_second_without_pong() {
-    let a = TestServer::start(TestServerConfig::default()).await;
-    let proxy = UdpProxy::start(a.udp_addr()).await;
-    let h = connect_to(proxy.addr_for(a.addr().id)).await;
+    let a = TestServer::start(TestServerConfig { own_runtime: true, ..Default::default() }).await;
+    let h = connect_to(a.addr()).await;
 
     // Healthy network: the probe is answered, no redial.
     let before = a.handshakes();
@@ -223,17 +226,185 @@ async fn network_changed_redials_after_one_second_without_pong() {
     assert!(h.state().is_connected());
     assert_eq!(a.handshakes(), before);
 
-    // Dead network: no Pong in 1 s, redial (well before the 3 s liveness).
+    // The server hangs for 2 s: shorter than the 3 s liveness limit, so only
+    // network_changed can end this connection early. No Pong in 1 s: redial.
     let before = a.handshakes();
-    proxy.blackhole_until_redial(a.udp_addr());
     let t0 = Instant::now();
+    a.freeze(Duration::from_secs(2));
     h.network_changed().await;
-    let recover = wait_reconnected(&h, &a, before).await.duration_since(t0);
-    println!("network_changed on a dead link: Connected again after {recover:?}");
-    assert!(recover >= Duration::from_millis(900), "gave up too early: {recover:?}");
-    assert!(recover < Duration::from_millis(2000), "recovered after {recover:?}");
-    assert!(proxy.blackhole_lifted());
+    let (detected, recovered) = observe_reconnect(&h, &a, before).await;
+    let (detect, recover) = (detected - t0, recovered - t0);
+    println!(
+        "network_changed on a hung link: gave up after {detect:?}, Connected after {recover:?}"
+    );
+    assert!(detect >= Duration::from_millis(900), "gave up too early: {detect:?}");
+    assert!(detect < Duration::from_millis(1500), "gave up after {detect:?}");
+    assert!(recover < Duration::from_millis(3500), "recovered after {recover:?}");
     h.close().await;
-    proxy.stop();
     a.shutdown().await;
+}
+
+#[tokio::test]
+async fn restarted_client_with_same_client_id_gets_its_first_input_written() {
+    let server = TestServer::start(TestServerConfig::default()).await;
+    let pane = server.add_pane();
+    let client_id = Uuid::new_v4();
+    let key = SecretKey::generate(&mut rand::rng());
+
+    // Process 1: seq 1..=3, acked.
+    let info = ClientInfo::new(client_id, ClientKind::Cli, "app", "1");
+    let h1 = Client::connect(server.addr(), key.clone(), info.clone()).await.unwrap();
+    for piece in [&b"one "[..], b"two ", b"three "] {
+        h1.send_input(pane, piece).await.unwrap();
+    }
+    wait_until("acks", Duration::from_secs(4), || h1.unacked_input_bytes() == 0).await;
+    h1.close().await;
+    assert_eq!(server.received_input(pane), b"one two three ");
+
+    // Process 2: same client_id, new input_epoch, seq starts at 1 again.
+    let h2 = Client::connect(server.addr(), key, info).await.unwrap();
+    h2.send_input(pane, b"after restart").await.unwrap();
+    wait_until("restarted input", Duration::from_secs(5), || {
+        server.received_input(pane).len() == 14 + 13
+    })
+    .await;
+    assert_eq!(server.received_input(pane), b"one two three after restart");
+    assert_eq!(server.dedup_drops(), 0, "a new epoch must not be deduped");
+    h2.close().await;
+    server.shutdown().await;
+}
+
+#[test]
+fn addr_cache_snapshot_round_trips_through_serde() {
+    let key = SecretKey::generate(&mut rand::rng());
+    let addr: std::net::SocketAddr = "203.0.113.7:47297".parse().unwrap();
+    let cache = AddrCache::new();
+    cache.insert(key.public(), addr);
+    let json = serde_json::to_string(&cache.snapshot()).unwrap();
+    let back: AddrCacheSnapshot = serde_json::from_str(&json).unwrap();
+    assert_eq!(AddrCache::from_snapshot(&back).get(key.public()), Some(addr));
+    // A bad entry is skipped, not fatal.
+    let junk = AddrCacheSnapshot { entries: vec![CachedAddr { node_id: "garbage".into(), addr }] };
+    assert!(AddrCache::from_snapshot(&junk).snapshot().entries.is_empty());
+}
+
+/// A server restart is the most common reconnect: same identity, same fixed
+/// port, new process, byte logs restored. The client only knows the node id
+/// and the cached direct address (no relay, no other address).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn server_restart_on_the_cached_port_reconnects_every_time() {
+    const RESTARTS: usize = 10;
+    let key = SecretKey::generate(&mut rand::rng());
+    let pane = Uuid::new_v4();
+    let cfg = |port: Option<u16>, log: Vec<u8>| TestServerConfig {
+        port,
+        secret_key: Some(key.clone()),
+        panes: vec![(pane, log)],
+        ..Default::default()
+    };
+    let first = TestServer::start(cfg(None, Vec::new())).await;
+    let port = first.udp_addr().port();
+
+    // What the app would have persisted from an earlier run.
+    let cache = AddrCache::from_snapshot(&AddrCacheSnapshot {
+        entries: vec![CachedAddr { node_id: key.public().to_string(), addr: first.udp_addr() }],
+    });
+    let opts = ClientOptions { addr_cache: cache, ..Default::default() };
+    let info = ClientInfo::new(Uuid::new_v4(), ClientKind::Cli, "restart", "0");
+    let h = Client::connect_with(
+        EndpointAddr::new(key.public()), // node id only: nothing but the cache to dial
+        SecretKey::generate(&mut rand::rng()),
+        info,
+        opts,
+    )
+    .await
+    .expect("first connect through the cached address");
+    let mut stream = h.attach_pane(pane).await.unwrap();
+
+    let current = std::sync::Arc::new(tokio::sync::Mutex::new(Some(first)));
+    let produced = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let producer = {
+        let (current, produced, stop) = (current.clone(), produced.clone(), stop.clone());
+        tokio::spawn(async move {
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                if let Some(s) = current.lock().await.as_ref() {
+                    let from = produced.load(std::sync::atomic::Ordering::SeqCst);
+                    let bytes: Vec<u8> = (from..from + 50).map(pattern).collect();
+                    s.append(pane, &bytes);
+                    produced.fetch_add(50, std::sync::atomic::Ordering::SeqCst);
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+    };
+    let (total_tx, mut total_rx) = tokio::sync::watch::channel(None::<u64>);
+    let consumer = tokio::spawn(async move {
+        let mut next = 0u64;
+        let mut resets = 0;
+        let mut data = Vec::new();
+        loop {
+            if total_rx.borrow().is_some_and(|t| next >= t) {
+                return (data, resets);
+            }
+            tokio::select! {
+                item = stream.next() => match item {
+                    Some(PaneItem::Reset { .. }) => resets += 1,
+                    Some(PaneItem::Data { offset, bytes }) => {
+                        assert_eq!(offset, next, "gap or duplicate at {offset}");
+                        next += bytes.len() as u64;
+                        data.extend_from_slice(&bytes);
+                    }
+                    Some(PaneItem::Ended) | None => panic!("pane ended"),
+                },
+                _ = total_rx.changed() => {}
+            }
+        }
+    });
+
+    let mut reconnect_times = Vec::new();
+    for round in 0..RESTARTS {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut guard = current.lock().await;
+        let old = guard.take().unwrap();
+        let log = old.log(pane);
+        old.shutdown().await; // process A dies
+        tokio::time::sleep(Duration::from_millis(50 + (round as u64 * 37) % 250)).await;
+        let started = Instant::now();
+        let fresh = TestServer::start(cfg(Some(port), log)).await; // process B, same port
+        *guard = Some(fresh);
+        drop(guard);
+        loop {
+            let up = current.lock().await.as_ref().map(|s| s.handshakes()).unwrap_or(0);
+            if up > 0 && h.state().is_connected() {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(15),
+                "round {round}: not reconnected {:?} after B came up",
+                started.elapsed()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        reconnect_times.push(started.elapsed());
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    producer.await.unwrap();
+    let total = produced.load(std::sync::atomic::Ordering::SeqCst);
+    total_tx.send(Some(total)).unwrap();
+    let (have, resets) = tokio::time::timeout(Duration::from_secs(10), consumer)
+        .await
+        .expect("client never caught up")
+        .unwrap();
+    println!("server restarts: reconnect after B up: {reconnect_times:?}");
+    assert_eq!(resets, 1, "restarts with restored logs must resume, not reset");
+    let want: Vec<u8> = (0..total).map(pattern).collect();
+    assert_eq!(have.len(), want.len(), "client missed bytes");
+    assert!(have == want, "bytes differ");
+    h.close().await;
+    let last = current.lock().await.take();
+    if let Some(s) = last {
+        s.shutdown().await;
+    }
 }

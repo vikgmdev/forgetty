@@ -149,7 +149,7 @@ async fn proto_mismatch_server_side_error_frame() {
     let ep = iroh::Endpoint::empty_builder().secret_key(new_identity()).bind().await.unwrap();
     let conn = ep.connect(server.addr(), forgetty_client::proto::ALPN_RPC).await.unwrap();
     let (mut send, mut recv) = conn.open_bi().await.unwrap();
-    let mut hello = Hello::new(Uuid::new_v4(), ClientKind::Cli, "raw", "0", vec![]);
+    let mut hello = Hello::new(Uuid::new_v4(), Uuid::new_v4(), ClientKind::Cli, "raw", "0", vec![]);
     hello.proto_major = 3;
     write_msg(&mut send, &hello).await.unwrap();
     let reply: HandshakeReply = forgetty_client::proto::read_msg(&mut recv).await.unwrap().unwrap();

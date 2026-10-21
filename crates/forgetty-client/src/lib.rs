@@ -11,6 +11,7 @@
 //! - [`pair`] pairs a new device from a QR payload.
 //! - [`ConnectionState`] is observable through [`ClientHandle::watch_state`].
 
+mod addr_cache;
 mod client;
 mod config;
 mod error;
@@ -20,6 +21,7 @@ mod state;
 #[cfg(feature = "test-util")]
 pub mod test_server;
 
+pub use addr_cache::{AddrCache, AddrCacheSnapshot, CachedAddr};
 pub use client::{Client, ClientHandle, EventItem, EventStream, PaneItem, PaneStream};
 pub use config::{transport_config, ClientInfo, ClientOptions, RelayChoice};
 pub use error::ClientError;

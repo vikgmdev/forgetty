@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use crate::addr_cache::AddrCache;
 use forgetty_proto::{cap, ClientKind, IDLE_TIMEOUT_SECS, KEEP_ALIVE_SECS};
 use iroh::endpoint::{IdleTimeout, QuicTransportConfig};
 use iroh::{EndpointAddr, RelayMode, RelayUrl};
@@ -91,6 +92,8 @@ pub struct ClientOptions {
     pub pane_buffer: usize,
     /// Events buffered per `EventStream` before it reports a resync.
     pub event_buffer: usize,
+    /// Last direct address per server. Dialed first on every connect.
+    pub addr_cache: AddrCache,
 }
 
 impl Default for ClientOptions {
@@ -101,6 +104,7 @@ impl Default for ClientOptions {
             dial_timeout: Duration::from_secs(5),
             pane_buffer: 64,
             event_buffer: 1024,
+            addr_cache: AddrCache::default(),
         }
     }
 }

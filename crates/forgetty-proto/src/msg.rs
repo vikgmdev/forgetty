@@ -69,6 +69,10 @@ pub struct Hello {
     /// Persisted by the client, stable across reconnects.
     #[serde(with = "uuid_str")]
     pub client_id: Uuid,
+    /// Random per client process start. Input `seq` restarts at 1 for every
+    /// new epoch; the server dedups on `(client_id, input_epoch)`.
+    #[serde(with = "uuid_str")]
+    pub input_epoch: Uuid,
     /// Kind of client.
     pub client_kind: ClientKind,
     /// Device name shown in `client ls`.
@@ -83,6 +87,7 @@ impl Hello {
     /// A `Hello` for this crate's protocol version.
     pub fn new(
         client_id: Uuid,
+        input_epoch: Uuid,
         client_kind: ClientKind,
         client_name: impl Into<String>,
         client_version: impl Into<String>,
@@ -92,6 +97,7 @@ impl Hello {
             proto_major: PROTO_MAJOR,
             proto_minor: PROTO_MINOR,
             client_id,
+            input_epoch,
             client_kind,
             client_name: client_name.into(),
             client_version: client_version.into(),

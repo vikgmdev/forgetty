@@ -24,3 +24,4 @@ rand = { workspace = true }
 # Turns on the `test-util` feature for the integration tests.
 forgetty-client = { path = ".", features = ["test-util"] }
 tracing-subscriber = { workspace = true }
+serde_json = { workspace = true }

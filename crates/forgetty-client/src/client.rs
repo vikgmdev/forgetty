@@ -35,6 +35,7 @@ use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use crate::addr_cache::AddrCache;
 use crate::config::{transport_config, ClientInfo, ClientOptions};
 use crate::error::ClientError;
 use crate::state::ConnectionState;
@@ -228,6 +229,8 @@ pub(crate) struct Shared {
     /// Wakes the liveness task for an immediate `Ping`.
     ping_now: Notify,
     next_nonce: AtomicU64,
+    /// Random per `spawn`: the `Hello.input_epoch`.
+    input_epoch: Uuid,
 }
 
 // ---------------------------------------------------------------------------
@@ -319,6 +322,7 @@ impl Client {
             kick: Notify::new(),
             ping_now: Notify::new(),
             next_nonce: AtomicU64::new(1),
+            input_epoch: Uuid::new_v4(),
         });
         let supervisor = tokio::spawn(supervise(shared.clone()));
         Ok(ClientHandle {
@@ -368,6 +372,12 @@ impl ClientHandle {
     /// `true` when both sides listed the capability in the current session.
     pub fn has_capability(&self, name: &str) -> bool {
         self.shared().link_tx.borrow().as_ref().is_some_and(|l| l.has_cap(name))
+    }
+
+    /// The direct addresses learned so far. Persist the snapshot and pass it
+    /// back in `ClientOptions::addr_cache` on the next start.
+    pub fn addr_cache(&self) -> AddrCache {
+        self.shared().opts.addr_cache.clone()
     }
 
     /// The local iroh endpoint id (the device id the server registers).
@@ -861,9 +871,15 @@ async fn supervise(shared: Arc<Shared>) {
 }
 
 async fn dial(shared: &Shared) -> Result<Established, DialError> {
+    // Cached direct address first; the relay in the server address runs in
+    // parallel (iroh tries every address).
+    let mut target = shared.server.clone();
+    if let Some(ip) = shared.opts.addr_cache.get(target.id) {
+        target = target.with_ip_addr(ip);
+    }
     let conn = shared
         .endpoint
-        .connect(shared.server.clone(), ALPN_RPC)
+        .connect(target, ALPN_RPC)
         .await
         .map_err(|e| DialError::Transient(e.to_string()))?;
     match handshake(shared, &conn).await {
@@ -898,6 +914,7 @@ async fn handshake(
     let info = &shared.info;
     let hello = Hello::new(
         info.client_id,
+        shared.input_epoch,
         info.kind,
         info.name.clone(),
         info.version.clone(),
@@ -1179,6 +1196,7 @@ async fn liveness(shared: Arc<Shared>, link: Arc<Link>) -> TaskEnd {
                 return TaskEnd::Lost("control closed".into());
             }
             last_ping = Some(Instant::now());
+            note_direct_addr(&shared, &link.conn);
         }
         if lock(&link.last_pong).elapsed() > dead_after {
             return TaskEnd::Lost("no Pong in 3 s".into());
@@ -1187,6 +1205,17 @@ async fn liveness(shared: Arc<Shared>, link: Arc<Link>) -> TaskEnd {
             _ = tokio::time::sleep(Duration::from_millis(100)) => {}
             _ = shared.ping_now.notified() => { last_ping = None; }
         }
+    }
+}
+
+/// Remember the direct address of the selected path, for the next dial.
+fn note_direct_addr(shared: &Shared, conn: &Connection) {
+    let direct = conn.to_info().paths().into_iter().find_map(|p| match p.remote_addr() {
+        iroh::TransportAddr::Ip(addr) if p.is_selected() => Some(*addr),
+        _ => None,
+    });
+    if let Some(addr) = direct {
+        shared.opts.addr_cache.insert(shared.server.id, addr);
     }
 }
 
