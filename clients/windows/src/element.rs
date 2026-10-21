@@ -77,6 +77,7 @@ impl Element for TerminalElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Prepaint {
+        crate::smoke::trace("e", 0);
         let focused = self.view.read(cx).focus.is_focused(window);
         let active = window.is_window_active();
         self.view.update(cx, |v, _cx| {
@@ -109,6 +110,7 @@ impl Element for TerminalElement {
             } else {
                 None
             };
+            crate::smoke::trace("E", v.rows_reshaped_last);
             Prepaint { rows: v.rows_shaped.clone(), cursor, selection: v.selection_spans() }
         })
     }
@@ -140,6 +142,7 @@ impl Element for TerminalElement {
             )
         };
 
+        crate::smoke::trace("g", 0);
         // IME: register the handler so TSF/IMM talks to the view.
         window.handle_input(&focus, ElementInputHandler::new(bounds, self.view.clone()), cx);
 
@@ -207,6 +210,7 @@ impl Element for TerminalElement {
             let _ = line.paint(origin, lh, TextAlign::Left, None, window, cx);
         }
 
+        crate::smoke::trace("G", 0);
         self.view.update(cx, |v, _cx| v.after_paint(window));
     }
 }

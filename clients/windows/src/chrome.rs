@@ -613,7 +613,7 @@ impl Render for AppShell {
         }
         body = body.child(self.render_panes(cx));
 
-        div()
+        let out = div()
             .size_full()
             .flex()
             .flex_col()
@@ -641,6 +641,8 @@ impl Render for AppShell {
                 .absolute()
                 .w(px(1.0))
                 .h(px(1.0)),
-            )
+            );
+        crate::smoke::trace("r", 0);
+        out
     }
 }
