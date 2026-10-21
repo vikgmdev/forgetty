@@ -335,8 +335,16 @@ impl SyncEndpoint {
     ///
     /// Must be called before dropping the endpoint to avoid the iroh error:
     /// `ERROR Endpoint dropped without calling Endpoint::close. Aborting ungracefully.`
+    ///
+    /// Bounded to 2 s: a peer that gave up mid-handshake leaves a half-open
+    /// connection that would otherwise hold up shutdown.
     pub async fn close(&self) {
-        self.endpoint.close().await;
+        if tokio::time::timeout(std::time::Duration::from_secs(2), self.endpoint.close())
+            .await
+            .is_err()
+        {
+            tracing::warn!("iroh endpoint close timed out after 2 s");
+        }
     }
 
     /// Run the accept loop.
