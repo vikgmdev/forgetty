@@ -393,7 +393,6 @@ impl AppShell {
                 .w(px(r.w))
                 .h(px(r.h))
                 .when(!(self.smoke_mode && crate::smoke::ab() == 3), |d| d.overflow_hidden())
-                .bg(hsla(th.bg))
                 .on_mouse_down(MouseButton::Left, cx.listener(move |s, _e, w, cx| s.focus_pane(pane, w, cx)));
             d = match self.views.get(&pane) {
                 Some(v) => d.child(v.clone()),
@@ -617,7 +616,6 @@ impl Render for AppShell {
             .size_full()
             .flex()
             .flex_col()
-            .when(!self.mica, |d| d.bg(hsla(th.bg)))
             .font_family("Segoe UI")
             .text_color(hsla(th.fg))
             .track_focus(&self.focus)
