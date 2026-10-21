@@ -1,0 +1,18 @@
+[package]
+name = "forgetty-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Forgetty protocol v2 wire types, MessagePack codec and frame I/O (no iroh dependency)"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+rmp-serde = "1"
+rmpv = { version = "1", features = ["with-serde"] }
+tokio = { version = "1", default-features = false, features = ["io-util"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "io-util"] }

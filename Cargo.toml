@@ -12,6 +12,8 @@ members = [
     "crates/forgetty-session",
     "crates/forgetty-sync",
     "crates/forgetty-server",
+    "crates/forgetty-proto",
+    "crates/forgetty-client",
 ]
 
 # V3 (AD-022): the GTK client is paused. Default members exclude the root
@@ -29,6 +31,8 @@ default-members = [
     "crates/forgetty-session",
     "crates/forgetty-sync",
     "crates/forgetty-server",
+    "crates/forgetty-proto",
+    "crates/forgetty-client",
 ]
 
 [workspace.package]
