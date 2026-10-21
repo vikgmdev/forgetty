@@ -11,7 +11,7 @@ pub mod terminal;
 
 pub use screen::{Cell, CellAttributes, Color, Screen};
 pub use selection::{Selection, SelectionMode};
-pub use terminal::{Terminal, TerminalEvent};
+pub use terminal::{Terminal, TerminalEvent, DEFAULT_MAX_SCROLLBACK_BYTES};
 
 /// A placeholder ANSI palette entry: fully opaque black.
 ///
