@@ -169,9 +169,10 @@ go through the relay.
 
 ## Notes
 
-- With a custom relay the endpoint still publishes its id and relay URL to the
-  iroh discovery service (the `N0` preset). Pairing and reconnecting do not
-  depend on that: the URL comes from the QR payload.
+- With your own relay the server turns the n0 discovery service off: it
+  publishes nothing to n0 and asks n0 nothing. The apps never use it. They dial
+  the relays in the pairing payload and the cached direct address. Add
+  `--n0-discovery` to `forgetty server run` to keep it on.
 - Limit who may relay with `access = { allowlist = ["<endpoint id>"] }` in the
   relay config: the server id (`forgetty server status`) and each phone.
 - `iroh-relay --dev` runs plain HTTP on port 3340 for tests. Never expose it.

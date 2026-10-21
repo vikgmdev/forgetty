@@ -286,6 +286,8 @@ impl Client {
         info: ClientInfo,
         opts: ClientOptions,
     ) -> Result<ClientHandle, ClientError> {
+        // An empty builder: no n0 discovery service. The client dials with the
+        // relay URLs of the pairing payload and the cached direct address.
         let endpoint = opts
             .shape(Endpoint::empty_builder())
             .secret_key(identity)

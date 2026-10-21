@@ -217,6 +217,21 @@ PIDS+=($!)
 for _ in $(seq 1 60); do grep -q "home is now relay" "$WORK/server2.log" 2>/dev/null && break; sleep 0.5; done
 grep -q "relays: $RELAY_URL/" "$WORK/server2.log" && ok "server log: relays: $RELAY_URL/" || bad "server did not log the relay"
 grep -q "home is now relay $RELAY_URL/" "$WORK/server2.log" && ok "server connected to the relay (home relay)" || bad "server has no home relay"
+grep -q "n0 discovery: off" "$WORK/server2.log" && ok "server log: n0 discovery: off (relay configured)" || bad "n0 discovery not off with a relay configured"
+# n0 discovery really is off: no TCP connection from the server to anything but localhost.
+SPID="$(pgrep -f "[s]2 server run --port 0 --relay-url" | head -1)"
+sleep 4
+EXTERN="$(ss -tn state established -p 2>/dev/null | grep "pid=$SPID," | awk '{print $4}' | grep -vE '^(127\.0\.0\.1|\[::1\]):' || true)"
+[ -n "$SPID" ] && [ -z "$EXTERN" ] && ok "server (n0 off) holds no connection outside localhost" || bad "server talks to the outside with n0 off: $EXTERN"
+# control: --n0-discovery brings it back (soft check: needs internet access).
+( cd "$WORK/elsewhere" && exec "$TB_BIN" --state-dir "$WORK/s5" server run --port 0 --relay-url "$RELAY_URL" --n0-discovery > "$WORK/server5.log" 2>&1 ) &
+P5=$!; PIDS+=($P5)
+for _ in $(seq 1 40); do grep -q "n0 discovery:" "$WORK/server5.log" 2>/dev/null && break; sleep 0.25; done
+grep -q "n0 discovery: on" "$WORK/server5.log" && ok "--n0-discovery turns it back on" || bad "--n0-discovery had no effect"
+sleep 6
+EXTERN5="$(ss -tn state established -p 2>/dev/null | grep "pid=$P5," | awk '{print $4}' | grep -vE '^(127\.0\.0\.1|\[::1\]):' || true)"
+[ -n "$EXTERN5" ] && ok "control: with --n0-discovery the server connects out ($EXTERN5)" || echo "  note  control: no outside connection seen (offline machine?)"
+kill "$P5" 2>/dev/null
 
 ( cd "$WORK/elsewhere" && exec "$TB_BIN" --state-dir "$STATE2" pair > "$WORK/pair.log" 2>&1 ) &
 PIDS+=($!)
@@ -231,7 +246,7 @@ echo "  building the forgetty-client probe"
 PROBE="$ROOT/target/debug/examples/relay_probe"
 OUTP="$("$PROBE" --payload "$PAYLOAD" --dir "$WORK/probe" --timeout 30 2>&1)"
 echo "    | $OUTP"
-has "$OUTP" 'RELAY_PROBE_OK .*direct_paths=disabled' && ok "forgetty-client paired and connected through the relay, direct paths disabled (no UDP socket)" || bad "relay probe failed"
+has "$OUTP" 'RELAY_PROBE_OK .*direct_paths=disabled' && ok "client with only the pairing payload paired and connected through the relay; n0 off on both sides, direct paths disabled" || bad "relay probe failed"
 for _ in $(seq 1 20); do grep -aq '^paired:' "$WORK/pair.log" && break; sleep 0.25; done
 grep -aq '^paired: relay-probe' "$WORK/pair.log" && ok "server confirms the paired device" || bad "server did not report the pairing"
 

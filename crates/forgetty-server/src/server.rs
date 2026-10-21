@@ -56,6 +56,13 @@ pub struct RunArgs {
     /// The pairing QR carries these URLs.
     #[arg(long = "relay-url", value_name = "URL")]
     pub relay_url: Vec<String>,
+
+    /// Keep the n0 DNS discovery service on although relays are configured.
+    /// With `--relay-url` / `relay_urls` it is off by default: the server then
+    /// publishes nothing to n0, and the apps use the relays in the pairing
+    /// payload plus the cached direct address.
+    #[arg(long)]
+    pub n0_discovery: bool,
 }
 
 /// Parse relay URLs from `--relay-url` or the config file.
@@ -648,6 +655,9 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
     // Relays: --relay-url replaces the config file list. None: iroh defaults.
     let relay_source = if args.relay_url.is_empty() { &config.relay_urls } else { &args.relay_url };
     let relay_urls = parse_relay_urls(relay_source)?;
+    // Own relays: no n0 discovery unless asked for (--n0-discovery).
+    let n0_discovery = relay_urls.is_empty() || args.n0_discovery;
+    info!("n0 discovery: {}", if n0_discovery { "on" } else { "off" });
     if relay_urls.is_empty() {
         info!("relays: iroh defaults");
     } else {
@@ -659,6 +669,7 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
     let sync_endpoint = match SyncEndpoint::builder(secret_key)
         .bind_port(port)
         .relay_urls(relay_urls)
+        .n0_discovery(n0_discovery)
         .transport_config(quic_config())
         .register_alpn(forgetty_proto::ALPN_RPC, rpc_v2.alpn_handler())
         .register_alpn(
