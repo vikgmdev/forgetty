@@ -688,7 +688,14 @@ fn handle_request(
                 conn.clone(),
                 state.clone(),
                 notify,
-                PaneStreamHeader { pane_id: p.pane_id, start_offset: start, reset, rows, cols },
+                PaneStreamHeader {
+                    pane_id: p.pane_id,
+                    start_offset: start,
+                    reset,
+                    rows,
+                    cols,
+                    snapshot_len: 0,
+                },
             ));
             streams.insert(p.pane_id, handle);
             to_value(&OkResult { ok: true }).map_err(bad)

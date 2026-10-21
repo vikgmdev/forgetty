@@ -1,0 +1,93 @@
+name: Server release
+
+# Runs only when a tag server-v* is pushed (for example server-v0.1.0-beta).
+# It builds the deb, the rpm and the tarballs for x86_64 and aarch64 (glibc
+# 2.28, see docs/packaging.md), writes SHA256SUMS and attaches all of it to the
+# GitHub release of the tag.
+on:
+  push:
+    tags:
+      - "server-v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Check the tag matches the crate version
+        run: |
+          version="$(sed -n '/^\[workspace.package\]/,/^\[/{s/^version *= *"\(.*\)"/\1/p}' Cargo.toml | head -1)"
+          if [ "${GITHUB_REF_NAME}" != "server-v${version}" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match version ${version} in Cargo.toml" >&2
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Install packaging tools
+        run: cargo install --locked cargo-zigbuild cargo-deb cargo-generate-rpm
+
+      - name: Build deb, rpm and tarball
+        run: scripts/build-server-dist.sh --target ${{ matrix.target }} --out dist-out/${{ matrix.target }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: server-${{ matrix.target }}
+          path: |
+            dist-out/${{ matrix.target }}/*.deb
+            dist-out/${{ matrix.target }}/*.rpm
+            dist-out/${{ matrix.target }}/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          pattern: server-*
+          merge-multiple: true
+
+      - name: SHA256SUMS
+        working-directory: assets
+        run: sha256sum -- *.deb *.rpm *.tar.gz > SHA256SUMS && cat SHA256SUMS
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prerelease=""
+          case "${GITHUB_REF_NAME}" in *-*) prerelease="--prerelease" ;; esac
+          gh release create "${GITHUB_REF_NAME}" assets/* $prerelease \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "Forgetty server ${GITHUB_REF_NAME#server-v}" \
+            --generate-notes

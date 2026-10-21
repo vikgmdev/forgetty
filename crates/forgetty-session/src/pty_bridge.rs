@@ -2,20 +2,25 @@
 //!
 //! Mirrors the pattern in `forgetty-gtk/src/pty_bridge.rs` but lives in the
 //! platform-agnostic session crate. The reader thread runs independently and
-//! sends `Vec<u8>` chunks to the session manager via a tokio unbounded channel.
+//! sends `Vec<u8>` chunks to the session manager via a bounded tokio channel.
+//! When the channel is full the thread stops reading, the PTY buffer fills and
+//! the program blocks on write (flow control, nothing is dropped).
 
 use std::io::Read as IoRead;
 use std::path::Path;
 use std::thread;
 
 use forgetty_pty::{PtyProcess, PtySize};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tracing::{debug, warn};
+
+/// Chunks (up to 64 KiB each) the reader thread may queue before it blocks.
+const PTY_QUEUE_CHUNKS: usize = 16;
 
 /// PTY-owning bridge with a background reader thread.
 ///
 /// Owns the `PtyProcess` (for writing and resizing on the caller's thread) and
-/// the `tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>` that delivers output from
+/// the `tokio::sync::mpsc::Receiver<Vec<u8>>` that delivers output from
 /// the reader thread. The receiver is stored as `Option` so callers can `take()`
 /// it exactly once to hand ownership to a dedicated drain task (V2-001).
 pub struct PtyBridge {
@@ -25,7 +30,7 @@ pub struct PtyBridge {
     ///
     /// `Some` on construction; taken to `None` by `SessionManager::take_pane_output_rx`
     /// when the per-pane drain task is spawned.
-    pub pty_rx: Option<UnboundedReceiver<Vec<u8>>>,
+    pub pty_rx: Option<Receiver<Vec<u8>>>,
 }
 
 impl PtyBridge {
@@ -65,7 +70,7 @@ impl PtyBridge {
             .take_reader()
             .ok_or_else(|| "PTY reader should be available on fresh PtyProcess".to_string())?;
 
-        let (tx, rx) = unbounded_channel::<Vec<u8>>();
+        let (tx, rx) = channel::<Vec<u8>>(PTY_QUEUE_CHUNKS);
 
         thread::Builder::new()
             .name("session-pty-reader".to_string())
@@ -79,7 +84,7 @@ impl PtyBridge {
 }
 
 /// Background thread that reads from the PTY and sends data via the channel.
-fn pty_reader_thread(mut reader: Box<dyn IoRead + Send>, tx: UnboundedSender<Vec<u8>>) {
+fn pty_reader_thread(mut reader: Box<dyn IoRead + Send>, tx: Sender<Vec<u8>>) {
     let mut buf = [0u8; 65536];
     loop {
         match reader.read(&mut buf) {
@@ -88,7 +93,7 @@ fn pty_reader_thread(mut reader: Box<dyn IoRead + Send>, tx: UnboundedSender<Vec
                 break;
             }
             Ok(n) => {
-                if tx.send(buf[..n].to_vec()).is_err() {
+                if tx.blocking_send(buf[..n].to_vec()).is_err() {
                     debug!("session PTY reader: channel closed, stopping");
                     break;
                 }

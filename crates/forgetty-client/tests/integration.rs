@@ -93,6 +93,7 @@ async fn read_exact_bytes(
                     next += bytes.len() as u64;
                     out.extend_from_slice(&bytes);
                 }
+                PaneItem::Snapshot { .. } => panic!("unexpected snapshot catch-up"),
                 PaneItem::Ended => panic!("unexpected Ended"),
             }
         }
@@ -351,6 +352,7 @@ async fn offset_older_than_log_gives_reset() {
                     next += bytes.len() as u64;
                     got.extend_from_slice(&bytes);
                 }
+                PaneItem::Snapshot { .. } => panic!("unexpected snapshot catch-up"),
                 PaneItem::Ended => panic!("ended"),
             }
         }

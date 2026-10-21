@@ -309,6 +309,12 @@ pub struct PaneStreamHeader {
     pub rows: u16,
     /// PTY columns now.
     pub cols: u16,
+    /// Snapshot catch-up (AD-023, capability `snapshot_catchup`): the first
+    /// `snapshot_len` bytes after the header are a VT snapshot of the screen,
+    /// not pane bytes. They do not advance the pane offset. The pane bytes
+    /// that follow start at `start_offset`. `0` for a normal stream.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub snapshot_len: u32,
 }
 
 /// Client to server, first frame on a `forgetty/pair/2` bi stream (section 7).
@@ -340,8 +346,12 @@ pub struct QrPayload {
     pub node_id: String,
     /// Host name of the machine.
     pub machine: String,
-    /// Relay URL.
+    /// Relay URL. With several relays this is the first one.
     pub relay: String,
+    /// All relay URLs of the server, in order, including `relay`. Absent in
+    /// payloads from servers with one relay and in older payloads.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relays: Vec<String>,
     /// One-time secret, 16 random bytes as base32.
     pub secret: String,
 }
@@ -364,6 +374,18 @@ impl QrPayload {
     /// Compact JSON for the QR code.
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).expect("QrPayload serializes")
+    }
+
+    /// Every relay URL in the payload: `relays`, or `relay` when `relays` is
+    /// empty. Empty strings and duplicates are dropped.
+    pub fn relay_urls(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for r in std::iter::once(&self.relay).chain(self.relays.iter()) {
+            if !r.is_empty() && !out.contains(r) {
+                out.push(r.clone());
+            }
+        }
+        out
     }
 
     /// Parse and check the version.
@@ -449,4 +471,8 @@ pub fn from_value<T: DeserializeOwned>(v: Value) -> Result<T, FrameError> {
 pub fn to_value<T: Serialize>(v: &T) -> Result<Value, FrameError> {
     let bytes = rmp_serde::to_vec_named(v).map_err(|e| FrameError::Encode(e.to_string()))?;
     rmp_serde::from_slice(&bytes).map_err(|e| FrameError::Decode(e.to_string()))
+}
+
+fn is_zero_u32(n: &u32) -> bool {
+    *n == 0
 }

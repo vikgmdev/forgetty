@@ -1035,3 +1035,71 @@ extern "C" {
     /// the bracketed-paste end sequence.
     pub fn ghostty_paste_is_safe(data: *const u8, len: usize) -> bool;
 }
+
+// ---------------------------------------------------------------------------
+// Formatter (ghostty/vt/formatter.h)
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+pub struct GhosttyFormatterOpaque {
+    _private: [u8; 0],
+}
+pub type GhosttyFormatter = *mut GhosttyFormatterOpaque;
+
+/// `GHOSTTY_FORMATTER_FORMAT_VT`.
+pub const GHOSTTY_FORMATTER_FORMAT_VT: i32 = 1;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GhosttyFormatterScreenExtra {
+    pub size: usize,
+    pub cursor: bool,
+    pub style: bool,
+    pub hyperlink: bool,
+    pub protection: bool,
+    pub kitty_keyboard: bool,
+    pub charsets: bool,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GhosttyFormatterTerminalExtra {
+    pub size: usize,
+    pub palette: bool,
+    pub modes: bool,
+    pub scrolling_region: bool,
+    pub tabstops: bool,
+    pub pwd: bool,
+    pub keyboard: bool,
+    pub screen: GhosttyFormatterScreenExtra,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GhosttyFormatterTerminalOptions {
+    pub size: usize,
+    pub emit: i32,
+    pub unwrap: bool,
+    pub trim: bool,
+    pub extra: GhosttyFormatterTerminalExtra,
+}
+
+extern "C" {
+    pub fn ghostty_formatter_terminal_new(
+        allocator: *const c_void,
+        formatter: *mut GhosttyFormatter,
+        terminal: GhosttyTerminal,
+        options: GhosttyFormatterTerminalOptions,
+    ) -> GhosttyResult;
+
+    pub fn ghostty_formatter_format_alloc(
+        formatter: GhosttyFormatter,
+        allocator: *const c_void,
+        out_ptr: *mut *mut u8,
+        out_len: *mut usize,
+    ) -> GhosttyResult;
+
+    pub fn ghostty_formatter_free(formatter: GhosttyFormatter);
+
+    pub fn ghostty_free(allocator: *const c_void, ptr: *mut u8, len: usize);
+}

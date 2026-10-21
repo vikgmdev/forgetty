@@ -12,6 +12,10 @@ use forgetty_client::{Client, ClientHandle, ClientInfo, PaneItem, PaneStream, Se
 use uuid::Uuid;
 
 async fn connect(server: &TestServer) -> ClientHandle {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
     let key = SecretKey::generate(&mut rand::rng());
     let info = ClientInfo::new(Uuid::new_v4(), ClientKind::Cli, "latency", "0.0.0");
     tokio::time::timeout(Duration::from_secs(10), Client::connect(server.addr(), key, info))
@@ -26,36 +30,53 @@ async fn connect(server: &TestServer) -> ClientHandle {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn keystroke_not_delayed_by_concurrent_50mb_output_burst() {
     const BURST: usize = 50 * 1024 * 1024;
-    // The byte log keeps the whole burst, so a reader that is a little behind
-    // is served from the log and never has to reset.
-    let server = TestServer::start_with(TestServerConfig::default(), Some(256)).await;
+    // Default byte log (8 MiB ring, 10 MiB file). A reader that is behind is
+    // served from the log by offset and never has to reset.
+    let server = TestServer::start(TestServerConfig::default()).await;
     let echo_pane = server.add_pane();
     let burst_pane = server.add_burst_pane(BURST);
     let h = connect(&server).await;
     let mut echo = h.attach_pane(echo_pane).await.unwrap();
     let mut burst = h.attach_pane(burst_pane).await.unwrap();
 
-    // Drain the burst pane like a UI would.
+    // Drain the burst pane like a UI would. A client that falls more than half
+    // the ring behind gets a snapshot instead of the bytes it missed (AD-023),
+    // so the test asks for the end offset, not for every byte.
     let drain = tokio::spawn(async move {
-        let mut total = 0usize;
-        let mut resets = 0usize;
+        let (mut end, mut resets, mut snapshots, mut data) = (0u64, 0usize, 0usize, 0u64);
+        let mut corrupt = false;
         let mut done_at = None;
         let deadline = Instant::now() + Duration::from_secs(60);
-        while total < BURST && Instant::now() < deadline {
+        while end < BURST as u64 && Instant::now() < deadline {
             match tokio::time::timeout(Duration::from_secs(5), burst.next()).await {
-                Ok(Some(PaneItem::Data { bytes, .. })) => total += bytes.len(),
-                Ok(Some(PaneItem::Reset { .. })) => resets += 1,
+                Ok(Some(PaneItem::Data { offset, bytes })) => {
+                    if !bytes
+                        .iter()
+                        .enumerate()
+                        .all(|(i, b)| *b == common::burst_byte(offset + i as u64))
+                    {
+                        corrupt = true;
+                    }
+                    data += bytes.len() as u64;
+                    end = end.max(offset + bytes.len() as u64);
+                }
+                // The first attach opens with a reset at the first offset.
+                Ok(Some(PaneItem::Reset { .. })) => resets += usize::from(end > 0),
+                Ok(Some(PaneItem::Snapshot { offset, .. })) => {
+                    snapshots += 1;
+                    end = end.max(offset);
+                }
                 Ok(Some(PaneItem::Ended)) | Ok(None) => break,
                 Err(_) => break,
             }
         }
-        if total < BURST {
-            eprintln!("burst drain stopped at {total} of {BURST} bytes, {resets} resets");
+        if end < BURST as u64 {
+            eprintln!("burst drain stopped at offset {end} of {BURST}, {resets} resets");
         }
-        if total >= BURST {
+        if end >= BURST as u64 {
             done_at = Some(Instant::now());
         }
-        (total, done_at)
+        (end, data, resets, snapshots, corrupt, done_at)
     });
 
     // One 1 KiB keystroke frame, echoed on its own pane stream.
@@ -68,7 +89,7 @@ async fn keystroke_not_delayed_by_concurrent_50mb_output_burst() {
         while got < 1024 {
             match echo.next().await.unwrap() {
                 PaneItem::Data { bytes, .. } => got += bytes.len(),
-                PaneItem::Reset { .. } => {}
+                PaneItem::Reset { .. } | PaneItem::Snapshot { .. } => {}
                 PaneItem::Ended => panic!("echo ended"),
             }
         }
@@ -91,15 +112,18 @@ async fn keystroke_not_delayed_by_concurrent_50mb_output_burst() {
         n += 1;
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
-    let (total, done_at) = drain.await.unwrap();
-    assert_eq!(total, BURST, "burst bytes lost");
+    let (end, data, resets, snapshots, corrupt, done_at) = drain.await.unwrap();
+    assert_eq!(end, BURST as u64, "the client never reached the end of the burst");
+    assert_eq!(resets, snapshots, "every reset after the first attach carries a snapshot");
+    assert!(!corrupt, "burst bytes differ from the pattern");
     let burst_time = done_at.unwrap().duration_since(burst_start);
 
     during.sort();
     idle.sort();
     let p = |v: &Vec<Duration>, q: f64| v[((v.len() as f64 * q) as usize).min(v.len() - 1)];
     println!(
-        "burst of 50 MiB took {burst_time:?}; input RTT idle p50={:?} p95={:?}; \
+        "burst of 50 MiB took {burst_time:?} ({data} bytes live, {snapshots} snapshot catch-ups); \
+         input RTT idle p50={:?} p95={:?}; \
          during burst n={} p50={:?} p95={:?} max={:?}",
         p(&idle, 0.5),
         p(&idle, 0.95),

@@ -3,7 +3,20 @@
 `forgetty` is one binary. It is the durable per-user terminal server (AD-017)
 and its CLI. It needs no GTK, no display server and no `pkg-config`.
 
-## Build and install
+## Install
+
+From a release (no Rust needed): see `packaging.md`.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/vikgmdev/forgetty/main/scripts/install.sh | bash
+```
+
+It installs the deb or rpm on a machine that has dpkg or rpm, or the tarball
+into `~/.local` with `--tarball` (no root). The packages put the user unit at
+`/usr/lib/systemd/user/forgetty-server.service` and print the two commands
+that enable it. Nothing runs as root.
+
+## Build and install from source
 
 ```sh
 cargo build --release -p forgetty-server
@@ -89,8 +102,40 @@ stream) and the `qa_*` test methods are not reachable over v2.
 - Every pane has an absolute byte offset. The ring and the disk log know the
   offset of their first byte. The first offset is stored in
   `logs/<pane>.log.off`, so a client resumes at its offset after a server
-  restart. A client that is behind the ring reads from the disk log. A client
-  behind the whole log is reset to the first available byte.
+  restart. The ring is 8 MiB per pane (`byte_log_ring_kb`).
+- The byte log never drops output. Only the server's own disk writer can hold a
+  PTY: when more than 4 MiB wait for it, the server stops reading that PTY
+  until the queue drains (event driven, no polling). No client stream, however
+  slow, ever holds a program (AD-023). Output that arrives after shutdown
+  starts is not logged, so the log on disk is exactly what clients saw.
+- A slow client catches up by snapshot (capability `snapshot_catchup`). A pane
+  stream that falls more than half the ring behind, or makes no write progress
+  for 2 s, is reset (stream code 0x13) and replaced by a new stream with
+  `reset: true`, `start_offset` at the head and `snapshot_len` bytes of VT
+  first: the screen, cursor, modes (alternate screen, bracketed paste, mouse,
+  keypad, cursor visibility), scroll region, tab stops, pwd, keyboard modes and
+  title, built from the ring on the cold path. Then live bytes follow. The
+  snapshot has no scrollback and no palette (cells keep palette indexes), and
+  only covers what the ring holds. A client without the capability keeps the
+  old rule: it reads from the disk log, and a client behind the whole log is
+  reset with code 0x11 and resumes with a reset.
+- Snapshot work is bounded. All streams share one build per pane (a build in
+  progress is joined, a result younger than 250 ms is reused), at most 2
+  builds run at once server wide, and a build nobody waits for any more is
+  dropped before it starts. One stream takes a catch-up at most once per
+  second, and waits twice as long each time it needs another soon, up to 10 s.
+  A pane has one live stream per connection: a new `attach_pane` replaces the
+  old one. An attach counts as a request in flight until its stream is open.
+- A stopping server answers `Hello` with `Error { code: "server_stopping" }`.
+  The client retries it with its normal backoff.
+- Each v2 connection queues at most 8 MiB of Control messages (counted in
+  bytes, with a fixed cost per message). It holds at most one `LayoutChanged`,
+  and a newer one replaces the pending one in place. Past the budget the
+  connection stops reading requests (QUIC flow control pushes back on the
+  client) and pulls no more events. After 10 s with no completed write the
+  server closes the connection with code 0x12. At most 64 requests run per
+  connection, one more closes it with code 0x14. Responses and Pongs are never
+  dropped, and nothing spawns a task per queued message.
 - Input is deduplicated by `(client_id, input_epoch)` and `seq`. The server
   writes the dedup table to `input_seq.json` in the state dir when it stops
   and loads it at start, so a frame the client did not see acked is not written
@@ -122,17 +167,45 @@ forgetty events [--json] [-p PANE]  stream events until Ctrl+C
 forgetty run [--keep] [--wait] [--cwd DIR] -- CMD...   new pane running CMD;
                                     --wait blocks and exits with CMD's exit code
 forgetty wait -p PANE [--status done|waiting|...] [--timeout S]
+forgetty label [-t pane|tab|workspace] TARGET LABEL   set a label ("" clears it)
+forgetty api list [-q] [--json] [--markdown]   every method (--markdown prints docs/socket-api.md)
+forgetty api describe METHOD [--json]   description, JSON Schemas, examples
+forgetty api call [-p PANE] METHOD [JSON | @file | -]   call a method, print the result
+forgetty skill setup [--agent claude|codex] [--scope user|project]
+forgetty skill status | show | remove
 forgetty client ls [--json]
 forgetty pair                       QR + payload, waits 60 s for one device
 forgetty devices [--json]
 forgetty revoke ID
 ```
 
-`PANE` is a full id or a unique id suffix of 4+ characters.
+A pane, tab or workspace target is, in this order: a full id, a label
+(case-insensitive), a 1-based position, or a unique id suffix of 4+ characters.
+Several labels or suffixes that match give exit 3 and the list of matches.
 
-Exit codes: 0 ok, 1 failed, 2 bad command line, 3 target not found or
-ambiguous, 4 server unreachable, 5 `wait` timed out (`run --wait` returns the
-command's own exit code instead).
+Exit codes: 0 ok, 1 failed, 2 bad command line (`api call`: `bad_request`),
+3 target not found or ambiguous (`api call`: `method_not_found`), 4 server
+unreachable, 5 `wait` timed out (`run --wait` returns the command's own exit
+code instead).
+
+### Self-describing API, labels and the agent skill
+
+Every socket method has a description, input and output JSON Schemas and
+examples in one table (`crates/forgetty-socket/src/api.rs`). The local socket
+and protocol v2 serve the same table: `api.list` and `api.describe { method }`.
+`docs/socket-api.md` is generated from it (`forgetty api list --markdown`), and
+a test fails when the file is stale (`UPDATE_DOCS=1 cargo test -p forgetty-socket
+socket_api_doc` rewrites it).
+
+`set_label { target: "workspace"|"tab"|"pane", id, label }` names a target. The
+server saves labels in the session file, sends a layout change to subscribers
+(`LayoutChanged` over v2, `label_changed` on the local socket) and restores them
+after a restart. A workspace label is its name. `rename_workspace` stays for old
+clients.
+
+`forgetty skill setup` writes a short skill file (`~/.claude/skills/forgetty/SKILL.md`,
+or `.claude/skills/forgetty/` with `--scope project`; Codex: `~/.codex/skills/forgetty/`
+and `.agents/skills/forgetty/`) that teaches a coding agent the commands above.
 
 `wait` without `--status` waits for the pane process to exit. Statuses are
 `idle`, `working`, `waiting`, `done`, `failed`.
@@ -191,7 +264,20 @@ scripts/p4a_gate.sh  # OSC scanner, status, capture, agent CLI
 scripts/p1qa_gate.sh # revoke, concurrent start, SIGTERM, kill -9, session file, modes
 scripts/p2b_gate.sh  # protocol v2: client suites against the real server, exactly-once,
                      # size policy, 50 MiB burst latency, restart reconnect, port 47297
+scripts/p2c_gate.sh  # AD-023: slow client never slows a program, snapshot catch-up,
+                     # request flood, stalled Control reader, then all earlier gates
+scripts/p5_gate.sh   # api list/describe/call, labels (resolve, persist), doc staleness,
+                     # skill files, v2 api and labels, agent test with `claude -p`
 ```
 
 Both run a server in a temp state dir as the current user and need outbound
 internet for iroh relay and discovery.
+
+## Relay
+
+Without a relay of your own the server uses iroh's default relays. To use your
+own `iroh-relay`, pass `--relay-url URL` (repeatable) to `forgetty server run`
+or set `relay_urls = ["https://relay.example.org"]` in
+`~/.config/forgetty/config.toml`. The pairing QR then carries the relay and the
+apps use it. How to run `iroh-relay` as a user service, with HTTPS and the
+firewall ports: `relay.md`.

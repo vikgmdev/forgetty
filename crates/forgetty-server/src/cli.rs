@@ -149,7 +149,13 @@ impl Client {
         Ok((client, info))
     }
 
-    fn call(&mut self, method: &str, params: Value) -> Result<Value> {
+    /// Send one request and return the raw JSON-RPC reply: the result, or the
+    /// error code and message.
+    fn call_rpc(
+        &mut self,
+        method: &str,
+        params: Value,
+    ) -> Result<std::result::Result<Value, (i64, String)>> {
         let id = self.next_id;
         self.next_id += 1;
         let req = json!({ "jsonrpc": "2.0", "method": method, "params": params, "id": id });
@@ -173,13 +179,20 @@ impl Client {
         if let Some(err) = resp.get("error") {
             let msg = err.get("message").and_then(Value::as_str).unwrap_or("unknown error");
             let code = err.get("code").and_then(Value::as_i64).unwrap_or(0);
-            return Err(if code == SERVER_BUSY {
+            return Ok(Err((code, msg.to_string())));
+        }
+        Ok(Ok(resp.get("result").cloned().unwrap_or(Value::Null)))
+    }
+
+    fn call(&mut self, method: &str, params: Value) -> Result<Value> {
+        match self.call_rpc(method, params)? {
+            Ok(v) => Ok(v),
+            Err((code, msg)) => Err(if code == SERVER_BUSY {
                 CliError::Failed(format!("server is busy: {msg}"))
             } else {
                 CliError::Failed(format!("{method}: {msg}"))
-            });
+            }),
         }
-        Ok(resp.get("result").cloned().unwrap_or(Value::Null))
     }
 }
 
@@ -236,47 +249,121 @@ fn forgetty_proto_major() -> u32 {
 // Target resolution
 // ---------------------------------------------------------------------------
 
-/// Resolve `target` against `ids`: a full id, or a unique suffix of 4+ chars.
-fn resolve_target(what: &str, target: &str, ids: &[String]) -> Result<String> {
-    let target = target.trim().to_ascii_lowercase();
-    if let Some(exact) = ids.iter().find(|id| id.to_ascii_lowercase() == target) {
-        return Ok(exact.clone());
+/// A thing a target can name: its id and its label (empty when none).
+struct Cand {
+    id: String,
+    label: String,
+}
+
+impl Cand {
+    fn show(&self) -> String {
+        if self.label.is_empty() {
+            self.id.clone()
+        } else {
+            format!("{} ({})", self.id, self.label)
+        }
     }
-    if target.len() < MIN_SUFFIX {
+}
+
+/// Resolve `target` against `cands`, in this order: a full id, a label
+/// (case-insensitive), a 1-based position, a unique id suffix of 4+ chars.
+/// Several labels or suffixes that match give exit 3 with the list.
+fn resolve_cands(what: &str, target: &str, cands: &[Cand]) -> Result<String> {
+    let target = target.trim();
+    let lower = target.to_ascii_lowercase();
+    if let Some(exact) = cands.iter().find(|c| c.id.to_ascii_lowercase() == lower) {
+        return Ok(exact.id.clone());
+    }
+    if !target.is_empty() {
+        let hits: Vec<&Cand> = cands
+            .iter()
+            .filter(|c| !c.label.is_empty() && c.label.to_ascii_lowercase() == lower)
+            .collect();
+        match hits.as_slice() {
+            [] => {}
+            [one] => return Ok(one.id.clone()),
+            many => {
+                return Err(CliError::NotFound(format!(
+                    "{what} label {target:?} is ambiguous ({} matches: {})",
+                    many.len(),
+                    many.iter().map(|c| c.show()).collect::<Vec<_>>().join(", ")
+                )))
+            }
+        }
+    }
+    if !target.is_empty() && target.bytes().all(|b| b.is_ascii_digit()) {
+        if let Ok(n) = target.parse::<usize>() {
+            if (1..=cands.len()).contains(&n) {
+                return Ok(cands[n - 1].id.clone());
+            }
+        }
+    }
+    if lower.len() < MIN_SUFFIX {
         return Err(CliError::Usage(format!(
-            "{what} target {target:?} is too short: give the full id or a suffix of {MIN_SUFFIX}+ characters"
+            "{what} target {target:?} is not an id, a label or a position. \
+             Give the full id, a label, a position or an id suffix of {MIN_SUFFIX}+ characters"
         )));
     }
-    let hits: Vec<&String> =
-        ids.iter().filter(|id| id.to_ascii_lowercase().ends_with(&target)).collect();
+    let hits: Vec<&Cand> =
+        cands.iter().filter(|c| c.id.to_ascii_lowercase().ends_with(&lower)).collect();
     match hits.as_slice() {
-        [one] => Ok((*one).clone()),
+        [one] => Ok(one.id.clone()),
         [] => Err(CliError::NotFound(format!("no {what} matches {target:?}"))),
         many => Err(CliError::NotFound(format!(
             "{what} target {target:?} is ambiguous ({} matches: {})",
             many.len(),
-            many.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+            many.iter().map(|c| c.show()).collect::<Vec<_>>().join(", ")
         ))),
     }
 }
 
-fn pane_ids(client: &mut Client) -> Result<Vec<String>> {
+/// Resolve against ids only (devices).
+fn resolve_target(what: &str, target: &str, ids: &[String]) -> Result<String> {
+    let cands: Vec<Cand> =
+        ids.iter().map(|id| Cand { id: id.clone(), label: String::new() }).collect();
+    resolve_cands(what, target, &cands)
+}
+
+fn pane_cands(client: &mut Client) -> Result<Vec<Cand>> {
     let tabs = client.call("list_tabs", Value::Null)?;
     Ok(tabs
         .get("tabs")
         .and_then(Value::as_array)
         .map(|a| {
             a.iter()
-                .filter_map(|t| t.get("pane_id").and_then(Value::as_str))
-                .map(String::from)
+                .filter_map(|t| {
+                    let id = t.get("pane_id").and_then(Value::as_str)?;
+                    let label = t.get("label").and_then(Value::as_str).unwrap_or("");
+                    Some(Cand { id: id.to_string(), label: label.to_string() })
+                })
                 .collect()
         })
         .unwrap_or_default())
 }
 
 fn resolve_pane(client: &mut Client, target: &str) -> Result<String> {
-    let ids = pane_ids(client)?;
-    resolve_target("pane", target, &ids)
+    let cands = pane_cands(client)?;
+    resolve_cands("pane", target, &cands)
+}
+
+/// Tabs of all workspaces in layout order, and the workspaces.
+fn layout_cands(client: &mut Client) -> Result<(Vec<Cand>, Vec<Cand>)> {
+    let layout = client.call("get_layout", Value::Null)?;
+    let mut tabs = Vec::new();
+    let mut workspaces = Vec::new();
+    for ws in layout.get("workspaces").and_then(Value::as_array).into_iter().flatten() {
+        if let Some(id) = ws.get("id").and_then(Value::as_str) {
+            let name = ws.get("name").and_then(Value::as_str).unwrap_or("");
+            workspaces.push(Cand { id: id.to_string(), label: name.to_string() });
+        }
+        for tab in ws.get("tabs").and_then(Value::as_array).into_iter().flatten() {
+            if let Some(id) = tab.get("id").and_then(Value::as_str) {
+                let label = tab.get("label").and_then(Value::as_str).unwrap_or("");
+                tabs.push(Cand { id: id.to_string(), label: label.to_string() });
+            }
+        }
+    }
+    Ok((tabs, workspaces))
 }
 
 // ---------------------------------------------------------------------------
@@ -435,11 +522,12 @@ pub fn ls(json_out: bool) -> Result<()> {
         println!("no panes");
         return Ok(());
     }
-    println!("{:<36}  {:>7}  {:>7}  {:<10}  CWD", "PANE", "PID", "SIZE", "STATE");
+    println!("{:<36}  {:<14}  {:>7}  {:>7}  {:<10}  CWD", "PANE", "LABEL", "PID", "SIZE", "STATE");
     for p in panes {
         println!(
-            "{:<36}  {:>7}  {:>7}  {:<10}  {}",
+            "{:<36}  {:<14}  {:>7}  {:>7}  {:<10}  {}",
             p.get("pane_id").and_then(Value::as_str).unwrap_or("?"),
+            printable(p.get("label").and_then(Value::as_str).unwrap_or("")),
             p.get("pid").and_then(Value::as_u64).unwrap_or(0),
             format!(
                 "{}x{}",
@@ -934,6 +1022,210 @@ pub fn wait(target: &str, status: Option<&str>, timeout: Option<f64>) -> Result<
     }
 }
 
+// ---------------------------------------------------------------------------
+// labels (P5)
+// ---------------------------------------------------------------------------
+
+/// What `forgetty label -t` names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum LabelKind {
+    Workspace,
+    Tab,
+    Pane,
+}
+
+impl LabelKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            LabelKind::Workspace => "workspace",
+            LabelKind::Tab => "tab",
+            LabelKind::Pane => "pane",
+        }
+    }
+}
+
+pub fn label(kind: LabelKind, target: &str, label: &str, json_out: bool) -> Result<()> {
+    let (mut client, _) = Client::connect()?;
+    let id = match kind {
+        LabelKind::Pane => resolve_pane(&mut client, target)?,
+        LabelKind::Tab => {
+            let (tabs, _) = layout_cands(&mut client)?;
+            resolve_cands("tab", target, &tabs)?
+        }
+        LabelKind::Workspace => {
+            let (_, workspaces) = layout_cands(&mut client)?;
+            resolve_cands("workspace", target, &workspaces)?
+        }
+    };
+    let result = match client
+        .call_rpc("set_label", json!({ "target": kind.as_str(), "id": id, "label": label }))?
+    {
+        Ok(v) => v,
+        // A bad label is a bad command line.
+        Err((code, msg)) if code == i64::from(forgetty_socket::protocol::INVALID_PARAMS) => {
+            return Err(CliError::Usage(format!("bad_request: {msg}")))
+        }
+        Err((_, msg)) => return Err(CliError::Failed(format!("set_label: {msg}"))),
+    };
+    if json_out {
+        println!(
+            "{}",
+            json!({ "target": kind.as_str(), "id": id, "label": label.trim(), "changed": result["changed"] })
+        );
+    } else if label.trim().is_empty() {
+        println!("cleared the label of {} {id}", kind.as_str());
+    } else {
+        println!("{} {id} is now {:?}", kind.as_str(), label.trim());
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// api list / describe / call (P5)
+// ---------------------------------------------------------------------------
+
+/// Name of a JSON-RPC error code, as the docs use it.
+fn rpc_error_name(code: i64) -> &'static str {
+    match code {
+        -32700 => "parse_error",
+        -32600 | -32602 => "bad_request",
+        -32601 => "method_not_found",
+        -32603 => "internal_error",
+        SERVER_BUSY => "server_busy",
+        _ => "error",
+    }
+}
+
+/// Exit code for a JSON-RPC error: `bad_request` is a usage error (2),
+/// `method_not_found` is not found (3), anything else is a failure (1).
+fn rpc_error(code: i64, msg: String) -> CliError {
+    let text = format!("{}: {msg}", rpc_error_name(code));
+    match code {
+        -32700 | -32600 | -32602 => CliError::Usage(text),
+        -32601 => CliError::NotFound(text),
+        _ => CliError::Failed(text),
+    }
+}
+
+pub fn api_list(quiet: bool, json_out: bool, markdown: bool) -> Result<()> {
+    if markdown {
+        // Needs no server: the table is compiled in.
+        print!("{}", forgetty_socket::apidoc::render());
+        return Ok(());
+    }
+    let (mut client, _) = Client::connect()?;
+    let result = match client.call_rpc("api.list", Value::Null)? {
+        Ok(v) => v,
+        Err((code, msg)) => return Err(rpc_error(code, msg)),
+    };
+    let empty = Vec::new();
+    let methods = result.get("methods").and_then(Value::as_array).unwrap_or(&empty);
+    if json_out {
+        println!("{}", serde_json::to_string_pretty(&result).unwrap_or_default());
+    } else if quiet {
+        for m in methods {
+            println!("{}", m.get("name").and_then(Value::as_str).unwrap_or("?"));
+        }
+    } else {
+        println!("{:<22}  {:<9}  {:<3}  SUMMARY", "METHOD", "KIND", "V2");
+        for m in methods {
+            println!(
+                "{:<22}  {:<9}  {:<3}  {}",
+                m.get("name").and_then(Value::as_str).unwrap_or("?"),
+                m.get("kind").and_then(Value::as_str).unwrap_or("?"),
+                if m.get("remote").and_then(Value::as_bool).unwrap_or(false) {
+                    "yes"
+                } else {
+                    "no"
+                },
+                m.get("summary").and_then(Value::as_str).unwrap_or("")
+            );
+        }
+    }
+    Ok(())
+}
+
+pub fn api_describe(method: &str, json_out: bool) -> Result<()> {
+    let (mut client, _) = Client::connect()?;
+    let d = match client.call_rpc("api.describe", json!({ "method": method }))? {
+        Ok(v) => v,
+        Err((code, msg)) => return Err(rpc_error(code, msg)),
+    };
+    if json_out {
+        println!("{}", serde_json::to_string_pretty(&d).unwrap_or_default());
+        return Ok(());
+    }
+    let text = |k: &str| d.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    let pretty = |k: &str| serde_json::to_string_pretty(&d[k]).unwrap_or_default();
+    println!("{}: {}", text("name"), text("summary"));
+    println!();
+    println!("{}", text("description"));
+    println!();
+    println!(
+        "kind: {}   protocol v2: {}",
+        text("kind"),
+        if d.get("remote").and_then(Value::as_bool).unwrap_or(false) { "yes" } else { "no" }
+    );
+    println!();
+    println!("params schema:\n{}", pretty("params_schema"));
+    println!();
+    println!("result schema:\n{}", pretty("result_schema"));
+    println!();
+    println!("request example:\n{}", pretty("request_example"));
+    println!();
+    println!("response example:\n{}", pretty("response_example"));
+    Ok(())
+}
+
+/// Read the params argument of `api call`: JSON text, `@file` or `-` (stdin).
+fn read_params(arg: Option<&str>) -> Result<Value> {
+    let text = match arg {
+        None => return Ok(Value::Null),
+        Some("-") => {
+            let mut buf = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
+                .map_err(|e| CliError::Usage(format!("bad_request: cannot read stdin: {e}")))?;
+            buf
+        }
+        Some(a) if a.starts_with('@') => std::fs::read_to_string(&a[1..])
+            .map_err(|e| CliError::Usage(format!("bad_request: cannot read {}: {e}", &a[1..])))?,
+        Some(a) => a.to_string(),
+    };
+    if text.trim().is_empty() {
+        return Ok(Value::Null);
+    }
+    serde_json::from_str(&text)
+        .map_err(|e| CliError::Usage(format!("bad_request: params are not valid JSON: {e}")))
+}
+
+pub fn api_call(pane: Option<&str>, method: &str, params: Option<&str>) -> Result<()> {
+    // Read the params before connecting, so a bad argument fails the same way
+    // with or without a server.
+    let mut params = read_params(params)?;
+    let (mut client, _) = Client::connect()?;
+    if let Some(target) = pane {
+        let id = resolve_pane(&mut client, target)?;
+        match &mut params {
+            Value::Null => params = json!({ "pane_id": id }),
+            Value::Object(map) => {
+                map.entry("pane_id").or_insert(json!(id));
+            }
+            _ => {
+                return Err(CliError::Usage(
+                    "bad_request: -p needs the params to be a JSON object".into(),
+                ))
+            }
+        }
+    }
+    match client.call_rpc(method, params)? {
+        Ok(v) => {
+            println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+            Ok(())
+        }
+        Err((code, msg)) => Err(rpc_error(code, msg)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -972,6 +1264,80 @@ mod tests {
     #[test]
     fn short_target_is_a_usage_error() {
         assert_eq!(resolve_target("pane", "999", &ids()).unwrap_err().code(), EXIT_USAGE);
+    }
+
+    fn cands() -> Vec<Cand> {
+        vec![
+            Cand { id: "28f3648d-d2c2-42d8-a9fa-3b14a1ea5999".into(), label: "Build".into() },
+            Cand { id: "8cbbc727-60cd-44c5-b9c8-077779315e2d".into(), label: "logs".into() },
+            Cand { id: "11111111-2222-3333-4444-5555a1ea5999".into(), label: "logs".into() },
+            Cand { id: "99999999-2222-3333-4444-5555aaaaaaaa".into(), label: "2".into() },
+        ]
+    }
+
+    #[test]
+    fn label_matches_case_insensitively() {
+        assert_eq!(resolve_cands("pane", "build", &cands()).unwrap(), cands()[0].id);
+        assert_eq!(resolve_cands("pane", "BUILD", &cands()).unwrap(), cands()[0].id);
+    }
+
+    #[test]
+    fn duplicate_label_is_ambiguous_with_a_list() {
+        let err = resolve_cands("pane", "logs", &cands()).unwrap_err();
+        assert_eq!(err.code(), EXIT_NOT_FOUND);
+        assert!(err.message().contains("ambiguous"));
+        assert!(err.message().contains(&cands()[1].id) && err.message().contains(&cands()[2].id));
+    }
+
+    #[test]
+    fn full_id_beats_label_beats_position_beats_suffix() {
+        let mut c = cands();
+        // A label equal to another item's full id: the id wins.
+        c[0].label = c[1].id.clone();
+        assert_eq!(resolve_cands("pane", &c[1].id, &c).unwrap(), c[1].id);
+        // A label "2" beats position 2.
+        assert_eq!(resolve_cands("pane", "2", &cands()).unwrap(), cands()[3].id);
+        // Position 1 (no label "1"), 1-based.
+        assert_eq!(resolve_cands("pane", "1", &cands()).unwrap(), cands()[0].id);
+        assert_eq!(resolve_cands("pane", "3", &cands()).unwrap(), cands()[2].id);
+        // A label that is also a suffix: label first.
+        let mut c = cands();
+        c[3].label = "315e2d".into();
+        assert_eq!(resolve_cands("pane", "315e2d", &c).unwrap(), c[3].id);
+        // No label: the suffix.
+        assert_eq!(resolve_cands("pane", "315e2d", &cands()).unwrap(), cands()[1].id);
+    }
+
+    #[test]
+    fn position_out_of_range_falls_through() {
+        // 5 is no position (4 items) and too short for a suffix.
+        assert_eq!(resolve_cands("pane", "5", &cands()).unwrap_err().code(), EXIT_USAGE);
+        // 5999 is no position, but it is a suffix shared by two ids.
+        assert_eq!(resolve_cands("pane", "5999", &cands()).unwrap_err().code(), EXIT_NOT_FOUND);
+    }
+
+    #[test]
+    fn rpc_errors_map_to_exit_codes() {
+        assert_eq!(rpc_error(-32602, "x".into()).code(), EXIT_USAGE);
+        assert_eq!(rpc_error(-32601, "x".into()).code(), EXIT_NOT_FOUND);
+        assert_eq!(rpc_error(-32603, "x".into()).code(), EXIT_FAILED);
+        assert!(rpc_error(-32602, "x".into()).message().starts_with("bad_request: "));
+        assert!(rpc_error(-32601, "x".into()).message().starts_with("method_not_found: "));
+    }
+
+    #[test]
+    fn api_call_params_come_from_text_file_or_nothing() {
+        assert_eq!(read_params(None).unwrap(), Value::Null);
+        assert_eq!(read_params(Some("{\"a\":1}")).unwrap(), json!({"a": 1}));
+        assert_eq!(read_params(Some("  ")).unwrap(), Value::Null);
+        assert_eq!(read_params(Some("{nope")).unwrap_err().code(), EXIT_USAGE);
+        let dir = std::env::temp_dir().join(format!("fgt-p5-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("p.json");
+        std::fs::write(&f, "{\"b\":2}").unwrap();
+        assert_eq!(read_params(Some(&format!("@{}", f.display()))).unwrap(), json!({"b": 2}));
+        assert_eq!(read_params(Some("@/nonexistent/x")).unwrap_err().code(), EXIT_USAGE);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

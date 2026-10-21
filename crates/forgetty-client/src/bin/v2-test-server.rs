@@ -56,8 +56,14 @@ async fn main() {
         ..Default::default()
     };
     let server = TestServer::start(cfg).await;
-    let qr =
-        QrPayload { v: QrPayload::VERSION, node_id: node_id.to_string(), machine, relay, secret };
+    let qr = QrPayload {
+        v: QrPayload::VERSION,
+        node_id: node_id.to_string(),
+        machine,
+        relay,
+        relays: Vec::new(),
+        secret,
+    };
     println!("NODE_ID={node_id}");
     println!("ADDR={}", server.udp_addr());
     println!("PANE={}", pane_id(1));

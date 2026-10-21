@@ -71,6 +71,12 @@ fn main() {
     if is_android {
         let zig_triple = android_zig_triple(&target_arch);
         cmd.arg(format!("-Dtarget={zig_triple}"));
+    } else if let Some(zig_triple) = linux_zig_target(&target_os, &target_arch) {
+        // Linux release builds (server packages): `FORGETTY_ZIG_TARGET`, for
+        // example `x86_64-linux-gnu.2.28`, pins the C library version the
+        // library needs. A cross-compile to another CPU gets a default.
+        println!("cargo:warning=zig target for libghostty-vt: {zig_triple}");
+        cmd.arg(format!("-Dtarget={zig_triple}"));
     }
 
     // Windows: always pass an explicit Zig target so the build is identical
@@ -171,6 +177,33 @@ fn main() {
     // Export the include path for bindgen or manual reference
     let include_dir = ghostty_dir.join("include");
     println!("cargo:include={}", include_dir.display());
+}
+
+/// Zig target for a Linux build that is not a plain native build.
+///
+/// `FORGETTY_ZIG_TARGET` wins. Without it, a build for another CPU than the
+/// host's uses glibc 2.28 of that CPU. A native build returns `None` (Zig
+/// builds for the host).
+fn linux_zig_target(target_os: &str, target_arch: &str) -> Option<String> {
+    println!("cargo:rerun-if-env-changed=FORGETTY_ZIG_TARGET");
+    if let Ok(t) = env::var("FORGETTY_ZIG_TARGET") {
+        if !t.is_empty() {
+            return Some(t);
+        }
+    }
+    if target_os != "linux" {
+        return None;
+    }
+    let host = env::var("HOST").unwrap_or_default();
+    let target = env::var("TARGET").unwrap_or_default();
+    if host == target {
+        return None;
+    }
+    let abi = if target.ends_with("musl") { "musl" } else { "gnu.2.28" };
+    match target_arch {
+        "x86_64" | "aarch64" => Some(format!("{target_arch}-linux-{abi}")),
+        _ => None,
+    }
 }
 
 /// Map a Rust target architecture name to the corresponding Zig Android target triple.

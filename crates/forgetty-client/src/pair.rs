@@ -17,23 +17,32 @@ pub struct PairedServer {
     pub addr: EndpointAddr,
     /// Host name from the QR payload.
     pub machine: String,
+    /// Relay URLs from the QR payload, in order. Store them per machine; build
+    /// the address again with [`server_addr`].
+    pub relays: Vec<String>,
 }
 
-/// Build the server address from a QR payload (node id plus relay URL).
-pub fn qr_to_addr(qr: &QrPayload) -> Result<EndpointAddr, ClientError> {
-    let id: EndpointId = qr
-        .node_id
+/// Build the server address from a node id and relay URLs.
+///
+/// An app stores `node_id` and the relay URLs of a paired machine
+/// ([`PairedServer::relays`]) and calls this on every start.
+pub fn server_addr(node_id: &str, relays: &[String]) -> Result<EndpointAddr, ClientError> {
+    let id: EndpointId = node_id
         .parse()
         .map_err(|e| ClientError::Invalid(format!("bad node_id in QR payload: {e}")))?;
     let mut addr = EndpointAddr::new(id);
-    if !qr.relay.is_empty() {
-        let relay: RelayUrl = qr
-            .relay
+    for url in relays.iter().filter(|r| !r.is_empty()) {
+        let relay: RelayUrl = url
             .parse()
             .map_err(|e| ClientError::Invalid(format!("bad relay in QR payload: {e}")))?;
         addr = addr.with_relay_url(relay);
     }
     Ok(addr)
+}
+
+/// Build the server address from a QR payload (node id plus all relay URLs).
+pub fn qr_to_addr(qr: &QrPayload) -> Result<EndpointAddr, ClientError> {
+    server_addr(&qr.node_id, &qr.relay_urls())
 }
 
 /// Pair this device with the server in a QR payload.
@@ -56,7 +65,7 @@ pub async fn pair(
         &ClientOptions::default(),
     )
     .await?;
-    Ok(PairedServer { addr, machine: qr.machine.clone() })
+    Ok(PairedServer { addr, machine: qr.machine.clone(), relays: qr.relay_urls() })
 }
 
 /// Pair with an explicit address and secret (tests, manual entry).
@@ -68,7 +77,8 @@ pub async fn pair_with_addr(
     client_kind: ClientKind,
     opts: &ClientOptions,
 ) -> Result<(), ClientError> {
-    let endpoint = Endpoint::empty_builder()
+    let endpoint = opts
+        .shape(Endpoint::empty_builder())
         .secret_key(identity)
         .relay_mode(opts.relay.mode(&addr))
         .transport_config(transport_config())

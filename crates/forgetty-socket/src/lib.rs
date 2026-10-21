@@ -11,12 +11,15 @@
 // `Response` propagates directly to the wire.
 #![allow(clippy::result_large_err)]
 
+pub mod api;
+pub mod apidoc;
 pub mod framing;
 pub mod handlers;
 pub mod protocol;
 #[cfg(feature = "qa-tools")]
 pub mod qa;
 pub mod server;
+pub mod types;
 
 pub use handlers::dispatch;
 pub use protocol::{Request, Response};

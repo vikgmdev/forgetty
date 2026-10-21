@@ -64,6 +64,10 @@ pub struct SessionTab {
     /// possible after restore from a stale JSON (see AC-7) and are degraded
     /// to a `warn!` + first-leaf fallback at the GTK consumer site.
     pub active_pane_id: Option<forgetty_core::PaneId>,
+    /// User label of the tab (`set_label`). Empty means none.
+    pub label: String,
+    /// User labels of panes in this tab, by pane id (`set_label`).
+    pub pane_labels: std::collections::BTreeMap<Uuid, String>,
 }
 
 // ---------------------------------------------------------------------------

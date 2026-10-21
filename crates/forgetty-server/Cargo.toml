@@ -65,3 +65,68 @@ base64 = "0.22"
 libc = "0.2"
 hostname = "0.4"
 rmpv = { version = "1", features = ["with-serde"] }
+
+# ---------------------------------------------------------------------------
+# Packages (P6). Build with:
+#   cargo build --release -p forgetty-server
+#   cargo deb -p forgetty-server --no-build
+#   cargo generate-rpm -p crates/forgetty-server
+# The server runs as a user service. No system service, no root daemon, no
+# maintainer-script action beyond printing the two enable commands.
+# ---------------------------------------------------------------------------
+[package.metadata.deb]
+name = "forgetty-server"
+maintainer = "Vick <vick@totemlabs.dev>"
+copyright = "2024-2026 TotemLabsForge LLC"
+license-file = ["../../dist/pkg/copyright", "0"]
+extended-description = """\
+Forgetty keeps your terminal sessions alive on a server and lets the Forgetty \
+apps (Android, Windows) attach to them over an encrypted peer-to-peer link. \
+This package installs the `forgetty` binary (server and command line) and a \
+systemd user unit. The server runs as your own user. Nothing is enabled or \
+started by the package."""
+section = "utils"
+priority = "optional"
+# glibc 2.28 is the floor of the release build (cargo-zigbuild, see
+# docs/packaging.md). libghostty-vt travels in /usr/lib/forgetty.
+depends = "libc6 (>= 2.28)"
+# /usr/bin/forgetty is also installed by the paused GTK package `forgetty`.
+conflicts = "forgetty"
+replaces = "forgetty"
+maintainer-scripts = "../../dist/pkg/deb"
+assets = [
+    ["target/release/forgetty", "usr/bin/forgetty", "755"],
+    ["target/release/lib/libghostty-vt.so.0.1.0", "usr/lib/forgetty/libghostty-vt.so.0", "644"],
+    ["../../dist/pkg/forgetty-server.service", "usr/lib/systemd/user/forgetty-server.service", "644"],
+    ["../../docs/server.md", "usr/share/doc/forgetty-server/server.md", "644"],
+    ["../../docs/relay.md", "usr/share/doc/forgetty-server/relay.md", "644"],
+    ["../../docs/packaging.md", "usr/share/doc/forgetty-server/packaging.md", "644"],
+    ["../../README.md", "usr/share/doc/forgetty-server/README.md", "644"],
+    ["../../dist/relay/iroh-relay.service", "usr/share/doc/forgetty-server/examples/iroh-relay.service", "644"],
+    ["../../dist/relay/iroh-relay.toml.example", "usr/share/doc/forgetty-server/examples/iroh-relay.toml.example", "644"],
+]
+
+[package.metadata.generate-rpm]
+name = "forgetty-server"
+summary = "Forgetty durable terminal server and CLI"
+license = "MIT"
+url = "https://forgetty.dev"
+post_install_script = "dist/pkg/deb/postinst"
+assets = [
+    { source = "target/release/forgetty", dest = "/usr/bin/forgetty", mode = "0755" },
+    { source = "target/release/lib/libghostty-vt.so.0.1.0", dest = "/usr/lib/forgetty/libghostty-vt.so.0", mode = "0644" },
+    { source = "dist/pkg/forgetty-server.service", dest = "/usr/lib/systemd/user/forgetty-server.service", mode = "0644" },
+    { source = "docs/server.md", dest = "/usr/share/doc/forgetty-server/server.md", mode = "0644", doc = true },
+    { source = "docs/relay.md", dest = "/usr/share/doc/forgetty-server/relay.md", mode = "0644", doc = true },
+    { source = "docs/packaging.md", dest = "/usr/share/doc/forgetty-server/packaging.md", mode = "0644", doc = true },
+    { source = "README.md", dest = "/usr/share/doc/forgetty-server/README.md", mode = "0644", doc = true },
+    { source = "LICENSE", dest = "/usr/share/licenses/forgetty-server/LICENSE", mode = "0644", license = true },
+    { source = "dist/relay/iroh-relay.service", dest = "/usr/share/doc/forgetty-server/examples/iroh-relay.service", mode = "0644", doc = true },
+    { source = "dist/relay/iroh-relay.toml.example", dest = "/usr/share/doc/forgetty-server/examples/iroh-relay.toml.example", mode = "0644", doc = true },
+]
+
+[package.metadata.generate-rpm.requires]
+glibc = ">= 2.28"
+
+[package.metadata.generate-rpm.conflicts]
+forgetty = "*"

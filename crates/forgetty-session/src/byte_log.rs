@@ -22,10 +22,11 @@
 //! `append` is called from `SessionManager::process_pane_bytes` while the
 //! manager mutex is held. It never blocks:
 //! - ring write: a slice copy,
-//! - disk write: `mpsc::Sender::try_send`. When the queue is full the chunk
-//!   is not queued. The appender sees the offset jump on the next chunk and
-//!   restarts the file there (`disk_first` moves), so the file always holds
-//!   one contiguous range.
+//! - disk write: an unbounded queue send, counted in bytes. The drain task
+//!   awaits `LogShared::wait_room` before it reads the next chunk from the
+//!   PTY. Above `DISK_HIGH_WATER` queued bytes it stops reading, the PTY
+//!   fills and the program blocks on write (flow control). A chunk is never
+//!   dropped, so the file and the offsets have no holes.
 //!
 //! No timers, no polling: the appender blocks on `rx.recv().await`, and it
 //! flushes at the end of every drain wake (event driven).
@@ -34,6 +35,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
@@ -44,8 +46,17 @@ use uuid::Uuid;
 
 use forgetty_workspace::{logs_dir, pane_log_path};
 
-/// Bounded channel capacity from `append` → disk appender task (SPEC §4.1).
-const DISK_CHANNEL_CAP: usize = 64;
+/// Bytes that may wait for the disk appender before the PTY reader stops
+/// (flow control). Above this, `LogShared::wait_room` blocks. A program that
+/// writes faster than the disk blocks on its PTY write: nothing is dropped.
+pub const DISK_HIGH_WATER: u64 = 4 * 1024 * 1024;
+
+/// The appender merges queued chunks up to about this size into one write.
+const COALESCE_MAX: usize = 1024 * 1024;
+
+/// The appender publishes the file extent at least this often during a burst,
+/// so readers behind the ring can be served from the file while it runs.
+const FLUSH_EVERY: u64 = 1024 * 1024;
 
 /// Private message type: chunks to append + flush-signal with oneshot reply.
 enum DiskMsg {
@@ -83,12 +94,79 @@ pub struct LogShared {
     pub wake: Notify,
     /// Woken when the disk appender flushed more bytes (or moved the file).
     pub disk_progress: Notify,
+    /// Bytes queued for the disk appender and not yet taken by it.
+    queued: AtomicU64,
+    /// Woken when the appender took a chunk off the queue.
+    room: Notify,
+    /// Set when the `ByteLog` is dropped (the pane is gone).
+    closed: AtomicBool,
+    /// Absolute offset one past the newest byte (mirror of the log's total).
+    total: AtomicU64,
+    /// Ring size in bytes.
+    ring_capacity: usize,
+    /// Odd while the appender replaces the file (rotation, restart). A reader
+    /// that saw the same even value before and after its read got one file.
+    epoch: AtomicU64,
+}
+
+/// Held by the appender while it replaces the file. Drop it after the new
+/// extent is published with `set_disk`.
+struct FileChange<'a>(&'a LogShared);
+
+impl<'a> FileChange<'a> {
+    fn begin(shared: &'a LogShared) -> Self {
+        shared.epoch.fetch_add(1, Ordering::AcqRel);
+        FileChange(shared)
+    }
+}
+
+impl Drop for FileChange<'_> {
+    fn drop(&mut self) {
+        self.0.epoch.fetch_add(1, Ordering::AcqRel);
+        // Readers that found the file in flux wait for this.
+        self.0.disk_progress.notify_waiters();
+    }
 }
 
 impl LogShared {
     /// Current extent of the file.
     pub fn disk_state(&self) -> DiskState {
         *self.disk.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Wait until the disk queue is below [`DISK_HIGH_WATER`]. Only the
+    /// server's own disk writer can hold a PTY (AD-023): a client's speed
+    /// never does. Event driven: the appender wakes this when it takes a
+    /// chunk.
+    pub async fn wait_room(&self) {
+        loop {
+            let room = self.room.notified();
+            tokio::pin!(room);
+            room.as_mut().enable();
+            if self.closed.load(Ordering::Acquire)
+                || !self.disk_enabled
+                || self.queued.load(Ordering::Acquire) < DISK_HIGH_WATER
+            {
+                return;
+            }
+            room.await;
+        }
+    }
+
+    /// Absolute offset one past the newest byte, readable without the log's
+    /// lock.
+    pub fn total(&self) -> u64 {
+        self.total.load(Ordering::Acquire)
+    }
+
+    /// Ring size in bytes.
+    pub fn ring_capacity(&self) -> usize {
+        self.ring_capacity
+    }
+
+    /// Bytes waiting for the disk appender.
+    pub fn queued_bytes(&self) -> u64 {
+        self.queued.load(Ordering::Acquire)
     }
 
     fn set_disk(&self, state: DiskState) {
@@ -121,14 +199,17 @@ pub struct ByteLog {
     /// Absolute offset one past the newest byte. Includes bytes evicted from
     /// the ring. Serves as the replay cursor high-water mark.
     total_bytes_written: u64,
-    /// Bounded channel to the disk appender task.
-    disk_tx: mpsc::Sender<DiskMsg>,
+    /// Queue to the disk appender task. Unbounded, but the PTY reader waits
+    /// on `LogShared::wait_room` first, so it holds about `DISK_HIGH_WATER`.
+    disk_tx: mpsc::UnboundedSender<DiskMsg>,
     shared: Arc<LogShared>,
 }
 
 impl Drop for ByteLog {
     /// Wake the readers of a closed log, so their streams see the pane is gone.
     fn drop(&mut self) {
+        self.shared.closed.store(true, Ordering::Release);
+        self.shared.room.notify_waiters();
         self.shared.wake.notify_waiters();
     }
 }
@@ -223,10 +304,17 @@ impl ByteLog {
             disk: Mutex::new(DiskState { first: disk_first, flushed_to: total_bytes_written }),
             wake: Notify::new(),
             disk_progress: Notify::new(),
+            queued: AtomicU64::new(0),
+            room: Notify::new(),
+            closed: AtomicBool::new(false),
+            total: AtomicU64::new(total_bytes_written),
+            ring_capacity,
+            epoch: AtomicU64::new(0),
         });
 
-        // Bounded disk channel. `try_send` drops chunks when full (R-3).
-        let (disk_tx, disk_rx) = mpsc::channel::<DiskMsg>(DISK_CHANNEL_CAP);
+        // Disk queue. Chunks are never dropped: the caller of `append` waits
+        // on `LogShared::wait_room` before it reads more from the PTY.
+        let (disk_tx, disk_rx) = mpsc::unbounded_channel::<DiskMsg>();
 
         if disk_enabled {
             tokio::spawn(disk_appender_task(
@@ -258,8 +346,8 @@ impl ByteLog {
 
     /// Append raw bytes to the ring and enqueue a disk write.
     ///
-    /// Hot path — must never block. Disk queue full → chunk not queued (the
-    /// appender restarts the file at the next chunk it gets).
+    /// Hot path, never blocks and never drops. The disk queue grows past
+    /// `DISK_HIGH_WATER` only by what callers append without waiting.
     pub fn append(&mut self, data: &[u8]) {
         if data.is_empty() {
             return;
@@ -279,10 +367,18 @@ impl ByteLog {
         }
 
         self.total_bytes_written = start.saturating_add(data.len() as u64);
+        self.shared.total.store(self.total_bytes_written, Ordering::Release);
 
         if self.shared.disk_enabled {
-            let _ =
-                self.disk_tx.try_send(DiskMsg::Chunk { start, data: Bytes::copy_from_slice(data) });
+            let len = data.len() as u64;
+            self.shared.queued.fetch_add(len, Ordering::AcqRel);
+            if self
+                .disk_tx
+                .send(DiskMsg::Chunk { start, data: Bytes::copy_from_slice(data) })
+                .is_err()
+            {
+                self.shared.queued.fetch_sub(len, Ordering::AcqRel);
+            }
         }
         self.shared.wake.notify_waiters();
     }
@@ -357,6 +453,17 @@ impl ByteLog {
         (Bytes::copy_from_slice(slice), self.total_bytes_written)
     }
 
+    /// Copy the ring without rearranging it, with the absolute offset of its
+    /// end. Unlike [`Self::ring_snapshot`] this takes `&self` and never moves
+    /// the ring's bytes, so it is cheap under the manager lock.
+    pub fn ring_copy(&self) -> (Vec<u8>, u64) {
+        let (a, b) = self.ring.as_slices();
+        let mut out = Vec::with_capacity(a.len() + b.len());
+        out.extend_from_slice(a);
+        out.extend_from_slice(b);
+        (out, self.total_bytes_written)
+    }
+
     /// Send a flush signal to the disk appender and await its completion.
     ///
     /// Called on clean shutdown / disconnect to ensure the file buffer is
@@ -365,7 +472,6 @@ impl ByteLog {
         let (tx, rx) = oneshot::channel();
         self.disk_tx
             .send(DiskMsg::Flush(tx))
-            .await
             .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
         rx.await.map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
         Ok(())
@@ -382,7 +488,6 @@ impl ByteLog {
             let (reply_tx, reply_rx) = oneshot::channel();
             tx_clone
                 .send(DiskMsg::Flush(reply_tx))
-                .await
                 .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
             reply_rx.await.map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
             Ok(())
@@ -410,7 +515,6 @@ impl ByteLog {
             if enabled {
                 let (reply, rx) = oneshot::channel();
                 tx.send(DiskMsg::Restart { first: new_first, data, reply })
-                    .await
                     .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
                 rx.await.map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
             }
@@ -430,6 +534,10 @@ pub async fn read_disk(
     len: usize,
 ) -> io::Result<Option<Vec<u8>>> {
     use tokio::io::AsyncReadExt;
+    let epoch = shared.epoch.load(Ordering::Acquire);
+    if epoch & 1 == 1 {
+        return Ok(None);
+    }
     let avail = disk.flushed_to.saturating_sub(next);
     let want = (len as u64).min(avail) as usize;
     if want == 0 {
@@ -440,7 +548,7 @@ pub async fn read_disk(
     let mut buf = vec![0u8; want];
     f.read_exact(&mut buf).await?;
     // The file may have been rotated between the state read and the read.
-    if shared.disk_state().first != disk.first {
+    if shared.epoch.load(Ordering::Acquire) != epoch || shared.disk_state().first != disk.first {
         return Ok(None);
     }
     Ok(Some(buf))
@@ -458,14 +566,22 @@ async fn disk_appender_task(
     mut file_len: u64,
     max_disk_bytes: u64,
     shared: Arc<LogShared>,
-    mut rx: mpsc::Receiver<DiskMsg>,
+    mut rx: mpsc::UnboundedReceiver<DiskMsg>,
 ) {
     // BufWriter amortises the cost of small PTY chunks.
     let mut writer = BufWriter::new(file);
     let log_path = shared.path.clone();
+    let mut unflushed: u64 = 0;
+
+    // A message read while coalescing chunks, handled on the next turn.
+    let mut stash: Option<DiskMsg> = None;
 
     loop {
-        match rx.recv().await {
+        let msg = match stash.take() {
+            Some(m) => Some(m),
+            None => rx.recv().await,
+        };
+        match msg {
             None => {
                 // Sender dropped — ByteLog is being closed. Flush and exit.
                 let _ = writer.flush().await;
@@ -473,11 +589,46 @@ async fn disk_appender_task(
                 return;
             }
             Some(DiskMsg::Chunk { start, data }) => {
+                shared.queued.fetch_sub(data.len() as u64, Ordering::AcqRel);
+                // Take the chunks that are already queued and contiguous, and
+                // write them with one call. One 64 KiB write per PTY read costs
+                // a blocking-pool round trip each.
+                let mut data = data;
+                if data.len() < COALESCE_MAX {
+                    let mut merged: Option<Vec<u8>> = None;
+                    let mut end = start + data.len() as u64;
+                    let mut size = data.len();
+                    while size < COALESCE_MAX {
+                        match rx.try_recv() {
+                            Ok(DiskMsg::Chunk { start: s2, data: d2 }) if s2 == end => {
+                                shared.queued.fetch_sub(d2.len() as u64, Ordering::AcqRel);
+                                let m = merged.get_or_insert_with(|| {
+                                    let mut v = Vec::with_capacity(COALESCE_MAX + 65536);
+                                    v.extend_from_slice(&data);
+                                    v
+                                });
+                                m.extend_from_slice(&d2);
+                                end += d2.len() as u64;
+                                size += d2.len();
+                            }
+                            Ok(other) => {
+                                stash = Some(other);
+                                break;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    if let Some(m) = merged {
+                        data = Bytes::from(m);
+                    }
+                }
+                shared.room.notify_waiters();
                 if start != file_first + file_len {
-                    // A chunk was not queued (queue full) or the file was
-                    // restarted: the file would have a hole. Start it over at
+                    // The file was restarted or the log jumped: the file
+                    // would have a hole. Start it over at
                     // this chunk so it stays one contiguous range.
                     let _ = writer.flush().await;
+                    let _change = FileChange::begin(&shared);
                     match restart_file(&log_path).await {
                         Ok(f) => {
                             writer = BufWriter::new(f);
@@ -498,13 +649,15 @@ async fn disk_appender_task(
                     continue;
                 }
                 file_len = file_len.saturating_add(data.len() as u64);
+                unflushed += data.len() as u64;
 
                 // End of this drain wake: nothing else is queued, so hand the
                 // buffered bytes to the kernel now. A kill -9 or a crash then
                 // loses nothing the pane already printed (the page cache
                 // outlives the process). Event driven, no timer (AD-009). A
                 // burst is written as one flush at its end.
-                if rx.is_empty() {
+                if shared.queued.load(Ordering::Acquire) == 0 || unflushed >= FLUSH_EVERY {
+                    unflushed = 0;
                     if let Err(e) = writer.flush().await {
                         warn!(pane = %pane_id, "disk appender: flush failed: {e}");
                     } else {
@@ -518,6 +671,7 @@ async fn disk_appender_task(
 
                 if file_len >= max_disk_bytes {
                     // Rotation: keep newest max_disk_bytes / 2 (SPEC §10.6).
+                    let _change = FileChange::begin(&shared);
                     match rotate_log(&log_path, &mut writer, max_disk_bytes / 2).await {
                         Ok(kept) => {
                             let new_first = file_first + (file_len - kept);
@@ -540,6 +694,7 @@ async fn disk_appender_task(
             }
             Some(DiskMsg::Restart { first, data, reply }) => {
                 let _ = writer.flush().await;
+                let _change = FileChange::begin(&shared);
                 match restart_file(&log_path).await {
                     Ok(f) => {
                         writer = BufWriter::new(f);
@@ -625,7 +780,7 @@ async fn rotate_log(
             .open(&tmp_path)?;
         let mut dst = tokio::fs::File::from_std(std_tmp);
         // Copy in chunks — avoids loading entire log into memory.
-        let mut buf = vec![0u8; 64 * 1024];
+        let mut buf = vec![0u8; 1024 * 1024];
         let mut remaining = to_keep;
         use tokio::io::AsyncReadExt;
         while remaining > 0 {
@@ -909,6 +1064,34 @@ mod tests {
         let disk = log.shared().disk_state();
         assert_eq!(disk, DiskState { first: 10, flushed_to: 14 });
         assert_eq!(std::fs::read(pane_log_path(pane_id)).unwrap(), b"bbbb");
+        cleanup(pane_id);
+    }
+
+    /// A burst larger than the high-water mark is written whole: `wait_room`
+    /// holds the reader back, nothing is dropped, the file has no holes.
+    #[tokio::test]
+    async fn a_burst_over_the_high_water_mark_is_lossless() {
+        let pane_id = Uuid::new_v4();
+        let mut log = ByteLog::new(pane_id, 1024 * 1024, 64 * 1024 * 1024).unwrap();
+        let shared = log.shared();
+        let chunk: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 251) as u8).collect();
+        let mut waited = false;
+        for _ in 0..200 {
+            // 12.5 MiB
+            if shared.queued_bytes() >= DISK_HIGH_WATER {
+                waited = true;
+            }
+            shared.wait_room().await;
+            log.append(&chunk);
+        }
+        assert!(waited, "the queue never reached the high-water mark");
+        log.flush_signal().await.unwrap();
+        let total = 200 * chunk.len() as u64;
+        assert_eq!(log.total_written(), total);
+        assert_eq!(shared.disk_state(), DiskState { first: 0, flushed_to: total });
+        let file = std::fs::read(pane_log_path(pane_id)).unwrap();
+        assert_eq!(file.len() as u64, total);
+        assert!(file.chunks(chunk.len()).all(|c| c == &chunk[..]));
         cleanup(pane_id);
     }
 

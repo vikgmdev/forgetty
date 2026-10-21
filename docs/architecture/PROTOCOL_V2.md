@@ -210,3 +210,31 @@ stream to the subscriber's own next offset from the log.
 6. Size policy (section 6): when a pane has no active client yet, the first
    `resize_pane` applies.
 7. `Notification.title` is a `String`, empty when the sequence has none.
+
+## 12. Snapshot catch-up (AD-023, capability `snapshot_catchup`)
+
+- `PaneStreamHeader` gains `snapshot_len: u32` (default 0, omitted when 0).
+- When `snapshot_len > 0`, `reset` is true. The first `snapshot_len` bytes after
+  the header are VT snapshot data (screen, cursor, modes, title of the active
+  screen, built from the ring). They do not advance the pane offset. The live
+  bytes after them start at `start_offset`.
+- The server replaces a stream by resetting it with stream code `0x13
+  superseded`, then opening a new one. The client keeps a per-pane stream
+  counter: a newer stream wins, and stale queued items are dropped on reset.
+- Triggers: the stream is more than half the ring behind, makes no write
+  progress for 2 s, or a resume starts further back than half the ring.
+- Limits: one build shared per pane, results younger than 250 ms reused, at
+  most 2 concurrent builds server-wide, at least 1 s between catch-ups per
+  stream with backoff to 10 s.
+- The snapshot has no scrollback, no palette, no OSC 10/11/12 colours. A client
+  without the capability gets `0x11 log_lost` and re-attaches.
+- Connection close codes: `0x12` control writer stalled 10 s, `0x14` more than
+  64 requests in flight.
+
+## 13. Methods added by P5
+
+- `api.list`, `api.describe { method }`: self-describing API (name,
+  description, input/output JSON Schema, examples). Allowed over v2.
+- `set_label { target: "workspace"|"tab"|"pane", id, label }`: emits
+  `LayoutChanged`. Layout values carry `label` on tabs and a `pane_labels` map.
+  Clients show the label when set, else the title.

@@ -99,6 +99,7 @@ async fn exactly_once_across_five_drops_and_one_restart() {
                         data.extend_from_slice(&bytes);
                         echoed.store(data.len() as u64, Ordering::SeqCst);
                     }
+                    PaneItem::Snapshot { .. } => panic!("unexpected snapshot catch-up"),
                     PaneItem::Ended => panic!("pane ended"),
                 }
             }
@@ -313,6 +314,243 @@ async fn stopping_server_refuses_v2_attaches() {
     server.shutdown().await;
 }
 
+/// A server restart under output load, with a new client connecting while the
+/// old process is stopping. The stopping server answers `server_stopping`, the
+/// client retries with its normal backoff and connects to the new process. The
+/// attached client resumes without a reset.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restart_under_load_with_a_client_connecting_in_the_stop_window() {
+    if !real_only() {
+        return;
+    }
+    let server = TestServer::start(TestServerConfig::default()).await;
+    let port = server.udp_addr().port();
+    let echo = server.add_pane();
+    let load = server.add_script_pane(
+        // About 50 MiB/s: a load the client can sustain, so any reset is the restart's.
+        "stty raw -echo; while :; do yes 0123456789abcdef | head -c 262144; sleep 0.005; done",
+    );
+    let a = connect(&server, "a").await;
+    let mut echo_s = a.attach_pane(echo).await.unwrap();
+    let mut load_s = a.attach_pane(load).await.unwrap();
+
+    // Client A drains the load pane through the restart.
+    let got = Arc::new(AtomicU64::new(0));
+    let resets = Arc::new(AtomicU64::new(0));
+    let drain = {
+        let (got, resets) = (got.clone(), resets.clone());
+        tokio::spawn(async move {
+            while let Some(item) = load_s.next().await {
+                match item {
+                    PaneItem::Data { bytes, .. } => {
+                        got.fetch_add(bytes.len() as u64, Ordering::SeqCst);
+                    }
+                    PaneItem::Reset { .. } => {
+                        resets
+                            .fetch_add(u64::from(got.load(Ordering::SeqCst) > 0), Ordering::SeqCst);
+                    }
+                    PaneItem::Snapshot { .. } => {}
+                    PaneItem::Ended => break,
+                }
+            }
+        })
+    };
+    wait_for("load output", Duration::from_secs(10), || got.load(Ordering::SeqCst) > 1 << 20).await;
+
+    // The server is stopping: B dials, is told so, and keeps trying.
+    server.socket_call("qa_stopping", json!({"on": true})).unwrap();
+    let kb = key();
+    server.authorize(kb.public());
+    let addr = server.addr();
+    let b = tokio::spawn(async move {
+        Client::connect(addr, kb, info("b")).await.map(|h| (h, Instant::now()))
+    });
+    wait_for("B to be refused twice", Duration::from_secs(10), || server.stopping_refusals() >= 2)
+        .await;
+    assert!(!b.is_finished(), "server_stopping must be retried, not fatal");
+
+    let saved = server.stop_for_restart().await;
+    let started = Instant::now();
+    let fresh = TestServer::start_again(saved, port).await;
+    let (hb, b_at) = tokio::time::timeout(Duration::from_secs(15), b)
+        .await
+        .expect("B never connected to the new server")
+        .unwrap()
+        .expect("B failed for good");
+    println!(
+        "stop window: B was refused with server_stopping, connected {:?} after the new server started",
+        b_at.duration_since(started)
+    );
+    assert!(hb.state().is_connected());
+    wait_for("A to reconnect", Duration::from_secs(10), || a.state().is_connected()).await;
+
+    // A still works on the restored pane and its load stream was not reset.
+    a.send_input(echo, b"after\n").await.unwrap();
+    let mut seen = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !String::from_utf8_lossy(&seen).contains("after") {
+            if let Some(PaneItem::Data { bytes, .. }) = echo_s.next().await {
+                seen.extend_from_slice(&bytes);
+            }
+        }
+    })
+    .await
+    .expect("echo after the restart");
+    assert_eq!(resets.load(Ordering::SeqCst), 0, "the load stream was reset by the restart");
+    drain.abort();
+    hb.close().await;
+    a.close().await;
+    fresh.shutdown().await;
+}
+
+/// A client that stops reading Control while layout events fire. The server
+/// keeps at most one pending `LayoutChanged` for it and pulls no more events
+/// while its queue is over budget, so its memory stays flat. If the queue
+/// fills anyway the connection is closed after 10 s. When the peer reads
+/// again it finds a handful of layouts, not 100k. A client that reconnects
+/// gets the right layout and live events.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_that_stops_reading_control_costs_no_memory_and_is_closed() {
+    if !real_only() {
+        return;
+    }
+    use forgetty_client::proto::{
+        read_msg, write_msg, ControlMsg, HandshakeReply, Hello, Value, ALPN_RPC,
+    };
+    use iroh::endpoint::ConnectionError;
+
+    let server = TestServer::start(TestServerConfig::default()).await;
+    let pane = server.add_pane();
+    // A layout of six panes, so each event is several KiB. The P2c gate also
+    // runs 31 (`STALL_PANES=30`).
+    let extra: usize = std::env::var("STALL_PANES").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+    for _ in 0..extra {
+        server.add_pane();
+    }
+
+    // A raw peer: handshake, subscribe, then never read again.
+    let kb = key();
+    server.authorize(kb.public());
+    let endpoint = iroh::Endpoint::empty_builder()
+        .secret_key(kb.clone())
+        .relay_mode(iroh::RelayMode::Disabled)
+        .transport_config(forgetty_client::transport_config())
+        .bind()
+        .await
+        .unwrap();
+    let conn = endpoint.connect(server.addr(), ALPN_RPC).await.unwrap();
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    let hello = Hello::new(
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        ClientKind::Cli,
+        "stalled",
+        "0.0.0",
+        vec!["resume".into(), "layout_events".into()],
+    );
+    write_msg(&mut send, &hello).await.unwrap();
+    match read_msg::<_, HandshakeReply>(&mut recv).await.unwrap() {
+        Some(HandshakeReply::Welcome(_)) => {}
+        other => panic!("handshake: {other:?}"),
+    }
+    write_msg(
+        &mut send,
+        &ControlMsg::Request { id: 1, method: "subscribe_events".into(), params: Value::Nil },
+    )
+    .await
+    .unwrap();
+    loop {
+        match read_msg::<_, ControlMsg>(&mut recv).await.unwrap() {
+            Some(ControlMsg::Response { id: 1, .. }) => break,
+            Some(_) => {}
+            None => panic!("control closed"),
+        }
+    }
+    let closed_at = Arc::new(std::sync::Mutex::new(None));
+    {
+        let (conn, closed_at) = (conn.clone(), closed_at.clone());
+        tokio::spawn(async move {
+            let why = conn.closed().await;
+            *closed_at.lock().unwrap() = Some((Instant::now(), why));
+        });
+    }
+
+    // 100k layout events over 15 s (1000 every 150 ms). The peer reads nothing.
+    let rss0 = server.rss_kib();
+    let t0 = Instant::now();
+    let mut peak = rss0;
+    for i in 0..100 {
+        server.fire_layout_events(1000);
+        if i % 3 == 0 {
+            peak = peak.max(server.rss_kib());
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    let grew_mb = peak.saturating_sub(rss0) as f64 / 1024.0;
+    let closed = closed_at.lock().unwrap().take();
+    println!(
+        "stalled control reader ({} panes): 100000 events in 15 s, server RSS {:.1} MiB -> peak {:.1} MiB (+{grew_mb:.1}), {}",
+        extra + 1,
+        rss0 as f64 / 1024.0,
+        peak as f64 / 1024.0,
+        match &closed {
+            Some((at, why)) => format!("connection closed after {:?} ({why:?})", at.duration_since(t0)),
+            None => "connection kept open with one pending layout".to_string(),
+        }
+    );
+    assert!(grew_mb < 20.0, "server RSS grew by {grew_mb:.1} MiB");
+    if let Some((_, why)) = &closed {
+        assert!(
+            matches!(why, ConnectionError::ApplicationClosed(c) if u64::from(c.error_code) == 0x12),
+            "closed for another reason: {why:?}"
+        );
+    } else {
+        // Still open: the peer reads now and finds the QUIC window's worth of
+        // layouts plus one, never the 100k that were fired.
+        let mut seen = 0usize;
+        while let Ok(Ok(Some(msg))) =
+            tokio::time::timeout(Duration::from_millis(500), read_msg::<_, ControlMsg>(&mut recv))
+                .await
+        {
+            if matches!(msg, ControlMsg::Event { .. }) {
+                seen += 1;
+            }
+        }
+        println!("stalled control reader: the peer then read {seen} events");
+        assert!(seen < 2000, "the server queued {seen} events for a peer that did not read");
+    }
+    endpoint.close().await;
+
+    // The same device reconnects: right layout, live events.
+    let h = tokio::time::timeout(
+        Duration::from_secs(10),
+        Client::connect(server.addr(), kb, info("back")),
+    )
+    .await
+    .expect("reconnect timed out")
+    .expect("reconnect failed");
+    let mut events = h.events().await.unwrap();
+    let layout = h.request("get_layout", Value::Nil).await.expect("get_layout");
+    assert!(
+        format!("{layout:?}").contains(&pane.to_string()),
+        "the layout after the reconnect misses the pane: {layout:?}"
+    );
+    server.fire_layout_events(1);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(EventItem::Server { event: ServerEvent::LayoutChanged { .. }, .. }) =
+                events.next().await
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("no live event after the reconnect");
+    h.close().await;
+    server.shutdown().await;
+}
+
 /// Absolute offsets: a rotated log keeps counting, the first offset is stored
 /// next to the log, and a restart gives the same offsets back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -339,27 +577,27 @@ async fn log_offsets_persist_across_rotation_and_restart() {
     assert_eq!(t, total);
     assert!(first > 0 && first <= total - 512 * 1024, "first offset {first}");
 
-    // Attach from an offset older than the log: reset at the first byte.
+    // A fresh attach starts at the oldest byte. The oldest byte is more than
+    // half the 1 MiB ring behind, so (AD-023) the server sends a snapshot of
+    // the screen at the head instead of replaying the log.
     let h = connect(&server, "offsets").await;
     let mut s = h.attach_pane(pane).await.unwrap();
-    let mut got_first = None;
+    let mut snap_at = None;
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             match s.next().await.unwrap() {
-                PaneItem::Reset { .. } => {}
-                PaneItem::Data { offset, bytes } => {
-                    got_first.get_or_insert(offset);
-                    if offset + bytes.len() as u64 >= total {
-                        return;
-                    }
+                PaneItem::Reset { .. } | PaneItem::Data { .. } => {}
+                PaneItem::Snapshot { offset, .. } => {
+                    snap_at = Some(offset);
+                    return;
                 }
                 PaneItem::Ended => panic!("ended"),
             }
         }
     })
     .await
-    .expect("replay");
-    assert_eq!(got_first, Some(first), "a fresh attach starts at the oldest byte");
+    .expect("snapshot");
+    assert_eq!(snap_at, Some(total), "the snapshot stands at the head of the log");
     drop(s);
     h.close().await;
 
@@ -424,4 +662,92 @@ async fn input_typed_during_a_restart_arrives_once() {
     assert_eq!(got, b"before during after");
     h.close().await;
     fresh.shutdown().await;
+}
+
+/// Throughput of `cat` on a 200 MiB file through the server with one v2
+/// client attached. Prints MB/s at the server (PTY to byte log) and at the
+/// client, and the resets the client saw. Never a wrong byte.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cat_200mb_through_the_server() {
+    if !real_only() {
+        return;
+    }
+    const N: u64 = 200 * 1024 * 1024;
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("big.bin");
+    {
+        use std::io::Write;
+        let mut f = std::io::BufWriter::new(std::fs::File::create(&file).unwrap());
+        let block: Vec<u8> = (0..17 * 4096u64).map(common::burst_byte).collect();
+        let mut left = N as usize;
+        while left > 0 {
+            let n = left.min(block.len());
+            f.write_all(&block[..n]).unwrap();
+            left -= n;
+        }
+        f.flush().unwrap();
+    }
+    let server = Arc::new(TestServer::start(TestServerConfig::default()).await);
+    let script = format!("stty raw -echo; read -r l; cat {}; exec cat", file.display());
+    let pane = server.add_script_pane(&script);
+    let h = connect(&server, "bench").await;
+    let mut s = h.attach_pane(pane).await.unwrap();
+
+    let t0 = Instant::now();
+    server.start_burst(pane, 0); // one line of input starts the cat
+    let ingest = {
+        let server = server.clone();
+        tokio::spawn(async move {
+            while server.log_bounds(pane).1 < N {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            t0.elapsed()
+        })
+    };
+    let (mut got, mut resets, mut snapshots, mut bad, mut end) = (0u64, 0u32, 0u32, false, 0u64);
+    let deadline = Instant::now() + Duration::from_secs(180);
+    while end < N && Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(10), s.next()).await {
+            Ok(Some(PaneItem::Data { offset, bytes })) => {
+                if !bytes
+                    .iter()
+                    .enumerate()
+                    .all(|(i, b)| *b == common::burst_byte(offset + i as u64))
+                {
+                    bad = true;
+                }
+                got += bytes.len() as u64;
+                end = end.max(offset + bytes.len() as u64);
+            }
+            Ok(Some(PaneItem::Reset { .. })) => resets += u32::from(end > 0),
+            Ok(Some(PaneItem::Snapshot { offset, .. })) => {
+                snapshots += 1;
+                end = end.max(offset);
+            }
+            _ => break,
+        }
+    }
+    let client_time = t0.elapsed();
+    let ingest_time = tokio::time::timeout(Duration::from_secs(60), ingest)
+        .await
+        .map(|r| r.unwrap())
+        .unwrap_or(Duration::from_secs(60));
+    let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
+    println!(
+        "cat 200 MiB: server ingest {:.0} MiB/s ({ingest_time:?}); client {:.0} MiB/s \
+         ({client_time:?}, {:.0} MiB received, {resets} resets, {snapshots} snapshot catch-ups, bad bytes: {bad})",
+        mb(N) / ingest_time.as_secs_f64(),
+        mb(got) / client_time.as_secs_f64(),
+        mb(got),
+    );
+    // The program runs at full speed (AD-023). A reader slower than the PTY
+    // falls behind and catches up by snapshot: that is counted, not an error.
+    // A wrong byte is.
+    assert!(!bad, "bytes differ from the pattern");
+    assert!(end >= N, "the stream stopped at {end} of {N}");
+    h.close().await;
+    match Arc::try_unwrap(server) {
+        Ok(server) => server.shutdown().await,
+        Err(_) => panic!("the ingest task still holds the server"),
+    }
 }

@@ -5,7 +5,7 @@
 //! The cell grid is populated from the libghostty-vt render state.
 
 /// A single cell in the terminal grid.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Cell {
     pub grapheme: String,
     pub attrs: CellAttributes,

@@ -45,6 +45,7 @@ async fn read_bytes(stream: &mut PaneStream, total: usize, timeout: Duration) ->
                     next += bytes.len() as u64;
                     out.extend_from_slice(&bytes);
                 }
+                PaneItem::Snapshot { .. } => panic!("unexpected snapshot catch-up"),
                 PaneItem::Ended => panic!("ended"),
             }
         }
@@ -360,6 +361,7 @@ async fn server_restart_on_the_cached_port_reconnects_every_time() {
                         next += bytes.len() as u64;
                         data.extend_from_slice(&bytes);
                     }
+                    Some(PaneItem::Snapshot { .. }) => panic!("unexpected snapshot catch-up"),
                     Some(PaneItem::Ended) | None => panic!("pane ended"),
                 },
                 _ = total_rx.changed() => {}

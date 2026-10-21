@@ -178,7 +178,7 @@ fn golden_ev_cdisc() {
 #[test]
 fn golden_header() {
     golden::<PaneStreamHeader>(
-        PaneStreamHeader { pane_id: id(3), start_offset: 65536, reset: false, rows: 24, cols: 80 },
+        PaneStreamHeader { pane_id: id(3), start_offset: 65536, reset: false, rows: 24, cols: 80, snapshot_len: 0 },
         "85a770616e655f6964d92430333033303330332d303330332d303330332d303330332d303330333033303330333033ac73746172745f6f6666736574ce00010000a57265736574c2a4726f777318a4636f6c7350",
     );
 }
@@ -229,6 +229,7 @@ fn golden_qr_payload() {
         node_id: "abc".into(),
         machine: "ovh".into(),
         relay: "https://r/".into(),
+        relays: Vec::new(),
         secret: "S".into(),
     };
     assert_eq!(
@@ -279,7 +280,14 @@ fn constants_match_contract() {
 #[test]
 fn uuids_are_strings_not_bin() {
     // 0xd9 0x24 = str8 of 36 bytes. A bin would be 0xc4 0x10.
-    let h = PaneStreamHeader { pane_id: id(3), start_offset: 0, reset: true, rows: 1, cols: 1 };
+    let h = PaneStreamHeader {
+        pane_id: id(3),
+        start_offset: 0,
+        reset: true,
+        rows: 1,
+        cols: 1,
+        snapshot_len: 0,
+    };
     let bytes = encode_msg(&h).unwrap();
     assert!(bytes.windows(2).any(|w| w == [0xd9, 0x24]));
 }
@@ -301,4 +309,22 @@ fn golden_pong() {
         ControlMsg::Pong { nonce: 5, input_acked: 1000 },
         "81a4506f6e6782a56e6f6e636505ab696e7075745f61636b6564cd03e8",
     );
+}
+
+#[test]
+fn snapshot_header_roundtrips_and_a_plain_one_has_no_snapshot_field() {
+    let plain = PaneStreamHeader {
+        pane_id: id(3),
+        start_offset: 7,
+        reset: false,
+        rows: 24,
+        cols: 80,
+        snapshot_len: 0,
+    };
+    let snap = PaneStreamHeader { reset: true, snapshot_len: 5000, ..plain.clone() };
+    let a = rmp_serde::to_vec_named(&plain).unwrap();
+    let b = rmp_serde::to_vec_named(&snap).unwrap();
+    assert!(b.len() > a.len());
+    assert_eq!(rmp_serde::from_slice::<PaneStreamHeader>(&a).unwrap(), plain);
+    assert_eq!(rmp_serde::from_slice::<PaneStreamHeader>(&b).unwrap(), snap);
 }

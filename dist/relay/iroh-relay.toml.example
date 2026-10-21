@@ -1,0 +1,47 @@
+# iroh-relay config for a Forgetty server. Copy to
+# ~/.config/forgetty/iroh-relay.toml and read docs/relay.md.
+#
+# iroh-relay 0.97.x. Pin the same minor version as the iroh crate in Forgetty.
+
+# Relay traffic (the default). Needs TLS below for QUIC address discovery.
+enable_relay = true
+
+# Plain HTTP port. With TLS it only serves a captive-portal check.
+# A user service cannot bind below 1024 unless
+#   sysctl net.ipv4.ip_unprivileged_port_start=80   (or lower)
+# is set. See relay.md for the alternatives (high ports or a port redirect).
+http_bind_addr = "[::]:80"
+
+# QUIC address discovery. Helps NAT traversal: clients learn their public
+# address. Requires the [tls] section. UDP.
+enable_quic_addr_discovery = true
+
+# Prometheus metrics. Keep it on localhost (do not open it in the firewall).
+enable_metrics = true
+metrics_bind_addr = "127.0.0.1:9090"
+
+# Optional: only these endpoint ids may relay. Put the server id
+# (`forgetty server status`) and the id of each paired phone here.
+# access = { allowlist = ["<endpoint id>", "<endpoint id>"] }
+
+[tls]
+# HTTPS (the relay itself) and QUIC address discovery.
+https_bind_addr = "[::]:443"
+quic_bind_addr = "[::]:7842"
+
+# --- Option A: Let's Encrypt, issued by iroh-relay itself (TLS-ALPN-01).
+# DNS: an A/AAAA record for the hostname that points at this server.
+# Port 443/tcp must be reachable from the internet while the cert is issued.
+cert_mode = "LetsEncrypt"
+hostname = "relay.example.org"
+contact = "you@example.org"
+prod_tls = true
+# cert_dir defaults to the working directory of the service
+# (~/.local/share/forgetty/iroh-relay), where the account key and the
+# certificates are kept.
+
+# --- Option B: a certificate you provide (certbot, acme.sh, a company CA).
+# cert_mode = "Manual"
+# manual_cert_path = "/home/you/.config/forgetty/relay/fullchain.pem"
+# manual_key_path  = "/home/you/.config/forgetty/relay/privkey.pem"
+# "Reloading" re-reads the files when they change (renewal without restart).

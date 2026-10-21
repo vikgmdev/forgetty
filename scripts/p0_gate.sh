@@ -14,6 +14,8 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 export PATH="$HOME/.cargo/bin:$HOME/.local/zig:$PATH"
+# Another process may hold the fixed UDP port 47297: use any free port.
+export FORGETTY_PORT="${FORGETTY_PORT:-0}"
 PROFILE="${PROFILE:-debug}"
 
 if [ "$(id -u)" = "0" ]; then

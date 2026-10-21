@@ -26,7 +26,7 @@ pub use client::{Client, ClientHandle, EventItem, EventStream, PaneItem, PaneStr
 pub use config::{transport_config, ClientInfo, ClientOptions, RelayChoice};
 pub use error::ClientError;
 pub use identity::{load_or_generate_client_id, load_or_generate_identity};
-pub use pair::{pair, pair_with_addr, qr_to_addr, PairedServer};
+pub use pair::{pair, pair_with_addr, qr_to_addr, server_addr, PairedServer};
 pub use state::ConnectionState;
 
 pub use forgetty_proto as proto;

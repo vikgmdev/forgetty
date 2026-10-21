@@ -102,11 +102,8 @@ impl Terminal {
         max_scrollback: usize,
     ) -> Self {
         let mut handle: ffi::GhosttyTerminal = std::ptr::null_mut();
-        let opts = ffi::GhosttyTerminalOptions {
-            cols: cols as u16,
-            rows: rows as u16,
-            max_scrollback,
-        };
+        let opts =
+            ffi::GhosttyTerminalOptions { cols: cols as u16, rows: rows as u16, max_scrollback };
         let rc = unsafe { ffi::ghostty_terminal_new(std::ptr::null(), &mut handle, opts) };
         assert_eq!(rc, ffi::GHOSTTY_SUCCESS, "ghostty_terminal_new failed: {rc}");
 
@@ -489,6 +486,72 @@ impl Terminal {
             );
         }
         tracking
+    }
+
+    /// The screen, cursor, style, modes, scrolling region, tab stops,
+    /// pwd and keyboard state as VT bytes (the libghostty formatter). Feeding
+    /// the result to a fresh terminal of the same size rebuilds the state.
+    /// Cold path only: it walks the whole screen.
+    pub fn format_vt(&self) -> Vec<u8> {
+        use std::mem::size_of;
+        let screen = ffi::GhosttyFormatterScreenExtra {
+            size: size_of::<ffi::GhosttyFormatterScreenExtra>(),
+            cursor: true,
+            style: true,
+            hyperlink: true,
+            protection: true,
+            kitty_keyboard: true,
+            charsets: true,
+        };
+        let extra = ffi::GhosttyFormatterTerminalExtra {
+            size: size_of::<ffi::GhosttyFormatterTerminalExtra>(),
+            // The palette belongs to the viewer's theme. A snapshot must not
+            // overwrite it (cells keep palette indexes).
+            palette: false,
+            modes: true,
+            scrolling_region: true,
+            tabstops: true,
+            pwd: true,
+            keyboard: true,
+            screen,
+        };
+        let opts = ffi::GhosttyFormatterTerminalOptions {
+            size: size_of::<ffi::GhosttyFormatterTerminalOptions>(),
+            emit: ffi::GHOSTTY_FORMATTER_FORMAT_VT,
+            unwrap: false,
+            trim: false,
+            extra,
+        };
+        let mut fmt: ffi::GhosttyFormatter = std::ptr::null_mut();
+        let rc = unsafe {
+            ffi::ghostty_formatter_terminal_new(std::ptr::null(), &mut fmt, self.handle, opts)
+        };
+        if rc != ffi::GHOSTTY_SUCCESS || fmt.is_null() {
+            return Vec::new();
+        }
+        let mut ptr: *mut u8 = std::ptr::null_mut();
+        let mut len: usize = 0;
+        let rc = unsafe {
+            ffi::ghostty_formatter_format_alloc(fmt, std::ptr::null(), &mut ptr, &mut len)
+        };
+        let out = if rc == ffi::GHOSTTY_SUCCESS && !ptr.is_null() {
+            let v = unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec();
+            unsafe { ffi::ghostty_free(std::ptr::null(), ptr, len) };
+            v
+        } else {
+            Vec::new()
+        };
+        unsafe { ffi::ghostty_formatter_free(fmt) };
+        out
+    }
+
+    /// Whether DEC private mode `n` (for example 2004, bracketed paste) is set.
+    pub fn dec_mode(&self, n: u16) -> bool {
+        let mut on = false;
+        unsafe {
+            ffi::ghostty_terminal_mode_get(self.handle, ffi::ghostty_mode_new(n, false), &mut on);
+        }
+        on
     }
 
     /// Check if focus reporting mode (DECSET 1004) is active.
@@ -1084,4 +1147,56 @@ unsafe extern "C" fn title_changed_callback(terminal: ffi::GhosttyTerminal, user
     };
 
     state.events.push(TerminalEvent::TitleChanged(title));
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::*;
+
+    fn vim_like() -> Vec<u8> {
+        // Shell prompt first, then a full-screen app: alt screen, bracketed
+        // paste, mouse, hidden cursor, title, colours, keypad mode.
+        let mut b = Vec::new();
+        b.extend_from_slice(b"\x1b]2;shell\x07$ vim file\r\n");
+        b.extend_from_slice(b"\x1b[?2004h");
+        b.extend_from_slice(b"\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b[?25l\x1b=");
+        b.extend_from_slice(b"\x1b]2;vim\x07\x1b[2J\x1b[H");
+        b.extend_from_slice(b"\x1b[1;34mline one\x1b[0m\r\n\x1b[7mstatus\x1b[0m\x1b[3;5H\x1b[38;5;208morange\x1b[0m");
+        b.extend_from_slice(b"\x1b]4;1;rgb:12/34/56\x07");
+        b
+    }
+
+    #[test]
+    fn format_vt_rebuilds_screen_and_modes() {
+        let pal = [forgetty_core::Rgba::default(); 16];
+        let mut a = Terminal::new(10, 40, pal);
+        a.feed(&vim_like());
+        let snap = a.format_vt();
+        assert!(!snap.is_empty());
+        println!("snapshot {} bytes", snap.len());
+        let mut b = Terminal::new(10, 40, pal);
+        b.feed(&snap);
+        assert_eq!(a.is_alternate_screen(), b.is_alternate_screen());
+        assert!(b.is_alternate_screen());
+        assert_eq!(a.is_mouse_tracking(), b.is_mouse_tracking());
+        assert_eq!(a.cursor_visible(), b.cursor_visible());
+        assert_eq!(a.dec_mode(2004), b.dec_mode(2004));
+        assert!(b.dec_mode(2004));
+        assert_eq!(a.dec_mode(1006), b.dec_mode(1006));
+        assert_eq!(a.cursor(), b.cursor());
+        for r in 0..10 {
+            for c in 0..40 {
+                let (x, y) = (a.screen().cell(r, c), b.screen().cell(r, c));
+                // A cell nobody wrote and a written blank differ only in the
+                // resolved default colour.
+                if x.grapheme.trim().is_empty() && y.grapheme.trim().is_empty() {
+                    continue;
+                }
+                assert_eq!(x, y, "cell {r},{c}");
+            }
+        }
+        // The formatter does not carry the title.
+        assert_eq!(a.title(), "vim");
+        assert_eq!(b.title(), "");
+    }
 }

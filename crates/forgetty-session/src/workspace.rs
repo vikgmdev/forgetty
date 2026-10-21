@@ -83,6 +83,8 @@ where
                     pane_tree: build_pane_tree_state(&tab_entry.pane_tree, &get_cwd),
                     pane_id: None,
                     active_pane_id: None,
+                    label: String::new(),
+                    pane_labels: Default::default(),
                 })
                 .collect();
 

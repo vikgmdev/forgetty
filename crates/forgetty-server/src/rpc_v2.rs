@@ -19,16 +19,19 @@
 //! Nothing here polls. Every wait is a `Notify`, a channel or a stream.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
+use crate::control_queue::ControlQueue;
+use crate::snapshot_hub::SnapshotHub;
 use forgetty_core::PaneId;
 use forgetty_proto::{
-    cap, close_code, error_code, from_value, method, read_input_frame, read_msg, to_value,
-    write_msg, write_output_frame, AttachPaneParams, ClientEntry, ClientKind, ControlMsg,
-    DetachPaneParams, ErrorMsg, HandshakeReply, Hello, OkResult, PaneStreamHeader,
-    ResizePaneParams, ServerEvent, SubscribeResult, Value, Welcome, PROTO_MAJOR, PROTO_MINOR,
+    cap, close_code, encode_msg, error_code, from_value, method, read_input_frame, read_msg,
+    stream_code, to_value, write_frame, write_msg, write_output_frame, AttachPaneParams,
+    ClientEntry, ClientKind, ControlMsg, DetachPaneParams, ErrorMsg, HandshakeReply, Hello,
+    OkResult, PaneStreamHeader, ResizePaneParams, ServerEvent, SubscribeResult, Value, Welcome,
+    PROTO_MAJOR, PROTO_MINOR,
 };
 use forgetty_pty::PtySize;
 use forgetty_session::{
@@ -46,8 +49,9 @@ use uuid::Uuid;
 /// Application close code of [`RpcV2::drop_connections`] (test harness).
 pub const DROP_CODE: u32 = 0x10;
 /// Application error code a pane stream is reset with when its reader fell
-/// behind the whole log. The client redials and resumes with a reset.
-pub const LOG_LOST_CODE: u32 = 0x11;
+/// behind the whole log and the peer has no `snapshot_catchup`. The client
+/// redials and resumes with a reset.
+pub const LOG_LOST_CODE: u32 = stream_code::LOG_LOST;
 
 /// Bytes per pane output frame.
 const CHUNK: usize = 128 * 1024;
@@ -56,16 +60,45 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Input `seq` state is kept this long after a client leaves (section 5).
 const INPUT_KEEP: Duration = Duration::from_secs(600);
 /// Events buffered per connection before it is told to resync.
-const EVENT_BUFFER: usize = 1024;
+const EVENT_BUFFER: usize = 256;
+/// Memory one connection's outgoing Control queue may hold. Past it the
+/// connection stops reading requests (AD-023 amendment, section 7).
+const CONTROL_QUEUE_BYTES: usize = 8 * 1024 * 1024;
+/// Requests a connection may have running at once. One more closes it.
+const MAX_INFLIGHT: usize = 64;
+/// A connection whose Control queue stays (half) full this long with no write
+/// completing is closed. The client reconnects and gets the state again.
+const STALL_LIMIT: Duration = Duration::from_secs(10);
+/// At most one lag resync (`LayoutChanged`) per connection in this time.
+const RESYNC_MIN: Duration = Duration::from_millis(250);
+/// Application close code for a connection whose Control queue stalled.
+pub const STALLED_CODE: u32 = 0x12;
+/// Application close code for a connection with more than [`MAX_INFLIGHT`]
+/// requests in flight.
+pub const TOO_MANY_REQUESTS_CODE: u32 = 0x14;
+/// A pane stream whose write makes no progress this long gets a snapshot
+/// catch-up (AD-023).
+const NO_PROGRESS: Duration = Duration::from_secs(2);
+/// One stream takes a snapshot catch-up at most this often. A stream that needs
+/// them again soon waits twice as long each time, up to [`MAX_CATCHUP_BACKOFF`].
+const MIN_CATCHUP_INTERVAL: Duration = Duration::from_secs(1);
+/// Longest wait between two catch-ups of one stream.
+const MAX_CATCHUP_BACKOFF: Duration = Duration::from_secs(10);
 
 /// Capabilities the server offers.
-pub const SERVER_CAPS: [&str; 5] =
-    [cap::RESUME, cap::LAYOUT_EVENTS, cap::STATUS_EVENTS, cap::CAPTURE, cap::SIZE_POLICY_LATEST];
+pub const SERVER_CAPS: [&str; 6] = [
+    cap::RESUME,
+    cap::LAYOUT_EVENTS,
+    cap::STATUS_EVENTS,
+    cap::CAPTURE,
+    cap::SIZE_POLICY_LATEST,
+    cap::SNAPSHOT_CATCHUP,
+];
 
 /// Methods a v2 client may call through the shared socket dispatch table.
 /// `send_input` is not here (input goes on the Input stream), nor are the
 /// `pair_*` methods (a paired device does not open pairing windows).
-const DISPATCH_ALLOWED: [&str; 26] = [
+const DISPATCH_ALLOWED: [&str; 29] = [
     methods::LIST_TABS,
     methods::GET_LAYOUT,
     methods::NEW_TAB,
@@ -92,6 +125,9 @@ const DISPATCH_ALLOWED: [&str; 26] = [
     methods::PANE_EXIT_STATUS,
     methods::LIST_DEVICES,
     methods::REVOKE_DEVICE,
+    methods::API_LIST,
+    methods::API_DESCRIBE,
+    methods::SET_LABEL,
 ];
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -137,10 +173,21 @@ pub struct Qa {
     pub hold_acks: AtomicBool,
     /// Completed handshakes.
     pub handshakes: AtomicU64,
+    /// Handshakes answered `server_stopping`.
+    pub stopping_refusals: AtomicU64,
     /// While true, handshakes stall before the reply.
     pub paused: watch::Sender<bool>,
     /// `(pane, from_offset)` of every `attach_pane`.
     pub attaches: Mutex<Vec<(Uuid, Option<u64>)>>,
+    /// Snapshot catch-ups served.
+    pub catchups: AtomicU64,
+    /// Connections closed for [`MAX_INFLIGHT`].
+    pub too_many_closes: AtomicU64,
+    /// Connections closed for [`STALL_LIMIT`].
+    pub stall_closes: AtomicU64,
+    /// Test only: `(pane, n)`. Each change makes the streams of `pane` take a
+    /// snapshot catch-up as if their reader had stalled.
+    pub force_catchup: watch::Sender<(Uuid, u64)>,
     /// Test only: skip the registry check.
     #[cfg(feature = "qa-tools")]
     pub open_access: AtomicBool,
@@ -165,6 +212,8 @@ pub struct RpcV2 {
     /// Set while the server shuts down: input is no longer written, so the
     /// saved `seq` state matches what reached the PTYs.
     inputs_frozen: AtomicBool,
+    /// Snapshot builds shared by every stream (AD-023).
+    pub snapshots: Arc<SnapshotHub>,
     /// Harness counters.
     pub qa: Qa,
 }
@@ -178,6 +227,7 @@ impl RpcV2 {
             .unwrap_or_else(|| "forgetty".to_string());
         let (events, _) = broadcast::channel(EVENT_BUFFER);
         let (paused, _) = watch::channel(false);
+        let (force_catchup, _) = watch::channel((Uuid::nil(), 0));
         let rpc = Arc::new(RpcV2 {
             sm,
             sync: OnceLock::new(),
@@ -191,12 +241,18 @@ impl RpcV2 {
             live: Mutex::new(Vec::new()),
             next_conn: AtomicU64::new(0),
             inputs_frozen: AtomicBool::new(false),
+            snapshots: Arc::new(SnapshotHub::default()),
             qa: Qa {
                 dedup_drops: AtomicU64::new(0),
                 hold_acks: AtomicBool::new(false),
                 handshakes: AtomicU64::new(0),
+                stopping_refusals: AtomicU64::new(0),
                 paused,
                 attaches: Mutex::new(Vec::new()),
+                catchups: AtomicU64::new(0),
+                too_many_closes: AtomicU64::new(0),
+                stall_closes: AtomicU64::new(0),
+                force_catchup,
                 #[cfg(feature = "qa-tools")]
                 open_access: AtomicBool::new(false),
                 #[cfg(feature = "qa-tools")]
@@ -336,7 +392,7 @@ impl RpcV2 {
     }
 
     /// `get_layout` as a MessagePack value.
-    fn layout_value(&self) -> Value {
+    pub(crate) fn layout_value(&self) -> Value {
         let req = Request {
             jsonrpc: "2.0".into(),
             method: methods::GET_LAYOUT.into(),
@@ -402,7 +458,7 @@ impl RpcV2 {
 
         // AD-017: this connection is an attached client until it ends. The
         // guard drops on every exit path. A stopping server takes no new
-        // clients: close without a reply, so the client retries later.
+        // clients: answer `server_stopping`, which the client retries.
         let kind = hello.client_kind;
         let Ok(_guard) = self.sm.clients().register(
             hello.client_id.to_string(),
@@ -410,6 +466,15 @@ impl RpcV2 {
             &hello.client_name,
         ) else {
             info!("rpc2: client {} refused, server is stopping", hello.client_name);
+            self.qa.stopping_refusals.fetch_add(1, Ordering::SeqCst);
+            let reply = HandshakeReply::Error(ErrorMsg {
+                code: error_code::SERVER_STOPPING.into(),
+                message: "the server is stopping".into(),
+            });
+            let _ = write_msg(&mut send, &reply).await;
+            let _ = send.finish();
+            // Let the client read the error before the connection goes away.
+            let _ = tokio::time::timeout(Duration::from_secs(2), conn.closed()).await;
             conn.close(close_code::OK.into(), b"server-stopping");
             return;
         };
@@ -855,6 +920,7 @@ fn pump_event(rpc: &RpcV2, ev: SessionEvent, layout_dirty: &mut bool) {
         }
         SessionEvent::PaneClosed { pane_id } => {
             lock(&rpc.sizes).remove(&pane_id.0);
+            rpc.snapshots.forget(pane_id);
             rpc.emit(ServerEvent::PaneClosed { pane_id: pane_id.0 });
             *layout_dirty = true;
         }
@@ -867,6 +933,7 @@ fn pump_event(rpc: &RpcV2, ev: SessionEvent, layout_dirty: &mut bool) {
         | SessionEvent::ActiveWorkspaceChanged { .. }
         | SessionEvent::WorkspaceCreated { .. }
         | SessionEvent::WorkspaceRenamed { .. }
+        | SessionEvent::LabelChanged { .. }
         | SessionEvent::WorkspaceDeleted { .. }
         | SessionEvent::WorkspaceColorChanged { .. }
         | SessionEvent::WorkspacesReordered { .. }
@@ -899,22 +966,75 @@ impl Session {
 
     async fn run(self, mut send: iroh::endpoint::SendStream, mut recv: iroh::endpoint::RecvStream) {
         let session = Arc::new(self);
-        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ControlMsg>();
-        let mut tasks: JoinSet<()> = JoinSet::new();
+        let queue = Arc::new(ControlQueue::new());
+        let inflight = Arc::new(AtomicUsize::new(0));
+        // Tasks that live as long as the session: the writer, the request
+        // reader and the stall watchdog. One ending ends the session.
+        let mut core: JoinSet<()> = JoinSet::new();
+        // One task per request in flight, per pane stream and for the input
+        // stream. Finished ones are reaped in the loop below.
+        let mut work: JoinSet<()> = JoinSet::new();
 
         // Control writer.
-        tasks.spawn(async move {
-            while let Some(msg) = out_rx.recv().await {
-                if write_msg(&mut send, &msg).await.is_err() {
-                    break;
+        {
+            let q = queue.clone();
+            core.spawn(async move {
+                while let Some(frame) = q.pop().await {
+                    if write_frame(&mut send, &frame).await.is_err() {
+                        break;
+                    }
+                    q.wrote();
                 }
-            }
-        });
+            });
+        }
+        core.spawn(watchdog(queue.clone(), session.conn.clone(), session.rpc.clone()));
+
+        // Control reader. It reads only while the queue is under its byte
+        // budget. A full queue leaves the requests in the QUIC receive
+        // window, so a client that does not read its answers cannot push the
+        // server any further (QUIC flow control, no buffering here).
+        let (req_tx, mut req_rx) = mpsc::channel::<ControlMsg>(1);
+        {
+            let (q, conn) = (queue.clone(), session.conn.clone());
+            core.spawn(async move {
+                loop {
+                    q.wait_below(CONTROL_QUEUE_BYTES).await;
+                    match read_msg::<_, ControlMsg>(&mut recv).await {
+                        Ok(Some(m)) => {
+                            if req_tx.send(m).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            // A frame this server cannot decode is skipped, a
+                            // broken stream ends the session (section 3a).
+                            if matches!(
+                                e,
+                                forgetty_proto::FrameError::Io(_)
+                                    | forgetty_proto::FrameError::UnexpectedEof
+                                    | forgetty_proto::FrameError::TooLarge { .. }
+                            ) {
+                                if matches!(e, forgetty_proto::FrameError::TooLarge { .. }) {
+                                    conn.close(
+                                        close_code::FRAME_TOO_LARGE.into(),
+                                        b"frame_too_large",
+                                    );
+                                }
+                                debug!("rpc2: control stream ended: {e}");
+                                break;
+                            }
+                            warn!("rpc2: skipped an undecodable control frame: {e}");
+                        }
+                    }
+                }
+            });
+        }
 
         // Input reader: the client's first uni stream.
         {
             let s = session.clone();
-            tasks.spawn(async move {
+            work.spawn(async move {
                 let Ok(mut input) = s.conn.accept_uni().await else { return };
                 let policy = s.has(cap::SIZE_POLICY_LATEST);
                 while let Ok(Some((pane, seq, bytes))) = read_input_frame(&mut input).await {
@@ -933,65 +1053,88 @@ impl Session {
         // Control request loop.
         let mut streams: HashMap<Uuid, AbortHandle> = HashMap::new();
         let mut events: Option<broadcast::Receiver<(u64, ServerEvent)>> = None;
+        // A lag resync is owed at this time (coalesced, section 7).
+        let mut resync_due: Option<tokio::time::Instant> = None;
+        let mut last_resync: Option<tokio::time::Instant> = None;
         loop {
+            let resync = async {
+                match resync_due {
+                    Some(t) => tokio::time::sleep_until(t).await,
+                    None => std::future::pending().await,
+                }
+            };
             tokio::select! {
-                msg = read_msg::<_, ControlMsg>(&mut recv) => {
-                    let msg = match msg {
-                        Ok(Some(m)) => m,
-                        Ok(None) => break,
-                        Err(e) => {
-                            // A frame this server cannot decode is skipped, a
-                            // broken stream ends the session (section 3a).
-                            if matches!(
-                                e,
-                                forgetty_proto::FrameError::Io(_)
-                                    | forgetty_proto::FrameError::UnexpectedEof
-                                    | forgetty_proto::FrameError::TooLarge { .. }
-                            ) {
-                                if matches!(e, forgetty_proto::FrameError::TooLarge { .. }) {
-                                    session.conn.close(close_code::FRAME_TOO_LARGE.into(), b"frame_too_large");
-                                }
-                                debug!("rpc2: control stream ended: {e}");
-                                break;
-                            }
-                            warn!("rpc2: skipped an undecodable control frame: {e}");
-                            continue;
-                        }
-                    };
+                msg = req_rx.recv() => {
+                    let Some(msg) = msg else { break };
                     match msg {
                         ControlMsg::Ping { nonce } => {
                             let input_acked = session.rpc.acked(session.client_id, session.epoch);
-                            let _ = out_tx.send(ControlMsg::Pong { nonce, input_acked });
+                            queue.push(control_frame(&ControlMsg::Pong { nonce, input_acked }));
                         }
                         ControlMsg::Request { id, method: m, params } => {
-                            session.on_request(
-                                id, m, params, &out_tx, &mut tasks, &mut streams, &mut events,
-                            );
+                            if !session.on_request(
+                                id, m, params, &queue, &inflight, &mut work, &mut streams,
+                                &mut events,
+                            ) {
+                                break;
+                            }
                         }
                         _ => {} // Response, Failure, Event, Pong come from the server only.
                     }
                 }
-                ev = next_event(&mut events) => {
+                // Take the next event only while the queue is under half its
+                // budget. A client that does not read leaves the events in the
+                // hub's ring (it lags, it does not grow a queue).
+                ev = async {
+                    queue.wait_below(CONTROL_QUEUE_BYTES / 2).await;
+                    next_event(&mut events).await
+                } => {
                     match ev {
                         Ok((seq, event)) => {
-                            if session.event_allowed(&event) {
-                                let _ = out_tx.send(ControlMsg::Event { seq, event });
+                            if !session.event_allowed(&event) {
+                                // not for this peer
+                            } else if matches!(event, ServerEvent::LayoutChanged { .. }) {
+                                // A layout is a full snapshot: one pending
+                                // layout per connection, replaced in place.
+                                queue.put_layout(control_frame(&ControlMsg::Event { seq, event }));
+                            } else {
+                                queue.push(control_frame(&ControlMsg::Event { seq, event }));
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(n)) => {
                             warn!("rpc2: client {} lagged by {n} events", session.client_id);
-                            session.rpc.emit(ServerEvent::LayoutChanged { layout: session.rpc.layout_value() });
+                            // Skip to the head and owe one resync, at most one
+                            // per RESYNC_MIN however many lags happen.
+                            let (_, rx) = session.rpc.subscribe();
+                            events = Some(rx);
+                            let now = tokio::time::Instant::now();
+                            let due = last_resync.map_or(now, |t| (t + RESYNC_MIN).max(now));
+                            resync_due = Some(resync_due.map_or(due, |d| d.min(due)));
                         }
                         Err(broadcast::error::RecvError::Closed) => events = None,
                     }
                 }
+                _ = resync => {
+                    resync_due = None;
+                    if session.has(cap::LAYOUT_EVENTS) {
+                        let seq = session.rpc.current_seq();
+                        let event = ServerEvent::LayoutChanged { layout: session.rpc.layout_value() };
+                        queue.put_layout(control_frame(&ControlMsg::Event { seq, event }));
+                        last_resync = Some(tokio::time::Instant::now());
+                    }
+                }
+                Some(_) = work.join_next(), if !work.is_empty() => {}
+                _ = core.join_next() => break,
             }
         }
+        queue.close();
         for (_, h) in streams {
             h.abort();
         }
-        tasks.abort_all();
-        while tasks.join_next().await.is_some() {}
+        work.abort_all();
+        core.abort_all();
+        while work.join_next().await.is_some() {}
+        while core.join_next().await.is_some() {}
     }
 
     fn event_allowed(&self, event: &ServerEvent) -> bool {
@@ -1004,19 +1147,38 @@ impl Session {
         }
     }
 
+    /// Count one request that runs on its own task. `None` (and the connection
+    /// closed) when [`MAX_INFLIGHT`] are running already.
+    fn begin_task(&self, inflight: &Arc<AtomicUsize>) -> Option<InflightGuard> {
+        if inflight.fetch_add(1, Ordering::SeqCst) >= MAX_INFLIGHT {
+            inflight.fetch_sub(1, Ordering::SeqCst);
+            warn!(
+                "rpc2: client {} has more than {MAX_INFLIGHT} requests in flight, closing",
+                self.client_id
+            );
+            self.rpc.qa.too_many_closes.fetch_add(1, Ordering::SeqCst);
+            self.conn.close(TOO_MANY_REQUESTS_CODE.into(), b"too-many-requests");
+            return None;
+        }
+        Some(InflightGuard(inflight.clone()))
+    }
+
     /// Handle one `Request`. The cheap, connection-local methods answer here.
-    /// Everything else runs on its own task, so `Ping` is never held up.
+    /// Everything else runs on its own task, so `Ping` is never held up. At
+    /// most [`MAX_INFLIGHT`] such tasks run per connection. Returns `false`
+    /// when the connection was closed for sending more.
     #[allow(clippy::too_many_arguments)]
     fn on_request(
         self: &Arc<Self>,
         id: u64,
         m: String,
         params: Value,
-        out: &mpsc::UnboundedSender<ControlMsg>,
-        tasks: &mut JoinSet<()>,
+        out: &Arc<ControlQueue>,
+        inflight: &Arc<AtomicUsize>,
+        work: &mut JoinSet<()>,
         streams: &mut HashMap<Uuid, AbortHandle>,
         events: &mut Option<broadcast::Receiver<(u64, ServerEvent)>>,
-    ) {
+    ) -> bool {
         let bad = |e: forgetty_proto::FrameError| (error_code::BAD_REQUEST, e.to_string());
         let reply = move |r: Result<Value, (&'static str, String)>| match r {
             Ok(result) => ControlMsg::Response { id, result },
@@ -1031,13 +1193,16 @@ impl Session {
                     *events = Some(rx);
                     seq
                 };
-                let _ = out.send(reply(to_value(&SubscribeResult { seq }).map_err(bad)));
+                out.push(control_frame(&reply(to_value(&SubscribeResult { seq }).map_err(bad))));
             }
             method::ATTACH_PANE => {
+                // An attach counts as a request in flight until its stream is
+                // open (a stream may start with a snapshot build).
+                let Some(guard) = self.begin_task(inflight) else { return false };
                 let r = from_value::<AttachPaneParams>(params)
                     .map_err(bad)
-                    .and_then(|p| self.attach(p, tasks, streams));
-                let _ = out.send(reply(r));
+                    .and_then(|p| self.attach(p, work, streams, guard));
+                out.push(control_frame(&reply(r)));
             }
             method::DETACH_PANE => {
                 let r = from_value::<DetachPaneParams>(params).map_err(bad).and_then(|p| {
@@ -1046,12 +1211,14 @@ impl Session {
                     }
                     to_value(&OkResult { ok: true }).map_err(bad)
                 });
-                let _ = out.send(reply(r));
+                out.push(control_frame(&reply(r)));
             }
             method::RESIZE_PANE => {
+                let Some(guard) = self.begin_task(inflight) else { return false };
                 let s = self.clone();
                 let out = out.clone();
-                tasks.spawn(async move {
+                work.spawn(async move {
+                    let _guard = guard;
                     let r = from_value::<ResizePaneParams>(params).map_err(bad).and_then(|p| {
                         if p.rows == 0 || p.cols == 0 {
                             return Err((
@@ -1076,25 +1243,27 @@ impl Session {
                         }
                         Err(e) => Err(e),
                     };
-                    let _ = out.send(reply(r));
+                    out.push(control_frame(&reply(r)));
                 });
             }
             method::LIST_CLIENTS => {
-                let _ = out.send(reply(self.rpc.list_clients()));
+                out.push(control_frame(&reply(self.rpc.list_clients())));
             }
             other => {
                 if other == method::CAPTURE && !self.has(cap::CAPTURE) {
-                    let _ = out.send(ControlMsg::Failure {
+                    out.push(control_frame(&ControlMsg::Failure {
                         id,
                         code: error_code::CAPABILITY_MISSING.into(),
-                        message: "capture needs the capture capability".into(),
-                    });
-                    return;
+                        message: "capture needs the capability".into(),
+                    }));
+                    return true;
                 }
+                let Some(guard) = self.begin_task(inflight) else { return false };
                 let s = self.clone();
                 let out = out.clone();
                 let other = other.to_string();
-                tasks.spawn(async move {
+                work.spawn(async move {
+                    let _guard = guard;
                     let rpc = s.rpc.clone();
                     let (client, name, p) = (s.client_id, other.clone(), params);
                     let r = tokio::task::spawn_blocking(move || {
@@ -1108,18 +1277,20 @@ impl Session {
                     .unwrap_or_else(|e| {
                         Err((error_code::INTERNAL, format!("handler failed: {e}")))
                     });
-                    let _ = out.send(reply(r));
+                    out.push(control_frame(&reply(r)));
                 });
             }
         }
+        true
     }
 
     /// `attach_pane`: pick the start offset (section 8) and open the stream.
     fn attach(
         self: &Arc<Self>,
         p: AttachPaneParams,
-        tasks: &mut JoinSet<()>,
+        work: &mut JoinSet<()>,
         streams: &mut HashMap<Uuid, AbortHandle>,
+        guard: InflightGuard,
     ) -> Result<Value, (&'static str, String)> {
         let pane = PaneId(p.pane_id);
         let Some(info) = self.rpc.sm.pane_info(pane) else {
@@ -1147,10 +1318,69 @@ impl Session {
             reset,
             rows: info.rows,
             cols: info.cols,
+            snapshot_len: 0,
         };
-        let handle = tasks.spawn(pane_stream(self.rpc.clone(), self.conn.clone(), shared, header));
+        let catchup = self.has(cap::SNAPSHOT_CATCHUP);
+        // One live stream per (connection, pane): the old one was aborted above.
+        let handle = work.spawn(pane_stream(
+            self.rpc.clone(),
+            self.conn.clone(),
+            shared,
+            header,
+            catchup,
+            guard,
+        ));
         streams.insert(p.pane_id, handle);
         to_value(&OkResult { ok: true }).map_err(|e| (error_code::INTERNAL, e.to_string()))
+    }
+}
+
+/// Counts one running request. Drops with the task.
+struct InflightGuard(Arc<AtomicUsize>);
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Encode a Control message as one frame payload. An answer too large for a
+/// frame becomes a `Failure`, so the caller still gets an answer.
+fn control_frame(msg: &ControlMsg) -> Vec<u8> {
+    match encode_msg(msg) {
+        Ok(bytes) if bytes.len() <= forgetty_proto::MAX_FRAME_LEN => bytes,
+        other => {
+            let reason = match other {
+                Ok(b) => format!("answer of {} bytes is over the frame limit", b.len()),
+                Err(e) => e.to_string(),
+            };
+            match msg {
+                ControlMsg::Response { id, .. } => encode_msg(&ControlMsg::Failure {
+                    id: *id,
+                    code: error_code::INTERNAL.into(),
+                    message: reason,
+                })
+                .unwrap_or_default(),
+                _ => Vec::new(),
+            }
+        }
+    }
+}
+
+/// Close a connection that leaves its Control queue (half) full for
+/// [`STALL_LIMIT`] with no write completing.
+async fn watchdog(queue: Arc<ControlQueue>, conn: Connection, rpc: Arc<RpcV2>) {
+    let half = CONTROL_QUEUE_BYTES / 2;
+    loop {
+        queue.wait_at_least(half).await;
+        let before = queue.written();
+        tokio::time::sleep(STALL_LIMIT).await;
+        if queue.bytes() >= half && queue.written() == before {
+            warn!("rpc2: a client did not read Control for {STALL_LIMIT:?}, closing");
+            rpc.qa.stall_closes.fetch_add(1, Ordering::SeqCst);
+            conn.close(STALLED_CODE.into(), b"control-stalled");
+            return;
+        }
     }
 }
 
@@ -1167,21 +1397,191 @@ async fn next_event(
 // Pane output stream
 // ---------------------------------------------------------------------------
 
+/// Why a pane stream ended.
+enum StreamEnd {
+    /// The pane closed: the stream was finished.
+    Closed,
+    /// The peer or the log is gone. Nothing more to do.
+    Gone,
+    /// The reader is too slow: replace the stream with a snapshot.
+    Catchup,
+}
+
 /// One Pane output stream: the header, then raw frames pulled from the pane
-/// byte log by offset. Back-pressure from QUIC slows this task only. The log
-/// keeps filling, and the task catches up from the ring or the disk file.
+/// byte log by offset.
+///
+/// A slow reader never slows the program (AD-023). The log keeps filling no
+/// matter what this task does. With `snapshot_catchup`, a reader that falls
+/// more than half the ring behind, or whose write makes no progress for
+/// [`NO_PROGRESS`], gets its stream reset (`SUPERSEDED`) and a new one that
+/// starts with a VT snapshot of the screen, then continues live. Without the
+/// capability the old rule stands: bytes come from the ring or the disk file,
+/// and a reader behind everything is reset with `LOG_LOST`.
 async fn pane_stream(
     rpc: Arc<RpcV2>,
     conn: Connection,
     shared: Arc<LogShared>,
-    header: PaneStreamHeader,
+    first: PaneStreamHeader,
+    catchup: bool,
+    guard: InflightGuard,
 ) {
-    let pane = PaneId(header.pane_id);
-    let Ok(mut send) = conn.open_uni().await else { return };
-    if write_msg(&mut send, &header).await.is_err() {
-        return;
+    let pane = PaneId(first.pane_id);
+    let lag_limit = (shared.ring_capacity() / 2) as u64;
+    let mut force = rpc.qa.force_catchup.subscribe();
+    force.mark_unchanged();
+    let mut header = first;
+    let mut snapshot: Vec<u8> = Vec::new();
+    let mut limiter = CatchupLimiter::default();
+    // A client that resumes far behind starts with the snapshot.
+    if catchup && shared.total().saturating_sub(header.start_offset) > lag_limit {
+        limiter.note_now();
+        let Some((h, snap)) = take_snapshot(&rpc, pane).await else { return };
+        header = h;
+        snapshot = snap;
     }
-    let mut next = header.start_offset;
+    // From here the attach no longer counts as a request in flight.
+    drop(guard);
+    loop {
+        let Ok(mut send) = conn.open_uni().await else { return };
+        let sent_snapshot = std::mem::take(&mut snapshot);
+        let after_snapshot = !sent_snapshot.is_empty();
+        header.snapshot_len = sent_snapshot.len() as u32;
+        if write_msg(&mut send, &header).await.is_err() {
+            return;
+        }
+        for part in sent_snapshot.chunks(CHUNK) {
+            if write_output_frame(&mut send, part).await.is_err() {
+                return;
+            }
+        }
+        match stream_from(
+            &rpc,
+            &shared,
+            &mut send,
+            pane,
+            header.start_offset,
+            catchup,
+            after_snapshot,
+            &mut force,
+        )
+        .await
+        {
+            StreamEnd::Gone => return,
+            StreamEnd::Closed => {
+                // Finish cleanly (FIN) and give the peer time to read it.
+                let _ = send.finish();
+                let _ = tokio::time::timeout(Duration::from_secs(5), send.stopped()).await;
+                return;
+            }
+            StreamEnd::Catchup => {
+                // A stream that keeps needing catch-ups waits between them.
+                tokio::time::sleep(limiter.delay()).await;
+                // Stop the old stream, so it queues nothing more for the peer.
+                let _ = send.reset(stream_code::SUPERSEDED.into());
+                let Some((h, snap)) = take_snapshot(&rpc, pane).await else { return };
+                header = h;
+                snapshot = snap;
+            }
+        }
+    }
+}
+
+/// Spacing of one stream's catch-ups: at least [`MIN_CATCHUP_INTERVAL`] apart,
+/// doubling up to [`MAX_CATCHUP_BACKOFF`] while the stream keeps needing them.
+struct CatchupLimiter {
+    last: Option<tokio::time::Instant>,
+    interval: Duration,
+}
+
+impl Default for CatchupLimiter {
+    fn default() -> Self {
+        CatchupLimiter { last: None, interval: MIN_CATCHUP_INTERVAL }
+    }
+}
+
+impl CatchupLimiter {
+    /// Record a catch-up that happens right now.
+    fn note_now(&mut self) {
+        self.last = Some(tokio::time::Instant::now());
+    }
+
+    /// How long to wait before the next catch-up. Records it as done.
+    fn delay(&mut self) -> Duration {
+        let now = tokio::time::Instant::now();
+        let wait = match self.last {
+            None => Duration::ZERO,
+            Some(last) => {
+                // Needed again within two intervals: back off. Otherwise start over.
+                self.interval = if now.duration_since(last) < self.interval * 2 {
+                    (self.interval * 2).min(MAX_CATCHUP_BACKOFF)
+                } else {
+                    MIN_CATCHUP_INTERVAL
+                };
+                (last + self.interval).saturating_duration_since(now)
+            }
+        };
+        self.last = Some(now + wait);
+        wait
+    }
+}
+
+/// Get the snapshot of a pane from the shared hub (one build for all streams,
+/// two builds at once at most). Returns the header of the stream that carries
+/// it, and the snapshot bytes.
+async fn take_snapshot(rpc: &Arc<RpcV2>, pane: PaneId) -> Option<(PaneStreamHeader, Vec<u8>)> {
+    let sm = rpc.sm.clone();
+    let snap = rpc.snapshots.get(pane, move || sm.snapshot_pane(pane)).await?;
+    rpc.qa.catchups.fetch_add(1, Ordering::SeqCst);
+    info!(
+        "rpc2: pane {pane} snapshot catch-up at {}: {} bytes (last build {} us)",
+        snap.offset,
+        snap.bytes.len(),
+        rpc.snapshots.stats.last_us.load(Ordering::Relaxed)
+    );
+    let header = PaneStreamHeader {
+        pane_id: pane.0,
+        start_offset: snap.offset,
+        reset: true,
+        rows: snap.rows,
+        cols: snap.cols,
+        snapshot_len: 0,
+    };
+    Some((header, snap.bytes.clone()))
+}
+
+/// Write one live frame. With `catchup`, a write that makes no progress for
+/// [`NO_PROGRESS`] ends the stream with [`StreamEnd::Catchup`].
+async fn write_live(
+    send: &mut iroh::endpoint::SendStream,
+    bytes: &[u8],
+    catchup: bool,
+) -> Result<(), StreamEnd> {
+    if !catchup {
+        return write_output_frame(send, bytes).await.map_err(|_| StreamEnd::Gone);
+    }
+    match tokio::time::timeout(NO_PROGRESS, write_output_frame(send, bytes)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(StreamEnd::Gone),
+        Err(_) => Err(StreamEnd::Catchup),
+    }
+}
+
+/// Send the pane's bytes from `next` on until the stream ends.
+async fn stream_from(
+    rpc: &Arc<RpcV2>,
+    shared: &Arc<LogShared>,
+    send: &mut iroh::endpoint::SendStream,
+    pane: PaneId,
+    mut next: u64,
+    catchup: bool,
+    after_snapshot: bool,
+    force: &mut watch::Receiver<(Uuid, u64)>,
+) -> StreamEnd {
+    let lag_limit = (shared.ring_capacity() / 2) as u64;
+    // A stream that follows a snapshot writes one frame before the lag test
+    // applies again. Each snapshot then makes progress, even while a heavy
+    // program keeps the head far ahead of the offset the snapshot stands at.
+    let mut lag_check = !after_snapshot;
     loop {
         // Arm both wake-ups before looking at the log, so nothing is missed.
         let wake = shared.wake.notified();
@@ -1190,47 +1590,92 @@ async fn pane_stream(
         wake.as_mut().enable();
         progress.as_mut().enable();
 
-        match rpc.sm.plan_log(pane, next, CHUNK) {
-            None => {
-                // The pane closed: finish cleanly (FIN).
-                let _ = send.finish();
-                let _ = tokio::time::timeout(Duration::from_secs(5), send.stopped()).await;
-                return;
+        if catchup {
+            let forced = force.has_changed().unwrap_or(false) && {
+                let target = force.borrow_and_update().0;
+                target == pane.0
+            };
+            if forced || (lag_check && shared.total().saturating_sub(next) > lag_limit) {
+                return StreamEnd::Catchup;
             }
-            Some(LogPlan::Caught) => wake.await,
+        }
+
+        match rpc.sm.plan_log(pane, next, CHUNK) {
+            None => return StreamEnd::Closed,
+            Some(LogPlan::Caught) => {
+                tokio::select! {
+                    _ = &mut wake => {}
+                    changed = force.changed(), if catchup => {
+                        if changed.is_ok() && force.borrow_and_update().0 == pane.0 {
+                            return StreamEnd::Catchup;
+                        }
+                    }
+                }
+            }
             Some(LogPlan::Ring(bytes)) => {
-                if write_output_frame(&mut send, &bytes).await.is_err() {
-                    return;
+                if let Err(end) = write_live(send, &bytes, catchup).await {
+                    return end;
                 }
                 next += bytes.len() as u64;
+                lag_check = true;
             }
-            Some(LogPlan::Disk { disk, len }) => match read_disk(&shared, disk, next, len).await {
+            Some(LogPlan::Disk { disk, len }) => match read_disk(shared, disk, next, len).await {
                 Ok(Some(bytes)) if !bytes.is_empty() => {
-                    if write_output_frame(&mut send, &bytes).await.is_err() {
-                        return;
+                    if let Err(end) = write_live(send, &bytes, catchup).await {
+                        return end;
                     }
                     next += bytes.len() as u64;
+                    lag_check = true;
                 }
                 // The file has not caught up yet: wait for the appender.
-                Ok(Some(_)) => {
-                    tokio::select! { _ = &mut progress => {}, _ = &mut wake => {} }
-                }
-                // The file moved under the read: plan again.
-                Ok(None) => {}
+                Ok(Some(_)) => progress.await,
+                // The file moved under the read: wait for the appender to
+                // publish the new extent, then plan again.
+                Ok(None) => progress.await,
                 Err(e) => {
                     warn!("rpc2: pane {pane} log read failed: {e}");
                     let _ = send.reset(LOG_LOST_CODE.into());
-                    return;
+                    return StreamEnd::Gone;
                 }
             },
             Some(LogPlan::Lost { first }) => {
                 // The reader fell behind everything the log still holds. The
                 // stream cannot say "reset" in the middle, so it breaks and the
                 // client resumes with a reset (section 8).
+                if catchup {
+                    // The log moved past the offset while a snapshot was built
+                    // or the reader stalled: take a newer snapshot.
+                    debug!("rpc2: pane {pane} reader at {next} is behind the log ({first}), catching up");
+                    return StreamEnd::Catchup;
+                }
                 warn!("rpc2: pane {pane} reader at {next} is behind the log (starts at {first})");
                 let _ = send.reset(LOG_LOST_CODE.into());
-                return;
+                return StreamEnd::Gone;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod limiter_tests {
+    use super::*;
+
+    #[test]
+    fn catchups_back_off_up_to_ten_seconds_and_recover() {
+        let mut l = CatchupLimiter::default();
+        assert_eq!(l.delay(), Duration::ZERO, "the first catch-up is immediate");
+        // Needed again at once, over and over (the caller waits each delay
+        // before the next call, so the next "now" is the previous slot).
+        let mut waits = Vec::new();
+        for _ in 0..6 {
+            let w = l.delay();
+            waits.push(w.as_secs_f64().round() as u64);
+            l.last = Some(tokio::time::Instant::now()); // the caller waited
+        }
+        assert_eq!(waits, [2, 4, 8, 10, 10, 10]);
+        // A stream that was quiet starts over with the minimum interval.
+        l.last = Some(tokio::time::Instant::now() - Duration::from_secs(60));
+        let w = l.delay();
+        assert!(w.is_zero(), "after a quiet minute the next catch-up is immediate: {w:?}");
     }
 }
