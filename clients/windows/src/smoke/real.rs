@@ -70,6 +70,7 @@ pub struct Real {
     fed_last: u64,
     fed_t: Option<Instant>,
     resets_before: u64,
+    restarts: u8,
     burst_t0: Option<Instant>,
     burst_fed0: u64,
     burst_last: Option<Instant>,
@@ -84,8 +85,19 @@ impl Real {
 }
 
 /// Stop the server inside WSL (used on every exit path).
+/// Stop the server and wait until it is gone, so the UDP port is free for a restart.
+/// Falls back to SIGKILL after a few seconds.
 pub fn stop_server(distro: &str) {
     let _ = wsl(distro, &["pkill", "-TERM", "-f", "forgetty server run"]).output();
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(6) {
+        let gone = wsl(distro, &["pgrep", "-f", "forgetty server run"]).stdin(Stdio::null()).output().map(|o| !o.status.success()).unwrap_or(true);
+        if gone {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let _ = wsl(distro, &["pkill", "-KILL", "-f", "forgetty server run"]).output();
 }
 
 fn kill_children(r: &mut Real) {
@@ -333,7 +345,7 @@ impl ShellSmoke {
                         self.real.resets_before = view.read(cx).resets;
                         let d = self.real.distro.clone();
                         // Stop the server process. Its panes' shells go with it.
-                        let _ = wsl(&d, &["pkill", "-TERM", "-f", "forgetty server run"]).output();
+                        stop_server(&d);
                         if let Some(mut c) = self.real.server.take() {
                             let _ = c.kill();
                             let _ = c.wait();
@@ -374,6 +386,13 @@ impl ShellSmoke {
                                 return;
                             }
                             self.real.last_probe = Some(Instant::now());
+                            // A server that exited (the port was not free yet) is started again.
+                            let exited = self.real.server.as_mut().is_some_and(|c| c.try_wait().map(|s| s.is_some()).unwrap_or(false));
+                            if exited && self.real.restarts < 5 {
+                                self.real.restarts += 1;
+                                self.real_start_server();
+                                return;
+                            }
                             if self.real_server_up() {
                                 self.real.t_ready = Some(Instant::now());
                                 record("real_server_restart_ms", json!(ms(self.phase_t0.elapsed())));
