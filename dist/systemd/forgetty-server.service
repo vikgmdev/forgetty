@@ -14,10 +14,17 @@ StandardOutput=journal
 StandardError=journal
 
 # XDG_RUNTIME_DIR is set by systemd for user services.
-# Panes are children of this process, so stop the whole cgroup on exit.
-KillMode=control-group
-# Give the server time to flush byte logs and save the layout on stop.
-TimeoutStopSec=20
+# On stop, SIGTERM goes to the server process ONLY (mixed). The server freezes
+# the layout, flushes and fsyncs the byte logs and the session file, then
+# exits. Its panes then get SIGHUP from the closing PTY masters, and systemd
+# SIGKILLs whatever is left in the cgroup. With KillMode=control-group every
+# pane process got SIGTERM at the same moment as the server, the exits raced
+# the layout save and a restart came back with fewer panes.
+KillMode=mixed
+# Time for the flush and save above before systemd gives up and sends SIGKILL.
+TimeoutStopSec=10
+# Exit 75 means another server already holds the lock. Do not restart-loop on it.
+RestartPreventExitStatus=75
 
 [Install]
 WantedBy=default.target

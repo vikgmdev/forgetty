@@ -30,15 +30,38 @@ systemctl --user status forgetty-server
 journalctl --user -u forgetty-server -f
 ```
 
+On `systemctl --user stop` or `restart` the unit sends SIGTERM to the server
+only (`KillMode=mixed`, `TimeoutStopSec=10`). The server freezes the layout
+(a pane exit after that point never removes a pane from the saved layout),
+flushes and fsyncs the byte logs and the session file, then exits. The shells
+get SIGHUP when the PTY masters close, and systemd kills what is left. A
+restart therefore comes back with every pane.
+
 Without systemd: `forgetty server start` runs the server detached and logs to
 `~/.local/share/forgetty/server.log`.
 
 ## What the server keeps
 
 - One server per user. A second `forgetty server run` exits with "already
-  running" (file lock `server-<id>.lock`).
-- The server id lives in `~/.local/share/forgetty/server_id`. The layout is in
-  `sessions/<id>.json`, byte logs in `logs/`. All survive a restart.
+  running" (file lock `server-<id>.lock`, exit code 75, which `server start`
+  treats as "another start is under way"). First-run state (`server_id`,
+  `identity.key`) is created while holding `server.lock` in the state dir, so
+  parallel first starts end with one server and one identity.
+- The server id lives in `~/.local/share/forgetty/server_id`. A `server_id`
+  that is not a UUID is an error: the server refuses to start rather than come
+  up with a new id and an empty layout. The layout is in `sessions/<id>.json`
+  (written through a unique temp file, fsync, rename, directory fsync; the
+  previous good copy is `sessions/<id>.json.bak`; a corrupt file loads the
+  `.bak`, logs an error and is kept as `.corrupt`). Byte logs are in `logs/`
+  and are written to the file at the end of every output burst, so a
+  `kill -9` loses no scrollback. All survive a restart.
+- The state directory is mode 0700. `identity.key`, `authorized_devices.json`,
+  `server_id` and the session files are created 0600 at open time (not
+  chmod-ed afterwards). Files an older build left wider are fixed at startup.
+- Pane cwd: `cwd` in `ls` is a display hint (OSC 7 from the shell, accepted
+  only for an empty, `localhost` or local host name). `spawn_cwd` is the real
+  directory (`/proc/<pid>/cwd` of the foreground process group leader) and the
+  only source for the cwd of new tabs and splits.
 - A client disconnect never ends a pane or the server. After a server restart
   the layout is restored and byte logs are replayed into the panes. Processes
   do not survive a restart (a restored pane starts a fresh shell).
@@ -57,6 +80,7 @@ Without systemd: `forgetty server start` runs the server detached and logs to
 forgetty server run                 foreground (what systemd runs)
 forgetty server start               start detached if not running
 forgetty server stop [--if-idle]    --if-idle refuses while a client is attached
+                                    (a stop that begins refuses new attaches)
 forgetty server status [--json]     pid, uptime, version, protocol, panes, clients, iroh node id
 forgetty ls [--json]
 forgetty new [--cwd DIR] [--keep] [-- CMD...]   prints the pane id; --keep = remain on exit
@@ -122,7 +146,9 @@ forgetty pair
 This opens a 60 s window with a fresh 128-bit secret and prints the QR code and
 the payload text. One device can pair in the window. A wrong, expired or reused
 secret is refused. The server logs the device name and id. `forgetty devices`
-lists paired devices, `forgetty revoke ID` removes one.
+lists paired devices, `forgetty revoke ID` removes one and closes every open
+connection of that device, on every ALPN, within a second (the client leaves
+`client ls`).
 
 Old apps that dial `forgetty/pair/1` get an "upgrade the app" error.
 
@@ -131,6 +157,8 @@ Old apps that dial `forgetty/pair/1` get an "upgrade the app" error.
 ```sh
 scripts/p0_gate.sh   # local socket and iroh echo
 scripts/p1_gate.sh   # durability, pairing secret, restart, stop --if-idle
+scripts/p4a_gate.sh  # OSC scanner, status, capture, agent CLI
+scripts/p1qa_gate.sh # revoke, concurrent start, SIGTERM, kill -9, session file, modes
 ```
 
 Both run a server in a temp state dir as the current user and need outbound

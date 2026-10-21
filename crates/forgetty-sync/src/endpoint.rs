@@ -132,6 +132,7 @@ impl SyncEndpointBuilder {
             registry,
             pairing: Arc::new(Mutex::new(PairingState::new())),
             extra_alpns: Arc::new(self.extra_alpns),
+            live: crate::connections::LiveConnections::new(),
             event_tx,
         })
     }
@@ -146,6 +147,8 @@ pub struct SyncEndpoint {
     registry: Arc<Mutex<DeviceRegistry>>,
     pairing: Arc<Mutex<PairingState>>,
     extra_alpns: Arc<HashMap<Vec<u8>, AlpnHandler>>,
+    /// Every open connection by device id, so a revoke can close them all.
+    live: crate::connections::LiveConnections,
     /// Broadcast channel for pairing/connection events. Receivers are vended to
     /// socket RPC handlers via `subscribe()`.
     pub event_tx: broadcast::Sender<SyncEvent>,
@@ -160,6 +163,29 @@ impl SyncEndpoint {
     /// Returns the local `EndpointId` (iroh 0.97 equivalent of spec's `NodeId`).
     pub fn node_id(&self) -> EndpointId {
         self.endpoint.id()
+    }
+
+    /// The table of open connections.
+    pub fn live_connections(&self) -> crate::connections::LiveConnections {
+        self.live.clone()
+    }
+
+    /// Revoke a device: remove it from the registry AND close every open
+    /// connection it has, on every ALPN. Returns `(was_registered, closed)`.
+    ///
+    /// The connections are closed even when the device was not in the registry
+    /// (for example it was removed by hand-editing the file).
+    pub fn revoke_device(
+        &self,
+        device_id: &str,
+    ) -> Result<(bool, usize), crate::registry::RegistryError> {
+        let found = self.registry.lock().unwrap_or_else(|e| e.into_inner()).remove(device_id)?;
+        let closed = self.live.revoke(device_id);
+        if found {
+            let _ =
+                self.event_tx.send(SyncEvent::DeviceRevoked { device_id: device_id.to_string() });
+        }
+        Ok((found, closed))
     }
 
     /// Returns a clone of the shared device registry.
@@ -241,10 +267,14 @@ impl SyncEndpoint {
             let pairing_state = Arc::clone(&self.pairing);
             let event_tx = self.event_tx.clone();
             let extras = Arc::clone(&self.extra_alpns);
+            let live = self.live.clone();
 
             tokio::spawn(async move {
                 match accepting.await {
                     Ok(conn) => {
+                        // Track before dispatch: a revoke that lands while the
+                        // handler starts still finds this connection.
+                        live.track(conn.remote_id().to_string(), conn.clone());
                         if alpn == FORGETTY_PAIRING_ALPN {
                             pairing::handle_pair_v2(conn, registry, pairing_state, event_tx).await;
                         } else if alpn == FORGETTY_PAIRING_ALPN_V1 {

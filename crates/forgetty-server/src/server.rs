@@ -44,23 +44,92 @@ pub struct RunArgs {
     pub session_id: Option<uuid::Uuid>,
 }
 
-/// Read the stable server id from `<data_dir>/server_id`, creating it on first run.
-pub fn load_or_create_server_id() -> anyhow::Result<uuid::Uuid> {
-    let path = forgetty_core::platform::data_dir().join("server_id");
-    if let Ok(text) = std::fs::read_to_string(&path) {
-        if let Ok(id) = uuid::Uuid::parse_str(text.trim()) {
-            return Ok(id);
+/// `server run` exit code when another server already holds the instance lock.
+/// `server start` uses it to tell "someone else is starting" from a real failure.
+pub const EXIT_ALREADY_RUNNING: i32 = 75; // keep in step with cli.rs
+
+/// Another server holds the instance lock.
+#[derive(Debug)]
+pub struct AlreadyRunning(pub PathBuf);
+
+impl std::fmt::Display for AlreadyRunning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "another forgetty server is already running (lock {})", self.0.display())
+    }
+}
+
+impl std::error::Error for AlreadyRunning {}
+
+/// Exclusive lock on `<state_dir>/server.lock`. Held while the server reads or
+/// creates its first-run state (`server_id`, `identity.key`), so two servers
+/// that start at once cannot each invent a different identity.
+///
+/// Released on drop, or by the kernel when the process dies.
+pub struct StateLock(#[allow(dead_code)] std::fs::File);
+
+/// Take the state-dir lock. Waits up to 30 s for another starter to finish.
+pub fn lock_state_dir() -> anyhow::Result<StateLock> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    let dir = forgetty_core::platform::data_dir();
+    forgetty_core::fsutil::ensure_private_dir(&dir)?;
+    let path = dir.join("server.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(forgetty_core::fsutil::FILE_MODE)
+        .open(&path)?;
+    forgetty_core::fsutil::fix_file_mode(&path)?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        // SAFETY: the fd is valid for the lifetime of `file`; flock takes no pointers.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(StateLock(file));
         }
-        warn!("server_id file {} is corrupt, generating a new id", path.display());
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::WouldBlock {
+            anyhow::bail!("lock {}: {err}", path.display());
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("lock {} is held by another starter for over 30 s", path.display());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Read the stable server id from `<data_dir>/server_id`, creating it on first run.
+///
+/// Needs the state lock, so the check-then-create cannot race. A file that is
+/// there but unreadable or not a UUID is an error: the server must not start
+/// with a new identity and an empty layout while saved sessions sit under the
+/// old id.
+pub fn load_or_create_server_id(_lock: &StateLock) -> anyhow::Result<uuid::Uuid> {
+    let path = forgetty_core::platform::data_dir().join("server_id");
+    match std::fs::read_to_string(&path) {
+        Ok(text) => {
+            return uuid::Uuid::parse_str(text.trim()).map_err(|_| {
+                anyhow::anyhow!(
+                    "server_id file {} is corrupt (not a UUID). Refusing to start with a new \
+                     identity: saved sessions belong to the old id. Restore the file, or delete \
+                     it to start over with a new identity",
+                    path.display()
+                )
+            });
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => anyhow::bail!("cannot read {}: {e}", path.display()),
     }
     let id = uuid::Uuid::new_v4();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+    if forgetty_core::fsutil::create_private_if_absent(&path, format!("{id}\n").as_bytes())? {
+        return Ok(id);
     }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, format!("{id}\n"))?;
-    std::fs::rename(&tmp, &path)?;
-    Ok(id)
+    // Created by someone else between the read and the create (not possible
+    // under the lock, but cheap to handle): use theirs.
+    let text = std::fs::read_to_string(&path)?;
+    uuid::Uuid::parse_str(text.trim())
+        .map_err(|_| anyhow::anyhow!("server_id file {} is corrupt", path.display()))
 }
 
 /// Take the single-instance lock `<data_dir>/server-<id>.lock`.
@@ -68,15 +137,21 @@ pub fn load_or_create_server_id() -> anyhow::Result<uuid::Uuid> {
 /// The returned file must stay open for the life of the process. The lock is
 /// released by the kernel when the process exits, however it exits.
 fn acquire_instance_lock(server_id: uuid::Uuid) -> anyhow::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::AsRawFd;
     let dir = forgetty_core::platform::data_dir();
-    std::fs::create_dir_all(&dir)?;
+    forgetty_core::fsutil::ensure_private_dir(&dir)?;
     let path = dir.join(format!("server-{server_id}.lock"));
-    let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(forgetty_core::fsutil::FILE_MODE)
+        .open(&path)?;
     // SAFETY: the fd is valid for the lifetime of `file`; flock takes no pointers.
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc != 0 {
-        anyhow::bail!("another forgetty server is already running (lock {})", path.display());
+        return Err(AlreadyRunning(path).into());
     }
     Ok(file)
 }
@@ -98,12 +173,22 @@ fn init_tracing() {
 pub async fn run(args: RunArgs) -> anyhow::Result<()> {
     init_tracing();
 
-    // Stable server id: survives restarts, so the session file is found again.
-    let session_id = match args.session_id {
-        Some(id) => id,
-        None => load_or_create_server_id()?,
+    // First-run state is created under the state-dir lock: the server id, the
+    // instance lock and the identity key. Two servers that start at once
+    // serialize here, the second finds the instance lock taken and exits.
+    let (session_id, secret_key, _instance_lock) = {
+        let state_lock = lock_state_dir()?;
+        // Stable server id: survives restarts, so the session file is found again.
+        let session_id = match args.session_id {
+            Some(id) => id,
+            None => load_or_create_server_id(&state_lock)?,
+        };
+        let instance_lock = acquire_instance_lock(session_id)?;
+        let secret_key = load_or_generate()?;
+        // Credential files written by an older build keep their old mode until here.
+        forgetty_core::fsutil::fix_file_mode(&forgetty_sync::registry::registry_path())?;
+        (session_id, secret_key, instance_lock)
     };
-    let _instance_lock = acquire_instance_lock(session_id)?;
 
     // The socket gives a shell. Keep it in a private directory, and refuse to
     // start if that directory is unsafe (squatted, symlink, wrong owner/mode).
@@ -511,7 +596,6 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
     // is registered here with a closure that forwards to the terminal-side
     // handler in `forgetty_server::iroh_terminal`, keeping all terminal-
     // specific behaviour out of the transport crate.
-    let secret_key = load_or_generate()?;
     let sm_for_alpn = Arc::clone(&session_manager);
     let sync_endpoint = match SyncEndpoint::builder(secret_key)
         .register_alpn(
@@ -566,6 +650,9 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
         _ = sigterm.recv() => { info!("Received SIGTERM"); }
         _ = sigint.recv()  => { info!("Received SIGINT");  }
     }
+    // Freeze the layout before anything else. Children that die with the
+    // server (a signal to the whole group) must not shrink the saved layout.
+    session_manager.begin_shutdown();
 
     info!("forgetty-server shutting down");
     forgetty_socket::graceful_exit(
@@ -725,19 +812,36 @@ mod tests {
         // SAFETY: this is the only test in this crate that touches the environment.
         unsafe { std::env::set_var("XDG_DATA_HOME", tmp.path()) };
 
-        let first = load_or_create_server_id().unwrap();
-        let second = load_or_create_server_id().unwrap();
+        let state = lock_state_dir().unwrap();
+        let first = load_or_create_server_id(&state).unwrap();
+        let second = load_or_create_server_id(&state).unwrap();
         assert_eq!(first, second, "the id survives a restart");
 
         let lock = acquire_instance_lock(first).unwrap();
         let err = acquire_instance_lock(first).unwrap_err();
         assert!(err.to_string().contains("already running"));
+        assert!(err.downcast_ref::<AlreadyRunning>().is_some());
         drop(lock);
         assert!(acquire_instance_lock(first).is_ok(), "lock is free after the holder exits");
 
-        // A corrupt id file is replaced, not fatal.
-        std::fs::write(forgetty_core::platform::data_dir().join("server_id"), "garbage").unwrap();
-        assert_ne!(load_or_create_server_id().unwrap(), first);
+        // A corrupt id file is an error. It is not replaced and the file is untouched.
+        let id_path = forgetty_core::platform::data_dir().join("server_id");
+        std::fs::write(&id_path, "garbage").unwrap();
+        let err = load_or_create_server_id(&state).unwrap_err();
+        assert!(err.to_string().contains("corrupt"), "{err}");
+        assert_eq!(std::fs::read_to_string(&id_path).unwrap(), "garbage");
+
+        // The state lock is exclusive between processes: a second lock attempt
+        // from another open file description blocks, so test it with flock(2).
+        {
+            use std::os::unix::io::AsRawFd;
+            let other =
+                std::fs::File::open(forgetty_core::platform::data_dir().join("server.lock"))
+                    .unwrap();
+            // SAFETY: valid fd, no pointers.
+            let rc = unsafe { libc::flock(other.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            assert_ne!(rc, 0, "server.lock is held while the StateLock lives");
+        }
 
         unsafe {
             match prior {

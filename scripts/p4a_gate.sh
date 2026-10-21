@@ -127,8 +127,10 @@ fg send -p "$TPANE" "printf '\\033]2;my-title\\007'" --enter
 poll_until "title my-title" 50 field_is "$TPANE" title "my-title"
 fg send -p "$TPANE" "cd /tmp; printf '\\033]7;file://%s%s\\007' \"\$HOSTNAME\" \"\$PWD\"" --enter
 poll_until "cwd /tmp" 50 field_is "$TPANE" cwd "/tmp"
-fg send -p "$TPANE" "printf '\\033]7;file://h/srv/osc7-only\\007'" --enter
+fg send -p "$TPANE" "printf '\\033]7;file://localhost/srv/osc7-only\\007'" --enter
 poll_until "cwd from OSC 7 only" 50 field_is "$TPANE" cwd "/srv/osc7-only"
+# OSC 7 is a display hint: the directory new panes spawn in stays the real one.
+field_is "$TPANE" spawn_cwd "/tmp" || fail "OSC 7 changed spawn_cwd: $(pane_json "$TPANE" spawn_cwd)"
 fg send -p "$TPANE" "printf '\\033]9;gate-note\\007'" --enter
 poll_until "notification" 50 field_is "$TPANE" last_notification.body "gate-note"
 pass "title my-title, cwd /tmp and /srv/osc7-only, notification gate-note"

@@ -154,7 +154,8 @@ fn handle_list_tabs(request: &Request, sm: &SessionManager) -> Response {
                     "pid": info.pid,
                     "rows": info.rows,
                     "cols": info.cols,
-                    "cwd": info.cwd.display().to_string(),
+                    "cwd": info.display_cwd,
+                    "spawn_cwd": info.cwd.display().to_string(),
                     "title": info.title,
                     "remain_on_exit": info.remain_on_exit,
                     "exited": info.exited,
@@ -1168,7 +1169,8 @@ fn handle_get_pane_info(request: &Request, sm: &SessionManager) -> Response {
             "rows": info.rows,
             "cols": info.cols,
             "title": info.title,
-            "cwd": info.cwd.display().to_string(),
+            "cwd": info.display_cwd,
+            "spawn_cwd": info.cwd.display().to_string(),
             "pid": info.pid,
             "remain_on_exit": info.remain_on_exit,
             "exited": info.exited,
@@ -1331,18 +1333,14 @@ fn handle_revoke_device(request: &Request, se: Option<&SyncEndpoint>) -> Respons
         }
     };
 
-    let registry = se.registry();
-    let mut reg = registry.lock().unwrap();
-    match reg.remove(&device_id) {
-        Ok(found) => {
-            if found {
-                // Emit revoke event (best-effort; ignore if no receivers).
-                let _ = se
-                    .event_tx
-                    .send(forgetty_sync::SyncEvent::DeviceRevoked { device_id: device_id.clone() });
-            }
-            Response::success(request.id.clone(), serde_json::json!({ "ok": found }))
-        }
+    // Registry removal AND closing every live connection of the device, on
+    // every ALPN. Removing only the registry entry would leave an open
+    // session running (the registry is checked once, at connect).
+    match se.revoke_device(&device_id) {
+        Ok((found, closed)) => Response::success(
+            request.id.clone(),
+            serde_json::json!({ "ok": found, "closed_connections": closed }),
+        ),
         Err(e) => Response::error(
             request.id.clone(),
             protocol::INTERNAL_ERROR,
@@ -2261,7 +2259,7 @@ mod tests {
     fn server_info_reports_version_proto_and_counts() {
         let sm = make_sm();
         let sid = Uuid::new_v4();
-        let _guard = sm.clients().register("c1", "socket", "test");
+        let _guard = sm.clients().register("c1", "socket", "test").unwrap();
         let resp = dispatch(&req("server_info", serde_json::Value::Null), sm, None, Some(sid));
         let v = resp.result.expect("server_info result");
         assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
@@ -2276,7 +2274,7 @@ mod tests {
     #[test]
     fn list_clients_returns_registered_clients() {
         let sm = make_sm();
-        let _a = sm.clients().register("dev-1", "stream1", "phone");
+        let _a = sm.clients().register("dev-1", "stream1", "phone").unwrap();
         let resp = dispatch(&req("list_clients", serde_json::Value::Null), sm, None, None);
         let clients = resp.result.unwrap()["clients"].as_array().unwrap().clone();
         assert_eq!(clients.len(), 1);
@@ -2418,5 +2416,43 @@ mod tests {
             tab_idx: 0
         })
         .is_none());
+    }
+
+    #[tokio::test]
+    async fn osc7_hint_does_not_choose_the_split_directory() {
+        let tmp = std::fs::canonicalize("/tmp").unwrap();
+        let sm = make_sm();
+        let params = serde_json::json!({
+            "workspace_idx": 0,
+            "cwd": tmp.display().to_string(),
+            "command": ["sh", "-c", "printf '\\033]7;file://localhost/etc\\007'; sleep 30"],
+        });
+        let resp = dispatch(&req("new_tab", params), Arc::clone(&sm), None, None);
+        let pane = resp.result.unwrap()["pane_id"].as_str().unwrap().to_string();
+        let pane_id = PaneId(Uuid::parse_str(&pane).unwrap());
+        for _ in 0..200 {
+            if sm.pane_info(pane_id).is_some_and(|i| i.display_cwd == "/etc") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        // Display: the hint. Spawn: the real directory.
+        let tabs =
+            dispatch(&req("list_tabs", serde_json::Value::Null), Arc::clone(&sm), None, None);
+        let tab = &tabs.result.unwrap()["tabs"][0];
+        assert_eq!(tab["cwd"], "/etc");
+        assert_eq!(tab["spawn_cwd"], tmp.display().to_string());
+
+        // A split without an explicit cwd opens in the real directory.
+        let resp = dispatch(
+            &req("split_pane", serde_json::json!({ "pane_id": pane, "direction": "vertical" })),
+            Arc::clone(&sm),
+            None,
+            None,
+        );
+        let new_pane = resp.result.expect("split ok")["pane_id"].as_str().unwrap().to_string();
+        let new_id = PaneId(Uuid::parse_str(&new_pane).unwrap());
+        assert_eq!(sm.pane_info(new_id).unwrap().cwd, tmp, "the split opens in /tmp, not /etc");
     }
 }

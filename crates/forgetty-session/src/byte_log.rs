@@ -264,6 +264,17 @@ async fn disk_appender_task(
                 }
                 file_size_approx = file_size_approx.saturating_add(data.len() as u64);
 
+                // End of this drain wake: nothing else is queued, so hand the
+                // buffered bytes to the kernel now. A kill -9 or a crash then
+                // loses nothing the pane already printed (the page cache
+                // outlives the process). Event driven, no timer (AD-009). A
+                // burst is written as one flush at its end.
+                if rx.is_empty() {
+                    if let Err(e) = writer.flush().await {
+                        warn!(pane = %pane_id, "disk appender: flush failed: {e}");
+                    }
+                }
+
                 if file_size_approx >= max_disk_bytes {
                     // Rotation: keep newest max_disk_bytes / 2 (SPEC §10.6).
                     // Rationale: halving the size avoids immediate re-rotation
@@ -281,8 +292,13 @@ async fn disk_appender_task(
                 }
             }
             Some(DiskMsg::Flush(reply)) => {
+                // Explicit flush (shutdown, disconnect): also fsync, so the log
+                // survives a power cut, not just a process crash.
                 if let Err(e) = writer.flush().await {
                     warn!(pane = %pane_id, "disk appender: flush failed: {e}");
+                }
+                if let Err(e) = writer.get_ref().sync_data().await {
+                    warn!(pane = %pane_id, "disk appender: fsync failed: {e}");
                 }
                 let _ = reply.send(());
             }
@@ -457,6 +473,27 @@ mod tests {
             max_disk
         );
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// P1-QA item 4: bytes reach the file at the end of a drain wake, with no
+    /// explicit flush and no close. Before the fix they sat in the BufWriter
+    /// until a signal or a close, so a crash lost the scrollback.
+    #[tokio::test]
+    async fn bytes_reach_the_file_without_an_explicit_flush() {
+        let pane_id = Uuid::new_v4();
+        let mut log = ByteLog::new(pane_id, 1024, 1024 * 1024).unwrap();
+        log.append(b"echo MARK_42\r\n");
+        let path = pane_log_path(pane_id);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let got = std::fs::read(&path).unwrap_or_default();
+            if got == b"echo MARK_42\r\n" {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "file holds {got:?}");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
         let _ = std::fs::remove_file(&path);
     }
 

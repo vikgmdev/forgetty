@@ -78,7 +78,7 @@ async fn pane_exited_and_pane_closed_are_forwarded() {
 async fn title_cwd_and_status_events_are_forwarded() {
     let sm = Arc::new(SessionManager::new());
     let (_dir, mut reader, task) = subscribe(Arc::clone(&sm)).await;
-    let script = "printf '\\033]2;evt-title\\007\\033]7;file://h/var/tmp\\007\\033]7501;state=done:msg=RmluaXNoZWQ=\\007'; sleep 30";
+    let script = "printf '\\033]2;evt-title\\007\\033]7;file:///var/tmp\\007\\033]7501;state=done:msg=RmluaXNoZWQ=\\007'; sleep 30";
     let cmd = Some(vec!["sh".into(), "-c".into(), script.into()]);
     let (pane, _) = sm.create_tab(0, None, size(), cmd).unwrap();
     let id = pane.to_string();

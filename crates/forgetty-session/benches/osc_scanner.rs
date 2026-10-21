@@ -306,9 +306,8 @@ fn main() {
 
     println!();
     println!("-- measured");
-    // No OSC 7 here: once a pane reports its cwd the server stops reading
-    // /proc for it, which would make "scanner on" faster than "off" and hide
-    // the scanner's own cost.
+    // Without OSC 7 here, so the stream matches what the micro runs call the
+    // typical case without cwd reports.
     let overhead = end_to_end(&rt, &sm, &replicate(&mixed_stream(false, false)));
     println!();
     println!(

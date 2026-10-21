@@ -6,6 +6,7 @@
 
 pub mod error;
 pub mod event;
+pub mod fsutil;
 pub mod platform;
 pub mod sanitize;
 pub mod types;

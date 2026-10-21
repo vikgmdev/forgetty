@@ -39,6 +39,10 @@ const BROADCAST_CAPACITY: usize = 1024;
 /// How many exited-pane exit codes the manager remembers.
 const EXIT_HISTORY_CAP: usize = 1024;
 
+/// How long an exited pane stays in the layout before it is closed (see
+/// `finish_pane`).
+const CLOSE_GRACE: std::time::Duration = std::time::Duration::from_millis(300);
+
 // ---------------------------------------------------------------------------
 // Internal state
 // ---------------------------------------------------------------------------
@@ -72,6 +76,10 @@ struct SessionManagerInner {
     /// Run the OSC scanner on PTY output (AD-019). On by default. Only the
     /// benchmark turns it off, to measure what the scanner costs.
     osc_scanning: bool,
+    /// The server is shutting down. Pane exits after this point must not
+    /// remove panes from the layout: the process exits right after and the
+    /// saved layout has to keep every pane for the next start.
+    shutting_down: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -108,8 +116,27 @@ impl SessionManager {
                 byte_log_max_mb: 10,
                 exit_history: std::collections::VecDeque::new(),
                 osc_scanning: true,
+                shutting_down: false,
             })),
         }
+    }
+
+    /// Freeze the layout for shutdown.
+    ///
+    /// From now on a pane whose process ends is not closed, so the layout in
+    /// memory (and the file saved from it) keeps every pane. This matters when
+    /// `systemctl stop` or a signal to the whole process group ends the shells
+    /// at the same moment as the server: without it the exits would shrink
+    /// the saved layout and the next start would come up with fewer panes.
+    /// Call it first thing in the shutdown path. It cannot be undone.
+    pub fn begin_shutdown(&self) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.shutting_down = true;
+    }
+
+    /// Whether [`begin_shutdown`](Self::begin_shutdown) was called.
+    pub fn is_shutting_down(&self) -> bool {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).shutting_down
     }
 
     /// Turn the OSC scanner on or off for all panes (AD-019). It is on by
@@ -1536,13 +1563,7 @@ impl SessionManager {
             .get_mut(&id)
             .ok_or_else(|| forgetty_core::ForgettyError::Pty(format!("pane {id} not found")))?;
 
-        if !pane.osc.cwd_from_osc {
-            if let Some(pid) = pane.pty_bridge.pty.pid() {
-                if let Ok(cwd) = std::fs::read_link(format!("/proc/{pid}/cwd")) {
-                    pane.cwd = cwd;
-                }
-            }
-        }
+        refresh_cwd(pane);
         let pty_exited = !pane.pty_bridge.pty.is_alive();
 
         // AD-019: scan for OSC 0/2/7/9/99/777/7501/133. Byte-level state
@@ -1737,6 +1758,15 @@ impl SessionManager {
             let _ = self.process_pane_bytes(pane_id, notice.as_bytes());
             debug!(%pane_id, ?code, "pane kept after exit (remain_on_exit)");
         } else {
+            // Grace before the pane leaves the layout. A signal sent to the
+            // server and its children together can end a child before the
+            // server has seen its own signal. The wait lets `begin_shutdown`
+            // win that race. One-shot, not a poll.
+            tokio::time::sleep(CLOSE_GRACE).await;
+            if self.is_shutting_down() {
+                debug!(%pane_id, "pane exited during shutdown, kept in the layout");
+                return;
+            }
             let _ = self.close_pane(pane_id);
         }
     }
@@ -1781,6 +1811,11 @@ impl SessionManager {
             rows: pane.rows,
             cols: pane.cols,
             cwd: pane.cwd.clone(),
+            display_cwd: pane
+                .osc
+                .display_cwd
+                .clone()
+                .unwrap_or_else(|| pane.cwd.display().to_string()),
             title: pane.title.clone(),
             remain_on_exit: pane.remain_on_exit,
             exited: pane.exited,
@@ -2172,12 +2207,57 @@ fn collect_pane_ids(tree: &PaneTreeLayout, out: &mut Vec<PaneId>) {
 /// existing cached value is kept.
 fn refresh_pane_cwds(panes: &mut HashMap<PaneId, PaneState>) {
     for pane in panes.values_mut() {
-        if let Some(pid) = pane.pty_bridge.pty.pid() {
-            if let Ok(cwd) = std::fs::read_link(format!("/proc/{pid}/cwd")) {
-                pane.cwd = cwd;
-            }
+        refresh_cwd(pane);
+    }
+}
+
+/// The pane's real working directory: `/proc/<pgid>/cwd` of the foreground
+/// process group leader, else `/proc/<pid>/cwd` of the shell. Never read from
+/// pane output.
+fn live_cwd(pane: &PaneState) -> Option<PathBuf> {
+    let pty = &pane.pty_bridge.pty;
+    if let Some(pgrp) = pty.foreground_pgrp().filter(|p| *p > 0) {
+        if let Ok(cwd) = std::fs::read_link(format!("/proc/{pgrp}/cwd")) {
+            return Some(cwd);
         }
     }
+    let pid = pty.pid()?;
+    std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+}
+
+/// Update `pane.cwd` from `/proc`. When the real directory changes, the OSC 7
+/// hint is stale and is dropped (a cooperating shell sends a new one at its
+/// next prompt).
+fn refresh_cwd(pane: &mut PaneState) {
+    if let Some(cwd) = live_cwd(pane) {
+        if pane.cwd != cwd {
+            pane.cwd = cwd;
+            pane.osc.display_cwd = None;
+        }
+    }
+}
+
+/// Is `host` (from an OSC 7 URL) this machine? Empty, `localhost` or the
+/// local hostname (full or short form), case-insensitive.
+fn is_local_host(host: &str) -> bool {
+    use std::sync::OnceLock;
+    static LOCAL: OnceLock<String> = OnceLock::new();
+    if host.is_empty() || host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let local = LOCAL.get_or_init(|| {
+        std::fs::read_to_string("/proc/sys/kernel/hostname")
+            .ok()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .or_else(|| std::env::var("HOSTNAME").ok().map(|s| s.to_ascii_lowercase()))
+            .unwrap_or_default()
+    });
+    if local.is_empty() {
+        return false;
+    }
+    let host = host.to_ascii_lowercase();
+    let short = |s: &str| s.split('.').next().unwrap_or("").to_string();
+    host == *local || short(&host) == short(local)
 }
 
 /// Recursively convert a `PaneTreeLayout` (daemon live tree) into a
@@ -2252,12 +2332,16 @@ fn apply_osc_events(
                     out.push(SessionEvent::TitleChanged { pane_id: id, title: t });
                 }
             }
-            OscEvent::Cwd(c) => {
-                pane.osc.cwd_from_osc = true;
-                let path = PathBuf::from(&c);
-                if pane.cwd != path {
-                    pane.cwd = path;
-                    out.push(SessionEvent::CwdChanged { pane_id: id, cwd: c });
+            OscEvent::Cwd { host, path } => {
+                // OSC 7 is output from the program in the pane, so it is a
+                // display hint only. It must come from this machine, and it
+                // never changes `pane.cwd`, which is where new panes spawn.
+                if !is_local_host(&host) {
+                    continue;
+                }
+                if pane.osc.display_cwd.as_deref() != Some(path.as_str()) {
+                    pane.osc.display_cwd = Some(path.clone());
+                    out.push(SessionEvent::CwdChanged { pane_id: id, cwd: path });
                 }
             }
             OscEvent::Status(report) => {
@@ -4309,6 +4393,42 @@ mod tests {
         assert_eq!(sm.pane_exit_status(pane), Some((false, Some(7))));
     }
 
+    /// P1-QA item 3: a pane whose process ends after `begin_shutdown` stays in
+    /// the layout, so the layout saved at shutdown keeps every pane.
+    #[tokio::test]
+    async fn pane_exit_after_begin_shutdown_keeps_the_pane_in_the_layout() {
+        let sm = SessionManager::new();
+        let (kept, _) = sm
+            .create_tab_with_options(0, None, small(), sh("sleep 0.3"), PaneId::new(), false)
+            .unwrap();
+        let (control, _) = sm
+            .create_tab_with_options(0, None, small(), sh("sleep 0.3"), PaneId::new(), false)
+            .unwrap();
+        assert!(!sm.is_shutting_down());
+
+        // Both panes end after the freeze, as when a signal reaches the
+        // server and its children together.
+        sm.begin_shutdown();
+        assert!(sm.is_shutting_down());
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert!(sm.pane_info(kept).is_some(), "pane stays after the freeze");
+        assert!(sm.pane_info(control).is_some());
+        let tabs: usize =
+            sm.snapshot_to_workspace_state().workspaces.iter().map(|w| w.tabs.len()).sum();
+        assert_eq!(tabs, 2, "the saved layout keeps both panes");
+        // The exit code is still recorded.
+        assert_eq!(sm.pane_exit_status(kept), Some((false, Some(0))));
+    }
+
+    #[tokio::test]
+    async fn pane_exit_without_shutdown_still_closes_the_pane() {
+        let sm = SessionManager::new();
+        let (pane, _) = sm
+            .create_tab_with_options(0, None, small(), sh("exit 0"), PaneId::new(), false)
+            .unwrap();
+        assert!(wait_for(|| sm.pane_info(pane).is_none()).await, "pane closes after the grace");
+    }
+
     #[tokio::test]
     async fn default_pane_closes_on_exit_and_records_the_code() {
         let sm = SessionManager::new();
@@ -4354,7 +4474,7 @@ mod tests {
         let sm = SessionManager::new();
         let mut rx = sm.subscribe_output();
         let script = "printf '\\033]2;my-title\\007'; \
-                      printf '\\033]7;file://h/var/tmp\\007'; \
+                      printf '\\033]7;file:///var/tmp\\007'; \
                       printf '\\033]7501;state=blocked:kind=question:msg=SXMgaXQgb2s/\\033\\\\'; \
                       printf '\\033]777;notify;Build;finished\\007'; \
                       sleep 30";
@@ -4387,7 +4507,8 @@ mod tests {
 
         let info = sm.pane_info(pane).unwrap();
         assert_eq!(info.title, "my-title");
-        assert_eq!(info.cwd, PathBuf::from("/var/tmp"), "OSC 7 beats /proc once reported");
+        assert_eq!(info.display_cwd, "/var/tmp", "OSC 7 is shown as the display cwd");
+        assert_ne!(info.cwd, PathBuf::from("/var/tmp"), "but it is not the real cwd");
         assert_eq!(info.status.status, crate::status::PaneStatus::Waiting);
         assert_eq!(info.status.kind.as_deref(), Some("question"));
         let n = info.last_notification.expect("notification stored");
@@ -4473,6 +4594,51 @@ mod tests {
             _ => None,
         });
         assert_eq!(code, Some(Some(7)));
+    }
+
+    #[tokio::test]
+    async fn osc7_cannot_choose_the_spawn_directory() {
+        let tmp = std::fs::canonicalize("/tmp").unwrap();
+        let sm = SessionManager::new();
+        let script = "printf '\\033]7;file://localhost/etc\\007'; sleep 30";
+        let (pane, _) = sm.create_tab(0, Some(tmp.clone()), small(), sh(script)).unwrap();
+        assert!(
+            wait_for(|| sm.pane_info(pane).is_some_and(|i| i.display_cwd == "/etc")).await,
+            "the hint is shown"
+        );
+        let info = sm.pane_info(pane).unwrap();
+        assert_eq!(info.cwd, tmp, "the real cwd is still /tmp");
+        // The layout that is saved and restored holds the real cwd too.
+        let saved = sm.snapshot_to_workspace_state();
+        let cwds = format!("{:?}", saved.workspaces);
+        assert!(cwds.contains("/tmp") && !cwds.contains("/etc"), "saved layout: {cwds}");
+        sm.close_pane(pane).unwrap();
+    }
+
+    #[tokio::test]
+    async fn osc7_from_another_host_is_ignored() {
+        let sm = SessionManager::new();
+        let script = "printf '\\033]7;file://evil.example.com/etc\\007'; \
+                      printf '\\033]7;file://LocalHost/var/tmp\\007'; sleep 30";
+        let (pane, _) = sm.create_tab(0, None, small(), sh(script)).unwrap();
+        assert!(wait_for(|| sm.pane_info(pane).is_some_and(|i| i.display_cwd == "/var/tmp")).await);
+        assert!(!sm.pane_info(pane).unwrap().display_cwd.contains("evil"));
+        sm.close_pane(pane).unwrap();
+    }
+
+    #[test]
+    fn local_host_check() {
+        assert!(is_local_host(""));
+        assert!(is_local_host("localhost"));
+        assert!(is_local_host("LOCALHOST"));
+        assert!(!is_local_host("evil.example.com"));
+        let me = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default();
+        let me = me.trim();
+        if !me.is_empty() {
+            assert!(is_local_host(me));
+            assert!(is_local_host(&me.to_ascii_uppercase()));
+            assert!(!is_local_host(&format!("{me}x")));
+        }
     }
 
     #[tokio::test]

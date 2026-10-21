@@ -27,9 +27,10 @@ pub struct PaneOsc {
     /// Status last published, to emit `StatusChanged` only on a real change.
     pub published: StatusSnapshot,
     pub last_notification: Option<NotificationInfo>,
-    /// The shell reported its directory with OSC 7. From then on that wins
-    /// over the process cwd from `/proc` (the shell may be on another host).
-    pub cwd_from_osc: bool,
+    /// Directory the program reported with OSC 7 (host checked). A display
+    /// hint only: it is never used to spawn a pane, to save the layout or to
+    /// split. Cleared when the real cwd changes.
+    pub display_cwd: Option<String>,
     /// Notification rate limit window.
     pub notify_window_start_ms: u64,
     pub notify_in_window: u32,
@@ -73,8 +74,12 @@ pub struct PaneInfo {
     pub pid: Option<u32>,
     pub rows: u16,
     pub cols: u16,
-    /// Last known working directory.
+    /// Real working directory: `/proc/<pid>/cwd` of the foreground process
+    /// group leader, else of the shell. This is what new tabs and splits use.
     pub cwd: PathBuf,
+    /// What to show for the directory: the OSC 7 hint if the program sent a
+    /// valid one for this host, else `cwd`. Display only.
+    pub display_cwd: String,
     /// Last known title.
     pub title: String,
     /// Kept after exit (opt-in).

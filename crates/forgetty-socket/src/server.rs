@@ -395,11 +395,19 @@ async fn handle_streaming_connection(
             // ---------------------------------------------------------------
             let (mut rx, replay_bytes, _replay_hwm) = sm.subscribe_with_snapshot(pane_id);
             // AD-017: a streaming socket is an attached client until it closes.
-            let _client = sm.clients().register(
+            let Ok(_client) = sm.clients().register(
                 uuid::Uuid::new_v4().to_string(),
                 "socket",
                 format!("subscribe_output {pane_id}"),
-            );
+            ) else {
+                let resp = Response::error(
+                    request.id.clone(),
+                    crate::protocol::SERVER_BUSY,
+                    "server is stopping".to_string(),
+                );
+                write_response(&mut writer, &resp).await?;
+                return Ok(());
+            };
 
             // Send the initial acknowledgment (last line-mode JSON response
             // on this connection).
@@ -502,11 +510,19 @@ async fn handle_streaming_connection(
             // Reuse the same broadcast channel as subscribe_output; we filter
             // to layout variants in the loop below.
             let mut rx = sm.subscribe_output();
-            let _client = sm.clients().register(
+            let Ok(_client) = sm.clients().register(
                 uuid::Uuid::new_v4().to_string(),
                 "socket",
                 "subscribe_layout".to_string(),
-            );
+            ) else {
+                let resp = Response::error(
+                    request.id.clone(),
+                    crate::protocol::SERVER_BUSY,
+                    "server is stopping".to_string(),
+                );
+                write_response(&mut writer, &resp).await?;
+                return Ok(());
+            };
 
             // Send the initial acknowledgment.
             let ack = Response::success(request.id.clone(), serde_json::json!({ "ok": true }));
@@ -885,9 +901,12 @@ async fn handle_streaming_connection(
 
         if request.method == methods::SHUTDOWN {
             let if_idle = request.params.get("if_idle").and_then(|v| v.as_bool()).unwrap_or(false);
+            // Enter the stopping state BEFORE answering. For --if-idle the idle
+            // check and the switch happen under one lock, so a client cannot
+            // attach between the check and the exit and then lose its session
+            // to the exit. If the check fails the state is untouched.
             if if_idle {
-                let attached = sm.clients().count();
-                if attached > 0 {
+                if let Err(attached) = sm.clients().begin_stop_if_idle() {
                     let resp = Response::error(
                         request.id.clone(),
                         crate::protocol::SERVER_BUSY,
@@ -896,6 +915,8 @@ async fn handle_streaming_connection(
                     write_response(&mut writer, &resp).await?;
                     continue;
                 }
+            } else {
+                sm.clients().begin_stop();
             }
             let resp = Response::success(request.id, serde_json::json!({ "ok": true }));
             write_response(&mut writer, &resp).await?;
@@ -1015,7 +1036,19 @@ fn peer_is_allowed(stream: &tokio::net::UnixStream, allowed_uid: Option<u32>) ->
 }
 
 /// Write the layout to `sessions/{server_id}.json` (AD-017). Failures are logged.
+///
+/// Does nothing once the server is shutting down: from then on only
+/// [`graceful_exit`] writes the file, so a late pane exit cannot save a
+/// smaller layout over the good one.
 pub fn save_layout(sm: &SessionManager, session_id: uuid::Uuid) {
+    if sm.is_shutting_down() {
+        return;
+    }
+    save_layout_final(sm, session_id);
+}
+
+/// Write the layout even in the shutdown state. Only the shutdown path calls this.
+fn save_layout_final(sm: &SessionManager, session_id: uuid::Uuid) {
     let state = sm.snapshot_to_workspace_state();
     if let Err(e) = forgetty_workspace::save_session_for(session_id, &state) {
         warn!("failed to save session layout: {e}");
@@ -1035,10 +1068,13 @@ pub async fn graceful_exit(
     session_id: Option<uuid::Uuid>,
     socket_path: &Path,
 ) -> ! {
+    // Freeze the layout first: nothing that happens from here on (a child
+    // dying with the server, a late PaneClosed) may rewrite the saved layout.
+    sm.begin_shutdown();
     sm.flush_all_byte_logs().await;
     info!("byte logs flushed");
     if let Some(sid) = session_id {
-        save_layout(sm, sid);
+        save_layout_final(sm, sid);
     }
     if let Some(se) = sync_endpoint {
         se.close().await;

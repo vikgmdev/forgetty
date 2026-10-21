@@ -192,9 +192,15 @@ workspaces. Despite the name, this is a pane list, not a tab list; prefer
 **Result:**
 ```json
 {"tabs":[{"pane_id":"<uuid>","pid":12345,"rows":24,"cols":80,
-         "cwd":"/home/user","title":"zsh",
+         "cwd":"/home/user","spawn_cwd":"/home/user","title":"zsh",
          "remain_on_exit":false,"exited":false,"exit_code":null}]}
 ```
+
+`cwd` is a display hint: the directory the shell reported with OSC 7, accepted
+only when its host is empty, `localhost` or the local host name, else the real
+directory. `spawn_cwd` is always the real directory (`/proc/<pid>/cwd` of the
+pane's foreground process group leader, else of the shell). New tabs and splits
+start in `spawn_cwd`; pane output cannot choose it.
 
 `exited` is true only for a pane kept with `remain_on_exit` whose process has
 ended. `exit_code` is then the process exit code (`null` if unknown).
@@ -358,7 +364,7 @@ Return metadata for a live pane.
 **Params:** `{"pane_id":"<uuid>"}` (required).
 
 **Result:** `{"pane_id":"<uuid>","rows":24,"cols":80,
-              "title":"<string>","cwd":"<path>","pid":<number>}`
+              "title":"<string>","cwd":"<path>","spawn_cwd":"<path>","pid":<number>}`
 
 #### `resize_pane`
 
@@ -599,15 +605,20 @@ List paired devices (from `authorized_devices.json`).
 
 #### `revoke_device`
 
-Remove a paired device. Live streams from that device are cut immediately
-and a `DeviceRevoked` event is emitted on the local sync event channel.
+Remove a paired device. Every open connection of that device, on every ALPN
+(pairing, `forgetty/stream/1` and any later protocol), is closed at once with
+application code 403 `device-revoked`. It leaves the client registry
+(`list_clients`) and a `DeviceRevoked` event is emitted on the local sync event
+channel. Connections are closed even if the device was no longer in the
+registry.
 
 **Request:** `{"jsonrpc":"2.0","method":"revoke_device","params":{"device_id":"<id>"},"id":1}`
 
 **Params:** `{"device_id":"<id>"}` (required).
 
-**Result:** `{"ok":<bool>}` — `true` if the device was in the registry,
-`false` if not found.
+**Result:** `{"ok":<bool>,"closed_connections":<n>}` — `ok` is `true` if the
+device was in the registry, `false` if not found. `closed_connections` is the
+number of live connections that were closed.
 
 #### `get_pairing_info`
 
@@ -693,7 +704,10 @@ iroh endpoint, remove the socket, exit. The ack line is written first.
 
 **Params:** `{"if_idle":<bool>}` (optional). With `if_idle`, the call fails with
 code `-32001` and message `N client(s) attached` while any client is attached
-(see `list_clients`).
+(see `list_clients`). The idle check and the switch to the stopping state are
+one atomic step: once a stop begins, `subscribe_output`, `subscribe_layout` and
+iroh streams are refused with `server is stopping`. A refused `if_idle` stop
+leaves the server open.
 
 **Result:** `{"ok":true}`
 

@@ -285,7 +285,7 @@ fn build_pane_list(sm: &SessionManager) -> Vec<WirePaneInfo> {
             sm.pane_info(pid).map(|info| WirePaneInfo {
                 id: pid.to_string(),
                 title: info.title,
-                cwd: info.cwd.to_string_lossy().into_owned(),
+                cwd: info.display_cwd,
                 git_branch: String::new(),
                 running_cmd: String::new(),
                 is_active: active_pane_ids.contains(&pid),
@@ -342,8 +342,13 @@ pub async fn handle_terminal_stream(
         let reg = registry.lock().unwrap();
         reg.list().iter().find(|d| d.device_id == device_id).map(|d| d.name.clone())
     };
-    let _client =
-        sm.clients().register(device_id.clone(), "stream1", device_name.unwrap_or_default());
+    let Ok(_client) =
+        sm.clients().register(device_id.clone(), "stream1", device_name.unwrap_or_default())
+    else {
+        info!("stream: device {device_id} refused, server is stopping");
+        conn.close(2u8.into(), b"server-stopping");
+        return;
+    };
 
     // --- Accept bi-directional streams (one per operation) ---
     loop {

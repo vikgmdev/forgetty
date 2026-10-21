@@ -88,8 +88,10 @@ pub struct StatusReport {
 pub enum OscEvent {
     /// OSC 0 or 2. Sanitised, can be empty.
     Title(String),
-    /// OSC 7. An absolute path, sanitised.
-    Cwd(String),
+    /// OSC 7. The host part of the `file://` URL (can be empty) and an
+    /// absolute path, sanitised. The caller decides if the host is this
+    /// machine. The path is a display hint only, never a spawn directory.
+    Cwd { host: String, path: String },
     /// OSC 7501.
     Status(StatusReport),
     /// OSC 9, 99 or 777.
@@ -385,8 +387,8 @@ impl OscScanner {
         match kind {
             Kind::Title => sink(OscEvent::Title(clean_text(&body, MAX_TITLE_CHARS))),
             Kind::Cwd => {
-                if let Some(p) = parse_cwd(&body) {
-                    sink(OscEvent::Cwd(p));
+                if let Some((host, path)) = parse_cwd(&body) {
+                    sink(OscEvent::Cwd { host, path });
                 }
             }
             Kind::Status => {
@@ -507,10 +509,14 @@ fn parse_osc777(body: &[u8]) -> Option<OscEvent> {
 }
 
 /// OSC 7: `file://host/path` with percent-escapes. Only an absolute path is
-/// accepted, and no decoded control character.
-fn parse_cwd(body: &[u8]) -> Option<String> {
+/// accepted, and no decoded control character. Returns `(host, path)`.
+fn parse_cwd(body: &[u8]) -> Option<(String, String)> {
     let rest = body.strip_prefix(b"file://")?;
     let slash = rest.iter().position(|&b| b == b'/')?;
+    let host = &rest[..slash];
+    if host.len() > 255 || !host.iter().all(|&b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) {
+        return None;
+    }
     let path = &rest[slash..];
     let mut out = Vec::with_capacity(path.len());
     let mut i = 0;
@@ -531,7 +537,7 @@ fn parse_cwd(body: &[u8]) -> Option<String> {
     }
     let s = String::from_utf8(out).ok()?;
     let clean = untrusted_max(&s, MAX_CWD_CHARS);
-    clean.starts_with('/').then_some(clean)
+    clean.starts_with('/').then(|| (String::from_utf8_lossy(host).into_owned(), clean))
 }
 
 fn hex(b: u8) -> Option<u8> {
@@ -794,9 +800,9 @@ mod tests {
     #[test]
     fn cwd_osc7() {
         let ev = assert_split_invariant(b"\x1b]7;file://host/tmp/some%20dir\x07");
-        assert_eq!(ev, vec![OscEvent::Cwd("/tmp/some dir".into())]);
+        assert_eq!(ev, vec![OscEvent::Cwd { host: "host".into(), path: "/tmp/some dir".into() }]);
         let ev = assert_split_invariant(b"\x1b]7;file:///var/tmp\x1b\\");
-        assert_eq!(ev, vec![OscEvent::Cwd("/var/tmp".into())]);
+        assert_eq!(ev, vec![OscEvent::Cwd { host: String::new(), path: "/var/tmp".into() }]);
     }
 
     #[test]
@@ -806,6 +812,9 @@ mod tests {
         assert!(scan(b"\x1b]7;file://host/tmp/%0Aevil\x07").is_empty());
         assert!(scan(b"\x1b]7;file://host/tmp/%zz\x07").is_empty());
         assert!(scan(b"\x1b]7;file://host/tmp/%4\x07").is_empty());
+        // a host with odd characters is rejected before it reaches the caller
+        assert!(scan(b"\x1b]7;file://ho st/tmp\x07").is_empty());
+        assert!(scan(b"\x1b]7;file://h%40/tmp\x07").is_empty());
     }
 
     #[test]
@@ -1172,7 +1181,7 @@ mod tests {
             ev,
             vec![
                 OscEvent::Title("one".into()),
-                OscEvent::Cwd("/x".into()),
+                OscEvent::Cwd { host: String::new(), path: "/x".into() },
                 OscEvent::Notification { title: None, body: "note".into() },
                 OscEvent::PromptStart,
             ]

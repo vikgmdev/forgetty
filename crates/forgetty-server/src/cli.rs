@@ -283,6 +283,9 @@ fn resolve_pane(client: &mut Client, target: &str) -> Result<String> {
 // server start / stop / status
 // ---------------------------------------------------------------------------
 
+/// `forgetty server run` exit code when another server already runs (EX_TEMPFAIL).
+const EXIT_ALREADY_RUNNING: i32 = 75;
+
 pub fn server_start() -> Result<()> {
     match Client::connect() {
         Ok((_, info)) => {
@@ -297,7 +300,8 @@ pub fn server_start() -> Result<()> {
 
     let exe = std::env::current_exe().map_err(|e| CliError::Failed(e.to_string()))?;
     let data = forgetty_core::platform::data_dir();
-    std::fs::create_dir_all(&data).map_err(|e| CliError::Failed(e.to_string()))?;
+    forgetty_core::fsutil::ensure_private_dir(&data)
+        .map_err(|e| CliError::Failed(e.to_string()))?;
     let log_path: PathBuf = data.join("server.log");
     let log = std::fs::OpenOptions::new()
         .create(true)
@@ -331,6 +335,17 @@ pub fn server_start() -> Result<()> {
             Err(e) => return Err(e),
         }
         if let Ok(Some(status)) = child.try_wait() {
+            // Another `server start` won the race: its server is on the way up.
+            // Keep waiting for it instead of reporting a failure.
+            if status.code() == Some(EXIT_ALREADY_RUNNING) {
+                if Instant::now() >= deadline {
+                    return Err(CliError::Failed(
+                        "another server holds the lock but did not come up within 20 s".into(),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
             return Err(CliError::Failed(format!(
                 "server exited at startup ({status}). See {}",
                 log_path.display()

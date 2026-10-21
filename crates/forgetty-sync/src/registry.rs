@@ -1,7 +1,7 @@
 //! Authorized device registry: `~/.local/share/forgetty/authorized_devices.json`.
 //!
-//! All writes are atomic (write to `.tmp` + rename) per R-4 to prevent
-//! corruption on daemon crash mid-write.
+//! All writes are atomic (unique temp file, fsync, rename) per R-4 to prevent
+//! corruption on daemon crash mid-write. The file is created mode 0600.
 
 use std::path::PathBuf;
 
@@ -47,11 +47,15 @@ impl DeviceRegistry {
     pub fn load() -> Result<Self, RegistryError> {
         let path = registry_path();
 
-        // Remove stale temp file from a previous crash.
+        // Remove the shared temp file an older build could leave behind.
         let tmp = path.with_extension("json.tmp");
         if tmp.exists() {
             let _ = std::fs::remove_file(&tmp);
         }
+
+        // The device list is a credential store: keep it 0600 even if an older
+        // build or a loose umask created it wider.
+        forgetty_core::fsutil::fix_file_mode(&path)?;
 
         let devices = if path.exists() {
             let data = std::fs::read_to_string(&path)?;
@@ -119,15 +123,12 @@ impl DeviceRegistry {
         self.save()
     }
 
-    /// Atomically write the registry to disk (write tmp, then rename).
+    /// Atomically write the registry to disk: unique temp file created 0600,
+    /// fsync, rename, fsync of the directory. No shared temp name, no
+    /// non-atomic fallback.
     fn save(&self) -> Result<(), RegistryError> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let tmp = self.path.with_extension("json.tmp");
         let json = serde_json::to_string_pretty(&self.devices)?;
-        std::fs::write(&tmp, json)?;
-        std::fs::rename(&tmp, &self.path)?;
+        forgetty_core::fsutil::write_private_atomic(&self.path, json.as_bytes())?;
         Ok(())
     }
 }
@@ -186,4 +187,38 @@ fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
 
 fn is_leap(y: u64) -> bool {
     (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn entry(id: &str) -> DeviceEntry {
+        DeviceEntry {
+            device_id: id.into(),
+            name: "n".into(),
+            paired_at: iso8601_now(),
+            last_seen: None,
+        }
+    }
+
+    #[test]
+    fn registry_file_is_created_0600_and_leaves_no_temp_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state/authorized_devices.json");
+        let mut reg = DeviceRegistry::empty_at(path.clone());
+        reg.add(entry("a")).unwrap();
+        reg.add(entry("b")).unwrap();
+        assert!(reg.remove("a").unwrap());
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(path.parent().unwrap()), 0o700);
+        let names: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["authorized_devices.json".to_string()], "{names:?}");
+    }
 }

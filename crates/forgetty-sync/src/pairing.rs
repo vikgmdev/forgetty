@@ -116,6 +116,10 @@ pub struct PairingState {
     window: Option<Window>,
     next_id: u64,
     paired: Option<(u64, String, String)>,
+    /// Window whose secret was accepted and whose device is being saved. The
+    /// save fsyncs, so this gap is long enough for a status poll to land in
+    /// it. It reads as "open" until `record_paired` or `abandon_pairing`.
+    in_progress: Option<u64>,
 }
 
 impl PairingState {
@@ -163,12 +167,23 @@ impl PairingState {
         }
         let id = window.id;
         self.window = None;
+        self.in_progress = Some(id);
         Ok(id)
     }
 
     /// Remember which device used window `id`.
     pub fn record_paired(&mut self, id: u64, device_id: &str, name: &str) {
+        if self.in_progress == Some(id) {
+            self.in_progress = None;
+        }
         self.paired = Some((id, device_id.to_string(), name.to_string()));
+    }
+
+    /// The device of window `id` could not be saved: the window is spent.
+    pub fn abandon_pairing(&mut self, id: u64) {
+        if self.in_progress == Some(id) {
+            self.in_progress = None;
+        }
     }
 
     /// Status of window `id`.
@@ -177,6 +192,11 @@ impl PairingState {
             if *pid == id {
                 return PairStatus::Paired { device_id: device_id.clone(), name: name.clone() };
             }
+        }
+        if self.in_progress == Some(id) {
+            // The secret was accepted a moment ago and the device is being
+            // saved. Not expired, not yet paired.
+            return PairStatus::Open { secs_left: 1 };
         }
         match &self.window {
             Some(w) if w.id == id && now < w.expires => {
@@ -266,6 +286,10 @@ pub async fn handle_pair_v2(
                         }
                         Err(e) => {
                             warn!("pair: failed to save device {device_id}: {e}");
+                            state
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .abandon_pairing(window_id);
                             PairResult { ok: false, reason: Some("server_error".to_string()) }
                         }
                     }
@@ -481,6 +505,19 @@ mod tests {
             st.status(w.id, t0),
             PairStatus::Paired { device_id: "abc".into(), name: "phone".into() }
         );
+    }
+
+    /// The gap between "secret accepted" and "device saved" must not read as
+    /// expired: `forgetty pair` polls status and gave up in that gap.
+    #[test]
+    fn status_is_open_while_the_device_is_being_saved() {
+        let mut st = PairingState::new();
+        let t0 = Instant::now();
+        let w = open(&mut st, t0);
+        let id = st.verify(&w.secret, t0).unwrap();
+        assert!(matches!(st.status(w.id, t0), PairStatus::Open { .. }), "not expired mid-save");
+        st.abandon_pairing(id);
+        assert_eq!(st.status(w.id, t0), PairStatus::Expired, "a failed save ends the window");
     }
 
     #[test]

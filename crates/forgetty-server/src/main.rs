@@ -233,7 +233,11 @@ fn main() {
                 Ok(()) => 0,
                 Err(e) => {
                     eprintln!("forgetty server: {e}");
-                    cli::EXIT_FAILED
+                    if e.downcast_ref::<server::AlreadyRunning>().is_some() {
+                        server::EXIT_ALREADY_RUNNING
+                    } else {
+                        cli::EXIT_FAILED
+                    }
                 }
             }
         }

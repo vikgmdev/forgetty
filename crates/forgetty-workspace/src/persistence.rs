@@ -22,7 +22,7 @@ pub fn session_path() -> PathBuf {
 
 /// Persist the workspace state as JSON to the default session file.
 ///
-/// Uses atomic write (write to `.tmp`, then `rename()`) to avoid corrupt
+/// Atomic and durable (unique temp file, fsync, rename; last good copy kept as `.bak`) to avoid corrupt
 /// files if the process is killed mid-write. Creates parent directories
 /// if they do not already exist.
 pub fn save_session(state: &WorkspaceState) -> Result<()> {
@@ -32,7 +32,7 @@ pub fn save_session(state: &WorkspaceState) -> Result<()> {
 /// Load the workspace state from the default session file.
 ///
 /// Returns `Ok(None)` when the file does not exist.
-/// Returns `Ok(None)` (and logs a warning) when the file is corrupt.
+/// A corrupt file falls back to the `.bak` copy (see `load_from_path`).
 pub fn load_session() -> Result<Option<WorkspaceState>> {
     Ok(load_from_path(&session_path())?)
 }
@@ -50,7 +50,7 @@ pub fn session_path_for(session_id: uuid::Uuid) -> PathBuf {
 
 /// Persist the workspace state to a UUID-named session file.
 ///
-/// Uses atomic write (write to `.tmp`, then `rename()`) to avoid corrupt
+/// Atomic and durable (unique temp file, fsync, rename; last good copy kept as `.bak`) to avoid corrupt
 /// files if the process is killed mid-write.
 pub fn save_session_for(session_id: uuid::Uuid, state: &WorkspaceState) -> io::Result<()> {
     save_to_path(&session_path_for(session_id), state)
@@ -58,7 +58,7 @@ pub fn save_session_for(session_id: uuid::Uuid, state: &WorkspaceState) -> io::R
 
 /// Load the workspace state from a UUID-named session file.
 ///
-/// Returns `Ok(None)` when the file does not exist or is corrupt.
+/// Returns `Ok(None)` when the file does not exist. A corrupt file falls back to `.bak`.
 pub fn load_session_for(session_id: uuid::Uuid) -> io::Result<Option<WorkspaceState>> {
     load_from_path(&session_path_for(session_id))
 }
@@ -86,41 +86,102 @@ pub fn list_sessions() -> Vec<uuid::Uuid> {
 // Private helpers (shared by default and UUID-based save/load)
 // ---------------------------------------------------------------------------
 
-/// Atomically write `state` to `path` as pretty-printed JSON.
+/// Serializes every session-file save in this process.
 ///
-/// Creates parent directories if they do not already exist. Uses a `.tmp`
-/// sibling file and `rename()` for atomicity.
-fn save_to_path(path: &std::path::Path, state: &WorkspaceState) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+/// The layout watcher, the debounce task, the periodic save and the shutdown
+/// path can all save at once. One lock means one writer at a time, so a slow
+/// older snapshot can never land after a newer one that started later.
+static SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Path of the last-good copy of a session file: `X.json` -> `X.json.bak`.
+fn backup_path(path: &std::path::Path) -> PathBuf {
+    let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    name.push(".bak");
+    path.with_file_name(name)
+}
+
+/// Where a corrupt session file is moved so it is kept for inspection:
+/// `X.json` -> `X.json.corrupt`.
+fn corrupt_path(path: &std::path::Path) -> PathBuf {
+    let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    name.push(".corrupt");
+    path.with_file_name(name)
+}
+
+/// Make the file at `path` the `.bak`, if it is a readable session. The `.bak`
+/// shares the inode with the old main file (hard link, then rename over the
+/// previous `.bak`), so this costs no copy and is atomic.
+fn rotate_backup(path: &std::path::Path) {
+    let Ok(old) = fs::read(path) else { return };
+    if serde_json::from_slice::<WorkspaceState>(&old).is_err() {
+        // Never replace a good backup with a damaged file.
+        return;
     }
+    let bak = backup_path(path);
+    let link = forgetty_core::fsutil::unique_tmp_path(path);
+    let result = fs::hard_link(path, &link).and_then(|()| fs::rename(&link, &bak));
+    if let Err(e) = result {
+        let _ = fs::remove_file(&link);
+        tracing::warn!("could not keep {} as last good: {e}", bak.display());
+    }
+}
+
+/// Atomically and durably write `state` to `path` as pretty-printed JSON.
+///
+/// - One save at a time per process (`SAVE_LOCK`).
+/// - Unique temp file (no shared `.tmp` name), created `0600`, `fsync`ed, then
+///   `rename`d; the directory is `fsync`ed after. There is no non-atomic
+///   fallback: when the rename fails the error is returned and the old file
+///   stays intact.
+/// - The previous good file is kept as `X.json.bak`.
+fn save_to_path(path: &std::path::Path, state: &WorkspaceState) -> io::Result<()> {
     let json = serde_json::to_string_pretty(state)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-    // Atomic write: write to temp file, then rename.
-    let tmp_path = path.with_extension("json.tmp");
-    fs::write(&tmp_path, &json)?;
-    if let Err(e) = fs::rename(&tmp_path, path) {
-        tracing::warn!("Atomic rename failed ({e}), falling back to direct write");
-        fs::write(path, &json)?;
+    let _guard = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if path.exists() {
+        rotate_backup(path);
     }
-    Ok(())
+    forgetty_core::fsutil::write_private_atomic(path, json.as_bytes())
 }
 
 /// Read and deserialize `WorkspaceState` from `path`.
 ///
-/// Returns `Ok(None)` when the file does not exist or the JSON is corrupt
-/// (a warning is printed to tracing in the latter case).
+/// - Missing file: `Ok(None)`.
+/// - Corrupt file: the last good copy (`X.json.bak`) is loaded and an error is
+///   logged. The corrupt file is moved to `X.json.corrupt`.
+/// - Corrupt file and no usable backup: an error is logged and `Ok(None)` is
+///   returned (the corrupt file is kept as `X.json.corrupt`).
 fn load_from_path(path: &std::path::Path) -> io::Result<Option<WorkspaceState>> {
     if !path.exists() {
         return Ok(None);
     }
-    let contents = fs::read_to_string(path)?;
-    match serde_json::from_str::<WorkspaceState>(&contents) {
-        Ok(state) => Ok(Some(state)),
-        Err(e) => {
-            // Corrupt or incompatible session file — treat as missing.
-            tracing::warn!("Session file is corrupt or incompatible ({e}), ignoring");
+    let contents = fs::read_to_string(path);
+    let parse_err = match contents.as_ref().map(|c| serde_json::from_str::<WorkspaceState>(c)) {
+        Ok(Ok(state)) => return Ok(Some(state)),
+        Ok(Err(e)) => e.to_string(),
+        Err(e) => e.to_string(),
+    };
+    tracing::error!(
+        "session file {} is corrupt or unreadable ({parse_err}); trying the last good copy",
+        path.display()
+    );
+    let bak = backup_path(path);
+    let recovered =
+        fs::read_to_string(&bak).ok().and_then(|c| serde_json::from_str::<WorkspaceState>(&c).ok());
+    if let Err(e) = fs::rename(path, corrupt_path(path)) {
+        tracing::warn!("could not move the corrupt session file aside: {e}");
+    }
+    match recovered {
+        Some(state) => {
+            tracing::error!("recovered {} from {}", path.display(), bak.display());
+            Ok(Some(state))
+        }
+        None => {
+            tracing::error!(
+                "no usable backup for {}; the corrupt file is kept as {}",
+                path.display(),
+                corrupt_path(path).display()
+            );
             Ok(None)
         }
     }
@@ -1717,5 +1778,107 @@ mod tests {
 
         let listed = list_sessions();
         assert_eq!(listed, vec![id], "list_sessions should only return top-level UUIDs");
+    }
+}
+
+#[cfg(test)]
+mod p1qa_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn named(name: &str) -> WorkspaceState {
+        WorkspaceState {
+            workspaces: vec![crate::workspace::Workspace {
+                id: Uuid::new_v4(),
+                name: name.to_string(),
+                root_paths: Vec::new(),
+                tabs: Vec::new(),
+                active_tab: 0,
+                color: None,
+            }],
+            ..WorkspaceState::default()
+        }
+    }
+
+    fn marker(s: &WorkspaceState) -> String {
+        s.workspaces.first().map(|w| w.name.clone()).unwrap_or_default()
+    }
+
+    #[test]
+    fn save_is_0600_keeps_a_bak_and_leaves_no_temp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions/a.json");
+        save_to_path(&path, &named("one")).unwrap();
+        assert!(!backup_path(&path).exists(), "no bak after the first save");
+        save_to_path(&path, &named("two")).unwrap();
+        save_to_path(&path, &named("three")).unwrap();
+        let mode = |p: &std::path::Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        let bak: WorkspaceState =
+            serde_json::from_str(&fs::read_to_string(backup_path(&path)).unwrap()).unwrap();
+        assert_eq!(marker(&bak), "two", "bak is the previous good save");
+        let mut names: Vec<_> = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["a.json".to_string(), "a.json.bak".to_string()], "{names:?}");
+    }
+
+    #[test]
+    fn corrupt_main_loads_the_bak_and_keeps_the_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.json");
+        save_to_path(&path, &named("good")).unwrap();
+        save_to_path(&path, &named("newer")).unwrap();
+        fs::write(&path, b"{ truncated").unwrap();
+        let loaded = load_from_path(&path).unwrap().expect("bak is loaded");
+        assert_eq!(marker(&loaded), "good");
+        assert_eq!(fs::read(corrupt_path(&path)).unwrap(), b"{ truncated");
+    }
+
+    #[test]
+    fn a_corrupt_main_never_replaces_a_good_bak() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.json");
+        save_to_path(&path, &named("good")).unwrap();
+        save_to_path(&path, &named("newer")).unwrap();
+        fs::write(&path, b"garbage").unwrap();
+        save_to_path(&path, &named("after")).unwrap();
+        let bak: WorkspaceState =
+            serde_json::from_str(&fs::read_to_string(backup_path(&path)).unwrap()).unwrap();
+        assert_eq!(marker(&bak), "good");
+    }
+
+    #[test]
+    fn corrupt_main_without_bak_is_none_and_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.json");
+        fs::write(&path, b"nope").unwrap();
+        assert!(load_from_path(&path).unwrap().is_none());
+        assert!(corrupt_path(&path).exists());
+    }
+
+    #[test]
+    fn concurrent_saves_never_corrupt_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.json");
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let p = path.clone();
+                std::thread::spawn(move || {
+                    for j in 0..40 {
+                        save_to_path(&p, &named(&format!("w{i}-{j}"))).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let loaded = load_from_path(&path).unwrap().expect("a valid file");
+        assert!(marker(&loaded).starts_with('w'));
+        assert!(!corrupt_path(&path).exists(), "load never had to recover");
     }
 }

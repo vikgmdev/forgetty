@@ -1105,6 +1105,7 @@ version = "0.1.0-beta"
 dependencies = [
  "dirs",
  "serde",
+ "tempfile",
  "thiserror 2.0.18",
  "uuid",
 ]

@@ -13,6 +13,7 @@
 //! - `SecretKey::generate()` → `SecretKey::generate(&mut rand::rngs::OsRng)`
 //! - `connecting.remote_node_id()` → `connection.remote_id()` (post-handshake)
 
+pub mod connections;
 pub mod endpoint;
 pub mod identity;
 pub mod pairing;
