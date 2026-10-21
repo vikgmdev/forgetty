@@ -168,6 +168,7 @@ enum Phase {
     RealSetup,
     RealPair,
     RealEcho,
+    RealSize,
     RealKeys,
     RealKill,
     RealRestart,
@@ -214,6 +215,7 @@ impl Phase {
             Phase::RealSetup => "w4-real-setup",
             Phase::RealPair => "w4-real-pair",
             Phase::RealEcho => "w4-real-echo",
+            Phase::RealSize => "w4-real-size",
             Phase::RealKeys => "w4-real-keys",
             Phase::RealKill => "w4-real-kill",
             Phase::RealRestart => "w4-real-restart",
@@ -264,6 +266,9 @@ pub struct ShellSmoke {
     nav_ok: bool,
     shot_frames: u32,
     frames_seen: u64,
+    /// Time between two `step` calls (one per frame), while frames flow: the runner's frame interval.
+    step_gaps: Vec<f64>,
+    last_step: Option<Instant>,
     w3: remote::W3,
     real: real::Real,
 }
@@ -352,6 +357,8 @@ impl ShellSmoke {
             nav_ok: true,
             shot_frames: 0,
             frames_seen: 0,
+            step_gaps: Vec::new(),
+            last_step: None,
             w3: remote::W3::default(),
             real: real::Real::new(real_distro),
         }
@@ -360,6 +367,26 @@ impl ShellSmoke {
     /// Phases that measure latency or throughput must not get extra frames.
     pub fn wants_ticks(&self) -> bool {
         !matches!(self.phase, Phase::Keys | Phase::Throughput | Phase::Synth | Phase::Keys4 | Phase::RKeys)
+    }
+
+    /// The runner's frame interval in ms: the median gap between frames (60 Hz on WARP gives 16.7).
+    /// Falls back to 16.67 when too few frames were seen.
+    fn frame_ms(&self) -> f64 {
+        if self.step_gaps.len() < 30 {
+            return 1000.0 / 60.0;
+        }
+        let mut g = self.step_gaps.clone();
+        g.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        g[g.len() / 2]
+    }
+
+    /// Key latency gate in frames: the median must be at most one frame plus 1.5 ms. The
+    /// latency lands on a frame boundary, so a limit in plain ms would fail on runner jitter.
+    fn key_gate(&self, p50: f64, suffix: &str) -> bool {
+        let frame = self.frame_ms();
+        record(&format!("frame_interval_ms{suffix}"), json!((frame * 100.0).round() / 100.0));
+        record(&format!("key_p50_frames{suffix}"), json!((p50 / frame * 100.0).round() / 100.0));
+        p50 <= frame + 1.5
     }
 
     fn goto(&mut self, p: Phase) {
@@ -434,6 +461,16 @@ impl ShellSmoke {
             record(&format!("window_active_at_frame_{}", self.frames_seen), json!(window.is_window_active()));
         }
         self.frames_seen += 1;
+        if let Some(t) = self.last_step.replace(now_t) {
+            let gap = ms(now_t - t);
+            // Gaps of an idle app are not the frame interval.
+            if (3.0..50.0).contains(&gap) {
+                if self.step_gaps.len() >= 600 {
+                    self.step_gaps.drain(..300);
+                }
+                self.step_gaps.push(gap);
+            }
+        }
         let phase_limit = if real::distro().is_some() { REAL_PHASE_TIMEOUT } else { PHASE_TIMEOUT };
         if self.phase_t0.elapsed() > phase_limit {
             if !is_w1(self.phase) {
@@ -504,7 +541,7 @@ impl ShellSmoke {
                     self.max_reshaped_per_key = self.max_reshaped_per_key.max(v.rows_reshaped_last);
                     if self.lat_ms.len() >= KEYSTROKES {
                         let (p50, reshaped) = summarize_keys(&self.lat_ms, self.max_reshaped_per_key, "");
-                        check("key_p50_le_18ms", p50 <= 18.0);
+                        check("key_p50_le_1frame_plus_1_5ms", self.key_gate(p50, ""));
                         check("damage_only_redraw", reshaped <= 3);
                         self.lat_ms.clear();
                         self.max_reshaped_per_key = 0;
@@ -952,7 +989,7 @@ impl ShellSmoke {
                         let (p50, reshaped) = summarize_keys(&self.lat_ms, self.max_reshaped_per_key, "_4panes");
                         record("rows_reshaped_unfocused_total_4panes", json!(self.others_reshaped));
                         record("visible_panes", json!(4));
-                        check("key_p50_4panes_le_18ms", p50 <= 18.0);
+                        check("key_p50_4panes_le_1frame_plus_1_5ms", self.key_gate(p50, "_4panes"));
                         check("damage_only_4panes", reshaped <= 3 && self.others_reshaped == 0);
                         view.update(cx, |v, _| v.send_bytes(&[0x1b]));
                         self.drag_divider(shell, cx);
@@ -1200,6 +1237,7 @@ impl ShellSmoke {
             Phase::RealSetup
             | Phase::RealPair
             | Phase::RealEcho
+            | Phase::RealSize
             | Phase::RealKeys
             | Phase::RealKill
             | Phase::RealRestart

@@ -72,6 +72,8 @@ pub struct Real {
     resets_before: u64,
     restarts: u8,
     port: u16,
+    /// The pane size the server reported for the last probe: `None` until it answers.
+    size_probe: Arc<Mutex<Option<(u16, u16)>>>,
     burst_t0: Option<Instant>,
     burst_fed0: u64,
     burst_last: Option<Instant>,
@@ -167,6 +169,19 @@ impl ShellSmoke {
             Err(e) => o.push_str(&format!("status: cannot run: {e}\n")),
         }
         o
+    }
+
+    /// Ask the server for `pane`'s PTY size (`get_pane_info`); the answer lands in `size_probe`.
+    fn probe_size(&self, shell: &AppShell, pane: PaneId, cx: &mut Context<AppShell>) {
+        *self.real.size_probe.lock().unwrap() = None;
+        let fut = shell.backend.get_pane_info(pane);
+        let out = self.real.size_probe.clone();
+        cx.spawn(async move |_this, _cx| {
+            if let Ok(i) = fut.await {
+                *out.lock().unwrap() = Some((i.rows, i.cols));
+            }
+        })
+        .detach();
     }
 
     fn real_dump(&self, shell: &AppShell, cx: &gpui::App) {
@@ -284,7 +299,7 @@ impl ShellSmoke {
                     check("real_echo_isolated", isolated);
                     let resets = self.real.panes.iter().all(|p| shell.views.get(p).is_some_and(|v| v.read(cx).resets >= 1));
                     check("real_vt_reset_on_attach", resets);
-                    self.goto(Phase::RealKeys);
+                    self.goto(Phase::RealSize);
                     return;
                 }
                 let p = self.real.panes[i];
@@ -303,6 +318,43 @@ impl ShellSmoke {
                 }
             }
             // ---- key to frame over the real server ----------------------------------------------
+            // ---- the server's PTY size follows the client grid (AD-020) -----------------------------
+            Phase::RealSize => {
+                let p0 = self.real.panes[0];
+                let Some(view) = shell.views.get(&p0).cloned() else { return };
+                let (grid, visible) = {
+                    let v = view.read(cx);
+                    ((v.rows as u16, v.cols as u16), v.visible)
+                };
+                match self.sub {
+                    0 => {
+                        if self.sub_t0.elapsed() < Duration::from_millis(1500) {
+                            return; // let the resize request reach the server
+                        }
+                        self.probe_size(shell, p0, cx);
+                        self.sub = 1;
+                    }
+                    _ => {
+                        let got = *self.real.size_probe.lock().unwrap();
+                        match got {
+                            Some(sz) if sz == grid || self.sub_t0.elapsed() > Duration::from_secs(10) => {
+                                record("real_size_before_restart", json!({"server": [sz.0, sz.1], "client": [grid.0, grid.1], "visible": visible}));
+                                check("real_server_size_equals_client_grid", sz == grid);
+                                self.goto(Phase::RealKeys);
+                            }
+                            Some(_) => {
+                                // Not equal yet: ask again, five times a second at most.
+                                if self.real.last_probe.map_or(true, |t| t.elapsed() > Duration::from_millis(200)) {
+                                    self.real.last_probe = Some(Instant::now());
+                                    self.probe_size(shell, p0, cx);
+                                }
+                            }
+                            None if self.sub_t0.elapsed() > Duration::from_secs(10) => fail("real: get_pane_info never answered"),
+                            None => {}
+                        }
+                    }
+                }
+            }
             Phase::RealKeys => {
                 let p0 = self.real.panes[0];
                 if shell.active_tab().map(|t| t.pane_tree.contains(p0)) != Some(true) {
@@ -482,9 +534,32 @@ impl ShellSmoke {
             // ---- the client's screen against `forgetty capture` ---------------------------------------
             Phase::RealFinal => {
                 let p0 = self.real.panes[0];
-                if !self.real_quiet(shell, cx, p0, Duration::from_millis(1500)) {
+                if self.sub == 0 {
+                    if !self.real_quiet(shell, cx, p0, Duration::from_millis(1500)) {
+                        return;
+                    }
+                    self.probe_size(shell, p0, cx);
+                    self.sub = 1;
+                    self.sub_t0 = Instant::now();
                     return;
                 }
+                // After a restart and a resume the server pane must have the client's grid again.
+                let grid = shell.views.get(&p0).map(|v| (v.read(cx).rows as u16, v.read(cx).cols as u16)).unwrap_or((0, 0));
+                let got = *self.real.size_probe.lock().unwrap();
+                match got {
+                    Some(sz) if sz == grid => {}
+                    _ if self.sub_t0.elapsed() > Duration::from_secs(10) => {}
+                    Some(_) => {
+                        if self.real.last_probe.map_or(true, |t| t.elapsed() > Duration::from_millis(200)) {
+                            self.real.last_probe = Some(Instant::now());
+                            self.probe_size(shell, p0, cx);
+                        }
+                        return;
+                    }
+                    None => return,
+                }
+                record("real_size_after_restart", json!({"server": got.map(|g| [g.0, g.1]), "client": [grid.0, grid.1]}));
+                check("real_server_size_equals_client_grid_after_restart", got == Some(grid));
                 let Some(s) = snap(shell, cx, p0) else { fail("real pane view vanished") };
                 let mut mine: Vec<String> = s.rows.iter().map(|r| r.trim_end().to_string()).collect();
                 while mine.last().is_some_and(|r| r.is_empty()) {
@@ -499,11 +574,9 @@ impl ShellSmoke {
                         while theirs.last().is_some_and(|r| r.is_empty()) {
                             theirs.pop();
                         }
-                        // The client grid can be taller than the server's pane: compare the last rows
-                        // both have, and require at least 20 of them.
-                        let n = mine.len().min(theirs.len());
+                        // Both sides hold the same grid now (AD-020), so the whole screen must match.
                         record("real_screen_rows", json!([mine.len(), theirs.len()]));
-                        let same = n >= 20 && mine[mine.len() - n..] == theirs[theirs.len() - n..];
+                        let same = mine.len() >= 20 && mine == theirs;
                         check("real_final_screen_matches_capture", same);
                         if !same {
                             record("real_screen_client", json!(mine));

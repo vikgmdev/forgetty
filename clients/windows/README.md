@@ -111,7 +111,7 @@ Ctrl+Shift+W close pane, Alt+Arrows focus, Ctrl+Shift+Z zoom, Ctrl+B sidebar, Ct
 Ctrl+Shift+N new workspace. Middle-click closes a tab; tabs and dividers drag.
 
 W2 smoke checks (on top of the W1 list): `tabs_4`, `tab_nav`, `split_4_panes`, `zoom_toggle`,
-`echo_per_pane`, `echo_isolated`, `key_p50_4panes_le_18ms`, `damage_only_4panes` (re-shaped rows in
+`echo_per_pane`, `echo_isolated`, `key_p50_4panes_le_1frame_plus_1_5ms`, `damage_only_4panes` (re-shaped rows in
 unfocused panes must stay 0), `divider_drag_ratios`, `divider_pty_follow`, `status_events`, `screenshot`
 (writes `layout-4pane.png`, uploaded as artifact `forgetty-win-layout-4pane`), `close_pane_pty_exit`,
 `close_tab_pty_exit`, `palette_opens`, `palette_fuzzy_split_right`, `palette_runs_action`, `tab_rename`,
@@ -243,7 +243,7 @@ downloaded or installed by the app. No telemetry: the request carries only a
 only if every check in `checks` is true. 10 s is no longer the budget (the throughput test needs
 more): hard timeout 420 s, 60 s per phase. On failure the JSON carries the last screen dump.
 
-Checks: `echo_found`, `key_p50_le_18ms`, `damage_only_redraw`, `key_encoder`, `kitty_encoder`,
+Checks: `echo_found`, `key_p50_le_1frame_plus_1_5ms` (median key-to-frame at most one measured frame interval plus 1.5 ms; the ms numbers stay in smoke.json), `damage_only_redraw`, `key_encoder`, `kitty_encoder`,
 `wide_direct`, `wide_shell`, `scrollback_direct`, `scrollback_shell`, `resize`, `throughput`,
 `throughput_conpty` (25k lines through ConPTY), `throughput_pump` (22.5 MB injected into the real
 pump at full speed, gate: no frame gap over 100 ms), `config`, `mouse_encoder`, `paste`, `selection`.

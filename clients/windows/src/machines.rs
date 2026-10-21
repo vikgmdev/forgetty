@@ -351,6 +351,14 @@ impl AppShell {
             e.conn = st.clone();
         }
         if st.is_connected() && !was_connected && self.machines.iter().any(|m| m.id == id && m.kind == MachineKind::Remote) {
+            // A new connection has no size on record at the server (a restarted server
+            // restores its panes at the default size, and a resumed stream has no reset):
+            // send each pane's grid again so the PTY follows this client (AD-020).
+            self.with_machine(id, |s| {
+                for v in s.views.values() {
+                    v.read(cx).reassert_size();
+                }
+            });
             // Events may have been missed while the link was down.
             self.fetch_layout(id, cx);
             self.save_addr_cache();
