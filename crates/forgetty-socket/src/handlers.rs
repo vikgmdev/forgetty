@@ -14,6 +14,9 @@ use forgetty_pty::PtySize;
 use forgetty_session::layout::{SessionLayout, SessionTab};
 use forgetty_session::workspace::PaneTreeLayout;
 use forgetty_session::{SessionManager, MAX_PANE_DIM};
+
+/// How long a local `send_input` waits for room in a pane's input queue.
+const LOCAL_INPUT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 use forgetty_sync::SyncEndpoint;
 use uuid::Uuid;
 
@@ -192,11 +195,8 @@ pub(crate) fn handle_new_tab(request: &Request, sm: &SessionManager) -> Response
         }
     };
 
-    let rows =
-        request.params.get("rows").and_then(|v| v.as_u64()).unwrap_or(DEFAULT_ROWS as u64) as u16;
-
-    let cols =
-        request.params.get("cols").and_then(|v| v.as_u64()).unwrap_or(DEFAULT_COLS as u64) as u16;
+    let rows = dim_param(request, "rows", DEFAULT_ROWS as u64);
+    let cols = dim_param(request, "cols", DEFAULT_COLS as u64);
 
     let size = PtySize { rows, cols, pixel_width: 0, pixel_height: 0 };
 
@@ -988,11 +988,8 @@ pub(crate) fn handle_split_pane(request: &Request, sm: &SessionManager) -> Respo
         );
     }
 
-    let rows =
-        request.params.get("rows").and_then(|v| v.as_u64()).unwrap_or(DEFAULT_ROWS as u64) as u16;
-
-    let cols =
-        request.params.get("cols").and_then(|v| v.as_u64()).unwrap_or(DEFAULT_COLS as u64) as u16;
+    let rows = dim_param(request, "rows", DEFAULT_ROWS as u64);
+    let cols = dim_param(request, "cols", DEFAULT_COLS as u64);
 
     let size = PtySize { rows, cols, pixel_width: 0, pixel_height: 0 };
 
@@ -1133,7 +1130,10 @@ pub(crate) fn handle_send_input(request: &Request, sm: &SessionManager) -> Respo
         }
     };
 
-    match sm.write_pty(id, &bytes) {
+    // A local caller is trusted: wait for room in the pane's queue instead of
+    // dropping (GTK VT replies must not be lost). The wait is bounded, so a
+    // hung pane cannot hold the handler thread for good.
+    match sm.write_pty_blocking(id, &bytes, LOCAL_INPUT_WAIT) {
         Ok(()) => Response::success(request.id.clone(), serde_json::json!({ "ok": true })),
         Err(e) => Response::error(
             request.id.clone(),
@@ -1177,6 +1177,13 @@ pub(crate) fn handle_get_pane_info(request: &Request, sm: &SessionManager) -> Re
             "last_notification": notification_json(&info),
         }),
     )
+}
+
+/// A `rows` or `cols` param, clamped to `1..=MAX_PANE_DIM` before it becomes a
+/// `u16` (a bare `as u16` wraps 65537 to 1).
+fn dim_param(request: &Request, key: &str, default: u64) -> u16 {
+    let n = request.params.get(key).and_then(|v| v.as_u64()).unwrap_or(default);
+    n.clamp(1, u64::from(MAX_PANE_DIM)) as u16
 }
 
 pub(crate) fn handle_resize_pane(request: &Request, sm: &SessionManager) -> Response {
@@ -1233,21 +1240,17 @@ pub(crate) fn handle_send_sigint(request: &Request, sm: &SessionManager) -> Resp
     // the local VINTR via ssh's pty-modes payload (FIX-017).
     let intr_byte = sm.intr_byte(id).unwrap_or(0x03);
 
-    match sm.write_pty(id, &[intr_byte]) {
-        Ok(()) => {
-            // For non-forwarder foreground processes (e.g., Node.js, pm2 in
-            // raw mode that swallow the byte), also kill(-pgid, SIGINT) so
-            // the signal reaches them via the kernel directly (BUG-001).
-            // Forwarders (ssh, mosh) are skipped — see `send_sigint`.
-            sm.send_sigint(id);
-            Response::success(request.id.clone(), serde_json::json!({ "ok": true }))
-        }
-        Err(e) => Response::error(
-            request.id.clone(),
-            protocol::INTERNAL_ERROR,
-            format!("failed to send SIGINT: {e}"),
-        ),
+    // The signal always goes out. The byte is best effort: a pane whose queue
+    // is full (a program that never reads) must still be interruptible.
+    if let Err(e) = sm.write_pty(id, &[intr_byte]) {
+        tracing::debug!(pane = %id, "send_sigint: intr byte not queued: {e}");
     }
+    // For non-forwarder foreground processes (e.g., Node.js, pm2 in raw mode
+    // that swallow the byte), also kill(-pgid, SIGINT) so the signal reaches
+    // them via the kernel directly (BUG-001). Forwarders (ssh, mosh) are
+    // skipped, see `send_sigint`.
+    sm.send_sigint(id);
+    Response::success(request.id.clone(), serde_json::json!({ "ok": true }))
 }
 
 // ---------------------------------------------------------------------------
@@ -1342,7 +1345,8 @@ pub(crate) fn handle_revoke_device(request: &Request, se: Option<&SyncEndpoint>)
             protocol::INTERNAL_ERROR,
             format!(
                 "device revoked and {} connection(s) closed, but the device list could not be \
-                 saved: {e}. The device stays denied until the next successful save.",
+                 saved: {e}. The device stays denied, and the server retries the save every 5 s \
+                 (it is also recorded in revoked.pending).",
                 out.closed
             ),
         );

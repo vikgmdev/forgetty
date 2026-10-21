@@ -1078,6 +1078,9 @@ pub fn add_shutdown_hook(hook: Box<dyn Fn() + Send + Sync>) {
     SHUTDOWN_HOOKS.lock().unwrap_or_else(|e| e.into_inner()).push(hook);
 }
 
+/// Longest `graceful_exit` waits for the byte logs to flush, and again to seal.
+const BYTE_LOG_STOP_LIMIT: std::time::Duration = std::time::Duration::from_secs(3);
+
 pub async fn graceful_exit(
     sm: &SessionManager,
     sync_endpoint: Option<&SyncEndpoint>,
@@ -1087,8 +1090,15 @@ pub async fn graceful_exit(
     // Freeze the layout first: nothing that happens from here on (a child
     // dying with the server, a late PaneClosed) may rewrite the saved layout.
     sm.begin_shutdown();
-    sm.flush_all_byte_logs().await;
-    sm.seal_all_byte_logs().await;
+    // Bounded: a full disk or a stuck appender must not hang `server stop`.
+    // A log that did not flush or seal stays unsealed, and the next start
+    // treats it as a crash (offsets move forward, nothing is reused).
+    if tokio::time::timeout(BYTE_LOG_STOP_LIMIT, sm.flush_all_byte_logs()).await.is_err() {
+        warn!("byte log flush did not finish in {BYTE_LOG_STOP_LIMIT:?}, stopping anyway");
+    }
+    if tokio::time::timeout(BYTE_LOG_STOP_LIMIT, sm.seal_all_byte_logs()).await.is_err() {
+        warn!("byte log seal did not finish in {BYTE_LOG_STOP_LIMIT:?}, stopping anyway");
+    }
     info!("byte logs flushed");
     for hook in SHUTDOWN_HOOKS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
         hook();

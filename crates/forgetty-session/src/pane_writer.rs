@@ -11,7 +11,9 @@
 
 use std::collections::VecDeque;
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use tokio::sync::{oneshot, Notify};
 
@@ -54,6 +56,18 @@ struct Shared {
     state: Mutex<State>,
     work: Condvar,
     space: Notify,
+    /// Pulsed after every finished job and on close. Blocking callers wait
+    /// on it for room ([`PaneWriter::queue_blocking`]) or for the drain
+    /// ([`PaneWriter::close_and_drain`]).
+    progress: Condvar,
+    /// Set when the pane is gone: an interrupted write gives up.
+    abort: AtomicBool,
+    /// The writer thread has returned.
+    exited: AtomicBool,
+    /// The writer thread, while it runs, so a pane that closes can interrupt a
+    /// write that is blocked on a program that never reads.
+    #[cfg(unix)]
+    thread: Mutex<Option<libc::pthread_t>>,
 }
 
 impl Shared {
@@ -77,6 +91,70 @@ impl Shared {
     }
 }
 
+impl Shared {
+    /// The writer thread is done.
+    fn finish(&self) {
+        #[cfg(unix)]
+        {
+            *self.thread.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+        self.exited.store(true, Ordering::SeqCst);
+        self.progress.notify_all();
+    }
+}
+
+/// Write all of `data` and flush. Unlike `write_all`, an interrupted write
+/// ends the job when the pane is gone (`abort`), so a thread blocked on a
+/// program that never reads can be woken and stopped.
+fn write_job(out: &mut dyn Write, data: &[u8], abort: &AtomicBool) -> Result<(), String> {
+    let mut off = 0;
+    while off < data.len() {
+        match out.write(&data[off..]) {
+            Ok(0) => return Err("write returned 0".to_string()),
+            Ok(n) => off += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                if abort.load(Ordering::SeqCst) {
+                    return Err("pane closed".to_string());
+                }
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    loop {
+        match out.flush() {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                if abort.load(Ordering::SeqCst) {
+                    return Err("pane closed".to_string());
+                }
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+}
+
+/// A signal handler that does nothing, installed without `SA_RESTART`: the
+/// signal only makes a blocked `write` return `EINTR`.
+#[cfg(unix)]
+fn install_wake_handler() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    extern "C" fn nop(_: libc::c_int) {}
+    ONCE.call_once(|| {
+        // SAFETY: a zeroed sigaction with a valid handler and an empty mask.
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = nop as extern "C" fn(libc::c_int) as usize;
+            libc::sigemptyset(&mut sa.sa_mask);
+            sa.sa_flags = 0;
+            libc::sigaction(WAKE_SIGNAL, &sa, std::ptr::null_mut());
+        }
+    });
+}
+
+#[cfg(unix)]
+const WAKE_SIGNAL: libc::c_int = libc::SIGUSR1;
+
 /// Owner of a pane's writer thread. Dropping it closes the queue and ends the
 /// thread (once the write it may be stuck in returns).
 pub struct PaneWriterOwner {
@@ -96,9 +174,21 @@ impl PaneWriterOwner {
             state: Mutex::new(State::default()),
             work: Condvar::new(),
             space: Notify::new(),
+            progress: Condvar::new(),
+            abort: AtomicBool::new(false),
+            exited: AtomicBool::new(false),
+            #[cfg(unix)]
+            thread: Mutex::new(None),
         });
         let s = shared.clone();
         std::thread::Builder::new().name("session-pty-writer".to_string()).spawn(move || {
+            #[cfg(unix)]
+            {
+                install_wake_handler();
+                // SAFETY: pthread_self has no preconditions.
+                *s.thread.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(unsafe { libc::pthread_self() });
+            }
             loop {
                 let job = {
                     let mut st = s.lock();
@@ -107,15 +197,17 @@ impl PaneWriterOwner {
                             break job;
                         }
                         if st.closed {
+                            drop(st);
+                            s.finish();
                             return;
                         }
                         st = s.work.wait(st).unwrap_or_else(|e| e.into_inner());
                     }
                 };
                 // The real write. It may block for as long as the program
-                // does not read; nothing else waits on it.
-                let res =
-                    out.write_all(&job.data).and_then(|()| out.flush()).map_err(|e| e.to_string());
+                // does not read; nothing else waits on it. A pane that closes
+                // interrupts it (see `PaneWriterOwner::drop`).
+                let res = write_job(&mut *out, &job.data, &s.abort);
                 let failed = res.is_err();
                 {
                     let mut st = s.lock();
@@ -135,7 +227,9 @@ impl PaneWriterOwner {
                     let _ = d.send(res);
                 }
                 s.space.notify_waiters();
+                s.progress.notify_all();
                 if failed {
+                    s.finish();
                     return;
                 }
             }
@@ -160,8 +254,33 @@ impl Drop for PaneWriterOwner {
         }
         st.bytes = 0;
         drop(st);
+        self.shared.abort.store(true, Ordering::SeqCst);
         self.shared.work.notify_all();
         self.shared.space.notify_waiters();
+        self.shared.progress.notify_all();
+        // A write blocked on a program that does not read never returns by
+        // itself, and the thread would hold the PTY fd for good. Interrupt it
+        // until the thread is gone. A signal that lands just before the write
+        // starts is lost, hence the repeats.
+        #[cfg(unix)]
+        {
+            let shared = self.shared.clone();
+            let _ = std::thread::Builder::new().name("session-pty-writer-kick".into()).spawn(
+                move || {
+                    for _ in 0..100 {
+                        if shared.exited.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        if let Some(t) = *shared.thread.lock().unwrap_or_else(|e| e.into_inner()) {
+                            // SAFETY: `t` is the id of the live writer thread
+                            // (cleared under this lock before it returns).
+                            unsafe { libc::pthread_kill(t, WAKE_SIGNAL) };
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                },
+            );
+        }
     }
 }
 
@@ -187,18 +306,55 @@ impl PaneWriter {
         }
     }
 
-    /// Queue `data`, waiting for room only, and hand back the receiver that
-    /// fires when the PTY has taken all of it (or the pane closed). Once this
-    /// returns `Ok` the bytes are in the queue: the caller records that
-    /// without an `await` in between, so a dropped caller cannot leave bytes
-    /// queued and unrecorded.
-    pub async fn queue_with_done(
-        &self,
-        data: Vec<u8>,
-    ) -> Result<oneshot::Receiver<Result<(), String>>, QueueError> {
-        let (tx, rx) = oneshot::channel();
-        self.push_waiting(Job { data, done: Some(tx) }).await?;
-        Ok(rx)
+    /// Queue `data`, blocking the calling thread until there is room, up to
+    /// `timeout`. For synchronous callers (the local socket). `Err(Full)` when
+    /// the time ran out.
+    pub fn queue_blocking(&self, data: Vec<u8>, timeout: Duration) -> Result<(), QueueError> {
+        let deadline = Instant::now() + timeout;
+        let job = Job { data, done: None };
+        let mut st = self.shared.lock();
+        loop {
+            if st.closed {
+                return Err(QueueError::Closed);
+            }
+            if st.bytes == 0 || st.bytes + job.data.len() <= INPUT_QUEUE_BYTES {
+                st.bytes += job.data.len();
+                st.queue.push_back(job);
+                drop(st);
+                self.shared.work.notify_one();
+                return Ok(());
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(QueueError::Full);
+            }
+            st = self.shared.progress.wait_timeout(st, left).unwrap_or_else(|e| e.into_inner()).0;
+        }
+    }
+
+    /// Stop taking input. What is queued is still written.
+    pub fn close(&self) {
+        self.shared.lock().closed = true;
+        self.shared.work.notify_all();
+    }
+
+    /// Stop taking input and wait until everything queued has been written,
+    /// up to `deadline`. Returns `true` when the queue drained. The write
+    /// that is under way is not interrupted.
+    pub fn close_and_drain(&self, deadline: Instant) -> bool {
+        let mut st = self.shared.lock();
+        st.closed = true;
+        self.shared.work.notify_all();
+        loop {
+            if st.bytes == 0 && st.queue.is_empty() {
+                return true;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            st = self.shared.progress.wait_timeout(st, left).unwrap_or_else(|e| e.into_inner()).0;
+        }
     }
 
     /// Bytes waiting in the queue (test and QA hook).
@@ -272,5 +428,110 @@ mod tests {
         assert_eq!(&got[got.len() - 5..], &[4; 5]);
         drop(owner);
         assert_eq!(w.try_queue(vec![0]), Err(QueueError::Closed));
+    }
+
+    #[tokio::test]
+    async fn close_and_drain_waits_for_the_queue_and_refuses_new_input() {
+        let open = Arc::new(AtomicBool::new(false));
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let owner = PaneWriterOwner::spawn(Box::new(Gate { open: open.clone(), out: out.clone() }))
+            .unwrap();
+        let w = owner.handle();
+        w.try_queue(vec![1; 100]).unwrap();
+        w.try_queue(vec![2; 100]).unwrap();
+        // Blocked: the drain runs out of time.
+        let w2 = w.clone();
+        let late = tokio::task::spawn_blocking(move || {
+            w2.close_and_drain(Instant::now() + Duration::from_millis(100))
+        })
+        .await
+        .unwrap();
+        assert!(!late);
+        assert_eq!(w.try_queue(vec![3]), Err(QueueError::Closed));
+        // Released: everything queued before the close is written.
+        open.store(true, Ordering::SeqCst);
+        let w2 = w.clone();
+        let ok = tokio::task::spawn_blocking(move || {
+            w2.close_and_drain(Instant::now() + Duration::from_secs(5))
+        })
+        .await
+        .unwrap();
+        assert!(ok);
+        assert_eq!(out.lock().unwrap().len(), 200);
+        drop(owner);
+    }
+
+    #[tokio::test]
+    async fn queue_blocking_waits_for_room_then_times_out() {
+        let open = Arc::new(AtomicBool::new(false));
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let owner = PaneWriterOwner::spawn(Box::new(Gate { open: open.clone(), out: out.clone() }))
+            .unwrap();
+        let w = owner.handle();
+        w.try_queue(vec![1; 10]).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        w.try_queue(vec![2; INPUT_QUEUE_BYTES - 10]).unwrap();
+        let w2 = w.clone();
+        let r = tokio::task::spawn_blocking(move || {
+            w2.queue_blocking(vec![3; 5], Duration::from_millis(100))
+        })
+        .await
+        .unwrap();
+        assert_eq!(r, Err(QueueError::Full));
+        let w2 = w.clone();
+        let waiting = tokio::task::spawn_blocking(move || {
+            w2.queue_blocking(vec![4; 5], Duration::from_secs(10))
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        open.store(true, Ordering::SeqCst);
+        waiting.await.unwrap().unwrap();
+        drop(owner);
+    }
+
+    /// A pane that closes while its writer is blocked on a program that never
+    /// reads: the thread must end (N8). A raw-mode pty with no reader blocks
+    /// a large write for good.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn closing_a_pane_frees_a_writer_blocked_on_a_hung_program() {
+        use std::os::fd::FromRawFd;
+        let (mut master, mut slave) = (0, 0);
+        // SAFETY: plain libc calls on fds we own.
+        let dup = unsafe {
+            assert_eq!(
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null()
+                ),
+                0
+            );
+            let mut t: libc::termios = std::mem::zeroed();
+            libc::tcgetattr(slave, &mut t);
+            libc::cfmakeraw(&mut t);
+            libc::tcsetattr(slave, libc::TCSANOW, &t);
+            libc::dup(master)
+        };
+        let out = unsafe { std::fs::File::from_raw_fd(dup) };
+        let owner = PaneWriterOwner::spawn(Box::new(out)).unwrap();
+        let w = owner.handle();
+        w.try_queue(vec![b'x'; 200 * 1024]).unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(w.queued_bytes() > 0, "the write should be stuck");
+        let shared = owner.shared.clone();
+        assert!(!shared.exited.load(Ordering::SeqCst));
+        drop(owner);
+        let t0 = Instant::now();
+        while !shared.exited.load(Ordering::SeqCst) {
+            assert!(t0.elapsed() < Duration::from_secs(3), "the writer thread is still blocked");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // SAFETY: closing the fds this test opened.
+        unsafe {
+            libc::close(master);
+            libc::close(slave);
+        }
     }
 }

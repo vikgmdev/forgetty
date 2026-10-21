@@ -107,6 +107,10 @@ pub struct LogShared {
     room: Notify,
     /// Set when the `ByteLog` is dropped (the pane is gone).
     closed: AtomicBool,
+    /// Set when the server is stopping: a disk write that keeps failing is
+    /// given up, so a full disk cannot hold the stop (the log stays unsealed,
+    /// and the next start treats it as a crash).
+    stopping: AtomicBool,
     /// Absolute offset one past the newest byte (mirror of the log's total).
     total: AtomicU64,
     /// Ring size in bytes.
@@ -345,6 +349,14 @@ impl ByteLog {
             );
         }
         let file_len = file_len_on_disk;
+        // A clean start: the seal has done its job. Unseal the sidecar (plain
+        // `<first>`, fsynced) before anything is appended. Left sealed, output
+        // lost in a later crash would leave the file ending exactly where the
+        // seal says, and the next start would take it for clean and reuse the
+        // offsets of the lost bytes.
+        if disk_enabled && !unclean && sidecar.is_some_and(|s| s.sealed.is_some()) {
+            write_sidecar(&log_path, disk_first);
+        }
 
         // Pre-load the tail into the ring (AC-17 cold-start replay). The ring
         // ends at the newest offset, which is the end of the file.
@@ -375,6 +387,7 @@ impl ByteLog {
             queued: AtomicU64::new(0),
             room: Notify::new(),
             closed: AtomicBool::new(false),
+            stopping: AtomicBool::new(false),
             total: AtomicU64::new(total_bytes_written),
             ring_capacity,
             epoch: AtomicU64::new(0),
@@ -454,6 +467,11 @@ impl ByteLog {
     }
 
     /// Shared state for readers: wake-ups and the file extent.
+    /// The server is stopping: stop retrying failed disk writes.
+    pub fn set_stopping(&self) {
+        self.shared.stopping.store(true, Ordering::Release);
+    }
+
     pub fn shared(&self) -> Arc<LogShared> {
         self.shared.clone()
     }
@@ -857,7 +875,7 @@ async fn write_with_retry(
         let Err(e) = res else { return true };
         warn!(pane = %pane_id, "disk appender: write failed, will retry: {e}");
         loop {
-            if shared.closed.load(Ordering::Acquire) {
+            if shared.closed.load(Ordering::Acquire) || shared.stopping.load(Ordering::Acquire) {
                 return false;
             }
             tokio::time::sleep(wait).await;
@@ -1397,6 +1415,67 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(2), progress)
             .await
             .expect("no wake-up when the log closed");
+        cleanup(pane_id);
+    }
+
+    /// A sealed log that restarts cleanly is unsealed before output starts:
+    /// bytes lost in a later crash must not let the next start reuse their
+    /// offsets for different bytes.
+    #[tokio::test]
+    async fn output_lost_after_a_clean_start_does_not_reuse_offsets() {
+        let pane_id = Uuid::new_v4();
+        {
+            let mut log = ByteLog::new(pane_id, 4096, 1024 * 1024).unwrap();
+            log.append(b"AAAA");
+            log.flush_signal().await.unwrap();
+            log.make_seal_future().await.unwrap();
+        }
+        // Clean start: offsets continue at 4, and the sidecar is no longer sealed.
+        {
+            let mut log = ByteLog::new(pane_id, 4096, 1024 * 1024).unwrap();
+            assert_eq!(log.total_written(), 4);
+            let sidecar =
+                std::fs::read_to_string(offset_sidecar_path(&pane_log_path(pane_id))).unwrap();
+            assert_eq!(sidecar.trim(), "0", "sidecar after a clean start: {sidecar:?}");
+            log.append(b"BBBB"); // offsets 4..8, a client may have seen them
+            log.flush_signal().await.unwrap();
+        }
+        // kill -9: the queue never reached the file.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(pane_log_path(pane_id))
+            .unwrap()
+            .set_len(4)
+            .unwrap();
+        let mut log = ByteLog::new(pane_id, 4096, 1024 * 1024).unwrap();
+        assert!(
+            log.total_written() >= 8,
+            "offsets 4..8 were handed out: total {}",
+            log.total_written()
+        );
+        log.append(b"CCCC");
+        log.flush_signal().await.unwrap();
+        // No offset below the old total answers with other bytes.
+        for off in 0..8u64 {
+            let plan = log.plan(off, 8);
+            assert!(matches!(plan, LogPlan::Lost { .. }), "offset {off} is still served: {plan:?}");
+        }
+        cleanup(pane_id);
+    }
+
+    /// A disk that keeps failing does not hold a stop: with `stopping` set the
+    /// appender gives up and the flush returns.
+    #[tokio::test]
+    async fn a_failing_disk_does_not_hold_the_stop() {
+        let pane_id = Uuid::new_v4();
+        let mut log = ByteLog::new(pane_id, 4096, 1024 * 1024).unwrap();
+        log.shared().fail_writes.store(1_000_000, Ordering::SeqCst);
+        log.append(b"stuck");
+        let flush = log.make_flush_future();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        log.set_stopping();
+        let r = tokio::time::timeout(std::time::Duration::from_secs(5), flush).await;
+        assert!(r.is_ok(), "the flush is still waiting on a failing disk");
         cleanup(pane_id);
     }
 }

@@ -44,7 +44,8 @@ pub use drain_result::DrainResult;
 pub use events::{LabelTarget, SessionEvent};
 pub use layout::{SessionLayout, SessionTab, SessionWorkspace};
 pub use manager::{
-    clamp_pane_dim, LabelError, PaneSnapshot, SessionManager, MAX_LABEL_CHARS, MAX_PANE_DIM,
+    clamp_pane_dim, InputOutcome, LabelError, PaneSnapshot, SessionManager, MAX_LABEL_CHARS,
+    MAX_PANE_DIM,
 };
 pub use pane::{DuplicatedTab, NotificationInfo, PaneInfo, PaneOsc, PaneState};
 pub use pane_writer::{PaneWriter, QueueError, INPUT_QUEUE_BYTES};

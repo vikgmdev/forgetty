@@ -149,6 +149,24 @@ pub struct SessionManager {
 /// grid memory and the VT work of a pane grow with its size.
 pub const MAX_PANE_DIM: u16 = 1000;
 
+/// `size` with rows and columns clamped to `1..=MAX_PANE_DIM`.
+fn clamp_size(mut size: PtySize) -> PtySize {
+    size.rows = clamp_pane_dim(size.rows);
+    size.cols = clamp_pane_dim(size.cols);
+    size
+}
+
+/// What happened to remote input put in a pane's queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputOutcome {
+    /// In the queue.
+    Queued,
+    /// The queue was full: the bytes were dropped.
+    Full,
+    /// The pane is gone or its PTY is closed: the bytes are spent.
+    Gone,
+}
+
 /// Clamp a requested rows or columns value to `1..=MAX_PANE_DIM`.
 pub fn clamp_pane_dim(n: u16) -> u16 {
     n.clamp(1, MAX_PANE_DIM)
@@ -188,6 +206,10 @@ impl SessionManager {
     pub fn begin_shutdown(&self) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.shutting_down = true;
+        // A disk that keeps failing must not hold the stop: appenders give up.
+        for log in inner.byte_logs.values() {
+            log.set_stopping();
+        }
     }
 
     /// Whether [`begin_shutdown`](Self::begin_shutdown) was called.
@@ -971,6 +993,7 @@ impl SessionManager {
         pane_id: PaneId,
         remain_on_exit: bool,
     ) -> Result<(PaneId, Uuid)> {
+        let size = clamp_size(size);
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
         // Bounds-check BEFORE spawning, so we never spawn a dangling PTY.
@@ -1039,6 +1062,7 @@ impl SessionManager {
         size: PtySize,
         cwd: Option<PathBuf>,
     ) -> Result<PaneId> {
+        let size = clamp_size(size);
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
         if !inner.panes.contains_key(&pane_id) {
@@ -1135,6 +1159,7 @@ impl SessionManager {
         cwd: Option<PathBuf>,
         new_pane_id: PaneId,
     ) -> Result<PaneId> {
+        let size = clamp_size(size);
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
         if !inner.panes.contains_key(&pane_id) {
@@ -1679,32 +1704,53 @@ impl SessionManager {
             .map_err(|e| forgetty_core::ForgettyError::Pty(format!("pane {id}: {e}")))
     }
 
-    /// Like [`Self::write_pty_queued`], but returns only when the PTY has
-    /// taken every byte. Input acks follow this.
-    pub async fn write_pty_wait(&self, id: PaneId, data: Vec<u8>) -> Result<()> {
+    /// Like [`Self::write_pty`] for synchronous callers that are trusted (the
+    /// local socket): blocks the calling thread until the queue has room, up
+    /// to `timeout`, instead of dropping the bytes.
+    pub fn write_pty_blocking(
+        &self,
+        id: PaneId,
+        data: &[u8],
+        timeout: std::time::Duration,
+    ) -> Result<()> {
         let w = self
             .pane_writer(id)
             .ok_or_else(|| forgetty_core::ForgettyError::Pty(format!("pane {id} not found")))?;
-        w.write(data)
-            .await
+        w.queue_blocking(data.to_vec(), timeout)
             .map_err(|e| forgetty_core::ForgettyError::Pty(format!("pane {id}: {e}")))
     }
 
-    /// Queue input for a pane, waiting for room only, and return the receiver
-    /// that fires once the PTY has taken the bytes. Dropping the future before
-    /// it returns queues nothing. After it returns the bytes are queued, so
-    /// the caller can record them as written-in-order at once.
-    pub async fn write_pty_enqueue(
-        &self,
-        id: PaneId,
-        data: Vec<u8>,
-    ) -> Result<tokio::sync::oneshot::Receiver<std::result::Result<(), String>>> {
-        let w = self
-            .pane_writer(id)
-            .ok_or_else(|| forgetty_core::ForgettyError::Pty(format!("pane {id} not found")))?;
-        w.queue_with_done(data)
-            .await
-            .map_err(|e| forgetty_core::ForgettyError::Pty(format!("pane {id}: {e}")))
+    /// Put remote input in the pane's queue without waiting (AD-024). A full
+    /// queue drops the bytes: the caller counts and logs it.
+    pub fn queue_input(&self, id: PaneId, data: Vec<u8>) -> InputOutcome {
+        let Some(w) = self.pane_writer(id) else { return InputOutcome::Gone };
+        match w.try_queue(data) {
+            Ok(()) => InputOutcome::Queued,
+            Err(crate::pane_writer::QueueError::Full) => InputOutcome::Full,
+            Err(crate::pane_writer::QueueError::Closed) => InputOutcome::Gone,
+        }
+    }
+
+    /// Close every pane's input queue and wait up to `timeout` in all for what
+    /// is queued to be written (graceful stop, AD-024). Returns the number of
+    /// panes whose queue did not drain.
+    pub fn close_input_queues_and_drain(&self, timeout: std::time::Duration) -> usize {
+        let writers: Vec<_> = {
+            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            inner.panes.values().map(|p| p.pty_bridge.writer.handle()).collect()
+        };
+        let deadline = std::time::Instant::now() + timeout;
+        let mut left = 0;
+        // Close all first, so none takes new input while the others drain.
+        for w in &writers {
+            w.close();
+        }
+        for w in &writers {
+            if !w.close_and_drain(deadline) {
+                left += 1;
+            }
+        }
+        left
     }
 
     /// Resize a pane's PTY to new dimensions.
