@@ -104,6 +104,7 @@ where
         window_width: layout.window_width,
         window_height: layout.window_height,
         pinned: false,
+        remain_on_exit_panes: Vec::new(),
     }
 }
 

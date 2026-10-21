@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use serde_json::{json, Value};
 
-use crate::server::default_socket_path;
+use forgetty_server::sockpath::{self, default_socket_path, SocketCheck};
 
 pub const EXIT_FAILED: i32 = 1;
 pub const EXIT_USAGE: i32 = 2;
@@ -93,6 +93,20 @@ impl Client {
     /// Connect without any version check.
     fn raw() -> Result<Self> {
         let path = default_socket_path();
+        // Never talk to a socket we cannot trust: a squatter could answer with
+        // a fake server or read what we send.
+        match sockpath::verify_socket_path(&path, sockpath::current_uid()) {
+            SocketCheck::Ok => {}
+            SocketCheck::Missing => {
+                return Err(CliError::Unreachable(format!(
+                    "server not reachable at {}. Start it with `forgetty server start`.",
+                    path.display()
+                )))
+            }
+            SocketCheck::Unsafe(why) => {
+                return Err(CliError::Failed(format!("refusing to use the server socket: {why}")))
+            }
+        }
         let stream = UnixStream::connect(&path).map_err(|e| {
             CliError::Unreachable(format!(
                 "server not reachable at {} ({e}). Start it with `forgetty server start`.",
@@ -217,9 +231,15 @@ fn resolve_pane(client: &mut Client, target: &str) -> Result<String> {
 // ---------------------------------------------------------------------------
 
 pub fn server_start() -> Result<()> {
-    if let Ok((_, info)) = Client::connect() {
-        println!("server already running (pid {})", info.num("pid"));
-        return Ok(());
+    match Client::connect() {
+        Ok((_, info)) => {
+            println!("server already running (pid {})", info.num("pid"));
+            return Ok(());
+        }
+        // No server yet: go on and start one.
+        Err(CliError::Unreachable(_)) => {}
+        // An unsafe socket or a broken reply: do not start over it.
+        Err(e) => return Err(e),
     }
 
     let exe = std::env::current_exe().map_err(|e| CliError::Failed(e.to_string()))?;
@@ -249,9 +269,13 @@ pub fn server_start() -> Result<()> {
 
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        if let Ok((_, info)) = Client::connect() {
-            println!("server started (pid {})", info.num("pid"));
-            return Ok(());
+        match Client::connect() {
+            Ok((_, info)) => {
+                println!("server started (pid {})", info.num("pid"));
+                return Ok(());
+            }
+            Err(CliError::Unreachable(_)) => {}
+            Err(e) => return Err(e),
         }
         if let Ok(Some(status)) = child.try_wait() {
             return Err(CliError::Failed(format!(
@@ -343,10 +367,10 @@ pub fn ls(json_out: bool) -> Result<()> {
         println!("no panes");
         return Ok(());
     }
-    println!("{:<36}  {:>7}  {:>7}  CWD", "PANE", "PID", "SIZE");
+    println!("{:<36}  {:>7}  {:>7}  {:<10}  CWD", "PANE", "PID", "SIZE", "STATE");
     for p in panes {
         println!(
-            "{:<36}  {:>7}  {:>7}  {}",
+            "{:<36}  {:>7}  {:>7}  {:<10}  {}",
             p.get("pane_id").and_then(Value::as_str).unwrap_or("?"),
             p.get("pid").and_then(Value::as_u64).unwrap_or(0),
             format!(
@@ -354,13 +378,31 @@ pub fn ls(json_out: bool) -> Result<()> {
                 p.get("cols").and_then(Value::as_u64).unwrap_or(0),
                 p.get("rows").and_then(Value::as_u64).unwrap_or(0)
             ),
+            pane_state(p),
             p.get("cwd").and_then(Value::as_str).unwrap_or("")
         );
     }
     Ok(())
 }
 
-pub fn new_pane(cwd: Option<PathBuf>, command: Vec<String>, json_out: bool) -> Result<()> {
+/// `running`, or `exited N` for a kept pane whose process ended.
+fn pane_state(p: &Value) -> String {
+    if p.get("exited").and_then(Value::as_bool).unwrap_or(false) {
+        match p.get("exit_code").and_then(Value::as_i64) {
+            Some(c) => format!("exited {c}"),
+            None => "exited".to_string(),
+        }
+    } else {
+        "running".to_string()
+    }
+}
+
+pub fn new_pane(
+    cwd: Option<PathBuf>,
+    command: Vec<String>,
+    keep: bool,
+    json_out: bool,
+) -> Result<()> {
     let (mut client, _) = Client::connect()?;
     let cwd = match cwd {
         Some(c) => c,
@@ -371,6 +413,9 @@ pub fn new_pane(cwd: Option<PathBuf>, command: Vec<String>, json_out: bool) -> R
     let mut params = json!({ "workspace_idx": 0, "cwd": cwd.display().to_string() });
     if !command.is_empty() {
         params["command"] = json!(command);
+    }
+    if keep {
+        params["remain_on_exit"] = json!(true);
     }
     let result = client.call("new_tab", params)?;
     if json_out {
@@ -456,7 +501,9 @@ pub fn client_ls(json_out: bool) -> Result<()> {
             "{:<12}  {:<8}  {:<24}  {} ago",
             &id[..id.len().min(12)],
             c.get("client_kind").and_then(Value::as_str).unwrap_or("?"),
-            c.get("client_name").and_then(Value::as_str).unwrap_or(""),
+            forgetty_sync::sanitize::untrusted(
+                c.get("client_name").and_then(Value::as_str).unwrap_or("")
+            ),
             human_duration(since)
         );
     }
@@ -486,7 +533,7 @@ pub fn devices(json_out: bool) -> Result<()> {
         println!(
             "{}  {}  paired {}",
             d.get("device_id").and_then(Value::as_str).unwrap_or("?"),
-            d.get("name").and_then(Value::as_str).unwrap_or(""),
+            forgetty_sync::sanitize::untrusted(d.get("name").and_then(Value::as_str).unwrap_or("")),
             d.get("paired_at").and_then(Value::as_str).unwrap_or("?")
         );
     }
@@ -536,7 +583,9 @@ pub fn pair(ttl: u64) -> Result<()> {
             Some("paired") => {
                 println!(
                     "paired: {} ({})",
-                    status.get("name").and_then(Value::as_str).unwrap_or("?"),
+                    forgetty_sync::sanitize::untrusted(
+                        status.get("name").and_then(Value::as_str).unwrap_or("?")
+                    ),
                     status.get("device_id").and_then(Value::as_str).unwrap_or("?")
                 );
                 return Ok(());

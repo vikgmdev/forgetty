@@ -35,6 +35,9 @@ use crate::workspace::{build_workspace_state, PaneTreeLayout, WorkspaceLayout};
 /// Capacity of the broadcast event channel.
 const BROADCAST_CAPACITY: usize = 1024;
 
+/// How many exited-pane exit codes the manager remembers.
+const EXIT_HISTORY_CAP: usize = 1024;
+
 // ---------------------------------------------------------------------------
 // Internal state
 // ---------------------------------------------------------------------------
@@ -61,6 +64,10 @@ struct SessionManagerInner {
     byte_log_ring_kb: u32,
     /// Byte-log on-disk cap in MiB. Default 10 MiB.
     byte_log_max_mb: u32,
+    /// Exit code of every pane process that has exited, newest last. Bounded
+    /// by `EXIT_HISTORY_CAP`. Lets `run --wait` read a code after the pane
+    /// closed.
+    exit_history: std::collections::VecDeque<(PaneId, i32)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -95,6 +102,7 @@ impl SessionManager {
                 // Defaults match `forgetty_config::defaults::default_config`.
                 byte_log_ring_kb: 1024,
                 byte_log_max_mb: 10,
+                exit_history: std::collections::VecDeque::new(),
             })),
         }
     }
@@ -154,6 +162,9 @@ impl SessionManager {
             title: String::new(),
             rows: size.rows,
             cols: size.cols,
+            remain_on_exit: false,
+            exited: false,
+            exit_code: None,
         };
 
         {
@@ -653,6 +664,9 @@ impl SessionManager {
                     title: String::new(),
                     rows: default_size.rows,
                     cols: default_size.cols,
+                    remain_on_exit: false,
+                    exited: false,
+                    exit_code: None,
                 };
                 inner.panes.insert(pane_id, pane);
                 inner.pane_order.push(pane_id);
@@ -758,6 +772,21 @@ impl SessionManager {
         command: Option<Vec<String>>,
         pane_id: PaneId,
     ) -> Result<(PaneId, Uuid)> {
+        self.create_tab_with_options(workspace_idx, cwd, size, command, pane_id, false)
+    }
+
+    /// Like [`create_tab_with_pane_id`](Self::create_tab_with_pane_id), with
+    /// the opt-in `remain_on_exit` flag set before the drain task starts, so a
+    /// command that exits at once is still kept.
+    pub fn create_tab_with_options(
+        &self,
+        workspace_idx: usize,
+        cwd: Option<PathBuf>,
+        size: PtySize,
+        command: Option<Vec<String>>,
+        pane_id: PaneId,
+        remain_on_exit: bool,
+    ) -> Result<(PaneId, Uuid)> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
         // Bounds-check BEFORE spawning, so we never spawn a dangling PTY.
@@ -783,6 +812,9 @@ impl SessionManager {
             title: String::new(),
             rows: size.rows,
             cols: size.cols,
+            remain_on_exit,
+            exited: false,
+            exit_code: None,
         };
 
         inner.panes.insert(pane_id, pane);
@@ -842,6 +874,9 @@ impl SessionManager {
             title: String::new(),
             rows: size.rows,
             cols: size.cols,
+            remain_on_exit: false,
+            exited: false,
+            exit_code: None,
         };
 
         inner.panes.insert(new_pane_id, new_pane);
@@ -932,6 +967,9 @@ impl SessionManager {
             title: String::new(),
             rows: size.rows,
             cols: size.cols,
+            remain_on_exit: false,
+            exited: false,
+            exit_code: None,
         };
 
         inner.panes.insert(new_pane_id, new_pane);
@@ -1111,6 +1149,9 @@ impl SessionManager {
             title: String::new(),
             rows: size.rows,
             cols: size.cols,
+            remain_on_exit: false,
+            exited: false,
+            exit_code: None,
         };
 
         inner.panes.insert(pane_id, pane);
@@ -1590,17 +1631,94 @@ impl SessionManager {
             let sm = self.clone();
             tokio::spawn(async move {
                 while let Some(bytes) = rx.recv().await {
-                    match sm.process_pane_bytes(pane_id, &bytes) {
-                        Ok(result) if result.pty_exited => {
-                            let _ = sm.close_pane(pane_id);
+                    if let Ok(result) = sm.process_pane_bytes(pane_id, &bytes) {
+                        if result.pty_exited {
+                            sm.finish_pane(pane_id).await;
                             return;
                         }
-                        _ => {}
                     }
                 }
-                let _ = sm.close_pane(pane_id);
+                sm.finish_pane(pane_id).await;
             });
         }
+    }
+
+    /// The pane's process has ended. Record its exit code, then either close
+    /// the pane (default) or keep it with a status line (`remain_on_exit`).
+    async fn finish_pane(&self, pane_id: PaneId) {
+        // After PTY EOF the child is usually already gone. Poll briefly so the
+        // exit code is known before the pane is closed.
+        let mut code: Option<i32> = None;
+        for _ in 0..25 {
+            {
+                let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                match inner.panes.get_mut(&pane_id) {
+                    Some(pane) => code = pane.pty_bridge.pty.exit_code().map(|c| c as i32),
+                    None => return,
+                }
+            }
+            if code.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let keep = {
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(c) = code {
+                inner.exit_history.retain(|(id, _)| *id != pane_id);
+                inner.exit_history.push_back((pane_id, c));
+                while inner.exit_history.len() > EXIT_HISTORY_CAP {
+                    inner.exit_history.pop_front();
+                }
+            }
+            match inner.panes.get_mut(&pane_id) {
+                Some(pane) if pane.remain_on_exit => {
+                    pane.exited = true;
+                    pane.exit_code = code;
+                    true
+                }
+                _ => false,
+            }
+        };
+
+        if keep {
+            let notice = match code {
+                Some(c) => format!("\r\n[forgetty: process exited with status {c}]\r\n"),
+                None => "\r\n[forgetty: process exited]\r\n".to_string(),
+            };
+            let _ = self.process_pane_bytes(pane_id, notice.as_bytes());
+            debug!(%pane_id, ?code, "pane kept after exit (remain_on_exit)");
+        } else {
+            let _ = self.close_pane(pane_id);
+        }
+    }
+
+    /// Turn `remain_on_exit` on or off for a pane. Used when restoring panes.
+    pub fn set_remain_on_exit(&self, id: PaneId, on: bool) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pane) = inner.panes.get_mut(&id) {
+            pane.remain_on_exit = on;
+        }
+    }
+
+    /// Exit status of a pane's process: `Some((running, code))`, or `None`
+    /// when the pane is unknown and has no recorded exit.
+    ///
+    /// Works for live panes, kept panes and (up to the history cap) panes that
+    /// already closed.
+    pub fn pane_exit_status(&self, id: PaneId) -> Option<(bool, Option<i32>)> {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pane) = inner.panes.get_mut(&id) {
+            if pane.exited {
+                return Some((false, pane.exit_code));
+            }
+            return match pane.pty_bridge.pty.exit_code() {
+                Some(c) => Some((false, Some(c as i32))),
+                None => Some((true, None)),
+            };
+        }
+        inner.exit_history.iter().rev().find(|(pid, _)| *pid == id).map(|(_, c)| (false, Some(*c)))
     }
 
     // -----------------------------------------------------------------------
@@ -1617,6 +1735,9 @@ impl SessionManager {
             cols: pane.cols,
             cwd: pane.cwd.clone(),
             title: pane.title.clone(),
+            remain_on_exit: pane.remain_on_exit,
+            exited: pane.exited,
+            exit_code: pane.exit_code,
         })
     }
 
@@ -1761,6 +1882,12 @@ impl SessionManager {
             window_width: None,
             window_height: None,
             pinned: inner.pinned,
+            remain_on_exit_panes: inner
+                .panes
+                .values()
+                .filter(|p| p.remain_on_exit)
+                .map(|p| p.id.0)
+                .collect(),
         }
     }
 
@@ -3980,5 +4107,73 @@ mod tests {
         // i32::MAX is well outside the kernel's pid_max range on any
         // realistic system; the /proc read will fail with ENOENT.
         assert!(!pgid_is_signal_forwarder(i32::MAX));
+    }
+
+    // -----------------------------------------------------------------------
+    // remain_on_exit
+    // -----------------------------------------------------------------------
+
+    fn sh(script: &str) -> Option<Vec<String>> {
+        Some(vec!["sh".to_string(), "-c".to_string(), script.to_string()])
+    }
+
+    fn small() -> PtySize {
+        PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 }
+    }
+
+    async fn wait_for(mut cond: impl FnMut() -> bool) -> bool {
+        for _ in 0..200 {
+            if cond() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn remain_on_exit_keeps_the_pane_with_its_exit_code() {
+        let sm = SessionManager::new();
+        let (pane, _) = sm
+            .create_tab_with_options(0, None, small(), sh("echo hi; exit 7"), PaneId::new(), true)
+            .unwrap();
+        assert!(wait_for(|| sm.pane_info(pane).is_some_and(|i| i.exited)).await, "pane exits");
+
+        let info = sm.pane_info(pane).expect("kept pane stays listed");
+        assert!(info.remain_on_exit && info.exited);
+        assert_eq!(info.exit_code, Some(7));
+        assert!(sm.list_panes().contains(&pane));
+        assert_eq!(sm.pane_exit_status(pane), Some((false, Some(7))));
+
+        // The status line reaches the byte log, so late subscribers see it.
+        let (_rx, replay, _) = sm.subscribe_with_snapshot(pane);
+        let text = String::from_utf8_lossy(&replay).to_string();
+        assert!(text.contains("process exited with status 7"), "replay was {text:?}");
+
+        // The flag is part of the persisted state.
+        assert_eq!(sm.snapshot_to_workspace_state().remain_on_exit_panes, vec![pane.0]);
+
+        // close_pane removes it; the code stays available.
+        sm.close_pane(pane).unwrap();
+        assert!(sm.pane_info(pane).is_none());
+        assert_eq!(sm.pane_exit_status(pane), Some((false, Some(7))));
+    }
+
+    #[tokio::test]
+    async fn default_pane_closes_on_exit_and_records_the_code() {
+        let sm = SessionManager::new();
+        let (pane, _) = sm.create_tab(0, None, small(), sh("exit 3")).unwrap();
+        assert!(wait_for(|| sm.pane_info(pane).is_none()).await, "pane closes");
+        assert_eq!(sm.pane_exit_status(pane), Some((false, Some(3))));
+        assert!(sm.snapshot_to_workspace_state().remain_on_exit_panes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn running_pane_reports_running() {
+        let sm = SessionManager::new();
+        let (pane, _) = sm.create_tab(0, None, small(), sh("sleep 30")).unwrap();
+        assert_eq!(sm.pane_exit_status(pane), Some((true, None)));
+        assert_eq!(sm.pane_exit_status(PaneId::new()), None);
+        sm.close_pane(pane).unwrap();
     }
 }

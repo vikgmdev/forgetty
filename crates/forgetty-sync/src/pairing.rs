@@ -27,7 +27,7 @@ use tracing::{info, warn};
 
 use crate::{
     registry::{iso8601_now, DeviceEntry, DeviceRegistry},
-    SyncEvent,
+    sanitize, SyncEvent,
 };
 
 /// Pairing window length (AD-021).
@@ -230,15 +230,18 @@ pub async fn handle_pair_v2(
             PairResult { ok: false, reason: Some("bad_request".to_string()) }
         }
         Some(req) => {
+            // Everything in the request except the secret is attacker text.
+            let req_name = sanitize::untrusted(&req.device_name);
+            let req_kind = sanitize::untrusted(&req.client_kind);
             let verdict =
                 state.lock().unwrap_or_else(|e| e.into_inner()).verify(&req.secret, Instant::now());
             match verdict {
                 Err(failure) => {
-                    warn!("pair: refused {device_id} ({}): {}", req.device_name, failure.reason());
+                    warn!("pair: refused {device_id} ({req_name}): {}", failure.reason());
                     PairResult { ok: false, reason: Some(failure.reason().to_string()) }
                 }
                 Ok(window_id) => {
-                    let name = sanitize_name(&req.device_name, &device_id);
+                    let name = name_or_fallback(&req_name, &device_id);
                     let entry = DeviceEntry {
                         device_id: device_id.clone(),
                         name: name.clone(),
@@ -253,10 +256,7 @@ pub async fn handle_pair_v2(
                     };
                     match saved {
                         Ok(()) => {
-                            info!(
-                                "pair: paired device name={name:?} id={device_id} kind={}",
-                                req.client_kind
-                            );
+                            info!("pair: paired device name={name:?} id={device_id} kind={req_kind:?}");
                             state
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner())
@@ -283,13 +283,12 @@ pub async fn handle_pair_v2(
     conn.close(0u8.into(), b"pair-done");
 }
 
-fn sanitize_name(raw: &str, device_id: &str) -> String {
-    let cleaned: String = raw.chars().filter(|c| !c.is_control()).take(64).collect();
-    let cleaned = cleaned.trim();
-    if cleaned.is_empty() {
+/// A sanitised device name, or `device-<id prefix>` when nothing is left.
+fn name_or_fallback(clean: &str, device_id: &str) -> String {
+    if clean.is_empty() {
         format!("device-{}", &device_id[..device_id.len().min(8)])
     } else {
-        cleaned.to_string()
+        clean.to_string()
     }
 }
 
@@ -497,6 +496,38 @@ mod tests {
         let t0 = Instant::now();
         let w = open(&mut st, t0);
         assert!(st.verify(&w.secret.to_ascii_lowercase(), t0).is_ok());
+    }
+
+    #[test]
+    fn hostile_names_never_reach_the_stored_or_logged_form() {
+        let id = "b8aaa7768b3a624d";
+        for raw in [
+            "evil\nINFO pair: paired device name=\"admin\"".to_string(),
+            "\u{1b}[31mred\u{1b}[0m".to_string(),
+            "A".repeat(10 * 1024),
+            "\u{1b}[2J\n\r".repeat(500),
+        ] {
+            let name = name_or_fallback(&sanitize::untrusted(&raw), id);
+            assert!(name.chars().count() <= sanitize::MAX_UNTRUSTED_CHARS.max(16));
+            assert!(!name.chars().any(|c| c.is_control()), "control char in {name:?}");
+        }
+        // Nothing left after cleaning: fall back to an id-based name.
+        let name = name_or_fallback(&sanitize::untrusted("\n\u{1b}[0m"), id);
+        assert_eq!(name, "device-b8aaa776");
+    }
+
+    #[test]
+    fn registry_add_sanitises_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut reg = crate::registry::DeviceRegistry::empty_at(tmp.path().join("authorized.json"));
+        reg.add(DeviceEntry {
+            device_id: "abc".into(),
+            name: "x\ny\u{1b}[31m".into(),
+            paired_at: "now".into(),
+            last_seen: None,
+        })
+        .unwrap();
+        assert_eq!(reg.list()[0].name, "xy");
     }
 
     #[test]

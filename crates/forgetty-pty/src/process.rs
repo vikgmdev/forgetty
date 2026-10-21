@@ -174,6 +174,13 @@ impl PtyProcess {
         matches!(self.child.try_wait(), Ok(None))
     }
 
+    /// Exit code of the child if it has already exited, without blocking.
+    ///
+    /// `None` while the child runs. Repeated calls return the same code.
+    pub fn exit_code(&mut self) -> Option<u32> {
+        self.child.try_wait().ok().flatten().map(|s| s.exit_code())
+    }
+
     /// Wait for the process to exit and return its exit code.
     pub fn wait(&mut self) -> Result<u32> {
         let status = self

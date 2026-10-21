@@ -11,3 +11,5 @@
 //! package.
 
 pub mod iroh_terminal;
+
+pub mod sockpath;

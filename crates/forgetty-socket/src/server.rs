@@ -56,6 +56,9 @@ pub struct SocketServer {
     /// Session UUID — used by `shutdown_save` to write the correct session file.
     /// `None` in test/legacy contexts where session_id is not relevant.
     session_id: Option<uuid::Uuid>,
+    /// Only peers with this uid are served. `None` means this process's uid.
+    /// Tests set another uid to simulate a foreign user.
+    allowed_uid: Option<u32>,
 }
 
 impl SocketServer {
@@ -83,7 +86,7 @@ impl SocketServer {
             std::fs::create_dir_all(parent)?;
         }
 
-        Ok(Self { socket_path, session_id: None })
+        Ok(Self { socket_path, session_id: None, allowed_uid: None })
     }
 
     /// Create a new server bound to an explicit socket path with a session UUID.
@@ -94,6 +97,15 @@ impl SocketServer {
         let mut server = Self::new_with_path(socket_path)?;
         server.session_id = Some(session_id);
         Ok(server)
+    }
+
+    /// Serve only peers with this uid instead of the current uid.
+    ///
+    /// For tests: it lets a same-user client act as a foreign user, so the
+    /// refusal path can be exercised without switching accounts.
+    pub fn restrict_to_uid(mut self, uid: u32) -> Self {
+        self.allowed_uid = Some(uid);
+        self
     }
 
     /// Get the socket path.
@@ -115,13 +127,18 @@ impl SocketServer {
         F: Fn(Request) -> Response + Send + Sync + 'static,
     {
         let listener = UnixListener::bind(&self.socket_path)?;
+        restrict_socket(&self.socket_path)?;
         info!("Socket server listening on {:?}", self.socket_path);
 
         let handler = Arc::new(handler);
+        let allowed_uid = self.allowed_uid;
 
         loop {
             match listener.accept().await {
                 Ok((stream, _addr)) => {
+                    if !peer_is_allowed(&stream, allowed_uid) {
+                        continue;
+                    }
                     debug!("Accepted socket connection");
                     let handler = Arc::clone(&handler);
                     tokio::spawn(async move {
@@ -156,10 +173,12 @@ impl SocketServer {
         sync_endpoint: Option<Arc<SyncEndpoint>>,
     ) -> std::io::Result<()> {
         let listener = UnixListener::bind(&self.socket_path)?;
+        restrict_socket(&self.socket_path)?;
         info!("Socket server listening on {:?}", self.socket_path);
 
         handlers::mark_started();
         let session_id = self.session_id;
+        let allowed_uid = self.allowed_uid;
         let socket_path = self.socket_path.clone();
         // Shared live-connection counter, used by `is_attached` to tell
         // "daemon orphaned after V2-005 disconnect" from "daemon actively
@@ -169,6 +188,9 @@ impl SocketServer {
         loop {
             match listener.accept().await {
                 Ok((stream, _addr)) => {
+                    if !peer_is_allowed(&stream, allowed_uid) {
+                        continue;
+                    }
                     debug!("Accepted socket connection");
                     let sm = Arc::clone(&sm);
                     let se = sync_endpoint.as_ref().map(Arc::clone);
@@ -895,6 +917,37 @@ async fn handle_streaming_connection(
 }
 
 /// Serialize and write a JSON-RPC response as a newline-terminated line.
+/// `chmod 0600` the socket so only the owner can connect, whatever the umask.
+fn restrict_socket(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+/// Is the peer's uid `expected_uid`? Reads `SO_PEERCRED`. A peer whose
+/// credentials cannot be read is refused.
+pub fn peer_matches_uid(stream: &tokio::net::UnixStream, expected_uid: u32) -> bool {
+    match stream.peer_cred() {
+        Ok(cred) => cred.uid() == expected_uid,
+        Err(e) => {
+            warn!("socket: cannot read peer credentials, dropping connection: {e}");
+            false
+        }
+    }
+}
+
+/// Accept-time check: drop any connection that is not from the allowed user
+/// (default: the user this process runs as). Logs the refused uid.
+fn peer_is_allowed(stream: &tokio::net::UnixStream, allowed_uid: Option<u32>) -> bool {
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let expected = allowed_uid.unwrap_or_else(|| unsafe { libc::getuid() });
+    if peer_matches_uid(stream, expected) {
+        return true;
+    }
+    let peer = stream.peer_cred().map(|c| c.uid().to_string()).unwrap_or_else(|_| "?".into());
+    warn!("socket: refused connection from uid {peer} (only uid {expected} is served)");
+    false
+}
+
 /// Write the layout to `sessions/{server_id}.json` (AD-017). Failures are logged.
 pub fn save_layout(sm: &SessionManager, session_id: uuid::Uuid) {
     let state = sm.snapshot_to_workspace_state();
@@ -963,6 +1016,48 @@ mod tests {
     use super::*;
     use forgetty_session::SessionManager;
 
+    #[tokio::test]
+    async fn peer_from_another_uid_is_refused() {
+        // A socketpair peer is this process, so its uid is ours. Judging it
+        // against any other expected uid is exactly the "different user" case.
+        let (a, _b) = tokio::net::UnixStream::pair().unwrap();
+        let me = unsafe { libc::getuid() };
+        assert!(peer_matches_uid(&a, me));
+        assert!(!peer_matches_uid(&a, me + 1));
+        assert!(!peer_matches_uid(&a, 0) || me == 0);
+        assert!(peer_is_allowed(&a, None));
+        assert!(!peer_is_allowed(&a, Some(me + 1)));
+    }
+
+    #[tokio::test]
+    async fn bound_socket_is_mode_0600_and_still_serves_the_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.sock");
+        let server = SocketServer::new_with_path(path.clone()).unwrap();
+        let sm = Arc::new(SessionManager::new());
+        let task = tokio::spawn(async move {
+            let _ = server.run_with_streaming(sm, None).await;
+        });
+        for _ in 0..100 {
+            if path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        let mut c = tokio::net::UnixStream::connect(&path).await.unwrap();
+        c.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"list_tabs\",\"id\":1}\n").await.unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = c.read(&mut buf).await.unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).contains("\"result\""));
+        task.abort();
+    }
+
     #[test]
     fn default_socket_path_with_xdg() {
         // Just verify the function returns a path ending with forgetty.sock.
@@ -982,7 +1077,8 @@ mod tests {
         // Clean up from previous test runs.
         let _ = std::fs::remove_file(&sock_path);
 
-        let _server = SocketServer { socket_path: sock_path.clone(), session_id: None };
+        let _server =
+            SocketServer { socket_path: sock_path.clone(), session_id: None, allowed_uid: None };
 
         let listener = UnixListener::bind(&sock_path).unwrap();
         let sm = Arc::new(SessionManager::new());

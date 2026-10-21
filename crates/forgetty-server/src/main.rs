@@ -54,6 +54,10 @@ enum Command {
         cwd: Option<PathBuf>,
         #[arg(long)]
         json: bool,
+        /// Keep the pane after its process exits: it shows the exit status and
+        /// stays listed (`exited`) until closed.
+        #[arg(long)]
+        keep: bool,
         /// Command to run instead of the shell, after `--`.
         #[arg(last = true)]
         command: Vec<String>,
@@ -178,7 +182,9 @@ fn main() {
             cli::finish(cli::server_status(json))
         }
         Command::Ls { json } => cli::finish(cli::ls(json)),
-        Command::New { cwd, json, command } => cli::finish(cli::new_pane(cwd, command, json)),
+        Command::New { cwd, json, keep, command } => {
+            cli::finish(cli::new_pane(cwd, command, keep, json))
+        }
         Command::Send { pane, enter, text } => cli::finish(cli::send(&pane, &text, enter)),
         Command::SendKey { pane, key } => cli::finish(cli::send_key(&pane, &key)),
         Command::Client { command: ClientCommand::Ls { json } } => {

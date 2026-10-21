@@ -31,7 +31,7 @@ fi
 
 # Short path: unix socket paths are limited to ~108 bytes.
 STATE="$(mktemp -d /tmp/p0gate.XXXXXX)"
-SOCK="$STATE/run/forgetty.sock"
+SOCK="$STATE/run/forgetty/forgetty.sock"
 fg() { "$BIN/forgetty" --state-dir "$STATE" "$@"; }
 PAIR_PID=""
 cleanup() {

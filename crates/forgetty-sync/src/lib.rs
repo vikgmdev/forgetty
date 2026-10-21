@@ -18,6 +18,7 @@ pub mod identity;
 pub mod pairing;
 pub mod qr;
 pub mod registry;
+pub mod sanitize;
 
 pub use endpoint::{
     AlpnHandler, SyncEndpoint, SyncEndpointBuilder, SyncEvent, FORGETTY_PAIRING_ALPN,

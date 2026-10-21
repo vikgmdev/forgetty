@@ -18,6 +18,7 @@ base64 = "0.22"
 bytes = "1"
 uuid = { workspace = true }
 hostname = "0.4"
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true }

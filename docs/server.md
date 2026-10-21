@@ -42,7 +42,14 @@ Without systemd: `forgetty server start` runs the server detached and logs to
 - A client disconnect never ends a pane or the server. After a server restart
   the layout is restored and byte logs are replayed into the panes. Processes
   do not survive a restart (a restored pane starts a fresh shell).
-- Socket: `$XDG_RUNTIME_DIR/forgetty.sock`.
+- Socket: `$XDG_RUNTIME_DIR/forgetty/forgetty.sock` (else
+  `/tmp/forgetty-<uid>/forgetty.sock`). The directory is mode 0700 and the
+  socket 0600. The server refuses to start on an unsafe directory (wrong owner,
+  symlink, group/other bits), drops connections from other uids
+  (`SO_PEERCRED`), and the CLI refuses a socket it does not own.
+- A pane closes when its process exits. `forgetty new --keep` keeps it
+  instead: it shows the exit status, stays listed as `exited N`, and is removed
+  by the `close_pane` socket method. The server records every pane exit code.
 
 ## CLI
 
@@ -52,7 +59,7 @@ forgetty server start               start detached if not running
 forgetty server stop [--if-idle]    --if-idle refuses while a client is attached
 forgetty server status [--json]     pid, uptime, version, protocol, panes, clients, iroh node id
 forgetty ls [--json]
-forgetty new [--cwd DIR] [-- CMD...]            prints the pane id
+forgetty new [--cwd DIR] [--keep] [-- CMD...]   prints the pane id; --keep = remain on exit
 forgetty send -p PANE TEXT [--enter]
 forgetty send-key -p PANE KEY       enter tab esc ctrl+c up down left right
 forgetty client ls [--json]

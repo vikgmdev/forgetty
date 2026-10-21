@@ -55,58 +55,39 @@ file.
 
 ## 2. Connection
 
-The daemon binds to
-`$XDG_RUNTIME_DIR/forgetty-{session_uuid}.sock`,
-falling back to `/tmp/forgetty-{session_uuid}.sock` when `XDG_RUNTIME_DIR`
-is unset.
+The server binds to `$XDG_RUNTIME_DIR/forgetty/forgetty.sock`. When
+`XDG_RUNTIME_DIR` is unset it uses `/tmp/forgetty-<uid>/forgetty.sock`.
 
-Access control is provided by the **parent directory**, not by the socket
-file's own mode. `$XDG_RUNTIME_DIR` is mode `0700` per the XDG Base
-Directory spec — only the owning user can traverse into it, so only the
-owner can reach the socket. The daemon does not `chmod` the socket file
-itself; its mode is whatever `UnixListener::bind` produces under the
-current umask (typically `0775` or `0664`, *not* `0600`). Any local
-process running as the user can connect — this is intentional (it is what
-enables `socat`, scripts, and agents to drive the daemon). The socket has
+Access control (local socket squatting defence):
+
+- The socket directory is created with mode `0700`. The server refuses to
+  start if the directory exists and is not owned by the current uid, is a
+  symlink, or has any group or other permission bit.
+- The socket file is set to mode `0600` right after `bind`.
+- The server checks `SO_PEERCRED` on every accepted connection and drops any
+  peer whose uid is not the server's uid. Nothing is read from that peer.
+- The `forgetty` CLI checks that the socket file is owned by the current uid
+  (and is not a symlink) before it connects, and refuses otherwise.
+
+Any process running as the same user can connect. This is intentional: it is
+what enables `socat`, scripts and agents to drive the server. The socket has
 no network exposure.
 
-**`/tmp` fallback is weaker.** When `$XDG_RUNTIME_DIR` is unset (rare;
-common on some non-systemd setups), the socket lives in `/tmp`, which is
-mode `1777` — sticky but world-traversable. Any local user on the machine
-could connect to the socket in that configuration. Ensure `XDG_RUNTIME_DIR`
-is set in your environment (systemd user sessions and most desktop
-environments set it automatically) so the production path is used.
-
-`{session_uuid}` is a v4 UUID generated at daemon startup (or passed via
-`--session-id`). The daemon logs its full socket path on startup:
-
-```
-INFO forgetty-daemon started, socket at /run/user/1000/forgetty-<uuid>.sock
-```
+The server logs its socket path on startup.
 
 ### Discovery
 
 ```sh
-# Enumerate running daemons for this user:
-ls -t "$XDG_RUNTIME_DIR"/forgetty-*.sock
-
-# Pick the most recent:
-SOCK=$(ls -t "$XDG_RUNTIME_DIR"/forgetty-*.sock | head -n1)
+SOCK="${XDG_RUNTIME_DIR:-/tmp/forgetty-$(id -u)}/forgetty/forgetty.sock"
 ```
+
+`forgetty --state-dir DIR` places the socket under `DIR/run/forgetty/`.
 
 ### Overriding the path
 
-`forgetty-daemon --socket-path <PATH>` overrides the default location.
-Parent directories are created on first bind; any stale socket file at the
+`forgetty server run --socket-path <PATH>` overrides the default location.
+The caller owns the safety of a custom directory. Any stale socket file at the
 target path is removed before re-binding.
-
-### Legacy path (tests only)
-
-`SocketServer::new()` — constructed without a session UUID — binds to
-`$XDG_RUNTIME_DIR/forgetty.sock`. This constructor is used only by
-`forgetty-socket`'s round-trip unit test; the production daemon always
-takes the `{session_uuid}` path described above. Do not rely on the legacy
-path from scripts.
 
 ---
 
@@ -211,8 +192,12 @@ workspaces. Despite the name, this is a pane list, not a tab list; prefer
 **Result:**
 ```json
 {"tabs":[{"pane_id":"<uuid>","pid":12345,"rows":24,"cols":80,
-         "cwd":"/home/user","title":"zsh"}]}
+         "cwd":"/home/user","title":"zsh",
+         "remain_on_exit":false,"exited":false,"exit_code":null}]}
 ```
+
+`exited` is true only for a pane kept with `remain_on_exit` whose process has
+ended. `exit_code` is then the process exit code (`null` if unknown).
 
 #### `get_layout`
 
@@ -250,6 +235,7 @@ default size; returns both the new tab UUID and the root pane UUID.
 | `cols` | number | no | PTY columns; defaults to `80`. |
 | `cwd` | string | no | Starting directory; silently ignored if not a directory. |
 | `command` | string[] | no | Profile command argv; empty array ignored. |
+| `remain_on_exit` | bool | no | Default `false`: the pane closes when its process exits. When `true` the pane stays listed with `exited: true` and `exit_code`, shows the exit status, and is removed by `close_pane`. Stored in the session file, so it survives server restarts. |
 
 **Result:** `{"tab_id":"<uuid>","pane_id":"<uuid>"}`
 
@@ -421,6 +407,17 @@ that swallow `0x03` without acting on it (Node.js, pm2 — BUG-001).
 **Params:** `{"pane_id":"<uuid>"}` (required).
 
 **Result:** `{"ok":true}`
+
+#### `pane_exit_status`
+
+Exit status of a pane process, live or already closed. The server records the
+exit code of every pane process (last 1024 kept).
+
+**Params:** `{"pane_id":"<uuid>"}`
+
+**Result:** `{"pane_id":"<uuid>","exited":true,"exit_code":5}` while running
+`exited` is false and `exit_code` is `null`. An id the server never knew
+returns an error.
 
 ### 5.3 Streaming
 

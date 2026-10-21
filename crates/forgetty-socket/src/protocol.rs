@@ -172,6 +172,9 @@ pub mod methods {
     pub const DISCONNECT: &str = "disconnect";
     /// P1: server version, protocol version, pid, uptime, pane and client counts.
     pub const SERVER_INFO: &str = "server_info";
+    /// Exit status of a pane process, live or already closed.
+    /// Params: `{ "pane_id": "<uuid>" }`. Result: `{ "running": bool, "exit_code": i32|null }`.
+    pub const PANE_EXIT_STATUS: &str = "pane_exit_status";
     /// P1: attached clients (iroh connections and streaming sockets).
     pub const LIST_CLIENTS: &str = "list_clients";
 

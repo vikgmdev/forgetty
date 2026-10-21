@@ -382,8 +382,8 @@ async fn handle_single_stream(
             handle_subscribe_stream(send, recv, sm, device_id, pane_id_str).await;
         }
 
-        Some(other) => {
-            warn!("stream: unexpected first message {:?} from {device_id}", other);
+        Some(_) => {
+            warn!("stream: unexpected first message type from {device_id}");
             let _ = write_msg(
                 &mut send,
                 &DaemonMsg::Error {
@@ -481,7 +481,7 @@ async fn handle_subscribe_stream(
                             .map(PaneId)
                             .unwrap_or(pane_id);
                         if let Err(e) = sm.write_pty(target, &data) {
-                            warn!("stream: write_pty failed for {pid_str}: {e}");
+                            warn!("stream: write_pty failed for pane {target}: {e}");
                         }
                     }
                     Some(ClientMsg::Subscribe { .. }) | Some(ClientMsg::ListPanes) => {

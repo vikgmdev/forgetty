@@ -60,7 +60,19 @@ impl DeviceRegistry {
             Vec::new()
         };
 
+        // Entries written before names were sanitised may hold anything.
+        let mut devices: Vec<DeviceEntry> = devices;
+        for d in &mut devices {
+            d.name = crate::sanitize::untrusted(&d.name);
+        }
+
         Ok(Self { path, devices })
+    }
+
+    /// An empty registry persisted at `path` (tests).
+    #[cfg(test)]
+    pub(crate) fn empty_at(path: PathBuf) -> Self {
+        Self { path, devices: Vec::new() }
     }
 
     /// Check whether an iroh `EndpointId` is in the authorized list.
@@ -70,7 +82,11 @@ impl DeviceRegistry {
     }
 
     /// Add a new device entry and persist atomically.
-    pub fn add(&mut self, entry: DeviceEntry) -> Result<(), RegistryError> {
+    ///
+    /// The name is sanitised here too ([`crate::sanitize::untrusted`]), so no
+    /// caller can store a hostile name.
+    pub fn add(&mut self, mut entry: DeviceEntry) -> Result<(), RegistryError> {
+        entry.name = crate::sanitize::untrusted(&entry.name);
         self.devices.push(entry);
         self.save()
     }

@@ -28,6 +28,12 @@ pub struct PaneState {
     pub rows: u16,
     /// Current PTY columns.
     pub cols: u16,
+    /// Keep the pane listed after its process exits (`forgetty new --keep`).
+    pub remain_on_exit: bool,
+    /// `true` once the process has exited and the pane was kept.
+    pub exited: bool,
+    /// Exit code of the process, once known.
+    pub exit_code: Option<i32>,
 }
 
 /// Public snapshot of pane metadata (returned by `SessionManager::pane_info()`).
@@ -42,6 +48,12 @@ pub struct PaneInfo {
     pub cwd: PathBuf,
     /// Last known title.
     pub title: String,
+    /// Kept after exit (opt-in).
+    pub remain_on_exit: bool,
+    /// The process has exited and the pane was kept.
+    pub exited: bool,
+    /// Exit code, once the process has exited.
+    pub exit_code: Option<i32>,
 }
 
 /// Returned per-tab metadata from `SessionManager::duplicate_workspace` (FIX-007).

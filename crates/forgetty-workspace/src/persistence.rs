@@ -837,6 +837,7 @@ mod tests {
             window_width: Some(960),
             window_height: Some(640),
             pinned: false,
+            remain_on_exit_panes: Vec::new(),
         }
     }
 
@@ -1040,6 +1041,7 @@ mod tests {
             window_width: Some(1200),
             window_height: Some(800),
             pinned: false,
+            remain_on_exit_panes: Vec::new(),
         };
 
         let json = serde_json::to_string_pretty(&state).unwrap();
@@ -1092,6 +1094,7 @@ mod tests {
             window_width: None,
             window_height: None,
             pinned: false,
+            remain_on_exit_panes: Vec::new(),
         };
 
         let json = serde_json::to_string_pretty(&state).unwrap();
@@ -1348,6 +1351,7 @@ mod tests {
             window_width: None,
             window_height: None,
             pinned: false,
+            remain_on_exit_panes: Vec::new(),
         };
 
         let mut set = std::collections::HashSet::new();

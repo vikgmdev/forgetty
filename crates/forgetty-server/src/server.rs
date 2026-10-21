@@ -25,6 +25,7 @@ use forgetty_socket::SocketServer;
 use forgetty_sync::{identity::load_or_generate, SyncEndpoint};
 
 use forgetty_server::iroh_terminal::{handle_terminal_stream, FORGETTY_STREAM_ALPN};
+use forgetty_server::sockpath;
 
 /// Options for `forgetty server run`.
 #[derive(Args, Debug, Default)]
@@ -41,18 +42,6 @@ pub struct RunArgs {
     /// Used by the paused GTK client, which runs one server per window.
     #[arg(long, hide = true)]
     pub session_id: Option<uuid::Uuid>,
-}
-
-/// Default socket path: `$XDG_RUNTIME_DIR/forgetty.sock`, else
-/// `/tmp/forgetty-<uid>.sock`. One server per user, so the path is fixed.
-pub fn default_socket_path() -> PathBuf {
-    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-        PathBuf::from(dir).join("forgetty.sock")
-    } else {
-        // SAFETY: getuid has no preconditions and cannot fail.
-        let uid = unsafe { libc::getuid() };
-        PathBuf::from(format!("/tmp/forgetty-{uid}.sock"))
-    }
 }
 
 /// Read the stable server id from `<data_dir>/server_id`, creating it on first run.
@@ -115,6 +104,15 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
         None => load_or_create_server_id()?,
     };
     let _instance_lock = acquire_instance_lock(session_id)?;
+
+    // The socket gives a shell. Keep it in a private directory, and refuse to
+    // start if that directory is unsafe (squatted, symlink, wrong owner/mode).
+    // A socket path given with --socket-path is the caller's responsibility.
+    if args.socket_path.is_none() {
+        let dir = sockpath::socket_dir();
+        sockpath::prepare_socket_dir(&dir)
+            .map_err(|e| anyhow::anyhow!("socket directory {} is unsafe: {e}", dir.display()))?;
+    }
 
     // Load config (canonicalize path first so relative paths survive CWD changes).
     let config_path = args.config_file.map(|p| {
@@ -348,6 +346,11 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
                         }
                     }
                 }
+                // `remain_on_exit` survives a restart. Pane ids are reused on
+                // restore, so the saved ids still match.
+                for id in &state.remain_on_exit_panes {
+                    session_manager.set_remain_on_exit(PaneId(*id), true);
+                }
                 for (ws_idx, tab_id, pane_id) in restore_targets {
                     if let Err(e) = session_manager.set_active_pane(ws_idx, tab_id, Some(pane_id)) {
                         warn!(
@@ -403,7 +406,7 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
         );
     }
 
-    let socket_path = args.socket_path.unwrap_or_else(default_socket_path);
+    let socket_path = args.socket_path.unwrap_or_else(sockpath::default_socket_path);
 
     // Bind the socket server (with session_id so shutdown_save can write the correct file).
     let socket_server = SocketServer::new_with_session(socket_path.clone(), session_id)?;

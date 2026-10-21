@@ -185,6 +185,49 @@ expect_rc 2 "pane suffix too short" -- fg send -p ab x
 expect_rc 2 "unknown key" -- fg send-key -p "$SUFFIX" f13
 pass "exit codes 3 and 2"
 
+step "socket permissions"
+SOCK="$STATE/run/forgetty/forgetty.sock"
+[ "$(stat -c %a "$STATE/run/forgetty")" = 700 ] || fail "socket dir is not mode 700"
+[ "$(stat -c %a "$SOCK")" = 600 ] || fail "socket is not mode 600"
+pass "socket dir 0700, socket 0600"
+
+step "new --keep: exited pane stays, exit code recorded, close_pane removes it"
+KPANE="$(fg new --keep -- sh -c 'echo keep-out; exit 5')" || fail "forgetty new --keep"
+[ -n "$KPANE" ] || fail "no keep pane id"
+KOK=0
+for _ in $(seq 1 50); do
+  if fg ls --json | python3 -I -c '
+import json,sys
+pid=sys.argv[1]
+t=json.load(sys.stdin)["tabs"]
+p=[x for x in t if x["pane_id"]==pid]
+sys.exit(0 if p and p[0].get("exited") is True and p[0].get("exit_code")==5 and p[0].get("remain_on_exit") is True else 1)
+' "$KPANE"; then KOK=1; break; fi
+  sleep 0.2
+done
+[ "$KOK" = 1 ] || { fg ls --json; fail "kept pane not listed as exited with code 5"; }
+fg ls | grep "$KPANE" | grep -q "exited 5" || { fg ls; fail "ls STATE column does not show exited 5"; }
+python3 -I - "$SOCK" "$KPANE" <<'PY' || fail "close_pane on the kept pane"
+import json, socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(10)
+s.connect(sys.argv[1])
+s.sendall((json.dumps({"jsonrpc": "2.0", "method": "close_pane", "params": {"pane_id": sys.argv[2]}, "id": 1}) + "\n").encode())
+buf = b""
+while not buf.endswith(b"\n"):
+    chunk = s.recv(65536)
+    if not chunk:
+        break
+    buf += chunk
+sys.exit(0 if "error" not in json.loads(buf) else 1)
+PY
+fg ls | grep -q "$KPANE" && fail "kept pane still listed after close_pane"
+# a default pane that exits is gone
+DPANE="$(fg new -- sh -c 'exit 0')" || fail "forgetty new (default)"
+sleep 2
+fg ls | grep -q "$DPANE" && fail "default pane still listed after its process exited"
+pass "--keep pane stays (exit 5), close_pane removes it, default pane closes on exit"
+
 # old pair/1 clients are refused, not paired
 step "server version info"
 fg server status | grep -q "protocol: 2.0" || fail "status does not show protocol 2.0"

@@ -74,6 +74,7 @@ pub fn dispatch(
             handle_server_info(request, &sm, sync_endpoint.as_deref(), session_id)
         }
         methods::LIST_CLIENTS => handle_list_clients(request, &sm),
+        methods::PANE_EXIT_STATUS => handle_pane_exit_status(request, &sm),
         methods::PAIR_OPEN => handle_pair_open(request, sync_endpoint.as_deref()),
         methods::PAIR_STATUS => handle_pair_status(request, sync_endpoint.as_deref()),
         // Sync / pairing methods — require sync_endpoint.
@@ -154,6 +155,9 @@ fn handle_list_tabs(request: &Request, sm: &SessionManager) -> Response {
                     "cols": info.cols,
                     "cwd": info.cwd.display().to_string(),
                     "title": info.title,
+                    "remain_on_exit": info.remain_on_exit,
+                    "exited": info.exited,
+                    "exit_code": info.exit_code,
                 })
             })
         })
@@ -218,7 +222,18 @@ fn handle_new_tab(request: &Request, sm: &SessionManager) -> Response {
         .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
         .filter(|v: &Vec<String>| !v.is_empty());
 
-    match sm.create_tab(workspace_idx, cwd, size, command) {
+    // Opt-in: keep the pane listed after its process exits.
+    let remain_on_exit =
+        request.params.get("remain_on_exit").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    match sm.create_tab_with_options(
+        workspace_idx,
+        cwd,
+        size,
+        command,
+        PaneId::new(),
+        remain_on_exit,
+    ) {
         Ok((pane_id, tab_id)) => Response::success(
             request.id.clone(),
             serde_json::json!({
@@ -850,6 +865,34 @@ fn handle_server_info(
     )
 }
 
+fn handle_pane_exit_status(request: &Request, sm: &SessionManager) -> Response {
+    let Some(raw) = request.params.get("pane_id").and_then(|v| v.as_str()) else {
+        return Response::error(
+            request.id.clone(),
+            protocol::INVALID_PARAMS,
+            "missing param: pane_id".to_string(),
+        );
+    };
+    let Ok(uuid) = Uuid::parse_str(raw) else {
+        return Response::error(
+            request.id.clone(),
+            protocol::INVALID_PARAMS,
+            "invalid pane_id".to_string(),
+        );
+    };
+    match sm.pane_exit_status(PaneId(uuid)) {
+        Some((running, code)) => Response::success(
+            request.id.clone(),
+            serde_json::json!({ "running": running, "exit_code": code }),
+        ),
+        None => Response::error(
+            request.id.clone(),
+            protocol::INVALID_PARAMS,
+            "pane not found and no exit recorded".to_string(),
+        ),
+    }
+}
+
 fn handle_list_clients(request: &Request, sm: &SessionManager) -> Response {
     let clients: Vec<serde_json::Value> = sm
         .clients()
@@ -1073,6 +1116,9 @@ fn handle_get_pane_info(request: &Request, sm: &SessionManager) -> Response {
             "title": info.title,
             "cwd": info.cwd.display().to_string(),
             "pid": info.pid,
+            "remain_on_exit": info.remain_on_exit,
+            "exited": info.exited,
+            "exit_code": info.exit_code,
         }),
     )
 }
@@ -2187,5 +2233,35 @@ mod tests {
         let sm = make_sm();
         let resp = dispatch(&req("pair_open", serde_json::Value::Null), sm, None, None);
         assert!(resp.error.is_some());
+    }
+
+    #[test]
+    fn pane_exit_status_unknown_pane_is_an_error() {
+        let sm = make_sm();
+        let params = serde_json::json!({ "pane_id": Uuid::new_v4().to_string() });
+        let resp = dispatch(&req("pane_exit_status", params), sm, None, None);
+        assert!(resp.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn new_tab_keep_flag_is_reported_by_list_tabs() {
+        let sm = make_sm();
+        let params = serde_json::json!({ "workspace_idx": 0, "remain_on_exit": true });
+        let resp = dispatch(&req("new_tab", params), Arc::clone(&sm), None, None);
+        let pane = resp.result.unwrap()["pane_id"].as_str().unwrap().to_string();
+        let tabs =
+            dispatch(&req("list_tabs", serde_json::Value::Null), Arc::clone(&sm), None, None);
+        let tab = &tabs.result.unwrap()["tabs"][0];
+        assert_eq!(tab["pane_id"], pane);
+        assert_eq!(tab["remain_on_exit"], true);
+        assert_eq!(tab["exited"], false);
+        assert!(tab["exit_code"].is_null());
+        let status = dispatch(
+            &req("pane_exit_status", serde_json::json!({ "pane_id": pane })),
+            sm,
+            None,
+            None,
+        );
+        assert_eq!(status.result.unwrap()["running"], true);
     }
 }
