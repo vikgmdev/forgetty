@@ -106,6 +106,13 @@ stream) and the `qa_*` test methods are not reachable over v2.
   only covers what the ring holds. A client without the capability keeps the
   old rule: it reads from the disk log, and a client behind the whole log is
   reset with code 0x11 and resumes with a reset.
+- Snapshot work is bounded. All streams share one build per pane (a build in
+  progress is joined, a result younger than 250 ms is reused), at most 2
+  builds run at once server wide, and a build nobody waits for any more is
+  dropped before it starts. One stream takes a catch-up at most once per
+  second, and waits twice as long each time it needs another soon, up to 10 s.
+  A pane has one live stream per connection: a new `attach_pane` replaces the
+  old one. An attach counts as a request in flight until its stream is open.
 - A stopping server answers `Hello` with `Error { code: "server_stopping" }`.
   The client retries it with its normal backoff.
 - Each v2 connection queues at most 8 MiB of Control messages (counted in

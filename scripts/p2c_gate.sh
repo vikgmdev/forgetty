@@ -5,7 +5,8 @@
 #   1. no code path lets a reader (a client stream) affect the PTY reader:
 #      the reader registry is gone from the byte log and the server
 #   2. unit tests: snapshot builder (screen, modes, title, cut anywhere),
-#      formatter FFI, control queue (byte cap, one replaceable layout),
+#      formatter FFI, control queue (byte cap, one replaceable layout), snapshot hub (shared
+#      builds, reuse, 2 at once, abandoned builds), catch-up backoff,
 #      protocol goldens
 #   3. throttled client (100 KB/s) on a paced 51 MiB program: run time within
 #      10 % of the run time with no client, its final screen equals a fresh
@@ -14,11 +15,14 @@
 #   4. vim-like alt-screen session after a forced catch-up: screen, cursor,
 #      alt screen, mouse, bracketed paste, keypad, cursor visibility and title
 #      match the server-side VT
-#   5. snapshot build time from an 8 MiB ring (release)
-#   6. 100k requests with no reads: task count and RSS stay flat, the
+#   5. 20 throttled clients on one pane plus a re-attach loop: at most 2
+#      snapshot builds at once, builds shared across streams, program run time
+#      within 10 %
+#   6. snapshot build time from an 8 MiB ring (release)
+#   7. 100k requests with no reads: task count and RSS stay flat, the
 #      connection closes; stalled Control reader with 6 and 31 panes
-#   7. `cat` of 200 MiB: server ingest MB/s with a client attached
-#   8. the earlier gates still pass: p0, p1, p4a, p1qa, p2b
+#   8. `cat` of 200 MiB: server ingest MB/s with a client attached
+#   9. the earlier gates still pass: p0, p1, p4a, p1qa, p2b
 #
 # Runs as the current user. All server state is under temp dirs.
 # Env: SKIP_OLD=1 skips step 8, ONLY="3 4" runs just those steps.
@@ -73,12 +77,14 @@ if want 2; then
   cargo test -p forgetty-session byte_log >>"$LOGS/u-session.log" 2>&1 || ok=0
   cargo test -p forgetty-vt format >"$LOGS/u-vt.log" 2>&1 || ok=0
   cargo test -p forgetty-server --lib control_queue >"$LOGS/u-server.log" 2>&1 || ok=0
+  cargo test -p forgetty-server --lib snapshot_hub >>"$LOGS/u-server.log" 2>&1 || ok=0
+  cargo test -p forgetty-server --lib limiter >>"$LOGS/u-server.log" 2>&1 || ok=0
   cargo test -p forgetty-proto >"$LOGS/u-proto.log" 2>&1 || ok=0
   [ $ok = 1 ] && { pass "unit tests"; SUMMARY+=("unit tests: pass"); } || { fail "unit tests"; tail -20 "$LOGS"/u-*.log; }
 fi
 
 # ---------------------------------------------------------------------------
-if want 3 || want 4 || want 6; then
+if want 3 || want 4 || want 5 || want 7; then
   FORGETTY_REAL_SERVER="$REAL" $CT_REL p2c -- --nocapture --test-threads=1 >"$LOGS/p2c.log" 2>&1
   grep -E "^test result|^test " "$LOGS/p2c.log" | sed 's/^/    /'
 fi
@@ -105,7 +111,18 @@ fi
 
 # ---------------------------------------------------------------------------
 if want 5; then
-  step "5. snapshot build time from an 8 MiB ring (release)"
+  step "5. 20 throttled clients plus a re-attach loop"
+  line=$(grep -h "snapshot load (" "$LOGS/p2c.log" | head -1 | sed 's/^test [a-z_0-9]* \.\.\. //')
+  if [ -n "$line" ] && ok_result "$LOGS/p2c.log"; then
+    pass "$line"; SUMMARY+=("$line")
+  else
+    fail "snapshot load test"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+if want 6; then
+  step "6. snapshot build time from an 8 MiB ring (release)"
   cargo test --release -p forgetty-session build_time -- --nocapture >"$LOGS/build.log" 2>&1
   line=$(grep -h "snapshot of" "$LOGS/build.log" | head -1)
   if [ -n "$line" ] && ok_result "$LOGS/build.log"; then
@@ -116,8 +133,8 @@ if want 5; then
 fi
 
 # ---------------------------------------------------------------------------
-if want 6; then
-  step "6. request flood, stalled Control reader"
+if want 7; then
+  step "7. request flood, stalled Control reader"
   for pat in "request flood (list_clients" "request flood (list_tabs"; do
     l=$(grep -h "$pat" "$LOGS/p2c.log" | head -1)
     if [ -n "$l" ]; then echo "    $l"; SUMMARY+=("$l"); else fail "missing: $pat"; fi
@@ -140,8 +157,8 @@ if want 6; then
 fi
 
 # ---------------------------------------------------------------------------
-if want 7; then
-  step "7. cat 200 MiB through the server"
+if want 8; then
+  step "8. cat 200 MiB through the server"
   FORGETTY_REAL_SERVER="$REAL" $CT_REL p2b cat_200mb -- --nocapture --test-threads=1 >"$LOGS/cat.log" 2>&1
   l=$(grep -h "cat 200 MiB:" "$LOGS/cat.log" | head -1 | sed 's/^test [a-z_0-9]* \.\.\. //')
   if [ -n "$l" ] && ok_result "$LOGS/cat.log"; then
@@ -152,8 +169,8 @@ if want 7; then
 fi
 
 # ---------------------------------------------------------------------------
-if want 8 && [ "${SKIP_OLD:-0}" != "1" ]; then
-  step "8. earlier gates"
+if want 9 && [ "${SKIP_OLD:-0}" != "1" ]; then
+  step "9. earlier gates"
   for g in p0 p1 p4a p1qa p2b; do
     if SKIP_OLD=1 bash "scripts/${g}_gate.sh" >"$LOGS/old-$g.log" 2>&1; then
       pass "${g}_gate.sh"; SUMMARY+=("${g}_gate: pass")

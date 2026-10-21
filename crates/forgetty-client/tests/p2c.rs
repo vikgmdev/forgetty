@@ -303,6 +303,110 @@ async fn a_throttled_client_does_not_slow_the_program() {
 }
 
 // ---------------------------------------------------------------------------
+// 1b. Many slow clients and a re-attach loop do not multiply the work
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn twenty_slow_clients_and_a_reattach_loop_stay_bounded() {
+    if !real_only() {
+        return;
+    }
+    let server = Arc::new(TestServer::start(TestServerConfig::default()).await);
+    let mut slow_hs = Vec::new();
+    for i in 0..20 {
+        slow_hs.push(connect(&server, &format!("slow{i}")).await);
+    }
+    let loop_h = connect(&server, "reattach").await;
+
+    let (mut base, mut with) = (Vec::new(), Vec::new());
+    let (mut builds, mut joins, mut reuses, mut served) = (0u64, 0u64, 0u64, 0u64);
+    let mut attaches = 0u64;
+    for round in 0..5 {
+        let quiet = server.add_script_pane(&paced_script());
+        base.push(run_program(&server, quiet).await);
+
+        let pane = server.add_script_pane(&paced_script());
+        let before = state(&server);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut tasks = Vec::new();
+        // 20 clients at 100 KB/s on the same pane.
+        for h in &slow_hs {
+            let mut s = h.attach_pane(pane).await.unwrap();
+            let stop = stop.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut vt = ClientVt::new();
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) && vt.end < TOTAL {
+                    let Ok(Some(item)) =
+                        tokio::time::timeout(Duration::from_millis(500), s.next()).await
+                    else {
+                        continue;
+                    };
+                    let n = match &item {
+                        PaneItem::Data { bytes, .. } | PaneItem::Snapshot { bytes, .. } => {
+                            bytes.len()
+                        }
+                        _ => 0,
+                    };
+                    vt.apply(item);
+                    tokio::time::sleep(Duration::from_secs_f64(n as f64 / 100_000.0)).await;
+                }
+            }));
+        }
+        // One client that attaches, reads a little, and attaches again.
+        let looped = {
+            let (h, stop) = (loop_h.clone(), stop.clone());
+            tokio::spawn(async move {
+                let mut n = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let Ok(mut s) = h.attach_pane(pane).await else { break };
+                    let _ = tokio::time::timeout(Duration::from_millis(40), async {
+                        for _ in 0..3 {
+                            s.next().await;
+                        }
+                    })
+                    .await;
+                    drop(s);
+                    n += 1;
+                    tokio::time::sleep(Duration::from_millis(60)).await;
+                }
+                n
+            })
+        };
+        let t = run_program(&server, pane).await;
+        with.push(t);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        attaches += looped.await.unwrap();
+        for t in tasks {
+            let _ = t.await;
+        }
+        let after = state(&server);
+        let d = |k: &str| after[k].as_u64().unwrap() - before[k].as_u64().unwrap();
+        builds += d("snapshot_builds");
+        joins += d("snapshot_joins");
+        reuses += d("snapshot_reuses");
+        served += d("catchups");
+        assert_eq!(d("too_many_closes"), 0, "round {round}: a connection was closed for requests");
+        assert_eq!(d("stall_closes"), 0, "round {round}: a connection was closed as stalled");
+    }
+    let st = state(&server);
+    let max_running = st["snapshot_max_running"].as_u64().unwrap();
+    base.sort();
+    with.sort();
+    let diff = (with[0].as_secs_f64() - base[0].as_secs_f64()) / base[0].as_secs_f64() * 100.0;
+    println!(
+        "snapshot load (20 clients at 100 KB/s + a re-attach loop, 5 rounds): {builds} builds for \
+         {served} snapshots served ({joins} joined, {reuses} reused, {attaches} re-attaches), \
+         at most {max_running} builds at once; program run time {:?} vs {:?} with no client \
+         ({diff:+.1}%)",
+        with[0], base[0]
+    );
+    assert!(max_running <= 2, "{max_running} snapshot builds ran at once");
+    assert!(builds <= 5 * 40, "{builds} snapshot builds in 5 rounds");
+    assert!(served > builds, "snapshots were not shared ({served} served, {builds} built)");
+    assert!(diff.abs() <= 10.0, "program run time changed by {diff:+.1}%");
+}
+
+// ---------------------------------------------------------------------------
 // 2. A vim-like alt-screen session survives a forced catch-up
 // ---------------------------------------------------------------------------
 

@@ -1367,8 +1367,8 @@ async fn pane_reader(shared: Arc<Shared>, gen: u64, mut recv: RecvStream) -> Tas
                 return TaskEnd::Done;
             }
             Err(e) => {
-                if is_superseded(&e) {
-                    // The server replaced this stream with a snapshot catch-up.
+                if is_superseded(&e) || lock(&pane.state).stream != mine {
+                    // The server replaced this stream (snapshot catch-up, new attach).
                     // The new stream is on its way, this one is over.
                     return TaskEnd::Done;
                 }

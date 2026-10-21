@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use crate::control_queue::ControlQueue;
+use crate::snapshot_hub::SnapshotHub;
 use forgetty_core::PaneId;
 use forgetty_proto::{
     cap, close_code, encode_msg, error_code, from_value, method, read_input_frame, read_msg,
@@ -78,6 +79,11 @@ pub const TOO_MANY_REQUESTS_CODE: u32 = 0x14;
 /// A pane stream whose write makes no progress this long gets a snapshot
 /// catch-up (AD-023).
 const NO_PROGRESS: Duration = Duration::from_secs(2);
+/// One stream takes a snapshot catch-up at most this often. A stream that needs
+/// them again soon waits twice as long each time, up to [`MAX_CATCHUP_BACKOFF`].
+const MIN_CATCHUP_INTERVAL: Duration = Duration::from_secs(1);
+/// Longest wait between two catch-ups of one stream.
+const MAX_CATCHUP_BACKOFF: Duration = Duration::from_secs(10);
 
 /// Capabilities the server offers.
 pub const SERVER_CAPS: [&str; 6] = [
@@ -172,10 +178,6 @@ pub struct Qa {
     pub attaches: Mutex<Vec<(Uuid, Option<u64>)>>,
     /// Snapshot catch-ups served.
     pub catchups: AtomicU64,
-    /// Build time of the last snapshot, microseconds.
-    pub last_snapshot_us: AtomicU64,
-    /// Size of the last snapshot, bytes.
-    pub last_snapshot_bytes: AtomicU64,
     /// Connections closed for [`MAX_INFLIGHT`].
     pub too_many_closes: AtomicU64,
     /// Connections closed for [`STALL_LIMIT`].
@@ -207,6 +209,8 @@ pub struct RpcV2 {
     /// Set while the server shuts down: input is no longer written, so the
     /// saved `seq` state matches what reached the PTYs.
     inputs_frozen: AtomicBool,
+    /// Snapshot builds shared by every stream (AD-023).
+    pub snapshots: Arc<SnapshotHub>,
     /// Harness counters.
     pub qa: Qa,
 }
@@ -234,6 +238,7 @@ impl RpcV2 {
             live: Mutex::new(Vec::new()),
             next_conn: AtomicU64::new(0),
             inputs_frozen: AtomicBool::new(false),
+            snapshots: Arc::new(SnapshotHub::default()),
             qa: Qa {
                 dedup_drops: AtomicU64::new(0),
                 hold_acks: AtomicBool::new(false),
@@ -242,8 +247,6 @@ impl RpcV2 {
                 paused,
                 attaches: Mutex::new(Vec::new()),
                 catchups: AtomicU64::new(0),
-                last_snapshot_us: AtomicU64::new(0),
-                last_snapshot_bytes: AtomicU64::new(0),
                 too_many_closes: AtomicU64::new(0),
                 stall_closes: AtomicU64::new(0),
                 force_catchup,
@@ -914,6 +917,7 @@ fn pump_event(rpc: &RpcV2, ev: SessionEvent, layout_dirty: &mut bool) {
         }
         SessionEvent::PaneClosed { pane_id } => {
             lock(&rpc.sizes).remove(&pane_id.0);
+            rpc.snapshots.forget(pane_id);
             rpc.emit(ServerEvent::PaneClosed { pane_id: pane_id.0 });
             *layout_dirty = true;
         }
@@ -1188,9 +1192,12 @@ impl Session {
                 out.push(control_frame(&reply(to_value(&SubscribeResult { seq }).map_err(bad))));
             }
             method::ATTACH_PANE => {
+                // An attach counts as a request in flight until its stream is
+                // open (a stream may start with a snapshot build).
+                let Some(guard) = self.begin_task(inflight) else { return false };
                 let r = from_value::<AttachPaneParams>(params)
                     .map_err(bad)
-                    .and_then(|p| self.attach(p, work, streams));
+                    .and_then(|p| self.attach(p, work, streams, guard));
                 out.push(control_frame(&reply(r)));
             }
             method::DETACH_PANE => {
@@ -1279,6 +1286,7 @@ impl Session {
         p: AttachPaneParams,
         work: &mut JoinSet<()>,
         streams: &mut HashMap<Uuid, AbortHandle>,
+        guard: InflightGuard,
     ) -> Result<Value, (&'static str, String)> {
         let pane = PaneId(p.pane_id);
         let Some(info) = self.rpc.sm.pane_info(pane) else {
@@ -1309,8 +1317,15 @@ impl Session {
             snapshot_len: 0,
         };
         let catchup = self.has(cap::SNAPSHOT_CATCHUP);
-        let handle =
-            work.spawn(pane_stream(self.rpc.clone(), self.conn.clone(), shared, header, catchup));
+        // One live stream per (connection, pane): the old one was aborted above.
+        let handle = work.spawn(pane_stream(
+            self.rpc.clone(),
+            self.conn.clone(),
+            shared,
+            header,
+            catchup,
+            guard,
+        ));
         streams.insert(p.pane_id, handle);
         to_value(&OkResult { ok: true }).map_err(|e| (error_code::INTERNAL, e.to_string()))
     }
@@ -1404,6 +1419,7 @@ async fn pane_stream(
     shared: Arc<LogShared>,
     first: PaneStreamHeader,
     catchup: bool,
+    guard: InflightGuard,
 ) {
     let pane = PaneId(first.pane_id);
     let lag_limit = (shared.ring_capacity() / 2) as u64;
@@ -1411,12 +1427,16 @@ async fn pane_stream(
     force.mark_unchanged();
     let mut header = first;
     let mut snapshot: Vec<u8> = Vec::new();
+    let mut limiter = CatchupLimiter::default();
     // A client that resumes far behind starts with the snapshot.
     if catchup && shared.total().saturating_sub(header.start_offset) > lag_limit {
+        limiter.note_now();
         let Some((h, snap)) = take_snapshot(&rpc, pane).await else { return };
         header = h;
         snapshot = snap;
     }
+    // From here the attach no longer counts as a request in flight.
+    drop(guard);
     loop {
         let Ok(mut send) = conn.open_uni().await else { return };
         let sent_snapshot = std::mem::take(&mut snapshot);
@@ -1450,6 +1470,8 @@ async fn pane_stream(
                 return;
             }
             StreamEnd::Catchup => {
+                // A stream that keeps needing catch-ups waits between them.
+                tokio::time::sleep(limiter.delay()).await;
                 // Stop the old stream, so it queues nothing more for the peer.
                 let _ = send.reset(stream_code::SUPERSEDED.into());
                 let Some((h, snap)) = take_snapshot(&rpc, pane).await else { return };
@@ -1460,20 +1482,57 @@ async fn pane_stream(
     }
 }
 
-/// Build the snapshot of a pane on a blocking thread. Returns the header of
-/// the stream that carries it, and the snapshot bytes.
+/// Spacing of one stream's catch-ups: at least [`MIN_CATCHUP_INTERVAL`] apart,
+/// doubling up to [`MAX_CATCHUP_BACKOFF`] while the stream keeps needing them.
+struct CatchupLimiter {
+    last: Option<tokio::time::Instant>,
+    interval: Duration,
+}
+
+impl Default for CatchupLimiter {
+    fn default() -> Self {
+        CatchupLimiter { last: None, interval: MIN_CATCHUP_INTERVAL }
+    }
+}
+
+impl CatchupLimiter {
+    /// Record a catch-up that happens right now.
+    fn note_now(&mut self) {
+        self.last = Some(tokio::time::Instant::now());
+    }
+
+    /// How long to wait before the next catch-up. Records it as done.
+    fn delay(&mut self) -> Duration {
+        let now = tokio::time::Instant::now();
+        let wait = match self.last {
+            None => Duration::ZERO,
+            Some(last) => {
+                // Needed again within two intervals: back off. Otherwise start over.
+                self.interval = if now.duration_since(last) < self.interval * 2 {
+                    (self.interval * 2).min(MAX_CATCHUP_BACKOFF)
+                } else {
+                    MIN_CATCHUP_INTERVAL
+                };
+                (last + self.interval).saturating_duration_since(now)
+            }
+        };
+        self.last = Some(now + wait);
+        wait
+    }
+}
+
+/// Get the snapshot of a pane from the shared hub (one build for all streams,
+/// two builds at once at most). Returns the header of the stream that carries
+/// it, and the snapshot bytes.
 async fn take_snapshot(rpc: &Arc<RpcV2>, pane: PaneId) -> Option<(PaneStreamHeader, Vec<u8>)> {
     let sm = rpc.sm.clone();
-    let started = std::time::Instant::now();
-    let snap = tokio::task::spawn_blocking(move || sm.snapshot_pane(pane)).await.ok().flatten()?;
-    let took = started.elapsed();
+    let snap = rpc.snapshots.get(pane, move || sm.snapshot_pane(pane)).await?;
     rpc.qa.catchups.fetch_add(1, Ordering::SeqCst);
-    rpc.qa.last_snapshot_us.store(took.as_micros() as u64, Ordering::SeqCst);
-    rpc.qa.last_snapshot_bytes.store(snap.bytes.len() as u64, Ordering::SeqCst);
     info!(
-        "rpc2: pane {pane} snapshot catch-up at {}: {} bytes in {took:?}",
+        "rpc2: pane {pane} snapshot catch-up at {}: {} bytes (last build {} us)",
         snap.offset,
-        snap.bytes.len()
+        snap.bytes.len(),
+        rpc.snapshots.stats.last_us.load(Ordering::Relaxed)
     );
     let header = PaneStreamHeader {
         pane_id: pane.0,
@@ -1483,7 +1542,7 @@ async fn take_snapshot(rpc: &Arc<RpcV2>, pane: PaneId) -> Option<(PaneStreamHead
         cols: snap.cols,
         snapshot_len: 0,
     };
-    Some((header, snap.bytes))
+    Some((header, snap.bytes.clone()))
 }
 
 /// Write one live frame. With `catchup`, a write that makes no progress for
@@ -1590,5 +1649,29 @@ async fn stream_from(
                 return StreamEnd::Gone;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod limiter_tests {
+    use super::*;
+
+    #[test]
+    fn catchups_back_off_up_to_ten_seconds_and_recover() {
+        let mut l = CatchupLimiter::default();
+        assert_eq!(l.delay(), Duration::ZERO, "the first catch-up is immediate");
+        // Needed again at once, over and over (the caller waits each delay
+        // before the next call, so the next "now" is the previous slot).
+        let mut waits = Vec::new();
+        for _ in 0..6 {
+            let w = l.delay();
+            waits.push(w.as_secs_f64().round() as u64);
+            l.last = Some(tokio::time::Instant::now()); // the caller waited
+        }
+        assert_eq!(waits, [2, 4, 8, 10, 10, 10]);
+        // A stream that was quiet starts over with the minimum interval.
+        l.last = Some(tokio::time::Instant::now() - Duration::from_secs(60));
+        let w = l.delay();
+        assert!(w.is_zero(), "after a quiet minute the next catch-up is immediate: {w:?}");
     }
 }

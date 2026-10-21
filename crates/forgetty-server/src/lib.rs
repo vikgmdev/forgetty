@@ -16,6 +16,7 @@ pub mod sockpath;
 
 pub mod control_queue;
 pub mod rpc_v2;
+pub mod snapshot_hub;
 
 #[cfg(feature = "qa-tools")]
 pub mod qa_hook;
