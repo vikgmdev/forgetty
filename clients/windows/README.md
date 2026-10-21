@@ -1,4 +1,4 @@
-# forgetty-win (V3 P3 spike)
+# forgetty-win (V3 Windows client)
 
 Rust native Windows client on GPUI + libghostty-vt + a local ConPTY shell.
 Separate Cargo workspace; the root workspace is untouched.
@@ -59,11 +59,64 @@ GPUI exposes the Windows IME (TSF/IMM) path through `Window::handle_input` with 
 handler in `paint` and report the cursor cell via `bounds_for_range` so the candidate window
 anchors at the cursor. Marked text can be drawn with `UnderlineStyle`.
 
+## App shell (W2)
+
+Layers, top to bottom:
+
+- `src/shell.rs`, `src/chrome.rs`: `AppShell` root view. Custom titlebar with tabs (client-side
+  decorations, `window_control_area` caption buttons so Windows 11 snap layouts work), sidebar
+  (machines, workspaces, tabs), split panes with draggable dividers, command palette. It talks only
+  to a `SessionBackend` and learns state only from `BackendEvent`s.
+- `shell-core/` (crate `forgetty-shell-core`, no UI code, unit-tested on Linux):
+  `layout.rs` (workspaces, tabs, pane tree with ratios; serde shape equals the server's `SessionLayout`),
+  `backend.rs` (`SessionBackend` trait, `BackendEvent`, requests/replies), `local.rs` (`LocalBackend`
+  on ConPTY), `keys.rs` (actions, chords, configurable keymap), `fuzzy.rs`, `osc.rs`.
+- `src/view.rs`, `src/element.rs`: one `TerminalView` per pane (libghostty-vt, damage-only row shaping).
+
+`SessionBackend` mirrors PROTOCOL_V2: `get_layout`, `new_tab`, `close_tab`, `focus_tab`, `move_tab`,
+`create_workspace`, `set_active_workspace`, `rename_workspace`, `split_pane`, `close_pane`,
+`set_active_pane`, `resize_pane`, `update_split_ratios`, `get_pane_info`, `attach_pane`, plus
+`subscribe()` for `LayoutChanged`, `PaneClosed`, `TitleChanged`, `CwdChanged`, `PaneResized`,
+`StatusChanged`. Every method returns a future; `LocalBackend` returns ready ones. A `RemoteBackend`
+on `forgetty-client` implements the same trait; the shell does not change.
+
+Notes and decisions:
+
+- Split direction is the server's: `horizontal` = side by side (Alt+Shift+Plus), `vertical` = stacked
+  (Alt+Shift+Minus). `update_split_ratios` is keyed by the leftmost leaf of the split's first child.
+- The protocol has no `rename_tab`: tab rename is a client-side title override (not persisted).
+  Pane zoom and the focused pane per tab are client UI state (focus is also sent via `set_active_pane`).
+- `StatusChanged.status` strings are not specified yet (P4). The client accepts `working`, `waiting`,
+  `done`, `failed`. `LocalBackend` derives them from OSC 133 marks (C = working, D;0 = done, D;n = failed,
+  A = waiting) and takes title from OSC 0/2, cwd from OSC 7 and OSC 9;9.
+- Security: a cwd from escape codes is a display hint only. New tabs and splits start in the parent
+  pane's spawn directory (else `default_cwd`, else the user profile). UNC, device (`\\?\`, `\\.\`)
+  paths and non-local `file://` hosts are dropped, so program output cannot make the client touch a
+  network share. The OSC scanner decodes on bytes and runs under `catch_unwind`.
+- Mica is used on Windows 11 22H2+ (`backdrop = "mica"`); older builds and `backdrop = "none"` get a solid
+  themed background. Panes always paint opaque.
+- Scrollback is 10 MiB of libghostty bytes per pane by default (`Terminal::new` too);
+  `scrollback_bytes` in `config.toml` changes it.
+
+Default keys (all in `[keybindings]` of `config.toml`, action name = value; `"none"` unbinds):
+Ctrl+Shift+T new tab, Ctrl+Shift+Q close tab, Ctrl+Tab / Ctrl+Shift+Tab cycle, Ctrl+1..9 go to tab,
+Ctrl+Shift+PageUp/Down move tab, Ctrl+Shift+R rename tab (also double-click), Alt+Shift+Plus / Minus split,
+Ctrl+Shift+W close pane, Alt+Arrows focus, Ctrl+Shift+Z zoom, Ctrl+B sidebar, Ctrl+Shift+P palette,
+Ctrl+Shift+N new workspace. Middle-click closes a tab; tabs and dividers drag.
+
+W2 smoke checks (on top of the W1 list): `tabs_4`, `tab_nav`, `split_4_panes`, `zoom_toggle`,
+`echo_per_pane`, `echo_isolated`, `key_p50_4panes_le_18ms`, `damage_only_4panes` (re-shaped rows in
+unfocused panes must stay 0), `divider_drag_ratios`, `divider_pty_follow`, `status_events`, `screenshot`
+(writes `layout-4pane.png`, uploaded as artifact `forgetty-win-layout-4pane`), `close_pane_pty_exit`,
+`close_tab_pty_exit`, `palette_opens`, `palette_fuzzy_split_right`, `palette_runs_action`, `tab_rename`,
+`config_w2`, `vt_default_scrollback`. Shortcuts in the smoke go through `AppShell::handle_key`, the same
+function the window's key handler calls.
+
 ## Smoke mode
 
 `--smoke` opens the window, drives `cmd.exe` through ConPTY and prints one JSON object. Exit 0
 only if every check in `checks` is true. 10 s is no longer the budget (the throughput test needs
-more): hard timeout 120 s, 45 s per phase. On failure the JSON carries the last screen dump.
+more): hard timeout 300 s, 60 s per phase. On failure the JSON carries the last screen dump.
 
 Checks: `echo_found`, `key_p50_le_18ms`, `damage_only_redraw`, `key_encoder`, `kitty_encoder`,
 `wide_direct`, `wide_shell`, `scrollback_direct`, `scrollback_shell`, `resize`, `throughput`,

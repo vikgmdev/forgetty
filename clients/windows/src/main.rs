@@ -1,22 +1,26 @@
-//! forgetty-win: V3 Windows client. GPUI window + libghostty-vt screen state
-//! + a `PaneSource` (local ConPTY today, remote durable-server pane later).
+//! forgetty-win: V3 Windows client. GPUI app shell (tabs, splits, sidebar,
+//! palette) over a `SessionBackend`, terminal panes on libghostty-vt.
 //! `--smoke` runs the headless CI gate.
 
+mod chrome;
 mod config;
 mod element;
 mod encoder;
+mod lineedit;
+mod screenshot;
+mod shell;
 mod smoke;
-mod source;
 mod view;
 
+use std::sync::Arc;
 use std::time::Instant;
 
-use gpui::{prelude::*, px, size, App, Bounds, WindowBounds, WindowOptions};
+use forgetty_shell_core::{LocalBackend, LocalConfig, SessionBackend};
+use gpui::{prelude::*, px, size, App, Bounds, TitlebarOptions, WindowBackgroundAppearance, WindowBounds, WindowOptions};
 use gpui_platform::application;
 
-use config::Config;
-use source::{LocalConPty, PaneSource};
-use view::{Metrics, TerminalView, INITIAL_COLS, INITIAL_ROWS};
+use config::{Backdrop, Config};
+use shell::AppShell;
 
 fn main() {
     let start = Instant::now();
@@ -30,20 +34,17 @@ fn main() {
         });
     }
 
-    let (cfg, cfg_err) = if smoke { (Config::default(), None) } else { Config::load() };
+    let (mut cfg, cfg_err) = if smoke { (Config::default(), None) } else { Config::load() };
+    // Mica needs Windows 11 22H2 (build 22621). Older systems get a solid background.
+    if matches!(cfg.backdrop, Backdrop::Mica | Backdrop::MicaAlt) && windows_build() < 22621 {
+        cfg.backdrop = Backdrop::None;
+    }
     if let Some(e) = cfg_err {
         eprintln!("forgetty-win: config error, using defaults: {e}");
     }
 
     application().run(move |cx: &mut App| {
-        let m = Metrics::measure(cx, &cfg);
-        let bounds = Bounds::centered(
-            None,
-            size(m.cell_w * INITIAL_COLS as f32, m.line_h * INITIAL_ROWS as f32 + px(0.0)),
-            cx,
-        );
-
-        let shell = if smoke {
+        let shell_cmd = if smoke {
             "cmd.exe".to_string()
         } else {
             cfg.shell
@@ -52,27 +53,44 @@ fn main() {
                 .or_else(|| std::env::var("COMSPEC").ok())
                 .unwrap_or_else(|| "cmd.exe".into())
         };
-        let cwd = if smoke { Some("C:\\") } else { None };
-        let pty = match LocalConPty::spawn(&shell, cwd, INITIAL_ROWS as u16, INITIAL_COLS as u16) {
-            Ok(s) => s,
-            Err(e) => fatal(smoke, &format!("local pty: {e:#}")),
+        let local = LocalBackend::new(LocalConfig {
+            shell: vec![shell_cmd],
+            default_cwd: if smoke { Some("C:\\".into()) } else { None },
+            machine_name: std::env::var("COMPUTERNAME").unwrap_or_else(|_| "This PC".into()),
+        });
+        let backend: Arc<dyn SessionBackend> = Arc::new(local.clone());
+        let smoke_state = smoke.then(|| Box::new(smoke::ShellSmoke::new(start, local.clone())));
+
+        let bounds = Bounds::centered(None, size(px(1000.0), px(680.0)), cx);
+        let background = if smoke {
+            WindowBackgroundAppearance::Opaque
+        } else {
+            match cfg.backdrop {
+                Backdrop::Mica => WindowBackgroundAppearance::MicaBackdrop,
+                Backdrop::MicaAlt => WindowBackgroundAppearance::MicaAltBackdrop,
+                Backdrop::Blur => WindowBackgroundAppearance::Blurred,
+                Backdrop::None => WindowBackgroundAppearance::Opaque,
+            }
         };
-        let smoke_state = smoke.then(|| Box::new(smoke::Smoke::new(start, pty.injector())));
-        let source: Box<dyn PaneSource> = Box::new(pty);
         let opened = cx.open_window(
-            WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() },
-            |window, cx| {
-                let view = cx.new(|cx| TerminalView::new(cfg, source, smoke_state, cx));
-                let handle = gpui::Focusable::focus_handle(view.read(cx), cx);
-                window.focus(&handle, cx);
-                // DECSET 1004 focus reporting + cursor hollow/solid on blur.
-                view.update(cx, |_, cx| {
-                    cx.observe_window_activation(window, |v, window, cx| {
-                        v.on_activation(window.is_window_active(), cx)
-                    })
-                    .detach();
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: Some(TitlebarOptions {
+                    title: Some("Forgetty".into()),
+                    appears_transparent: true,
+                    traffic_light_position: None,
+                }),
+                window_background: background,
+                window_min_size: Some(size(px(480.0), px(300.0))),
+                ..Default::default()
+            },
+            move |window, cx| {
+                let shell = cx.new(|cx| AppShell::new(cfg, backend, smoke_state, window, cx));
+                shell.update(cx, |_, cx| {
+                    cx.observe_window_activation(window, |s, window, cx| s.on_window_activation(window, cx))
+                        .detach();
                 });
-                view
+                shell
             },
         );
         if let Err(e) = opened {
@@ -88,4 +106,33 @@ fn fatal(smoke: bool, msg: &str) -> ! {
     }
     eprintln!("forgetty-win: {msg}");
     std::process::exit(1);
+}
+
+#[cfg(windows)]
+fn windows_build() -> u32 {
+    #[repr(C)]
+    struct OsVersionInfo {
+        size: u32,
+        major: u32,
+        minor: u32,
+        build: u32,
+        platform: u32,
+        csd: [u16; 128],
+    }
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn RtlGetVersion(info: *mut OsVersionInfo) -> i32;
+    }
+    let mut v = OsVersionInfo { size: std::mem::size_of::<OsVersionInfo>() as u32, major: 0, minor: 0, build: 0, platform: 0, csd: [0; 128] };
+    // SAFETY: plain out-struct with its size field set.
+    if unsafe { RtlGetVersion(&mut v) } == 0 {
+        v.build
+    } else {
+        0
+    }
+}
+
+#[cfg(not(windows))]
+fn windows_build() -> u32 {
+    0
 }

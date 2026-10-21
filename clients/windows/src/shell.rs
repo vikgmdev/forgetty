@@ -1,0 +1,965 @@
+//! The app shell: tabs, splits, sidebar, palette. It talks only to a
+//! `SessionBackend` (layout requests out, `BackendEvent`s in), so it cannot
+//! tell a local ConPTY backend from a remote one.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use forgetty_shell_core::fuzzy;
+use forgetty_shell_core::keys::{Action, Chord, Keymap, ACTIONS};
+use forgetty_shell_core::layout::{neighbor, Divider, PaneGeometry, Rect, Side};
+use forgetty_shell_core::{
+    BackendEvent, BackendFuture, Layout, MachineInfo, NewTab, PaneId, PaneSource, PaneStatus, SessionBackend,
+    SplitDir, SplitPane, SplitRatio, Tab, Uuid,
+};
+use gpui::{AppContext as _,
+    Context, Entity, FocusHandle, Focusable, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Window,
+};
+
+use crate::config::{Backdrop, Config};
+use crate::lineedit::{EditResult, LineEdit};
+use crate::smoke::ShellSmoke;
+use crate::view::{Metrics, TerminalView};
+
+pub const TITLEBAR_H: f32 = 38.0;
+pub const SIDEBAR_W: f32 = 232.0;
+/// Divider thickness between panes, in px.
+pub const BAR: f32 = 1.0;
+pub const MIN_PANE_W: f32 = 120.0;
+pub const MIN_PANE_H: f32 = 60.0;
+pub const CAPTION_W: f32 = 138.0;
+pub const TAB_LEFT: f32 = 10.0;
+pub const PLUS_W: f32 = 34.0;
+const TAB_MIN_W: f32 = 104.0;
+const TAB_MAX_W: f32 = 220.0;
+
+#[derive(Clone, Debug, Default)]
+pub struct PaneMeta {
+    pub title: String,
+    pub cwd: String,
+    pub status: PaneStatus,
+    pub message: String,
+}
+
+pub struct PaletteItem {
+    pub action: Action,
+    pub title: &'static str,
+    pub shortcut: String,
+    pub hits: Vec<usize>,
+}
+
+pub struct Palette {
+    pub edit: LineEdit,
+    pub selected: usize,
+    pub items: Vec<PaletteItem>,
+}
+
+pub struct Rename {
+    pub tab: Uuid,
+    pub edit: LineEdit,
+}
+
+pub enum Drag {
+    Tab { id: Uuid, index: usize },
+    Divider { tab: Uuid, divider: Divider, ratio: f32 },
+}
+
+#[derive(Clone, Copy)]
+pub struct Theme {
+    pub bg: u32,
+    pub chrome: u32,
+    pub tab_active: u32,
+    pub hover: u32,
+    pub border: u32,
+    pub fg: u32,
+    pub dim: u32,
+    pub accent: u32,
+}
+
+pub fn blend(a: u32, b: u32, t: f32) -> u32 {
+    let ch = |s: u32| {
+        let x = ((a >> s) & 0xff) as f32;
+        let y = ((b >> s) & 0xff) as f32;
+        ((x + (y - x) * t).round() as u32).min(255)
+    };
+    (ch(16) << 16) | (ch(8) << 8) | ch(0)
+}
+
+impl Theme {
+    pub fn from_cfg(cfg: &Config) -> Self {
+        let light = {
+            let b = cfg.background;
+            ((b >> 16) & 0xff) + ((b >> 8) & 0xff) + (b & 0xff) > 3 * 140
+        };
+        let toward = if light { 0x000000 } else { 0xffffff };
+        Theme {
+            bg: cfg.background,
+            chrome: blend(cfg.background, toward, 0.05),
+            tab_active: cfg.background,
+            hover: blend(cfg.background, toward, 0.10),
+            border: blend(cfg.background, toward, 0.16),
+            fg: cfg.foreground,
+            dim: blend(cfg.foreground, cfg.background, 0.45),
+            accent: cfg.accent,
+        }
+    }
+}
+
+pub struct AppShell {
+    pub cfg: Config,
+    pub theme: Theme,
+    pub keymap: Keymap,
+    pub backend: Arc<dyn SessionBackend>,
+    pub machine: MachineInfo,
+    pub layout: Layout,
+    pub views: HashMap<PaneId, Entity<TerminalView>>,
+    attaching: HashSet<PaneId>,
+    pub meta: HashMap<PaneId, PaneMeta>,
+    pub title_override: HashMap<Uuid, String>,
+    /// Active pane per tab (UI state; also reported to the backend).
+    pub local_active: HashMap<Uuid, PaneId>,
+    pub zoomed: HashMap<Uuid, PaneId>,
+    pub sidebar_open: bool,
+    pub palette: Option<Palette>,
+    pub rename: Option<Rename>,
+    pub drag: Option<Drag>,
+    pub focus: FocusHandle,
+    pub metrics: Metrics,
+    pub viewport: (f32, f32),
+    pub spin: usize,
+    sync_dirty: bool,
+    pub window_active: bool,
+    applied_title: String,
+    had_tabs: bool,
+    pub frames: u64,
+    pub smoke_mode: bool,
+    pub smoke: Option<Box<ShellSmoke>>,
+    pub mica: bool,
+}
+
+pub fn basename(path: &str) -> String {
+    let t = path.trim_end_matches(['\\', '/']);
+    if t.is_empty() {
+        return path.to_string();
+    }
+    let b = t.rsplit(['\\', '/']).next().unwrap_or(t);
+    if b.ends_with(':') {
+        return format!("{b}\\");
+    }
+    b.to_string()
+}
+
+fn clean_title(t: &str) -> String {
+    let lower = t.to_ascii_lowercase();
+    if (lower.ends_with(".exe") || lower.ends_with(".cmd")) && t.contains(['\\', '/']) {
+        let b = basename(t);
+        return b.rsplit_once('.').map(|x| x.0.to_string()).unwrap_or(b);
+    }
+    t.to_string()
+}
+
+impl AppShell {
+    pub fn new(
+        cfg: Config,
+        backend: Arc<dyn SessionBackend>,
+        smoke: Option<Box<ShellSmoke>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let metrics = Metrics::measure(cx, &cfg);
+        let smoke_mode = smoke.is_some();
+        let keymap = Keymap::new(&cfg.keybindings);
+        for w in &keymap.warnings {
+            eprintln!("forgetty-win: keybindings: {w}");
+        }
+        let mica = !smoke_mode && cfg.backdrop != Backdrop::None;
+        let vp = window.viewport_size();
+        let focus = cx.focus_handle();
+        window.focus(&focus, cx);
+
+        let shell = AppShell {
+            theme: Theme::from_cfg(&cfg),
+            sidebar_open: cfg.sidebar_open,
+            keymap,
+            machine: backend.machine(),
+            backend: backend.clone(),
+            layout: Layout::default(),
+            views: HashMap::new(),
+            attaching: HashSet::new(),
+            meta: HashMap::new(),
+            title_override: HashMap::new(),
+            local_active: HashMap::new(),
+            zoomed: HashMap::new(),
+            palette: None,
+            rename: None,
+            drag: None,
+            focus,
+            metrics,
+            viewport: (f32::from(vp.width), f32::from(vp.height)),
+            spin: 0,
+            sync_dirty: true,
+            window_active: true,
+            applied_title: String::new(),
+            had_tabs: false,
+            frames: 0,
+            smoke_mode,
+            smoke,
+            mica,
+            cfg,
+        };
+
+        // Backend events -> shell state.
+        let rx = backend.subscribe();
+        cx.spawn(async move |this, cx| {
+            while let Ok(first) = rx.recv().await {
+                let mut evs = vec![first];
+                while let Ok(e) = rx.try_recv() {
+                    evs.push(e);
+                }
+                if this.update(cx, |s, cx| s.on_events(evs, cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+
+        if smoke_mode {
+            // The smoke state machine advances per painted frame: keep frames coming.
+            cx.spawn(async move |this, cx| loop {
+                cx.background_executor().timer(std::time::Duration::from_millis(60)).await;
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
+                }
+            })
+            .detach();
+        }
+
+        // Spinner: ticks only while some pane reports "working".
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(std::time::Duration::from_millis(90)).await;
+            let alive = this
+                .update(cx, |s, cx| {
+                    if s.meta.values().any(|m| m.status == PaneStatus::Working) {
+                        s.spin = s.spin.wrapping_add(1);
+                        cx.notify();
+                    }
+                })
+                .is_ok();
+            if !alive {
+                break;
+            }
+        })
+        .detach();
+
+        // Bootstrap: take whatever the backend already has, else open one tab.
+        let fut = backend.get_layout();
+        cx.spawn(async move |this, cx| {
+            let layout = fut.await.unwrap_or_default();
+            let _ = this.update(cx, |s, cx| {
+                s.apply_layout(layout, cx);
+                if s.layout.tab_count() == 0 {
+                    s.new_tab(cx);
+                }
+            });
+        })
+        .detach();
+
+        shell
+    }
+
+    // ---- backend plumbing -----------------------------------------------------
+
+    /// Run a backend future; apply its result on the UI thread. State changes
+    /// arrive separately as events.
+    pub fn call<T: Send + 'static>(
+        &mut self,
+        cx: &mut Context<Self>,
+        fut: BackendFuture<T>,
+        then: impl FnOnce(&mut Self, T, &mut Context<Self>) + 'static,
+    ) {
+        cx.spawn(async move |this, cx| match fut.await {
+            Ok(v) => {
+                let _ = this.update(cx, |s, cx| then(s, v, cx));
+            }
+            Err(e) => eprintln!("forgetty-win: backend: {e}"),
+        })
+        .detach();
+    }
+
+    fn on_events(&mut self, evs: Vec<BackendEvent>, cx: &mut Context<Self>) {
+        let mut layout = None;
+        for ev in evs {
+            match ev {
+                BackendEvent::LayoutChanged(l) => layout = Some(l),
+                BackendEvent::PaneClosed { pane_id } => {
+                    self.meta.remove(&pane_id);
+                }
+                BackendEvent::TitleChanged { pane_id, title } => {
+                    self.meta.entry(pane_id).or_default().title = title;
+                }
+                BackendEvent::CwdChanged { pane_id, cwd } => {
+                    self.meta.entry(pane_id).or_default().cwd = cwd;
+                }
+                BackendEvent::PaneResized { .. } => {}
+                BackendEvent::StatusChanged { pane_id, status, message } => {
+                    let m = self.meta.entry(pane_id).or_default();
+                    m.status = status;
+                    m.message = message;
+                }
+            }
+        }
+        if let Some(l) = layout {
+            self.apply_layout(l, cx);
+        }
+        cx.notify();
+    }
+
+    pub fn apply_layout(&mut self, mut layout: Layout, cx: &mut Context<Self>) {
+        // A divider being dragged keeps the user's ratio until release.
+        if let Some(Drag::Divider { tab, divider, ratio }) = &self.drag {
+            if let Some((w, t)) = layout.find_tab(*tab) {
+                layout.workspaces[w].tabs[t].pane_tree.set_ratio_at(&divider.path, *ratio);
+            }
+        }
+        let panes: HashSet<PaneId> = layout.all_panes().into_iter().collect();
+        self.views.retain(|id, _| panes.contains(id));
+        self.meta.retain(|id, _| panes.contains(id));
+        let tabs: HashSet<Uuid> = layout.workspaces.iter().flat_map(|w| w.tabs.iter().map(|t| t.id)).collect();
+        self.title_override.retain(|id, _| tabs.contains(id));
+        self.local_active.retain(|id, p| tabs.contains(id) && panes.contains(p));
+        self.zoomed.retain(|id, p| tabs.contains(id) && panes.contains(p));
+        if self.rename.as_ref().is_some_and(|r| !tabs.contains(&r.tab)) {
+            self.rename = None;
+        }
+        if layout.tab_count() > 0 {
+            self.had_tabs = true;
+        } else if self.had_tabs {
+            cx.quit();
+            return;
+        }
+        self.layout = layout;
+        let ids: Vec<PaneId> = panes.into_iter().collect();
+        for p in ids {
+            self.attach(p, cx);
+        }
+        self.sync_dirty = true;
+        cx.notify();
+    }
+
+    fn attach(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+        if self.views.contains_key(&pane) || !self.attaching.insert(pane) {
+            return;
+        }
+        let src = self.backend.attach_pane(pane);
+        let info = self.backend.get_pane_info(pane);
+        cx.spawn(async move |this, cx| {
+            let src = src.await;
+            let info = info.await.ok();
+            let _ = this.update(cx, |s, cx| {
+                s.attaching.remove(&pane);
+                match src {
+                    Ok(src) => s.add_view(pane, src, info, cx),
+                    Err(e) => eprintln!("forgetty-win: attach {}: {e}", pane.0),
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn add_view(
+        &mut self,
+        pane: PaneId,
+        src: Box<dyn PaneSource>,
+        info: Option<forgetty_shell_core::PaneInfo>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.layout.all_panes().contains(&pane) {
+            src.shutdown();
+            return;
+        }
+        let (rows, cols) = info.as_ref().map(|i| (i.rows as usize, i.cols as usize)).unwrap_or((30, 120));
+        if let Some(i) = info {
+            let m = self.meta.entry(pane).or_default();
+            if m.title.is_empty() {
+                m.title = i.title;
+            }
+            if m.cwd.is_empty() {
+                m.cwd = i.cwd;
+            }
+            if m.status == PaneStatus::None {
+                m.status = i.status;
+            }
+        }
+        let cfg = self.cfg.clone();
+        let smoke_mode = self.smoke_mode;
+        let view = cx.new(|cx| TerminalView::new(cfg, pane, src, rows, cols, smoke_mode, cx));
+        self.views.insert(pane, view);
+        self.sync_dirty = true;
+        cx.notify();
+    }
+
+    // ---- derived state ----------------------------------------------------------
+
+    pub fn content_rect(&self) -> Rect {
+        let sb = if self.sidebar_open { SIDEBAR_W } else { 0.0 };
+        Rect::new(0.0, 0.0, (self.viewport.0 - sb).max(1.0), (self.viewport.1 - TITLEBAR_H).max(1.0))
+    }
+
+    /// Window coordinates of the content area's top-left corner.
+    pub fn content_origin(&self) -> (f32, f32) {
+        (if self.sidebar_open { SIDEBAR_W } else { 0.0 }, TITLEBAR_H)
+    }
+
+    pub fn active_tab(&self) -> Option<&Tab> {
+        self.layout.active_tab()
+    }
+
+    pub fn active_pane_of(&self, tab: &Tab) -> PaneId {
+        match self.local_active.get(&tab.id) {
+            Some(p) if tab.pane_tree.contains(*p) => *p,
+            _ => tab.focused_pane(),
+        }
+    }
+
+    pub fn active_pane(&self) -> Option<PaneId> {
+        self.active_tab().map(|t| self.active_pane_of(t))
+    }
+
+    /// Pane rectangles of the active tab, in content coordinates. A zoomed
+    /// pane fills the whole area.
+    pub fn active_geometry(&self) -> Option<(Uuid, PaneGeometry)> {
+        let tab = self.active_tab()?;
+        let rect = self.content_rect();
+        if let Some(z) = self.zoomed.get(&tab.id) {
+            if tab.pane_tree.contains(*z) {
+                return Some((tab.id, PaneGeometry { panes: vec![(*z, rect)], dividers: Vec::new() }));
+            }
+        }
+        Some((tab.id, tab.pane_tree.geometry(rect, BAR)))
+    }
+
+    pub fn grid_for(&self, w: f32, h: f32) -> (u16, u16) {
+        let cols = (w / f32::from(self.metrics.cell_w)).floor().clamp(2.0, 1000.0) as u16;
+        let rows = (h / f32::from(self.metrics.line_h)).floor().clamp(1.0, 500.0) as u16;
+        (rows, cols)
+    }
+
+    pub fn tab_title(&self, tab: &Tab) -> String {
+        if let Some(t) = self.title_override.get(&tab.id) {
+            return t.clone();
+        }
+        if let Some(m) = self.meta.get(&self.active_pane_of(tab)) {
+            if !m.title.is_empty() {
+                return clean_title(&m.title);
+            }
+        }
+        if !tab.title.is_empty() {
+            return tab.title.clone();
+        }
+        "Terminal".to_string()
+    }
+
+    pub fn tab_cwd(&self, tab: &Tab) -> String {
+        self.meta
+            .get(&self.active_pane_of(tab))
+            .map(|m| basename(&m.cwd))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_default()
+    }
+
+    pub fn tab_status(&self, tab: &Tab) -> PaneStatus {
+        tab.pane_tree
+            .leaves()
+            .iter()
+            .filter_map(|p| self.meta.get(p).map(|m| m.status))
+            .max_by_key(|s| s.rank())
+            .unwrap_or(PaneStatus::None)
+    }
+
+    /// (left offset, tab width) of the tab strip for the active workspace.
+    pub fn tab_strip(&self) -> (f32, f32) {
+        let n = self.layout.active_workspace().map(|w| w.tabs.len()).unwrap_or(0).max(1) as f32;
+        let avail = self.viewport.0 - TAB_LEFT - CAPTION_W - PLUS_W - 48.0;
+        (TAB_LEFT, (avail / n).clamp(TAB_MIN_W, TAB_MAX_W))
+    }
+
+    // ---- focus / visibility sync -----------------------------------------------
+
+    pub fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let visible: HashSet<PaneId> =
+            self.active_geometry().map(|(_, g)| g.panes.iter().map(|(p, _)| *p).collect()).unwrap_or_default();
+        let active = self.active_pane();
+        let win_active = window.is_window_active() || self.smoke_mode;
+        self.window_active = win_active;
+        for (id, v) in &self.views {
+            let (vis, foc) = (visible.contains(id), Some(*id) == active && win_active);
+            v.update(cx, |v, cx| {
+                v.set_visible(vis, cx);
+                v.set_focused(foc, cx);
+            });
+        }
+        let target = match active.and_then(|a| self.views.get(&a)) {
+            Some(v) => v.read(cx).focus.clone(),
+            None => self.focus.clone(),
+        };
+        if !target.is_focused(window) {
+            window.defer(cx, move |window, cx| window.focus(&target, cx));
+        }
+    }
+
+    pub fn request_sync(&mut self, cx: &mut Context<Self>) {
+        self.sync_dirty = true;
+        cx.notify();
+    }
+
+    pub fn take_sync_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.sync_dirty)
+    }
+
+    pub fn on_window_activation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync(window, cx);
+        cx.notify();
+    }
+
+    // ---- actions ----------------------------------------------------------------
+
+    pub fn new_tab(&mut self, cx: &mut Context<Self>) {
+        let r = self.content_rect();
+        let (rows, cols) = self.grid_for(r.w, r.h);
+        // No cwd: the backend decides (it never trusts escape-code paths).
+        let req = NewTab { workspace_idx: self.layout.active_workspace, rows, cols, cwd: None, command: Vec::new() };
+        let fut = self.backend.new_tab(req);
+        self.call(cx, fut, |s, reply, cx| {
+            s.local_active.insert(reply.tab_id, reply.pane_id);
+            cx.notify();
+        });
+    }
+
+    pub fn close_tab(&mut self, tab: Uuid, cx: &mut Context<Self>) {
+        let fut = self.backend.close_tab(tab);
+        self.call(cx, fut, |_, _, _| {});
+    }
+
+    pub fn focus_tab(&mut self, tab: Uuid, cx: &mut Context<Self>) {
+        let fut = self.backend.focus_tab(tab);
+        self.call(cx, fut, |_, _, _| {});
+    }
+
+    fn tab_ids(&self) -> Vec<Uuid> {
+        self.layout.active_workspace().map(|w| w.tabs.iter().map(|t| t.id).collect()).unwrap_or_default()
+    }
+
+    pub fn cycle_tab(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let ids = self.tab_ids();
+        let Some(ws) = self.layout.active_workspace() else { return };
+        if ids.len() < 2 {
+            return;
+        }
+        let n = ids.len() as isize;
+        let to = ((ws.active_tab as isize + delta) % n + n) % n;
+        self.focus_tab(ids[to as usize], cx);
+    }
+
+    pub fn goto_tab(&mut self, n: u8, cx: &mut Context<Self>) {
+        let ids = self.tab_ids();
+        if ids.is_empty() {
+            return;
+        }
+        let i = if n >= 9 { ids.len() - 1 } else { (n as usize - 1).min(ids.len() - 1) };
+        self.focus_tab(ids[i], cx);
+    }
+
+    pub fn move_tab_by(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let Some(ws) = self.layout.active_workspace() else { return };
+        let to = ws.active_tab as isize + delta;
+        if to < 0 || to >= ws.tabs.len() as isize {
+            return;
+        }
+        let id = ws.tabs[ws.active_tab].id;
+        let fut = self.backend.move_tab(id, to as usize);
+        self.call(cx, fut, |_, _, _| {});
+    }
+
+    pub fn split(&mut self, dir: SplitDir, cx: &mut Context<Self>) {
+        let (Some(tab), Some(pane)) = (self.active_tab().map(|t| t.id), self.active_pane()) else { return };
+        let rect = self
+            .active_geometry()
+            .and_then(|(_, g)| g.panes.iter().find(|(p, _)| *p == pane).map(|(_, r)| *r))
+            .unwrap_or_else(|| self.content_rect());
+        let (w, h) = match dir {
+            SplitDir::Horizontal => (rect.w / 2.0, rect.h),
+            SplitDir::Vertical => (rect.w, rect.h / 2.0),
+        };
+        let (rows, cols) = self.grid_for(w, h);
+        // The backend starts the new pane where the parent was started.
+        let fut = self.backend.split_pane(SplitPane { pane_id: pane, direction: dir, rows, cols, cwd: None });
+        // Splitting un-zooms: the new pane must be visible.
+        self.zoomed.remove(&tab);
+        self.call(cx, fut, move |s, new_pane, cx| {
+            s.local_active.insert(tab, new_pane);
+            s.request_sync(cx);
+        });
+    }
+
+    pub fn close_pane(&mut self, cx: &mut Context<Self>) {
+        if let Some(p) = self.active_pane() {
+            let fut = self.backend.close_pane(p);
+            self.call(cx, fut, |_, _, _| {});
+        }
+    }
+
+    pub fn focus_pane(&mut self, pane: PaneId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.layout.find_pane(pane).and_then(|(w, t)| self.layout.workspaces.get(w).and_then(|ws| ws.tabs.get(t))) else {
+            return;
+        };
+        let tab_id = tab.id;
+        if self.local_active.get(&tab_id) == Some(&pane) && self.active_pane() == Some(pane) {
+            return;
+        }
+        self.local_active.insert(tab_id, pane);
+        let fut = self.backend.set_active_pane(tab_id, Some(pane));
+        self.call(cx, fut, |_, _, _| {});
+        self.sync(window, cx);
+        cx.notify();
+    }
+
+    pub fn focus_side(&mut self, side: Side, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some((_, geo)), Some(from)) = (self.active_geometry(), self.active_pane()) else { return };
+        if let Some(to) = neighbor(&geo.panes, from, side) {
+            self.focus_pane(to, window, cx);
+        }
+    }
+
+    pub fn toggle_zoom(&mut self, cx: &mut Context<Self>) {
+        let (Some(tab), Some(pane)) = (self.active_tab().map(|t| t.id), self.active_pane()) else { return };
+        if self.zoomed.remove(&tab).is_none() {
+            if self.active_tab().is_some_and(|t| t.pane_tree.pane_count() > 1) {
+                self.zoomed.insert(tab, pane);
+            }
+        }
+        self.request_sync(cx);
+    }
+
+    pub fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_open = !self.sidebar_open;
+        self.request_sync(cx);
+    }
+
+    pub fn new_workspace(&mut self, cx: &mut Context<Self>) {
+        let r = self.content_rect();
+        let (rows, cols) = self.grid_for(r.w, r.h);
+        let fut = self.backend.create_workspace(None, rows, cols);
+        self.call(cx, fut, |s, reply, cx| {
+            s.local_active.insert(reply.tab_id, reply.pane_id);
+            cx.notify();
+        });
+    }
+
+    pub fn cycle_workspace(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let n = self.layout.workspaces.len() as isize;
+        if n < 2 {
+            return;
+        }
+        let to = ((self.layout.active_workspace as isize + delta) % n + n) % n;
+        let fut = self.backend.set_active_workspace(to as usize);
+        self.call(cx, fut, |_, _, _| {});
+    }
+
+    pub fn set_workspace(&mut self, idx: usize, cx: &mut Context<Self>) {
+        let fut = self.backend.set_active_workspace(idx);
+        self.call(cx, fut, |_, _, _| {});
+    }
+
+    pub fn begin_rename(&mut self, tab: Uuid, cx: &mut Context<Self>) {
+        let Some((w, t)) = self.layout.find_tab(tab) else { return };
+        let current = self.tab_title(&self.layout.workspaces[w].tabs[t]);
+        self.rename = Some(Rename { tab, edit: LineEdit::new(&current) });
+        cx.notify();
+    }
+
+    pub fn run_action(&mut self, a: Action, window: &mut Window, cx: &mut Context<Self>) {
+        match a {
+            Action::NewTab => self.new_tab(cx),
+            Action::CloseTab => {
+                if let Some(t) = self.active_tab().map(|t| t.id) {
+                    self.close_tab(t, cx);
+                }
+            }
+            Action::NextTab => self.cycle_tab(1, cx),
+            Action::PrevTab => self.cycle_tab(-1, cx),
+            Action::GotoTab(n) => self.goto_tab(n, cx),
+            Action::MoveTabLeft => self.move_tab_by(-1, cx),
+            Action::MoveTabRight => self.move_tab_by(1, cx),
+            Action::RenameTab => {
+                if let Some(t) = self.active_tab().map(|t| t.id) {
+                    self.begin_rename(t, cx);
+                }
+            }
+            Action::SplitRight => self.split(SplitDir::Horizontal, cx),
+            Action::SplitDown => self.split(SplitDir::Vertical, cx),
+            Action::ClosePane => self.close_pane(cx),
+            Action::FocusLeft => self.focus_side(Side::Left, window, cx),
+            Action::FocusRight => self.focus_side(Side::Right, window, cx),
+            Action::FocusUp => self.focus_side(Side::Up, window, cx),
+            Action::FocusDown => self.focus_side(Side::Down, window, cx),
+            Action::ZoomPane => self.toggle_zoom(cx),
+            Action::ToggleSidebar => self.toggle_sidebar(cx),
+            Action::CommandPalette => self.toggle_palette(cx),
+            Action::NewWorkspace => self.new_workspace(cx),
+            Action::NextWorkspace => self.cycle_workspace(1, cx),
+            Action::PrevWorkspace => self.cycle_workspace(-1, cx),
+        }
+        cx.notify();
+    }
+
+    // ---- palette ------------------------------------------------------------------
+
+    pub fn toggle_palette(&mut self, cx: &mut Context<Self>) {
+        if self.palette.is_some() {
+            self.palette = None;
+        } else {
+            self.rename = None;
+            let mut p = Palette { edit: LineEdit::default(), selected: 0, items: Vec::new() };
+            self.refresh_palette(&mut p);
+            self.palette = Some(p);
+        }
+        cx.notify();
+    }
+
+    fn refresh_palette(&self, p: &mut Palette) {
+        let mut scored: Vec<(i32, usize, PaletteItem)> = Vec::new();
+        for (order, info) in ACTIONS.iter().enumerate() {
+            if let Some((score, hits)) = fuzzy::score(&p.edit.text, info.title) {
+                scored.push((
+                    score,
+                    order,
+                    PaletteItem {
+                        action: info.action,
+                        title: info.title,
+                        shortcut: self.keymap.shortcut(info.action),
+                        hits,
+                    },
+                ));
+            }
+        }
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        p.items = scored.into_iter().map(|x| x.2).collect();
+        p.selected = 0;
+    }
+
+    // ---- keyboard -----------------------------------------------------------------
+
+    pub fn chord_of(ks: &Keystroke) -> Chord {
+        let m = &ks.modifiers;
+        Chord::new(m.control, m.alt, m.shift, m.platform, &ks.key)
+    }
+
+    /// Returns true when the shell consumed the key (the terminal must not see it).
+    pub fn handle_key(&mut self, ks: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let chord = Self::chord_of(ks);
+        if self.palette.is_some() {
+            self.palette_key(ks, &chord, window, cx);
+            return true;
+        }
+        if self.rename.is_some() {
+            self.rename_key(ks, cx);
+            return true;
+        }
+        if let Some(a) = self.keymap.lookup(&chord) {
+            self.run_action(a, window, cx);
+            return true;
+        }
+        false
+    }
+
+    fn palette_key(&mut self, ks: &Keystroke, chord: &Chord, window: &mut Window, cx: &mut Context<Self>) {
+        let toggles = self.keymap.lookup(chord) == Some(Action::CommandPalette);
+        if toggles || ks.key == "escape" {
+            self.palette = None;
+            cx.notify();
+            return;
+        }
+        let Some(mut p) = self.palette.take() else { return };
+        let n = p.items.len();
+        match ks.key.as_str() {
+            "enter" => {
+                let action = p.items.get(p.selected).map(|i| i.action);
+                cx.notify();
+                if let Some(a) = action {
+                    self.run_action(a, window, cx);
+                }
+                return;
+            }
+            "down" if n > 0 => p.selected = (p.selected + 1) % n,
+            "up" if n > 0 => p.selected = (p.selected + n - 1) % n,
+            _ => {
+                if self.palette_edit(&mut p, ks) {
+                    // refreshed inside
+                }
+            }
+        }
+        self.palette = Some(p);
+        cx.notify();
+    }
+
+    fn palette_edit(&self, p: &mut Palette, ks: &Keystroke) -> bool {
+        if p.edit.key(ks) == EditResult::Edited {
+            let old = p.edit.cursor;
+            let mut tmp = Palette { edit: p.edit.clone(), selected: 0, items: Vec::new() };
+            self.refresh_palette(&mut tmp);
+            p.items = tmp.items;
+            p.selected = 0;
+            p.edit.cursor = old;
+            return true;
+        }
+        false
+    }
+
+    fn rename_key(&mut self, ks: &Keystroke, cx: &mut Context<Self>) {
+        let Some(r) = self.rename.as_mut() else { return };
+        match ks.key.as_str() {
+            "escape" => self.rename = None,
+            "enter" => {
+                let (tab, text) = (r.tab, r.edit.text.trim().to_string());
+                self.rename = None;
+                if text.is_empty() {
+                    self.title_override.remove(&tab);
+                } else {
+                    self.title_override.insert(tab, text);
+                }
+            }
+            _ => {
+                r.edit.key(ks);
+            }
+        }
+        cx.notify();
+    }
+
+    // ---- mouse --------------------------------------------------------------------
+
+    pub fn on_tab_mouse_down(&mut self, id: Uuid, index: usize, ev: &MouseDownEvent, cx: &mut Context<Self>) {
+        if ev.button != MouseButton::Left {
+            return;
+        }
+        if ev.click_count >= 2 {
+            self.begin_rename(id, cx);
+            return;
+        }
+        self.rename = None;
+        self.drag = Some(Drag::Tab { id, index });
+        self.focus_tab(id, cx);
+        cx.notify();
+    }
+
+    pub fn begin_divider_drag(&mut self, tab: Uuid, divider: Divider, cx: &mut Context<Self>) {
+        let ratio = divider.ratio;
+        self.drag = Some(Drag::Divider { tab, divider, ratio });
+        cx.notify();
+    }
+
+    /// Move the dragged divider to a pointer position in window coordinates.
+    pub fn drag_to(&mut self, x: f32, y: f32, cx: &mut Context<Self>) {
+        let (ox, oy) = self.content_origin();
+        match &mut self.drag {
+            Some(Drag::Divider { tab, divider, ratio }) => {
+                let min = match divider.dir {
+                    SplitDir::Horizontal => MIN_PANE_W,
+                    SplitDir::Vertical => MIN_PANE_H,
+                };
+                let r = divider.ratio_for(x - ox, y - oy, BAR, min);
+                if (r - *ratio).abs() > f32::EPSILON {
+                    *ratio = r;
+                    let (tab, path) = (*tab, divider.path.clone());
+                    if let Some((w, t)) = self.layout.find_tab(tab) {
+                        self.layout.workspaces[w].tabs[t].pane_tree.set_ratio_at(&path, r);
+                    }
+                    cx.notify();
+                }
+            }
+            Some(Drag::Tab { id, index }) => {
+                let (left, tw) = {
+                    let n = self.layout.active_workspace().map(|w| w.tabs.len()).unwrap_or(0).max(1) as f32;
+                    let avail = self.viewport.0 - TAB_LEFT - CAPTION_W - PLUS_W - 48.0;
+                    (TAB_LEFT, (avail / n).clamp(TAB_MIN_W, TAB_MAX_W))
+                };
+                let count = self.layout.active_workspace().map(|w| w.tabs.len()).unwrap_or(1);
+                let to = (((x - left) / tw).floor().max(0.0) as usize).min(count.saturating_sub(1));
+                if to != *index {
+                    let id = *id;
+                    *index = to;
+                    // Reorder locally at once, then tell the backend.
+                    let aw = self.layout.active_workspace;
+                    if let Some(ws) = self.layout.workspaces.get_mut(aw) {
+                        if let Some(from) = ws.tabs.iter().position(|t| t.id == id) {
+                            let tab = ws.tabs.remove(from);
+                            ws.tabs.insert(to.min(ws.tabs.len()), tab);
+                            ws.active_tab = to.min(ws.tabs.len().saturating_sub(1));
+                        }
+                    }
+                    let fut = self.backend.move_tab(id, to);
+                    self.call(cx, fut, |_, _, _| {});
+                    cx.notify();
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// Finish a drag. A divider drag persists its ratio through the backend.
+    pub fn end_drag(&mut self, cx: &mut Context<Self>) {
+        if let Some(d) = self.drag.take() {
+            if let Drag::Divider { divider, ratio, .. } = d {
+                let fut = self
+                    .backend
+                    .update_split_ratios(vec![SplitRatio { pane_id: divider.first_leaf, ratio }]);
+                self.call(cx, fut, |_, _, _| {});
+            }
+            cx.notify();
+        }
+    }
+
+    pub fn on_mouse_move(&mut self, ev: &MouseMoveEvent, _w: &mut Window, cx: &mut Context<Self>) {
+        if self.drag.is_none() {
+            return;
+        }
+        if ev.pressed_button != Some(MouseButton::Left) {
+            self.end_drag(cx);
+            return;
+        }
+        self.drag_to(f32::from(ev.position.x), f32::from(ev.position.y), cx);
+    }
+
+    pub fn on_mouse_up(&mut self, _ev: &MouseUpEvent, _w: &mut Window, cx: &mut Context<Self>) {
+        self.end_drag(cx);
+    }
+
+    // ---- after paint -----------------------------------------------------------------
+
+    pub fn window_title(&self) -> String {
+        match self.active_tab() {
+            Some(t) => format!("{} - Forgetty", self.tab_title(t)),
+            None => "Forgetty".to_string(),
+        }
+    }
+
+    /// Called at the end of every painted frame.
+    pub fn after_paint(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.frames += 1;
+        let title = self.window_title();
+        if title != self.applied_title {
+            window.set_window_title(&title);
+            self.applied_title = title;
+        }
+        if let Some(mut sm) = self.smoke.take() {
+            sm.step(self, window, cx);
+            self.smoke = Some(sm);
+        }
+    }
+}
+
+impl Focusable for AppShell {
+    fn focus_handle(&self, _cx: &gpui::App) -> FocusHandle {
+        self.focus.clone()
+    }
+}

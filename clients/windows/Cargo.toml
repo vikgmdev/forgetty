@@ -26,6 +26,8 @@ serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 anyhow = "1"
+png = "0.17"
+raw-window-handle = "0.6"
 
 # Zed patches crates.io crates in its own workspace root. Patches do not apply
 # to dependents, so the ones gpui needs are repeated here (same revs as v1.24.4).

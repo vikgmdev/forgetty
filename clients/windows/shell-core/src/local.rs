@@ -102,6 +102,14 @@ impl LocalBackend {
         self.inner.lock().panes.len()
     }
 
+    /// Run bytes through the OSC scanner as if the pane had printed them, so a
+    /// test can drive title, cwd and status events without a cooperating shell.
+    /// The bytes do not reach the pane's output stream.
+    pub fn inject_osc(&self, pane: PaneId, bytes: &[u8]) {
+        let events = OscScanner::new().feed(bytes);
+        self.inner.apply_osc(pane, events);
+    }
+
     /// Kill every shell.
     pub fn shutdown_all(&self) {
         for p in self.inner.lock().panes.values() {

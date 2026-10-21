@@ -1,30 +1,38 @@
-//! `--smoke`: the CI gate. Drives a real window + ConPTY shell through every
-//! W1 feature and prints one JSON object. Exit 0 only if every check passes.
+//! `--smoke`: the CI gate. Drives a real window and real ConPTY shells through
+//! every W1 and W2 feature and prints one JSON object. Exit 0 only if every
+//! check passes.
 //!
-//! The state machine advances from `after_paint`, i.e. only when a frame was
-//! drawn, so it measures the same path a user sees.
+//! The state machine advances from the shell's `after_paint`, i.e. only when a
+//! frame was drawn, so it measures the same path a user sees. Keyboard
+//! shortcuts go through the same `AppShell::handle_key` the window uses.
 
 use std::io::Write;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use forgetty_shell_core::keys::{Action, Chord, Keymap};
+use forgetty_shell_core::layout::{neighbor, Side};
+use forgetty_shell_core::{now, LocalBackend, PaneEvent, PaneId, PaneStatus, Uuid};
 use forgetty_vt::ffi;
 use forgetty_vt::{Screen, Terminal, ANSI_PALETTE_BLACK};
-use gpui::{size, Keystroke, Window};
+use gpui::{px, size, Context, Keystroke, Modifiers, Window};
 use serde_json::{json, Map, Value};
 
 use crate::config::Config;
-use crate::source::PaneEvent;
+use crate::shell::{AppShell, BAR};
 use crate::view::TerminalView;
 
 pub const KEYSTROKES: usize = 100;
-pub const TOTAL_TIMEOUT: Duration = Duration::from_secs(120);
-const PHASE_TIMEOUT: Duration = Duration::from_secs(45);
+pub const TOTAL_TIMEOUT: Duration = Duration::from_secs(300);
+const PHASE_TIMEOUT: Duration = Duration::from_secs(60);
 const CONPTY_LINES: u32 = 25_000;
 const CONPTY_BYTES: f64 = CONPTY_LINES as f64 * 90.0;
 const SYNTH_LINES: u32 = 250_000;
 const SYNTH_BYTES: f64 = SYNTH_LINES as f64 * 90.0;
 const BIG_FILE: &str = "C:\\big.txt";
+pub const SHOT_FILE: &str = "layout-4pane.png";
+const WIN_W: f32 = 1000.0;
+const WIN_H: f32 = 680.0;
 
 static RESULTS: Mutex<Option<Map<String, Value>>> = Mutex::new(None);
 static PHASE: Mutex<&'static str> = Mutex::new("window");
@@ -76,6 +84,7 @@ fn check(name: &str, pass: bool) {
 
 #[derive(PartialEq, Clone, Copy, Debug)]
 enum Phase {
+    // W1: single pane, first tab.
     WaitPrompt,
     WaitEcho,
     Keys,
@@ -86,6 +95,22 @@ enum Phase {
     ResizeAsk,
     Throughput,
     Synth,
+    // W2: app shell.
+    Restore,
+    Tabs4,
+    TabNav,
+    SplitSteps,
+    SplitSettle,
+    Echo4,
+    Keys4,
+    DividerWait,
+    Status,
+    Shot,
+    ClosePane,
+    CloseTab,
+    PaletteOpen,
+    PaletteRun,
+    Rename,
 }
 
 impl Phase {
@@ -101,6 +126,21 @@ impl Phase {
             Phase::ResizeAsk => "resize-ask-shell",
             Phase::Throughput => "throughput-conpty",
             Phase::Synth => "throughput-pump",
+            Phase::Restore => "w2-restore-window",
+            Phase::Tabs4 => "w2-open-4-tabs",
+            Phase::TabNav => "w2-tab-navigation",
+            Phase::SplitSteps => "w2-split-steps",
+            Phase::SplitSettle => "w2-split-settle",
+            Phase::Echo4 => "w2-echo-per-pane",
+            Phase::Keys4 => "w2-keystrokes-4-panes",
+            Phase::DividerWait => "w2-divider-drag",
+            Phase::Status => "w2-status",
+            Phase::Shot => "w2-screenshot",
+            Phase::ClosePane => "w2-close-pane",
+            Phase::CloseTab => "w2-close-tab",
+            Phase::PaletteOpen => "w2-palette-open",
+            Phase::PaletteRun => "w2-palette-run",
+            Phase::Rename => "w2-rename",
         }
     }
 }
@@ -112,8 +152,9 @@ struct Probe {
     t0: Instant,
 }
 
-pub struct Smoke {
+pub struct ShellSmoke {
     start: Instant,
+    local: LocalBackend,
     phase: Phase,
     phase_t0: Instant,
     first_frame_seen: bool,
@@ -121,49 +162,115 @@ pub struct Smoke {
     lat_ms: Vec<f64>,
     base_col: usize,
     max_reshaped_per_key: usize,
+    others_reshaped: usize,
     old_dims: (usize, usize),
     resize_t0: Option<Instant>,
     thr_t0: Instant,
     thr_last: Option<Instant>,
     thr_max_gap: f64,
     thr_frames: u32,
-    injector: async_channel::Sender<PaneEvent>,
+    // W2
+    p1: Option<PaneId>,
+    sub: usize,
+    sub_t0: Instant,
+    tab2: Option<Uuid>,
+    panes4: Vec<PaneId>,
+    tokens: Vec<String>,
+    before_sizes: Vec<(PaneId, u16, u16)>,
+    want_ratio: f32,
+    ratio_before: f32,
+    pane_to_close: Option<PaneId>,
+    tab_to_close: Option<(Uuid, PaneId)>,
+    count_before: usize,
+    nav_ok: bool,
+    shot_frames: u32,
 }
 
-impl Smoke {
-    pub fn new(start: Instant, injector: async_channel::Sender<PaneEvent>) -> Self {
+/// Snapshot of one pane's screen.
+struct Snap {
+    rows: Vec<String>,
+    cr: usize,
+    cc: usize,
+}
+
+impl Snap {
+    fn at_prompt(&self) -> bool {
+        self.rows.get(self.cr).is_some_and(|r| r.trim_end().ends_with('>'))
+    }
+    fn find_exact(&self, s: &str) -> Option<usize> {
+        self.rows.iter().position(|r| r.trim() == s)
+    }
+}
+
+fn snap(shell: &AppShell, cx: &gpui::App, p: PaneId) -> Option<Snap> {
+    let v = shell.views.get(&p)?.read(cx);
+    let screen = v.term.screen();
+    let rows = (0..screen.rows()).map(|r| row_text(screen, r)).collect();
+    let (cr, cc) = v.term.cursor();
+    Some(Snap { rows, cr, cc })
+}
+
+fn key(chord: &str) -> Keystroke {
+    let c = Chord::parse(chord).expect("chord");
+    Keystroke {
+        modifiers: Modifiers { control: c.ctrl, alt: c.alt, shift: c.shift, platform: c.win, function: false },
+        key: c.key,
+        key_char: None,
+    }
+}
+
+fn typed(ch: char) -> Keystroke {
+    Keystroke {
+        modifiers: Modifiers::default(),
+        key: if ch == ' ' { "space".into() } else { ch.to_string() },
+        key_char: Some(ch.to_string()),
+    }
+}
+
+impl ShellSmoke {
+    pub fn new(start: Instant, local: LocalBackend) -> Self {
         run_direct_checks();
-        Smoke {
+        let t = Instant::now();
+        ShellSmoke {
             start,
+            local,
             phase: Phase::WaitPrompt,
-            phase_t0: Instant::now(),
+            phase_t0: t,
             first_frame_seen: false,
             probe: None,
             lat_ms: Vec::new(),
             base_col: 0,
             max_reshaped_per_key: 0,
+            others_reshaped: 0,
             old_dims: (0, 0),
             resize_t0: None,
-            thr_t0: Instant::now(),
+            thr_t0: t,
             thr_last: None,
             thr_max_gap: 0.0,
             thr_frames: 0,
-            injector,
+            p1: None,
+            sub: 0,
+            sub_t0: t,
+            tab2: None,
+            panes4: Vec::new(),
+            tokens: Vec::new(),
+            before_sizes: Vec::new(),
+            want_ratio: 0.4,
+            ratio_before: 0.5,
+            pane_to_close: None,
+            tab_to_close: None,
+            count_before: 0,
+            nav_ok: true,
+            shot_frames: 0,
         }
     }
 
     fn goto(&mut self, p: Phase) {
         self.phase = p;
         self.phase_t0 = Instant::now();
+        self.sub = 0;
+        self.sub_t0 = Instant::now();
         set_phase(p.name());
-    }
-}
-
-impl TerminalView {
-    pub fn smoke_step(&mut self, window: &mut Window, now: Instant) {
-        let Some(mut sm) = self.smoke.take() else { return };
-        sm.step(self, window, now);
-        self.smoke = Some(sm);
     }
 }
 
@@ -176,14 +283,55 @@ fn leading_number(s: &str) -> Option<u64> {
     (d.len() == 7 && d.chars().all(|c| c.is_ascii_digit())).then(|| d.parse().ok()).flatten()
 }
 
-impl Smoke {
-    fn step(&mut self, v: &mut TerminalView, window: &mut Window, now: Instant) {
+fn is_w1(p: Phase) -> bool {
+    matches!(
+        p,
+        Phase::WaitPrompt
+            | Phase::WaitEcho
+            | Phase::Keys
+            | Phase::ClearLine
+            | Phase::Wide
+            | Phase::Gen
+            | Phase::ResizeWait
+            | Phase::ResizeAsk
+            | Phase::Throughput
+            | Phase::Synth
+    )
+}
+
+impl ShellSmoke {
+    pub fn step(&mut self, shell: &mut AppShell, window: &mut Window, cx: &mut Context<AppShell>) {
+        let now_t = Instant::now();
         if !self.first_frame_seen {
             self.first_frame_seen = true;
-            record("time_to_first_frame_ms", json!(ms(now - self.start)));
+            record("time_to_first_frame_ms", json!(ms(now_t - self.start)));
             set_phase(Phase::WaitPrompt.name());
         }
+        if self.phase_t0.elapsed() > PHASE_TIMEOUT {
+            fail(&format!("phase {} stuck for {:?}", self.phase.name(), PHASE_TIMEOUT));
+        }
 
+        if is_w1(self.phase) {
+            // W1 runs against the first tab's only pane.
+            let Some(p1) = shell.active_pane() else { return };
+            let Some(view) = shell.views.get(&p1).cloned() else { return };
+            self.p1 = Some(p1);
+            let frames = shell.frames;
+            let mut finished = false;
+            view.update(cx, |v, _| {
+                finished = self.w1_step(v, window, now_t, frames);
+            });
+            if finished {
+                self.goto(Phase::Restore);
+            }
+            return;
+        }
+        self.w2_step(shell, window, cx, now_t);
+    }
+
+    // ---- W1: unchanged checks on the first pane --------------------------------------
+
+    fn w1_step(&mut self, v: &mut TerminalView, window: &mut Window, now: Instant, frames: u64) -> bool {
         let (rows, cr, cc) = {
             let screen = v.term.screen();
             let rows: Vec<String> = (0..screen.rows()).map(|r| row_text(screen, r)).collect();
@@ -193,10 +341,6 @@ impl Smoke {
         *SCREEN_DUMP.lock().unwrap() = rows.join("\n");
         let at_prompt = rows.get(cr).is_some_and(|r| r.trim_end().ends_with('>'));
         let find_exact = |s: &str| rows.iter().position(|r| r.trim() == s);
-
-        if self.phase_t0.elapsed() > PHASE_TIMEOUT {
-            fail(&format!("phase {} stuck for {:?}", self.phase.name(), PHASE_TIMEOUT));
-        }
 
         match self.phase {
             Phase::WaitPrompt => {
@@ -208,8 +352,6 @@ impl Smoke {
                 }
             }
             Phase::WaitEcho => {
-                // The command line reads "C:\>echo spike-ok": match the output
-                // line only (whole row) and wait for the next prompt below it.
                 if let Some(fr) = find_exact("spike-ok") {
                     if at_prompt && cr > fr {
                         record("found", json!("spike-ok"));
@@ -222,10 +364,7 @@ impl Smoke {
             }
             Phase::Keys => {
                 let done = match &self.probe {
-                    Some(p) => {
-                        let screen = v.term.screen();
-                        screen.cell(p.row, p.col).grapheme.starts_with(p.ch)
-                    }
+                    Some(p) => v.term.screen().cell(p.row, p.col).grapheme.starts_with(p.ch),
                     None => false,
                 };
                 if done {
@@ -233,7 +372,14 @@ impl Smoke {
                     self.lat_ms.push(ms(now - p.t0));
                     self.max_reshaped_per_key = self.max_reshaped_per_key.max(v.rows_reshaped_last);
                     if self.lat_ms.len() >= KEYSTROKES {
-                        self.finish_keys(v);
+                        let (p50, reshaped) = summarize_keys(&self.lat_ms, self.max_reshaped_per_key, "");
+                        check("key_p50_le_18ms", p50 <= 18.0);
+                        check("damage_only_redraw", reshaped <= 3);
+                        self.lat_ms.clear();
+                        self.max_reshaped_per_key = 0;
+                        // cmd clears the input line on Escape.
+                        v.send_bytes(&[0x1b]);
+                        self.goto(Phase::ClearLine);
                     } else {
                         self.start_probe(v, cr, cc);
                     }
@@ -273,7 +419,7 @@ impl Smoke {
                 if let Some(fr) = find_exact("GEN-OK") {
                     if at_prompt && cr > fr {
                         self.old_dims = (v.rows, v.cols);
-                        let target = size(v.metrics.cell_w * 100.0, v.metrics.line_h * 25.0);
+                        let target = size(v.metrics.cell_w * 100.0, v.metrics.line_h * 25.0 + px(crate::shell::TITLEBAR_H));
                         window.resize(target);
                         self.resize_t0 = Some(Instant::now());
                         self.goto(Phase::ResizeWait);
@@ -283,10 +429,7 @@ impl Smoke {
             Phase::ResizeWait => {
                 if (v.rows, v.cols) != self.old_dims && at_prompt {
                     record("resize_grid", json!([v.rows, v.cols]));
-                    record(
-                        "resize_applied_ms",
-                        json!(ms(self.resize_t0.map(|t| now - t).unwrap_or_default())),
-                    );
+                    record("resize_applied_ms", json!(ms(self.resize_t0.map(|t| now - t).unwrap_or_default())));
                     v.send_bytes(
                         b"powershell -NoProfile -Command \"$s=$Host.UI.RawUI.WindowSize; 'WS:{0}x{1}' -f $s.Width,$s.Height\"\r",
                     );
@@ -326,8 +469,11 @@ impl Smoke {
                         mouse_and_paste_checks(v);
                         scrollback_shell_check(v, &rows);
                         // Now push 22.5 MB through the real pump at full producer speed.
-                        let tx = self.injector.clone();
-                        std::thread::spawn(move || synth_producer(tx));
+                        if let Some(tx) = self.p1.and_then(|p| self.local.pty(p)).map(|p| p.injector()) {
+                            std::thread::spawn(move || synth_producer(tx));
+                        } else {
+                            fail("no pty for the first pane");
+                        }
                         self.thr_t0 = Instant::now();
                         self.thr_last = None;
                         self.thr_max_gap = 0.0;
@@ -349,10 +495,19 @@ impl Smoke {
                     record("pump_max_frame_gap_ms", json!(self.thr_max_gap));
                     record("pump_frames", json!(self.thr_frames));
                     check("throughput_pump", self.thr_max_gap <= 100.0);
-                    self.finish(v);
+                    record("frames_drawn_w1", json!(frames));
+                    record("shape_cache_misses", json!(v.shape_misses));
+                    record("vt_fed_mb", json!((v.fed_bytes as f64 / 1e6 * 10.0).round() / 10.0));
+                    record("vt_feed_total_ms", json!(ms(v.feed_time)));
+                    record("vt_feed_max_ms", json!(ms(v.max_feed)));
+                    record("font", json!(format!("{} {:.1}pt", v.metrics.font.family, v.cfg.font_size_pt)));
+                    record("grid_w1", json!([v.rows, v.cols]));
+                    return true;
                 }
             }
+            _ => {}
         }
+        false
     }
 
     fn start_probe(&mut self, v: &mut TerminalView, row: usize, col: usize) {
@@ -360,54 +515,579 @@ impl Smoke {
         self.probe = Some(Probe { row, col, ch, t0: Instant::now() });
         v.send_bytes(ch.to_string().as_bytes());
     }
+}
 
-    fn finish_keys(&mut self, v: &mut TerminalView) {
-        let mut s = self.lat_ms.clone();
-        s.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let avg = s.iter().sum::<f64>() / s.len() as f64;
-        let p50 = s[s.len() / 2];
-        record("keystrokes", json!(s.len()));
-        record("key_to_frame_avg_ms", json!((avg * 1000.0).round() / 1000.0));
-        record("key_to_frame_p50_ms", json!(p50));
-        record("key_to_frame_p95_ms", json!(s[(s.len() * 95) / 100]));
-        record("key_to_frame_max_ms", json!(s.last().unwrap()));
-        record("rows_reshaped_per_key_max", json!(self.max_reshaped_per_key));
-        check("key_p50_le_18ms", p50 <= 18.0);
-        check("damage_only_redraw", self.max_reshaped_per_key <= 3);
-        // cmd clears the input line on Escape.
-        v.send_bytes(&[0x1b]);
-        self.goto(Phase::ClearLine);
+/// Record latency stats under `suffix` and return (p50, max reshaped rows).
+fn summarize_keys(lat: &[f64], max_reshaped: usize, suffix: &str) -> (f64, usize) {
+    let mut s = lat.to_vec();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let avg = s.iter().sum::<f64>() / s.len() as f64;
+    let p50 = s[s.len() / 2];
+    record(&format!("keystrokes{suffix}"), json!(s.len()));
+    record(&format!("key_to_frame_avg_ms{suffix}"), json!((avg * 1000.0).round() / 1000.0));
+    record(&format!("key_to_frame_p50_ms{suffix}"), json!(p50));
+    record(&format!("key_to_frame_p95_ms{suffix}"), json!(s[(s.len() * 95) / 100]));
+    record(&format!("key_to_frame_max_ms{suffix}"), json!(s.last().unwrap()));
+    record(&format!("rows_reshaped_per_key_max{suffix}"), json!(max_reshaped));
+    (p50, max_reshaped)
+}
+
+// ---- W2: app shell ------------------------------------------------------------------
+
+impl ShellSmoke {
+    fn press(&mut self, shell: &mut AppShell, window: &mut Window, cx: &mut Context<AppShell>, chord: &str) {
+        let handled = shell.handle_key(&key(chord), window, cx);
+        if !handled {
+            fail(&format!("shortcut {chord} was not handled by the shell"));
+        }
+        self.sub_t0 = Instant::now();
     }
 
-    fn finish(&mut self, v: &mut TerminalView) -> ! {
+    fn next_key_char(&self) -> char {
+        (b'a' + (self.lat_ms.len() % 26) as u8) as char
+    }
+
+    fn tab_pane_count(shell: &AppShell) -> usize {
+        shell.active_tab().map(|t| t.pane_tree.pane_count()).unwrap_or(0)
+    }
+
+    fn all_at_prompt(shell: &AppShell, cx: &gpui::App, panes: &[PaneId]) -> bool {
+        panes.iter().all(|p| snap(shell, cx, *p).is_some_and(|s| s.at_prompt()))
+    }
+
+    fn pty_exited(&self, pane: PaneId) -> bool {
+        self.local.closed_ptys().iter().any(|(p, pty)| *p == pane && pty.try_exited())
+    }
+
+    fn w2_step(&mut self, shell: &mut AppShell, window: &mut Window, cx: &mut Context<AppShell>, now_t: Instant) {
+        match self.phase {
+            Phase::Restore => {
+                if self.sub == 0 {
+                    window.resize(size(px(WIN_W), px(WIN_H)));
+                    self.sub = 1;
+                    self.sub_t0 = Instant::now();
+                } else if self.sub_t0.elapsed() > Duration::from_millis(700) {
+                    record("viewport_w2", json!([shell.viewport.0, shell.viewport.1]));
+                    // Three more tabs through the real shortcut path.
+                    for _ in 0..3 {
+                        self.press(shell, window, cx, "ctrl+shift+t");
+                    }
+                    self.goto(Phase::Tabs4);
+                }
+            }
+            Phase::Tabs4 => {
+                let panes = shell.layout.all_panes();
+                let fresh: Vec<PaneId> = panes.iter().copied().filter(|p| Some(*p) != self.p1).collect();
+                if shell.layout.tab_count() == 4 && shell.views.len() == 4 && Self::all_at_prompt(shell, cx, &fresh) {
+                    let ids: std::collections::HashSet<Uuid> = shell
+                        .layout
+                        .workspaces
+                        .iter()
+                        .flat_map(|w| w.tabs.iter().map(|t| t.id))
+                        .collect();
+                    check("tabs_4", ids.len() == 4 && panes.len() == 4);
+                    self.goto(Phase::TabNav);
+                }
+            }
+            Phase::TabNav => {
+                // (shortcut, expected active tab index)
+                const STEPS: [(&str, usize); 6] = [
+                    ("ctrl+1", 0),
+                    ("ctrl+tab", 1),
+                    ("ctrl+shift+tab", 0),
+                    ("ctrl+9", 3),
+                    ("ctrl+3", 2),
+                    ("ctrl+2", 1),
+                ];
+                let i = self.sub / 2;
+                if i >= STEPS.len() {
+                    check("tab_nav", self.nav_ok);
+                    self.tab2 = shell.layout.active_workspace().and_then(|w| w.tabs.get(1)).map(|t| t.id);
+                    self.goto(Phase::SplitSteps);
+                    return;
+                }
+                if self.sub % 2 == 0 {
+                    self.press(shell, window, cx, STEPS[i].0);
+                    self.sub += 1;
+                } else {
+                    let active = shell.layout.active_workspace().map(|w| w.active_tab).unwrap_or(99);
+                    if active == STEPS[i].1 {
+                        self.sub += 1;
+                    } else if self.sub_t0.elapsed() > Duration::from_secs(5) {
+                        self.nav_ok = false;
+                        record("tab_nav_failed_at", json!(STEPS[i].0));
+                        self.sub += 1;
+                    }
+                }
+            }
+            Phase::SplitSteps => {
+                // Build a 2x2 grid in tab 2 with the real shortcuts and focus keys.
+                // (shortcut, Some(side) = focus move, None = split), panes wanted after
+                const OPS: [(&str, Option<Side>, usize); 5] = [
+                    ("alt+shift+=", None, 2),
+                    ("alt+left", Some(Side::Left), 2),
+                    ("alt+shift+-", None, 3),
+                    ("alt+right", Some(Side::Right), 3),
+                    ("alt+shift+-", None, 4),
+                ];
+                let i = self.sub / 2;
+                if i >= OPS.len() {
+                    self.goto(Phase::SplitSettle);
+                    return;
+                }
+                let (chord, side, want) = OPS[i];
+                if self.sub % 2 == 0 {
+                    let prev = shell.active_pane();
+                    self.panes4 = prev.into_iter().collect(); // remember the pane we pressed in
+                    if let Some(side) = side {
+                        let (Some((_, geo)), Some(from)) = (shell.active_geometry(), prev) else { return };
+                        match neighbor(&geo.panes, from, side) {
+                            Some(to) => self.pane_to_close = Some(to),
+                            None => fail(&format!("no neighbor for {chord}")),
+                        }
+                    }
+                    self.press(shell, window, cx, chord);
+                    self.sub += 1;
+                } else {
+                    let ok = match side {
+                        Some(_) => shell.active_pane() == self.pane_to_close,
+                        None => {
+                            Self::tab_pane_count(shell) == want
+                                && shell.active_pane().is_some()
+                                && shell.active_pane() != self.panes4.first().copied()
+                        }
+                    };
+                    if ok {
+                        self.sub += 1;
+                    } else if self.sub_t0.elapsed() > Duration::from_secs(8) {
+                        fail(&format!("split step {chord} did not complete"));
+                    }
+                }
+            }
+            Phase::SplitSettle => {
+                let Some(tab) = shell.active_tab().cloned() else { return };
+                let panes = tab.pane_tree.leaves();
+                match self.sub {
+                    0 => {
+                        let ready = panes.len() == 4
+                            && panes.iter().all(|p| shell.views.contains_key(p))
+                            && Self::all_at_prompt(shell, cx, &panes);
+                        if ready {
+                            self.panes4 = panes.clone();
+                            let geo = shell.active_geometry().map(|x| x.1).unwrap_or_default();
+                            let c = shell.content_rect();
+                            let inside = geo.panes.iter().all(|(_, r)| r.x >= 0.0 && r.y >= 0.0 && r.right() <= c.w + 0.5 && r.bottom() <= c.h + 0.5);
+                            let disjoint = geo.panes.iter().enumerate().all(|(i, (_, a))| {
+                                geo.panes.iter().skip(i + 1).all(|(_, b)| {
+                                    a.right() <= b.x + 0.5 || b.right() <= a.x + 0.5 || a.bottom() <= b.y + 0.5 || b.bottom() <= a.y + 0.5
+                                })
+                            });
+                            check("split_4_panes", geo.panes.len() == 4 && geo.dividers.len() == 3 && inside && disjoint);
+                            self.press(shell, window, cx, "ctrl+shift+z");
+                            self.sub = 1;
+                        }
+                    }
+                    1 => {
+                        if shell.zoomed.contains_key(&tab.id) && shell.active_geometry().is_some_and(|g| g.1.panes.len() == 1) {
+                            self.nav_ok = true;
+                            self.press(shell, window, cx, "ctrl+shift+z");
+                            self.sub = 2;
+                        } else if self.sub_t0.elapsed() > Duration::from_secs(5) {
+                            fail("zoom did not engage");
+                        }
+                    }
+                    _ => {
+                        if !shell.zoomed.contains_key(&tab.id) && shell.active_geometry().is_some_and(|g| g.1.panes.len() == 4) {
+                            check("zoom_toggle", self.nav_ok);
+                            self.tokens = (0..4).map(|i| format!("PANE{i}-{:x}", 0x51a0 + i * 7)).collect();
+                            self.goto(Phase::Echo4);
+                        } else if self.sub_t0.elapsed() > Duration::from_secs(5) {
+                            fail("zoom did not release");
+                        }
+                    }
+                }
+            }
+            Phase::Echo4 => {
+                let i = self.sub / 2;
+                if i >= 4 {
+                    // Each pane shows its own token and none of the others.
+                    let mut isolated = true;
+                    for (n, p) in self.panes4.clone().iter().enumerate() {
+                        let Some(s) = snap(shell, cx, *p) else { fail("pane view vanished") };
+                        for (m, t) in self.tokens.iter().enumerate() {
+                            let has = s.find_exact(t).is_some();
+                            if has != (m == n) {
+                                isolated = false;
+                            }
+                        }
+                    }
+                    check("echo_per_pane", true);
+                    check("echo_isolated", isolated);
+                    self.goto(Phase::Keys4);
+                    return;
+                }
+                let p = self.panes4[i];
+                if self.sub % 2 == 0 {
+                    shell.focus_pane(p, window, cx);
+                    let Some(view) = shell.views.get(&p).cloned() else { return };
+                    let cmd = format!("echo {}\r", self.tokens[i]);
+                    view.update(cx, |v, _| v.send_bytes(cmd.as_bytes()));
+                    self.sub += 1;
+                } else if let Some(s) = snap(shell, cx, p) {
+                    if let Some(fr) = s.find_exact(&self.tokens[i]) {
+                        if s.at_prompt() && s.cr > fr {
+                            self.sub += 1;
+                        }
+                    }
+                }
+            }
+            Phase::Keys4 => {
+                let p0 = self.panes4[0];
+                let Some(view) = shell.views.get(&p0).cloned() else { return };
+                if self.sub == 2 {
+                    // Waiting for the Escape to clear the input line.
+                    let Some(s) = snap(shell, cx, p0) else { return };
+                    if s.at_prompt() && s.cc == self.base_col {
+                        self.probe = Some(Probe { row: s.cr, col: s.cc, ch: self.next_key_char(), t0: Instant::now() });
+                        let ch = self.probe.as_ref().unwrap().ch;
+                        view.update(cx, |v, _| v.send_bytes(ch.to_string().as_bytes()));
+                        self.sub = 1;
+                    }
+                    return;
+                }
+                if self.sub == 0 {
+                    shell.focus_pane(p0, window, cx);
+                    let Some(s) = snap(shell, cx, p0) else { return };
+                    if s.at_prompt() && shell.active_pane() == Some(p0) {
+                        let (r, c) = (s.cr, s.cc);
+                        self.base_col = c;
+                        self.probe = Some(Probe { row: r, col: c, ch: 'a', t0: Instant::now() });
+                        view.update(cx, |v, _| v.send_bytes(b"a"));
+                        self.lat_ms.clear();
+                        self.max_reshaped_per_key = 0;
+                        self.others_reshaped = 0;
+                        self.sub = 1;
+                    }
+                    return;
+                }
+                // Every frame: rows re-shaped in panes that did not get the key.
+                let others: usize = self.panes4[1..]
+                    .iter()
+                    .filter_map(|p| shell.views.get(p))
+                    .map(|v| v.read(cx).rows_reshaped_last)
+                    .sum();
+                self.others_reshaped += others;
+                let (done, focused_reshaped, row, col) = {
+                    let v = view.read(cx);
+                    match &self.probe {
+                        Some(p) => (v.term.screen().cell(p.row, p.col).grapheme.starts_with(p.ch), v.rows_reshaped_last, p.row, p.col),
+                        None => (false, 0, 0, 0),
+                    }
+                };
+                if done {
+                    let p = self.probe.take().unwrap();
+                    self.lat_ms.push(ms(now_t - p.t0));
+                    self.max_reshaped_per_key = self.max_reshaped_per_key.max(focused_reshaped);
+                    if self.lat_ms.len() >= KEYSTROKES {
+                        let (p50, reshaped) = summarize_keys(&self.lat_ms, self.max_reshaped_per_key, "_4panes");
+                        record("rows_reshaped_unfocused_total_4panes", json!(self.others_reshaped));
+                        record("visible_panes", json!(4));
+                        check("key_p50_4panes_le_18ms", p50 <= 18.0);
+                        check("damage_only_4panes", reshaped <= 3 && self.others_reshaped == 0);
+                        view.update(cx, |v, _| v.send_bytes(&[0x1b]));
+                        self.drag_divider(shell, cx);
+                        self.goto(Phase::DividerWait);
+                    } else if self.lat_ms.len() % 20 == 0 {
+                        view.update(cx, |v, _| v.send_bytes(&[0x1b]));
+                        self.sub = 2;
+                    } else {
+                        // The cursor now sits on the next glyph position.
+                        let (r, c) = {
+                            let v = view.read(cx);
+                            v.term.cursor()
+                        };
+                        let _ = (row, col);
+                        let ch = self.next_key_char();
+                        self.probe = Some(Probe { row: r, col: c, ch, t0: Instant::now() });
+                        view.update(cx, |v, _| v.send_bytes(ch.to_string().as_bytes()));
+                    }
+                }
+            }
+            Phase::DividerWait => {
+                let Some(tab) = shell.active_tab().cloned() else { return };
+                let backend_ratio = now(shell.backend.get_layout())
+                    .ok()
+                    .and_then(|l| l.find_tab(tab.id).and_then(|(w, t)| l.workspaces[w].tabs[t].pane_tree.ratio_at(&[])));
+                let ui_ratio = tab.pane_tree.ratio_at(&[]);
+                let near = |r: Option<f32>| r.is_some_and(|r| (r - self.want_ratio).abs() < 0.012);
+                if !(near(backend_ratio) && near(ui_ratio)) {
+                    return;
+                }
+                // PTY sizes follow the views, and moved the right way.
+                let geo = shell.active_geometry().map(|x| x.1).unwrap_or_default();
+                let divider_x = geo.dividers.iter().find(|d| d.path.is_empty()).map(|d| d.bar.x).unwrap_or(0.0);
+                let mut follow = true;
+                let mut moved = true;
+                for (p, r) in &geo.panes {
+                    let Some(v) = shell.views.get(p) else { return };
+                    let (vr, vc) = {
+                        let v = v.read(cx);
+                        (v.rows as u16, v.cols as u16)
+                    };
+                    let Ok(info) = now(shell.backend.get_pane_info(*p)) else { fail("pane info missing") };
+                    if (info.rows, info.cols) != (vr, vc) {
+                        follow = false;
+                    }
+                    let before = self.before_sizes.iter().find(|b| b.0 == *p).copied();
+                    if let Some((_, _, bc)) = before {
+                        let left = r.x < divider_x;
+                        let ok = if left { info.cols < bc } else { info.cols > bc };
+                        if !ok {
+                            moved = false;
+                        }
+                    }
+                }
+                if !follow || !moved {
+                    if self.phase_t0.elapsed() > Duration::from_secs(10) {
+                        record("divider_follow_debug", json!({"follow": follow, "moved": moved}));
+                        check("divider_drag_ratios", true);
+                        check("divider_pty_follow", false);
+                        self.start_status(shell);
+                    }
+                    return;
+                }
+                record("divider_ratio", json!({"before": self.ratio_before, "after": backend_ratio}));
+                check("divider_drag_ratios", true);
+                check("divider_pty_follow", true);
+                self.start_status(shell);
+            }
+            Phase::Status => {
+                let tabs: Vec<_> = shell.layout.active_workspace().map(|w| w.tabs.clone()).unwrap_or_default();
+                if tabs.len() < 4 {
+                    return;
+                }
+                let st: Vec<PaneStatus> = tabs.iter().map(|t| shell.tab_status(t)).collect();
+                let ok = st[0] == PaneStatus::Working
+                    && st[1] == PaneStatus::Done
+                    && st[2] == PaneStatus::Failed
+                    && st[3] == PaneStatus::Waiting
+                    && shell.tab_title(&tabs[0]) == "make all"
+                    && shell.tab_cwd(&tabs[0]) == "forgetty";
+                if ok {
+                    check("status_events", true);
+                    self.goto(Phase::Shot);
+                } else if self.phase_t0.elapsed() > Duration::from_secs(8) {
+                    record("status_debug", json!(st.iter().map(|s| s.as_str()).collect::<Vec<_>>()));
+                    check("status_events", false);
+                    self.goto(Phase::Shot);
+                }
+            }
+            Phase::Shot => {
+                self.shot_frames += 1;
+                if self.sub == 0 {
+                    if !shell.sidebar_open {
+                        self.press(shell, window, cx, "ctrl+b");
+                    }
+                    self.sub = 1;
+                    self.shot_frames = 0;
+                    self.sub_t0 = Instant::now();
+                } else if self.sub_t0.elapsed() > Duration::from_millis(600) && self.shot_frames > 6 {
+                    let r = crate::screenshot::capture(window, SHOT_FILE);
+                    match &r {
+                        Ok(s) => record("screenshot", json!({"file": SHOT_FILE, "w": s.w, "h": s.h, "method": s.method, "distinct_colors": s.distinct, "non_background_pct": s.busy_pct})),
+                        Err(e) => record("screenshot", json!({"error": e})),
+                    }
+                    check("screenshot", r.as_ref().is_ok_and(|s| s.distinct >= 8 && s.busy_pct > 2.0) && shell.sidebar_open);
+                    self.goto(Phase::ClosePane);
+                }
+            }
+            Phase::ClosePane => {
+                let before = Self::tab_pane_count(shell);
+                if self.sub == 0 {
+                    // Tab 2 (the 2x2 tab) is still the active one.
+                    if before != 4 {
+                        if self.phase_t0.elapsed() > Duration::from_secs(8) {
+                            record("close_pane_debug", json!({"panes_in_active_tab": before}));
+                            check("close_pane_pty_exit", false);
+                            self.goto(Phase::CloseTab);
+                        }
+                        return;
+                    }
+                    self.pane_to_close = shell.active_pane();
+                    self.count_before = before;
+                    self.press(shell, window, cx, "ctrl+shift+w");
+                    self.sub = 1;
+                } else {
+                    let p = self.pane_to_close.unwrap();
+                    if before == self.count_before - 1 && self.pty_exited(p) {
+                        check("close_pane_pty_exit", true);
+                        self.goto(Phase::CloseTab);
+                    } else if self.sub_t0.elapsed() > Duration::from_secs(10) {
+                        record("close_pane_debug", json!({"panes": before, "exited": self.pty_exited(p)}));
+                        check("close_pane_pty_exit", false);
+                        self.goto(Phase::CloseTab);
+                    }
+                }
+            }
+            Phase::CloseTab => {
+                match self.sub {
+                    0 => {
+                        self.press(shell, window, cx, "ctrl+9");
+                        self.sub = 1;
+                    }
+                    1 => {
+                        let n = shell.layout.active_workspace().map(|w| w.tabs.len()).unwrap_or(0);
+                        let active = shell.layout.active_workspace().map(|w| w.active_tab).unwrap_or(0);
+                        if n == 4 && active == 3 {
+                            let t = shell.active_tab().cloned().unwrap();
+                            self.tab_to_close = Some((t.id, t.pane_tree.first_leaf()));
+                            self.press(shell, window, cx, "ctrl+shift+q");
+                            self.sub = 2;
+                        }
+                    }
+                    _ => {
+                        let (_, pane) = self.tab_to_close.unwrap();
+                        if shell.layout.tab_count() == 3 && self.pty_exited(pane) {
+                            check("close_tab_pty_exit", true);
+                            self.goto(Phase::PaletteOpen);
+                        } else if self.sub_t0.elapsed() > Duration::from_secs(10) {
+                            check("close_tab_pty_exit", false);
+                            self.goto(Phase::PaletteOpen);
+                        }
+                    }
+                }
+            }
+            Phase::PaletteOpen => {
+                if self.sub == 0 {
+                    self.press(shell, window, cx, "ctrl+shift+p");
+                    self.sub = 1;
+                } else if shell.palette.is_some() {
+                    check("palette_opens", true);
+                    for ch in "split right".chars() {
+                        shell.handle_key(&typed(ch), window, cx);
+                    }
+                    let (top, count, shortcut) = shell
+                        .palette
+                        .as_ref()
+                        .map(|p| {
+                            (
+                                p.items.first().map(|i| i.action),
+                                p.items.len(),
+                                p.items.first().map(|i| i.shortcut.clone()).unwrap_or_default(),
+                            )
+                        })
+                        .unwrap_or((None, 0, String::new()));
+                    record("palette_query", json!({"query": "split right", "top": format!("{top:?}"), "results": count, "shortcut": shortcut}));
+                    check("palette_fuzzy_split_right", top == Some(Action::SplitRight) && shortcut == "Alt+Shift+Plus");
+                    self.count_before = Self::tab_pane_count(shell);
+                    self.press(shell, window, cx, "enter");
+                    self.goto(Phase::PaletteRun);
+                } else if self.sub_t0.elapsed() > Duration::from_secs(5) {
+                    check("palette_opens", false);
+                    check("palette_fuzzy_split_right", false);
+                    self.goto(Phase::Rename);
+                }
+            }
+            Phase::PaletteRun => {
+                let n = Self::tab_pane_count(shell);
+                if shell.palette.is_none() && n == self.count_before + 1 {
+                    check("palette_runs_action", true);
+                    self.goto(Phase::Rename);
+                } else if self.phase_t0.elapsed() > Duration::from_secs(8) {
+                    record("palette_run_debug", json!({"before": self.count_before, "now": n}));
+                    check("palette_runs_action", false);
+                    self.goto(Phase::Rename);
+                }
+            }
+            Phase::Rename => {
+                match self.sub {
+                    0 => {
+                        self.press(shell, window, cx, "ctrl+shift+r");
+                        self.sub = 1;
+                    }
+                    1 => {
+                        if shell.rename.is_some() {
+                            for _ in 0..64 {
+                                shell.handle_key(&key("backspace"), window, cx);
+                            }
+                            for ch in "abc".chars() {
+                                shell.handle_key(&typed(ch), window, cx);
+                            }
+                            self.press(shell, window, cx, "enter");
+                            self.sub = 2;
+                        } else if self.sub_t0.elapsed() > Duration::from_secs(5) {
+                            check("tab_rename", false);
+                            self.finish(shell);
+                        }
+                    }
+                    _ => {
+                        let title = shell.active_tab().map(|t| shell.tab_title(t));
+                        if shell.rename.is_none() && title.as_deref() == Some("abc") {
+                            check("tab_rename", true);
+                            self.finish(shell);
+                        } else if self.sub_t0.elapsed() > Duration::from_secs(5) {
+                            record("rename_debug", json!(title));
+                            check("tab_rename", false);
+                            self.finish(shell);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Drag the root divider of the 2x2 tab from its current ratio to `want_ratio`
+    /// with the same calls the mouse handlers make.
+    fn drag_divider(&mut self, shell: &mut AppShell, cx: &mut Context<AppShell>) {
+        let Some((tab_id, geo)) = shell.active_geometry() else { fail("no geometry for divider drag") };
+        let Some(dv) = geo.dividers.iter().find(|d| d.path.is_empty()).cloned() else { fail("no root divider") };
+        self.before_sizes = self
+            .panes4
+            .iter()
+            .filter_map(|p| now(shell.backend.get_pane_info(*p)).ok().map(|i| (*p, i.rows, i.cols)))
+            .collect();
+        self.ratio_before = dv.ratio;
+        self.want_ratio = 0.4;
+        shell.begin_divider_drag(tab_id, dv.clone(), cx);
+        let (ox, oy) = shell.content_origin();
+        let avail = dv.area.w - BAR;
+        let x = ox + dv.area.x + BAR / 2.0 + self.want_ratio * avail;
+        let y = oy + dv.area.y + dv.area.h / 2.0;
+        shell.drag_to(x, y, cx);
+        shell.end_drag(cx);
+    }
+
+    /// Put distinct statuses, titles and a cwd on the four tabs, as a shell
+    /// with integration (or a build tool) would.
+    fn start_status(&mut self, shell: &mut AppShell) {
+        let tabs: Vec<_> = shell.layout.active_workspace().map(|w| w.tabs.clone()).unwrap_or_default();
+        if tabs.len() == 4 {
+            let pane = |i: usize| shell.active_pane_of(&tabs[i]);
+            self.local.inject_osc(pane(0), b"\x1b]0;make all\x07\x1b]7;file:///C:/work/forgetty\x1b\\\x1b]133;C\x07");
+            self.local.inject_osc(pane(1), b"\x1b]0;cargo test\x07\x1b]133;C\x07\x1b]133;D;0\x07");
+            self.local.inject_osc(pane(2), b"\x1b]0;deploy\x07\x1b]133;C\x07\x1b]133;D;1\x07");
+            self.local.inject_osc(pane(3), b"\x1b]0;ssh prod\x07\x1b]133;A\x07");
+        }
+        self.goto(Phase::Status);
+    }
+
+    fn finish(&mut self, shell: &mut AppShell) -> ! {
         record("total_s", json!(ms(self.start.elapsed()) / 1000.0));
-        record("frames_drawn", json!(v.frames));
-        record("shape_cache_misses", json!(v.shape_misses));
-        record("vt_fed_mb", json!((v.fed_bytes as f64 / 1e6 * 10.0).round() / 10.0));
-        record("vt_feed_total_ms", json!(ms(v.feed_time)));
-        record("vt_feed_max_ms", json!(ms(v.max_feed)));
-        record("font", json!(format!("{} {:.1}pt", v.metrics.font.family, v.cfg.font_size_pt)));
-        record("grid", json!([v.rows, v.cols]));
-        let all = {
+        record("frames_drawn", json!(shell.frames));
+        let (all, n_checks) = {
             let g = RESULTS.lock().unwrap();
-            g.as_ref()
-                .and_then(|m| m.get("checks"))
-                .and_then(|c| c.as_object())
-                .map(|c| c.values().all(|x| x == &json!(true)))
-                .unwrap_or(false)
+            let checks = g.as_ref().and_then(|m| m.get("checks")).and_then(|c| c.as_object());
+            (
+                checks.map(|c| c.values().all(|x| x == &json!(true))).unwrap_or(false),
+                checks.map(|c| c.len()).unwrap_or(0),
+            )
         };
-        let n_checks = RESULTS
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(|m| m.get("checks"))
-            .and_then(|c| c.as_object())
-            .map(|c| c.len())
-            .unwrap_or(0);
-        let all = all && n_checks >= 10;
+        record("checks_run", json!(n_checks));
+        let all = all && n_checks >= 30;
         println!("{}", snapshot(all));
         let _ = std::io::stdout().flush();
-        v.source.shutdown();
+        self.local.shutdown_all();
         std::process::exit(if all { 0 } else { 1 });
     }
 }
@@ -471,7 +1151,7 @@ fn run_direct_checks() {
     let d = Config::default();
     let ok = c.as_ref().is_ok_and(|c| {
         c.shell.as_deref() == Some("pwsh.exe")
-            && c.scrollback_lines == 5000
+            && c.scrollback_bytes == 5000 * 2048
             && c.font_family == "Fira Code"
             && c.font_size_pt == 13.5
             && c.foreground == 0x112233
@@ -484,6 +1164,28 @@ fn run_direct_checks() {
         && d.font_size_pt == 11.0
         && Config::from_toml("font = 3").is_err();
     check("config", ok);
+
+    // W2 config: scrollback_bytes default and override, backdrop, keybindings.
+    let c2 = Config::from_toml(
+        "scrollback_bytes = 2097152\nbackdrop='none'\nsidebar=true\n[theme]\naccent='#ff8800'\n[keybindings]\nnew_tab='ctrl+alt+t'\nsplit_right=['ctrl+shift+d','alt+shift+plus']\nclose_pane='none'\n",
+    );
+    let km = c2.as_ref().map(|c| Keymap::new(&c.keybindings)).unwrap_or_default();
+    let chord = |s: &str| Chord::parse(s).unwrap();
+    let ok2 = c2.as_ref().is_ok_and(|c| {
+        c.scrollback_bytes == 2 * 1024 * 1024
+            && c.backdrop == crate::config::Backdrop::None
+            && c.sidebar_open
+            && c.accent == 0xff8800
+    }) && Config::default().scrollback_bytes == 10 * 1024 * 1024
+        && km.lookup(&chord("ctrl+alt+t")) == Some(Action::NewTab)
+        && km.lookup(&chord("ctrl+shift+t")).is_none()
+        && km.lookup(&chord("ctrl+shift+d")) == Some(Action::SplitRight)
+        && km.chords(Action::ClosePane).is_empty()
+        && km.lookup(&chord("ctrl+shift+p")) == Some(Action::CommandPalette)
+        && Config::from_toml("backdrop='glass'").is_err();
+    check("config_w2", ok2);
+    // New terminals get the 10 MiB default from forgetty-vt.
+    check("vt_default_scrollback", forgetty_vt::DEFAULT_MAX_SCROLLBACK_BYTES == 10 * 1024 * 1024);
 }
 
 fn encoder_checks(v: &mut TerminalView) {

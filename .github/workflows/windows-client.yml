@@ -1,7 +1,8 @@
 name: windows-client
 
-# V3 P3 spike: GPUI + libghostty-vt on Windows. Builds clients/windows, runs the
-# headless smoke mode, uploads the exe plus DLLs.
+# V3 Windows client: GPUI app shell + libghostty-vt + ConPTY. Builds clients/windows,
+# runs the headless smoke mode (W1 + W2 checks), uploads the exe, DLLs, smoke.json
+# and a screenshot of the 4-pane layout.
 on:
   push:
     branches: [v3/win-spike]
@@ -47,6 +48,14 @@ jobs:
           $code = $LASTEXITCODE
           Write-Host "forgetty-win --smoke exit code: $code"
           exit $code
+
+      - name: Upload layout screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: forgetty-win-layout-4pane
+          if-no-files-found: warn
+          path: clients/windows/target/release/layout-4pane.png
 
       - name: Upload artifact
         if: always()

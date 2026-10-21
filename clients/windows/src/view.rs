@@ -28,8 +28,6 @@ use crate::config::Config;
 use crate::element::TerminalElement;
 use crate::encoder::{self, Input};
 
-pub const INITIAL_ROWS: usize = 30;
-pub const INITIAL_COLS: usize = 120;
 const SHAPE_CACHE_MAX: usize = 4096;
 const FEED_CHUNK: usize = 256 * 1024;
 
@@ -129,6 +127,7 @@ pub struct TerminalView {
     pub visible: bool,
     /// Set by the shell: this is the active pane of the active tab.
     pub focused: bool,
+    #[allow(dead_code)]
     pub pane_id: PaneId,
     pub closed: Option<String>,
     pub frames: u64,
@@ -275,7 +274,7 @@ impl TerminalView {
                 self.source.write_input(&resp);
             }
             // Titles and cwd come from the backend (it scans the same bytes).
-            self.term.drain_events().for_each(drop);
+            drop(self.term.drain_events());
         }
         if let Some(reason) = closed {
             self.closed = Some(reason);
