@@ -118,15 +118,58 @@ New methods:
 Each frame payload: `[16 bytes pane uuid][u64 BE seq][input bytes]`. No
 MessagePack, no base64. `seq` starts at 1 per `(client_id, input_epoch)` and increases by 1
 per frame, across reconnects of the same process. A new process sends a new
-`input_epoch`, so its counter starts fresh. The server keeps the last written
+`input_epoch`, so its counter starts fresh.
+
+**Dedup and ack happen at enqueue (AD-024).** The server keeps the last handled
 `seq` per `(client_id, input_epoch)` (in memory, kept 10 min after the client
-leaves) and drops any frame
-with `seq <=` that value, so a resent frame is never written twice. The server
-writes the bytes to the PTY in arrival order.
+leaves) and drops any frame with `seq <=` that value, so a resent frame is
+never queued twice. A frame counts as handled, and `Pong.input_acked` covers
+it, once the server has put it in the bounded input queue of its pane (256
+KiB). It does not wait for the PTY to take the bytes.
+
+**Ordering is per pane.** Each pane has its own queue and its own writer, so
+the bytes of one pane reach its PTY in arrival order, and a pane whose program
+does not read input delays only itself. Frames of one client for different
+panes are not ordered against each other at the PTY.
+
+**A full queue drops frames.** When the queue of a pane has no room, the
+server drops the frame, counts it, logs it, and still acks it (the client must
+not resend into a queue that cannot drain). If the dropped bytes contain the
+pane's VINTR byte (Ctrl+C by default), the server sends SIGINT to the pane's
+foreground process group anyway, so Ctrl+C still ends a program that hangs.
+While the server stops, it freezes input, closes the queues, waits up to 2 s
+for them to drain, and only then saves the `seq` state. Frames it did not
+queue are not acked, so the client resends them to the next server.
 
 The client keeps every frame until a `Pong.input_acked` covers it (cap 64 KiB).
-After a reconnect it resends all unacked frames in order. Input is exactly-once. Input from a
-client also marks that client as the pane's latest active client (section 6).
+After a reconnect it resends all unacked frames in order. Input from a
+client also marks that client as the pane's latest active client (section 6),
+except `auto` input (below).
+
+**Input flags (AD-025, capability `input_flags`).** When both sides list
+`input_flags`, every frame on that connection has one more byte after `seq`:
+
+```
+[16 bytes pane uuid][u64 BE seq][u8 flags][input bytes]
+```
+
+- Bit 0 set: `auto`. The bytes are an automatic terminal reply (DA, CPR,
+  kitty-keyboard answers, focus reports). Bit 0 clear: `user` (keys, paste,
+  mouse). Bits 1 to 7 are reserved. Senders set them to 0 and receivers
+  ignore them.
+- Without the capability the frame has no flags byte, as above, and counts as
+  `user`. A client must not send a flags byte unless the server's `Welcome`
+  lists `input_flags`.
+- An `auto` frame never makes its client the pane's latest active client.
+- The server writes an `auto` frame to the PTY only when its sender is the
+  pane's size owner (the latest active client, section 6). A pane with no
+  owner yet takes its first attached client as owner. `auto` frames from every
+  other client are dropped, but they still go through dedup and are acked like
+  any other frame.
+- When the owner detaches (`detach_pane`) or disconnects, the client among
+  those still attached to the pane whose `user` input came most recently
+  becomes the owner, and the PTY takes the size that client asked for. If no
+  client is attached, the pane has no owner.
 
 ## 6. Size policy (AD-020)
 

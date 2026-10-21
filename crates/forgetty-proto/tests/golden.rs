@@ -223,6 +223,45 @@ fn golden_input_frame() {
 }
 
 #[test]
+fn input_frame_with_flags_round_trips() {
+    // user: bit 0 clear. The flags byte sits after seq, before the bytes.
+    let user = encode_input_frame_flags(id(3), 258, 0, b"ls\r");
+    assert_eq!(hex(&user), "030303030303030303030303030303030000000000000102006c730d");
+    let (pane, seq, flags, bytes) = decode_input_frame_flags(&user).unwrap();
+    assert_eq!((pane, seq, flags, bytes), (id(3), 258, 0, &b"ls\r"[..]));
+    // auto: bit 0 set.
+    let auto = encode_input_frame_flags(id(3), 259, INPUT_FLAG_AUTO, b"\x1b[?62c");
+    let (pane, seq, flags, bytes) = decode_input_frame_flags(&auto).unwrap();
+    assert_eq!((pane, seq), (id(3), 259));
+    assert_ne!(flags & INPUT_FLAG_AUTO, 0);
+    assert_eq!(bytes, b"\x1b[?62c");
+    // Unknown bits come back untouched; empty bytes are fine.
+    let odd = encode_input_frame_flags(id(1), 1, 0xfe, b"");
+    let (_, _, flags, bytes) = decode_input_frame_flags(&odd).unwrap();
+    assert_eq!((flags, bytes.len()), (0xfe, 0));
+    // A frame without the flags byte is too short for the flags decoder.
+    let plain = encode_input_frame(id(3), 1, b"");
+    assert!(decode_input_frame_flags(&plain).is_err());
+    // The plain decoder reads the flags byte as input, so peers must agree on
+    // the capability.
+    assert_eq!(decode_input_frame(&user).unwrap().2[0], 0);
+}
+
+#[tokio::test]
+async fn input_frame_with_flags_round_trips_on_a_stream() {
+    let mut buf = Vec::new();
+    write_input_frame_flags(&mut buf, id(5), 9, INPUT_FLAG_AUTO, b"x").await.unwrap();
+    write_input_frame_flags(&mut buf, id(5), 10, 0, b"yz").await.unwrap();
+    let mut r = &buf[..];
+    assert_eq!(
+        read_input_frame_flags(&mut r).await.unwrap(),
+        Some((id(5), 9, INPUT_FLAG_AUTO, b"x".to_vec()))
+    );
+    assert_eq!(read_input_frame_flags(&mut r).await.unwrap(), Some((id(5), 10, 0, b"yz".to_vec())));
+    assert_eq!(read_input_frame_flags(&mut r).await.unwrap(), None);
+}
+
+#[test]
 fn golden_qr_payload() {
     let q = QrPayload {
         v: 2,

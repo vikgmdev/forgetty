@@ -85,6 +85,8 @@ fn handle(
                 "snapshot_reuses": rpc.snapshots.stats.reuses.load(Ordering::SeqCst),
                 "snapshot_cancelled": rpc.snapshots.stats.cancelled.load(Ordering::SeqCst),
                 "snapshot_max_running": rpc.snapshots.stats.max_running.load(Ordering::SeqCst),
+                "input_drops": rpc.qa.input_drops.load(Ordering::SeqCst),
+                "auto_drops": rpc.qa.auto_drops.load(Ordering::SeqCst),
                 "too_many_closes": rpc.qa.too_many_closes.load(Ordering::SeqCst),
                 "stall_closes": rpc.qa.stall_closes.load(Ordering::SeqCst),
                 "alive_tasks": tokio::runtime::Handle::current().metrics().num_alive_tasks(),
