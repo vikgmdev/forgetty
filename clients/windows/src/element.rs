@@ -10,7 +10,7 @@ use gpui::{
     Pixels, Style, TextAlign, TextRun, UnderlineStyle, Window, px,
 };
 
-use crate::view::{hsla, RowShaped, TerminalView};
+use crate::view::{hsla, shade, RowShaped, TerminalView};
 
 pub struct TerminalElement {
     view: Entity<TerminalView>,
@@ -127,15 +127,16 @@ impl Element for TerminalElement {
     ) {
         let (cw, lh, font, font_size, fg, bg, cur_col, sel_col, focus, marked, cursor_cell) = {
             let v = self.view.read(cx);
+            let k = 1.0 - v.dim;
             (
                 v.metrics.cell_w,
                 v.metrics.line_h,
                 v.metrics.font.clone(),
                 v.metrics.font_size,
-                hsla(v.cfg.foreground),
-                hsla(v.cfg.background),
-                hsla(v.cfg.cursor),
-                hsla(v.cfg.selection),
+                shade(hsla(v.cfg.foreground), k),
+                shade(hsla(v.cfg.background), k),
+                shade(hsla(v.cfg.cursor), k),
+                shade(hsla(v.cfg.selection), k),
                 v.focus.clone(),
                 v.marked.clone(),
                 v.term.cursor(),

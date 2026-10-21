@@ -398,20 +398,16 @@ impl AppShell {
                 Some(v) => d.child(v.clone()),
                 None => d,
             };
-            if multi && !focused {
-                // Static alpha overlay: cheap, no animation state, never blocks input.
-                d = d.child(div().absolute().top_0().left_0().size_full().bg(alpha(0x000000, 0.28)));
-            }
             if multi && focused {
-                d = d.child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .left_0()
-                        .size_full()
-                        .border_1()
-                        .border_color(hsla(th.accent)),
-                );
+                // Thin accent frame as four 1 px bars (a bordered full-pane quad costs
+                // a full-pane fill on software GPUs).
+                let acc = hsla(th.accent);
+                let bar = || div().absolute().bg(acc);
+                d = d
+                    .child(bar().top_0().left_0().w_full().h(px(1.0)))
+                    .child(bar().bottom_0().left_0().w_full().h(px(1.0)))
+                    .child(bar().top_0().left_0().h_full().w(px(1.0)))
+                    .child(bar().top_0().right_0().h_full().w(px(1.0)));
             }
             if zoomed {
                 d = d.child(

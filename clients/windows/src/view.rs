@@ -31,6 +31,11 @@ use crate::encoder::{self, Input};
 const SHAPE_CACHE_MAX: usize = 4096;
 const FEED_CHUNK: usize = 256 * 1024;
 
+/// Scale brightness (same as a black overlay of alpha 1-k).
+pub fn shade(c: Hsla, k: f32) -> Hsla {
+    Hsla { l: c.l * k, ..c }
+}
+
 pub fn hsla(hex: u32) -> Hsla {
     rgb(hex).into()
 }
@@ -136,6 +141,8 @@ pub struct TerminalView {
     /// Smoke only: dry-run key encoding writes here instead of the source.
     pub capture_input: Option<Vec<u8>>,
     pub pending_paste: Option<PendingPaste>,
+    /// 0.0 normal, otherwise the share of brightness removed (unfocused pane in a split).
+    pub dim: f32,
     pub fed_bytes: u64,
     pub feed_time: Duration,
     pub max_feed: Duration,
@@ -253,6 +260,7 @@ impl TerminalView {
             last_paint: None,
             capture_input: None,
             pending_paste: None,
+            dim: 0.0,
             fed_bytes: 0,
             feed_time: Duration::ZERO,
             max_feed: Duration::ZERO,
@@ -313,6 +321,17 @@ impl TerminalView {
         }
     }
 
+    /// Dim the pane by recoloring (no overlay quad: full-pane alpha quads are costly
+    /// on software GPUs). Rows are rebuilt with scaled colors.
+    pub fn set_dim(&mut self, dim: f32, cx: &mut Context<Self>) {
+        if (self.dim - dim).abs() > 1e-3 {
+            self.dim = dim;
+            self.last_gen = 0;
+            self.row_hash.iter_mut().for_each(|h| *h = 0);
+            cx.notify();
+        }
+    }
+
     fn blink_tick(&mut self, cx: &mut Context<Self>) {
         if !self.visible || !self.focused {
             self.cursor_on = true;
@@ -360,7 +379,7 @@ impl TerminalView {
             if self.rows_shaped[r].is_some() && !screen.row_dirty_since(r, self.last_gen) {
                 continue;
             }
-            let h = hash_row(screen, r);
+            let h = hash_row(screen, r) ^ if self.dim > 0.0 { 0x9E37_79B9_7F4A_7C15 } else { 0 };
             if self.rows_shaped[r].is_some() && self.row_hash[r] == h {
                 continue;
             }
@@ -369,7 +388,7 @@ impl TerminalView {
                 Some(s) => s.clone(),
                 None => {
                     let m = &self.metrics;
-                    let (text, runs, bgs) = build_row(screen, r, &m.font, &self.cfg);
+                    let (text, runs, bgs) = build_row(screen, r, &m.font, &self.cfg, 1.0 - self.dim);
                     let line = window.text_system().shape_line(text, m.font_size, &runs, Some(m.cell_w));
                     let s = Arc::new(RowShaped { line, bgs });
                     if self.shape_cache.len() >= SHAPE_CACHE_MAX {
@@ -1005,8 +1024,9 @@ fn build_row(
     r: usize,
     base: &Font,
     cfg: &Config,
+    k: f32,
 ) -> (SharedString, Vec<TextRun>, Vec<(usize, usize, Hsla)>) {
-    let default_bg = hsla(cfg.background);
+    let default_bg = shade(hsla(cfg.background), k);
     let mut text = String::with_capacity(screen.cols());
     let mut runs: Vec<TextRun> = Vec::new();
     let mut bgs: Vec<(usize, usize, Hsla)> = Vec::new();
@@ -1014,6 +1034,7 @@ fn build_row(
 
     for (c, cell) in screen.row(r).iter().enumerate() {
         let (fg, bg) = resolve(&cell.attrs, cfg);
+        let (fg, bg) = (shade(fg, k), shade(bg, k));
         let g = if cell.grapheme.is_empty() || cell.attrs.spacer { " " } else { cell.grapheme.as_str() };
         text.push_str(g);
 
@@ -1066,7 +1087,7 @@ impl Render for TerminalView {
         self.window_active = window.is_window_active();
         div()
             .size_full()
-            .bg(hsla(self.cfg.background))
+            .bg(shade(hsla(self.cfg.background), 1.0 - self.dim))
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key_down))
             .on_key_up(cx.listener(Self::on_key_up))

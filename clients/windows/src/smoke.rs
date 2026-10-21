@@ -842,7 +842,8 @@ impl ShellSmoke {
                 if self.sub == 0 {
                     shell.focus_pane(p0, window, cx);
                     let Some(s) = snap(shell, cx, p0) else { return };
-                    if s.at_prompt() && shell.active_pane() == Some(p0) {
+                    // Let the focus change settle: dimming recolors (re-shapes) the other panes once.
+                    if s.at_prompt() && shell.active_pane() == Some(p0) && self.sub_t0.elapsed() > Duration::from_millis(400) {
                         let (r, c) = (s.cr, s.cc);
                         self.base_col = c;
                         self.probe = Some(Probe { row: r, col: c, ch: 'a', t0: Instant::now() });

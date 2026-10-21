@@ -515,11 +515,14 @@ impl AppShell {
         let active = self.active_pane();
         let win_active = window.is_window_active() || self.smoke_mode;
         self.window_active = win_active;
+        let multi = visible.len() > 1;
         for (id, v) in &self.views {
             let (vis, foc) = (visible.contains(id), Some(*id) == active && win_active);
+            let dim = if multi && vis && Some(*id) != active { 0.28 } else { 0.0 };
             v.update(cx, |v, cx| {
                 v.set_visible(vis, cx);
                 v.set_focused(foc, cx);
+                v.set_dim(dim, cx);
             });
         }
         let target = match active.and_then(|a| self.views.get(&a)) {
