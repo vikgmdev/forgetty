@@ -36,7 +36,7 @@ CI: `.github/workflows/windows-client.yml` (branch `v3/win-spike`).
   with a yield between batches. One resize per frame (grid follows the window, VT + PTY).
   Shaped lines are cached per row by content hash (rows the VT did not touch are not even hashed).
   Selection (drag, double-click word, triple-click line), copy on select, Ctrl+Shift+C/V,
-  bracketed paste, wheel and Shift+PageUp/PageDown scrolling (pixel deltas accumulate, view snaps
+  bracketed paste with pastejacking defense (`forgetty_vt::paste`: ESC and C1 CSI stripped in bracketed mode, C0/C1 stripped when unbracketed, newline or stripped bytes show an Enter/Esc confirm overlay with a preview), wheel and Shift+PageUp/PageDown scrolling (pixel deltas accumulate, view snaps
   to rows, no re-parse), DECSET 1004 focus reports, window title from OSC.
 - `src/element.rs`: custom GPUI `Element`: background quads, selection, cursor (block, bar,
   underline, hollow, DECSCUSR blink), shaped text per row, IME preedit at the cursor.
@@ -67,7 +67,9 @@ more): hard timeout 120 s, 45 s per phase. On failure the JSON carries the last 
 
 Checks: `echo_found`, `key_p50_le_18ms`, `damage_only_redraw`, `key_encoder`, `kitty_encoder`,
 `wide_direct`, `wide_shell`, `scrollback_direct`, `scrollback_shell`, `resize`, `throughput`,
-`config`, `mouse_encoder`, `paste`, `selection`.
+`throughput_conpty` (25k lines through ConPTY), `throughput_pump` (22.5 MB injected into the real
+pump at full speed, gate: no frame gap over 100 ms), `config`, `mouse_encoder`, `paste`, `selection`.
+ConPTY itself delivers only a few thousand lines per second, so the 20 MB drain runs through the pump.
 
 Keystrokes in the latency test are injected at `TerminalView::send_keystroke` (same encoder path
 as a real key), below the Win32 key event hop.

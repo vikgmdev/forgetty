@@ -53,13 +53,12 @@ fn main() {
                 .unwrap_or_else(|| "cmd.exe".into())
         };
         let cwd = if smoke { Some("C:\\") } else { None };
-        let source: Box<dyn PaneSource> =
-            match LocalConPty::spawn(&shell, cwd, INITIAL_ROWS as u16, INITIAL_COLS as u16) {
-                Ok(s) => Box::new(s),
-                Err(e) => fatal(smoke, &format!("local pty: {e:#}")),
-            };
-
-        let smoke_state = smoke.then(|| Box::new(smoke::Smoke::new(start)));
+        let pty = match LocalConPty::spawn(&shell, cwd, INITIAL_ROWS as u16, INITIAL_COLS as u16) {
+            Ok(s) => s,
+            Err(e) => fatal(smoke, &format!("local pty: {e:#}")),
+        };
+        let smoke_state = smoke.then(|| Box::new(smoke::Smoke::new(start, pty.injector())));
+        let source: Box<dyn PaneSource> = Box::new(pty);
         let opened = cx.open_window(
             WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() },
             |window, cx| {

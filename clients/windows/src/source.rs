@@ -41,6 +41,7 @@ pub trait PaneSource {
 /// Local ConPTY shell through portable-pty.
 pub struct LocalConPty {
     rx: async_channel::Receiver<PaneEvent>,
+    tx: async_channel::Sender<PaneEvent>,
     input_tx: mpsc::Sender<Vec<u8>>,
     master: Mutex<Box<dyn MasterPty + Send>>,
     child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
@@ -121,7 +122,15 @@ impl LocalConPty {
             }
         })?;
 
-        Ok(Self { rx, input_tx, master: Mutex::new(pair.master), child })
+        Ok(Self { rx, tx, input_tx, master: Mutex::new(pair.master), child })
+    }
+}
+
+impl LocalConPty {
+    /// Sender into the same bounded channel the PTY reader uses. The smoke test
+    /// uses it to push synthetic output through the real pump.
+    pub fn injector(&self) -> async_channel::Sender<PaneEvent> {
+        self.tx.clone()
     }
 }
 

@@ -1026,4 +1026,12 @@ extern "C" {
         buf_len: usize,
         out_written: *mut usize,
     ) -> GhosttyResult;
+
+    // -----------------------------------------------------------------------
+    // Paste safety
+    // -----------------------------------------------------------------------
+
+    /// libghostty's paste-safety check: false if the data holds a newline or
+    /// the bracketed-paste end sequence.
+    pub fn ghostty_paste_is_safe(data: *const u8, len: usize) -> bool;
 }

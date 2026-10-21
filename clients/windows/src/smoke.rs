@@ -14,12 +14,16 @@ use gpui::{size, Keystroke, Window};
 use serde_json::{json, Map, Value};
 
 use crate::config::Config;
+use crate::source::PaneEvent;
 use crate::view::TerminalView;
 
 pub const KEYSTROKES: usize = 100;
 pub const TOTAL_TIMEOUT: Duration = Duration::from_secs(120);
 const PHASE_TIMEOUT: Duration = Duration::from_secs(45);
-const THROUGHPUT_BYTES: f64 = 250_000.0 * 90.0;
+const CONPTY_LINES: u32 = 25_000;
+const CONPTY_BYTES: f64 = CONPTY_LINES as f64 * 90.0;
+const SYNTH_LINES: u32 = 250_000;
+const SYNTH_BYTES: f64 = SYNTH_LINES as f64 * 90.0;
 const BIG_FILE: &str = "C:\\big.txt";
 
 static RESULTS: Mutex<Option<Map<String, Value>>> = Mutex::new(None);
@@ -81,6 +85,7 @@ enum Phase {
     ResizeWait,
     ResizeAsk,
     Throughput,
+    Synth,
 }
 
 impl Phase {
@@ -94,7 +99,8 @@ impl Phase {
             Phase::Gen => "generate-file",
             Phase::ResizeWait => "resize-wait",
             Phase::ResizeAsk => "resize-ask-shell",
-            Phase::Throughput => "throughput",
+            Phase::Throughput => "throughput-conpty",
+            Phase::Synth => "throughput-pump",
         }
     }
 }
@@ -121,10 +127,11 @@ pub struct Smoke {
     thr_last: Option<Instant>,
     thr_max_gap: f64,
     thr_frames: u32,
+    injector: async_channel::Sender<PaneEvent>,
 }
 
 impl Smoke {
-    pub fn new(start: Instant) -> Self {
+    pub fn new(start: Instant, injector: async_channel::Sender<PaneEvent>) -> Self {
         run_direct_checks();
         Smoke {
             start,
@@ -141,6 +148,7 @@ impl Smoke {
             thr_last: None,
             thr_max_gap: 0.0,
             thr_frames: 0,
+            injector,
         }
     }
 
@@ -253,7 +261,7 @@ impl Smoke {
                         check("wide_shell", ok);
                         v.send_bytes(
                             format!(
-                                "powershell -NoProfile -Command \"$l='0123456789abcdef'*5; $o=1..250000 | ForEach-Object {{ '{{0:D7}} {{1}}' -f $_,$l }}; [IO.File]::WriteAllLines('{BIG_FILE}',$o)\" && echo GEN-OK\r"
+                                "powershell -NoProfile -Command \"$l='0123456789abcdef'*5; $o=1..{CONPTY_LINES} | ForEach-Object {{ '{{0:D7}} {{1}}' -f $_,$l }}; [IO.File]::WriteAllLines('{BIG_FILE}',$o)\" && echo GEN-OK\r"
                             )
                             .as_bytes(),
                         );
@@ -309,16 +317,39 @@ impl Smoke {
                 if let Some(fr) = find_exact("THRU-DONE") {
                     if at_prompt && cr > fr {
                         let secs = (now - self.thr_t0).as_secs_f64();
-                        record("throughput_drain_s", json!((secs * 1000.0).round() / 1000.0));
-                        record("throughput_mb_per_s", json!(((THROUGHPUT_BYTES / 1e6 / secs) * 10.0).round() / 10.0));
-                        record("throughput_max_frame_gap_ms", json!(self.thr_max_gap));
-                        record("throughput_frames", json!(self.thr_frames));
-                        check("throughput", self.thr_max_gap <= 100.0);
+                        record("conpty_drain_s", json!((secs * 1000.0).round() / 1000.0));
+                        record("conpty_mb_per_s", json!(((CONPTY_BYTES / 1e6 / secs) * 100.0).round() / 100.0));
+                        record("conpty_max_frame_gap_ms", json!(self.thr_max_gap));
+                        record("conpty_frames", json!(self.thr_frames));
+                        check("throughput_conpty", self.thr_max_gap <= 100.0);
                         selection_check(v, &rows);
                         mouse_and_paste_checks(v);
                         scrollback_shell_check(v, &rows);
-                        self.finish(v);
+                        // Now push 22.5 MB through the real pump at full producer speed.
+                        let tx = self.injector.clone();
+                        std::thread::spawn(move || synth_producer(tx));
+                        self.thr_t0 = Instant::now();
+                        self.thr_last = None;
+                        self.thr_max_gap = 0.0;
+                        self.thr_frames = 0;
+                        self.goto(Phase::Synth);
                     }
+                }
+            }
+            Phase::Synth => {
+                if let Some(last) = self.thr_last {
+                    self.thr_max_gap = self.thr_max_gap.max(ms(now - last));
+                }
+                self.thr_last = Some(now);
+                self.thr_frames += 1;
+                if find_exact("SYN-DONE").is_some() {
+                    let secs = (now - self.thr_t0).as_secs_f64();
+                    record("pump_drain_s", json!((secs * 1000.0).round() / 1000.0));
+                    record("pump_mb_per_s", json!(((SYNTH_BYTES / 1e6 / secs) * 10.0).round() / 10.0));
+                    record("pump_max_frame_gap_ms", json!(self.thr_max_gap));
+                    record("pump_frames", json!(self.thr_frames));
+                    check("throughput_pump", self.thr_max_gap <= 100.0);
+                    self.finish(v);
                 }
             }
         }
@@ -352,6 +383,9 @@ impl Smoke {
         record("total_s", json!(ms(self.start.elapsed()) / 1000.0));
         record("frames_drawn", json!(v.frames));
         record("shape_cache_misses", json!(v.shape_misses));
+        record("vt_fed_mb", json!((v.fed_bytes as f64 / 1e6 * 10.0).round() / 10.0));
+        record("vt_feed_total_ms", json!(ms(v.feed_time)));
+        record("vt_feed_max_ms", json!(ms(v.max_feed)));
         record("font", json!(format!("{} {:.1}pt", v.metrics.font.family, v.cfg.font_size_pt)));
         record("grid", json!([v.rows, v.cols]));
         let all = {
@@ -514,9 +548,41 @@ fn mouse_and_paste_checks(v: &mut TerminalView) {
     let ok = press == b"\x1b[<0;6;4M" && release == b"\x1b[<0;6;4m" && drag == b"\x1b[<32;7;4M";
     check("mouse_encoder", ok);
 
-    let ok = crate::view::paste_bytes("a\r\nb\nc", false) == b"a\rb\rc"
-        && crate::view::paste_bytes("x\x1b[201~y", true) == b"\x1b[200~x[201~y\x1b[201~";
+    // Plain line pastes at once; multi-line unbracketed parks behind a confirm prompt.
+    v.capture_input = Some(Vec::new());
+    let prompt_plain = v.send_paste("hello");
+    let sent_plain = v.capture_input.take().unwrap_or_default();
+    v.capture_input = Some(Vec::new());
+    let prompt_multi = v.send_paste("a\nb");
+    let held = v.capture_input.take().unwrap_or_default();
+    v.resolve_paste(false);
+    let cancelled = v.pending_paste.is_none();
+    v.send_paste("a\nb");
+    v.capture_input = Some(Vec::new());
+    v.resolve_paste(true);
+    let confirmed = v.capture_input.take().unwrap_or_default();
+    let ok = !prompt_plain
+        && sent_plain == b"hello"
+        && prompt_multi
+        && held.is_empty()
+        && cancelled
+        && confirmed == b"a\rb";
     check("paste", ok);
+}
+
+fn synth_producer(tx: async_channel::Sender<PaneEvent>) {
+    let tail = "0123456789abcdef".repeat(5);
+    let mut chunk = Vec::with_capacity(17_000);
+    for i in 0..SYNTH_LINES {
+        chunk.extend_from_slice(format!("{i:07} {tail}\r\n").as_bytes());
+        if chunk.len() >= 16_000 {
+            if tx.send_blocking(PaneEvent::Output(std::mem::take(&mut chunk))).is_err() {
+                return;
+            }
+        }
+    }
+    chunk.extend_from_slice(b"SYN-DONE\r\n");
+    let _ = tx.send_blocking(PaneEvent::Output(chunk));
 }
 
 fn hexs(b: &[u8]) -> String {

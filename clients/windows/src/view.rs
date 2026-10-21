@@ -135,6 +135,18 @@ pub struct TerminalView {
     pub smoke: Option<Box<Smoke>>,
     /// Smoke only: dry-run key encoding writes here instead of the source.
     pub capture_input: Option<Vec<u8>>,
+    pub pending_paste: Option<PendingPaste>,
+    pub fed_bytes: u64,
+    pub feed_time: Duration,
+    pub max_feed: Duration,
+}
+
+/// A paste waiting for the user's confirmation (Enter pastes, Esc cancels).
+pub struct PendingPaste {
+    pub bytes: Vec<u8>,
+    pub preview: Vec<String>,
+    pub total_lines: usize,
+    pub stripped: usize,
 }
 
 struct YieldNow(bool);
@@ -237,6 +249,10 @@ impl TerminalView {
             last_paint: None,
             smoke,
             capture_input: None,
+            pending_paste: None,
+            fed_bytes: 0,
+            feed_time: Duration::ZERO,
+            max_feed: Duration::ZERO,
         }
     }
 
@@ -244,7 +260,12 @@ impl TerminalView {
 
     fn feed(&mut self, bytes: &[u8], closed: Option<String>, cx: &mut Context<Self>) {
         if !bytes.is_empty() {
+            let t0 = Instant::now();
             self.term.feed(bytes);
+            let dt = t0.elapsed();
+            self.fed_bytes += bytes.len() as u64;
+            self.feed_time += dt;
+            self.max_feed = self.max_feed.max(dt);
             // Terminal replies (DA, CPR, mode queries). ConPTY waits on these.
             for resp in self.term.drain_write_pty() {
                 self.source.write_input(&resp);
@@ -392,6 +413,16 @@ impl TerminalView {
     fn on_key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
         let m = &ks.modifiers;
+        if self.pending_paste.is_some() {
+            match ks.key.as_str() {
+                "enter" => self.resolve_paste(true),
+                "escape" => self.resolve_paste(false),
+                _ => {}
+            }
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
         if m.control && m.shift && !m.alt {
             match ks.key.as_str() {
                 "c" => {
@@ -459,13 +490,66 @@ impl TerminalView {
     pub fn paste(&mut self, cx: &mut Context<Self>) {
         let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) else { return };
         self.send_paste(&text);
+        cx.notify();
     }
 
-    pub fn send_paste(&mut self, text: &str) {
+    /// Sanitize and send, or park the paste for confirmation when it could run
+    /// commands the user did not see (newline without bracketed paste, hidden
+    /// control bytes). Returns true if a confirm prompt is now showing.
+    pub fn send_paste(&mut self, text: &str) -> bool {
         let bracketed = encoder::private_mode(self.term.raw_handle(), 2004);
+        let p = forgetty_vt::paste::prepare(text, bracketed);
+        if p.needs_confirm {
+            self.pending_paste = Some(PendingPaste {
+                bytes: p.bytes,
+                preview: text.lines().take(8).map(visible).collect(),
+                total_lines: text.lines().count().max(1),
+                stripped: p.stripped,
+            });
+            return true;
+        }
         self.snap_to_bottom();
-        let bytes = paste_bytes(text, bracketed);
-        self.send_bytes(&bytes);
+        self.send_bytes(&p.bytes);
+        false
+    }
+
+    pub fn resolve_paste(&mut self, accept: bool) {
+        if let Some(p) = self.pending_paste.take() {
+            if accept {
+                self.snap_to_bottom();
+                self.send_bytes(&p.bytes);
+            }
+        }
+    }
+
+    fn paste_overlay(&self) -> Option<gpui::Div> {
+        let p = self.pending_paste.as_ref()?;
+        let mut d = div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .p_2()
+            .bg(hsla(0x202020))
+            .border_b_1()
+            .border_color(hsla(0xe5c07b))
+            .text_color(hsla(0xffffff))
+            .font_family(self.metrics.font.family.clone())
+            .text_size(self.metrics.font_size)
+            .flex()
+            .flex_col();
+        let note = if p.stripped > 0 { format!(", {} control char(s) removed", p.stripped) } else { String::new() };
+        d = d.child(format!(
+            "Paste {} line(s){note}?  Enter = paste, Esc = cancel",
+            p.total_lines
+        ));
+        for l in &p.preview {
+            d = d.child(SharedString::from(l.clone()));
+        }
+        if p.total_lines > p.preview.len() {
+            d = d.child(format!("... {} more line(s)", p.total_lines - p.preview.len()));
+        }
+        Some(d)
     }
 
     pub fn copy_selection(&mut self, cx: &mut Context<Self>) {
@@ -733,18 +817,25 @@ impl TerminalView {
     }
 }
 
-/// Clipboard text to PTY bytes: newlines become CR, and with bracketed paste
-/// (DECSET 2004) the text is wrapped and cannot close the bracket early.
-pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
-    let t = text.replace("\r\n", "\r").replace('\n', "\r");
-    if !bracketed {
-        return t.into_bytes();
+/// Make control characters visible in the confirm preview.
+fn visible(line: &str) -> String {
+    let mut out = String::new();
+    for c in line.chars() {
+        match c {
+            '\t' => out.push_str("    "),
+            c if (c as u32) < 0x20 => {
+                out.push('^');
+                out.push((c as u8 + 64) as char);
+            }
+            '\u{7f}' => out.push_str("^?"),
+            c if (0x80..=0x9f).contains(&(c as u32)) => out.push_str(&format!("<U+{:04X}>", c as u32)),
+            c => out.push(c),
+        }
+        if out.chars().count() > 160 {
+            out.push('…');
+            break;
+        }
     }
-    let t = t.replace('\x1b', "");
-    let mut out = Vec::with_capacity(t.len() + 12);
-    out.extend_from_slice(b"\x1b[200~");
-    out.extend_from_slice(t.as_bytes());
-    out.extend_from_slice(b"\x1b[201~");
     out
 }
 
@@ -974,5 +1065,6 @@ impl Render for TerminalView {
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_scroll_wheel(cx.listener(Self::on_scroll))
             .child(TerminalElement::new(cx.entity()))
+            .children(self.paste_overlay())
     }
 }
