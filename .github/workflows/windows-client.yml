@@ -205,13 +205,13 @@ jobs:
         shell: pwsh
         run: |
           $msi = (Get-ChildItem out/*.msi | Select-Object -First 1).FullName
-          # The package asks for no elevation: Word Count bit 8 ("elevated privileges") is clear, no ALLUSERS.
+          # Word Count bit 8 set means "elevated privileges are not required to install".
           $wi = New-Object -ComObject WindowsInstaller.Installer
           $db = $wi.GetType().InvokeMember("OpenDatabase", "InvokeMethod", $null, $wi, @($msi, 0))
           $si = $db.GetType().InvokeMember("SummaryInformation", "GetProperty", $null, $db, @(0))
           $wc = [int]$si.GetType().InvokeMember("Property", "GetProperty", $null, $si, @(15))
           Write-Host "summary word count: $wc"
-          if (($wc -band 8) -ne 0) { throw "the package asks for elevation" }
+          if (($wc -band 8) -eq 0) { throw "the package asks for elevation" }
           $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /l*v install.log" -Wait -PassThru
           if ($p.ExitCode -ne 0) { Get-Content install.log -Tail 60; throw "install failed: $($p.ExitCode)" }
           $dir = Join-Path $env:LOCALAPPDATA "Programs\Forgetty"
