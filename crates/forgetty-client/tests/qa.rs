@@ -7,7 +7,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::{TestServer, TestServerConfig};
-use forgetty_client::proto::{ClientKind, Value};
+use forgetty_client::proto::{
+    read_msg, to_value, write_msg, ClientKind, ControlMsg, HandshakeReply, Hello, Value, ALPN_RPC,
+};
 use forgetty_client::{Client, ClientHandle, ClientInfo, PaneItem, SecretKey};
 use serde_json::json;
 use uuid::Uuid;
@@ -132,4 +134,108 @@ async fn a_pane_that_never_reads_input_stalls_nothing_cat() {
     // cat echoes what it gets. Before the writer queue, a PTY write held the
     // lock the output drain needs, so cat and the server blocked each other.
     blocked_input_stalls_nothing("stty raw -echo; exec cat").await;
+}
+
+// ---------------------------------------------------------------------------
+// Raw peers
+// ---------------------------------------------------------------------------
+
+/// Handshake a raw peer with `caps` and return its connection and control stream.
+async fn raw_peer(
+    server: &TestServer,
+    caps: &[&str],
+    client_id: Uuid,
+) -> (iroh::Endpoint, iroh::endpoint::Connection, iroh::endpoint::SendStream) {
+    let k = SecretKey::generate(&mut rand::rng());
+    server.authorize(k.public());
+    let endpoint = iroh::Endpoint::empty_builder()
+        .secret_key(k)
+        .relay_mode(iroh::RelayMode::Disabled)
+        .transport_config(forgetty_client::transport_config())
+        .bind()
+        .await
+        .unwrap();
+    let conn = endpoint.connect(server.addr(), ALPN_RPC).await.unwrap();
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    let hello = Hello::new(
+        client_id,
+        Uuid::new_v4(),
+        ClientKind::Cli,
+        "raw",
+        "0.0.0",
+        caps.iter().map(|c| c.to_string()).collect(),
+    );
+    write_msg(&mut send, &hello).await.unwrap();
+    match read_msg::<_, HandshakeReply>(&mut recv).await.unwrap() {
+        Some(HandshakeReply::Welcome(_)) => {}
+        other => panic!("handshake: {other:?}"),
+    }
+    // Keep reading the control stream, so only the pane stream goes unread.
+    tokio::spawn(async move { while let Ok(Some(_)) = read_msg::<_, ControlMsg>(&mut recv).await {} });
+    (endpoint, conn, send)
+}
+
+async fn attach_raw(send: &mut iroh::endpoint::SendStream, id: u64, pane: Uuid) {
+    let params = to_value(&json!({"pane_id": pane.to_string(), "from_offset": null})).unwrap();
+    let msg = ControlMsg::Request { id, method: "attach_pane".into(), params };
+    write_msg(send, &msg).await.unwrap();
+}
+
+fn qa_state(server: &TestServer) -> serde_json::Value {
+    server.socket_call("qa_state", json!({})).expect("qa_state")
+}
+
+/// A peer that attaches and never reads its pane stream: the QUIC send buffer
+/// takes a window of bytes at once, which must not count as keeping pace.
+/// The server rebuilds snapshots for it at the backoff rate, not every 100 ms.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peer_that_never_reads_does_not_get_a_snapshot_every_100_ms() {
+    if !real_only() {
+        return;
+    }
+    let server = TestServer::start(TestServerConfig::default()).await;
+    let pane = server.add_script_pane("exec yes 0123456789abcdef");
+    let (endpoint, conn, mut send) =
+        raw_peer(&server, &["resume", "snapshot_catchup"], Uuid::new_v4()).await;
+    attach_raw(&mut send, 1, pane).await;
+    tokio::time::sleep(Duration::from_secs(15)).await;
+    let st = qa_state(&server);
+    let catchups = st["catchups"].as_u64().unwrap();
+    let builds = st["snapshot_builds"].as_u64().unwrap();
+    println!("peer that never reads, 15 s: {catchups} catch-ups, {builds} snapshot builds");
+    assert!(catchups <= 10, "{catchups} catch-ups for a peer that reads nothing");
+    drop(conn);
+    endpoint.close().await;
+    server.shutdown().await;
+}
+
+/// Attaching again and again must not reset the catch-up backoff: the pacing
+/// is kept per (client, pane), not per stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn re_attaching_does_not_reset_the_catch_up_backoff() {
+    if !real_only() {
+        return;
+    }
+    let server = TestServer::start(TestServerConfig::default()).await;
+    let pane = server.add_script_pane("exec yes 0123456789abcdef");
+    let (endpoint, conn, mut send) =
+        raw_peer(&server, &["resume", "snapshot_catchup"], Uuid::new_v4()).await;
+    // Let the log grow past half a ring, so every attach starts with a snapshot.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let t0 = Instant::now();
+    let mut id = 1;
+    while t0.elapsed() < Duration::from_secs(8) {
+        attach_raw(&mut send, id, pane).await;
+        id += 1;
+        // Long enough for each attach's snapshot to be built and sent.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let st = qa_state(&server);
+    let catchups = st["catchups"].as_u64().unwrap();
+    println!("{} re-attaches in 8 s: {catchups} catch-ups", id - 1);
+    assert!(catchups <= 3, "{catchups} snapshot catch-ups for {} re-attaches", id - 1);
+    drop(conn);
+    endpoint.close().await;
+    server.shutdown().await;
 }

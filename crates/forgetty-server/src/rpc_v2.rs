@@ -221,6 +221,9 @@ pub struct RpcV2 {
     events: broadcast::Sender<(u64, ServerEvent)>,
     event_seq: Mutex<u64>,
     inputs: Mutex<HashMap<(Uuid, Uuid), Arc<InputRec>>>,
+    /// Catch-up pacing per `(client_id, pane)`, kept across attaches and
+    /// connections: a peer cannot reset its backoff by attaching again.
+    pacing: Mutex<HashMap<(Uuid, Uuid), Pace>>,
     clients: Mutex<HashMap<Uuid, ClientRec>>,
     sizes: Mutex<HashMap<Uuid, PaneSizes>>,
     live: Mutex<Vec<(u64, Connection)>>,
@@ -252,6 +255,7 @@ impl RpcV2 {
             events,
             event_seq: Mutex::new(0),
             inputs: Mutex::new(HashMap::new()),
+            pacing: Mutex::new(HashMap::new()),
             clients: Mutex::new(HashMap::new()),
             sizes: Mutex::new(HashMap::new()),
             live: Mutex::new(Vec::new()),
@@ -616,6 +620,7 @@ impl RpcV2 {
             };
             if gone {
                 lock(&rpc.inputs).retain(|(c, _), _| *c != client_id);
+                lock(&rpc.pacing).retain(|(c, _), _| *c != client_id);
             }
         });
     }
@@ -1349,6 +1354,7 @@ impl Session {
         // One live stream per (connection, pane): the old one was aborted above.
         let handle = work.spawn(pane_stream(
             self.rpc.clone(),
+            self.client_id,
             self.conn.clone(),
             shared,
             header,
@@ -1456,6 +1462,7 @@ impl StreamEnd {
 /// and a reader behind everything is reset with `LOG_LOST`.
 async fn pane_stream(
     rpc: Arc<RpcV2>,
+    client: Uuid,
     conn: Connection,
     shared: Arc<LogShared>,
     first: PaneStreamHeader,
@@ -1468,10 +1475,10 @@ async fn pane_stream(
     force.mark_unchanged();
     let mut header = first;
     let mut snapshot: Vec<u8> = Vec::new();
-    let mut limiter = CatchupLimiter::default();
-    // A client that resumes far behind starts with the snapshot.
+    // A client that resumes far behind starts with the snapshot, paced like
+    // any other catch-up of this client and pane.
     if catchup && shared.total().saturating_sub(header.start_offset) > lag_limit {
-        limiter.note_now();
+        tokio::time::sleep(rpc.catchup_delay(client, pane, false)).await;
         let Some((h, snap)) = take_snapshot(&rpc, pane, &shared).await else { return };
         header = h;
         snapshot = snap;
@@ -1528,7 +1535,7 @@ async fn pane_stream(
                     } else {
                         rate >= KEEPING_PACE_RATE
                     };
-                tokio::time::sleep(limiter.delay(keeping_pace)).await;
+                tokio::time::sleep(rpc.catchup_delay(client, pane, keeping_pace)).await;
                 // Stop the old stream, so it queues nothing more for the peer.
                 let _ = send.reset(stream_code::SUPERSEDED.into());
                 let Some((h, snap)) = take_snapshot(&rpc, pane, &shared).await else { return };
@@ -1553,11 +1560,6 @@ impl Default for CatchupLimiter {
 }
 
 impl CatchupLimiter {
-    /// Record a catch-up that happens right now.
-    fn note_now(&mut self) {
-        self.last = Some(tokio::time::Instant::now());
-    }
-
     /// How long to wait before the next catch-up. Records it as done.
     /// `keeping_pace`: the peer is not the slow part, so no backoff.
     fn delay(&mut self, keeping_pace: bool) -> Duration {
@@ -1580,6 +1582,45 @@ impl CatchupLimiter {
         };
         self.last = Some(now + wait);
         wait
+    }
+}
+
+/// Keeping-pace catch-ups a `(client, pane)` may take in a burst, and per
+/// second after that (one per 10 s). Bytes accepted into the QUIC send buffer prove nothing
+/// about a peer that never reads, so the exception is capped, not trusted.
+const KEEPING_PACE_BURST: f64 = 6.0;
+const KEEPING_PACE_PER_SEC: f64 = 0.1;
+
+/// Pacing state of one `(client_id, pane)`.
+struct Pace {
+    limiter: CatchupLimiter,
+    tokens: f64,
+    refilled: tokio::time::Instant,
+}
+
+impl RpcV2 {
+    /// How long `(client, pane)` waits before its next snapshot catch-up. The
+    /// peer's keeping-pace claim counts only while it has tokens left.
+    fn catchup_delay(&self, client: Uuid, pane: PaneId, keeping_pace: bool) -> Duration {
+        let now = tokio::time::Instant::now();
+        let mut map = lock(&self.pacing);
+        if map.len() > 4096 {
+            // Entries leave with their client; this only bounds a flood of ids.
+            map.retain(|_, p| now.duration_since(p.refilled) < Duration::from_secs(300));
+        }
+        let p = map.entry((client, pane.0)).or_insert_with(|| Pace {
+            limiter: CatchupLimiter::default(),
+            tokens: KEEPING_PACE_BURST,
+            refilled: now,
+        });
+        let earned = now.duration_since(p.refilled).as_secs_f64() * KEEPING_PACE_PER_SEC;
+        p.tokens = (p.tokens + earned).min(KEEPING_PACE_BURST);
+        p.refilled = now;
+        let keeping = keeping_pace && p.tokens >= 1.0;
+        if keeping {
+            p.tokens -= 1.0;
+        }
+        p.limiter.delay(keeping)
     }
 }
 

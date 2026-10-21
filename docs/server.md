@@ -130,7 +130,12 @@ stream) and the `qa_*` test methods are not reachable over v2.
   bytes at 4 MiB/s or more, or the log ran past that snapshot before any live
   byte went out although the snapshot reached the peer within 500 ms (the
   build alone took longer than the ring holds at the program's speed). A write
-  that stalls for 2 s never counts as keeping pace.
+  that stalls for 2 s never counts as keeping pace. Bytes accepted into the
+  QUIC send buffer prove nothing about a peer that never reads, so the
+  exception is capped: 6 per (client, pane) in a burst, then one per 10 s;
+  after that the normal backoff applies. The pacing state is kept per
+  (client_id, pane) across attaches and connections, so attaching again does
+  not reset it.
   A pane has one live stream per connection: a new `attach_pane` replaces the
   old one. An attach counts as a request in flight until its stream is open.
 - A stopping server answers `Hello` with `Error { code: "server_stopping" }`.
