@@ -318,7 +318,7 @@ pub async fn handle_terminal_stream(
 
     // --- Authorization check ---
     let is_authorized = {
-        let reg = registry.lock().unwrap();
+        let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
         reg.is_authorized(&remote_id)
     };
 
@@ -339,7 +339,7 @@ pub async fn handle_terminal_stream(
     // AD-017: this connection is an attached client until it ends. The guard
     // drops on every exit path of this function.
     let device_name = {
-        let reg = registry.lock().unwrap();
+        let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
         reg.list().iter().find(|d| d.device_id == device_id).map(|d| d.name.clone())
     };
     let Ok(_client) =

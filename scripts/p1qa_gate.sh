@@ -52,6 +52,11 @@ BG_PIDS=()
 CUR="$STATE/main"   # state dir used by fg; steps switch it
 
 fg() { "$BIN/forgetty" --state-dir "$CUR" "$@"; }
+# `grep -q` leaves at the first match. A writer that still has output to send
+# then gets SIGPIPE, and under `pipefail` the pipeline fails (the CLI died this
+# way when the box was busy: 17 % of `server status | grep -q` under load).
+# `qgrep` reads all its input, so the writer always finishes.
+qgrep() { grep "$@" >/dev/null; }
 qa() { local tool="$1"; shift; XDG_DATA_HOME="$CLIENT_DATA" "$BIN/$tool" "$@"; }
 
 cleanup() {
@@ -173,22 +178,22 @@ sleep 0.5
 
 fg pair >"$STATE/pair.out" 2>&1 &
 PAIR_PID=$!; BG_PIDS+=("$PAIR_PID")
-for _ in $(seq 1 50); do grep -q '^payload: ' "$STATE/pair.out" 2>/dev/null && break; sleep 0.1; done
+for _ in $(seq 1 50); do qgrep '^payload: ' "$STATE/pair.out" 2>/dev/null && break; sleep 0.1; done
 PAYLOAD="$(sed -n 's/^payload: //p' "$STATE/pair.out")"
 [ -n "$PAYLOAD" ] || { cat "$STATE/pair.out"; fail "no pairing payload"; }
 OUT="$(qa forgetty-pair-test --payload "$PAYLOAD" --name revoke-phone 2>&1)"; RC=$?
-[ "$RC" = 0 ] && grep -q "paired ok" <<<"$OUT" || { echo "$OUT" | tail -3; fail "pairing failed"; }
+[ "$RC" = 0 ] && qgrep "paired ok" <<<"$OUT" || { echo "$OUT" | tail -3; fail "pairing failed"; }
 wait "$PAIR_PID" 2>/dev/null
 
 qa forgetty-stream-test --dial "$NODE_ID" --pane-id "$PANE" --hold-secs 60 --print-output \
   >"$STATE/hold.out" 2>&1 &
 HOLD_PID=$!; BG_PIDS+=("$HOLD_PID")
 poll "held client counted" 100 clients_is 1
-fg client ls | grep -q revoke-phone || fail "client ls does not show revoke-phone"
+fg client ls | qgrep revoke-phone || fail "client ls does not show revoke-phone"
 
 # positive control: the held client sees output before the revoke
 fg send --enter -p "$PANE" 'echo PRE_$((1+1))' || fail "send (pre)"
-poll "PRE_2 reaches the held client" 50 grep -q 'PRE_2' "$STATE/hold.out"
+poll "PRE_2 reaches the held client" 50 qgrep 'PRE_2' "$STATE/hold.out"
 
 DEV_ID="$(fg devices | awk '/revoke-phone/ {print $1}')"
 [ -n "$DEV_ID" ] || fail "device id not found"
@@ -207,9 +212,9 @@ python3 -I -c 'import sys; sys.exit(0 if float(sys.argv[2])-float(sys.argv[1]) <
   || fail "connection cut took more than 1 s"
 fg send --enter -p "$PANE" 'echo POST_$((3+4))' || fail "send (post)"
 sleep 1.5
-grep -q 'POST_7' "$STATE/hold.out" && fail "marker reached the revoked client"
+qgrep 'POST_7' "$STATE/hold.out" && fail "marker reached the revoked client"
 [ "$(client_count)" = 0 ] || fail "revoked device reconnected"
-fg devices | grep -q revoke-phone && fail "device still listed"
+fg devices | qgrep revoke-phone && fail "device still listed"
 pass "revoked client cut in under 1 s, client ls = 0, marker POST_7 never arrived"
 fg server stop >/dev/null 2>&1
 fi
@@ -255,7 +260,7 @@ for i in $(seq 1 "$ROUNDS"); do
   [ "$NODE1" = "$NODE2" ] || fail "round $i: node id changed ($NODE1 -> $NODE2)"
   [ "$ID1" = "$(cat "$CUR/data/forgetty/server_id")" ] || fail "round $i: server_id changed"
   [ "$KEY1" = "$(sha1sum < "$CUR/data/forgetty/identity.key")" ] || fail "round $i: identity.key changed"
-  fg ls | grep -q "$P" || { fg ls; fail "round $i: pane lost over stop/start"; }
+  fg ls | qgrep "$P" || { fg ls; fail "round $i: pane lost over stop/start"; }
   fg server stop >/dev/null 2>&1
   rm -rf "$CUR"
 done
@@ -269,7 +274,7 @@ fg server stop >/dev/null 2>&1
 echo 'not-a-uuid' >"$CUR/data/forgetty/server_id"
 "$BIN/forgetty" --state-dir "$CUR" server run >"$STATE/corrupt.out" 2>&1; RC=$?
 [ "$RC" != 0 ] || fail "server started on a corrupt server_id"
-grep -qi 'corrupt' "$STATE/corrupt.out" || { cat "$STATE/corrupt.out"; fail "no clear error for a corrupt server_id"; }
+qgrep -i 'corrupt' "$STATE/corrupt.out" || { cat "$STATE/corrupt.out"; fail "no clear error for a corrupt server_id"; }
 [ "$(cat "$CUR/data/forgetty/server_id")" = "not-a-uuid" ] || fail "corrupt server_id was overwritten"
 [ "$(live_servers "$CUR")" = 0 ] || fail "a server is running on a corrupt id"
 pass "corrupt server_id: refused with a clear error, file untouched"
@@ -320,9 +325,9 @@ sleep 1.5
 kill -9 "$(server_pid)"
 sleep 0.5
 expect_rc 0 "restart after kill -9" -- fg server start
-fg ls | grep -q "$PANE" || { fg ls; fail "pane lost after kill -9"; }
+fg ls | qgrep "$PANE" || { fg ls; fail "pane lost after kill -9"; }
 OUT="$(fg capture -p "$PANE" --trim)"
-grep -q '^MARK_42' <<<"$OUT" || { echo "$OUT"; fail "MARK_42 not replayed after kill -9"; }
+qgrep '^MARK_42' <<<"$OUT" || { echo "$OUT"; fail "MARK_42 not replayed after kill -9"; }
 pass "MARK_42 replayed after kill -9"
 fg server stop >/dev/null 2>&1
 fi
@@ -347,7 +352,7 @@ echo '{ "truncated' >"$SF"
 expect_rc 0 "start with a corrupt session file" -- fg server start
 N="$(pane_count)"
 [ "$N" -ge 5 ] || { fg ls; fail "corrupt main did not fall back to .bak (got $N panes)"; }
-grep -qi 'corrupt' "$CUR/data/forgetty/server.log" || fail "no error logged for the corrupt file"
+qgrep -i 'corrupt' "$CUR/data/forgetty/server.log" || fail "no error logged for the corrupt file"
 [ -f "$SF.corrupt" ] || fail "corrupt file was not kept"
 pass "6 panes saved with a .bak, no temp files, corrupt main restored from .bak ($N panes), error logged"
 fg server stop >/dev/null 2>&1
@@ -363,7 +368,7 @@ NODE_ID="$(fg server status --json | jget node_id)"
 fg new -- sleep 600 >/dev/null || fail "new"
 fg pair >"$STATE/pair2.out" 2>&1 &
 PAIR_PID=$!; BG_PIDS+=("$PAIR_PID")
-for _ in $(seq 1 50); do grep -q '^payload: ' "$STATE/pair2.out" 2>/dev/null && break; sleep 0.1; done
+for _ in $(seq 1 50); do qgrep '^payload: ' "$STATE/pair2.out" 2>/dev/null && break; sleep 0.1; done
 PAYLOAD="$(sed -n 's/^payload: //p' "$STATE/pair2.out")"
 qa forgetty-pair-test --payload "$PAYLOAD" --identity "$CLIENT_DATA/modes.key" --name mode-phone >/dev/null 2>&1 || fail "pairing"
 wait "$PAIR_PID" 2>/dev/null

@@ -19,7 +19,10 @@ use serde::{de::DeserializeOwned, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use uuid::Uuid;
 
-use crate::consts::{INPUT_HEADER_LEN, INPUT_SEQ_LEN, MAX_FRAME_LEN, PANE_UUID_LEN};
+use crate::consts::{
+    INPUT_FLAGS_LEN, INPUT_HEADER_LEN, INPUT_HEADER_LEN_FLAGS, INPUT_SEQ_LEN, MAX_FRAME_LEN,
+    PANE_UUID_LEN,
+};
 
 /// Frames up to this size are written with one `write_all` call.
 const COALESCE_LIMIT: usize = 16 * 1024;
@@ -180,6 +183,53 @@ pub fn decode_input_frame(payload: &[u8]) -> Result<(Uuid, u64, &[u8]), FrameErr
     let mut seq = [0u8; INPUT_SEQ_LEN];
     seq.copy_from_slice(&payload[PANE_UUID_LEN..INPUT_HEADER_LEN]);
     Ok((Uuid::from_bytes(raw), u64::from_be_bytes(seq), &payload[INPUT_HEADER_LEN..]))
+}
+
+/// Build the payload of an input frame with a flags byte, for a connection
+/// that negotiated `input_flags` (AD-025):
+/// `[16 byte uuid][u64 BE seq][u8 flags][bytes]`.
+pub fn encode_input_frame_flags(pane: Uuid, seq: u64, flags: u8, bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(INPUT_HEADER_LEN_FLAGS + bytes.len());
+    out.extend_from_slice(pane.as_bytes());
+    out.extend_from_slice(&seq.to_be_bytes());
+    out.push(flags);
+    out.extend_from_slice(bytes);
+    out
+}
+
+/// Split an input frame payload that has a flags byte into pane, sequence
+/// number, flags and bytes. Flag bits this version does not know are returned
+/// as they are, so the caller can ignore them.
+pub fn decode_input_frame_flags(payload: &[u8]) -> Result<(Uuid, u64, u8, &[u8]), FrameError> {
+    if payload.len() < INPUT_HEADER_LEN_FLAGS {
+        return Err(FrameError::ShortInput { len: payload.len() });
+    }
+    let (pane, seq, rest) = decode_input_frame(payload)?;
+    Ok((pane, seq, rest[0], &rest[INPUT_FLAGS_LEN..]))
+}
+
+/// Write an input frame with a flags byte.
+pub async fn write_input_frame_flags<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    pane: Uuid,
+    seq: u64,
+    flags: u8,
+    bytes: &[u8],
+) -> Result<(), FrameError> {
+    write_frame(w, &encode_input_frame_flags(pane, seq, flags, bytes)).await
+}
+
+/// Read an input frame with a flags byte. `Ok(None)` is a clean end of stream.
+pub async fn read_input_frame_flags<R: AsyncRead + Unpin>(
+    r: &mut R,
+) -> Result<Option<(Uuid, u64, u8, Vec<u8>)>, FrameError> {
+    match read_frame(r).await? {
+        Some(payload) => {
+            let (pane, seq, flags, rest) = decode_input_frame_flags(&payload)?;
+            Ok(Some((pane, seq, flags, rest.to_vec())))
+        }
+        None => Ok(None),
+    }
 }
 
 /// Write an input frame.

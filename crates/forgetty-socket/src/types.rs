@@ -335,6 +335,17 @@ pub struct PaneInfoResult {
     pub exit_code: Option<i32>,
     pub status: PaneStatus,
     pub last_notification: Option<LastNotification>,
+    /// The client that owns the pane's size (AD-020), `null` when none does.
+    pub size_owner: Option<SizeOwnerInfo>,
+}
+
+#[derive(JsonSchema, Serialize, Deserialize)]
+pub struct SizeOwnerInfo {
+    pub client_id: Uuid,
+    /// `android`, `windows`, `cli`, `gtk` for remote clients, `local` for a
+    /// socket client of the server.
+    pub client_kind: String,
+    pub client_name: String,
 }
 
 #[derive(JsonSchema, Serialize, Deserialize)]
@@ -342,6 +353,27 @@ pub struct ResizePaneParams {
     pub pane_id: Uuid,
     pub rows: u16,
     pub cols: u16,
+    /// A streaming client's own id (the `client_id` it gave to
+    /// `subscribe_layout` or `subscribe_output`). Such a client can become the
+    /// size owner. Without it the size applies and ownership does not change.
+    pub client_id: Option<Uuid>,
+}
+
+#[derive(JsonSchema, Serialize, Deserialize)]
+pub struct SubscribeOutputParams {
+    pub pane_id: Uuid,
+    /// The client's stable id. A fresh one is made when absent.
+    pub client_id: Option<Uuid>,
+    /// Name shown by `list_clients` and `size_owner`.
+    pub client_name: Option<String>,
+}
+
+#[derive(JsonSchema, Serialize, Deserialize)]
+pub struct SubscribeLayoutParams {
+    /// The client's stable id. A fresh one is made when absent.
+    pub client_id: Option<Uuid>,
+    /// Name shown by `list_clients` and `size_owner`.
+    pub client_name: Option<String>,
 }
 
 #[derive(JsonSchema, Serialize, Deserialize)]

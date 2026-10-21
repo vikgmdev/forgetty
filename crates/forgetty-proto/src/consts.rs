@@ -25,6 +25,16 @@ pub const PANE_UUID_LEN: usize = 16;
 pub const INPUT_SEQ_LEN: usize = 8;
 /// Length of an input frame header: `[16 uuid][u64 BE seq]`.
 pub const INPUT_HEADER_LEN: usize = PANE_UUID_LEN + INPUT_SEQ_LEN;
+/// Length of the flags byte that follows `seq` when `input_flags` is
+/// negotiated (AD-025).
+pub const INPUT_FLAGS_LEN: usize = 1;
+/// Length of an input frame header with the flags byte:
+/// `[16 uuid][u64 BE seq][u8 flags]`.
+pub const INPUT_HEADER_LEN_FLAGS: usize = INPUT_HEADER_LEN + INPUT_FLAGS_LEN;
+/// Input flag bit 0: the bytes are an automatic terminal reply (DA, CPR,
+/// kitty-keyboard answers, focus reports), not something the user typed
+/// (AD-025). A frame without this bit is `user` input.
+pub const INPUT_FLAG_AUTO: u8 = 0b0000_0001;
 
 /// The client sends `Ping` this often while connected (section 4).
 pub const PING_INTERVAL_MS: u64 = 1000;
@@ -97,6 +107,11 @@ pub mod cap {
     pub const SIZE_POLICY_LATEST: &str = "size_policy_latest";
     /// A slow pane stream catches up by a VT snapshot (AD-023).
     pub const SNAPSHOT_CATCHUP: &str = "snapshot_catchup";
+    /// `SizeOwnerChanged` events (AD-020). `size_owner` fields need no
+    /// capability.
+    pub const SIZE_OWNER: &str = "size_owner";
+    /// Input frames carry a flags byte after `seq` (AD-025).
+    pub const INPUT_FLAGS: &str = "input_flags";
 }
 
 /// Method names that are new in v2 (section 4).

@@ -586,6 +586,7 @@ Kind: call. Protocol v2: yes.
 | `pid` | integer or null | no |  |
 | `remain_on_exit` | boolean | yes |  |
 | `rows` | integer | yes |  |
+| `size_owner` | `SizeOwnerInfo` or null | no | The client that owns the pane's size (AD-020), `null` when none does. |
 | `spawn_cwd` | string | yes |  |
 | `status` | `PaneStatus` | yes |  |
 | `title` | string | yes |  |
@@ -609,6 +610,14 @@ Kind: call. Protocol v2: yes.
 | `record_id` | string or null | no | Id of the status record. `null` is the root record. |
 | `status` | string | yes | `idle`, `working`, `waiting`, `done` or `failed`. |
 
+`SizeOwnerInfo`
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `client_id` | string (uuid) | yes |  |
+| `client_kind` | string | yes | `android`, `windows`, `cli`, `gtk` for remote clients, `local` for a socket client of the server. |
+| `client_name` | string | yes |  |
+
 **Example**
 
 ```json
@@ -620,7 +629,7 @@ Kind: call. Protocol v2: yes.
 
 Set the PTY size of a pane.
 
-Sends the new size to the PTY. A size change is reported to subscribers as a `pane_resized` event.
+Sends the new size to the PTY. A size change is reported to subscribers as a `pane_resized` event. With `client_id` (a streaming client's own id) the caller takes the pane's size ownership when it has a `subscribe_output` on that pane (AD-020). Without either, the size applies and ownership stays as it is.
 
 Kind: call. Protocol v2: no.
 
@@ -628,6 +637,7 @@ Kind: call. Protocol v2: no.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
+| `client_id` | string (uuid) or null | no | A streaming client's own id (the `client_id` it gave to `subscribe_layout` or `subscribe_output`). Such a client can become the size owner. Without it the size applies and ownership does not change. |
 | `cols` | integer | yes |  |
 | `pane_id` | string (uuid) | yes |  |
 | `rows` | integer | yes |  |
@@ -1378,6 +1388,8 @@ Kind: stream. Protocol v2: no.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
+| `client_id` | string (uuid) or null | no | The client's stable id. A fresh one is made when absent. |
+| `client_name` | string or null | no | Name shown by `list_clients` and `size_owner`. |
 | `pane_id` | string (uuid) | yes |  |
 
 **Result**
@@ -1397,13 +1409,16 @@ Kind: stream. Protocol v2: no.
 
 Stream layout and pane events as JSON lines.
 
-After the ack the server sends one JSON-RPC notification per line: `pane_created`, `pane_closed`, `pane_exited`, `title_changed`, `cwd_changed`, `status_changed`, `notification`, `label_changed`, and the layout changes (`tab_created`, `tab_closed`, `pane_split`, `tab_moved`, `active_tab_changed`, `active_workspace_changed`, `workspace_created`, `workspace_renamed`, `workspace_deleted`, `workspace_color_changed`, `workspaces_reordered`, `active_pane_changed`).
+After the ack the server sends one JSON-RPC notification per line: `pane_created`, `pane_closed`, `pane_exited`, `title_changed`, `cwd_changed`, `status_changed`, `notification`, `label_changed`, and the layout changes (`tab_created`, `tab_closed`, `pane_split`, `tab_moved`, `active_tab_changed`, `active_workspace_changed`, `workspace_created`, `workspace_renamed`, `workspace_deleted`, `workspace_color_changed`, `workspaces_reordered`, `active_pane_changed`). `client_id` and `client_name` name the connection in `list_clients` and make it a client that can own a pane's size.
 
 Kind: stream. Protocol v2: no.
 
 **Params**
 
-None.
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `client_id` | string (uuid) or null | no | The client's stable id. A fresh one is made when absent. |
+| `client_name` | string or null | no | Name shown by `list_clients` and `size_owner`. |
 
 **Result**
 

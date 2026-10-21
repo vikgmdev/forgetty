@@ -420,7 +420,28 @@ build or the laptop's view of it.
 - One pane that does not read never delays a client's input to other panes,
   Control or Pong.
 - Graceful stop closes the queues, waits up to 2 s for them to drain, and then
-  saves the dedup state.
+  saves the dedup state. Input never crosses a restart: processes do not
+  survive it (AD-017), so a resent frame would type into a fresh shell. The
+  server carries no unwritten frames over. `Welcome.boot_id` (new for each run)
+  tells a client that the server restarted, and the client drops the input it
+  had not seen acked and shows the user how many bytes were not sent.
+- There is one ack counter per client epoch (`Pong.input_acked`), not one per
+  pane. Because a dropped frame is acked, the server must not let later input
+  of that client reach the same pane with a hole in front of it: after the
+  first dropped frame for a (client, pane), it drops every later frame of that
+  client for that pane until the pane's queue is empty. It then sends that
+  client one `InputDropped { pane_id, bytes }` event (capability
+  `input_flags`).
+- An interrupt (a VINTR byte that the pane's tty would turn into SIGINT, or
+  `send_sigint`) also drops the input queued for that pane, what the writer
+  has half written, and what the tty holds unread, so a stale paste does not
+  run in the shell after Ctrl+C. The server signals the foreground group
+  itself when VINTR cannot go in order (the queue is full, in a hole, or the
+  writer is busy). VINTR counts only while ISIG is on and VINTR is set.
+- The writer thread writes through a plain duplicate of the master fd. A
+  library writer that sends `\n` and EOF on drop is never used: it would make
+  a shell run what is half typed at its prompt when the pane or the server
+  closes.
 - A fresh attach (`from_offset = None`) to a pane whose log holds more than
   half a ring starts with a snapshot (AD-023), not at the oldest byte.
 
@@ -491,3 +512,23 @@ The following concepts are **explicitly rejected**. Do not reintroduce without a
 | "Multiple GTK windows attach to the same daemon simultaneously" | DAEMON_SYNC_ARCHITECTURE.md | Superseded by AD-001 (one daemon per window) in 2026-04-03. |
 | Old AD-007: "libghostty-vt is per-pane only" in the daemon | (This file, pre-2026-04-13) | Superseded by AD-007 (daemon has no VT) + AD-008 (VT lives in client). libghostty-vt is still per-pane, but only the client links it. |
 | Old AD-008: "GTK is a stateless renderer, no terminal semantics" | (This file, pre-2026-04-13) | Superseded by AD-008 (clients own terminal semantics). The M4-era intent was "GTK doesn't own layout state"; that part is still true. What changed: GTK owns VT parsing. |
+
+## AD-026: The size owner is visible to clients (amends AD-020 and AD-025)
+
+**Decision:**
+- `get_pane_info` and `PaneResized` carry `size_owner` (`{ client_id,
+  client_kind, client_name }` or none). `SizeOwnerChanged` (capability
+  `size_owner`) reports each change, before the `PaneResized` it causes.
+- The owner is the one AD-025 uses for `auto` input, so what clients see and
+  what the server enforces cannot differ.
+- A local socket client that names itself (`client_id`) is a client like any
+  other: it appears in `list_clients` as `local`, can own a pane, and hands it
+  over when it leaves. A resize with a `client_id` takes ownership. A one-shot
+  resize without one does not.
+- A client opens a pane and takes its size only when the pane has no owner.
+
+**Why:** the Android client letterboxed against a size it did not know the
+cause of, and took the size from a desktop window each time it opened a pane.
+It needs to know who owns the size to decide.
+
+**Decided:** 2026-10-21.

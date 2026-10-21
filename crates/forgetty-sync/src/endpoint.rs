@@ -90,6 +90,10 @@ pub struct RevokeOutcome {
     /// Set when the registry file could not be saved. The device is revoked
     /// anyway (denied in memory) and the next successful save persists it.
     pub save_error: Option<crate::registry::RegistryError>,
+    /// A restart cannot bring the device back: the revoke record in
+    /// `revoked.pending` or the registry file has it on disk. `false` means
+    /// the device is denied in memory only.
+    pub durable: bool,
 }
 
 /// Builder for [`SyncEndpoint`].
@@ -286,18 +290,22 @@ impl SyncEndpoint {
     /// connections are closed even when the device was not in the registry
     /// (for example it was removed by hand-editing the file).
     pub fn revoke_device(&self, device_id: &str) -> RevokeOutcome {
-        let removed = self.registry.lock().unwrap_or_else(|e| e.into_inner()).remove(device_id);
+        let removed = self.registry.lock().unwrap_or_else(|e| e.into_inner()).revoke(device_id);
         let closed = self.live.revoke(device_id);
         // Removed in memory counts as found even when the save failed.
-        let (found, save_error) = match removed {
-            Ok(found) => (found, None),
-            Err(e) => (true, Some(e)),
-        };
+        let (found, save_error, durable) = (removed.found, removed.save_error, removed.durable);
         if found {
             let _ =
                 self.event_tx.send(SyncEvent::DeviceRevoked { device_id: device_id.to_string() });
         }
-        RevokeOutcome { found, closed, save_error }
+        if save_error.is_some() {
+            // Denied in memory meanwhile. Keep trying to put it on disk.
+            crate::registry::spawn_save_retry(
+                Arc::clone(&self.registry),
+                std::time::Duration::from_secs(5),
+            );
+        }
+        RevokeOutcome { found, closed, save_error, durable }
     }
 
     /// Returns a clone of the shared device registry.
@@ -327,8 +335,16 @@ impl SyncEndpoint {
     ///
     /// Must be called before dropping the endpoint to avoid the iroh error:
     /// `ERROR Endpoint dropped without calling Endpoint::close. Aborting ungracefully.`
+    ///
+    /// Bounded to 2 s: a peer that gave up mid-handshake leaves a half-open
+    /// connection that would otherwise hold up shutdown.
     pub async fn close(&self) {
-        self.endpoint.close().await;
+        if tokio::time::timeout(std::time::Duration::from_secs(2), self.endpoint.close())
+            .await
+            .is_err()
+        {
+            tracing::warn!("iroh endpoint close timed out after 2 s");
+        }
     }
 
     /// Run the accept loop.

@@ -141,6 +141,8 @@ async fn handshake_and_requests() {
 
     // resize reaches the server.
     let pane = server.add_pane();
+    // A client owns a pane's size only while it has a stream on it (AD-025).
+    let _stream = h.attach_pane(pane).await.unwrap();
     h.resize(pane, 40, 120).await.unwrap();
     assert_eq!(server.pane_size(pane), (40, 120));
 
@@ -182,7 +184,7 @@ async fn proto_mismatch_client_side_fails_for_good() {
     init_log();
     if common::is_real() {
         // Needs a server that answers with another major; the real one never does.
-        println!("skipped against the real server: it always speaks major 2");
+        println!("SKIPPED (mock-only: the real server always speaks major 2)");
         return;
     }
     // A server that answers with a different major: the client must stop.
@@ -618,6 +620,7 @@ async fn resize_pane_emits_pane_resized() {
     let pane = server.initial_pane(0);
     let h = connect(&server).await;
     let mut events = h.events().await.expect("events");
+    let _stream = h.attach_pane(pane).await.expect("attach");
     h.resize(pane, 40, 100).await.expect("resize");
     let got = tokio::time::timeout(Duration::from_secs(5), async {
         loop {

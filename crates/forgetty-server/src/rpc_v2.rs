@@ -27,23 +27,24 @@ use crate::control_queue::ControlQueue;
 use crate::snapshot_hub::SnapshotHub;
 use forgetty_core::PaneId;
 use forgetty_proto::{
-    cap, close_code, encode_msg, error_code, from_value, method, read_input_frame, read_msg,
-    stream_code, to_value, write_frame, write_msg, write_output_frame, AttachPaneParams,
-    ClientEntry, ClientKind, ControlMsg, DetachPaneParams, ErrorMsg, HandshakeReply, Hello,
-    OkResult, PaneStreamHeader, ResizePaneParams, ServerEvent, SubscribeResult, Value, Welcome,
-    PROTO_MAJOR, PROTO_MINOR,
+    cap, close_code, encode_msg, error_code, from_value, method, read_input_frame,
+    read_input_frame_flags, read_msg, stream_code, to_value, write_frame, write_msg,
+    write_output_frame, AttachPaneParams, ClientEntry, ClientKind, ControlMsg, DetachPaneParams,
+    ErrorMsg, HandshakeReply, Hello, OkResult, PaneStreamHeader, ResizePaneParams, ServerEvent,
+    SubscribeResult, Value, Welcome, INPUT_FLAG_AUTO, PROTO_MAJOR, PROTO_MINOR,
 };
 use forgetty_pty::PtySize;
 use forgetty_session::{
-    read_disk, LogPlan, LogShared, PaneTreeLayout, SessionEvent, SessionManager,
+    read_disk, InputOutcome, LogPlan, LogShared, PaneTreeLayout, SessionEvent, SessionManager,
+    SizeGovernor, SizeOwner,
 };
 use forgetty_socket::protocol::{self, methods, Request};
-use forgetty_sync::registry::{iso8601_now, DeviceRegistry};
+use forgetty_sync::registry::{iso8601_from_secs, iso8601_now, DeviceRegistry};
 use forgetty_sync::SyncEndpoint;
 use iroh::endpoint::Connection;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::{AbortHandle, JoinSet};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 /// Application close code of [`RpcV2::drop_connections`] (test harness).
@@ -57,6 +58,10 @@ pub const LOG_LOST_CODE: u32 = stream_code::LOG_LOST;
 const CHUNK: usize = 128 * 1024;
 /// How long a silent peer may hold the handshake open.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often a session looks for lost input to report.
+const INPUT_LOSS_POLL: Duration = Duration::from_millis(200);
+/// Graceful stop waits this long for the pane input queues to drain (AD-024).
+const INPUT_DRAIN_LIMIT: Duration = Duration::from_secs(2);
 /// Input `seq` state is kept this long after a client leaves (section 5).
 const INPUT_KEEP: Duration = Duration::from_secs(600);
 /// Events buffered per connection before it is told to resync.
@@ -107,21 +112,49 @@ const MAX_CATCHUP_BACKOFF: Duration = Duration::from_secs(10);
 /// took live bytes at [`KEEPING_PACE_RATE`] since its last snapshot, or the
 /// snapshot was late by the build time alone): no backoff, only this floor.
 const KEEPING_PACE_INTERVAL: Duration = Duration::from_millis(100);
+/// Live bytes a cycle must have delivered to prove that the peer reads. A
+/// peer that never reads still takes one 128 KiB chunk (or two) into whatever
+/// room its QUIC window has left, and that is 1 GB/s when the cycle lasts
+/// 100 us. A peer that reads takes more than the room that was left.
+const KEEPING_PACE_MIN_LIVE: u64 = 4 * CHUNK as u64;
+
+/// What a catch-up says about its peer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Claim {
+    /// The write stalled, or the peer reads too slowly to tell.
+    Stalled,
+    /// The snapshot went out quickly and the log ran past it before a live
+    /// byte: the build was too slow for the program, not the peer.
+    Weak,
+    /// One or two chunks in a few microseconds: a good rate on paper, and what
+    /// a peer that never reads gets into the room its QUIC window has left.
+    /// Only [`KEEPING_PACE_TINY_BURST`] of these in a row are taken at face
+    /// value.
+    Tiny,
+    /// The peer took live bytes at a good rate: it reads.
+    Strong,
+}
+
+/// Tiny claims in a row, without a strong one between, that still count as
+/// keeping pace.
+const KEEPING_PACE_TINY_BURST: u32 = 4;
 /// Live bytes per second since its last snapshot that put a stream among the
-/// peers that keep pace (a 100 KB/s link does not, a localhost reader does).
-const KEEPING_PACE_RATE: f64 = 4.0 * 1024.0 * 1024.0;
+/// peers that read (a 100 KB/s link does not, a loaded localhost reader does).
+const KEEPING_PACE_RATE: f64 = 1024.0 * 1024.0;
 /// A snapshot that took longer than this to reach the peer says nothing
 /// about the program being fast: the peer is slow.
 const SNAPSHOT_SEND_OK: Duration = Duration::from_millis(500);
 
 /// Capabilities the server offers.
-pub const SERVER_CAPS: [&str; 6] = [
+pub const SERVER_CAPS: [&str; 8] = [
     cap::RESUME,
     cap::LAYOUT_EVENTS,
     cap::STATUS_EVENTS,
     cap::CAPTURE,
     cap::SIZE_POLICY_LATEST,
     cap::SNAPSHOT_CATCHUP,
+    cap::INPUT_FLAGS,
+    cap::SIZE_OWNER,
 ];
 
 /// Methods a v2 client may call through the shared socket dispatch table.
@@ -167,18 +200,28 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 // Shared state
 // ---------------------------------------------------------------------------
 
-/// Last input `seq` written for one `(client_id, input_epoch)`.
+/// Input state of one `(client_id, input_epoch)`.
 #[derive(Default)]
 struct InputRec {
-    /// Last `seq` the PTY has taken (what `Pong.input_acked` says).
+    /// Last `seq` that entered its pane's queue (or was dropped by a full one):
+    /// what `Pong.input_acked` says, and what a resend is checked against.
     last: AtomicU64,
-    /// Last `seq` put in the pane's queue. A frame at or below it is a resend.
-    queued: AtomicU64,
-    /// Held across dedup and the real write, so frames of one client epoch
-    /// stay in order and are written once, even on overlapping connections.
-    /// An async lock: a write that waits on a full pane queue holds up this
-    /// client's input and nothing else.
+    /// Held across dedup and the enqueue, so frames of one client epoch stay
+    /// in order and are queued once, even on overlapping connections.
     gate: tokio::sync::Mutex<()>,
+    /// Panes where a frame of this client was dropped (AD-024). Later frames
+    /// for that pane are dropped too until its queue is empty, so the program
+    /// never sees input with a hole in the middle.
+    holes: Mutex<HashMap<Uuid, Hole>>,
+}
+
+/// Input of one client dropped for one pane.
+struct Hole {
+    /// Bytes dropped so far.
+    bytes: u64,
+    /// The pane queue is empty again: input flows, the loss is due to be
+    /// reported to the client.
+    closed: bool,
 }
 
 /// One connected client, by `client_id` (several connections can overlap
@@ -200,6 +243,54 @@ struct PaneSizes {
     active: Option<Uuid>,
     /// The last size each client asked for.
     by_client: HashMap<Uuid, (u16, u16)>,
+    /// Clients with a live stream on this pane, in the order they attached.
+    attached: Vec<Uuid>,
+    /// When each client last sent `user` input here (a tick of `user_tick`).
+    last_user: HashMap<Uuid, u64>,
+}
+
+impl PaneSizes {
+    /// `client` leaves the pane (AD-025). `forget_size` is set when it leaves
+    /// the server, not only the pane. If it was the owner, the attached
+    /// client with the most recent user input takes over (the earliest
+    /// attached one when nobody has typed). Returns the size to apply when
+    /// the owner changed to a client that asked for one.
+    fn leave(&mut self, client: Uuid, forget_size: bool) -> Option<(u16, u16)> {
+        self.attached.retain(|c| *c != client);
+        if forget_size {
+            self.by_client.remove(&client);
+            self.last_user.remove(&client);
+        }
+        if self.active != Some(client) {
+            return None;
+        }
+        let mut best: Option<(Uuid, u64)> = None;
+        for c in &self.attached {
+            let tick = self.last_user.get(c).copied().unwrap_or(0);
+            if best.is_none_or(|(_, t)| tick > t) {
+                best = Some((*c, tick));
+            }
+        }
+        self.active = best.map(|(c, _)| c);
+        self.active.and_then(|c| self.by_client.get(&c).copied())
+    }
+
+    /// May `client`'s `auto` input reach the PTY? Only the owner's may. A
+    /// pane without an owner takes its first attached client as owner.
+    fn auto_allowed(&self, client: Uuid) -> bool {
+        self.owner() == Some(client)
+    }
+
+    /// The size owner. The latest active client owns the pane while it has a
+    /// stream on it. One that does not (it focused a tab it never attached)
+    /// hands the pane to the first attached client. `None` when nobody has a
+    /// stream.
+    fn owner(&self) -> Option<Uuid> {
+        match self.active {
+            Some(owner) if self.attached.contains(&owner) => Some(owner),
+            _ => self.attached.first().copied(),
+        }
+    }
 }
 
 /// Counters and switches for the protocol harness. Cheap, always compiled.
@@ -218,6 +309,11 @@ pub struct Qa {
     pub attaches: Mutex<Vec<(Uuid, Option<u64>)>>,
     /// Snapshot catch-ups served.
     pub catchups: AtomicU64,
+    /// Input frames dropped because the pane's queue was full (AD-024).
+    pub input_drops: AtomicU64,
+    /// `auto` input frames dropped because their sender is not the size owner
+    /// (AD-025).
+    pub auto_drops: AtomicU64,
     /// Connections closed for [`MAX_INFLIGHT`].
     pub too_many_closes: AtomicU64,
     /// Connections closed for [`STALL_LIMIT`].
@@ -238,15 +334,20 @@ pub struct RpcV2 {
     sm: Arc<SessionManager>,
     sync: OnceLock<Arc<SyncEndpoint>>,
     server_id: Uuid,
+    /// New for every run of this process (`Welcome.boot_id`).
+    boot_id: Uuid,
     hostname: String,
     events: broadcast::Sender<(u64, ServerEvent)>,
     event_seq: Mutex<u64>,
     inputs: Mutex<HashMap<(Uuid, Uuid), Arc<InputRec>>>,
-    /// Catch-up pacing per `(client_id, pane)`, kept across attaches and
+    /// Catch-up pacing per `(remote node id, pane)`, kept across attaches and
     /// connections: a peer cannot reset its backoff by attaching again.
-    pacing: Mutex<HashMap<(Uuid, Uuid), Pace>>,
+    pacing: Mutex<HashMap<(iroh::EndpointId, Uuid), Pace>>,
     clients: Mutex<HashMap<Uuid, ClientRec>>,
+    /// Lock order: `sizes`, then `clients`, then the session manager's `inner`.
     sizes: Mutex<HashMap<Uuid, PaneSizes>>,
+    /// Orders `user` input across clients, for the owner hand over (AD-025).
+    user_tick: AtomicU64,
     live: Mutex<Vec<(u64, Connection)>>,
     next_conn: AtomicU64,
     /// Set while the server shuts down: input is no longer written, so the
@@ -272,6 +373,7 @@ impl RpcV2 {
             sm,
             sync: OnceLock::new(),
             server_id,
+            boot_id: Uuid::new_v4(),
             hostname,
             events,
             event_seq: Mutex::new(0),
@@ -279,6 +381,7 @@ impl RpcV2 {
             pacing: Mutex::new(HashMap::new()),
             clients: Mutex::new(HashMap::new()),
             sizes: Mutex::new(HashMap::new()),
+            user_tick: AtomicU64::new(0),
             live: Mutex::new(Vec::new()),
             next_conn: AtomicU64::new(0),
             inputs_frozen: AtomicBool::new(false),
@@ -291,6 +394,8 @@ impl RpcV2 {
                 paused,
                 attaches: Mutex::new(Vec::new()),
                 catchups: AtomicU64::new(0),
+                input_drops: AtomicU64::new(0),
+                auto_drops: AtomicU64::new(0),
                 too_many_closes: AtomicU64::new(0),
                 stall_closes: AtomicU64::new(0),
                 force_catchup,
@@ -301,6 +406,14 @@ impl RpcV2 {
             },
         });
         rpc.load_inputs();
+        // Local socket clients take part in the size policy (AD-020).
+        let governor = Arc::new(LocalSizes(Arc::downgrade(&rpc)));
+        rpc.sm.set_size_governor(governor.clone());
+        rpc.sm.clients().set_leave_hook(move |id| {
+            if let Ok(id) = Uuid::parse_str(id) {
+                governor.local_left(id);
+            }
+        });
         tokio::spawn(event_pump(rpc.clone()));
         let saver = rpc.clone();
         forgetty_socket::add_shutdown_hook(Box::new(move || saver.save_inputs()));
@@ -322,12 +435,23 @@ impl RpcV2 {
     /// typing), and a new shell would run them a second time. A graceful stop
     /// therefore writes the table, and the next start reads it back.
     pub fn save_inputs(&self) {
+        // Freeze first: no frame is recorded from here on. Then let what the
+        // panes already queued reach the PTYs, so the saved `seq` matches what
+        // the shells got (AD-024). A hung pane does not hold the stop longer
+        // than the limit.
         self.inputs_frozen.store(true, Ordering::SeqCst);
+        let undrained = self.sm.close_input_queues_and_drain(INPUT_DRAIN_LIMIT);
+        if undrained > 0 {
+            // What stays in those queues was acked and is lost: input never
+            // crosses a restart (a client that sees the new `boot_id` drops
+            // what it holds), and the programs it was for are gone.
+            warn!("rpc2: {undrained} pane input queue(s) did not drain in {INPUT_DRAIN_LIMIT:?}");
+        }
         let entries: Vec<serde_json::Value> = lock(&self.inputs)
             .iter()
             .map(|((c, e), r)| {
                 serde_json::json!({
-                    "client_id": c, "input_epoch": e, "last": r.last.load(Ordering::SeqCst)
+                    "client_id": c, "input_epoch": e, "last": r.last.load(Ordering::SeqCst),
                 })
             })
             .collect();
@@ -372,11 +496,7 @@ impl RpcV2 {
                 };
                 inputs.insert(
                     (c, ep),
-                    Arc::new(InputRec {
-                        last: AtomicU64::new(last),
-                        queued: AtomicU64::new(last),
-                        ..Default::default()
-                    }),
+                    Arc::new(InputRec { last: AtomicU64::new(last), ..Default::default() }),
                 );
                 loaded += 1;
             }
@@ -491,6 +611,25 @@ impl RpcV2 {
         hello.client_name =
             forgetty_core::sanitize::untrusted_max(&hello.client_name, MAX_CLIENT_NAME_CHARS);
 
+        // `local` names the server's own socket clients and `unknown` is what
+        // a decoder makes of a kind it does not know. A remote client is
+        // neither, and must not pass for a local one in `list_clients` or as
+        // a size owner.
+        if matches!(hello.client_kind, ClientKind::Local | ClientKind::Unknown) {
+            let reply = HandshakeReply::Error(ErrorMsg {
+                code: error_code::BAD_REQUEST.into(),
+                message: format!(
+                    "bad_hello: client_kind {} is not allowed",
+                    hello.client_kind.as_str()
+                ),
+            });
+            let _ = write_msg(&mut send, &reply).await;
+            let _ = send.finish();
+            let _ = tokio::time::timeout(Duration::from_secs(2), conn.closed()).await;
+            conn.close(close_code::OK.into(), b"bad hello");
+            return;
+        }
+
         if hello.proto_major != PROTO_MAJOR {
             let reply = HandshakeReply::Error(ErrorMsg {
                 code: error_code::PROTO_MISMATCH.into(),
@@ -545,6 +684,7 @@ impl RpcV2 {
             server_version: env!("CARGO_PKG_VERSION").to_string(),
             hostname: self.hostname.clone(),
             capabilities: SERVER_CAPS.iter().map(|c| c.to_string()).collect(),
+            boot_id: Some(self.boot_id),
         };
         if write_msg(&mut send, &HandshakeReply::Welcome(welcome)).await.is_err() {
             return;
@@ -640,15 +780,7 @@ impl RpcV2 {
         };
         self.emit(ServerEvent::ClientDisconnected { client_id: hello.client_id });
         // Sizes asked for by a client that left no longer count.
-        {
-            let mut sizes = lock(&self.sizes);
-            for ps in sizes.values_mut() {
-                ps.by_client.remove(&hello.client_id);
-                if ps.active == Some(hello.client_id) {
-                    ps.active = None;
-                }
-            }
-        }
+        self.forget_client_sizes(hello.client_id);
         // Input `seq` state outlives the client by 10 minutes (section 5). One
         // deadline per departure, not a poll.
         let rpc = self.clone();
@@ -668,7 +800,6 @@ impl RpcV2 {
             };
             if gone {
                 lock(&rpc.inputs).retain(|(c, _), _| *c != client_id);
-                lock(&rpc.pacing).retain(|(c, _), _| *c != client_id);
             }
         });
     }
@@ -691,51 +822,193 @@ impl RpcV2 {
         pane: Uuid,
         seq: u64,
         bytes: Vec<u8>,
+        auto: bool,
         policy: bool,
     ) {
         let rec = lock(&self.inputs).entry((client, epoch)).or_default().clone();
         {
+            // Dedup and enqueue under one lock, so frames of one client epoch
+            // keep their order and a resend is never queued twice. Nothing
+            // here waits on the PTY (AD-024): a frame is done when it is in
+            // the pane's queue, and a pane that does not read costs its own
+            // frames only.
             let _gate = rec.gate.lock().await;
             if self.inputs_frozen.load(Ordering::SeqCst) {
-                return; // shutting down: not written, so not acked, so resent
+                return; // shutting down: not recorded, so not acked, so resent
             }
-            if seq <= rec.queued.load(Ordering::SeqCst) {
+            if seq <= rec.last.load(Ordering::SeqCst) {
                 self.qa.dedup_drops.fetch_add(1, Ordering::SeqCst);
                 return;
             }
-            #[cfg(feature = "qa-tools")]
-            let copy = bytes.clone();
-            // Wait for room only. The `await` returns with the bytes queued, and
-            // `queued` is set before the next `await`: a connection that dies
-            // here (this future is dropped) either queued nothing and recorded
-            // nothing, or queued and recorded. A resend is then never written
-            // twice.
-            let done = match self.sm.write_pty_enqueue(PaneId(pane), bytes).await {
-                Ok(done) => Some(done),
-                Err(e) => {
-                    debug!("rpc2: input for pane {pane}: {e}");
-                    None
+            if auto && !self.auto_allowed(client, pane) {
+                // A terminal reply from a client that does not own the pane:
+                // another VT answers the same query (AD-025). Spent, acked,
+                // never written, and never a sign of life for the size policy.
+                self.qa.auto_drops.fetch_add(1, Ordering::SeqCst);
+                rec.last.fetch_max(seq, Ordering::SeqCst);
+                return;
+            }
+            let len = bytes.len();
+            // The byte that makes the tty signal the program, only while ISIG
+            // is on. Terminal replies never interrupt.
+            let interrupt_at = if auto {
+                None
+            } else {
+                self.sm.intr_byte(PaneId(pane)).and_then(|v| bytes.iter().rposition(|b| *b == v))
+            };
+            let busy = self.sm.queued_input_bytes(PaneId(pane)).unwrap_or(0) > 0;
+            // Is this client's input to the pane in a hole? It stays so until
+            // the pane's queue is empty.
+            let in_hole = {
+                let mut holes = lock(&rec.holes);
+                match holes.get_mut(&pane) {
+                    Some(h) if !h.closed && busy => true,
+                    Some(h) => {
+                        h.closed = true; // empty again: flows, loss to be reported
+                        false
+                    }
+                    None => false,
                 }
             };
-            rec.queued.fetch_max(seq, Ordering::SeqCst);
-            #[cfg(feature = "qa-tools")]
-            lock(&self.qa.input_log).entry(pane).or_default().extend_from_slice(&copy);
-            // The ack follows the real write. It runs on its own task, so it
-            // lands even when this connection goes away while the pane is
-            // slow. The gate stays held until then: a program that does not
-            // read stalls this client's input and nothing else. A pane that is
-            // gone takes no more input; its frame is spent.
-            let r = rec.clone();
-            let ack = tokio::spawn(async move {
-                if let Some(done) = done {
-                    let _ = done.await;
+            // A Ctrl+C must work although the program does not read: the
+            // write is stuck, so the byte would wait behind it. Signal now and
+            // drop what was queued for the program that is being interrupted.
+            let (queue_bytes, interrupted) = match interrupt_at {
+                Some(at) if in_hole || busy => {
+                    self.interrupt_pane(pane).await;
+                    (bytes[at + 1..].to_vec(), true)
                 }
-                r.last.fetch_max(seq, Ordering::SeqCst);
-            });
-            let _ = ack.await;
+                _ => (bytes, false),
+            };
+            let in_hole = in_hole && !interrupted;
+            #[cfg(feature = "qa-tools")]
+            let copy = queue_bytes.clone();
+            let mut dropped = in_hole;
+            if !in_hole && !queue_bytes.is_empty() {
+                match self.sm.queue_input(PaneId(pane), queue_bytes) {
+                    InputOutcome::Queued => {
+                        #[cfg(feature = "qa-tools")]
+                        lock(&self.qa.input_log).entry(pane).or_default().extend_from_slice(&copy);
+                    }
+                    InputOutcome::Full => {
+                        dropped = true;
+                        // The program in that pane has not read 256 KiB of
+                        // input. Drop this frame and, to keep the stream free
+                        // of holes, the ones behind it.
+                        if interrupt_at.is_some() {
+                            self.interrupt_pane(pane).await;
+                        }
+                    }
+                    // A pane that is gone takes no more input; the frame is
+                    // spent. During a stop the queue is closed on purpose:
+                    // the frame was not written, so it is not recorded and
+                    // the client resends it.
+                    InputOutcome::Gone => {
+                        if self.inputs_frozen.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        debug!("rpc2: input for pane {pane}: pane is gone");
+                    }
+                }
+            }
+            if dropped {
+                let n = self.qa.input_drops.fetch_add(1, Ordering::SeqCst) + 1;
+                if n.is_power_of_two() {
+                    warn!(
+                        "rpc2: pane {pane} input queue full, dropped {len} bytes from client \
+                         {client} ({n} frames dropped so far)"
+                    );
+                }
+                let mut holes = lock(&rec.holes);
+                let h = holes.entry(pane).or_insert(Hole { bytes: 0, closed: false });
+                h.closed = false;
+                h.bytes += len as u64;
+            }
+            rec.last.fetch_max(seq, Ordering::SeqCst);
         }
-        if policy {
-            self.touch_active(client, pane);
+        // `auto` input is no sign that the user is here (AD-025).
+        if !auto {
+            self.note_user(client, pane);
+            if policy {
+                self.touch_active(client, pane);
+            }
+        }
+    }
+
+    /// Ctrl+C for a pane that cannot take it in order: drop the input queued
+    /// behind the interrupted program, then interrupt it once. In that order, so the shell that gets the prompt back finds no stale
+    /// paste waiting. The drop waits for a stuck write, so it runs on the
+    /// blocking pool.
+    async fn interrupt_pane(&self, pane: Uuid) {
+        let sm = self.sm.clone();
+        let dropped = tokio::task::spawn_blocking(move || {
+            let dropped = sm.discard_queued_input(PaneId(pane));
+            // One SIGINT: the byte through the tty, or the group signal when
+            // no byte went in (see `SessionManager::interrupt`).
+            sm.interrupt(PaneId(pane));
+            dropped
+        })
+        .await
+        .unwrap_or(0);
+        debug!("rpc2: interrupt for pane {pane}, {dropped} queued bytes dropped");
+    }
+
+    /// Losses of input to report to the client of `rec`: the holes whose pane
+    /// queue is empty again. Each is reported once.
+    fn take_input_losses(&self, rec: &InputRec) -> Vec<(Uuid, u64)> {
+        let mut holes = lock(&rec.holes);
+        let ready: Vec<Uuid> = holes
+            .iter()
+            .filter(|(pane, h)| {
+                h.closed || self.sm.queued_input_bytes(PaneId(**pane)).is_none_or(|b| b == 0)
+            })
+            .map(|(p, _)| *p)
+            .collect();
+        ready.into_iter().filter_map(|p| holes.remove(&p).map(|h| (p, h.bytes))).collect()
+    }
+
+    fn auto_allowed(&self, client: Uuid, pane: Uuid) -> bool {
+        lock(&self.sizes).get(&pane).is_some_and(|ps| ps.auto_allowed(client))
+    }
+
+    /// `client` just sent `user` input to `pane`.
+    fn note_user(&self, client: Uuid, pane: Uuid) {
+        let tick = self.user_tick.fetch_add(1, Ordering::SeqCst) + 1;
+        lock(&self.sizes).entry(pane).or_default().last_user.insert(client, tick);
+    }
+
+    /// `client` attached a stream on `pane`.
+    fn note_attached(&self, client: Uuid, pane: Uuid) {
+        let apply = {
+            let mut sizes = lock(&self.sizes);
+            let ps = sizes.entry(pane).or_default();
+            if !ps.attached.contains(&client) {
+                ps.attached.push(client);
+            }
+            // No owner with a stream, and this client came first and already
+            // asked for a size (its resize came before its attach): it owns
+            // the pane now.
+            let owned = ps.active.is_some_and(|a| ps.attached.contains(&a));
+            if !owned && ps.attached.first() == Some(&client) && ps.by_client.contains_key(&client)
+            {
+                ps.active = Some(client);
+                ps.by_client.get(&client).copied()
+            } else {
+                None
+            }
+        };
+        self.publish_owner(pane);
+        if let Some((rows, cols)) = apply {
+            self.apply_size(pane, rows, cols);
+        }
+    }
+
+    /// `client` detached its stream from `pane` and stays connected.
+    fn note_detached(&self, client: Uuid, pane: Uuid) {
+        let apply = lock(&self.sizes).get_mut(&pane).and_then(|ps| ps.leave(client, false));
+        self.publish_owner(pane);
+        if let Some((rows, cols)) = apply {
+            self.apply_size(pane, rows, cols);
         }
     }
 
@@ -759,9 +1032,15 @@ impl RpcV2 {
             if ps.active == Some(client) {
                 return;
             }
+            // A client with no stream on the pane cannot own it (AD-025).
+            if !ps.attached.contains(&client) {
+                return;
+            }
             ps.active = Some(client);
             ps.by_client.get(&client).copied()
         };
+        // The owner is announced before the size it causes.
+        self.publish_owner(pane);
         if let Some((rows, cols)) = apply {
             self.apply_size(pane, rows, cols);
         }
@@ -779,19 +1058,109 @@ impl RpcV2 {
             let mut sizes = lock(&self.sizes);
             let ps = sizes.entry(p.pane_id).or_default();
             ps.by_client.insert(client, (p.rows, p.cols));
-            match ps.active {
-                None => {
+            let attached = ps.attached.contains(&client);
+            // An owner with no stream on the pane is no owner.
+            match ps.active.filter(|a| ps.attached.contains(a)) {
+                // Only a client that has a stream on the pane takes it.
+                None if attached => {
                     ps.active = Some(client);
                     true
                 }
+                None => false,
                 Some(a) => a == client,
             }
         } else {
             true
         };
+        if policy {
+            self.publish_owner(p.pane_id);
+        }
         if apply {
             self.apply_size(p.pane_id, p.rows, p.cols);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Size owner (AD-020)
+    // -----------------------------------------------------------------------
+
+    /// What clients are told about `client` as a size owner: a remote client
+    /// with its device kind, a local socket client as `local`.
+    fn size_owner_info(&self, client: Uuid) -> Option<SizeOwner> {
+        if let Some(r) = lock(&self.clients).get(&client) {
+            return Some(SizeOwner {
+                client_id: client,
+                client_kind: r.kind.as_str().to_string(),
+                client_name: r.name.clone(),
+            });
+        }
+        let info = self.sm.clients().find(&client.to_string())?;
+        (info.client_kind == "socket").then(|| SizeOwner {
+            client_id: client,
+            client_kind: ClientKind::Local.as_str().to_string(),
+            client_name: info.client_name,
+        })
+    }
+
+    /// Tell the session manager who owns `pane` now. It sends
+    /// `SizeOwnerChanged` when that changed. Call it before the resize the
+    /// owner's size causes, so the events arrive in that order.
+    ///
+    /// Lock order: `sizes`, then `clients` (here), then the session manager's
+    /// `inner` (in `set_size_owner`). The owner is worked out and recorded
+    /// under one `sizes` lock, so two racing calls cannot record an older
+    /// owner after a newer one. Nothing takes `sizes` while holding `inner`:
+    /// `inner` only sends session events, and this server reads those on its
+    /// own task.
+    fn publish_owner(&self, pane: Uuid) {
+        let sizes = lock(&self.sizes);
+        let owner = sizes.get(&pane).and_then(|ps| ps.owner());
+        let info = owner.and_then(|c| self.size_owner_info(c));
+        self.sm.set_size_owner(PaneId(pane), info);
+    }
+
+    /// A client left the server: its sizes no longer count and the panes it
+    /// owned go to the attached client that typed last.
+    fn forget_client_sizes(&self, client: Uuid) {
+        let (panes, handed_over) = {
+            let mut sizes = lock(&self.sizes);
+            let handed: Vec<(Uuid, (u16, u16))> = sizes
+                .iter_mut()
+                .filter_map(|(pane, ps)| ps.leave(client, true).map(|sz| (*pane, sz)))
+                .collect();
+            (sizes.keys().copied().collect::<Vec<Uuid>>(), handed)
+        };
+        for pane in panes {
+            self.publish_owner(pane);
+        }
+        for (pane, (rows, cols)) in handed_over {
+            self.apply_size(pane, rows, cols);
+        }
+    }
+
+    /// A registered local client resizes `pane`. A user at a local window is
+    /// the active user: a client with a `subscribe_output` on the pane takes
+    /// the pane's size and ownership. One without it only sets the size.
+    fn local_resize(&self, client: Uuid, pane: Uuid, rows: u16, cols: u16) {
+        let (rows, cols) =
+            (forgetty_session::clamp_pane_dim(rows), forgetty_session::clamp_pane_dim(cols));
+        // A remote client already uses this id: no ownership, the size applies.
+        if !lock(&self.clients).contains_key(&client) {
+            let owns = {
+                let mut sizes = lock(&self.sizes);
+                let ps = sizes.entry(pane).or_default();
+                let attached = ps.attached.contains(&client);
+                if attached {
+                    ps.by_client.insert(client, (rows, cols));
+                    ps.active = Some(client);
+                }
+                attached
+            };
+            if owns {
+                self.publish_owner(pane);
+            }
+        }
+        self.apply_size(pane, rows, cols);
     }
 
     // -----------------------------------------------------------------------
@@ -810,6 +1179,20 @@ impl RpcV2 {
                 connected_at: r.connected_at.clone(),
             })
             .collect();
+        // Local socket clients that gave themselves an id (the streaming
+        // connections of one client share it, so it shows once).
+        for c in self.sm.clients().list() {
+            let Ok(id) = Uuid::parse_str(&c.client_id) else { continue };
+            if c.client_kind != "socket" || entries.iter().any(|e| e.client_id == id) {
+                continue;
+            }
+            entries.push(ClientEntry {
+                client_id: id,
+                client_kind: ClientKind::Local,
+                client_name: c.client_name,
+                connected_at: iso8601_from_secs(c.connected_at),
+            });
+        }
         entries.sort_by(|a, b| {
             a.connected_at.cmp(&b.connected_at).then(a.client_id.cmp(&b.client_id))
         });
@@ -832,12 +1215,29 @@ impl RpcV2 {
             params: mp_to_json(params),
             id: Some(serde_json::json!(1)),
         };
-        let resp = forgetty_socket::dispatch(
-            &req,
-            self.sm.clone(),
-            self.sync.get().cloned(),
-            Some(self.server_id),
-        );
+        let (sm, sync, id) = (self.sm.clone(), self.sync.get().cloned(), self.server_id);
+        // A handler that panics answers with an error and a log line, not a
+        // dead request.
+        let resp = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            forgetty_socket::dispatch(&req, sm, sync, Some(id))
+        })) {
+            Ok(r) => r,
+            Err(payload) => {
+                let why = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "panic".to_string());
+                error!("rpc2: {method} panicked: {why}");
+                return Err((
+                    error_code::INTERNAL,
+                    format!("{method} failed inside the server: {why}"),
+                ));
+            }
+        };
+        if let Some(err) = &resp.error {
+            warn!("rpc2: {method} failed: code {}: {}", err.code, err.message);
+        }
         if let Some(err) = resp.error {
             return Err(map_error(err.code, err.message));
         }
@@ -990,6 +1390,60 @@ async fn event_pump(rpc: Arc<RpcV2>) {
     }
 }
 
+/// The size policy for local socket clients. Holds the server weakly: the
+/// session manager outlives nothing it needs.
+struct LocalSizes(std::sync::Weak<RpcV2>);
+
+impl SizeGovernor for LocalSizes {
+    fn local_resize(&self, client: Uuid, pane: PaneId, size: PtySize) {
+        if let Some(rpc) = self.0.upgrade() {
+            rpc.local_resize(client, pane.0, size.rows, size.cols);
+        }
+    }
+
+    fn local_attached(&self, client: Uuid, pane: PaneId) {
+        if let Some(rpc) = self.0.upgrade() {
+            if !lock(&rpc.clients).contains_key(&client) {
+                rpc.note_attached(client, pane.0);
+            }
+        }
+    }
+
+    fn local_detached(&self, client: Uuid, pane: PaneId) {
+        if let Some(rpc) = self.0.upgrade() {
+            if !lock(&rpc.clients).contains_key(&client) {
+                rpc.note_detached(client, pane.0);
+            }
+        }
+    }
+
+    fn local_left(&self, client: Uuid) {
+        if let Some(rpc) = self.0.upgrade() {
+            // A remote client with this id is not a local one.
+            if !lock(&rpc.clients).contains_key(&client) {
+                rpc.forget_client_sizes(client);
+            }
+        }
+    }
+}
+
+/// The wire form of a size owner.
+fn wire_owner(o: &SizeOwner) -> forgetty_proto::SizeOwner {
+    let client_kind = match o.client_kind.as_str() {
+        "windows" => ClientKind::Windows,
+        "android" => ClientKind::Android,
+        "cli" => ClientKind::Cli,
+        "gtk" => ClientKind::Gtk,
+        "local" => ClientKind::Local,
+        _ => ClientKind::Unknown,
+    };
+    forgetty_proto::SizeOwner {
+        client_id: o.client_id,
+        client_kind,
+        client_name: o.client_name.clone(),
+    }
+}
+
 fn pump_event(rpc: &RpcV2, ev: SessionEvent, layout_dirty: &mut bool) {
     match ev {
         SessionEvent::TitleChanged { pane_id, title } => {
@@ -1015,11 +1469,24 @@ fn pump_event(rpc: &RpcV2, ev: SessionEvent, layout_dirty: &mut bool) {
         SessionEvent::PaneExited { pane_id, exit_code } => {
             rpc.emit(ServerEvent::PaneExited { pane_id: pane_id.0, exit_code })
         }
-        SessionEvent::PaneResized { pane_id, rows, cols } => {
-            rpc.emit(ServerEvent::PaneResized { pane_id: pane_id.0, rows, cols })
+        SessionEvent::PaneResized { pane_id, rows, cols, size_owner } => {
+            rpc.emit(ServerEvent::PaneResized {
+                pane_id: pane_id.0,
+                rows,
+                cols,
+                size_owner: size_owner.as_ref().map(wire_owner),
+            })
+        }
+        SessionEvent::SizeOwnerChanged { pane_id, owner } => {
+            rpc.emit(ServerEvent::SizeOwnerChanged {
+                pane_id: pane_id.0,
+                owner: owner.as_ref().map(wire_owner),
+            })
         }
         SessionEvent::PaneClosed { pane_id } => {
             lock(&rpc.sizes).remove(&pane_id.0);
+            rpc.sm.forget_size_owner(pane_id);
+            RpcV2::forget_pane_pacing(&mut lock(&rpc.pacing), pane_id);
             rpc.snapshots.forget(pane_id);
             rpc.emit(ServerEvent::PaneClosed { pane_id: pane_id.0 });
             *layout_dirty = true;
@@ -1088,6 +1555,22 @@ impl Session {
             });
         }
         core.spawn(watchdog(queue.clone(), session.conn.clone(), session.rpc.clone()));
+        // Tell a client that lost input (AD-024) once its pane reads again.
+        if session.has(cap::INPUT_FLAGS) {
+            let (s, q) = (session.clone(), queue.clone());
+            core.spawn(async move {
+                let rec = lock(&s.rpc.inputs).entry((s.client_id, s.epoch)).or_default().clone();
+                let mut tick = tokio::time::interval(INPUT_LOSS_POLL);
+                loop {
+                    tick.tick().await;
+                    for (pane_id, bytes) in s.rpc.take_input_losses(&rec) {
+                        let seq = s.rpc.current_seq();
+                        let event = ServerEvent::InputDropped { pane_id, bytes };
+                        q.push(control_frame(&ControlMsg::Event { seq, event }));
+                    }
+                }
+            });
+        }
 
         // Control reader. It reads only while the queue is under its byte
         // budget. A full queue leaves the requests in the QUIC receive
@@ -1137,14 +1620,25 @@ impl Session {
             work.spawn(async move {
                 let Ok(mut input) = s.conn.accept_uni().await else { return };
                 let policy = s.has(cap::SIZE_POLICY_LATEST);
+                let flagged = s.has(cap::INPUT_FLAGS);
                 loop {
-                    match read_input_frame(&mut input).await {
-                        Ok(Some((pane, seq, bytes))) => {
+                    // With `input_flags` every frame has a flags byte after
+                    // `seq`; without it every frame is `user` input.
+                    let frame = if flagged {
+                        read_input_frame_flags(&mut input).await
+                    } else {
+                        read_input_frame(&mut input)
+                            .await
+                            .map(|f| f.map(|(pane, seq, bytes)| (pane, seq, 0u8, bytes)))
+                    };
+                    match frame {
+                        Ok(Some((pane, seq, flags, bytes))) => {
+                            let auto = flags & INPUT_FLAG_AUTO != 0;
                             // Awaited here, so the frames of one client stay in
                             // order. A pane that does not read holds this loop
                             // and nothing else.
                             s.rpc
-                                .handle_input(s.client_id, s.epoch, pane, seq, bytes, policy)
+                                .handle_input(s.client_id, s.epoch, pane, seq, bytes, auto, policy)
                                 .await;
                         }
                         // The client finished the stream, or the connection is
@@ -1263,6 +1757,7 @@ impl Session {
     fn event_allowed(&self, event: &ServerEvent) -> bool {
         match event {
             ServerEvent::LayoutChanged { .. } => self.has(cap::LAYOUT_EVENTS),
+            ServerEvent::SizeOwnerChanged { .. } => self.has(cap::SIZE_OWNER),
             ServerEvent::StatusChanged { .. }
             | ServerEvent::Notification { .. }
             | ServerEvent::PaneExited { .. } => self.has(cap::STATUS_EVENTS),
@@ -1338,6 +1833,7 @@ impl Session {
                     if let Some(h) = streams.remove(&p.pane_id) {
                         h.abort();
                     }
+                    self.rpc.note_detached(self.client_id, p.pane_id);
                     to_value(&OkResult { ok: true }).map_err(bad)
                 });
                 out.push(control_frame(&reply(r)));
@@ -1464,12 +1960,13 @@ impl Session {
             rows: info.rows,
             cols: info.cols,
             snapshot_len: 0,
+            // Everything the log holds now is replay. What comes after is live.
+            replay_end: Some(total),
         };
         let catchup = self.has(cap::SNAPSHOT_CATCHUP);
         // One live stream per (connection, pane): the old one was aborted above.
         let handle = work.spawn(pane_stream(
             self.rpc.clone(),
-            self.client_id,
             self.conn.clone(),
             shared,
             header,
@@ -1477,6 +1974,7 @@ impl Session {
             guard,
         ));
         streams.insert(p.pane_id, handle);
+        self.rpc.note_attached(self.client_id, p.pane_id);
         to_value(&OkResult { ok: true }).map_err(|e| (error_code::INTERNAL, e.to_string()))
     }
 }
@@ -1587,7 +2085,6 @@ impl StreamEnd {
 /// and a reader behind everything is reset with `LOG_LOST`.
 async fn pane_stream(
     rpc: Arc<RpcV2>,
-    client: Uuid,
     conn: Connection,
     shared: Arc<LogShared>,
     first: PaneStreamHeader,
@@ -1603,8 +2100,10 @@ async fn pane_stream(
     // A client that resumes far behind starts with the snapshot, paced like
     // any other catch-up of this client and pane.
     if catchup && shared.total().saturating_sub(header.start_offset) > lag_limit {
-        tokio::time::sleep(rpc.catchup_delay(client, pane, false)).await;
-        let Some((h, snap)) = take_snapshot(&rpc, pane, &shared).await else { return };
+        tokio::time::sleep(rpc.resume_delay(conn.remote_id(), pane)).await;
+        let Some((h, snap)) = take_snapshot(&rpc, conn.remote_id(), pane, &shared).await else {
+            return;
+        };
         header = h;
         snapshot = snap;
     }
@@ -1616,6 +2115,10 @@ async fn pane_stream(
         let after_snapshot = !sent_snapshot.is_empty();
         let cycle_start = tokio::time::Instant::now();
         header.snapshot_len = sent_snapshot.len() as u32;
+        if sent_snapshot.is_empty() {
+            // Replay ends where the log stands as this stream starts.
+            header.replay_end = Some(shared.total().max(header.start_offset));
+        }
         if write_msg(&mut send, &header).await.is_err() {
             return;
         }
@@ -1653,17 +2156,39 @@ async fn pane_stream(
                 // took longer than the ring holds at the program's speed).
                 // Only a peer that is slow itself waits and backs off.
                 let live = next.saturating_sub(header.start_offset);
-                let rate = live as f64 / cycle_start.elapsed().as_secs_f64().max(0.001);
-                let keeping_pace = !stalled
-                    && if live == 0 {
-                        snapshot_sent_in < SNAPSHOT_SEND_OK
+                let cycle = cycle_start.elapsed();
+                let rate = live as f64 / cycle.as_secs_f64().max(0.001);
+                // `Strong` is evidence that the peer reads: it took a good rate
+                // of live bytes, more than the room a peer that never reads has
+                // left in its QUIC window. Only `Strong` ends the backoff that
+                // stalls built up. `Tiny` (one chunk in a few microseconds) is
+                // what a peer that never reads shows too, so it is believed
+                // only a few times in a row. `Weak` (a slow build, no live
+                // byte) is the server's doing and costs a token.
+                let claim = if stalled {
+                    Claim::Stalled
+                } else if live == 0 {
+                    if snapshot_sent_in < SNAPSHOT_SEND_OK {
+                        Claim::Weak
                     } else {
-                        rate >= KEEPING_PACE_RATE
-                    };
-                tokio::time::sleep(rpc.catchup_delay(client, pane, keeping_pace)).await;
+                        Claim::Stalled
+                    }
+                } else if rate >= KEEPING_PACE_RATE {
+                    if live >= KEEPING_PACE_MIN_LIVE {
+                        Claim::Strong
+                    } else {
+                        Claim::Tiny
+                    }
+                } else {
+                    Claim::Stalled
+                };
+                tokio::time::sleep(rpc.catchup_delay(conn.remote_id(), pane, claim)).await;
                 // Stop the old stream, so it queues nothing more for the peer.
                 let _ = send.reset(stream_code::SUPERSEDED.into());
-                let Some((h, snap)) = take_snapshot(&rpc, pane, &shared).await else { return };
+                let Some((h, snap)) = take_snapshot(&rpc, conn.remote_id(), pane, &shared).await
+                else {
+                    return;
+                };
                 header = h;
                 snapshot = snap;
             }
@@ -1685,16 +2210,28 @@ impl Default for CatchupLimiter {
 }
 
 impl CatchupLimiter {
-    /// How long to wait before the next catch-up. Records it as done.
-    /// `keeping_pace`: the peer is not the slow part, so no backoff.
-    fn delay(&mut self, keeping_pace: bool) -> Duration {
+    /// How long until `gap` has passed since the last catch-up.
+    fn floor(&self, gap: Duration) -> Duration {
+        let now = tokio::time::Instant::now();
+        self.last.map_or(Duration::ZERO, |l| (l + gap).saturating_duration_since(now))
+    }
+
+    /// The next backed off catch-up starts from the minimum again.
+    fn reset_backoff(&mut self) {
+        self.interval = MIN_CATCHUP_INTERVAL;
+    }
+
+    /// A catch-up that is not backed off happens at `at`.
+    fn mark(&mut self, at: tokio::time::Instant) {
+        self.last = Some(at);
+    }
+
+    /// How long to wait before the next backed off catch-up. Records it as
+    /// done.
+    fn delay(&mut self) -> Duration {
         let now = tokio::time::Instant::now();
         let wait = match self.last {
             None => Duration::ZERO,
-            Some(last) if keeping_pace => {
-                self.interval = MIN_CATCHUP_INTERVAL;
-                (last + KEEPING_PACE_INTERVAL).saturating_duration_since(now)
-            }
             Some(last) => {
                 // Needed again within two intervals: back off. Otherwise start over.
                 self.interval = if now.duration_since(last) < self.interval * 2 {
@@ -1710,42 +2247,124 @@ impl CatchupLimiter {
     }
 }
 
-/// Keeping-pace catch-ups a `(client, pane)` may take in a burst, and per
-/// second after that (one per 10 s). Bytes accepted into the QUIC send buffer prove nothing
-/// about a peer that never reads, so the exception is capped, not trusted.
+/// Catch-ups a `(node, pane)` whose reads keep up may take in a burst, and
+/// per second after that. They never back off: the peer reads what it gets.
 const KEEPING_PACE_BURST: f64 = 6.0;
-const KEEPING_PACE_PER_SEC: f64 = 0.1;
+const KEEPING_PACE_PER_SEC: f64 = 1.0;
 
-/// Pacing state of one `(client_id, pane)`.
+/// Pacing state of one `(remote node id, pane)`. Keyed by the node, not by
+/// `client_id`: the id is peer text, a fresh one per connection would reset it.
 struct Pace {
     limiter: CatchupLimiter,
     tokens: f64,
+    /// Tokens earn from here on. Time spent waiting out a delay earns none.
     refilled: tokio::time::Instant,
+    /// The last catch-up of this peer was a reading one: its stream took live
+    /// bytes at a good rate, so it has shown that it reads. The next attach
+    /// that resumes far behind may take the token path. Used up by that
+    /// resume, so a peer that attaches again and again without reading
+    /// between gets the backoff.
+    kept_pace: bool,
+    /// Tiny claims since the last strong one.
+    tiny_streak: u32,
 }
 
 impl RpcV2 {
-    /// How long `(client, pane)` waits before its next snapshot catch-up. The
-    /// peer's keeping-pace claim counts only while it has tokens left.
-    fn catchup_delay(&self, client: Uuid, pane: PaneId, keeping_pace: bool) -> Duration {
-        let now = tokio::time::Instant::now();
-        let mut map = lock(&self.pacing);
-        if map.len() > 4096 {
-            // Entries leave with their client; this only bounds a flood of ids.
-            map.retain(|_, p| now.duration_since(p.refilled) < Duration::from_secs(300));
+    /// How long `(node, pane)` waits before its next snapshot catch-up.
+    /// A peer that claims to keep pace (`Weak` or `Strong`) gets a burst of 6,
+    /// then one catch-up per second. `Strong` also ends the backoff its stalls
+    /// built up. A peer whose write stalled, or that reads too slowly to tell,
+    /// waits 1 s, then 2, 4, 8, 10 s while it keeps needing them.
+    fn catchup_delay(&self, node: iroh::EndpointId, pane: PaneId, claim: Claim) -> Duration {
+        Self::pace(&mut lock(&self.pacing), node, pane, claim)
+    }
+
+    /// How long an attach that resumes far behind waits for its snapshot. A
+    /// peer whose last catch-up showed that it reads (an honest client that
+    /// dropped and comes back) goes through the token path, once. Any other
+    /// resume, a peer with no such record or one that attaches again and again
+    /// without reading, waits out the backoff.
+    fn resume_delay(&self, node: iroh::EndpointId, pane: PaneId) -> Duration {
+        Self::resume(&mut lock(&self.pacing), node, pane)
+    }
+
+    fn resume(
+        map: &mut HashMap<(iroh::EndpointId, Uuid), Pace>,
+        node: iroh::EndpointId,
+        pane: PaneId,
+    ) -> Duration {
+        let reads = map.get(&(node, pane.0)).is_some_and(|p| p.kept_pace);
+        let wait = Self::pace(map, node, pane, if reads { Claim::Weak } else { Claim::Stalled });
+        if let Some(p) = map.get_mut(&(node, pane.0)) {
+            p.kept_pace = false;
         }
-        let p = map.entry((client, pane.0)).or_insert_with(|| Pace {
+        wait
+    }
+
+    /// A pane that closed has no catch-ups left to pace.
+    fn forget_pane_pacing(map: &mut HashMap<(iroh::EndpointId, Uuid), Pace>, pane: PaneId) {
+        map.retain(|(_, p), _| *p != pane.0);
+    }
+
+    fn pace(
+        map: &mut HashMap<(iroh::EndpointId, Uuid), Pace>,
+        node: iroh::EndpointId,
+        pane: PaneId,
+        claim: Claim,
+    ) -> Duration {
+        let now = tokio::time::Instant::now();
+        if map.len() > 4096 {
+            // Only a flood of nodes gets here (each is an authorized device).
+            map.retain(|_, p| now.saturating_duration_since(p.refilled) < Duration::from_secs(300));
+        }
+        let p = map.entry((node, pane.0)).or_insert_with(|| Pace {
             limiter: CatchupLimiter::default(),
             tokens: KEEPING_PACE_BURST,
             refilled: now,
+            kept_pace: false,
+            tiny_streak: 0,
         });
-        let earned = now.duration_since(p.refilled).as_secs_f64() * KEEPING_PACE_PER_SEC;
+        let earned = now.saturating_duration_since(p.refilled).as_secs_f64() * KEEPING_PACE_PER_SEC;
         p.tokens = (p.tokens + earned).min(KEEPING_PACE_BURST);
-        p.refilled = now;
-        let keeping = keeping_pace && p.tokens >= 1.0;
-        if keeping {
-            p.tokens -= 1.0;
+        match claim {
+            Claim::Strong => p.tiny_streak = 0,
+            Claim::Tiny => p.tiny_streak += 1,
+            Claim::Weak | Claim::Stalled => {}
         }
-        p.limiter.delay(keeping)
+        // A peer that keeps claiming a few bytes without ever proving a read
+        // is treated as one whose write stalls.
+        let claim = if claim == Claim::Tiny && p.tiny_streak > KEEPING_PACE_TINY_BURST {
+            Claim::Stalled
+        } else {
+            claim
+        };
+        let wait = if claim != Claim::Stalled {
+            // Out of burst: the wait is the time to the next token.
+            let for_token = if p.tokens >= 1.0 {
+                p.tokens -= 1.0;
+                Duration::ZERO
+            } else {
+                let w = Duration::from_secs_f64((1.0 - p.tokens) / KEEPING_PACE_PER_SEC);
+                p.tokens = 0.0;
+                w
+            };
+            let gap = p.limiter.floor(KEEPING_PACE_INTERVAL);
+            let w = for_token.max(gap);
+            // A peer that reads what it gets is done with the backoff its
+            // stalls built up, or an honest client would wait 2 to 10 s for
+            // it. A claim that proves nothing leaves the backoff alone.
+            if claim == Claim::Strong {
+                p.limiter.reset_backoff();
+            }
+            p.limiter.mark(now + w);
+            p.kept_pace = claim == Claim::Strong;
+            w
+        } else {
+            p.kept_pace = false;
+            p.limiter.delay()
+        };
+        p.refilled = now + wait;
+        wait
     }
 }
 
@@ -1754,6 +2373,7 @@ impl RpcV2 {
 /// it, and the snapshot bytes.
 async fn take_snapshot(
     rpc: &Arc<RpcV2>,
+    node: iroh::EndpointId,
     pane: PaneId,
     shared: &Arc<LogShared>,
 ) -> Option<(PaneStreamHeader, Vec<u8>)> {
@@ -1765,7 +2385,10 @@ async fn take_snapshot(
         let slack = (shared.ring_capacity() / 8) as u64;
         move |s: &forgetty_session::PaneSnapshot| shared.total().saturating_sub(s.offset) <= slack
     };
-    let snap = rpc.snapshots.get_if(pane, fresh, move || sm.snapshot_pane(pane)).await?;
+    let snap = rpc
+        .snapshots
+        .get_for(*node.as_bytes(), pane, fresh, move || sm.snapshot_pane(pane))
+        .await?;
     rpc.qa.catchups.fetch_add(1, Ordering::SeqCst);
     info!(
         "rpc2: pane {pane} snapshot catch-up at {}: {} bytes (last build {} us)",
@@ -1780,6 +2403,8 @@ async fn take_snapshot(
         rows: snap.rows,
         cols: snap.cols,
         snapshot_len: 0,
+        // The snapshot stands at its offset: every pane byte after it is live.
+        replay_end: Some(snap.offset),
     };
     Some((header, snap.bytes.clone()))
 }
@@ -1926,27 +2551,296 @@ mod limiter_tests {
     #[test]
     fn catchups_back_off_up_to_ten_seconds_and_recover() {
         let mut l = CatchupLimiter::default();
-        assert_eq!(l.delay(false), Duration::ZERO, "the first catch-up is immediate");
+        assert_eq!(l.delay(), Duration::ZERO, "the first catch-up is immediate");
         // Needed again at once, over and over (the caller waits each delay
         // before the next call, so the next "now" is the previous slot).
         let mut waits = Vec::new();
         for _ in 0..6 {
-            let w = l.delay(false);
+            let w = l.delay();
             waits.push(w.as_secs_f64().round() as u64);
             l.last = Some(tokio::time::Instant::now()); // the caller waited
         }
         assert_eq!(waits, [2, 4, 8, 10, 10, 10]);
         // A stream that was quiet starts over with the minimum interval.
         l.last = Some(tokio::time::Instant::now() - Duration::from_secs(60));
-        let w = l.delay(false);
+        let w = l.delay();
         assert!(w.is_zero(), "after a quiet minute the next catch-up is immediate: {w:?}");
-        // A peer that keeps pace with the program waits only the floor, and
-        // its run of fast catch-ups does not raise the backoff.
-        l.last = Some(tokio::time::Instant::now());
-        let w = l.delay(true);
+    }
+
+    #[test]
+    fn a_peer_that_reads_gets_a_burst_then_one_per_second_and_no_backoff() {
+        let mut l = CatchupLimiter::default();
+        let floor = |l: &CatchupLimiter| l.floor(KEEPING_PACE_INTERVAL);
+        assert_eq!(floor(&l), Duration::ZERO);
+        l.mark(tokio::time::Instant::now());
+        let w = floor(&l);
         assert!(w <= KEEPING_PACE_INTERVAL && w > Duration::from_millis(50), "{w:?}");
-        l.last = Some(tokio::time::Instant::now());
-        let w = l.delay(false);
-        assert_eq!(w.as_secs_f64().round() as u64, 2, "backoff starts over: {w:?}");
+    }
+}
+
+#[cfg(test)]
+mod pacing_tests {
+    use super::*;
+
+    /// Builds only the pacing map, which is all `catchup_delay` needs.
+    fn pace_map() -> Mutex<HashMap<(iroh::EndpointId, Uuid), Pace>> {
+        Mutex::new(HashMap::new())
+    }
+
+    fn node() -> iroh::EndpointId {
+        iroh::SecretKey::generate(&mut rand::rng()).public()
+    }
+
+    /// The same arithmetic as `RpcV2::catchup_delay`, on a map of its own.
+    fn delay(
+        map: &Mutex<HashMap<(iroh::EndpointId, Uuid), Pace>>,
+        n: iroh::EndpointId,
+        pane: Uuid,
+        keeping: bool,
+    ) -> Duration {
+        let claim = if keeping { Claim::Strong } else { Claim::Stalled };
+        RpcV2::pace(&mut lock(map), n, PaneId(pane), claim)
+    }
+
+    fn weak(
+        map: &Mutex<HashMap<(iroh::EndpointId, Uuid), Pace>>,
+        n: iroh::EndpointId,
+        pane: Uuid,
+    ) -> Duration {
+        RpcV2::pace(&mut lock(map), n, PaneId(pane), Claim::Weak)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reading_peer_has_a_burst_of_six_then_one_per_second_without_backoff() {
+        let map = pace_map();
+        let (n, pane) = (node(), Uuid::new_v4());
+        let mut waits = Vec::new();
+        for _ in 0..12 {
+            let w = delay(&map, n, pane, true);
+            waits.push(w);
+            tokio::time::sleep(w).await; // the caller waits, then is served
+        }
+        // The first 6 only wait the 100 ms floor (the first not at all).
+        assert!(waits[0].is_zero());
+        for w in &waits[1..6] {
+            assert!(*w <= KEEPING_PACE_INTERVAL, "{w:?}");
+        }
+        // After that the wait is the time to the next token: 1 s, always.
+        for w in &waits[6..] {
+            assert!(
+                *w >= Duration::from_millis(900) && *w <= Duration::from_millis(1100),
+                "steady state is one per second, no growth: {waits:?}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_peer_backs_off_to_ten_seconds_whatever_its_burst() {
+        let map = pace_map();
+        let (n, pane) = (node(), Uuid::new_v4());
+        let mut waits = Vec::new();
+        for _ in 0..7 {
+            let w = delay(&map, n, pane, false);
+            waits.push(w.as_secs());
+            tokio::time::sleep(w).await;
+        }
+        assert_eq!(waits, [0, 2, 4, 8, 10, 10, 10]);
+        // A reading claim after that costs a token and ends the backoff: the
+        // next stall starts again from the minimum.
+        let w = delay(&map, n, pane, true);
+        assert!(w <= Duration::from_secs(1), "{w:?}");
+        tokio::time::sleep(w).await;
+        let w = delay(&map, n, pane, false);
+        assert!(w <= Duration::from_secs(2), "a reading claim ends the backoff: {w:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_honest_client_resumes_within_a_second_after_old_stalls() {
+        let map = pace_map();
+        let (n, pane) = (node(), Uuid::new_v4());
+        // Three stalls: the interval grows.
+        let mut waits = Vec::new();
+        for _ in 0..3 {
+            let w = delay(&map, n, pane, false);
+            waits.push(w.as_secs());
+            tokio::time::sleep(w).await;
+        }
+        assert_eq!(waits, [0, 2, 4], "the interval grows with each stall");
+        // The peer then keeps pace for 5 s, each catch-up a reading one.
+        for _ in 0..5 {
+            let w = delay(&map, n, pane, true);
+            tokio::time::sleep(w.max(Duration::from_secs(1))).await;
+        }
+        // It drops and resumes: the attach goes through the token path, not
+        // the backoff, and is served in 1.2 s at most.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let w = RpcV2::resume(&mut lock(&map), n, PaneId(pane));
+        assert!(w <= Duration::from_millis(1200), "resume waits {w:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_claim_that_proves_nothing_does_not_end_the_backoff() {
+        let map = pace_map();
+        let (n, pane) = (node(), Uuid::new_v4());
+        for _ in 0..5 {
+            let w = delay(&map, n, pane, false);
+            tokio::time::sleep(w).await;
+        }
+        // A peer that never reads can make weak claims all day.
+        let w = weak(&map, n, pane);
+        tokio::time::sleep(w).await;
+        let w = delay(&map, n, pane, false);
+        assert!(w >= Duration::from_secs(8), "weak claims reset the backoff: {w:?}");
+        // A strong one does end it.
+        tokio::time::sleep(w).await;
+        let w = delay(&map, n, pane, true);
+        tokio::time::sleep(w).await;
+        let w = delay(&map, n, pane, false);
+        assert!(w <= Duration::from_secs(2), "a strong claim kept the backoff: {w:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_that_only_ever_claims_a_chunk_is_backed_off_after_four() {
+        let map = pace_map();
+        let (n, pane) = (node(), Uuid::new_v4());
+        let mut waits = Vec::new();
+        for _ in 0..12 {
+            let w = RpcV2::pace(&mut lock(&map), n, PaneId(pane), Claim::Tiny);
+            waits.push(w.as_secs());
+            tokio::time::sleep(w).await;
+        }
+        // 4 are believed (100 ms apart), then the stall rules apply: 2, 4, 8, 10.
+        assert!(waits[..4].iter().all(|w| *w == 0), "{waits:?}");
+        assert!(waits[4..].iter().any(|w| *w >= 8), "{waits:?}");
+        // One proven read gives the burst back.
+        let w = delay(&map, n, pane, true);
+        tokio::time::sleep(w).await;
+        let w = RpcV2::pace(&mut lock(&map), n, PaneId(pane), Claim::Tiny);
+        assert!(w <= Duration::from_secs(2), "{w:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_closed_pane_leaves_no_pacing_entries() {
+        let map = pace_map();
+        let (n1, n2) = (node(), node());
+        let (gone, kept) = (Uuid::new_v4(), Uuid::new_v4());
+        for n in [n1, n2] {
+            delay(&map, n, gone, true);
+            delay(&map, n, kept, true);
+        }
+        RpcV2::forget_pane_pacing(&mut lock(&map), PaneId(gone));
+        let m = lock(&map);
+        assert_eq!(m.len(), 2);
+        assert!(m.keys().all(|(_, p)| *p == kept));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_resume_after_a_stall_still_waits_out_the_backoff() {
+        let map = pace_map();
+        let (n, pane) = (node(), Uuid::new_v4());
+        for _ in 0..4 {
+            let w = delay(&map, n, pane, false);
+            tokio::time::sleep(w).await;
+        }
+        let w = RpcV2::resume(&mut lock(&map), n, PaneId(pane));
+        assert!(w >= Duration::from_secs(1), "{w:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_that_attaches_again_and_again_without_reading_gets_the_backoff() {
+        let map = pace_map();
+        let (n, pane) = (node(), Uuid::new_v4());
+        // It once showed that it reads: one resume goes the token path.
+        delay(&map, n, pane, true);
+        let first = RpcV2::resume(&mut lock(&map), n, PaneId(pane));
+        assert!(first <= Duration::from_secs(1), "{first:?}");
+        tokio::time::sleep(first).await;
+        // Then it only attaches, and never reads between: the backoff grows
+        // to the 10 s cap, whatever its pace.
+        let mut waits = Vec::new();
+        for _ in 0..6 {
+            let w = RpcV2::resume(&mut lock(&map), n, PaneId(pane));
+            waits.push(w.as_secs());
+            tokio::time::sleep(w.max(Duration::from_millis(1200))).await;
+        }
+        assert!(waits.iter().all(|w| *w >= 1) && *waits.last().unwrap() >= 8, "{waits:?}");
+    }
+}
+
+#[cfg(test)]
+mod owner_tests {
+    use super::*;
+
+    #[test]
+    fn an_owner_without_a_stream_on_the_pane_does_not_own_the_auto_replies() {
+        let (a, b, ghost) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let mut ps = PaneSizes { attached: vec![a, b], ..Default::default() };
+        // No owner yet: the first attached client answers.
+        assert!(ps.auto_allowed(a) && !ps.auto_allowed(b));
+        // An owner that is attached answers.
+        ps.active = Some(b);
+        assert!(ps.auto_allowed(b) && !ps.auto_allowed(a));
+        // An owner with no stream here (it focused a tab it never attached)
+        // is no owner: the first attached client answers again.
+        ps.active = Some(ghost);
+        assert!(ps.auto_allowed(a) && !ps.auto_allowed(b) && !ps.auto_allowed(ghost));
+    }
+
+    #[test]
+    fn the_owner_leaving_hands_the_pane_to_the_most_recent_typist() {
+        let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let mut ps = PaneSizes { attached: vec![a, b, c], active: Some(a), ..Default::default() };
+        ps.by_client.insert(b, (30, 100));
+        ps.by_client.insert(c, (40, 120));
+        ps.last_user.insert(b, 5);
+        ps.last_user.insert(c, 9);
+        assert_eq!(ps.leave(a, false), Some((40, 120)));
+        assert_eq!(ps.active, Some(c));
+        // Nobody left attached: no owner.
+        ps.leave(b, false);
+        ps.leave(c, false);
+        assert_eq!(ps.active, None);
+    }
+
+    #[test]
+    fn the_reported_owner_is_the_one_whose_auto_input_counts() {
+        let (a, b, ghost) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let mut ps = PaneSizes::default();
+        assert_eq!(ps.owner(), None, "a pane nobody attached has no owner");
+        ps.attached = vec![a, b];
+        assert_eq!(ps.owner(), Some(a), "the first attached client, until someone is active");
+        ps.active = Some(b);
+        assert_eq!(ps.owner(), Some(b));
+        ps.active = Some(ghost);
+        assert_eq!(ps.owner(), Some(a), "an owner without a stream here is no owner");
+        for c in [a, b] {
+            assert_eq!(ps.owner() == Some(c), ps.auto_allowed(c));
+        }
+        // The owner detaches: the other attached client owns the pane.
+        ps.active = Some(a);
+        ps.leave(a, false);
+        assert_eq!(ps.owner(), Some(b));
+        ps.leave(b, false);
+        assert_eq!(ps.owner(), None);
+    }
+
+    #[test]
+    fn wire_owner_maps_every_kind_and_an_unknown_one_to_unknown() {
+        let o = |k: &str| SizeOwner {
+            client_id: Uuid::nil(),
+            client_kind: k.to_string(),
+            client_name: String::new(),
+        };
+        for (s, k) in [
+            ("windows", ClientKind::Windows),
+            ("android", ClientKind::Android),
+            ("cli", ClientKind::Cli),
+            ("gtk", ClientKind::Gtk),
+            ("local", ClientKind::Local),
+            ("unknown", ClientKind::Unknown),
+            ("something new", ClientKind::Unknown),
+        ] {
+            assert_eq!(wire_owner(&o(s)).client_kind, k, "{s}");
+        }
     }
 }

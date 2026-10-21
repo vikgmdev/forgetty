@@ -285,6 +285,30 @@ where
 /// the client writes are dropped unread (V2-003 SPEC §4.4).
 ///
 /// For all other methods: delegates synchronously to `handlers::dispatch`.
+/// The id and name a streaming connection registers under. A `client_id`
+/// param (a UUID) names the client across its connections; without one every
+/// connection is a client of its own. The name is clipped and cleaned: it
+/// reaches `list_clients` and logs.
+fn client_identity(
+    request: &crate::protocol::Request,
+    default_name: impl FnOnce() -> String,
+) -> (String, String) {
+    let id = request
+        .params
+        .get("client_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        .unwrap_or_else(uuid::Uuid::new_v4);
+    let name = request
+        .params
+        .get("client_name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.chars().filter(|c| !c.is_control()).take(64).collect::<String>())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(default_name);
+    (id.to_string(), name)
+}
+
 async fn handle_streaming_connection(
     stream: tokio::net::UnixStream,
     sm: Arc<SessionManager>,
@@ -395,11 +419,8 @@ async fn handle_streaming_connection(
             // ---------------------------------------------------------------
             let (mut rx, replay_bytes, _replay_hwm) = sm.subscribe_with_snapshot(pane_id);
             // AD-017: a streaming socket is an attached client until it closes.
-            let Ok(_client) = sm.clients().register(
-                uuid::Uuid::new_v4().to_string(),
-                "socket",
-                format!("subscribe_output {pane_id}"),
-            ) else {
+            let (cid, cname) = client_identity(&request, || format!("subscribe_output {pane_id}"));
+            let Ok(_client) = sm.clients().register(cid.clone(), "socket", cname) else {
                 let resp = Response::error(
                     request.id.clone(),
                     crate::protocol::SERVER_BUSY,
@@ -408,6 +429,11 @@ async fn handle_streaming_connection(
                 write_response(&mut writer, &resp).await?;
                 return Ok(());
             };
+            // AD-020: this client has a stream on the pane until this
+            // function returns. Only such a client can own the pane's size.
+            let _output = uuid::Uuid::parse_str(&cid)
+                .ok()
+                .map(|client| sm.attach_local_output(client, pane_id));
 
             // Send the initial acknowledgment (last line-mode JSON response
             // on this connection).
@@ -510,11 +536,8 @@ async fn handle_streaming_connection(
             // Reuse the same broadcast channel as subscribe_output; we filter
             // to layout variants in the loop below.
             let mut rx = sm.subscribe_output();
-            let Ok(_client) = sm.clients().register(
-                uuid::Uuid::new_v4().to_string(),
-                "socket",
-                "subscribe_layout".to_string(),
-            ) else {
+            let (cid, cname) = client_identity(&request, || "subscribe_layout".to_string());
+            let Ok(_client) = sm.clients().register(cid, "socket", cname) else {
                 let resp = Response::error(
                     request.id.clone(),
                     crate::protocol::SERVER_BUSY,
@@ -947,12 +970,46 @@ async fn handle_streaming_connection(
             continue;
         }
 
-        let response = handlers::dispatch(
-            &request,
-            Arc::clone(&sm),
-            sync_endpoint.as_ref().map(Arc::clone),
-            session_id,
-        );
+        // `send_input` may wait up to 10 s for room in a pane whose program
+        // does not read (AD-024), `capture` feeds the whole ring through a
+        // terminal, and `send_sigint` waits for a stuck writer to stop before
+        // it signals. All three would hold a runtime worker, so they run on
+        // the blocking pool. The connection still answers in order. A handler that
+        // panics or dies gets an error back, never a closed connection.
+        let heavy = request.method == methods::SEND_INPUT
+            || request.method == methods::CAPTURE
+            || request.method == methods::SEND_SIGINT;
+        let response = if heavy {
+            let (req, sm2, se, sid) = (
+                request.clone(),
+                Arc::clone(&sm),
+                sync_endpoint.as_ref().map(Arc::clone),
+                session_id,
+            );
+            let method = request.method.clone();
+            match tokio::task::spawn_blocking(move || guarded_dispatch(&req, sm2, se, sid)).await {
+                Ok(r) => r,
+                Err(e) => {
+                    error!("socket: {method}: handler task failed: {e}");
+                    Response::error(
+                        request.id.clone(),
+                        crate::protocol::INTERNAL_ERROR,
+                        format!("{method}: handler task failed: {e}"),
+                    )
+                }
+            }
+        } else {
+            guarded_dispatch(
+                &request,
+                Arc::clone(&sm),
+                sync_endpoint.as_ref().map(Arc::clone),
+                session_id,
+            )
+        };
+        if let Some(err) = &response.error {
+            // A failed call always says why in the server log.
+            warn!("socket: {} failed: code {}: {}", request.method, err.code, err.message);
+        }
         write_response(&mut writer, &response).await?;
     }
 
@@ -1078,6 +1135,9 @@ pub fn add_shutdown_hook(hook: Box<dyn Fn() + Send + Sync>) {
     SHUTDOWN_HOOKS.lock().unwrap_or_else(|e| e.into_inner()).push(hook);
 }
 
+/// Longest `graceful_exit` waits for the byte logs to flush, and again to seal.
+const BYTE_LOG_STOP_LIMIT: std::time::Duration = std::time::Duration::from_secs(3);
+
 pub async fn graceful_exit(
     sm: &SessionManager,
     sync_endpoint: Option<&SyncEndpoint>,
@@ -1087,8 +1147,15 @@ pub async fn graceful_exit(
     // Freeze the layout first: nothing that happens from here on (a child
     // dying with the server, a late PaneClosed) may rewrite the saved layout.
     sm.begin_shutdown();
-    sm.flush_all_byte_logs().await;
-    sm.seal_all_byte_logs().await;
+    // Bounded: a full disk or a stuck appender must not hang `server stop`.
+    // A log that did not flush or seal stays unsealed, and the next start
+    // treats it as a crash (offsets move forward, nothing is reused).
+    if tokio::time::timeout(BYTE_LOG_STOP_LIMIT, sm.flush_all_byte_logs()).await.is_err() {
+        warn!("byte log flush did not finish in {BYTE_LOG_STOP_LIMIT:?}, stopping anyway");
+    }
+    if tokio::time::timeout(BYTE_LOG_STOP_LIMIT, sm.seal_all_byte_logs()).await.is_err() {
+        warn!("byte log seal did not finish in {BYTE_LOG_STOP_LIMIT:?}, stopping anyway");
+    }
     info!("byte logs flushed");
     for hook in SHUTDOWN_HOOKS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
         hook();
@@ -1104,6 +1171,38 @@ pub async fn graceful_exit(
 }
 
 /// Serialize and write a JSON-RPC response as a newline-terminated line.
+/// [`handlers::dispatch`] that turns a panic in a handler into an error
+/// response and a log line. A panic must not close the connection without a
+/// word (the CLI would only say "server closed the connection").
+fn guarded_dispatch(
+    request: &Request,
+    sm: Arc<SessionManager>,
+    se: Option<Arc<SyncEndpoint>>,
+    session_id: Option<uuid::Uuid>,
+) -> Response {
+    guard_handler(request, || handlers::dispatch(request, sm, se, session_id))
+}
+
+/// Run `f`, and answer `request` with an internal error if it panics.
+fn guard_handler(request: &Request, f: impl FnOnce() -> Response) -> Response {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(r) => r,
+        Err(payload) => {
+            let why = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "panic".to_string());
+            error!("socket: {} panicked: {why}", request.method);
+            Response::error(
+                request.id.clone(),
+                crate::protocol::INTERNAL_ERROR,
+                format!("{} failed inside the server: {why}", request.method),
+            )
+        }
+    }
+}
+
 async fn write_response(
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     response: &Response,
@@ -1138,6 +1237,28 @@ fn default_socket_path() -> PathBuf {
 mod tests {
     use super::*;
     use forgetty_session::SessionManager;
+
+    #[test]
+    fn a_panicking_handler_answers_with_an_error() {
+        let req = Request {
+            jsonrpc: "2.0".into(),
+            method: "capture".into(),
+            params: serde_json::Value::Null,
+            id: Some(serde_json::json!(7)),
+        };
+        let resp = guard_handler(&req, || panic!("vt blew up"));
+        let err = resp.error.expect("an error response");
+        assert_eq!(err.code, crate::protocol::INTERNAL_ERROR);
+        assert!(
+            err.message.contains("capture") && err.message.contains("vt blew up"),
+            "{}",
+            err.message
+        );
+        assert_eq!(resp.id, Some(serde_json::json!(7)));
+        // A normal handler passes through.
+        let ok = guard_handler(&req, || Response::success(req.id.clone(), serde_json::json!(1)));
+        assert!(ok.error.is_none());
+    }
 
     #[tokio::test]
     async fn peer_from_another_uid_is_refused() {

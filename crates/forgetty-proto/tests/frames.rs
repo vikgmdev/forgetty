@@ -107,6 +107,7 @@ async fn pane_stream_shape() {
         rows: 24,
         cols: 80,
         snapshot_len: 0,
+        replay_end: None,
     };
     write_msg(&mut a, &h).await.unwrap();
     write_output_frame(&mut a, b"\x1b[31mred").await.unwrap();
@@ -120,10 +121,16 @@ async fn pane_stream_shape() {
 }
 
 #[test]
-fn unknown_event_variant_fails_decode_cleanly() {
-    // A frame from a newer server with an event this crate does not know.
+fn unknown_event_variant_decodes_as_unknown() {
+    // A frame from a newer server with an event this crate does not know: the
+    // frame decodes, so its `seq` is not lost and nothing is torn down.
     let bytes = rmp_unknown_event();
-    assert!(matches!(decode_msg::<ControlMsg>(&bytes), Err(FrameError::Decode(_))));
+    assert!(matches!(
+        decode_msg::<ControlMsg>(&bytes),
+        Ok(ControlMsg::Event { event: ServerEvent::Unknown, .. })
+    ));
+    // Other garbage is still a clean decode error.
+    assert!(matches!(decode_msg::<ControlMsg>(&[0xc1]), Err(FrameError::Decode(_))));
 }
 
 fn rmp_unknown_event() -> Vec<u8> {

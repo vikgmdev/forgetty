@@ -16,9 +16,10 @@ pub mod msg;
 
 pub use consts::*;
 pub use frame::{
-    decode_input_frame, decode_msg, encode_input_frame, encode_msg, read_frame, read_frame_into,
-    read_input_frame, read_msg, read_output_frame, write_frame, write_input_frame, write_msg,
-    write_output_frame, FrameError,
+    decode_input_frame, decode_input_frame_flags, decode_msg, encode_input_frame,
+    encode_input_frame_flags, encode_msg, read_frame, read_frame_into, read_input_frame,
+    read_input_frame_flags, read_msg, read_output_frame, write_frame, write_input_frame,
+    write_input_frame_flags, write_msg, write_output_frame, FrameError,
 };
 pub use msg::*;
 /// MessagePack dynamic value used for `params` and `result`.

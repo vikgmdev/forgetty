@@ -195,6 +195,8 @@ struct State {
     dedup_drops: AtomicU64,
     hold_acks: AtomicBool,
     server_id: Uuid,
+    /// New for each start of the server, like the real one's.
+    boot_id: Uuid,
     panes: Mutex<HashMap<Uuid, PaneLog>>,
     conns: Mutex<Vec<Connection>>,
     events: broadcast::Sender<(u64, ServerEvent)>,
@@ -267,6 +269,7 @@ impl TestServer {
             dedup_drops: AtomicU64::new(0),
             hold_acks: AtomicBool::new(false),
             server_id: Uuid::new_v4(),
+            boot_id: Uuid::new_v4(),
             panes: Mutex::new(HashMap::new()),
             conns: Mutex::new(Vec::new()),
             events,
@@ -453,10 +456,25 @@ impl TestServer {
     /// Stop the server for `duration` without closing anything: it neither
     /// reads nor writes a packet, like a dead network or a hung process. Needs
     /// `own_runtime`. Queued packets are handled when it thaws.
+    ///
+    /// Returns only when both worker threads are blocked. `Runtime::spawn`
+    /// returns at once, and on a busy box the blocking tasks may not run for a
+    /// while: a packet that arrives meanwhile is answered, and a caller that
+    /// counts on the silence (a Ping with no Pong) is wrong.
     pub fn freeze(&self, duration: Duration) {
         let rt = self.rt.as_ref().expect("freeze needs TestServerConfig::own_runtime");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
         for _ in 0..2 {
-            rt.spawn(async move { std::thread::sleep(duration) });
+            let started = started_tx.clone();
+            rt.spawn(async move {
+                let _ = started.send(());
+                std::thread::sleep(duration);
+            });
+        }
+        for _ in 0..2 {
+            if started_rx.recv_timeout(Duration::from_secs(10)).is_err() {
+                break; // the runtime is not scheduling: nothing more to wait for
+            }
         }
     }
 }
@@ -542,6 +560,7 @@ async fn handle_rpc(conn: Connection, state: Arc<State>) {
         server_version: "test".into(),
         hostname: "test-host".into(),
         capabilities: state.cfg.capabilities.clone(),
+        boot_id: Some(state.boot_id),
     };
     if write_msg(&mut send, &HandshakeReply::Welcome(welcome)).await.is_err() {
         return;
@@ -665,7 +684,7 @@ fn handle_request(
         }
         method::ATTACH_PANE => {
             let p: AttachPaneParams = from_value(params).map_err(bad)?;
-            let (start, reset, rows, cols, notify) = {
+            let (start, reset, rows, cols, notify, total) = {
                 let panes = lock(&state.panes);
                 let Some(log) = panes.get(&p.pane_id) else {
                     return Err((error_code::NOT_FOUND, "no such pane".into()));
@@ -678,7 +697,7 @@ fn handle_request(
                     Some(o) if o < log.first => (log.first, true),
                     Some(o) => (o, false),
                 };
-                (start, reset, log.rows, log.cols, log.notify.clone())
+                (start, reset, log.rows, log.cols, log.notify.clone(), total)
             };
             lock(&state.attaches).push((p.pane_id, p.from_offset));
             if let Some(old) = streams.remove(&p.pane_id) {
@@ -695,6 +714,7 @@ fn handle_request(
                     rows,
                     cols,
                     snapshot_len: 0,
+                    replay_end: Some(total),
                 },
             ));
             streams.insert(p.pane_id, handle);
@@ -720,7 +740,13 @@ fn handle_request(
             let seq = state.event_seq.fetch_add(1, Ordering::SeqCst) + 1;
             let _ = state.events.send((
                 seq,
-                ServerEvent::PaneResized { pane_id: p.pane_id, rows: p.rows, cols: p.cols },
+                ServerEvent::PaneResized {
+                    pane_id: p.pane_id,
+                    rows: p.rows,
+                    cols: p.cols,
+                    // The mock keeps no size owner (the real server does).
+                    size_owner: None,
+                },
             ));
             to_value(&OkResult { ok: true }).map_err(bad)
         }

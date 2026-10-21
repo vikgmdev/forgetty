@@ -83,6 +83,8 @@ const CLOSE_GRACE: std::time::Duration = std::time::Duration::from_millis(300);
 
 struct SessionManagerInner {
     panes: HashMap<PaneId, PaneState>,
+    /// The size owner of each pane that has one (AD-020).
+    size_owners: HashMap<PaneId, crate::sizes::SizeOwner>,
     /// Tracks insertion order so `list_panes()` returns panes in creation order.
     /// `HashMap` iteration is non-deterministic; preserving order ensures tabs
     /// are restored in the same visual position after a window reopen.
@@ -143,11 +145,47 @@ pub struct SessionManager {
     inner: Arc<Mutex<SessionManagerInner>>,
     /// Attached clients (AD-017). Shared by every clone.
     clients: crate::clients::ClientRegistry,
+    /// The size policy local clients go through (AD-020). Shared by every clone.
+    governor: Arc<std::sync::OnceLock<Arc<dyn crate::sizes::SizeGovernor>>>,
+}
+
+/// A local `subscribe_output` on a pane (see
+/// [`SessionManager::attach_local_output`]). Drop it when the stream ends.
+pub struct LocalOutputGuard {
+    sm: SessionManager,
+    client: Uuid,
+    pane: PaneId,
+}
+
+impl Drop for LocalOutputGuard {
+    fn drop(&mut self) {
+        if let Some(g) = self.sm.governor.get() {
+            g.local_detached(self.client, self.pane);
+        }
+    }
 }
 
 /// Largest rows or columns a pane takes. A client can ask for any `u16`; the
 /// grid memory and the VT work of a pane grow with its size.
 pub const MAX_PANE_DIM: u16 = 1000;
+
+/// `size` with rows and columns clamped to `1..=MAX_PANE_DIM`.
+fn clamp_size(mut size: PtySize) -> PtySize {
+    size.rows = clamp_pane_dim(size.rows);
+    size.cols = clamp_pane_dim(size.cols);
+    size
+}
+
+/// What happened to remote input put in a pane's queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputOutcome {
+    /// In the queue.
+    Queued,
+    /// The queue was full: the bytes were dropped.
+    Full,
+    /// The pane is gone or its PTY is closed: the bytes are spent.
+    Gone,
+}
 
 /// Clamp a requested rows or columns value to `1..=MAX_PANE_DIM`.
 pub fn clamp_pane_dim(n: u16) -> u16 {
@@ -160,6 +198,7 @@ impl SessionManager {
         let event_tx = EventBus::new();
         Self {
             clients: crate::clients::ClientRegistry::new(),
+            governor: Arc::new(std::sync::OnceLock::new()),
             inner: Arc::new(Mutex::new(SessionManagerInner {
                 panes: HashMap::new(),
                 pane_order: Vec::new(),
@@ -173,6 +212,7 @@ impl SessionManager {
                 exit_history: std::collections::VecDeque::new(),
                 osc_scanning: true,
                 shutting_down: false,
+                size_owners: HashMap::new(),
             })),
         }
     }
@@ -188,6 +228,10 @@ impl SessionManager {
     pub fn begin_shutdown(&self) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.shutting_down = true;
+        // A disk that keeps failing must not hold the stop: appenders give up.
+        for log in inner.byte_logs.values() {
+            log.set_stopping();
+        }
     }
 
     /// Whether [`begin_shutdown`](Self::begin_shutdown) was called.
@@ -205,6 +249,63 @@ impl SessionManager {
     /// Registry of attached clients (iroh connections and streaming sockets).
     pub fn clients(&self) -> &crate::clients::ClientRegistry {
         &self.clients
+    }
+
+    /// Install the size policy. Local clients go through it from now on. Only
+    /// the first call has an effect.
+    pub fn set_size_governor(&self, governor: Arc<dyn crate::sizes::SizeGovernor>) {
+        let _ = self.governor.set(governor);
+    }
+
+    /// The size owner of `id` (AD-020).
+    pub fn size_owner(&self, id: PaneId) -> Option<crate::sizes::SizeOwner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).size_owners.get(&id).cloned()
+    }
+
+    /// Record the size owner of `id`. Sends `SizeOwnerChanged` when it
+    /// differs from the recorded one. Returns whether it changed.
+    ///
+    /// The server calls this while it holds its per-pane `sizes` lock, so the
+    /// lock order is `sizes`, then `inner`. Never take that lock while holding
+    /// `inner`.
+    pub fn set_size_owner(&self, id: PaneId, owner: Option<crate::sizes::SizeOwner>) -> bool {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.size_owners.get(&id) == owner.as_ref() {
+            return false;
+        }
+        match &owner {
+            Some(o) => inner.size_owners.insert(id, o.clone()),
+            None => inner.size_owners.remove(&id),
+        };
+        let _ = inner.event_tx.send(SessionEvent::SizeOwnerChanged { pane_id: id, owner });
+        true
+    }
+
+    /// Drop the owner record of a pane that is gone. No event.
+    pub fn forget_size_owner(&self, id: PaneId) {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).size_owners.remove(&id);
+    }
+
+    /// A local client has a `subscribe_output` on `pane` until the guard is
+    /// dropped. Only such a client can own the pane's size (AD-020).
+    pub fn attach_local_output(&self, client: Uuid, pane: PaneId) -> LocalOutputGuard {
+        if let Some(g) = self.governor.get() {
+            g.local_attached(client, pane);
+        }
+        LocalOutputGuard { sm: self.clone(), client, pane }
+    }
+
+    /// A resize asked for by a local client. With a `client` the size policy
+    /// decides (the client may become the owner); without one the size is
+    /// applied and ownership stays as it is.
+    pub fn resize_pane_for(&self, client: Option<Uuid>, id: PaneId, size: PtySize) -> Result<()> {
+        match (client, self.governor.get()) {
+            (Some(client), Some(governor)) => {
+                governor.local_resize(client, id, size);
+                Ok(())
+            }
+            _ => self.resize_pane(id, size),
+        }
     }
 
     /// Configure byte-log sizes for subsequently-created panes (V2-007).
@@ -971,6 +1072,7 @@ impl SessionManager {
         pane_id: PaneId,
         remain_on_exit: bool,
     ) -> Result<(PaneId, Uuid)> {
+        let size = clamp_size(size);
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
         // Bounds-check BEFORE spawning, so we never spawn a dangling PTY.
@@ -1039,6 +1141,7 @@ impl SessionManager {
         size: PtySize,
         cwd: Option<PathBuf>,
     ) -> Result<PaneId> {
+        let size = clamp_size(size);
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
         if !inner.panes.contains_key(&pane_id) {
@@ -1135,6 +1238,7 @@ impl SessionManager {
         cwd: Option<PathBuf>,
         new_pane_id: PaneId,
     ) -> Result<PaneId> {
+        let size = clamp_size(size);
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
         if !inner.panes.contains_key(&pane_id) {
@@ -1636,19 +1740,40 @@ impl SessionManager {
     // I/O
     // -----------------------------------------------------------------------
 
-    /// Read the byte the kernel's line discipline treats as the interrupt
-    /// character (`c_cc[VINTR]`) for the given pane's PTY.
+    /// The byte the kernel's line discipline turns into SIGINT for this
+    /// pane's PTY right now (`c_cc[VINTR]`).
     ///
-    /// Returns `None` if the pane is unknown or the termios read fails;
-    /// callers should fall back to `0x03` (POSIX default). The daemon's
-    /// Ctrl+C path uses this so it can write the byte the line discipline
-    /// will actually translate to `SIGINT` — both locally and (because ssh
-    /// forwards `VINTR` via `pty-modes`) on the remote end of an SSH
-    /// session (FIX-017).
+    /// `None` if the pane is unknown, the termios read fails, `ISIG` is off
+    /// (an editor in raw mode takes Ctrl+C as input) or VINTR is disabled.
+    /// The caller then sends no interrupt byte and signals nothing for a
+    /// plain byte. Users who remap VINTR (`stty intr ^X`) and ssh sessions
+    /// that forward it through pty-modes are covered (FIX-017).
     pub fn intr_byte(&self, id: PaneId) -> Option<u8> {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let pane = inner.panes.get(&id)?;
         pane.pty_bridge.pty.vintr()
+    }
+
+    /// Interrupt the pane's foreground program once. The interrupt byte goes
+    /// into the PTY and the line discipline turns it into SIGINT (cooked
+    /// mode), which also reaches programs that forward the byte (ssh, mosh).
+    /// The group is signalled directly only when no byte was queued: `ISIG`
+    /// is off (a raw-mode program that swallows Ctrl+C, BUG-001), VINTR is
+    /// disabled or the queue is full. Both together would deliver SIGINT
+    /// twice to a cooked-mode program, and terraform or docker compose skip
+    /// their graceful stop on the second one.
+    ///
+    /// Returns `true` when the byte was queued. The caller drops the stale
+    /// input first ([`Self::discard_queued_input`]).
+    pub fn interrupt(&self, id: PaneId) -> bool {
+        if let Some(b) = self.intr_byte(id) {
+            match self.write_pty(id, &[b]) {
+                Ok(()) => return true,
+                Err(e) => debug!(%id, "interrupt: byte not queued: {e}"),
+            }
+        }
+        self.send_sigint(id);
+        false
     }
 
     /// The pane's input queue. Takes `inner` only to find it.
@@ -1679,32 +1804,92 @@ impl SessionManager {
             .map_err(|e| forgetty_core::ForgettyError::Pty(format!("pane {id}: {e}")))
     }
 
-    /// Like [`Self::write_pty_queued`], but returns only when the PTY has
-    /// taken every byte. Input acks follow this.
-    pub async fn write_pty_wait(&self, id: PaneId, data: Vec<u8>) -> Result<()> {
+    /// Like [`Self::write_pty`] for synchronous callers that are trusted (the
+    /// local socket): blocks the calling thread until the queue has room, up
+    /// to `timeout`, instead of dropping the bytes.
+    pub fn write_pty_blocking(
+        &self,
+        id: PaneId,
+        data: &[u8],
+        timeout: std::time::Duration,
+    ) -> Result<()> {
         let w = self
             .pane_writer(id)
             .ok_or_else(|| forgetty_core::ForgettyError::Pty(format!("pane {id} not found")))?;
-        w.write(data)
-            .await
+        w.queue_blocking(data.to_vec(), timeout)
             .map_err(|e| forgetty_core::ForgettyError::Pty(format!("pane {id}: {e}")))
     }
 
-    /// Queue input for a pane, waiting for room only, and return the receiver
-    /// that fires once the PTY has taken the bytes. Dropping the future before
-    /// it returns queues nothing. After it returns the bytes are queued, so
-    /// the caller can record them as written-in-order at once.
-    pub async fn write_pty_enqueue(
+    /// Put remote input in the pane's queue without waiting (AD-024). A full
+    /// queue drops the bytes: the caller counts and logs it.
+    pub fn queue_input(&self, id: PaneId, data: Vec<u8>) -> InputOutcome {
+        let Some(w) = self.pane_writer(id) else { return InputOutcome::Gone };
+        match w.try_queue(data) {
+            Ok(()) => InputOutcome::Queued,
+            Err(crate::pane_writer::QueueError::Full) => InputOutcome::Full,
+            Err(crate::pane_writer::QueueError::Closed) => InputOutcome::Gone,
+        }
+    }
+
+    /// [`Self::queue_input`] that runs `on_end` when the bytes leave the queue
+    /// for good (written, discarded or given up). Not run unless `Queued`.
+    pub fn queue_input_tracked(
         &self,
         id: PaneId,
         data: Vec<u8>,
-    ) -> Result<tokio::sync::oneshot::Receiver<std::result::Result<(), String>>> {
-        let w = self
-            .pane_writer(id)
-            .ok_or_else(|| forgetty_core::ForgettyError::Pty(format!("pane {id} not found")))?;
-        w.queue_with_done(data)
-            .await
-            .map_err(|e| forgetty_core::ForgettyError::Pty(format!("pane {id}: {e}")))
+        on_end: crate::pane_writer::OnEnd,
+    ) -> InputOutcome {
+        let Some(w) = self.pane_writer(id) else { return InputOutcome::Gone };
+        match w.try_queue_tracked(data, on_end) {
+            Ok(()) => InputOutcome::Queued,
+            Err(crate::pane_writer::QueueError::Full) => InputOutcome::Full,
+            Err(crate::pane_writer::QueueError::Closed) => InputOutcome::Gone,
+        }
+    }
+
+    /// Throw away input meant for the program an interrupt ends (a stale
+    /// paste must not run in the shell after Ctrl+C): what the pane queued,
+    /// what the writer has half written, and what the terminal holds unread.
+    /// Blocks up to 300 ms for a stuck write to let go. Returns the bytes
+    /// dropped from the queue.
+    pub fn discard_queued_input(&self, id: PaneId) -> usize {
+        let Some(w) = self.pane_writer(id) else { return 0 };
+        let freed = w.discard_pending();
+        // The write under way is woken and stops. Flush the terminal only
+        // after that, or the room it makes lets the write go on.
+        w.wait_idle(std::time::Duration::from_millis(300));
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pane) = inner.panes.get(&id) {
+            pane.pty_bridge.pty.flush_pending_input();
+        }
+        freed
+    }
+
+    /// Bytes waiting in a pane's input queue, `None` for an unknown pane.
+    pub fn queued_input_bytes(&self, id: PaneId) -> Option<usize> {
+        self.pane_writer(id).map(|w| w.queued_bytes())
+    }
+
+    /// Close every pane's input queue and wait up to `timeout` in all for what
+    /// is queued to be written (graceful stop, AD-024). Returns the number of
+    /// panes whose queue did not drain.
+    pub fn close_input_queues_and_drain(&self, timeout: std::time::Duration) -> usize {
+        let writers: Vec<_> = {
+            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            inner.panes.values().map(|p| p.pty_bridge.writer.handle()).collect()
+        };
+        let deadline = std::time::Instant::now() + timeout;
+        let mut left = 0;
+        // Close all first, so none takes new input while the others drain.
+        for w in &writers {
+            w.close();
+        }
+        for w in &writers {
+            if !w.close_and_drain(deadline) {
+                left += 1;
+            }
+        }
+        left
     }
 
     /// Resize a pane's PTY to new dimensions.
@@ -1726,10 +1911,12 @@ impl SessionManager {
         pane.rows = size.rows;
         pane.cols = size.cols;
         if changed {
+            let size_owner = inner.size_owners.get(&id).cloned();
             let _ = inner.event_tx.send(SessionEvent::PaneResized {
                 pane_id: id,
                 rows: size.rows,
                 cols: size.cols,
+                size_owner,
             });
         }
         Ok(())
@@ -2313,8 +2500,9 @@ impl SessionManager {
 
     /// Send SIGINT to the foreground process group of a pane.
     ///
-    /// Daemon-side implementation of the Ctrl+C signal path:
-    /// 1. The caller (handle_send_sigint) already wrote 0x03 via write_pty.
+    /// Daemon-side implementation of the Ctrl+C signal path. Call it through
+    /// [`Self::interrupt`], which runs it only when no interrupt byte went in.
+    /// 1. The caller wrote no byte (or it failed).
     /// 2. This method calls kill(-pgid, SIGINT) UNLESS the foreground pgrp
     ///    leader is a known signal-forwarder (ssh, mosh-client, telnet, rsh).
     ///    Forwarders read 0x03 from stdin and pass it through; killing them

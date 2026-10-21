@@ -41,6 +41,11 @@ mkdir -p "$CLIENT_DATA"
 BG_PIDS=()
 
 fg() { "$BIN/forgetty" --state-dir "$STATE" "$@"; }
+# `grep -q` leaves at the first match. A writer that still has output to send
+# then gets SIGPIPE, and under `pipefail` the pipeline fails (the CLI died this
+# way when the box was busy: 17 % of `server status | grep -q` under load).
+# `qgrep` reads all its input, so the writer always finishes.
+qgrep() { grep "$@" >/dev/null; }
 # QA bins: own identity dir, never the user's real one.
 qa() { local tool="$1"; shift; XDG_DATA_HOME="$CLIENT_DATA" "$BIN/$tool" "$@"; }
 
@@ -81,7 +86,7 @@ PANE="$(fg new -- bash -c 'sleep 30; echo p1-done; exec sleep 3600')" || fail "f
 PANE_T0=$(date +%s)
 [ -n "$PANE" ] || fail "no pane id"
 echo "node_id=$NODE_ID pane=$PANE"
-fg ls | grep -q "$PANE" || fail "pane not in ls"
+fg ls | qgrep "$PANE" || fail "pane not in ls"
 pass "server started, pane $PANE running"
 
 # ------------------------------------------------------------------ 2. pairing
@@ -89,33 +94,33 @@ step "pairing (AD-021)"
 fg pair >"$STATE/pair.out" 2>&1 &
 PAIR_PID=$!
 BG_PIDS+=("$PAIR_PID")
-for _ in $(seq 1 50); do grep -q '^payload: ' "$STATE/pair.out" 2>/dev/null && break; sleep 0.1; done
+for _ in $(seq 1 50); do qgrep '^payload: ' "$STATE/pair.out" 2>/dev/null && break; sleep 0.1; done
 PAYLOAD="$(sed -n 's/^payload: //p' "$STATE/pair.out")"
 [ -n "$PAYLOAD" ] || { cat "$STATE/pair.out"; fail "forgetty pair printed no payload"; }
-grep -q '"v":2' <<<"$PAYLOAD" || fail "payload is not v2: $PAYLOAD"
-grep -q '"secret"' <<<"$PAYLOAD" || fail "payload has no secret"
+qgrep '"v":2' <<<"$PAYLOAD" || fail "payload is not v2: $PAYLOAD"
+qgrep '"secret"' <<<"$PAYLOAD" || fail "payload has no secret"
 
 OUT="$(qa forgetty-pair-test --dial "$NODE_ID" --secret AAAAAAAAAAAAAAAAAAAAAAAAAA 2>&1)"; RC=$?
 echo "$OUT" | tail -2
-[ "$RC" != 0 ] && grep -q "bad_secret" <<<"$OUT" || fail "wrong secret was not refused"
+[ "$RC" != 0 ] && qgrep "bad_secret" <<<"$OUT" || fail "wrong secret was not refused"
 pass "wrong secret refused"
 
 OUT="$(qa forgetty-pair-test --payload "$PAYLOAD" --name gate-phone 2>&1)"; RC=$?
 echo "$OUT" | tail -2
-[ "$RC" = 0 ] && grep -q "paired ok" <<<"$OUT" || fail "right secret was refused"
+[ "$RC" = 0 ] && qgrep "paired ok" <<<"$OUT" || fail "right secret was refused"
 wait "$PAIR_PID" 2>/dev/null
-grep -q '^paired: gate-phone' "$STATE/pair.out" || { cat "$STATE/pair.out"; fail "forgetty pair did not report the device"; }
+qgrep '^paired: gate-phone' "$STATE/pair.out" || { cat "$STATE/pair.out"; fail "forgetty pair did not report the device"; }
 pass "right secret paired: $(grep '^paired:' "$STATE/pair.out")"
 
 OUT="$(qa forgetty-pair-test --payload "$PAYLOAD" --identity "$CLIENT_DATA/second.key" --name intruder 2>&1)"; RC=$?
 echo "$OUT" | tail -1
-[ "$RC" != 0 ] && grep -q "pair refused" <<<"$OUT" || fail "reused secret was accepted"
+[ "$RC" != 0 ] && qgrep "pair refused" <<<"$OUT" || fail "reused secret was accepted"
 pass "second attempt with the same secret refused"
 
-fg devices | grep -q gate-phone || fail "devices does not list gate-phone"
-fg devices | grep -q intruder && fail "intruder was paired"
+fg devices | qgrep gate-phone || fail "devices does not list gate-phone"
+fg devices | qgrep intruder && fail "intruder was paired"
 OUT="$(fg pair --ttl 2 2>&1)"; RC=$?
-grep -q '^expired' <<<"$OUT" && [ "$RC" = 1 ] || { echo "$OUT" | tail -3; fail "pair window did not expire (rc=$RC)"; }
+qgrep '^expired' <<<"$OUT" && [ "$RC" = 1 ] || { echo "$OUT" | tail -3; fail "pair window did not expire (rc=$RC)"; }
 pass "devices lists the phone; unused window expires"
 
 # ------------------------------------------------------------------ 3. attach / leave
@@ -128,18 +133,18 @@ for _ in $(seq 1 100); do
   sleep 0.2
 done
 [ "$(fg server status --json | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["clients"])')" = 1 ] || fail "attached client not counted"
-fg client ls | grep -q gate-phone || { fg client ls; fail "client ls does not show gate-phone"; }
+fg client ls | qgrep gate-phone || { fg client ls; fail "client ls does not show gate-phone"; }
 wait "$HOLD_PID"
-grep -q "PASS: held" "$STATE/hold.out" || { cat "$STATE/hold.out"; fail "attach client failed"; }
+qgrep "PASS: held" "$STATE/hold.out" || { cat "$STATE/hold.out"; fail "attach client failed"; }
 sleep 1
-fg ls | grep -q "$PANE" || fail "pane died when the client left"
+fg ls | qgrep "$PANE" || fail "pane died when the client left"
 pass "client attached (counted), left, pane still alive"
 
 step "p1-done appears later in a fresh subscribe"
 ELAPSED=$(( $(date +%s) - PANE_T0 ))
 [ "$ELAPSED" -lt 34 ] && sleep $(( 34 - ELAPSED ))
 OUT="$(qa forgetty-stream-test --dial "$NODE_ID" --pane-id "$PANE" --expect p1-done --timeout-secs 20 2>&1)"; RC=$?
-grep -q "PASS: expected output found" <<<"$OUT" && [ "$RC" = 0 ] || { echo "$OUT" | tail -5; fail "p1-done not seen in fresh subscribe"; }
+qgrep "PASS: expected output found" <<<"$OUT" && [ "$RC" = 0 ] || { echo "$OUT" | tail -5; fail "p1-done not seen in fresh subscribe"; }
 pass "p1-done seen after the original client was gone"
 
 # ------------------------------------------------------------------ 4. stop --if-idle
@@ -152,12 +157,12 @@ for _ in $(seq 1 100); do
   sleep 0.2
 done
 expect_rc 1 "stop --if-idle with a client attached" -- fg server stop --if-idle
-grep -q "client(s) attached" "$STATE/last.out" || { cat "$STATE/last.out"; fail "busy message missing"; }
+qgrep "client(s) attached" "$STATE/last.out" || { cat "$STATE/last.out"; fail "busy message missing"; }
 expect_rc 0 "server still up after refused stop" -- fg server status
 pass "stop --if-idle refused while a client is attached"
 # The client leaves on its own (graceful close), as a real app would.
 wait "$HOLD2_PID" 2>/dev/null
-grep -q "PASS: held" "$STATE/hold2.out" || { cat "$STATE/hold2.out"; fail "second attach client failed"; }
+qgrep "PASS: held" "$STATE/hold2.out" || { cat "$STATE/hold2.out"; fail "second attach client failed"; }
 for _ in $(seq 1 100); do
   [ "$(fg server status --json | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["clients"])')" = 0 ] && break
   sleep 0.2
@@ -169,9 +174,9 @@ pass "stop --if-idle succeeded once the client left"
 # ------------------------------------------------------------------ 5. restart
 step "restart restores layout and scrollback"
 expect_rc 0 "server start (2)" -- fg server start
-fg ls | grep -q "$PANE" || { fg ls; fail "pane id $PANE not listed after restart"; }
+fg ls | qgrep "$PANE" || { fg ls; fail "pane id $PANE not listed after restart"; }
 OUT="$(qa forgetty-stream-test --dial "$NODE_ID" --pane-id "$PANE" --expect p1-done --timeout-secs 20 2>&1)"; RC=$?
-grep -q "PASS: expected output found" <<<"$OUT" && [ "$RC" = 0 ] || { echo "$OUT" | tail -5; fail "scrollback not replayed after restart"; }
+qgrep "PASS: expected output found" <<<"$OUT" && [ "$RC" = 0 ] || { echo "$OUT" | tail -5; fail "scrollback not replayed after restart"; }
 pass "same pane id listed after restart, scrollback replayed"
 
 step "CLI send with id suffix"
@@ -179,7 +184,7 @@ SUFFIX="${PANE: -6}"
 fg send -p "$SUFFIX" 'echo p1-o"k"' || fail "forgetty send"
 fg send-key -p "$SUFFIX" enter || fail "forgetty send-key"
 OUT="$(qa forgetty-stream-test --dial "$NODE_ID" --pane-id "$PANE" --expect 'p1-ok' --timeout-secs 20 2>&1)"; RC=$?
-grep -q "PASS: expected output found" <<<"$OUT" && [ "$RC" = 0 ] || { echo "$OUT" | tail -5; fail "send + send-key output not seen"; }
+qgrep "PASS: expected output found" <<<"$OUT" && [ "$RC" = 0 ] || { echo "$OUT" | tail -5; fail "send + send-key output not seen"; }
 pass "send and send-key reached the restored pane"
 
 expect_rc 3 "unknown pane suffix" -- fg send -p ffffff x
@@ -208,7 +213,7 @@ sys.exit(0 if p and p[0].get("exited") is True and p[0].get("exit_code")==5 and 
   sleep 0.2
 done
 [ "$KOK" = 1 ] || { fg ls --json; fail "kept pane not listed as exited with code 5"; }
-fg ls | grep "$KPANE" | grep -q "exited 5" || { fg ls; fail "ls STATE column does not show exited 5"; }
+fg ls | grep "$KPANE" | qgrep "exited 5" || { fg ls; fail "ls STATE column does not show exited 5"; }
 python3 -I - "$SOCK" "$KPANE" <<'PY' || fail "close_pane on the kept pane"
 import json, socket, sys
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -223,16 +228,16 @@ while not buf.endswith(b"\n"):
     buf += chunk
 sys.exit(0 if "error" not in json.loads(buf) else 1)
 PY
-fg ls | grep -q "$KPANE" && fail "kept pane still listed after close_pane"
+fg ls | qgrep "$KPANE" && fail "kept pane still listed after close_pane"
 # a default pane that exits is gone
 DPANE="$(fg new -- sh -c 'exit 0')" || fail "forgetty new (default)"
 sleep 2
-fg ls | grep -q "$DPANE" && fail "default pane still listed after its process exited"
+fg ls | qgrep "$DPANE" && fail "default pane still listed after its process exited"
 pass "--keep pane stays (exit 5), close_pane removes it, default pane closes on exit"
 
 # old pair/1 clients are refused, not paired
 step "server version info"
-fg server status | grep -q "protocol: 2.0" || fail "status does not show protocol 2.0"
+fg server status | qgrep "protocol: 2.0" || fail "status does not show protocol 2.0"
 pass "status reports protocol 2.0"
 
 echo "P1 GATE: PASS"
