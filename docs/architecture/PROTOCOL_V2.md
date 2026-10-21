@@ -251,7 +251,7 @@ connected. Its `resize_pane` calls pass the same `client_id`. A resize with a
 `client_id` makes that client the owner at once, because a user at a local
 window is the active user. Without a `subscribe_output` on the pane the size
 applies and the owner does not change. A remote `Hello` with `client_kind`
-`local` or `unknown` is refused (`bad_request`, message `bad_hello`). A `client_id` that is not an attached streaming
+`local` is refused (`bad_request`, message `bad_hello`). `unknown` is accepted and listed as `unknown`. A `client_id` that is not an attached streaming
 client is an error (`invalid_params`). A one-shot `resize_pane` without
 `client_id` (the CLI) applies the size and does not change the owner. When the
 last connection of a local client closes, the owner passes on like any owner
@@ -314,8 +314,11 @@ known gap, section 12).
   therefore starts another connect attempt 400 ms, 800 ms, then 1.6 s after
   the dial starts (and every 800 ms after that), each sending a fresh first
   packet at once. The attempts overlap and the first to connect wins. The
-  others finish in the background and are closed, so the server is not left
-  with half-open connections. These attempts are inside one dial
+  others finish in the background and are closed (2 s at most), so the server
+  is not left with half-open connections. Every way a dial ends (its own
+  timeout, the 1 s direct limit, `network_changed()`, the other leg winning)
+  retires its attempts like this, never drops one half way through the
+  handshake. These attempts are inside one dial
   and do not use up the backoff above. `network_changed()` aborts the dial in
   flight and dials at once with the backoff reset. A cached direct address and
   the addresses of the pairing payload (relay) are dialed in parallel; the

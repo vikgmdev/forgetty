@@ -776,6 +776,24 @@ impl TestServer {
         }
     }
 
+    /// Run the real `forgetty` CLI against this server (`--state-dir`).
+    /// Returns its stdout, or its stderr and exit status on failure.
+    pub fn cli(&self, args: &[&str]) -> Result<String, String> {
+        let Inner::Real(r) = &self.inner else { panic!("mock server has no CLI") };
+        let out = Command::new(Real::binary())
+            .arg("--state-dir")
+            .arg(r.dir.path().join("state"))
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| e.to_string())?;
+        if out.status.success() {
+            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        } else {
+            Err(format!("{}: {}", out.status, String::from_utf8_lossy(&out.stderr)))
+        }
+    }
+
     /// Call a method on the real server's local socket.
     pub fn socket_call(&self, method: &str, params: Value) -> Result<Value, String> {
         match &self.inner {

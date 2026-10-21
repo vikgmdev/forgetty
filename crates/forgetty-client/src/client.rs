@@ -967,7 +967,11 @@ async fn supervise(shared: Arc<Shared>) {
         }
     }
     shared.link_tx.send_replace(None);
-    shared.endpoint.close().await;
+    // The close frames are out when `close` starts. What it waits for after
+    // that is the peers' acks, and connections that were retired (or lost
+    // across an outage) can take seconds to drain: an app that quits must not
+    // wait for them.
+    let _ = tokio::time::timeout(CLOSE_GRACE, shared.endpoint.close()).await;
     shared.state_tx.send_replace(final_state);
 }
 
@@ -985,55 +989,71 @@ const CONNECT_PROBES_MS: [u64; 3] = [400, 400, 800];
 /// A dial to the cached direct address gives up after this long.
 const DIRECT_DIAL_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// How long closing the client waits for its connections to drain.
+const CLOSE_GRACE: Duration = Duration::from_secs(1);
+
+/// How long connect attempts that lost the race, or were abandoned, get to
+/// finish their handshake so they can be closed. Past it they are dropped.
+const RETIRE_GRACE: Duration = Duration::from_secs(2);
+
+/// The connect attempts of one [`connect_probing`] call. When it goes out of
+/// scope, by a win, the 1 s direct limit, the dial timeout, a kick or the
+/// other leg winning, the attempts still in flight are retired, not dropped.
+/// Dropped half way through the handshake an attempt leaves a half-open
+/// connection on the server, which holds up its shutdown for seconds. Each one
+/// gets [`RETIRE_GRACE`] to finish and is then closed.
+struct Attempts(Option<tokio::task::JoinSet<Result<Connection, String>>>);
+
+impl Drop for Attempts {
+    fn drop(&mut self) {
+        let Some(mut set) = self.0.take() else { return };
+        if set.is_empty() {
+            return;
+        }
+        let Ok(rt) = tokio::runtime::Handle::try_current() else { return };
+        rt.spawn(async move {
+            let grace = tokio::time::sleep(RETIRE_GRACE);
+            tokio::pin!(grace);
+            loop {
+                tokio::select! {
+                    done = set.join_next() => match done {
+                        Some(Ok(Ok(conn))) => conn.close(0u32.into(), b"redundant dial"),
+                        Some(_) => {}
+                        None => return,
+                    },
+                    () = &mut grace => return,
+                }
+            }
+        });
+    }
+}
+
 /// QUIC connect to `target`: attempts overlap, one more every gap
 /// ([`CONNECT_PROBES_MS`]), and the first to connect wins. Fails at once on a
 /// real error, never on a timeout: the caller's dial timeout ends it.
 async fn connect_probing(shared: &Shared, target: EndpointAddr) -> Result<Connection, String> {
-    let mut attempts = tokio::task::JoinSet::new();
+    let mut attempts = Attempts(Some(tokio::task::JoinSet::new()));
     let mut n = 0usize;
     loop {
         let endpoint = shared.endpoint.clone();
         let to = target.clone();
-        attempts
-            .spawn(async move { endpoint.connect(to, ALPN_RPC).await.map_err(|e| e.to_string()) });
+        let set = attempts.0.as_mut().expect("set is taken only on drop");
+        set.spawn(async move { endpoint.connect(to, ALPN_RPC).await.map_err(|e| e.to_string()) });
         let gap = Duration::from_millis(CONNECT_PROBES_MS[n.min(CONNECT_PROBES_MS.len() - 1)]);
         n += 1;
+        let set = attempts.0.as_mut().expect("set is taken only on drop");
         tokio::select! {
-            Some(done) = attempts.join_next() => {
-                let result = match done {
+            Some(done) = set.join_next() => {
+                return match done {
                     Ok(result) => result,
                     Err(e) => Err(format!("connect attempt failed: {e}")),
                 };
-                if !attempts.is_empty() {
-                    retire_attempts(attempts);
-                }
-                return result;
             },
             () = tokio::time::sleep(gap) => {
                 debug!("client: connect attempt {n} unanswered after {gap:?}, another");
             }
         }
     }
-}
-
-/// Let the connect attempts that lost the race finish and close what they
-/// get. Dropped half way through the handshake they leave a half-open
-/// connection on the server, which holds up its shutdown for seconds.
-fn retire_attempts(mut attempts: tokio::task::JoinSet<Result<Connection, String>>) {
-    tokio::spawn(async move {
-        let grace = tokio::time::sleep(Duration::from_secs(3));
-        tokio::pin!(grace);
-        loop {
-            tokio::select! {
-                done = attempts.join_next() => match done {
-                    Some(Ok(Ok(conn))) => conn.close(0u32.into(), b"redundant dial"),
-                    Some(_) => {}
-                    None => return,
-                },
-                () = &mut grace => return,
-            }
-        }
-    });
 }
 
 /// Connect to `target` and run the handshake. `connect_limit` bounds the QUIC
