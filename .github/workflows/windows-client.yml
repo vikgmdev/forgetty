@@ -164,7 +164,7 @@ jobs:
         if: always()
         shell: pwsh
         run: |
-          wsl -d Ubuntu-24.04 -u root --exec bash -c "ls -la /root/.local/share/forgetty 2>&1 | head -20; tail -n 60 /root/.local/share/forgetty/server.log 2>&1" 
+          wsl -d Ubuntu-24.04 -u root --exec bash -c "ls -la /root/.local/share/forgetty 2>&1 | head -20; ls -la /root/.local/share/forgetty/logs | head -20; for f in $(ls -t /root/.local/share/forgetty/logs/*.log* 2>/dev/null | head -3); do echo ==== $f; tail -n 60 $f; done; ps aux | grep -c forgetty" 
 
       - name: Upload real-server smoke result
         if: always()

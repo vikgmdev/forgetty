@@ -419,6 +419,7 @@ impl ShellSmoke {
                 }
             }
         }
+        o.push_str(&self.real_diag());
         o
     }
 

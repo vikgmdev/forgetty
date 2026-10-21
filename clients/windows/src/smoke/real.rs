@@ -137,6 +137,25 @@ impl ShellSmoke {
         self.real.fed_t.is_some_and(|t| t.elapsed() >= quiet) && fed > 0
     }
 
+    /// Extra lines for the stuck-phase dump: server and pair output, and what `status` says.
+    pub(super) fn real_diag(&self) -> String {
+        if self.real.distro.is_empty() {
+            return String::new();
+        }
+        let mut o = format!("server log: {:?}\n", self.real.server_log.lock().unwrap().iter().rev().take(30).collect::<Vec<_>>());
+        let st = wsl(&self.real.distro, &[BIN, "server", "status", "--json"]).stdin(Stdio::null()).output();
+        match st {
+            Ok(out) => o.push_str(&format!(
+                "status: {:?} out={} err={}\n",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stdout).trim(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            )),
+            Err(e) => o.push_str(&format!("status: cannot run: {e}\n")),
+        }
+        o
+    }
+
     fn real_dump(&self, shell: &AppShell, cx: &gpui::App) {
         let mut o = String::new();
         for p in &self.real.panes {
