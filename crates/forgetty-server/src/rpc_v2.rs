@@ -611,11 +611,11 @@ impl RpcV2 {
         hello.client_name =
             forgetty_core::sanitize::untrusted_max(&hello.client_name, MAX_CLIENT_NAME_CHARS);
 
-        // `local` names the server's own socket clients and `unknown` is what
-        // a decoder makes of a kind it does not know. A remote client is
-        // neither, and must not pass for a local one in `list_clients` or as
-        // a size owner.
-        if matches!(hello.client_kind, ClientKind::Local | ClientKind::Unknown) {
+        // `local` names the server's own socket clients. A remote client is
+        // not one, and must not pass for it in `list_clients` or as a size
+        // owner. `unknown` is what a decoder makes of a kind it does not
+        // know: a newer client is accepted and shown as `unknown`.
+        if hello.client_kind == ClientKind::Local {
             let reply = HandshakeReply::Error(ErrorMsg {
                 code: error_code::BAD_REQUEST.into(),
                 message: format!(
