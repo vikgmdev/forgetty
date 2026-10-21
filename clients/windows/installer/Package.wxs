@@ -35,15 +35,15 @@
 
   <Fragment>
     <ComponentGroup Id="AppFiles" Directory="INSTALLFOLDER">
-      <Component Id="AppExe" Guid="*">
+      <Component Id="AppExe" Guid="718F72D1-69C5-491E-A8B6-9861A06611A4">
         <File Id="AppExeFile" Source="$(Payload)\forgetty-win.exe" />
         <RegistryValue Root="HKCU" Key="Software\Forgetty\Installer" Name="AppExe" Type="integer" Value="1" KeyPath="yes" />
       </Component>
-      <Component Id="VtDll" Guid="*">
+      <Component Id="VtDll" Guid="81C61D4D-A86C-4516-960B-6E149D71BED2">
         <File Id="VtDllFile" Source="$(Payload)\ghostty-vt.dll" />
         <RegistryValue Root="HKCU" Key="Software\Forgetty\Installer" Name="VtDll" Type="integer" Value="1" KeyPath="yes" />
       </Component>
-      <Component Id="CliName" Guid="*">
+      <Component Id="CliName" Guid="7DD9C4D4-D9BF-446C-B2AB-5EBEAEEDA997">
         <File Id="CliExeFile" Name="forgetty.exe" Source="$(Payload)\forgetty-win.exe" />
         <RegistryValue Root="HKCU" Key="Software\Forgetty\Installer" Name="CliName" Type="integer" Value="1" KeyPath="yes" />
       </Component>

@@ -121,6 +121,7 @@ jobs:
   # virtualization). If WSL cannot host the server, the step output says why.
   wsl-e2e:
     needs: [build-and-smoke, linux-server]
+    if: ${{ !cancelled() && needs.linux-server.result == 'success' }}
     runs-on: windows-latest
     timeout-minutes: 40
     steps:
@@ -178,6 +179,7 @@ jobs:
   # installs; a per-user MSI installs with no admin rights and no setup.
   installer:
     needs: build-and-smoke
+    if: ${{ !cancelled() }}
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
