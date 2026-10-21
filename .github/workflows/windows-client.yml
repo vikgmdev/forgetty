@@ -14,6 +14,9 @@ on:
       - "crates/forgetty-core/**"
       - "crates/forgetty-client/**"
       - "crates/forgetty-proto/**"
+      - "crates/forgetty-sync/**"
+      - "crates/forgetty-server/**"
+      - "crates/forgetty-session/**"
       - ".github/workflows/windows-client.yml"
   workflow_dispatch:
 
