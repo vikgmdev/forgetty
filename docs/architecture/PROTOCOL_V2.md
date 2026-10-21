@@ -223,9 +223,12 @@ stream to the subscriber's own next offset from the log.
   counter: a newer stream wins, and stale queued items are dropped on reset.
 - Triggers: the stream is more than half the ring behind, makes no write
   progress for 2 s, or a resume starts further back than half the ring.
-- Limits: one build shared per pane, results younger than 250 ms reused, at
-  most 2 concurrent builds server-wide, at least 1 s between catch-ups per
-  stream with backoff to 10 s.
+- Limits: one build shared per pane, a finished snapshot reused only while
+  the log is within 1/8 ring of it, at most 2 concurrent builds server-wide.
+  A slow or stalled stream waits at least 1 s between catch-ups, with backoff
+  to 10 s. A stream that keeps pace (4 MiB/s or more of live bytes since its
+  last snapshot, or a snapshot delivered in under 500 ms that the log outran
+  before any live byte) waits at most 100 ms and gets no backoff.
 - The snapshot has no scrollback, no palette, no OSC 10/11/12 colours. A client
   without the capability gets `0x11 log_lost` and re-attaches.
 - Connection close codes: `0x12` control writer stalled 10 s, `0x14` more than
