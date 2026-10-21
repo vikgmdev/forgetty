@@ -361,16 +361,18 @@ known gap, section 12).
   node cannot keep another from a build. A node that joins a build still
   waiting in another node's queue can start it on its own turn.
 - Pacing, per `(node id, pane)`, kept after the stream and the connection end
-  (attaching again does not reset it; the first snapshot of a far-behind attach
-  is paced the same way):
+  (attaching again does not reset it). The first snapshot of a far-behind
+  attach goes through the same token path as a reading peer, unless the last
+  catch-up of that node and pane was a stall: then the backoff below applies.
+  So a client that drops after it kept pace resumes within about a second:
   - A stream whose peer reads (it took live bytes at 1 MiB/s or more since its
     last snapshot, or took a snapshot in under 500 ms that the log outran
     before any live byte) gets a burst of 6 catch-ups at least 100 ms apart,
     then one per second. It never backs off.
   - A stream whose write made no progress for 2 s, or whose peer reads too
     slowly to show it reads, waits at least 1 s between catch-ups, with backoff
-    to 10 s while it keeps needing them. A catch-up of the first kind does not
-    reset that backoff.
+    to 10 s while it keeps needing them. A catch-up of the first kind ends
+    that backoff: the next stall starts again from 1 s.
 - Scrollback for a fresh attach is a known gap. A client that attaches to a
   busy pane sees the screen, not the history above it. The server does not
   build it.
