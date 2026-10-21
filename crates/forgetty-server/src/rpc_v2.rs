@@ -75,7 +75,7 @@ pub const SERVER_CAPS: [&str; 5] =
 /// Methods a v2 client may call through the shared socket dispatch table.
 /// `send_input` is not here (input goes on the Input stream), nor are the
 /// `pair_*` methods (a paired device does not open pairing windows).
-const DISPATCH_ALLOWED: [&str; 26] = [
+const DISPATCH_ALLOWED: [&str; 29] = [
     methods::LIST_TABS,
     methods::GET_LAYOUT,
     methods::NEW_TAB,
@@ -102,6 +102,9 @@ const DISPATCH_ALLOWED: [&str; 26] = [
     methods::PANE_EXIT_STATUS,
     methods::LIST_DEVICES,
     methods::REVOKE_DEVICE,
+    methods::API_LIST,
+    methods::API_DESCRIBE,
+    methods::SET_LABEL,
 ];
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -889,6 +892,7 @@ fn pump_event(rpc: &RpcV2, ev: SessionEvent, layout_dirty: &mut bool) {
         | SessionEvent::ActiveWorkspaceChanged { .. }
         | SessionEvent::WorkspaceCreated { .. }
         | SessionEvent::WorkspaceRenamed { .. }
+        | SessionEvent::LabelChanged { .. }
         | SessionEvent::WorkspaceDeleted { .. }
         | SessionEvent::WorkspaceColorChanged { .. }
         | SessionEvent::WorkspacesReordered { .. }

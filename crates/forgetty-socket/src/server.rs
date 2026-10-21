@@ -823,6 +823,7 @@ async fn handle_streaming_connection(
                                 | SessionEvent::TitleChanged { .. }
                                 | SessionEvent::CwdChanged { .. }
                                 | SessionEvent::StatusChanged { .. }
+                                | SessionEvent::LabelChanged { .. }
                                 | SessionEvent::Notification { .. })) => {
                                 // P-010: pane lifecycle events used to be dropped
                                 // here. AD-019 adds the pane metadata events.
@@ -973,6 +974,10 @@ pub fn pane_event_notification(ev: &SessionEvent) -> Option<serde_json::Value> {
         SessionEvent::PaneClosed { pane_id } => {
             ("pane_closed", serde_json::json!({ "pane_id": pane_id.to_string() }))
         }
+        SessionEvent::LabelChanged { target, id, label } => (
+            "label_changed",
+            serde_json::json!({ "target": target.as_str(), "id": id.to_string(), "label": label }),
+        ),
         SessionEvent::PaneExited { pane_id, exit_code } => (
             "pane_exited",
             serde_json::json!({ "pane_id": pane_id.to_string(), "exit_code": exit_code }),

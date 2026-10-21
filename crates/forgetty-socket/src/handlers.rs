@@ -43,57 +43,19 @@ pub fn dispatch(
     sync_endpoint: Option<Arc<SyncEndpoint>>,
     session_id: Option<Uuid>,
 ) -> Response {
-    match request.method.as_str() {
-        methods::LIST_TABS => handle_list_tabs(request, &sm),
-        methods::GET_LAYOUT => handle_get_layout(request, &sm),
-        methods::NEW_TAB => handle_new_tab(request, &sm),
-        methods::CLOSE_TAB => handle_close_tab(request, &sm),
-        methods::FOCUS_TAB => handle_focus_tab(request, &sm),
-        methods::SET_ACTIVE_WORKSPACE => handle_set_active_workspace(request, &sm),
-        methods::SPLIT_PANE => handle_split_pane(request, &sm),
-        methods::MOVE_TAB => handle_move_tab(request, &sm),
-        methods::SEND_INPUT => handle_send_input(request, &sm),
-        methods::GET_PANE_INFO => handle_get_pane_info(request, &sm),
-        methods::RESIZE_PANE => handle_resize_pane(request, &sm),
-        methods::SEND_SIGINT => handle_send_sigint(request, &sm),
-        methods::NOTIFY => handle_notify(request, &sm),
-        methods::CLOSE_PANE => handle_close_pane(request, &sm),
-        methods::CREATE_WORKSPACE => handle_create_workspace(request, &sm),
-        methods::RENAME_WORKSPACE => handle_rename_workspace(request, &sm),
-        methods::DELETE_WORKSPACE => handle_delete_workspace(request, &sm),
-        methods::DUPLICATE_WORKSPACE => handle_duplicate_workspace(request, &sm),
-        methods::SET_WORKSPACE_COLOR => handle_set_workspace_color(request, &sm),
-        methods::MOVE_WORKSPACE => handle_move_workspace(request, &sm),
-        methods::SET_ACTIVE_PANE => handle_set_active_pane(request, &sm),
-        // Split ratio + pinned session methods (B-002).
-        methods::UPDATE_SPLIT_RATIOS => handle_update_split_ratios(request, &sm),
-        // AD-017: pinned/trash lifecycle is gone. Compat no-ops.
-        methods::SET_PINNED => handle_set_pinned(request),
-        methods::GET_PINNED => handle_get_pinned(request),
-        methods::SERVER_INFO => {
-            handle_server_info(request, &sm, sync_endpoint.as_deref(), session_id)
-        }
-        methods::LIST_CLIENTS => handle_list_clients(request, &sm),
-        methods::PANE_EXIT_STATUS => handle_pane_exit_status(request, &sm),
-        methods::CAPTURE => handle_capture(request, &sm),
-        methods::PAIR_OPEN => handle_pair_open(request, sync_endpoint.as_deref()),
-        methods::PAIR_STATUS => handle_pair_status(request, sync_endpoint.as_deref()),
-        // Sync / pairing methods — require sync_endpoint.
-        methods::LIST_DEVICES => handle_list_devices(request, sync_endpoint.as_deref()),
-        methods::REVOKE_DEVICE => handle_revoke_device(request, sync_endpoint.as_deref()),
-        methods::GET_PAIRING_INFO => handle_get_pairing_info(request, sync_endpoint.as_deref()),
-        _ => {
-            #[cfg(feature = "qa-tools")]
-            if let Some(resp) = crate::qa::call(request, &sm) {
-                return resp;
-            }
-            Response::error(
-                request.id.clone(),
-                protocol::METHOD_NOT_FOUND,
-                format!("Unknown method: {}", request.method),
-            )
-        }
+    if let Some(handler) = crate::api::find(&request.method).and_then(|m| m.handler) {
+        let ctx = crate::api::Ctx { sm, sync: sync_endpoint, session_id };
+        return handler(request, &ctx);
     }
+    #[cfg(feature = "qa-tools")]
+    if let Some(resp) = crate::qa::call(request, &sm) {
+        return resp;
+    }
+    Response::error(
+        request.id.clone(),
+        protocol::METHOD_NOT_FOUND,
+        format!("Unknown method: {}", request.method),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -149,7 +111,7 @@ fn require_pane_id(request: &Request, sm: &SessionManager) -> Result<PaneId, Res
 // Handlers
 // ---------------------------------------------------------------------------
 
-fn handle_list_tabs(request: &Request, sm: &SessionManager) -> Response {
+pub(crate) fn handle_list_tabs(request: &Request, sm: &SessionManager) -> Response {
     let ids = sm.list_panes();
     let tabs: Vec<serde_json::Value> = ids
         .into_iter()
@@ -168,6 +130,7 @@ fn handle_list_tabs(request: &Request, sm: &SessionManager) -> Response {
                     "exit_code": info.exit_code,
                     "status": status_json(&info),
                     "last_notification": notification_json(&info),
+                    "label": info.label,
                 })
             })
         })
@@ -197,7 +160,7 @@ fn notification_json(info: &forgetty_session::PaneInfo) -> serde_json::Value {
     }
 }
 
-fn handle_get_layout(request: &Request, sm: &SessionManager) -> Response {
+pub(crate) fn handle_get_layout(request: &Request, sm: &SessionManager) -> Response {
     let layout = sm.layout();
     match serde_json::to_value(&layout) {
         Ok(v) => Response::success(request.id.clone(), v),
@@ -209,7 +172,7 @@ fn handle_get_layout(request: &Request, sm: &SessionManager) -> Response {
     }
 }
 
-fn handle_new_tab(request: &Request, sm: &SessionManager) -> Response {
+pub(crate) fn handle_new_tab(request: &Request, sm: &SessionManager) -> Response {
     // FIX-004: warn + default policy. Missing/non-u64 `workspace_idx` is
     // preserved (defaults to 0) for wire compat with pre-FIX-004 callers
     // such as `scripts/perf/typometer.sh` and older SDKs, but loudly logged
@@ -280,7 +243,7 @@ fn handle_new_tab(request: &Request, sm: &SessionManager) -> Response {
     }
 }
 
-fn handle_close_tab(request: &Request, sm: &SessionManager) -> Response {
+pub(crate) fn handle_close_tab(request: &Request, sm: &SessionManager) -> Response {
     // Try tab_id first (preferred path).
     if let Some(tab_id_str) = request.params.get("tab_id").and_then(|v| v.as_str()) {
         let tab_uuid = match Uuid::parse_str(tab_id_str) {
@@ -360,7 +323,7 @@ fn handle_close_tab(request: &Request, sm: &SessionManager) -> Response {
     }
 }
 
-fn handle_focus_tab(request: &Request, sm: &SessionManager) -> Response {
+pub(crate) fn handle_focus_tab(request: &Request, sm: &SessionManager) -> Response {
     let tab_id_str = match request.params.get("tab_id").and_then(|v| v.as_str()) {
         Some(s) => s.to_string(),
         None => {
@@ -419,7 +382,7 @@ fn handle_focus_tab(request: &Request, sm: &SessionManager) -> Response {
 
 /// Handle `set_active_workspace` RPC — persist the globally-active workspace
 /// index so session-restore brings the correct workspace back on cold start.
-fn handle_set_active_workspace(request: &Request, sm: &SessionManager) -> Response {
+pub(crate) fn handle_set_active_workspace(request: &Request, sm: &SessionManager) -> Response {
     let ws_idx = match request.params.get("workspace_idx").and_then(|v| v.as_u64()) {
         Some(n) => n as usize,
         None => {
@@ -446,7 +409,7 @@ fn handle_set_active_workspace(request: &Request, sm: &SessionManager) -> Respon
 /// If the pane is the sole leaf of its tab, the entire tab is closed (same
 /// behaviour as `close_tab`). If it is part of a split, only this pane is
 /// removed and the sibling promoted.
-fn handle_close_pane(request: &Request, sm: &SessionManager) -> Response {
+pub(crate) fn handle_close_pane(request: &Request, sm: &SessionManager) -> Response {
     let pane_id = match require_pane_id(request, sm) {
         Ok(id) => id,
         Err(e) => return e,
@@ -507,7 +470,7 @@ fn handle_close_pane(request: &Request, sm: &SessionManager) -> Response {
     }
 }
 
-fn handle_create_workspace(request: &Request, sm: &SessionManager) -> Response {
+pub(crate) fn handle_create_workspace(request: &Request, sm: &SessionManager) -> Response {
     let name =
         request.params.get("name").and_then(|v| v.as_str()).unwrap_or("Workspace").to_string();
 
@@ -533,12 +496,41 @@ fn handle_create_workspace(request: &Request, sm: &SessionManager) -> Response {
     }
 }
 
+/// `set_label { target, id, label }`.
+pub(crate) fn handle_set_label(request: &Request, sm: &SessionManager) -> Response {
+    let bad = |msg: String| Response::error(request.id.clone(), protocol::INVALID_PARAMS, msg);
+    let Some(target) = request
+        .params
+        .get("target")
+        .and_then(|v| v.as_str())
+        .and_then(forgetty_session::LabelTarget::parse)
+    else {
+        return bad("target must be \"workspace\", \"tab\" or \"pane\"".to_string());
+    };
+    let Some(id_raw) = request.params.get("id").and_then(|v| v.as_str()) else {
+        return bad("missing param: id".to_string());
+    };
+    let Ok(id) = Uuid::parse_str(id_raw) else {
+        return bad(format!("invalid UUID: {id_raw}"));
+    };
+    let Some(label) = request.params.get("label").and_then(|v| v.as_str()) else {
+        return bad("missing param: label".to_string());
+    };
+    match sm.set_label(target, id, label) {
+        Ok(changed) => Response::success(
+            request.id.clone(),
+            serde_json::json!({ "ok": true, "changed": changed }),
+        ),
+        Err(e) => bad(e.to_string()),
+    }
+}
+
 /// Handle `rename_workspace` RPC (FIX-001).
 ///
 /// Params: `{ "workspace_idx": u64, "name": "..." }`.
 /// Success: `{ "ok": true }`. Out-of-range index returns `INTERNAL_ERROR` with
 /// the bounds message from `SessionManager::rename_workspace`.
-fn handle_rename_workspace(request: &Request, sm: &SessionManager) -> Response {
+pub(crate) fn handle_rename_workspace(request: &Request, sm: &SessionManager) -> Response {
     let workspace_idx = match request.params.get("workspace_idx").and_then(|v| v.as_u64()) {
         Some(n) => n as usize,
         None => {
@@ -576,7 +568,7 @@ fn handle_rename_workspace(request: &Request, sm: &SessionManager) -> Response {
 /// Params: `{ "workspace_idx": u64 }`.
 /// Success: `{ "ok": true }`. Out-of-range index or last-workspace deletion
 /// return `INTERNAL_ERROR` with the message from `SessionManager::delete_workspace`.
-fn handle_delete_workspace(request: &Request, sm: &SessionManager) -> Response {
+pub(crate) fn handle_delete_workspace(request: &Request, sm: &SessionManager) -> Response {
     let workspace_idx = match request.params.get("workspace_idx").and_then(|v| v.as_u64()) {
         Some(n) => n as usize,
         None => {
@@ -616,7 +608,7 @@ fn handle_delete_workspace(request: &Request, sm: &SessionManager) -> Response {
 /// The tab list matches the source's tab count in source order; each entry
 /// is backed by a fresh daemon-side PTY (subscribe_output-ready). GTK uses
 /// this response to build widgets without an extra `get_layout` round-trip.
-fn handle_duplicate_workspace(request: &Request, sm: &SessionManager) -> Response {
+pub(crate) fn handle_duplicate_workspace(request: &Request, sm: &SessionManager) -> Response {
     let source_workspace_idx =
         match request.params.get("source_workspace_idx").and_then(|v| v.as_u64()) {
             Some(n) => n as usize,
@@ -675,7 +667,7 @@ fn handle_duplicate_workspace(request: &Request, sm: &SessionManager) -> Respons
 ///
 /// The daemon stores the hex string verbatim (see AD-007); GTK produces
 /// and validates the hex format client-side.
-fn handle_set_workspace_color(request: &Request, sm: &SessionManager) -> Response {
+pub(crate) fn handle_set_workspace_color(request: &Request, sm: &SessionManager) -> Response {
     let workspace_idx = match request.params.get("workspace_idx").and_then(|v| v.as_u64()) {
         Some(n) => n as usize,
         None => {
@@ -709,7 +701,7 @@ fn handle_set_workspace_color(request: &Request, sm: &SessionManager) -> Respons
 /// - Same-index call → `{ "ok": true }` (idempotent no-op; no event emitted).
 /// - Success → `{ "ok": true }` and a `WorkspacesReordered` event is
 ///   broadcast on the session event channel.
-fn handle_move_workspace(request: &Request, sm: &SessionManager) -> Response {
+pub(crate) fn handle_move_workspace(request: &Request, sm: &SessionManager) -> Response {
     let from_idx = match request.params.get("from_idx").and_then(|v| v.as_u64()) {
         Some(n) => n as usize,
         None => {
@@ -754,7 +746,7 @@ fn handle_move_workspace(request: &Request, sm: &SessionManager) -> Response {
 ///   - missing/invalid `workspace_idx` / `tab_id` → INVALID_PARAMS
 ///   - workspace out-of-bounds, tab not found, or `pane_id` not a leaf in
 ///     the tab's pane_tree → INTERNAL_ERROR
-fn handle_set_active_pane(request: &Request, sm: &SessionManager) -> Response {
+pub(crate) fn handle_set_active_pane(request: &Request, sm: &SessionManager) -> Response {
     let workspace_idx = match request.params.get("workspace_idx").and_then(|v| v.as_u64()) {
         Some(n) => n as usize,
         None => {
@@ -820,7 +812,7 @@ fn handle_set_active_pane(request: &Request, sm: &SessionManager) -> Response {
     }
 }
 
-fn handle_update_split_ratios(request: &Request, sm: &SessionManager) -> Response {
+pub(crate) fn handle_update_split_ratios(request: &Request, sm: &SessionManager) -> Response {
     let ratios = match request.params.get("ratios").and_then(|v| v.as_array()) {
         Some(arr) => arr,
         None => {
@@ -855,13 +847,13 @@ fn handle_update_split_ratios(request: &Request, sm: &SessionManager) -> Respons
 
 /// AD-017: the pinned/trash lifecycle no longer exists. Kept so old clients
 /// that still call `set_pinned` get `ok` instead of an error.
-fn handle_set_pinned(request: &Request) -> Response {
+pub(crate) fn handle_set_pinned(request: &Request) -> Response {
     Response::success(request.id.clone(), serde_json::json!({ "ok": true }))
 }
 
 /// AD-017 compat: every session is durable, so `pinned` is always `false`
 /// (the flag has no effect).
-fn handle_get_pinned(request: &Request) -> Response {
+pub(crate) fn handle_get_pinned(request: &Request) -> Response {
     Response::success(request.id.clone(), serde_json::json!({ "pinned": false }))
 }
 
@@ -872,7 +864,7 @@ pub fn mark_started() {
     let _ = STARTED.get_or_init(std::time::Instant::now);
 }
 
-fn handle_server_info(
+pub(crate) fn handle_server_info(
     request: &Request,
     sm: &SessionManager,
     se: Option<&SyncEndpoint>,
@@ -896,7 +888,7 @@ fn handle_server_info(
     )
 }
 
-fn handle_pane_exit_status(request: &Request, sm: &SessionManager) -> Response {
+pub(crate) fn handle_pane_exit_status(request: &Request, sm: &SessionManager) -> Response {
     let Some(raw) = request.params.get("pane_id").and_then(|v| v.as_str()) else {
         return Response::error(
             request.id.clone(),
@@ -925,7 +917,7 @@ fn handle_pane_exit_status(request: &Request, sm: &SessionManager) -> Response {
 }
 
 /// `capture`: visible screen text of a pane (AD-019, cold path).
-fn handle_capture(request: &Request, sm: &SessionManager) -> Response {
+pub(crate) fn handle_capture(request: &Request, sm: &SessionManager) -> Response {
     let id = match require_pane_id(request, sm) {
         Ok(id) => id,
         Err(e) => return e,
@@ -954,7 +946,7 @@ fn handle_capture(request: &Request, sm: &SessionManager) -> Response {
     }
 }
 
-fn handle_list_clients(request: &Request, sm: &SessionManager) -> Response {
+pub(crate) fn handle_list_clients(request: &Request, sm: &SessionManager) -> Response {
     let clients: Vec<serde_json::Value> = sm
         .clients()
         .list()
@@ -971,7 +963,7 @@ fn handle_list_clients(request: &Request, sm: &SessionManager) -> Response {
     Response::success(request.id.clone(), serde_json::json!({ "clients": clients }))
 }
 
-fn handle_split_pane(request: &Request, sm: &SessionManager) -> Response {
+pub(crate) fn handle_split_pane(request: &Request, sm: &SessionManager) -> Response {
     let pane_id = match require_pane_id(request, sm) {
         Ok(id) => id,
         Err(e) => return e,
@@ -1028,7 +1020,7 @@ fn handle_split_pane(request: &Request, sm: &SessionManager) -> Response {
     }
 }
 
-fn handle_move_tab(request: &Request, sm: &SessionManager) -> Response {
+pub(crate) fn handle_move_tab(request: &Request, sm: &SessionManager) -> Response {
     let tab_id_str = match request.params.get("tab_id").and_then(|v| v.as_str()) {
         Some(s) => s.to_string(),
         None => {
@@ -1113,7 +1105,7 @@ fn tree_contains_pane(tree: &PaneTreeLayout, pane_id: PaneId) -> bool {
     }
 }
 
-fn handle_send_input(request: &Request, sm: &SessionManager) -> Response {
+pub(crate) fn handle_send_input(request: &Request, sm: &SessionManager) -> Response {
     let id = match require_pane_id(request, sm) {
         Ok(id) => id,
         Err(e) => return e,
@@ -1151,7 +1143,7 @@ fn handle_send_input(request: &Request, sm: &SessionManager) -> Response {
     }
 }
 
-fn handle_get_pane_info(request: &Request, sm: &SessionManager) -> Response {
+pub(crate) fn handle_get_pane_info(request: &Request, sm: &SessionManager) -> Response {
     let id = match require_pane_id(request, sm) {
         Ok(id) => id,
         Err(e) => return e,
@@ -1187,7 +1179,7 @@ fn handle_get_pane_info(request: &Request, sm: &SessionManager) -> Response {
     )
 }
 
-fn handle_resize_pane(request: &Request, sm: &SessionManager) -> Response {
+pub(crate) fn handle_resize_pane(request: &Request, sm: &SessionManager) -> Response {
     let id = match require_pane_id(request, sm) {
         Ok(id) => id,
         Err(e) => return e,
@@ -1227,7 +1219,7 @@ fn handle_resize_pane(request: &Request, sm: &SessionManager) -> Response {
     }
 }
 
-fn handle_send_sigint(request: &Request, sm: &SessionManager) -> Response {
+pub(crate) fn handle_send_sigint(request: &Request, sm: &SessionManager) -> Response {
     let id = match require_pane_id(request, sm) {
         Ok(id) => id,
         Err(e) => return e,
@@ -1273,7 +1265,7 @@ fn handle_send_sigint(request: &Request, sm: &SessionManager) -> Response {
 /// The handler is intentionally minimal: validate params, log, return `ok`.
 /// It does **not** modify session state, emit broadcast events, or touch
 /// `SyncEndpoint` (AD-015 preserved).
-fn handle_notify(request: &Request, sm: &SessionManager) -> Response {
+pub(crate) fn handle_notify(request: &Request, sm: &SessionManager) -> Response {
     let pane_id = match require_pane_id(request, sm) {
         Ok(id) => id,
         Err(e) => return e,
@@ -1306,7 +1298,7 @@ fn sync_unavailable(request: &Request) -> Response {
     )
 }
 
-fn handle_list_devices(request: &Request, se: Option<&SyncEndpoint>) -> Response {
+pub(crate) fn handle_list_devices(request: &Request, se: Option<&SyncEndpoint>) -> Response {
     let Some(se) = se else { return sync_unavailable(request) };
     let registry = se.registry();
     let reg = registry.lock().unwrap();
@@ -1325,7 +1317,7 @@ fn handle_list_devices(request: &Request, se: Option<&SyncEndpoint>) -> Response
     Response::success(request.id.clone(), serde_json::json!({ "devices": devices }))
 }
 
-fn handle_revoke_device(request: &Request, se: Option<&SyncEndpoint>) -> Response {
+pub(crate) fn handle_revoke_device(request: &Request, se: Option<&SyncEndpoint>) -> Response {
     let Some(se) = se else { return sync_unavailable(request) };
 
     let device_id = match request.params.get("device_id").and_then(|v| v.as_str()) {
@@ -1355,7 +1347,7 @@ fn handle_revoke_device(request: &Request, se: Option<&SyncEndpoint>) -> Respons
     }
 }
 
-fn handle_pair_open(request: &Request, se: Option<&SyncEndpoint>) -> Response {
+pub(crate) fn handle_pair_open(request: &Request, se: Option<&SyncEndpoint>) -> Response {
     let Some(se) = se else { return sync_unavailable(request) };
     let ttl = request
         .params
@@ -1379,7 +1371,7 @@ fn handle_pair_open(request: &Request, se: Option<&SyncEndpoint>) -> Response {
     )
 }
 
-fn handle_pair_status(request: &Request, se: Option<&SyncEndpoint>) -> Response {
+pub(crate) fn handle_pair_status(request: &Request, se: Option<&SyncEndpoint>) -> Response {
     let Some(se) = se else { return sync_unavailable(request) };
     let Some(id) = request.params.get("window_id").and_then(|v| v.as_u64()) else {
         return Response::error(
@@ -1400,7 +1392,7 @@ fn handle_pair_status(request: &Request, se: Option<&SyncEndpoint>) -> Response 
     Response::success(request.id.clone(), result)
 }
 
-fn handle_get_pairing_info(request: &Request, se: Option<&SyncEndpoint>) -> Response {
+pub(crate) fn handle_get_pairing_info(request: &Request, se: Option<&SyncEndpoint>) -> Response {
     let Some(se) = se else { return sync_unavailable(request) };
 
     let node_id = se.node_id().to_string();

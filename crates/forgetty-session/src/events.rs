@@ -7,6 +7,35 @@ use bytes::Bytes;
 use forgetty_core::PaneId;
 use uuid::Uuid;
 
+/// What a label (`set_label`) is attached to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LabelTarget {
+    Workspace,
+    Tab,
+    Pane,
+}
+
+impl LabelTarget {
+    /// Wire name: `workspace`, `tab` or `pane`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LabelTarget::Workspace => "workspace",
+            LabelTarget::Tab => "tab",
+            LabelTarget::Pane => "pane",
+        }
+    }
+
+    /// Parse a wire name.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "workspace" => Some(LabelTarget::Workspace),
+            "tab" => Some(LabelTarget::Tab),
+            "pane" => Some(LabelTarget::Pane),
+            _ => None,
+        }
+    }
+}
+
 /// Events broadcast to subscribers (daemon, Android, MCP server, etc.).
 ///
 /// In T-048 GTK does not yet consume this channel — it still polls via
@@ -94,6 +123,10 @@ pub enum SessionEvent {
     /// subscribers can update their local copy without re-fetching the full
     /// layout. Emitted only when the name actually changed (idempotence).
     WorkspaceRenamed { workspace_idx: usize, workspace_id: Uuid, name: String },
+
+    /// A label changed (`set_label`). For a workspace the label is its name
+    /// (`WorkspaceRenamed` is sent as well). An empty label means cleared.
+    LabelChanged { target: LabelTarget, id: Uuid, label: String },
 
     /// A workspace was deleted (FIX-003). Carries the index valid at emission
     /// time (may be stale if another client shifted indices concurrently) and

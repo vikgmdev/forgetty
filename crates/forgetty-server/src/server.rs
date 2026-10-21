@@ -485,6 +485,42 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
                         }
                     }
                 }
+                // Labels (`set_label`) survive a restart. Tabs match by position,
+                // panes by their place in the tree, the same way as the active pane.
+                {
+                    let live_layout = session_manager.layout();
+                    for (ws_idx, saved_workspace) in state.workspaces.iter().enumerate() {
+                        let Some(live_ws) = live_layout.workspaces.get(ws_idx) else { continue };
+                        for (i, saved_tab) in saved_workspace.tabs.iter().enumerate() {
+                            let Some(live_tab) = live_ws.tabs.get(i) else { continue };
+                            if !saved_tab.label.is_empty() {
+                                if let Err(e) = session_manager.set_label(
+                                    forgetty_session::LabelTarget::Tab,
+                                    live_tab.id,
+                                    &saved_tab.label,
+                                ) {
+                                    warn!("cold-start restore: tab label: {e}");
+                                }
+                            }
+                            for (saved_pane, label) in &saved_tab.pane_labels {
+                                let Some(live_pane) = live_pane_id_for_saved(
+                                    &saved_tab.pane_tree,
+                                    &live_tab.pane_tree,
+                                    *saved_pane,
+                                ) else {
+                                    continue;
+                                };
+                                if let Err(e) = session_manager.set_label(
+                                    forgetty_session::LabelTarget::Pane,
+                                    live_pane.0,
+                                    label,
+                                ) {
+                                    warn!("cold-start restore: pane label: {e}");
+                                }
+                            }
+                        }
+                    }
+                }
                 // `remain_on_exit` survives a restart. Pane ids are reused on
                 // restore, so the saved ids still match.
                 for id in &state.remain_on_exit_panes {
@@ -592,6 +628,7 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
                     | Ok(SessionEvent::ActiveWorkspaceChanged { .. })
                     | Ok(SessionEvent::WorkspaceCreated { .. })
                     | Ok(SessionEvent::WorkspaceRenamed { .. })
+                    | Ok(SessionEvent::LabelChanged { .. })
                     | Ok(SessionEvent::WorkspaceDeleted { .. })
                     | Ok(SessionEvent::WorkspaceColorChanged { .. })
                     | Ok(SessionEvent::WorkspacesReordered { .. })

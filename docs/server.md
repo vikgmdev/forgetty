@@ -148,17 +148,45 @@ forgetty events [--json] [-p PANE]  stream events until Ctrl+C
 forgetty run [--keep] [--wait] [--cwd DIR] -- CMD...   new pane running CMD;
                                     --wait blocks and exits with CMD's exit code
 forgetty wait -p PANE [--status done|waiting|...] [--timeout S]
+forgetty label [-t pane|tab|workspace] TARGET LABEL   set a label ("" clears it)
+forgetty api list [-q] [--json] [--markdown]   every method (--markdown prints docs/socket-api.md)
+forgetty api describe METHOD [--json]   description, JSON Schemas, examples
+forgetty api call [-p PANE] METHOD [JSON | @file | -]   call a method, print the result
+forgetty skill setup [--agent claude|codex] [--scope user|project]
+forgetty skill status | show | remove
 forgetty client ls [--json]
 forgetty pair                       QR + payload, waits 60 s for one device
 forgetty devices [--json]
 forgetty revoke ID
 ```
 
-`PANE` is a full id or a unique id suffix of 4+ characters.
+A pane, tab or workspace target is, in this order: a full id, a label
+(case-insensitive), a 1-based position, or a unique id suffix of 4+ characters.
+Several labels or suffixes that match give exit 3 and the list of matches.
 
-Exit codes: 0 ok, 1 failed, 2 bad command line, 3 target not found or
-ambiguous, 4 server unreachable, 5 `wait` timed out (`run --wait` returns the
-command's own exit code instead).
+Exit codes: 0 ok, 1 failed, 2 bad command line (`api call`: `bad_request`),
+3 target not found or ambiguous (`api call`: `method_not_found`), 4 server
+unreachable, 5 `wait` timed out (`run --wait` returns the command's own exit
+code instead).
+
+### Self-describing API, labels and the agent skill
+
+Every socket method has a description, input and output JSON Schemas and
+examples in one table (`crates/forgetty-socket/src/api.rs`). The local socket
+and protocol v2 serve the same table: `api.list` and `api.describe { method }`.
+`docs/socket-api.md` is generated from it (`forgetty api list --markdown`), and
+a test fails when the file is stale (`UPDATE_DOCS=1 cargo test -p forgetty-socket
+socket_api_doc` rewrites it).
+
+`set_label { target: "workspace"|"tab"|"pane", id, label }` names a target. The
+server saves labels in the session file, sends a layout change to subscribers
+(`LayoutChanged` over v2, `label_changed` on the local socket) and restores them
+after a restart. A workspace label is its name. `rename_workspace` stays for old
+clients.
+
+`forgetty skill setup` writes a short skill file (`~/.claude/skills/forgetty/SKILL.md`,
+or `.claude/skills/forgetty/` with `--scope project`; Codex: `~/.codex/skills/forgetty/`
+and `.agents/skills/forgetty/`) that teaches a coding agent the commands above.
 
 `wait` without `--status` waits for the pane process to exit. Statuses are
 `idle`, `working`, `waiting`, `done`, `failed`.
@@ -217,6 +245,8 @@ scripts/p4a_gate.sh  # OSC scanner, status, capture, agent CLI
 scripts/p1qa_gate.sh # revoke, concurrent start, SIGTERM, kill -9, session file, modes
 scripts/p2b_gate.sh  # protocol v2: client suites against the real server, exactly-once,
                      # size policy, 50 MiB burst latency, restart reconnect, port 47297
+scripts/p5_gate.sh   # api list/describe/call, labels (resolve, persist), doc staleness,
+                     # skill files, v2 api and labels, agent test with `claude -p`
 ```
 
 Both run a server in a temp state dir as the current user and need outbound
