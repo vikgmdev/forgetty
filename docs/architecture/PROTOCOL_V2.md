@@ -163,6 +163,13 @@ ring/disk log remember the offset of their first byte.
 A lagging subscriber (broadcast `Lagged`) does not drop: the server rewinds that
 stream to the subscriber's own next offset from the log.
 
+With `snapshot_catchup` (section 12), a start further back than half the ring
+from the head begins with a VT snapshot, whatever the request was. That
+includes a fresh attach (`from_offset = None`) on a pane whose log is over half
+a ring: it gets the snapshot of the screen as it is now (fast first paint), not
+the oldest byte of the log. The scrollback before the screen is not sent (a
+known gap, section 12).
+
 ## 9. Client reconnect rules (`forgetty-client` crate)
 
 - On connection loss: redial at once, then backoff 100 ms, 250 ms, 500 ms, 1 s,
@@ -193,8 +200,8 @@ stream to the subscriber's own next offset from the log.
    stop and loaded on start. After `kill -9` it is lost, and a resend after a
    crash can repeat input once. This is accepted.
 2. A reader that falls behind the whole log gets its pane stream reset with
-   QUIC stream error code `0x11 behind_log`. The client re-attaches with
-   `from_offset` and gets `reset = true`.
+   QUIC stream error code `0x11 log_lost` (same name as in section 12). The
+   client re-attaches with `from_offset` and gets `reset = true`.
 3. The byte log never drops bytes to keep up. When its disk queue is full, the
    server stops reading that PTY until the queue drains (PTY flow control), so
    the program blocks on write. The in-memory ring default is 8 MiB per pane.
@@ -210,6 +217,23 @@ stream to the subscriber's own next offset from the log.
 6. Size policy (section 6): when a pane has no active client yet, the first
    `resize_pane` applies.
 7. `Notification.title` is a `String`, empty when the sequence has none.
+8. `Hello.client_name` is peer text. The server strips control characters and
+   keeps at most 64 characters before it logs or lists the name.
+9. A bad frame on the input stream (over the cap, shorter than the 24 byte
+   header, or not decodable) closes the connection with `0x02 frame_too_large`,
+   so the client dials again. A clean end of the stream does not.
+10. `resize_pane` rows and cols are clamped to `1..=1000` (0 is `bad_request`
+    over v2). The local socket clamps the same way.
+11. Input to a pane goes through a bounded per-pane queue (256 KiB) and a
+    writer thread. A pane whose program does not read stalls the input stream
+    of the client that sends to it and nothing else. `Pong.input_acked` covers
+    a frame only after the PTY took its bytes.
+12. The byte log survives a failed disk write by retrying with backoff. After a
+    crash (the log was not sealed by a graceful stop) the server starts the
+    pane's offsets past everything the old log could have held. An offset a
+    client kept from before the crash then falls in the lost range: the client
+    gets `reset = true` (attach) or `0x11 log_lost` (a stream that was reading
+    it), never other bytes under that offset.
 
 ## 12. Snapshot catch-up (AD-023, capability `snapshot_catchup`)
 
@@ -228,11 +252,23 @@ stream to the subscriber's own next offset from the log.
   A slow or stalled stream waits at least 1 s between catch-ups, with backoff
   to 10 s. A stream that keeps pace (4 MiB/s or more of live bytes since its
   last snapshot, or a snapshot delivered in under 500 ms that the log outran
-  before any live byte) waits at most 100 ms and gets no backoff.
+  before any live byte) waits at most 100 ms and gets no backoff, but only
+  within a cap per `(client_id, pane)`: a burst of 6, then one more every 10 s.
+  Past the cap it is paced like a slow stream. The pacing state outlives the
+  stream and the connection, so attaching again does not reset it, and the
+  first snapshot of a far-behind attach is paced the same way.
+- Scrollback for a fresh attach is a known gap. A client that attaches to a
+  busy pane sees the screen, not the history above it. The server does not
+  build it.
 - The snapshot has no scrollback, no palette, no OSC 10/11/12 colours. A client
   without the capability gets `0x11 log_lost` and re-attaches.
-- Connection close codes: `0x12` control writer stalled 10 s, `0x14` more than
-  64 requests in flight.
+- Connection close codes: `0x12` the Control queue was half full (4 MiB) for
+  10 s and the client drained less than 32 KiB/s of it, `0x14` more than 64
+  requests in flight, `0x15` more than 4 connections from one device (the
+  oldest closes).
+- Control memory per connection: the 8 MiB budget counts queued bytes plus
+  bytes set aside for requests still running (64 KiB each, 4 MiB for
+  `capture`). The server stops reading requests while the total is over budget.
 
 ## 13. Methods added by P5
 

@@ -144,10 +144,14 @@ stream) and the `qa_*` test methods are not reachable over v2.
   bytes, with a fixed cost per message). It holds at most one `LayoutChanged`,
   and a newer one replaces the pending one in place. Past the budget the
   connection stops reading requests (QUIC flow control pushes back on the
-  client) and pulls no more events. After 10 s with no completed write the
+  client) and pulls no more events. A request that runs on its own task sets
+  bytes aside against the budget until its answer is queued (64 KiB, 4 MiB for
+  `capture`), so requests in flight cannot owe more than the budget. When the
+  queue is half full and the client drains less than 32 KiB/s over 10 s, the
   server closes the connection with code 0x12. At most 64 requests run per
-  connection, one more closes it with code 0x14. Responses and Pongs are never
-  dropped, and nothing spawns a task per queued message.
+  connection, one more closes it with code 0x14. A device holds at most 4
+  connections: a fifth closes the oldest with code 0x15. Responses and Pongs
+  are never dropped, and nothing spawns a task per queued message.
 - Input is deduplicated by `(client_id, input_epoch)` and `seq`. The server
   writes the dedup table to `input_seq.json` in the state dir when it stops
   and loads it at start, so a frame the client did not see acked is not written
