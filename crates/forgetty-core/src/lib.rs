@@ -7,6 +7,7 @@
 pub mod error;
 pub mod event;
 pub mod platform;
+pub mod sanitize;
 pub mod types;
 
 pub use error::{ForgettyError, Result};

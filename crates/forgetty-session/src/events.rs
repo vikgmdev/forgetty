@@ -29,6 +29,27 @@ pub enum SessionEvent {
     PaneClosed { pane_id: PaneId },
 
     // -----------------------------------------------------------------------
+    // Pane metadata found by the OSC scanner (AD-019)
+    // -----------------------------------------------------------------------
+    /// The pane title changed (OSC 0 or 2).
+    TitleChanged { pane_id: PaneId, title: String },
+
+    /// The pane working directory changed (OSC 7).
+    CwdChanged { pane_id: PaneId, cwd: String },
+
+    /// The pane's program status changed (OSC 7501). `status` is one of
+    /// `idle`, `working`, `waiting`, `done`, `failed`.
+    StatusChanged { pane_id: PaneId, status: String, message: Option<String> },
+
+    /// A program in the pane sent a desktop notification (OSC 9, 99, 777).
+    /// Rate limited per pane.
+    Notification { pane_id: PaneId, title: Option<String>, body: String },
+
+    /// The pane's process exited. Sent for kept and for closing panes, before
+    /// `PaneClosed`.
+    PaneExited { pane_id: PaneId, exit_code: Option<i32> },
+
+    // -----------------------------------------------------------------------
     // Layout mutation events (T-063)
     // -----------------------------------------------------------------------
     /// A new tab was created in the given workspace.

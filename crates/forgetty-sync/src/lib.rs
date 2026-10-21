@@ -18,7 +18,8 @@ pub mod identity;
 pub mod pairing;
 pub mod qr;
 pub mod registry;
-pub mod sanitize;
+/// Sanitising of untrusted text. Lives in `forgetty-core`; re-exported here.
+pub use forgetty_core::sanitize;
 
 pub use endpoint::{
     AlpnHandler, SyncEndpoint, SyncEndpointBuilder, SyncEvent, FORGETTY_PAIRING_ALPN,

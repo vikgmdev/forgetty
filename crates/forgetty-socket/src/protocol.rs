@@ -175,6 +175,10 @@ pub mod methods {
     /// Exit status of a pane process, live or already closed.
     /// Params: `{ "pane_id": "<uuid>" }`. Result: `{ "running": bool, "exit_code": i32|null }`.
     pub const PANE_EXIT_STATUS: &str = "pane_exit_status";
+    /// P4a (AD-019): visible screen text of a pane, built on request from the
+    /// byte-log ring. Params: `{ "pane_id", "trim": bool, "last_lines": u32? }`.
+    /// Result: `{ "text": string }`.
+    pub const CAPTURE: &str = "capture";
     /// P1: attached clients (iroh connections and streaming sockets).
     pub const LIST_CLIENTS: &str = "list_clients";
 

@@ -1180,12 +1180,16 @@ dependencies = [
 name = "forgetty-session"
 version = "0.1.0-beta"
 dependencies = [
+ "base64",
  "bytes",
  "forgetty-core",
  "forgetty-pty",
+ "forgetty-vt",
  "forgetty-workspace",
  "libc",
+ "memchr",
  "serde",
+ "tempfile",
  "tokio",
  "tracing",
  "uuid",
@@ -1220,6 +1224,7 @@ dependencies = [
  "base64",
  "data-encoding",
  "dirs",
+ "forgetty-core",
  "hostname",
  "image",
  "iroh",

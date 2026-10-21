@@ -801,9 +801,31 @@ async fn handle_streaming_connection(
                                     break;
                                 }
                             }
+                            Ok(ev @ (SessionEvent::PaneCreated { .. }
+                                | SessionEvent::PaneClosed { .. }
+                                | SessionEvent::PaneExited { .. }
+                                | SessionEvent::TitleChanged { .. }
+                                | SessionEvent::CwdChanged { .. }
+                                | SessionEvent::StatusChanged { .. }
+                                | SessionEvent::Notification { .. })) => {
+                                // P-010: pane lifecycle events used to be dropped
+                                // here. AD-019 adds the pane metadata events.
+                                // Names follow PROTOCOL_V2 `ServerEvent` in
+                                // snake_case (`pane_closed` = `PaneClosed`).
+                                if let Some(notification) = pane_event_notification(&ev) {
+                                    let mut out = serde_json::to_string(&notification)
+                                        .unwrap_or_else(|_| "{}".to_string());
+                                    out.push('\n');
+                                    if writer.write_all(out.as_bytes()).await.is_err() {
+                                        break;
+                                    }
+                                    if writer.flush().await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
                             Ok(_) => {
-                                // Output events (PtyOutput, PaneCreated, PaneClosed,
-                                // Notification) are not forwarded to subscribe_layout clients.
+                                // PtyOutput is not forwarded to subscribe_layout clients.
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                                 // Consumer fell behind; continue from here.
@@ -916,7 +938,51 @@ async fn handle_streaming_connection(
     Ok(())
 }
 
-/// Serialize and write a JSON-RPC response as a newline-terminated line.
+/// JSON-RPC notification for a pane lifecycle or metadata event, or `None`
+/// for an event that is not one.
+///
+/// Method names are the snake_case form of the PROTOCOL_V2 `ServerEvent`
+/// names: `pane_closed`, `title_changed`, `cwd_changed`, `status_changed`.
+/// `pane_created`, `pane_exited` and `notification` are local-socket additions.
+pub fn pane_event_notification(ev: &SessionEvent) -> Option<serde_json::Value> {
+    let (method, params) = match ev {
+        SessionEvent::PaneCreated { pane_id } => {
+            ("pane_created", serde_json::json!({ "pane_id": pane_id.to_string() }))
+        }
+        SessionEvent::PaneClosed { pane_id } => {
+            ("pane_closed", serde_json::json!({ "pane_id": pane_id.to_string() }))
+        }
+        SessionEvent::PaneExited { pane_id, exit_code } => (
+            "pane_exited",
+            serde_json::json!({ "pane_id": pane_id.to_string(), "exit_code": exit_code }),
+        ),
+        SessionEvent::TitleChanged { pane_id, title } => {
+            ("title_changed", serde_json::json!({ "pane_id": pane_id.to_string(), "title": title }))
+        }
+        SessionEvent::CwdChanged { pane_id, cwd } => {
+            ("cwd_changed", serde_json::json!({ "pane_id": pane_id.to_string(), "cwd": cwd }))
+        }
+        SessionEvent::StatusChanged { pane_id, status, message } => (
+            "status_changed",
+            serde_json::json!({
+                "pane_id": pane_id.to_string(),
+                "status": status,
+                "message": message,
+            }),
+        ),
+        SessionEvent::Notification { pane_id, title, body } => (
+            "notification",
+            serde_json::json!({
+                "pane_id": pane_id.to_string(),
+                "title": title,
+                "body": body,
+            }),
+        ),
+        _ => return None,
+    };
+    Some(serde_json::json!({ "jsonrpc": "2.0", "method": method, "params": params }))
+}
+
 /// `chmod 0600` the socket so only the owner can connect, whatever the umask.
 fn restrict_socket(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -981,6 +1047,7 @@ pub async fn graceful_exit(
     std::process::exit(0);
 }
 
+/// Serialize and write a JSON-RPC response as a newline-terminated line.
 async fn write_response(
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     response: &Response,

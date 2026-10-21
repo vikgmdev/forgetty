@@ -15,6 +15,8 @@ pub const EXIT_FAILED: i32 = 1;
 pub const EXIT_USAGE: i32 = 2;
 pub const EXIT_NOT_FOUND: i32 = 3;
 pub const EXIT_UNREACHABLE: i32 = 4;
+/// `forgetty wait` ran out of time.
+pub const EXIT_TIMEOUT: i32 = 5;
 
 /// JSON-RPC error code the server uses for "clients attached".
 const SERVER_BUSY: i64 = -32001;
@@ -58,8 +60,14 @@ type Result<T> = std::result::Result<T, CliError>;
 
 /// Turn a command result into an exit code, printing the error to stderr.
 pub fn finish(result: Result<()>) -> i32 {
+    finish_code(result.map(|()| 0))
+}
+
+/// Like [`finish`] for commands that choose their own exit code on success
+/// (`run --wait`, `wait`).
+pub fn finish_code(result: Result<i32>) -> i32 {
     match result {
-        Ok(()) => 0,
+        Ok(code) => code,
         Err(e) => {
             eprintln!("forgetty: {}", e.message());
             e.code()
@@ -172,6 +180,51 @@ impl Client {
             });
         }
         Ok(resp.get("result").cloned().unwrap_or(Value::Null))
+    }
+}
+
+impl Client {
+    /// Read one line from a stream (after `subscribe_layout`). Waits up to
+    /// `wait`. `pending` holds a partial line across calls. `Ok(None)` is a
+    /// timeout, an error is a closed connection.
+    fn poll_line(&mut self, pending: &mut Vec<u8>, wait: Duration) -> Result<Option<Value>> {
+        self.reader.get_ref().set_read_timeout(Some(wait)).ok();
+        loop {
+            match self.reader.read_until(b'\n', pending) {
+                Ok(0) => return Err(CliError::Unreachable("server closed the connection".into())),
+                Ok(_) => {
+                    if pending.ends_with(b"\n") {
+                        let line = std::mem::take(pending);
+                        let text = String::from_utf8_lossy(&line);
+                        let text = text.trim();
+                        if text.is_empty() {
+                            continue;
+                        }
+                        return serde_json::from_str(text)
+                            .map(Some)
+                            .map_err(|e| CliError::Failed(format!("bad server event: {e}")));
+                    }
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return Ok(None);
+                }
+                Err(e) => {
+                    return Err(CliError::Unreachable(format!("server connection lost: {e}")))
+                }
+            }
+        }
+    }
+
+    /// Subscribe to the server event stream on a new connection.
+    fn subscribe() -> Result<Self> {
+        let mut c = Self::raw()?;
+        c.call("subscribe_layout", Value::Null)?;
+        Ok(c)
     }
 }
 
@@ -599,6 +652,273 @@ pub fn pair(ttl: u64) -> Result<()> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// close, capture, events, run, wait (P4a)
+// ---------------------------------------------------------------------------
+
+pub fn close(target: &str) -> Result<()> {
+    let (mut client, _) = Client::connect()?;
+    let pane = resolve_pane(&mut client, target)?;
+    client.call("close_pane", json!({ "pane_id": pane }))?;
+    Ok(())
+}
+
+pub fn capture(target: &str, trim: bool, lines: Option<u32>, json_out: bool) -> Result<()> {
+    let (mut client, _) = Client::connect()?;
+    let pane = resolve_pane(&mut client, target)?;
+    let mut params = json!({ "pane_id": pane, "trim": trim });
+    if let Some(n) = lines {
+        params["last_lines"] = json!(n);
+    }
+    let result = client.call("capture", params)?;
+    let text = result.get("text").and_then(Value::as_str).unwrap_or("");
+    if json_out {
+        println!("{}", json!({ "pane_id": pane, "text": text }));
+    } else if !text.is_empty() {
+        println!("{text}");
+    }
+    Ok(())
+}
+
+/// `pane_closed` becomes `PaneClosed`, as in PROTOCOL_V2 `ServerEvent`.
+fn event_name(method: &str) -> String {
+    method
+        .split('_')
+        .map(|w| {
+            let mut c = w.chars();
+            match c.next() {
+                Some(f) => f.to_ascii_uppercase().to_string() + c.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect()
+}
+
+/// One event as the `--json` line: `{"event":"StatusChanged", ...params}`.
+fn event_json(msg: &Value) -> Option<Value> {
+    let method = msg.get("method").and_then(Value::as_str)?;
+    let mut obj = serde_json::Map::new();
+    obj.insert("event".into(), json!(event_name(method)));
+    if let Some(params) = msg.get("params").and_then(Value::as_object) {
+        for (k, v) in params {
+            obj.insert(k.clone(), v.clone());
+        }
+    }
+    Some(Value::Object(obj))
+}
+
+/// Clean text for a terminal: the server already sanitises, this is belt and
+/// braces for what gets printed to the operator's tty.
+fn printable(s: &str) -> String {
+    forgetty_core::sanitize::untrusted_max(s, 512)
+}
+
+fn event_line(ev: &Value) -> String {
+    let name = ev.get("event").and_then(Value::as_str).unwrap_or("?");
+    let mut line = name.to_string();
+    if let Some(p) = ev.get("pane_id").and_then(Value::as_str) {
+        line.push_str(&format!(" pane={}", &p[p.len().saturating_sub(8)..]));
+    }
+    if let Some(obj) = ev.as_object() {
+        for (k, v) in obj {
+            if k == "event" || k == "pane_id" || v.is_null() {
+                continue;
+            }
+            let text = match v {
+                Value::String(s) => printable(s),
+                other => other.to_string(),
+            };
+            line.push_str(&format!(" {k}={text:?}"));
+        }
+    }
+    line
+}
+
+pub fn events(pane: Option<&str>, json_out: bool) -> Result<()> {
+    let (mut main, _) = Client::connect()?;
+    let filter = match pane {
+        Some(t) => Some(resolve_pane(&mut main, t)?),
+        None => None,
+    };
+    drop(main);
+    let mut sub = Client::subscribe()?;
+    let mut pending = Vec::new();
+    loop {
+        let Some(msg) = sub.poll_line(&mut pending, Duration::from_secs(3600))? else { continue };
+        let Some(ev) = event_json(&msg) else { continue };
+        if let Some(want) = &filter {
+            if ev.get("pane_id").and_then(Value::as_str) != Some(want.as_str()) {
+                continue;
+            }
+        }
+        if json_out {
+            println!("{ev}");
+        } else {
+            println!("{}", event_line(&ev));
+        }
+    }
+}
+
+/// Exit code to report for a process exit code. `None` (unknown) is a failure.
+fn exit_value(code: Option<i64>) -> i32 {
+    match code {
+        Some(c) => (c & 0xff) as i32,
+        None => EXIT_FAILED,
+    }
+}
+
+pub fn run(keep: bool, wait: bool, cwd: Option<PathBuf>, command: Vec<String>) -> Result<i32> {
+    if command.is_empty() {
+        return Err(CliError::Usage("run needs a command after `--`".into()));
+    }
+    // Subscribe before the pane exists, so a fast exit cannot be missed.
+    let mut sub = if wait { Some(Client::subscribe()?) } else { None };
+
+    let (mut client, _) = Client::connect()?;
+    let cwd = match cwd {
+        Some(c) => c,
+        None => std::env::current_dir().map_err(|e| CliError::Failed(e.to_string()))?,
+    };
+    let cwd = std::fs::canonicalize(&cwd)
+        .map_err(|e| CliError::Usage(format!("--cwd {}: {e}", cwd.display())))?;
+    let mut params = json!({
+        "workspace_idx": 0,
+        "cwd": cwd.display().to_string(),
+        "command": command,
+    });
+    if keep {
+        params["remain_on_exit"] = json!(true);
+    }
+    let result = client.call("new_tab", params)?;
+    let pane = result.get("pane_id").and_then(Value::as_str).unwrap_or("").to_string();
+    println!("{pane}");
+    let Some(sub) = sub.as_mut() else { return Ok(0) };
+
+    let mut pending = Vec::new();
+    let mut last_check = Instant::now();
+    loop {
+        let msg = sub.poll_line(&mut pending, Duration::from_millis(500))?;
+        if let Some(msg) = msg {
+            let params = msg.get("params");
+            let for_pane = params.and_then(|p| p.get("pane_id")).and_then(Value::as_str)
+                == Some(pane.as_str());
+            match msg.get("method").and_then(Value::as_str) {
+                Some("pane_exited") if for_pane => {
+                    let code = params.and_then(|p| p.get("exit_code")).and_then(Value::as_i64);
+                    return Ok(exit_value(code));
+                }
+                // Closed without an exit event (closed by hand): use the record.
+                Some("pane_closed") if for_pane => return exit_from_record(&mut client, &pane),
+                _ => {}
+            }
+        }
+        // Safety net if the event stream missed something.
+        if last_check.elapsed() >= Duration::from_secs(2) {
+            last_check = Instant::now();
+            if let Some(code) = exit_if_done(&mut client, &pane)? {
+                return Ok(code);
+            }
+        }
+    }
+}
+
+fn exit_from_record(client: &mut Client, pane: &str) -> Result<i32> {
+    match exit_if_done(client, pane)? {
+        Some(c) => Ok(c),
+        None => Err(CliError::Failed(format!("pane {pane} closed without an exit status"))),
+    }
+}
+
+/// Exit code of the pane's process if it has ended.
+fn exit_if_done(client: &mut Client, pane: &str) -> Result<Option<i32>> {
+    let st = client.call("pane_exit_status", json!({ "pane_id": pane }))?;
+    if st.get("running").and_then(Value::as_bool).unwrap_or(true) {
+        return Ok(None);
+    }
+    Ok(Some(exit_value(st.get("exit_code").and_then(Value::as_i64))))
+}
+
+pub fn wait(target: &str, status: Option<&str>, timeout: Option<f64>) -> Result<i32> {
+    let want = match status {
+        Some(s) => Some(
+            forgetty_session::PaneStatus::parse(s)
+                .ok_or_else(|| {
+                    CliError::Usage(format!(
+                        "unknown status {s:?}. Use idle, working, waiting, done or failed."
+                    ))
+                })?
+                .as_str(),
+        ),
+        None => None,
+    };
+    let (mut client, _) = Client::connect()?;
+    let pane = resolve_pane(&mut client, target)?;
+    // Subscribe first, then look at the current state: nothing falls in between.
+    let mut sub = Client::subscribe()?;
+    let deadline = timeout.map(|t| Instant::now() + Duration::from_secs_f64(t.max(0.0)));
+    let mut pending = Vec::new();
+    let mut last_check = Instant::now() - Duration::from_secs(10);
+
+    loop {
+        if last_check.elapsed() >= Duration::from_secs(2) {
+            last_check = Instant::now();
+            match client.call("get_pane_info", json!({ "pane_id": pane })) {
+                Ok(info) => match want {
+                    Some(w) => {
+                        let cur = info
+                            .pointer("/status/status")
+                            .and_then(Value::as_str)
+                            .unwrap_or("idle");
+                        if cur == w {
+                            return Ok(0);
+                        }
+                    }
+                    None => {
+                        if exit_if_done(&mut client, &pane)?.is_some() {
+                            return Ok(0);
+                        }
+                    }
+                },
+                // The pane is gone.
+                Err(_) => {
+                    return match (want, exit_if_done(&mut client, &pane)) {
+                        (None, Ok(Some(_))) => Ok(0),
+                        _ => Err(CliError::Failed(format!(
+                            "pane {pane} closed before reaching the wanted state"
+                        ))),
+                    };
+                }
+            }
+        }
+        if let Some(d) = deadline {
+            if Instant::now() >= d {
+                eprintln!("forgetty: wait timed out");
+                return Ok(EXIT_TIMEOUT);
+            }
+        }
+        let Some(msg) = sub.poll_line(&mut pending, Duration::from_millis(500))? else { continue };
+        let params = msg.get("params");
+        if params.and_then(|p| p.get("pane_id")).and_then(Value::as_str) != Some(pane.as_str()) {
+            continue;
+        }
+        match (msg.get("method").and_then(Value::as_str), want) {
+            (Some("status_changed"), Some(w)) => {
+                if params.and_then(|p| p.get("status")).and_then(Value::as_str) == Some(w) {
+                    return Ok(0);
+                }
+            }
+            (Some("pane_exited"), None) => return Ok(0),
+            (Some("pane_closed"), None) => return Ok(0),
+            (Some("pane_closed"), Some(_)) => {
+                return Err(CliError::Failed(format!(
+                    "pane {pane} closed before reaching the wanted state"
+                )))
+            }
+            _ => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -653,5 +973,39 @@ mod tests {
         assert_eq!(CliError::Usage(String::new()).code(), 2);
         assert_eq!(CliError::NotFound(String::new()).code(), 3);
         assert_eq!(CliError::Unreachable(String::new()).code(), 4);
+    }
+
+    #[test]
+    fn event_names_follow_serverevent() {
+        assert_eq!(event_name("status_changed"), "StatusChanged");
+        assert_eq!(event_name("pane_closed"), "PaneClosed");
+        assert_eq!(event_name("cwd_changed"), "CwdChanged");
+        assert_eq!(event_name("notification"), "Notification");
+    }
+
+    #[test]
+    fn event_json_flattens_params() {
+        let msg = json!({"jsonrpc":"2.0","method":"status_changed",
+            "params":{"pane_id":"p","status":"waiting","message":"m"}});
+        let ev = event_json(&msg).unwrap();
+        assert_eq!(ev["event"], "StatusChanged");
+        assert_eq!(ev["status"], "waiting");
+        assert_eq!(ev["message"], "m");
+        assert!(event_json(&json!({"result":{}})).is_none());
+    }
+
+    #[test]
+    fn event_line_hides_control_characters() {
+        let ev = json!({"event":"Notification","pane_id":"0123456789abcdef","body":"a\u{1b}[31mb"});
+        let line = event_line(&ev);
+        assert!(!line.contains('\u{1b}'), "{line:?}");
+        assert!(line.contains("pane=89abcdef"));
+    }
+
+    #[test]
+    fn exit_values() {
+        assert_eq!(exit_value(Some(7)), 7);
+        assert_eq!(exit_value(Some(256 + 3)), 3);
+        assert_eq!(exit_value(None), EXIT_FAILED);
     }
 }

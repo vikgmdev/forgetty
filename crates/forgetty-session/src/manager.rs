@@ -28,7 +28,8 @@ use crate::byte_log::ByteLog;
 use crate::drain_result::DrainResult;
 use crate::events::SessionEvent;
 use crate::layout::{SessionLayout, SessionTab};
-use crate::pane::{DuplicatedTab, PaneInfo, PaneState};
+use crate::osc::OscEvent;
+use crate::pane::{DuplicatedTab, NotificationInfo, PaneInfo, PaneState};
 use crate::pty_bridge::PtyBridge;
 use crate::workspace::{build_workspace_state, PaneTreeLayout, WorkspaceLayout};
 
@@ -68,6 +69,9 @@ struct SessionManagerInner {
     /// by `EXIT_HISTORY_CAP`. Lets `run --wait` read a code after the pane
     /// closed.
     exit_history: std::collections::VecDeque<(PaneId, i32)>,
+    /// Run the OSC scanner on PTY output (AD-019). On by default. Only the
+    /// benchmark turns it off, to measure what the scanner costs.
+    osc_scanning: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -103,8 +107,16 @@ impl SessionManager {
                 byte_log_ring_kb: 1024,
                 byte_log_max_mb: 10,
                 exit_history: std::collections::VecDeque::new(),
+                osc_scanning: true,
             })),
         }
+    }
+
+    /// Turn the OSC scanner on or off for all panes (AD-019). It is on by
+    /// default. This switch exists so the benchmark can measure its cost.
+    pub fn set_osc_scanning(&self, on: bool) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.osc_scanning = on;
     }
 
     /// Registry of attached clients (iroh connections and streaming sockets).
@@ -165,6 +177,7 @@ impl SessionManager {
             remain_on_exit: false,
             exited: false,
             exit_code: None,
+            osc: Default::default(),
         };
 
         {
@@ -667,6 +680,7 @@ impl SessionManager {
                     remain_on_exit: false,
                     exited: false,
                     exit_code: None,
+                    osc: Default::default(),
                 };
                 inner.panes.insert(pane_id, pane);
                 inner.pane_order.push(pane_id);
@@ -815,6 +829,7 @@ impl SessionManager {
             remain_on_exit,
             exited: false,
             exit_code: None,
+            osc: Default::default(),
         };
 
         inner.panes.insert(pane_id, pane);
@@ -877,6 +892,7 @@ impl SessionManager {
             remain_on_exit: false,
             exited: false,
             exit_code: None,
+            osc: Default::default(),
         };
 
         inner.panes.insert(new_pane_id, new_pane);
@@ -970,6 +986,7 @@ impl SessionManager {
             remain_on_exit: false,
             exited: false,
             exit_code: None,
+            osc: Default::default(),
         };
 
         inner.panes.insert(new_pane_id, new_pane);
@@ -1152,6 +1169,7 @@ impl SessionManager {
             remain_on_exit: false,
             exited: false,
             exit_code: None,
+            osc: Default::default(),
         };
 
         inner.panes.insert(pane_id, pane);
@@ -1510,18 +1528,33 @@ impl SessionManager {
     /// (DSR, device-status, etc.) are produced by the client's parser and
     /// written back via `write_pty`.
     pub fn process_pane_bytes(&self, id: PaneId, bytes: &[u8]) -> Result<DrainResult> {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let inner = &mut *guard;
+        let scanning = inner.osc_scanning;
         let pane = inner
             .panes
             .get_mut(&id)
             .ok_or_else(|| forgetty_core::ForgettyError::Pty(format!("pane {id} not found")))?;
 
-        if let Some(pid) = pane.pty_bridge.pty.pid() {
-            if let Ok(cwd) = std::fs::read_link(format!("/proc/{pid}/cwd")) {
-                pane.cwd = cwd;
+        if !pane.osc.cwd_from_osc {
+            if let Some(pid) = pane.pty_bridge.pty.pid() {
+                if let Ok(cwd) = std::fs::read_link(format!("/proc/{pid}/cwd")) {
+                    pane.cwd = cwd;
+                }
             }
         }
         let pty_exited = !pane.pty_bridge.pty.is_alive();
+
+        // AD-019: scan for OSC 0/2/7/9/99/777/7501/133. Byte-level state
+        // machine, no allocation unless a sequence of interest is found.
+        let mut found: Vec<OscEvent> = Vec::new();
+        if scanning {
+            pane.osc.scanner.feed(bytes, &mut |e| found.push(e));
+        }
+        let mut meta_events: Vec<SessionEvent> = Vec::new();
+        if !found.is_empty() {
+            apply_osc_events(id, pane, found, &mut meta_events);
+        }
 
         // V2-007 AC-13: ring write BEFORE broadcast, both under the same
         // `inner` mutex guard. This is the ordering invariant that makes
@@ -1541,6 +1574,9 @@ impl SessionManager {
             pane_id: id,
             data: bytes::Bytes::copy_from_slice(bytes),
         });
+        for ev in meta_events {
+            let _ = inner.event_tx.send(ev);
+        }
         Ok(DrainResult { pty_exited })
     }
 
@@ -1672,6 +1708,17 @@ impl SessionManager {
                     inner.exit_history.pop_front();
                 }
             }
+            // The process is gone: transient status records (working, waiting)
+            // end with it. done and failed stay (OSC 7501 lifetime rules).
+            let mut meta_events: Vec<SessionEvent> = Vec::new();
+            if let Some(pane) = inner.panes.get_mut(&pane_id) {
+                pane.osc.status.drop_transient();
+                publish_status(pane_id, pane, &mut meta_events);
+            }
+            let _ = inner.event_tx.send(SessionEvent::PaneExited { pane_id, exit_code: code });
+            for ev in meta_events {
+                let _ = inner.event_tx.send(ev);
+            }
             match inner.panes.get_mut(&pane_id) {
                 Some(pane) if pane.remain_on_exit => {
                     pane.exited = true;
@@ -1738,7 +1785,32 @@ impl SessionManager {
             remain_on_exit: pane.remain_on_exit,
             exited: pane.exited,
             exit_code: pane.exit_code,
+            status: pane.osc.status.effective(),
+            last_notification: pane.osc.last_notification.clone(),
         })
+    }
+
+    /// Visible screen text of a pane, built on request from its byte-log ring
+    /// (AD-019). Returns `None` for an unknown pane.
+    ///
+    /// Cold path: a VT instance is created at the pane's current size, fed
+    /// with the ring and dropped. The lock is held only for the snapshot.
+    pub fn capture_pane(
+        &self,
+        id: PaneId,
+        trim: bool,
+        last_lines: Option<usize>,
+    ) -> Option<String> {
+        let (rows, cols, replay) = {
+            let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let inner = &mut *guard;
+            let pane = inner.panes.get(&id)?;
+            let (rows, cols) = (pane.rows, pane.cols);
+            let replay =
+                inner.byte_logs.get_mut(&id).map(|log| log.ring_snapshot().0).unwrap_or_default();
+            (rows, cols, replay)
+        };
+        Some(crate::capture::capture_text(&replay, rows, cols, trim, last_lines))
     }
 
     /// List all live pane IDs.
@@ -2148,6 +2220,84 @@ fn _assert_send_sync() {
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// OSC scanner results (AD-019)
+// ---------------------------------------------------------------------------
+
+/// Most notification events per pane per second. A program can write them as
+/// fast as it likes (OSC 7501 asks terminals to rate-limit what a report
+/// causes outside the terminal).
+const NOTIFY_MAX_PER_SEC: u32 = 10;
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Update the pane from scanner events and queue the events to broadcast.
+fn apply_osc_events(
+    id: PaneId,
+    pane: &mut PaneState,
+    found: Vec<OscEvent>,
+    out: &mut Vec<SessionEvent>,
+) {
+    for ev in found {
+        match ev {
+            OscEvent::Title(t) => {
+                if pane.title != t {
+                    pane.title = t.clone();
+                    out.push(SessionEvent::TitleChanged { pane_id: id, title: t });
+                }
+            }
+            OscEvent::Cwd(c) => {
+                pane.osc.cwd_from_osc = true;
+                let path = PathBuf::from(&c);
+                if pane.cwd != path {
+                    pane.cwd = path;
+                    out.push(SessionEvent::CwdChanged { pane_id: id, cwd: c });
+                }
+            }
+            OscEvent::Status(report) => {
+                pane.osc.status.apply(report);
+                publish_status(id, pane, out);
+            }
+            OscEvent::PromptStart => {
+                pane.osc.status.drop_transient();
+                publish_status(id, pane, out);
+            }
+            OscEvent::Notification { title, body } => {
+                let now = now_ms();
+                if now.saturating_sub(pane.osc.notify_window_start_ms) >= 1000 {
+                    pane.osc.notify_window_start_ms = now;
+                    pane.osc.notify_in_window = 0;
+                }
+                if pane.osc.notify_in_window >= NOTIFY_MAX_PER_SEC {
+                    continue;
+                }
+                pane.osc.notify_in_window += 1;
+                pane.osc.last_notification =
+                    Some(NotificationInfo { title: title.clone(), body: body.clone(), at_ms: now });
+                out.push(SessionEvent::Notification { pane_id: id, title, body });
+            }
+        }
+    }
+}
+
+/// Queue a `StatusChanged` when the pane status really changed.
+fn publish_status(id: PaneId, pane: &mut PaneState, out: &mut Vec<SessionEvent>) {
+    let now = pane.osc.status.effective();
+    if now != pane.osc.published {
+        out.push(SessionEvent::StatusChanged {
+            pane_id: id,
+            status: now.status.as_str().to_string(),
+            message: now.message.clone(),
+        });
+        pane.osc.published = now;
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -4174,6 +4324,172 @@ mod tests {
         let (pane, _) = sm.create_tab(0, None, small(), sh("sleep 30")).unwrap();
         assert_eq!(sm.pane_exit_status(pane), Some((true, None)));
         assert_eq!(sm.pane_exit_status(PaneId::new()), None);
+        sm.close_pane(pane).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // OSC scanner on the drain path (AD-019)
+    // -----------------------------------------------------------------------
+
+    async fn collect_until(
+        rx: &mut broadcast::Receiver<SessionEvent>,
+        mut done: impl FnMut(&SessionEvent) -> bool,
+    ) -> Vec<SessionEvent> {
+        let mut seen = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tokio::time::Instant::now() < deadline {
+            if let Ok(Ok(ev)) = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                let stop = done(&ev);
+                seen.push(ev);
+                if stop {
+                    break;
+                }
+            }
+        }
+        seen
+    }
+
+    #[tokio::test]
+    async fn osc_title_cwd_status_and_notification_reach_pane_info_and_events() {
+        let sm = SessionManager::new();
+        let mut rx = sm.subscribe_output();
+        let script = "printf '\\033]2;my-title\\007'; \
+                      printf '\\033]7;file://h/var/tmp\\007'; \
+                      printf '\\033]7501;state=blocked:kind=question:msg=SXMgaXQgb2s/\\033\\\\'; \
+                      printf '\\033]777;notify;Build;finished\\007'; \
+                      sleep 30";
+        let (pane, _) = sm.create_tab(0, None, small(), sh(script)).unwrap();
+        let events = collect_until(
+            &mut rx,
+            |e| matches!(e, SessionEvent::Notification { pane_id, .. } if *pane_id == pane),
+        )
+        .await;
+
+        let title = events.iter().find_map(|e| match e {
+            SessionEvent::TitleChanged { pane_id, title } if *pane_id == pane => {
+                Some(title.clone())
+            }
+            _ => None,
+        });
+        assert_eq!(title.as_deref(), Some("my-title"));
+        let cwd = events.iter().find_map(|e| match e {
+            SessionEvent::CwdChanged { pane_id, cwd } if *pane_id == pane => Some(cwd.clone()),
+            _ => None,
+        });
+        assert_eq!(cwd.as_deref(), Some("/var/tmp"));
+        let status = events.iter().find_map(|e| match e {
+            SessionEvent::StatusChanged { pane_id, status, message } if *pane_id == pane => {
+                Some((status.clone(), message.clone()))
+            }
+            _ => None,
+        });
+        assert_eq!(status, Some(("waiting".to_string(), Some("Is it ok?".to_string()))));
+
+        let info = sm.pane_info(pane).unwrap();
+        assert_eq!(info.title, "my-title");
+        assert_eq!(info.cwd, PathBuf::from("/var/tmp"), "OSC 7 beats /proc once reported");
+        assert_eq!(info.status.status, crate::status::PaneStatus::Waiting);
+        assert_eq!(info.status.kind.as_deref(), Some("question"));
+        let n = info.last_notification.expect("notification stored");
+        assert_eq!((n.title.as_deref(), n.body.as_str()), (Some("Build"), "finished"));
+        sm.close_pane(pane).unwrap();
+    }
+
+    #[tokio::test]
+    async fn status_changed_is_not_repeated_for_the_same_report() {
+        let sm = SessionManager::new();
+        let mut rx = sm.subscribe_output();
+        let script = "for i in 1 2 3; do printf '\\033]7501;state=working:msg=T24=\\007'; done; \
+                      printf '\\033]7501;state=done:msg=RmluaXNo\\007'; sleep 30";
+        let (pane, _) = sm.create_tab(0, None, small(), sh(script)).unwrap();
+        let events = collect_until(
+            &mut rx,
+            |e| matches!(e, SessionEvent::StatusChanged { status, .. } if status == "done"),
+        )
+        .await;
+        let working = events
+            .iter()
+            .filter(
+                |e| matches!(e, SessionEvent::StatusChanged { status, .. } if status == "working"),
+            )
+            .count();
+        assert!(working <= 1, "same report must not repeat the event, got {working}");
+        sm.close_pane(pane).unwrap();
+    }
+
+    #[tokio::test]
+    async fn exit_drops_working_but_keeps_done() {
+        let sm = SessionManager::new();
+        let (pane, _) = sm
+            .create_tab_with_options(
+                0,
+                None,
+                small(),
+                sh("printf '\\033]7501;state=working:id=a\\007\\033]7501;state=done:id=b:msg=b2s=\\007'"),
+                PaneId::new(),
+                true,
+            )
+            .unwrap();
+        assert!(wait_for(|| sm.pane_info(pane).is_some_and(|i| i.exited)).await);
+        let info = sm.pane_info(pane).unwrap();
+        assert_eq!(info.status.status, crate::status::PaneStatus::Done);
+        assert_eq!(info.status.message.as_deref(), Some("ok"));
+    }
+
+    #[tokio::test]
+    async fn prompt_start_drops_working() {
+        let sm = SessionManager::new();
+        let script =
+            "printf '\\033]7501;state=working\\007'; sleep 1; printf '\\033]133;A\\007'; sleep 30";
+        let (pane, _) = sm.create_tab(0, None, small(), sh(script)).unwrap();
+        assert!(
+            wait_for(|| sm
+                .pane_info(pane)
+                .is_some_and(|i| i.status.status == crate::status::PaneStatus::Working))
+            .await
+        );
+        assert!(
+            wait_for(|| sm
+                .pane_info(pane)
+                .is_some_and(|i| i.status.status == crate::status::PaneStatus::Idle))
+            .await,
+            "OSC 133;A ends a working record"
+        );
+        sm.close_pane(pane).unwrap();
+    }
+
+    #[tokio::test]
+    async fn pane_exited_event_carries_the_code() {
+        let sm = SessionManager::new();
+        let mut rx = sm.subscribe_output();
+        let (pane, _) = sm.create_tab(0, None, small(), sh("exit 7")).unwrap();
+        let events = collect_until(
+            &mut rx,
+            |e| matches!(e, SessionEvent::PaneClosed { pane_id } if *pane_id == pane),
+        )
+        .await;
+        let code = events.iter().find_map(|e| match e {
+            SessionEvent::PaneExited { pane_id, exit_code } if *pane_id == pane => Some(*exit_code),
+            _ => None,
+        });
+        assert_eq!(code, Some(Some(7)));
+    }
+
+    #[tokio::test]
+    async fn capture_returns_the_visible_screen_from_the_ring() {
+        let sm = SessionManager::new();
+        let (pane, _) =
+            sm.create_tab(0, None, small(), sh("echo captured-line; sleep 30")).unwrap();
+        assert!(
+            wait_for(|| sm
+                .capture_pane(pane, true, None)
+                .is_some_and(|t| t.contains("captured-line")))
+            .await,
+            "capture shows the line"
+        );
+        let text = sm.capture_pane(pane, true, Some(1)).unwrap();
+        assert_eq!(text.lines().count(), 1);
+        assert!(sm.capture_pane(PaneId::new(), true, None).is_none());
         sm.close_pane(pane).unwrap();
     }
 }

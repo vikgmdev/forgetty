@@ -75,6 +75,7 @@ pub fn dispatch(
         }
         methods::LIST_CLIENTS => handle_list_clients(request, &sm),
         methods::PANE_EXIT_STATUS => handle_pane_exit_status(request, &sm),
+        methods::CAPTURE => handle_capture(request, &sm),
         methods::PAIR_OPEN => handle_pair_open(request, sync_endpoint.as_deref()),
         methods::PAIR_STATUS => handle_pair_status(request, sync_endpoint.as_deref()),
         // Sync / pairing methods — require sync_endpoint.
@@ -158,12 +159,35 @@ fn handle_list_tabs(request: &Request, sm: &SessionManager) -> Response {
                     "remain_on_exit": info.remain_on_exit,
                     "exited": info.exited,
                     "exit_code": info.exit_code,
+                    "status": status_json(&info),
+                    "last_notification": notification_json(&info),
                 })
             })
         })
         .collect();
 
     Response::success(request.id.clone(), serde_json::json!({ "tabs": tabs }))
+}
+
+/// Program status of a pane (OSC 7501) as JSON. `status` is `idle`, `working`,
+/// `waiting`, `done` or `failed`.
+fn status_json(info: &forgetty_session::PaneInfo) -> serde_json::Value {
+    serde_json::json!({
+        "status": info.status.status.as_str(),
+        "message": info.status.message,
+        "kind": info.status.kind,
+        "progress": info.status.progress,
+        "app": info.status.app,
+        "record_id": info.status.record_id,
+    })
+}
+
+/// Last desktop notification of a pane, or `null`.
+fn notification_json(info: &forgetty_session::PaneInfo) -> serde_json::Value {
+    match &info.last_notification {
+        Some(n) => serde_json::json!({ "title": n.title, "body": n.body, "at_ms": n.at_ms }),
+        None => serde_json::Value::Null,
+    }
 }
 
 fn handle_get_layout(request: &Request, sm: &SessionManager) -> Response {
@@ -893,6 +917,36 @@ fn handle_pane_exit_status(request: &Request, sm: &SessionManager) -> Response {
     }
 }
 
+/// `capture`: visible screen text of a pane (AD-019, cold path).
+fn handle_capture(request: &Request, sm: &SessionManager) -> Response {
+    let id = match require_pane_id(request, sm) {
+        Ok(id) => id,
+        Err(e) => return e,
+    };
+    let trim = request.params.get("trim").and_then(|v| v.as_bool()).unwrap_or(false);
+    let last_lines = match request.params.get("last_lines") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => match v.as_u64() {
+            Some(n) => Some(n.min(100_000) as usize),
+            None => {
+                return Response::error(
+                    request.id.clone(),
+                    protocol::INVALID_PARAMS,
+                    "last_lines must be a non-negative integer".to_string(),
+                )
+            }
+        },
+    };
+    match sm.capture_pane(id, trim, last_lines) {
+        Some(text) => Response::success(request.id.clone(), serde_json::json!({ "text": text })),
+        None => Response::error(
+            request.id.clone(),
+            protocol::INVALID_PARAMS,
+            format!("pane not found: {id}"),
+        ),
+    }
+}
+
 fn handle_list_clients(request: &Request, sm: &SessionManager) -> Response {
     let clients: Vec<serde_json::Value> = sm
         .clients()
@@ -1119,6 +1173,8 @@ fn handle_get_pane_info(request: &Request, sm: &SessionManager) -> Response {
             "remain_on_exit": info.remain_on_exit,
             "exited": info.exited,
             "exit_code": info.exit_code,
+            "status": status_json(&info),
+            "last_notification": notification_json(&info),
         }),
     )
 }
@@ -2263,5 +2319,104 @@ mod tests {
             None,
         );
         assert_eq!(status.result.unwrap()["running"], true);
+    }
+
+    #[tokio::test]
+    async fn list_tabs_and_get_pane_info_carry_status_and_notification() {
+        let sm = make_sm();
+        let resp = dispatch(
+            &req("new_tab", serde_json::json!({ "workspace_idx": 0 })),
+            Arc::clone(&sm),
+            None,
+            None,
+        );
+        let pane = resp.result.unwrap()["pane_id"].as_str().unwrap().to_string();
+        for result in [
+            dispatch(&req("list_tabs", serde_json::Value::Null), Arc::clone(&sm), None, None)
+                .result
+                .unwrap()["tabs"][0]
+                .clone(),
+            dispatch(
+                &req("get_pane_info", serde_json::json!({ "pane_id": pane })),
+                Arc::clone(&sm),
+                None,
+                None,
+            )
+            .result
+            .unwrap(),
+        ] {
+            assert_eq!(result["status"]["status"], "idle");
+            assert!(result["status"]["message"].is_null());
+            assert!(result["last_notification"].is_null());
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_unknown_pane_is_an_error_and_bad_lines_is_rejected() {
+        let sm = make_sm();
+        let resp = dispatch(
+            &req("capture", serde_json::json!({ "pane_id": uuid::Uuid::new_v4().to_string() })),
+            Arc::clone(&sm),
+            None,
+            None,
+        );
+        assert!(resp.error.is_some());
+
+        let resp = dispatch(
+            &req("new_tab", serde_json::json!({ "workspace_idx": 0 })),
+            Arc::clone(&sm),
+            None,
+            None,
+        );
+        let pane = resp.result.unwrap()["pane_id"].as_str().unwrap().to_string();
+        let resp = dispatch(
+            &req("capture", serde_json::json!({ "pane_id": pane, "last_lines": "x" })),
+            Arc::clone(&sm),
+            None,
+            None,
+        );
+        assert!(resp.error.is_some());
+        let resp = dispatch(
+            &req("capture", serde_json::json!({ "pane_id": pane, "trim": true, "last_lines": 3 })),
+            sm,
+            None,
+            None,
+        );
+        assert!(resp.result.unwrap()["text"].is_string());
+    }
+
+    #[test]
+    fn pane_event_notifications_use_serverevent_names() {
+        use crate::server::pane_event_notification;
+        use forgetty_session::SessionEvent;
+        let id = PaneId::new();
+        let ev = SessionEvent::StatusChanged {
+            pane_id: id,
+            status: "waiting".into(),
+            message: Some("m".into()),
+        };
+        let n = pane_event_notification(&ev).unwrap();
+        assert_eq!(n["method"], "status_changed");
+        assert_eq!(n["params"]["status"], "waiting");
+        assert_eq!(n["params"]["pane_id"], id.to_string());
+        assert_eq!(
+            pane_event_notification(&SessionEvent::PaneClosed { pane_id: id }).unwrap()["method"],
+            "pane_closed"
+        );
+        assert_eq!(
+            pane_event_notification(&SessionEvent::TitleChanged { pane_id: id, title: "t".into() })
+                .unwrap()["method"],
+            "title_changed"
+        );
+        assert_eq!(
+            pane_event_notification(&SessionEvent::CwdChanged { pane_id: id, cwd: "/".into() })
+                .unwrap()["method"],
+            "cwd_changed"
+        );
+        assert!(pane_event_notification(&SessionEvent::ActiveTabChanged {
+            workspace_idx: 0,
+            tab_idx: 0
+        })
+        .is_none());
     }
 }

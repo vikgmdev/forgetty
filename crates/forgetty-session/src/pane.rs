@@ -6,7 +6,34 @@ use std::path::PathBuf;
 use forgetty_core::PaneId;
 use uuid::Uuid;
 
+use crate::osc::OscScanner;
 use crate::pty_bridge::PtyBridge;
+use crate::status::{StatusSnapshot, StatusTracker};
+
+/// The last desktop notification (OSC 9, 99 or 777) a pane sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotificationInfo {
+    pub title: Option<String>,
+    pub body: String,
+    /// Unix time in milliseconds.
+    pub at_ms: u64,
+}
+
+/// What the OSC scanner learns about a pane (AD-019). One per pane.
+#[derive(Debug, Default)]
+pub struct PaneOsc {
+    pub scanner: OscScanner,
+    pub status: StatusTracker,
+    /// Status last published, to emit `StatusChanged` only on a real change.
+    pub published: StatusSnapshot,
+    pub last_notification: Option<NotificationInfo>,
+    /// The shell reported its directory with OSC 7. From then on that wins
+    /// over the process cwd from `/proc` (the shell may be on another host).
+    pub cwd_from_osc: bool,
+    /// Notification rate limit window.
+    pub notify_window_start_ms: u64,
+    pub notify_in_window: u32,
+}
 
 /// Full per-pane state, owned behind the `Arc<Mutex<SessionManagerInner>>`.
 ///
@@ -34,6 +61,8 @@ pub struct PaneState {
     pub exited: bool,
     /// Exit code of the process, once known.
     pub exit_code: Option<i32>,
+    /// Title, cwd, status and notifications found in the output (AD-019).
+    pub osc: PaneOsc,
 }
 
 /// Public snapshot of pane metadata (returned by `SessionManager::pane_info()`).
@@ -54,6 +83,10 @@ pub struct PaneInfo {
     pub exited: bool,
     /// Exit code, once the process has exited.
     pub exit_code: Option<i32>,
+    /// Program status (OSC 7501), `idle` when the program reports nothing.
+    pub status: StatusSnapshot,
+    /// Last desktop notification the pane sent, if any.
+    pub last_notification: Option<NotificationInfo>,
 }
 
 /// Returned per-tab metadata from `SessionManager::duplicate_workspace` (FIX-007).

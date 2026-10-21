@@ -62,6 +62,12 @@ forgetty ls [--json]
 forgetty new [--cwd DIR] [--keep] [-- CMD...]   prints the pane id; --keep = remain on exit
 forgetty send -p PANE TEXT [--enter]
 forgetty send-key -p PANE KEY       enter tab esc ctrl+c up down left right
+forgetty close -p PANE              close a pane (also a kept, exited one)
+forgetty capture -p PANE [--trim] [--lines N] [--json]   visible screen as text
+forgetty events [--json] [-p PANE]  stream events until Ctrl+C
+forgetty run [--keep] [--wait] [--cwd DIR] -- CMD...   new pane running CMD;
+                                    --wait blocks and exits with CMD's exit code
+forgetty wait -p PANE [--status done|waiting|...] [--timeout S]
 forgetty client ls [--json]
 forgetty pair                       QR + payload, waits 60 s for one device
 forgetty devices [--json]
@@ -71,7 +77,35 @@ forgetty revoke ID
 `PANE` is a full id or a unique id suffix of 4+ characters.
 
 Exit codes: 0 ok, 1 failed, 2 bad command line, 3 target not found or
-ambiguous, 4 server unreachable.
+ambiguous, 4 server unreachable, 5 `wait` timed out (`run --wait` returns the
+command's own exit code instead).
+
+`wait` without `--status` waits for the pane process to exit. Statuses are
+`idle`, `working`, `waiting`, `done`, `failed`.
+
+## Pane state from the output (AD-019)
+
+The server scans PTY output for a few OSC sequences with a byte-level state
+machine (not a VT parser; it keeps state across read boundaries and buffers at
+most 4 KiB per sequence):
+
+- OSC 0 and 2: pane title
+- OSC 7: working directory
+- OSC 9, 99, 777: notifications (rate limited to 10 per second per pane)
+- OSC 7501: program status, see
+  <https://www.superlogical.com/rex/docs/build/program-status.md>
+  (`blocked` shows as `waiting`, `error` as `failed`)
+- OSC 133 `A`: a new prompt ends `working` and `waiting` status
+
+Everything in a sequence is untrusted and sanitised before it is stored. State
+shows in `forgetty ls --json`, `get_pane_info` and the event stream.
+`forgetty capture` builds a terminal from the pane's byte-log ring only when
+asked.
+
+Benchmark: `cargo bench -p forgetty-session --bench osc_scanner` times the
+scanner over a 100 MiB mixed stream through a real PTY. It adds under 1 % to
+drain time. A stream with an OSC of interest in every few lines costs more (see
+the bench output).
 
 The CLI warns on stderr when the running server has another version than the
 CLI. Restart the server then.

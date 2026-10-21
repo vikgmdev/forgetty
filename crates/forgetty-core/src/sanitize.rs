@@ -6,7 +6,7 @@
 //! forge log lines, drive the operator's terminal with escape sequences, or
 //! flip text direction.
 
-/// Longest accepted untrusted string, in characters.
+/// Longest accepted untrusted string, in characters (names, ids).
 pub const MAX_UNTRUSTED_CHARS: usize = 64;
 
 /// Clean `raw` for logging, storing and display.
@@ -21,11 +21,17 @@ pub const MAX_UNTRUSTED_CHARS: usize = 64;
 ///
 /// The result can be empty. Callers pick their own fallback.
 pub fn untrusted(raw: &str) -> String {
+    untrusted_max(raw, MAX_UNTRUSTED_CHARS)
+}
+
+/// Same as [`untrusted`] with a caller-chosen character cap, for longer free
+/// text such as a pane title, a status message or a notification body.
+pub fn untrusted_max(raw: &str, max_chars: usize) -> String {
     let mut out = String::new();
     let mut count = 0usize;
     let mut chars = raw.chars().peekable();
     while let Some(c) = chars.next() {
-        if count >= MAX_UNTRUSTED_CHARS {
+        if count >= max_chars {
             break;
         }
         if c == '\u{1b}' {
@@ -112,6 +118,13 @@ mod tests {
     fn a_10kb_blob_of_escapes_and_newlines_is_empty() {
         let blob = "\u{1b}[31m\n".repeat(2000);
         assert_eq!(untrusted(&blob), "");
+    }
+
+    #[test]
+    fn untrusted_max_uses_the_given_cap() {
+        let big = "y".repeat(1000);
+        assert_eq!(untrusted_max(&big, 200).chars().count(), 200);
+        assert_eq!(untrusted_max("a\u{1b}[31mb", 10), "ab");
     }
 
     #[test]

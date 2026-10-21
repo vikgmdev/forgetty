@@ -415,9 +415,52 @@ exit code of every pane process (last 1024 kept).
 
 **Params:** `{"pane_id":"<uuid>"}`
 
-**Result:** `{"pane_id":"<uuid>","exited":true,"exit_code":5}` while running
-`exited` is false and `exit_code` is `null`. An id the server never knew
-returns an error.
+**Result:** `{"running":false,"exit_code":5}`. While the process runs it is
+`{"running":true,"exit_code":null}`. An id the server never knew returns an
+error.
+
+#### `capture`
+
+Visible screen of a pane as text (AD-019, cold path). The server builds a
+`forgetty-vt` terminal from the pane's byte-log ring at the pane's current size,
+reads the screen and drops the terminal. Nothing runs on the PTY drain path. It
+works after a server restart, because the ring is reloaded from the disk log.
+
+**Params:** `{"pane_id":"<uuid>","trim":false,"last_lines":null}`
+
+| Field | Type | Description |
+|---|---|---|
+| `pane_id` | string | required |
+| `trim` | bool | Remove trailing whitespace from every line and trailing blank lines. Default `false`. |
+| `last_lines` | number | Keep only the last N lines (after `trim`). Default: all rows. |
+
+**Result:** `{"text":"line 1\nline 2"}` (one line per screen row, joined by `\n`).
+
+**Errors:** unknown pane, or `last_lines` not a non-negative integer.
+
+#### Pane state in `list_tabs` and `get_pane_info`
+
+Both carry, per pane, what the OSC scanner (AD-019) found in the output:
+
+| Field | Description |
+|---|---|
+| `title` | Last OSC 0 or 2 title (sanitised, 256 chars at most). |
+| `cwd` | Last OSC 7 directory. Once a pane has reported one it wins over `/proc/<pid>/cwd`. |
+| `status` | `{ "status", "message", "kind", "progress", "app", "record_id" }` from OSC 7501. |
+| `last_notification` | `{ "title", "body", "at_ms" }` of the last OSC 9, 99 or 777 notification, else `null`. |
+
+`status.status` is `idle` (default, also when nothing was reported), `working`,
+`waiting`, `done` or `failed`. The wire names of the Program Status Protocol map
+as `blocked` to `waiting` and `error` to `failed`. With several records
+(`id=`), the pane shows the most urgent one: waiting, failed, working, done,
+idle. `working` and `waiting` records end when the process exits or a new shell
+prompt begins (OSC 133 `A`). `done` and `failed` stay.
+
+All text is untrusted and sanitised before it is stored: control characters and
+bidi overrides removed, length capped. An OSC 7501 report with a control
+character in `msg` or `title`, or one over the limits of the protocol, is
+discarded whole. The scanner buffers at most 4 KiB per sequence and discards
+longer ones. Notifications are limited to 10 per second per pane.
 
 ### 5.3 Streaming
 
@@ -493,6 +536,20 @@ client, no `id` in the message):
 | `pane_split` | `{"tab_id":"<uuid>","parent_pane_id":"<uuid>","new_pane_id":"<uuid>","direction":"horizontal"\|"vertical"}` |
 | `tab_moved` | `{"workspace_idx":<n>,"tab_id":"<uuid>","new_index":<n>}` |
 | `active_tab_changed` | `{"workspace_idx":<n>,"tab_idx":<n>}` |
+| `active_workspace_changed`, `workspace_created`, `workspace_renamed`, `workspace_deleted`, `workspace_color_changed`, `workspaces_reordered`, `active_pane_changed` | see the layout methods |
+| `pane_created` | `{"pane_id":"<uuid>"}` |
+| `pane_exited` | `{"pane_id":"<uuid>","exit_code":<n>\|null}`, sent before `pane_closed` (and alone for a kept pane) |
+| `pane_closed` | `{"pane_id":"<uuid>"}` |
+| `title_changed` | `{"pane_id":"<uuid>","title":"..."}` |
+| `cwd_changed` | `{"pane_id":"<uuid>","cwd":"/path"}` |
+| `status_changed` | `{"pane_id":"<uuid>","status":"waiting","message":"..."\|null}`, only when the pane status really changes |
+| `notification` | `{"pane_id":"<uuid>","title":"..."\|null,"body":"..."}` |
+
+`pane_closed`, `title_changed`, `cwd_changed` and `status_changed` are the
+snake_case forms of the PROTOCOL_V2 `ServerEvent` names (`PaneClosed`,
+`TitleChanged`, `CwdChanged`, `StatusChanged`). `pane_created`, `pane_exited`
+and `notification` exist on the local socket only for now. `forgetty events
+--json` prints each notification as `{"event":"StatusChanged", ...params}`.
 
 Example emitted line — on the wire this is a single line terminated by
 `\n`; wrapped here for readability:
@@ -504,16 +561,10 @@ Example emitted line — on the wire this is a single line terminated by
  "params":{"workspace_idx":0,"tab_id":"<uuid>","pane_id":"<uuid>"}}
 ```
 
-**Known limitations.** The subscription does not currently emit events for
-pane-closure (there is no pane_closed notification) or workspace lifecycle
-events such as workspace_created or workspace_switched. The underlying
-broadcast channel inside the daemon does carry `PaneCreated`, `PaneClosed`,
-and `Notification` events, but the `subscribe_layout` handler intentionally
-filters to the five layout events above. To detect pane closure or
-workspace changes, call `get_layout` on a new connection when you need a
-fresh snapshot, or open an additional subscription. This is the current
-shape of the API, not a permanent contract — a future task may broaden the
-event set.
+**Slow readers.** The events share the server's broadcast channel with PTY
+output. A reader that falls far behind can miss events. `forgetty wait`
+re-checks `get_pane_info` every 2 s for that reason. A client that must not
+miss a state change should do the same.
 
 **Pipelining contract.** After the ack, the connection is
 server-to-client only: the daemon stops reading the client's write half,

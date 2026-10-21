@@ -6,12 +6,17 @@
 //! forgetty new [--cwd DIR] [-- CMD...]
 //! forgetty send -p PANE TEXT
 //! forgetty send-key -p PANE KEY
+//! forgetty close -p PANE
+//! forgetty capture -p PANE [--trim] [--lines N] [--json]
+//! forgetty events [--json] [-p PANE]
+//! forgetty run [--keep] [--wait] [--cwd DIR] -- CMD...
+//! forgetty wait -p PANE [--status done|waiting|...] [--timeout S]
 //! forgetty client ls [--json]
 //! forgetty pair | devices | revoke ID
 //! ```
 //!
 //! Exit codes: 0 ok, 1 failed, 2 bad command line, 3 target not found or
-//! ambiguous, 4 server unreachable.
+//! ambiguous, 4 server unreachable, 5 `wait` timed out.
 
 mod cli;
 mod server;
@@ -78,6 +83,64 @@ enum Command {
         #[arg(short = 'p', long)]
         pane: String,
         key: String,
+    },
+    /// Close a pane. A kept pane (`new --keep`) that already exited goes too.
+    Close {
+        /// Pane id or unique id suffix of 4+ characters.
+        #[arg(short = 'p', long)]
+        pane: String,
+    },
+    /// Print the visible screen of a pane as text.
+    Capture {
+        /// Pane id or unique id suffix of 4+ characters.
+        #[arg(short = 'p', long)]
+        pane: String,
+        /// Remove trailing spaces and trailing blank lines.
+        #[arg(long)]
+        trim: bool,
+        /// Keep only the last N lines.
+        #[arg(long, value_name = "N")]
+        lines: Option<u32>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stream server events (title, cwd, status, notifications, pane and
+    /// layout changes) until Ctrl+C.
+    Events {
+        #[arg(long)]
+        json: bool,
+        /// Only events of this pane (id or unique id suffix of 4+ characters).
+        #[arg(short = 'p', long)]
+        pane: Option<String>,
+    },
+    /// Run a command in a new pane and print the pane id. With `--wait`,
+    /// block and exit with the command's exit code.
+    Run {
+        /// Keep the pane after the command exits (see `new --keep`).
+        #[arg(long)]
+        keep: bool,
+        /// Wait for the command to exit and return its exit code.
+        #[arg(long)]
+        wait: bool,
+        /// Starting directory (default: the current directory).
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// Command and arguments, after `--`.
+        #[arg(last = true)]
+        command: Vec<String>,
+    },
+    /// Wait until a pane reaches a status, or (without `--status`) until its
+    /// process exits. Exit 0 when reached, 5 on timeout.
+    Wait {
+        /// Pane id or unique id suffix of 4+ characters.
+        #[arg(short = 'p', long)]
+        pane: String,
+        /// idle, working, waiting, done or failed.
+        #[arg(long)]
+        status: Option<String>,
+        /// Give up after this many seconds.
+        #[arg(long, value_name = "SECONDS")]
+        timeout: Option<f64>,
     },
     /// Inspect attached clients.
     Client {
@@ -187,6 +250,17 @@ fn main() {
         }
         Command::Send { pane, enter, text } => cli::finish(cli::send(&pane, &text, enter)),
         Command::SendKey { pane, key } => cli::finish(cli::send_key(&pane, &key)),
+        Command::Close { pane } => cli::finish(cli::close(&pane)),
+        Command::Capture { pane, trim, lines, json } => {
+            cli::finish(cli::capture(&pane, trim, lines, json))
+        }
+        Command::Events { json, pane } => cli::finish(cli::events(pane.as_deref(), json)),
+        Command::Run { keep, wait, cwd, command } => {
+            cli::finish_code(cli::run(keep, wait, cwd, command))
+        }
+        Command::Wait { pane, status, timeout } => {
+            cli::finish_code(cli::wait(&pane, status.as_deref(), timeout))
+        }
         Command::Client { command: ClientCommand::Ls { json } } => {
             cli::finish(cli::client_ls(json))
         }
