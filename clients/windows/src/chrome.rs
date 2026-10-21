@@ -400,31 +400,18 @@ impl AppShell {
                 None => d,
             };
             if multi && !focused {
-                // Dim fades in over 90 ms and never blocks input.
-                d = d.child(
-                    div()
-                        .absolute()
-                        .size_full()
-                        .bg(gpui::black())
-                        .with_animation(
-                            ("dim", pane.0.as_u128() as u64),
-                            Animation::new(Duration::from_millis(90)).with_easing(ease_out_quint()),
-                            |el, t| el.opacity(0.24 * t),
-                        ),
-                );
+                // Static alpha overlay: cheap, no animation state, never blocks input.
+                d = d.child(div().absolute().top_0().left_0().size_full().bg(alpha(0x000000, 0.28)));
             }
             if multi && focused {
                 d = d.child(
                     div()
                         .absolute()
+                        .top_0()
+                        .left_0()
                         .size_full()
                         .border_1()
-                        .border_color(hsla(th.accent))
-                        .with_animation(
-                            ("focus", pane.0.as_u128() as u64),
-                            Animation::new(Duration::from_millis(90)).with_easing(ease_out_quint()),
-                            |el, t| el.opacity(t),
-                        ),
+                        .border_color(hsla(th.accent)),
                 );
             }
             if zoomed {
@@ -603,6 +590,15 @@ impl AppShell {
 
 impl Render for AppShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.smoke_mode {
+            let now = std::time::Instant::now();
+            if let Some(end) = self.last_paint_end.take() {
+                if self.idle_ms.len() < 20_000 {
+                    self.idle_ms.push(now.duration_since(end).as_secs_f32() * 1000.0);
+                }
+            }
+            self.render_t0 = Some(now);
+        }
         let vp = window.viewport_size();
         self.viewport = (f32::from(vp.width), f32::from(vp.height));
         if self.take_sync_dirty() {

@@ -1086,6 +1086,15 @@ impl ShellSmoke {
     fn finish(&mut self, shell: &mut AppShell) -> ! {
         record("total_s", json!(ms(self.start.elapsed()) / 1000.0));
         record("frames_drawn", json!(shell.frames));
+        for (name, v) in [("frame_cpu", &mut shell.cpu_ms), ("frame_idle", &mut shell.idle_ms)] {
+            if !v.is_empty() {
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let q = |f: f32| v[((v.len() - 1) as f32 * f) as usize];
+                record(&format!("{name}_p50_ms"), json!(q(0.5)));
+                record(&format!("{name}_p95_ms"), json!(q(0.95)));
+                record(&format!("{name}_max_ms"), json!(q(1.0)));
+            }
+        }
         let (all, n_checks) = {
             let g = RESULTS.lock().unwrap();
             let checks = g.as_ref().and_then(|m| m.get("checks")).and_then(|c| c.as_object());

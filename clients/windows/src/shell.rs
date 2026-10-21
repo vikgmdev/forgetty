@@ -4,6 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 
 use forgetty_shell_core::fuzzy;
 use forgetty_shell_core::keys::{Action, Chord, Keymap, ACTIONS};
@@ -133,6 +134,12 @@ pub struct AppShell {
     applied_title: String,
     had_tabs: bool,
     pub frames: u64,
+    /// Frame timing probes: render start to end of paint (CPU), and end of
+    /// paint to the next render start (present + wait).
+    pub render_t0: Option<Instant>,
+    pub last_paint_end: Option<Instant>,
+    pub cpu_ms: Vec<f32>,
+    pub idle_ms: Vec<f32>,
     pub smoke_mode: bool,
     pub smoke: Option<Box<ShellSmoke>>,
     pub mica: bool,
@@ -203,6 +210,10 @@ impl AppShell {
             applied_title: String::new(),
             had_tabs: false,
             frames: 0,
+            render_t0: None,
+            last_paint_end: None,
+            cpu_ms: Vec::new(),
+            idle_ms: Vec::new(),
             smoke_mode,
             smoke,
             mica,
@@ -947,6 +958,15 @@ impl AppShell {
     /// Called at the end of every painted frame.
     pub fn after_paint(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.frames += 1;
+        let now = Instant::now();
+        if self.smoke_mode {
+            if let Some(t0) = self.render_t0.take() {
+                if self.cpu_ms.len() < 20_000 {
+                    self.cpu_ms.push(now.duration_since(t0).as_secs_f32() * 1000.0);
+                }
+            }
+            self.last_paint_end = Some(now);
+        }
         let title = self.window_title();
         if title != self.applied_title {
             window.set_window_title(&title);
