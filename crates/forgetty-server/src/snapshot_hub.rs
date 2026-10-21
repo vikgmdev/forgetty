@@ -119,12 +119,28 @@ impl SnapshotHub {
     where
         F: FnOnce() -> Option<PaneSnapshot> + Send + 'static,
     {
+        self.get_if(pane, |_| true, build).await
+    }
+
+    /// Like [`Self::get`], but a finished result is handed out again only
+    /// while `usable` accepts it (it may be young and still too far behind
+    /// the log to be of use).
+    pub async fn get_if<F, U>(
+        self: &Arc<Self>,
+        pane: PaneId,
+        usable: U,
+        build: F,
+    ) -> Option<Arc<PaneSnapshot>>
+    where
+        F: FnOnce() -> Option<PaneSnapshot> + Send + 'static,
+        U: Fn(&PaneSnapshot) -> bool,
+    {
         let mut build = Some(build);
         loop {
             let (b, mut rx) = {
                 let mut map = self.lock();
                 match map.get(&pane) {
-                    Some(Slot::Ready(at, snap)) if at.elapsed() < self.reuse_for => {
+                    Some(Slot::Ready(at, snap)) if at.elapsed() < self.reuse_for && usable(snap) => {
                         self.stats.reuses.fetch_add(1, Ordering::Relaxed);
                         return Some(snap.clone());
                     }

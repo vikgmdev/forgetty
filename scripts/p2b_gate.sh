@@ -51,7 +51,13 @@ cleanup() {
   for d in "$TMP"/st-*/; do
     [ -d "$d" ] && "$REAL" --state-dir "$d" server stop >/dev/null 2>&1
   done
-  [ "${KEEP:-0}" = "1" ] || rm -rf "$TMP"
+  # A failed run keeps its logs: the evidence is the only way to tell a
+  # real failure from a timing one.
+  if [ "${KEEP:-0}" = "1" ] || [ "$FAIL" != "0" ]; then
+    echo "logs kept in $LOGS"
+  else
+    rm -rf "$TMP"
+  fi
 }
 trap cleanup EXIT
 

@@ -188,23 +188,37 @@ impl Real {
         log_mb: Option<u32>,
         open_access_override: Option<bool>,
     ) -> Real {
-        let child = Self::spawn(&dir, port, log_mb);
+        let mut child = Self::spawn(&dir, port, log_mb);
         let pid = child.id() as i32;
         let sock = Self::socket(dir.path());
         let t0 = std::time::Instant::now();
+        let mut last;
         let (rpc, state) = loop {
-            if let Ok(rpc) = Rpc::connect(&sock) {
-                if let Ok(state) = rpc.call("qa_state", json!({})) {
-                    if state.get("udp_port").is_some_and(|p| !p.is_null()) {
-                        break (rpc, state);
+            match Rpc::connect(&sock) {
+                Ok(rpc) => match rpc.call("qa_state", json!({})) {
+                    Ok(state) if state.get("udp_port").is_some_and(|p| !p.is_null()) => {
+                        break (rpc, state)
                     }
-                }
+                    Ok(state) => last = format!("qa_state without a UDP port: {state}"),
+                    Err(e) => last = format!("qa_state failed: {e}"),
+                },
+                Err(e) => last = format!("socket connect failed: {e}"),
             }
-            assert!(
-                t0.elapsed() < Duration::from_secs(30),
-                "real server did not start; see {}",
-                dir.path().join("server.log").display()
-            );
+            if t0.elapsed() >= Duration::from_secs(30) {
+                // The temp dir (and the log with it) goes when this panics, so
+                // say what the server wrote, and do not leave it running.
+                let log = std::fs::read_to_string(dir.path().join("server.log"))
+                    .unwrap_or_default();
+                let tail: Vec<&str> = log.lines().rev().take(40).collect();
+                let exited = child.try_wait().ok().flatten();
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "real server did not start in 30 s (last try: {last}; process exit: \
+                     {exited:?}); server.log tail:\n{}",
+                    tail.into_iter().rev().collect::<Vec<_>>().join("\n")
+                );
+            }
             tokio::time::sleep(Duration::from_millis(5)).await;
         };
         let node_id: EndpointId = state["node_id"].as_str().unwrap().parse().expect("node id");

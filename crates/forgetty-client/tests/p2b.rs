@@ -734,10 +734,11 @@ async fn cat_200mb_through_the_server() {
         .unwrap_or(Duration::from_secs(60));
     let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
     println!(
-        "cat 200 MiB: server ingest {:.0} MiB/s ({ingest_time:?}); client {:.0} MiB/s \
-         ({client_time:?}, {:.0} MiB received, {resets} resets, {snapshots} snapshot catch-ups, bad bytes: {bad})",
+        "cat 200 MiB: server ingest {:.0} MiB/s ({ingest_time:?}); client at the end after \
+         {client_time:?} ({:.0} MiB/s of the stream covered), {:.0} MiB of it as live bytes, \
+         {resets} resets, {snapshots} snapshot catch-ups, bad bytes: {bad}",
         mb(N) / ingest_time.as_secs_f64(),
-        mb(got) / client_time.as_secs_f64(),
+        mb(end) / client_time.as_secs_f64(),
         mb(got),
     );
     // The program runs at full speed (AD-023). A reader slower than the PTY
@@ -745,6 +746,12 @@ async fn cat_200mb_through_the_server() {
     // A wrong byte is.
     assert!(!bad, "bytes differ from the pattern");
     assert!(end >= N, "the stream stopped at {end} of {N}");
+    // A client that keeps pace with the program is not made to wait out the
+    // backoff of a slow one: it is at the end soon after the program is.
+    assert!(
+        client_time < ingest_time + Duration::from_millis(1500),
+        "the client reached the end after {client_time:?}, the program after {ingest_time:?}"
+    );
     h.close().await;
     match Arc::try_unwrap(server) {
         Ok(server) => server.shutdown().await,

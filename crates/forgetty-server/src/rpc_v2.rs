@@ -84,6 +84,16 @@ const NO_PROGRESS: Duration = Duration::from_secs(2);
 const MIN_CATCHUP_INTERVAL: Duration = Duration::from_secs(1);
 /// Longest wait between two catch-ups of one stream.
 const MAX_CATCHUP_BACKOFF: Duration = Duration::from_secs(10);
+/// Spacing of catch-ups for a stream that keeps pace with the program (it
+/// took live bytes at [`KEEPING_PACE_RATE`] since its last snapshot, or the
+/// snapshot was late by the build time alone): no backoff, only this floor.
+const KEEPING_PACE_INTERVAL: Duration = Duration::from_millis(100);
+/// Live bytes per second since its last snapshot that put a stream among the
+/// peers that keep pace (a 100 KB/s link does not, a localhost reader does).
+const KEEPING_PACE_RATE: f64 = 4.0 * 1024.0 * 1024.0;
+/// A snapshot that took longer than this to reach the peer says nothing
+/// about the program being fast: the peer is slow.
+const SNAPSHOT_SEND_OK: Duration = Duration::from_millis(500);
 
 /// Capabilities the server offers.
 pub const SERVER_CAPS: [&str; 6] = [
@@ -1403,8 +1413,20 @@ enum StreamEnd {
     Closed,
     /// The peer or the log is gone. Nothing more to do.
     Gone,
-    /// The reader is too slow: replace the stream with a snapshot.
-    Catchup,
+    /// The reader fell behind: replace the stream with a snapshot.
+    /// `next` is the offset it had reached. `stalled`: a write made no
+    /// progress for [`NO_PROGRESS`], so the peer itself is the slow part.
+    Catchup { next: u64, stalled: bool },
+}
+
+impl StreamEnd {
+    /// Fill in the offset a catch-up request stands at.
+    fn at(self, next: u64) -> Self {
+        match self {
+            StreamEnd::Catchup { stalled, .. } => StreamEnd::Catchup { next, stalled },
+            other => other,
+        }
+    }
 }
 
 /// One Pane output stream: the header, then raw frames pulled from the pane
@@ -1435,7 +1457,7 @@ async fn pane_stream(
     // A client that resumes far behind starts with the snapshot.
     if catchup && shared.total().saturating_sub(header.start_offset) > lag_limit {
         limiter.note_now();
-        let Some((h, snap)) = take_snapshot(&rpc, pane).await else { return };
+        let Some((h, snap)) = take_snapshot(&rpc, pane, &shared).await else { return };
         header = h;
         snapshot = snap;
     }
@@ -1445,6 +1467,7 @@ async fn pane_stream(
         let Ok(mut send) = conn.open_uni().await else { return };
         let sent_snapshot = std::mem::take(&mut snapshot);
         let after_snapshot = !sent_snapshot.is_empty();
+        let cycle_start = tokio::time::Instant::now();
         header.snapshot_len = sent_snapshot.len() as u32;
         if write_msg(&mut send, &header).await.is_err() {
             return;
@@ -1454,6 +1477,7 @@ async fn pane_stream(
                 return;
             }
         }
+        let snapshot_sent_in = cycle_start.elapsed();
         match stream_from(
             &rpc,
             &shared,
@@ -1473,12 +1497,26 @@ async fn pane_stream(
                 let _ = tokio::time::timeout(Duration::from_secs(5), send.stopped()).await;
                 return;
             }
-            StreamEnd::Catchup => {
-                // A stream that keeps needing catch-ups waits between them.
-                tokio::time::sleep(limiter.delay()).await;
+            StreamEnd::Catchup { next, stalled } => {
+                // A peer that keeps pace with the program is not slow, however
+                // often a fast program leaves it behind: since its last
+                // snapshot it took live bytes at a good rate, or the log ran
+                // past that snapshot before a single live byte went out
+                // although the snapshot itself got through quickly (the build
+                // took longer than the ring holds at the program's speed).
+                // Only a peer that is slow itself waits and backs off.
+                let live = next.saturating_sub(header.start_offset);
+                let rate = live as f64 / cycle_start.elapsed().as_secs_f64().max(0.001);
+                let keeping_pace = !stalled
+                    && if live == 0 {
+                        snapshot_sent_in < SNAPSHOT_SEND_OK
+                    } else {
+                        rate >= KEEPING_PACE_RATE
+                    };
+                tokio::time::sleep(limiter.delay(keeping_pace)).await;
                 // Stop the old stream, so it queues nothing more for the peer.
                 let _ = send.reset(stream_code::SUPERSEDED.into());
-                let Some((h, snap)) = take_snapshot(&rpc, pane).await else { return };
+                let Some((h, snap)) = take_snapshot(&rpc, pane, &shared).await else { return };
                 header = h;
                 snapshot = snap;
             }
@@ -1506,10 +1544,15 @@ impl CatchupLimiter {
     }
 
     /// How long to wait before the next catch-up. Records it as done.
-    fn delay(&mut self) -> Duration {
+    /// `keeping_pace`: the peer is not the slow part, so no backoff.
+    fn delay(&mut self, keeping_pace: bool) -> Duration {
         let now = tokio::time::Instant::now();
         let wait = match self.last {
             None => Duration::ZERO,
+            Some(last) if keeping_pace => {
+                self.interval = MIN_CATCHUP_INTERVAL;
+                (last + KEEPING_PACE_INTERVAL).saturating_duration_since(now)
+            }
             Some(last) => {
                 // Needed again within two intervals: back off. Otherwise start over.
                 self.interval = if now.duration_since(last) < self.interval * 2 {
@@ -1528,9 +1571,20 @@ impl CatchupLimiter {
 /// Get the snapshot of a pane from the shared hub (one build for all streams,
 /// two builds at once at most). Returns the header of the stream that carries
 /// it, and the snapshot bytes.
-async fn take_snapshot(rpc: &Arc<RpcV2>, pane: PaneId) -> Option<(PaneStreamHeader, Vec<u8>)> {
+async fn take_snapshot(
+    rpc: &Arc<RpcV2>,
+    pane: PaneId,
+    shared: &Arc<LogShared>,
+) -> Option<(PaneStreamHeader, Vec<u8>)> {
     let sm = rpc.sm.clone();
-    let snap = rpc.snapshots.get(pane, move || sm.snapshot_pane(pane)).await?;
+    // A finished snapshot is handed out again only while the log has not
+    // moved far past it: a stale one would be behind the ring on arrival.
+    let fresh = {
+        let shared = shared.clone();
+        let slack = (shared.ring_capacity() / 8) as u64;
+        move |s: &forgetty_session::PaneSnapshot| shared.total().saturating_sub(s.offset) <= slack
+    };
+    let snap = rpc.snapshots.get_if(pane, fresh, move || sm.snapshot_pane(pane)).await?;
     rpc.qa.catchups.fetch_add(1, Ordering::SeqCst);
     info!(
         "rpc2: pane {pane} snapshot catch-up at {}: {} bytes (last build {} us)",
@@ -1562,7 +1616,7 @@ async fn write_live(
     match tokio::time::timeout(NO_PROGRESS, write_output_frame(send, bytes)).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(_)) => Err(StreamEnd::Gone),
-        Err(_) => Err(StreamEnd::Catchup),
+        Err(_) => Err(StreamEnd::Catchup { next: 0, stalled: true }),
     }
 }
 
@@ -1596,7 +1650,7 @@ async fn stream_from(
                 target == pane.0
             };
             if forced || (lag_check && shared.total().saturating_sub(next) > lag_limit) {
-                return StreamEnd::Catchup;
+                return StreamEnd::Catchup { next, stalled: false };
             }
         }
 
@@ -1607,14 +1661,14 @@ async fn stream_from(
                     _ = &mut wake => {}
                     changed = force.changed(), if catchup => {
                         if changed.is_ok() && force.borrow_and_update().0 == pane.0 {
-                            return StreamEnd::Catchup;
+                            return StreamEnd::Catchup { next, stalled: false };
                         }
                     }
                 }
             }
             Some(LogPlan::Ring(bytes)) => {
                 if let Err(end) = write_live(send, &bytes, catchup).await {
-                    return end;
+                    return end.at(next);
                 }
                 next += bytes.len() as u64;
                 lag_check = true;
@@ -1622,7 +1676,7 @@ async fn stream_from(
             Some(LogPlan::Disk { disk, len }) => match read_disk(shared, disk, next, len).await {
                 Ok(Some(bytes)) if !bytes.is_empty() => {
                     if let Err(end) = write_live(send, &bytes, catchup).await {
-                        return end;
+                        return end.at(next);
                     }
                     next += bytes.len() as u64;
                     lag_check = true;
@@ -1646,7 +1700,7 @@ async fn stream_from(
                     // The log moved past the offset while a snapshot was built
                     // or the reader stalled: take a newer snapshot.
                     debug!("rpc2: pane {pane} reader at {next} is behind the log ({first}), catching up");
-                    return StreamEnd::Catchup;
+                    return StreamEnd::Catchup { next, stalled: false };
                 }
                 warn!("rpc2: pane {pane} reader at {next} is behind the log (starts at {first})");
                 let _ = send.reset(LOG_LOST_CODE.into());
@@ -1663,19 +1717,27 @@ mod limiter_tests {
     #[test]
     fn catchups_back_off_up_to_ten_seconds_and_recover() {
         let mut l = CatchupLimiter::default();
-        assert_eq!(l.delay(), Duration::ZERO, "the first catch-up is immediate");
+        assert_eq!(l.delay(false), Duration::ZERO, "the first catch-up is immediate");
         // Needed again at once, over and over (the caller waits each delay
         // before the next call, so the next "now" is the previous slot).
         let mut waits = Vec::new();
         for _ in 0..6 {
-            let w = l.delay();
+            let w = l.delay(false);
             waits.push(w.as_secs_f64().round() as u64);
             l.last = Some(tokio::time::Instant::now()); // the caller waited
         }
         assert_eq!(waits, [2, 4, 8, 10, 10, 10]);
         // A stream that was quiet starts over with the minimum interval.
         l.last = Some(tokio::time::Instant::now() - Duration::from_secs(60));
-        let w = l.delay();
+        let w = l.delay(false);
         assert!(w.is_zero(), "after a quiet minute the next catch-up is immediate: {w:?}");
+        // A peer that keeps pace with the program waits only the floor, and
+        // its run of fast catch-ups does not raise the backoff.
+        l.last = Some(tokio::time::Instant::now());
+        let w = l.delay(true);
+        assert!(w <= KEEPING_PACE_INTERVAL && w > Duration::from_millis(50), "{w:?}");
+        l.last = Some(tokio::time::Instant::now());
+        let w = l.delay(false);
+        assert_eq!(w.as_secs_f64().round() as u64, 2, "backoff starts over: {w:?}");
     }
 }

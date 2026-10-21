@@ -47,7 +47,15 @@ LOGS="$TMP/logs"
 mkdir -p "$LOGS"
 FAIL=0
 SUMMARY=()
-trap '[ "${KEEP:-0}" = "1" ] || rm -rf "$TMP"' EXIT
+# A failed run keeps its logs (and those of the nested gates inside them).
+cleanup() {
+  if [ "${KEEP:-0}" = "1" ] || [ "$FAIL" != "0" ]; then
+    echo "logs kept in $LOGS"
+  else
+    rm -rf "$TMP"
+  fi
+}
+trap cleanup EXIT
 
 want() { [ -z "${ONLY:-}" ] || [[ " $ONLY " == *" $1 "* ]]; }
 step() { echo "--- $*"; }

@@ -122,8 +122,15 @@ stream) and the `qa_*` test methods are not reachable over v2.
 - Snapshot work is bounded. All streams share one build per pane (a build in
   progress is joined, a result younger than 250 ms is reused), at most 2
   builds run at once server wide, and a build nobody waits for any more is
-  dropped before it starts. One stream takes a catch-up at most once per
-  second, and waits twice as long each time it needs another soon, up to 10 s.
+  dropped before it starts. A result is reused only while the log has not
+  moved more than an eighth of the ring past it. One stream takes a catch-up
+  at most once per second, and waits twice as long each time it needs another
+  soon, up to 10 s. A stream that keeps pace with the program is exempt from
+  the backoff and waits 100 ms at most: since its last snapshot it took live
+  bytes at 4 MiB/s or more, or the log ran past that snapshot before any live
+  byte went out although the snapshot reached the peer within 500 ms (the
+  build alone took longer than the ring holds at the program's speed). A write
+  that stalls for 2 s never counts as keeping pace.
   A pane has one live stream per connection: a new `attach_pane` replaces the
   old one. An attach counts as a request in flight until its stream is open.
 - A stopping server answers `Hello` with `Error { code: "server_stopping" }`.
