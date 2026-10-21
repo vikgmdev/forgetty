@@ -872,10 +872,14 @@ async fn supervise(shared: Arc<Shared>) {
     let mut shutdown = shared.shutdown_tx.subscribe();
     let mut failures = 0usize;
     let mut final_state = ConnectionState::Closed;
+    let mut attempt_no = 0u64;
     loop {
         if *shutdown.borrow() {
             break;
         }
+        attempt_no += 1;
+        let attempt_started = Instant::now();
+        debug!("client: dial #{attempt_no} starts (failures so far {failures})");
         // A `network_changed` while a dial is in flight aborts it and starts
         // a new one at once, with no backoff.
         if shared.reset_backoff.swap(false, Ordering::SeqCst) {
@@ -892,6 +896,10 @@ async fn supervise(shared: Arc<Shared>) {
         };
         let delay = match result {
             Ok(Ok(est)) => {
+                debug!(
+                    "client: dial #{attempt_no} connected after {:?}",
+                    attempt_started.elapsed()
+                );
                 let started = Instant::now();
                 let (end, resumed) = run_session(&shared, est, &mut shutdown).await;
                 match end {
@@ -925,13 +933,19 @@ async fn supervise(shared: Arc<Shared>) {
                 break;
             }
             Ok(Err(DialError::Transient(reason))) => {
-                debug!("client: dial failed: {reason}");
+                debug!(
+                    "client: dial #{attempt_no} failed after {:?}: {reason}",
+                    attempt_started.elapsed()
+                );
                 let d = backoff(failures);
                 failures += 1;
                 Some(d)
             }
             Err(_) => {
-                debug!("client: dial timed out");
+                debug!(
+                    "client: dial #{attempt_no} timed out after {:?}",
+                    attempt_started.elapsed()
+                );
                 let d = backoff(failures);
                 failures += 1;
                 Some(d)
@@ -944,6 +958,7 @@ async fn supervise(shared: Arc<Shared>) {
             delay
         };
         if let Some(delay) = delay {
+            debug!("client: backoff {delay:?} before dial #{}", attempt_no + 1);
             tokio::select! {
                 _ = tokio::time::sleep(delay) => {}
                 _ = shutdown.changed() => {}
@@ -956,8 +971,70 @@ async fn supervise(shared: Arc<Shared>) {
     shared.state_tx.send_replace(final_state);
 }
 
+/// Gap before each further QUIC connect attempt, in milliseconds. The last
+/// one repeats.
+///
+/// One attempt is not enough: QUIC repeats its first packet only after a
+/// timeout that starts near 1 s and doubles. A dial that starts while the
+/// server is down (a restart, a network that is still coming back) then
+/// notices the server up to 1 s, 2 s, ... late. So while no attempt has
+/// connected, a new one sends a fresh first packet every gap. The earlier ones
+/// stay alive and the first to connect wins, so a slow link still finishes.
+const CONNECT_PROBES_MS: [u64; 3] = [400, 400, 800];
+
 /// A dial to the cached direct address gives up after this long.
 const DIRECT_DIAL_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// QUIC connect to `target`: attempts overlap, one more every gap
+/// ([`CONNECT_PROBES_MS`]), and the first to connect wins. Fails at once on a
+/// real error, never on a timeout: the caller's dial timeout ends it.
+async fn connect_probing(shared: &Shared, target: EndpointAddr) -> Result<Connection, String> {
+    let mut attempts = tokio::task::JoinSet::new();
+    let mut n = 0usize;
+    loop {
+        let endpoint = shared.endpoint.clone();
+        let to = target.clone();
+        attempts
+            .spawn(async move { endpoint.connect(to, ALPN_RPC).await.map_err(|e| e.to_string()) });
+        let gap = Duration::from_millis(CONNECT_PROBES_MS[n.min(CONNECT_PROBES_MS.len() - 1)]);
+        n += 1;
+        tokio::select! {
+            Some(done) = attempts.join_next() => {
+                let result = match done {
+                    Ok(result) => result,
+                    Err(e) => Err(format!("connect attempt failed: {e}")),
+                };
+                if !attempts.is_empty() {
+                    retire_attempts(attempts);
+                }
+                return result;
+            },
+            () = tokio::time::sleep(gap) => {
+                debug!("client: connect attempt {n} unanswered after {gap:?}, another");
+            }
+        }
+    }
+}
+
+/// Let the connect attempts that lost the race finish and close what they
+/// get. Dropped half way through the handshake they leave a half-open
+/// connection on the server, which holds up its shutdown for seconds.
+fn retire_attempts(mut attempts: tokio::task::JoinSet<Result<Connection, String>>) {
+    tokio::spawn(async move {
+        let grace = tokio::time::sleep(Duration::from_secs(3));
+        tokio::pin!(grace);
+        loop {
+            tokio::select! {
+                done = attempts.join_next() => match done {
+                    Some(Ok(Ok(conn))) => conn.close(0u32.into(), b"redundant dial"),
+                    Some(_) => {}
+                    None => return,
+                },
+                () = &mut grace => return,
+            }
+        }
+    });
+}
 
 /// Connect to `target` and run the handshake. `connect_limit` bounds the QUIC
 /// connect only: once the path is up the handshake can take as long as the
@@ -968,15 +1045,15 @@ async fn dial_to(
     target: EndpointAddr,
     connect_limit: Option<Duration>,
 ) -> Result<Established, DialError> {
-    let connecting = shared.endpoint.connect(target, ALPN_RPC);
+    let probing = connect_probing(shared, target);
     let conn = match connect_limit {
-        Some(limit) => match tokio::time::timeout(limit, connecting).await {
+        Some(limit) => match tokio::time::timeout(limit, probing).await {
             Ok(r) => r,
             Err(_) => return Err(DialError::Transient("direct connect timed out".into())),
         },
-        None => connecting.await,
+        None => probing.await,
     }
-    .map_err(|e| DialError::Transient(e.to_string()))?;
+    .map_err(DialError::Transient)?;
     match handshake(shared, &conn).await {
         Ok((send, recv, welcome)) => Ok(Established { conn, send, recv, welcome }),
         Err(e) => {
@@ -1014,7 +1091,10 @@ async fn dial(shared: &Shared) -> Result<Established, DialError> {
         match r {
             Ok(est) => return Ok(est),
             Err(e @ DialError::Fatal(_)) => return Err(e),
-            Err(e) => last = e,
+            Err(DialError::Transient(m)) => {
+                debug!("client: a dial leg failed: {m}");
+                last = DialError::Transient(m);
+            }
         }
     }
     Err(last)

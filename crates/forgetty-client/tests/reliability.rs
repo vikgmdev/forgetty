@@ -298,6 +298,10 @@ fn addr_cache_snapshot_round_trips_through_serde() {
 /// and the cached direct address (no relay, no other address).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn server_restart_on_the_cached_port_reconnects_every_time() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
     const RESTARTS: usize = 10;
     let first = TestServer::start(TestServerConfig {
         panes: vec![(Uuid::new_v4(), Vec::new())],
@@ -406,7 +410,7 @@ async fn server_restart_on_the_cached_port_reconnects_every_time() {
     println!("server restarts: reconnect after B up: {reconnect_times:?}");
     let slowest = reconnect_times.iter().max().unwrap();
     assert!(
-        *slowest < Duration::from_millis(1500),
+        *slowest < Duration::from_millis(1000),
         "slowest reconnect after a restart was {slowest:?}"
     );
     assert_eq!(resets, 1, "restarts with restored logs must resume, not reset");

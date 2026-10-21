@@ -307,6 +307,19 @@ known gap, section 12).
 
 - On connection loss: redial at once, then backoff 100 ms, 250 ms, 500 ms, 1 s,
   2 s, then every 2 s. Never give up while the app is in the foreground.
+- **Redial speed.** Once the server is reachable again the client is connected
+  within 1 s. A QUIC connect that gets no answer repeats its first packet only
+  after a timeout that starts near 1 s and doubles, so one long attempt would
+  notice a server that came back up to several seconds late. The client
+  therefore starts another connect attempt 400 ms, 800 ms, then 1.6 s after
+  the dial starts (and every 800 ms after that), each sending a fresh first
+  packet at once. The attempts overlap and the first to connect wins. The
+  others finish in the background and are closed, so the server is not left
+  with half-open connections. These attempts are inside one dial
+  and do not use up the backoff above. `network_changed()` aborts the dial in
+  flight and dials at once with the backoff reset. A cached direct address and
+  the addresses of the pairing payload (relay) are dialed in parallel; the
+  direct connect gets 1 s.
 - After `Welcome`: re-send `subscribe_events`, then `attach_pane` with the last
   known offset for every pane the UI shows.
 - The UI shows "reconnecting" after 1 s without a connection, never sooner.
