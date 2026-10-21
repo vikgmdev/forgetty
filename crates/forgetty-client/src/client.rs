@@ -1249,6 +1249,9 @@ async fn run_session(
             reason = conn.closed() => break SessionEnd::Lost(reason.to_string()),
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
+                    // Input the user typed just before closing is still on its
+                    // way: the session tasks keep running while this waits.
+                    drain_input(shared, &link).await;
                     break SessionEnd::Shutdown;
                 }
             }
@@ -1272,6 +1275,38 @@ async fn run_session(
         return (SessionEnd::Fatal(reason), resumed);
     }
     (end, resumed)
+}
+
+/// How long a closing client waits for the server to ack its input.
+const INPUT_DRAIN: Duration = Duration::from_millis(300);
+
+/// Wait up to [`INPUT_DRAIN`] until the server has acked all the input sent
+/// (`input_acked` in a `Pong` covers every frame), asking with a `Ping` so the
+/// ack does not wait for the next liveness one. Input that is not acked by
+/// then is dropped with the connection, as before.
+async fn drain_input(shared: &Arc<Shared>, link: &Arc<Link>) {
+    let deadline = tokio::time::Instant::now() + INPUT_DRAIN;
+    while !lock(&shared.input.state).frames.is_empty() {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            debug!(
+                "client: closing with {} bytes of input not acked",
+                lock(&shared.input.state).bytes
+            );
+            return;
+        }
+        let nonce = shared.next_nonce.fetch_add(1, Ordering::Relaxed);
+        let mut pong = link.pong_tx.subscribe();
+        if send_ping(link, nonce).is_err() {
+            return;
+        }
+        let _ = tokio::time::timeout(deadline - now, pong.wait_for(|n| *n >= nonce)).await;
+        // Frames the writer had not sent when the Ping went out are still
+        // open: ask again shortly.
+        if !lock(&shared.input.state).frames.is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

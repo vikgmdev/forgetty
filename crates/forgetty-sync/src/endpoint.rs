@@ -52,11 +52,19 @@ pub const FORGETTY_PAIRING_ALPN: &[u8] = b"forgetty/pair/2";
 /// authorization policy (the registry is shared across ALPNs; updates made
 /// by the pairing handler are visible here without further plumbing).
 ///
-/// The handler is called **synchronously** inside the per-connection tokio
-/// task. If it needs to run long-lived work (e.g. a subscribe-forever stream),
-/// it must spawn its own task — otherwise it blocks the task that would
-/// otherwise return to the accept loop's spawn for the next connection.
-pub type AlpnHandler = Arc<dyn Fn(Connection, Arc<Mutex<DeviceRegistry>>) + Send + Sync + 'static>;
+/// The handler returns a future that lives as long as the connection is in
+/// use: the accept task awaits it and then closes the connection, so a handler
+/// that returns early (or forgets to close) does not leave it open. A handler
+/// that wants to keep the connection past its return must not return.
+pub type AlpnHandler = Arc<
+    dyn Fn(
+            Connection,
+            Arc<Mutex<DeviceRegistry>>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync
+        + 'static,
+>;
 
 /// Events emitted by the sync endpoint to signal pairing and connection state
 /// changes. Consumed by the socket RPC handlers for GTK polling.
@@ -435,13 +443,14 @@ impl SyncEndpoint {
                         } else if alpn == FORGETTY_PAIRING_ALPN_V1 {
                             pairing::handle_pair_v1(conn, registry, event_tx).await;
                         } else if let Some(handler) = extras.get(alpn.as_slice()) {
-                            handler(conn, registry);
+                            handler(conn, registry).await;
                         } else {
                             warn!("totem-sync: unknown ALPN {:?}, closing connection", alpn);
                             conn.close(1u8.into(), b"unknown-alpn");
                         }
-                        // Counted until it closes (the handlers run on their
-                        // own tasks).
+                        // The handler is done: close, whatever it did. A
+                        // close after the handler's own is a no-op.
+                        watch.close(0u8.into(), b"done");
                         watch.closed().await;
                     }
                     Err(e) => {

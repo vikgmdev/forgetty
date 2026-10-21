@@ -1112,9 +1112,16 @@ static void h(int s) { (void)s; n++; }
 int main(int argc, char **argv) {
     struct termios t;
     tcgetattr(0, &t);
-    cfmakeraw(&t);
+    if (argc > 1 && !strcmp(argv[1], "cooked")) {
+        /* ISIG stays on, VINTR is disabled: no byte can signal. */
+        t.c_lflag &= ~(ICANON | ECHO);
+        t.c_lflag |= ISIG;
+        t.c_cc[VMIN] = 1;
+        t.c_cc[VTIME] = 0;
+        t.c_cc[VINTR] = 0;
+    } else cfmakeraw(&t);
     if (argc > 1 && !strcmp(argv[1], "off")) t.c_cc[VINTR] = 0;
-    else if (argc > 1 && strcmp(argv[1], "d")) t.c_cc[VINTR] = (cc_t)atoi(argv[1]);
+    else if (argc > 1 && strcmp(argv[1], "d") && strcmp(argv[1], "cooked")) t.c_cc[VINTR] = (cc_t)atoi(argv[1]);
     tcsetattr(0, TCSANOW, &t);
     struct sigaction a = {0};
     a.sa_handler = h;
@@ -1137,19 +1144,20 @@ fn count(hay: &[u8], needle: &str) -> usize {
 }
 
 /// With ISIG off the program reads Ctrl+C as a key and nothing signals it. The
-/// key is `c_cc[VINTR]`, or 0x03 when VINTR is disabled. Every way to send
-/// Ctrl+C gets the same.
+/// key is 0x03 whatever VINTR is: a remapped VINTR is written only for a
+/// forwarder. With ISIG on and VINTR disabled the key is 0x03 as well, plain
+/// input, and nothing signals either. Every way to send Ctrl+C gets the same.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ctrl_c_in_raw_mode_is_the_interrupt_key_and_never_a_signal() {
     if !real_only() {
         return;
     }
     let server = TestServer::start(TestServerConfig::default()).await;
-    for (arg, key) in [("d", 3u8), ("24", 24), ("off", 3)] {
+    for (arg, key) in [("d", 3u8), ("24", 3), ("off", 3), ("cooked", 3)] {
         let pane = server.add_script_pane(&format!("{RAW_PROBE}{arg}\n"));
         let logged = |needle: &str| contains(&server.log(pane), needle.as_bytes());
         wait_for("the program to start", || logged("READY")).await;
-        let want = format!("BYTE={key}\r\n");
+        let want = format!("BYTE={key}\r");
         let seen = || count(&server.log(pane), &want);
         let id = pane.to_string();
 
@@ -1158,7 +1166,7 @@ async fn ctrl_c_in_raw_mode_is_the_interrupt_key_and_never_a_signal() {
         server.cli(&["send-key", "-p", &id, "ctrl+c"]).unwrap();
         wait_for("the key from send-key", || seen() == 2).await;
 
-        // A typed Ctrl+C (rpc v2) reaches the program as the same key.
+        // A typed Ctrl+C (rpc v2) is plain input here as well.
         let c = connect(&server, "typist").await;
         c.send_input(pane, &[key]).await.unwrap();
         wait_for("the key from a typed Ctrl+C", || seen() == 3).await;
@@ -1602,6 +1610,63 @@ async fn one_ctrl_c_on_a_busy_cooked_pane_is_one_sigint() {
         );
     }
     c.close().await;
+    server.shutdown().await;
+}
+
+/// A forwarder in raw mode whose VINTR was remapped gets the remapped key: the
+/// far side's terminal uses the setting ssh forwarded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_raw_mode_forwarder_with_a_remapped_vintr_gets_that_key() {
+    use std::os::unix::fs::PermissionsExt;
+    if !real_only() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("forgetty-rawfwd2-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("got");
+    let prog = dir.join("ssh");
+    std::fs::write(
+        &prog,
+        format!(
+            "#!/bin/sh\nstty intr '^X' raw -echo\n\
+             while :; do b=$(dd bs=1 count=1 2>/dev/null | od -An -tu1); echo \"GOT:$b\" >> {l}; done\n",
+            l = log.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&prog, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let server = TestServer::start(TestServerConfig::default()).await;
+    let pane = server.add_script_pane(&format!("exec {}", prog.display()));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    server.socket_call("send_sigint", json!({"pane_id": pane.to_string()})).unwrap();
+    wait_for("the forwarder to read ^X", || {
+        std::fs::read_to_string(&log).is_ok_and(|t| {
+            t.lines().any(|l| l.strip_prefix("GOT:").is_some_and(|b| b.trim() == "24"))
+        })
+    })
+    .await;
+    server.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Input typed just before `close()` reaches the program: the client waits
+/// (up to 300 ms) for the server to ack it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn input_sent_just_before_close_is_not_lost() {
+    if !real_only() {
+        return;
+    }
+    let server = TestServer::start(TestServerConfig::default()).await;
+    let pane = server.add_script_pane("stty raw -echo; exec cat");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    for i in 0..15 {
+        let c = connect(&server, "closer").await;
+        let marker = format!("<m{i:02}>");
+        c.send_input(pane, marker.as_bytes()).await.unwrap();
+        c.close().await;
+        wait_for(&format!("marker {i}"), || contains(&pty_input(&server, pane), marker.as_bytes()))
+            .await;
+    }
     server.shutdown().await;
 }
 

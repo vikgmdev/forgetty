@@ -528,7 +528,7 @@ impl RpcV2 {
         let rpc = self.clone();
         Arc::new(move |conn, registry| {
             let rpc = rpc.clone();
-            tokio::spawn(async move { rpc.serve(conn, registry).await });
+            Box::pin(async move { rpc.serve(conn, registry).await })
         })
     }
 

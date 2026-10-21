@@ -323,6 +323,9 @@ known gap, section 12).
   flight and dials at once with the backoff reset. A cached direct address and
   the addresses of the pairing payload (relay) are dialed in parallel; the
   direct connect gets 1 s.
+- On `close()` the client waits up to 300 ms for the server to ack the input it
+  sent (a `Ping` asks for the ack), then closes. What is not acked by then is
+  dropped.
 - After `Welcome`: re-send `subscribe_events`, then `attach_pane` with the last
   known offset for every pane the UI shows.
 - The UI shows "reconnecting" after 1 s without a connection, never sooner.
