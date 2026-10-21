@@ -447,6 +447,7 @@ impl ShellSmoke {
                     if self.lat_ms.len() >= KEYSTROKES {
                         let (p50, reshaped) = summarize_keys(&self.lat_ms, self.max_reshaped_per_key, "");
                         dump_trace("keys");
+                        record("prof_keys", json!(crate::prof::report()));
                         check("key_p50_le_18ms", p50 <= 18.0);
                         check("damage_only_redraw", reshaped <= 3);
                         self.lat_ms.clear();

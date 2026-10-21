@@ -171,6 +171,7 @@ impl Element for TerminalElement {
         }
         crate::smoke::trace("3", 0);
         // Pass 4: text, one shaped line per row.
+        crate::prof::SAMPLE_ON.store(true, std::sync::atomic::Ordering::Release);
         for (r, row) in prepaint.rows.iter().enumerate() {
             if let Some(row) = row {
                 let origin = point(bounds.origin.x, bounds.origin.y + lh * r as f32);
@@ -182,6 +183,7 @@ impl Element for TerminalElement {
                 }
             }
         }
+        crate::prof::SAMPLE_ON.store(false, std::sync::atomic::Ordering::Release);
         crate::smoke::trace("4", 0);
         // Pass 5: thin cursors over the text.
         if let Some((b, shape)) = prepaint.cursor {

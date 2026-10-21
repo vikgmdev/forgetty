@@ -9,6 +9,7 @@ mod encoder;
 mod lineedit;
 mod screenshot;
 mod shell;
+mod prof;
 mod smoke;
 mod view;
 
@@ -35,6 +36,9 @@ fn main() {
     }
 
     raise_timer_resolution(smoke);
+    if smoke {
+        prof::start();
+    }
 
     let (mut cfg, cfg_err) = if smoke { (Config::default(), None) } else { Config::load() };
     // Mica needs Windows 11 22H2 (build 22621). Older systems get a solid background.
