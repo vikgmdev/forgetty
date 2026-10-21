@@ -92,6 +92,8 @@ pub struct PaneInfo {
     pub status: StatusSnapshot,
     /// Last desktop notification the pane sent, if any.
     pub last_notification: Option<NotificationInfo>,
+    /// User label (`set_label`), empty when none.
+    pub label: String,
 }
 
 /// Returned per-tab metadata from `SessionManager::duplicate_workspace` (FIX-007).

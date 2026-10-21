@@ -13,13 +13,23 @@
 //! forgetty wait -p PANE [--status done|waiting|...] [--timeout S]
 //! forgetty client ls [--json]
 //! forgetty pair | devices | revoke ID
+//! forgetty label [-t tab|pane|workspace] TARGET LABEL
+//! forgetty api list [-q] [--json] [--markdown]
+//! forgetty api describe METHOD [--json]
+//! forgetty api call [-p PANE] METHOD [JSON | @file | -]
+//! forgetty skill setup|status|show|remove
 //! ```
 //!
-//! Exit codes: 0 ok, 1 failed, 2 bad command line, 3 target not found or
-//! ambiguous, 4 server unreachable, 5 `wait` timed out.
+//! A pane, tab or workspace target is a full id, a label, a position or a
+//! unique id suffix of 4+ characters, in that order.
+//!
+//! Exit codes: 0 ok, 1 failed, 2 bad command line (or `bad_request`), 3 target
+//! not found or ambiguous (or `method_not_found`), 4 server unreachable,
+//! 5 `wait` timed out.
 
 mod cli;
 mod server;
+mod skill;
 
 use std::path::{Path, PathBuf};
 
@@ -147,6 +157,29 @@ enum Command {
         #[command(subcommand)]
         command: ClientCommand,
     },
+    /// Set the label of a pane, tab or workspace. An empty label clears it.
+    ///
+    /// TARGET is a full id, a label (case-insensitive), a 1-based position or
+    /// a unique id suffix of 4+ characters. Several matches give exit 3.
+    Label {
+        /// What to label.
+        #[arg(short = 't', long = "type", value_enum, default_value = "pane")]
+        kind: cli::LabelKind,
+        #[arg(long)]
+        json: bool,
+        target: String,
+        label: String,
+    },
+    /// Inspect and call the server API (JSON-RPC methods with JSON Schemas).
+    Api {
+        #[command(subcommand)]
+        command: ApiCommand,
+    },
+    /// Install a skill that teaches a coding agent to use this CLI.
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommand,
+    },
     /// Open a 60 s pairing window and print the QR code.
     Pair {
         /// Window length in seconds (testing only).
@@ -178,6 +211,67 @@ enum ServerCommand {
     Status {
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ApiCommand {
+    /// List every method.
+    List {
+        /// Names only, one per line.
+        #[arg(short = 'q', long)]
+        quiet: bool,
+        #[arg(long)]
+        json: bool,
+        /// Print `docs/socket-api.md` (needs no server).
+        #[arg(long)]
+        markdown: bool,
+    },
+    /// Show a method: description, params and result schemas, examples.
+    Describe {
+        method: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Call a method and print the result as JSON.
+    ///
+    /// PARAMS is JSON text, `@file` (read a file) or `-` (read stdin).
+    /// With `-p`, the pane id goes into `pane_id` of the params.
+    Call {
+        /// Pane id, label, position or id suffix, for methods that take `pane_id`.
+        #[arg(short = 'p', long)]
+        pane: Option<String>,
+        method: String,
+        params: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SkillCommand {
+    /// Write the skill file.
+    Setup {
+        #[arg(long, value_enum, default_value = "claude")]
+        agent: skill::Agent,
+        #[arg(long, value_enum, default_value = "user")]
+        scope: skill::Scope,
+    },
+    /// Show where the skill is installed and whether it is current.
+    Status {
+        #[arg(long, value_enum)]
+        agent: Option<skill::Agent>,
+        #[arg(long, value_enum)]
+        scope: Option<skill::Scope>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print the skill text.
+    Show,
+    /// Delete the skill file.
+    Remove {
+        #[arg(long, value_enum, default_value = "claude")]
+        agent: skill::Agent,
+        #[arg(long, value_enum, default_value = "user")]
+        scope: skill::Scope,
     },
 }
 
@@ -219,6 +313,16 @@ fn main() {
         if let Err(e) = apply_state_dir(dir) {
             eprintln!("forgetty: --state-dir {}: {e}", dir.display());
             std::process::exit(cli::EXIT_FAILED);
+        }
+    }
+
+    // A CLI command whose output is piped to `head` should end quietly, not
+    // panic. The server keeps Rust's default (SIGPIPE ignored): it relies on
+    // write errors from closed sockets.
+    if !matches!(cli.command, Command::Server { command: ServerCommand::Run(_) }) {
+        // SAFETY: resetting a signal disposition before any thread starts.
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
         }
     }
 
@@ -268,6 +372,25 @@ fn main() {
         Command::Client { command: ClientCommand::Ls { json } } => {
             cli::finish(cli::client_ls(json))
         }
+        Command::Label { kind, json, target, label } => {
+            cli::finish(cli::label(kind, &target, &label, json))
+        }
+        Command::Api { command } => cli::finish(match command {
+            ApiCommand::List { quiet, json, markdown } => cli::api_list(quiet, json, markdown),
+            ApiCommand::Describe { method, json } => cli::api_describe(&method, json),
+            ApiCommand::Call { pane, method, params } => {
+                cli::api_call(pane.as_deref(), &method, params.as_deref())
+            }
+        }),
+        Command::Skill { command } => cli::finish(match command {
+            SkillCommand::Setup { agent, scope } => skill::setup(agent, scope),
+            SkillCommand::Status { agent, scope, json } => skill::status(agent, scope, json),
+            SkillCommand::Show => {
+                skill::show();
+                Ok(())
+            }
+            SkillCommand::Remove { agent, scope } => skill::remove(agent, scope),
+        }),
         Command::Pair { ttl } => cli::finish(cli::pair(ttl)),
         Command::Devices { json } => cli::finish(cli::devices(json)),
         Command::Revoke { id } => cli::finish(cli::revoke(&id)),

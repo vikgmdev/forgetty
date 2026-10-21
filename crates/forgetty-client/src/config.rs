@@ -62,6 +62,17 @@ pub enum RelayChoice {
     Custom(Vec<RelayUrl>),
 }
 
+impl ClientOptions {
+    /// Apply `relay_only` to an endpoint builder.
+    pub(crate) fn shape(&self, builder: iroh::endpoint::Builder) -> iroh::endpoint::Builder {
+        if self.relay_only {
+            builder.clear_ip_transports()
+        } else {
+            builder
+        }
+    }
+}
+
 impl RelayChoice {
     pub(crate) fn mode(&self, server: &EndpointAddr) -> RelayMode {
         match self {
@@ -95,6 +106,9 @@ pub struct ClientOptions {
     pub event_buffer: usize,
     /// Last direct address per server. Dialed first on every connect.
     pub addr_cache: AddrCache,
+    /// Bind no IP socket: every packet goes through a relay, direct paths are
+    /// impossible. For tests of a relay and for networks where UDP is blocked.
+    pub relay_only: bool,
 }
 
 impl Default for ClientOptions {
@@ -106,6 +120,7 @@ impl Default for ClientOptions {
             pane_buffer: 64,
             event_buffer: 1024,
             addr_cache: AddrCache::default(),
+            relay_only: false,
         }
     }
 }

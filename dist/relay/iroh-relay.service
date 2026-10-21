@@ -1,0 +1,21 @@
+[Unit]
+Description=iroh-relay (Forgetty self-hosted relay)
+Documentation=file:///usr/share/doc/forgetty-server/relay.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# iroh-relay 0.97.x, the version that matches the iroh in Forgetty 0.1.
+ExecStart=%h/.local/bin/iroh-relay --config-path %h/.config/forgetty/iroh-relay.toml
+# Let's Encrypt certificates and account keys go here (cert_dir in the config).
+WorkingDirectory=%h/.local/share/forgetty/iroh-relay
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

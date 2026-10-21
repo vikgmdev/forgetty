@@ -92,9 +92,27 @@ pub struct SyncEndpointBuilder {
     extra_alpns: HashMap<Vec<u8>, AlpnHandler>,
     bind_port: Option<u16>,
     transport: Option<iroh::endpoint::QuicTransportConfig>,
+    relay_urls: Vec<iroh::RelayUrl>,
+    n0_discovery: bool,
 }
 
 impl SyncEndpointBuilder {
+    /// Publish this endpoint to, and resolve peers from, the n0 DNS discovery
+    /// service (the `N0` preset does). Default `true`. The server turns it off
+    /// when it has relays of its own: the apps get relay and direct address from
+    /// the pairing payload and the address cache, so nothing needs to be public.
+    pub fn n0_discovery(mut self, on: bool) -> Self {
+        self.n0_discovery = on;
+        self
+    }
+
+    /// Use these relays instead of iroh's default relay map. The endpoint
+    /// connects to the first one as its home relay. Empty keeps the default.
+    pub fn relay_urls(mut self, urls: Vec<iroh::RelayUrl>) -> Self {
+        self.relay_urls = urls;
+        self
+    }
+
     /// Register a handler for a non-pairing ALPN.
     ///
     /// The binary that owns the terminal stream handler (or any future
@@ -137,6 +155,12 @@ impl SyncEndpointBuilder {
             let mut builder = Endpoint::builder(presets::N0)
                 .secret_key(self.secret_key.clone())
                 .alpns(alpn_list.clone());
+            if !self.relay_urls.is_empty() {
+                builder = builder.relay_mode(iroh::RelayMode::custom(self.relay_urls.clone()));
+            }
+            if !self.n0_discovery {
+                builder = builder.clear_address_lookup();
+            }
             if let Some(t) = &self.transport {
                 builder = builder.transport_config(t.clone());
             }
@@ -174,6 +198,8 @@ impl SyncEndpointBuilder {
             registry,
             pairing: Arc::new(Mutex::new(PairingState::new())),
             extra_alpns: Arc::new(self.extra_alpns),
+            relay_urls: self.relay_urls.iter().map(|u| u.to_string()).collect(),
+            n0_discovery: self.n0_discovery,
             live: crate::connections::LiveConnections::new(),
             event_tx,
         })
@@ -191,6 +217,10 @@ pub struct SyncEndpoint {
     extra_alpns: Arc<HashMap<Vec<u8>, AlpnHandler>>,
     /// Every open connection by device id, so a revoke can close them all.
     live: crate::connections::LiveConnections,
+    /// Configured relay URLs (empty: iroh's default relays).
+    relay_urls: Vec<String>,
+    /// Whether the n0 DNS discovery service is in use.
+    n0_discovery: bool,
     /// Broadcast channel for pairing/connection events. Receivers are vended to
     /// socket RPC handlers via `subscribe()`.
     pub event_tx: broadcast::Sender<SyncEvent>,
@@ -204,12 +234,25 @@ impl SyncEndpoint {
             extra_alpns: HashMap::new(),
             bind_port: None,
             transport: None,
+            relay_urls: Vec::new(),
+            n0_discovery: true,
         }
     }
 
     /// Returns the local `EndpointId` (iroh 0.97 equivalent of spec's `NodeId`).
     pub fn node_id(&self) -> EndpointId {
         self.endpoint.id()
+    }
+
+    /// Relay URLs this endpoint was configured with, as written in the pairing
+    /// QR. Empty when it uses iroh's default relays.
+    pub fn relay_urls(&self) -> &[String] {
+        &self.relay_urls
+    }
+
+    /// Whether the endpoint publishes to and resolves from n0 DNS discovery.
+    pub fn n0_discovery(&self) -> bool {
+        self.n0_discovery
     }
 
     /// The local UDP sockets the endpoint listens on.

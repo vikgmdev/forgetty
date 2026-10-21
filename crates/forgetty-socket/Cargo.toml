@@ -23,7 +23,9 @@ bytes = "1"
 uuid = { workspace = true }
 hostname = "0.4"
 libc = "0.2"
+schemars = { version = "1", features = ["uuid1"] }
 
 [dev-dependencies]
+jsonschema = { version = "0.59", default-features = false }
 tokio = { workspace = true }
 tempfile = "3"

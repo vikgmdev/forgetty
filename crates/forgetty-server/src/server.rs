@@ -50,6 +50,37 @@ pub struct RunArgs {
     /// `0` so they do not fight over the fixed port).
     #[arg(long)]
     pub port: Option<u16>,
+
+    /// Relay server of the iroh endpoint, for example
+    /// `https://relay.example.org`. Repeat for several. Replaces `relay_urls`
+    /// in the config file. Without either, iroh's default relays stay in use.
+    /// The pairing QR carries these URLs.
+    #[arg(long = "relay-url", value_name = "URL")]
+    pub relay_url: Vec<String>,
+
+    /// Keep the n0 DNS discovery service on although relays are configured.
+    /// With `--relay-url` / `relay_urls` it is off by default: the server then
+    /// publishes nothing to n0, and the apps use the relays in the pairing
+    /// payload plus the cached direct address.
+    #[arg(long)]
+    pub n0_discovery: bool,
+}
+
+/// Parse relay URLs from `--relay-url` or the config file.
+pub fn parse_relay_urls(urls: &[String]) -> anyhow::Result<Vec<iroh::RelayUrl>> {
+    let mut out: Vec<iroh::RelayUrl> = Vec::new();
+    for u in urls {
+        let parsed: iroh::RelayUrl =
+            u.trim().parse().map_err(|e| anyhow::anyhow!("invalid relay URL {u:?}: {e}"))?;
+        let scheme = parsed.scheme();
+        if scheme != "http" && scheme != "https" {
+            anyhow::bail!("invalid relay URL {u:?}: scheme must be http or https");
+        }
+        if !out.contains(&parsed) {
+            out.push(parsed);
+        }
+    }
+    Ok(out)
 }
 
 /// Default UDP port of the iroh endpoint (PROTOCOL_V2 section 1).
@@ -454,6 +485,42 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
                         }
                     }
                 }
+                // Labels (`set_label`) survive a restart. Tabs match by position,
+                // panes by their place in the tree, the same way as the active pane.
+                {
+                    let live_layout = session_manager.layout();
+                    for (ws_idx, saved_workspace) in state.workspaces.iter().enumerate() {
+                        let Some(live_ws) = live_layout.workspaces.get(ws_idx) else { continue };
+                        for (i, saved_tab) in saved_workspace.tabs.iter().enumerate() {
+                            let Some(live_tab) = live_ws.tabs.get(i) else { continue };
+                            if !saved_tab.label.is_empty() {
+                                if let Err(e) = session_manager.set_label(
+                                    forgetty_session::LabelTarget::Tab,
+                                    live_tab.id,
+                                    &saved_tab.label,
+                                ) {
+                                    warn!("cold-start restore: tab label: {e}");
+                                }
+                            }
+                            for (saved_pane, label) in &saved_tab.pane_labels {
+                                let Some(live_pane) = live_pane_id_for_saved(
+                                    &saved_tab.pane_tree,
+                                    &live_tab.pane_tree,
+                                    *saved_pane,
+                                ) else {
+                                    continue;
+                                };
+                                if let Err(e) = session_manager.set_label(
+                                    forgetty_session::LabelTarget::Pane,
+                                    live_pane.0,
+                                    label,
+                                ) {
+                                    warn!("cold-start restore: pane label: {e}");
+                                }
+                            }
+                        }
+                    }
+                }
                 // `remain_on_exit` survives a restart. Pane ids are reused on
                 // restore, so the saved ids still match.
                 for id in &state.remain_on_exit_panes {
@@ -561,6 +628,7 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
                     | Ok(SessionEvent::ActiveWorkspaceChanged { .. })
                     | Ok(SessionEvent::WorkspaceCreated { .. })
                     | Ok(SessionEvent::WorkspaceRenamed { .. })
+                    | Ok(SessionEvent::LabelChanged { .. })
                     | Ok(SessionEvent::WorkspaceDeleted { .. })
                     | Ok(SessionEvent::WorkspaceColorChanged { .. })
                     | Ok(SessionEvent::WorkspacesReordered { .. })
@@ -625,8 +693,24 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
         .port
         .or_else(|| std::env::var("FORGETTY_PORT").ok().and_then(|v| v.parse().ok()))
         .unwrap_or(DEFAULT_PORT);
+    // Relays: --relay-url replaces the config file list. None: iroh defaults.
+    let relay_source = if args.relay_url.is_empty() { &config.relay_urls } else { &args.relay_url };
+    let relay_urls = parse_relay_urls(relay_source)?;
+    // Own relays: no n0 discovery unless asked for (--n0-discovery).
+    let n0_discovery = relay_urls.is_empty() || args.n0_discovery;
+    info!("n0 discovery: {}", if n0_discovery { "on" } else { "off" });
+    if relay_urls.is_empty() {
+        info!("relays: iroh defaults");
+    } else {
+        info!(
+            "relays: {}",
+            relay_urls.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(", ")
+        );
+    }
     let sync_endpoint = match SyncEndpoint::builder(secret_key)
         .bind_port(port)
+        .relay_urls(relay_urls)
+        .n0_discovery(n0_discovery)
         .transport_config(quic_config())
         .register_alpn(forgetty_proto::ALPN_RPC, rpc_v2.alpn_handler())
         .register_alpn(
@@ -838,6 +922,27 @@ fn restore_subtree(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn relay_urls_parse_and_dedupe() {
+        let urls = vec![
+            "https://relay.example.org".to_string(),
+            "https://relay.example.org/".to_string(),
+            " http://127.0.0.1:3340 ".to_string(),
+        ];
+        let parsed = parse_relay_urls(&urls).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].to_string(), "https://relay.example.org/");
+        assert_eq!(parsed[1].to_string(), "http://127.0.0.1:3340/");
+        assert!(parse_relay_urls(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn bad_relay_urls_are_refused() {
+        assert!(parse_relay_urls(&["not a url".to_string()]).is_err());
+        let e = parse_relay_urls(&["ftp://relay.example.org".to_string()]).unwrap_err();
+        assert!(e.to_string().contains("http or https"), "{e}");
+    }
     use super::*;
 
     /// One test mutates XDG_DATA_HOME; keep the mutations in a single test.

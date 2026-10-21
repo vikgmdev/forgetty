@@ -26,7 +26,7 @@ use uuid::Uuid;
 
 use crate::byte_log::ByteLog;
 use crate::drain_result::DrainResult;
-use crate::events::SessionEvent;
+use crate::events::{LabelTarget, SessionEvent};
 use crate::layout::{SessionLayout, SessionTab};
 use crate::osc::OscEvent;
 use crate::pane::{DuplicatedTab, NotificationInfo, PaneInfo, PaneState};
@@ -265,6 +265,8 @@ impl SessionManager {
                 title: String::new(),
                 pane_tree: PaneTreeLayout::Leaf { pane_id: id },
                 active_pane_id: None,
+                label: String::new(),
+                pane_labels: Default::default(),
             };
             if let Some(ws) = inner.layout.workspaces.first_mut() {
                 ws.tabs.push(tab);
@@ -400,6 +402,88 @@ impl SessionManager {
             workspace_idx, %workspace_id, "rename_workspace: workspace renamed"
         );
         Ok(())
+    }
+
+    /// Set the label of a workspace, tab or pane (`set_label`).
+    ///
+    /// A workspace label is its name and cannot be empty. An empty tab or
+    /// pane label clears it. Returns `Ok(true)` when the label changed and
+    /// `Ok(false)` when it was already set (no event then). Sends
+    /// `LabelChanged`, and `WorkspaceRenamed` for a workspace.
+    pub fn set_label(
+        &self,
+        target: LabelTarget,
+        id: Uuid,
+        label: &str,
+    ) -> std::result::Result<bool, LabelError> {
+        let label = validate_label(label)?;
+        if target == LabelTarget::Workspace && label.is_empty() {
+            return Err(LabelError::BadLabel("a workspace label cannot be empty".into()));
+        }
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let inner = &mut *guard;
+        let changed = match target {
+            LabelTarget::Workspace => {
+                let ws = inner
+                    .layout
+                    .workspaces
+                    .iter_mut()
+                    .enumerate()
+                    .find(|(_, w)| w.id == id)
+                    .ok_or_else(|| {
+                    LabelError::NotFound(format!("workspace not found: {id}"))
+                })?;
+                let (idx, ws) = ws;
+                if ws.name == label {
+                    false
+                } else {
+                    ws.name = label.clone();
+                    let _ = inner.event_tx.send(SessionEvent::WorkspaceRenamed {
+                        workspace_idx: idx,
+                        workspace_id: id,
+                        name: label.clone(),
+                    });
+                    true
+                }
+            }
+            LabelTarget::Tab => {
+                let tab = inner
+                    .layout
+                    .workspaces
+                    .iter_mut()
+                    .flat_map(|w| w.tabs.iter_mut())
+                    .find(|t| t.id == id)
+                    .ok_or_else(|| LabelError::NotFound(format!("tab not found: {id}")))?;
+                if tab.label == label {
+                    false
+                } else {
+                    tab.label = label.clone();
+                    true
+                }
+            }
+            LabelTarget::Pane => {
+                let pane = PaneId(id);
+                let tab = inner
+                    .layout
+                    .workspaces
+                    .iter_mut()
+                    .flat_map(|w| w.tabs.iter_mut())
+                    .find(|t| pane_tree_contains_leaf(&t.pane_tree, pane))
+                    .ok_or_else(|| LabelError::NotFound(format!("pane not found: {id}")))?;
+                if label.is_empty() {
+                    tab.pane_labels.remove(&id).is_some()
+                } else if tab.pane_labels.get(&id) == Some(&label) {
+                    false
+                } else {
+                    tab.pane_labels.insert(id, label.clone());
+                    true
+                }
+            }
+        };
+        if changed {
+            let _ = inner.event_tx.send(SessionEvent::LabelChanged { target, id, label });
+        }
+        Ok(changed)
     }
 
     /// Set (or clear) a workspace's accent colour (FIX-010).
@@ -766,6 +850,8 @@ impl SessionManager {
                     title: String::new(),
                     pane_tree: PaneTreeLayout::Leaf { pane_id },
                     active_pane_id: None,
+                    label: String::new(),
+                    pane_labels: Default::default(),
                 });
                 dup_tabs.push(DuplicatedTab { tab_id, pane_id });
             }
@@ -916,6 +1002,8 @@ impl SessionManager {
             title: String::new(),
             pane_tree: PaneTreeLayout::Leaf { pane_id },
             active_pane_id: None,
+            label: String::new(),
+            pane_labels: Default::default(),
         };
         inner.layout.workspaces[workspace_idx].tabs.push(tab);
 
@@ -1256,6 +1344,8 @@ impl SessionManager {
             title: String::new(),
             pane_tree: PaneTreeLayout::Leaf { pane_id },
             active_pane_id: None,
+            label: String::new(),
+            pane_labels: Default::default(),
         };
         inner.layout.workspaces[workspace_idx].tabs.push(tab);
 
@@ -1915,7 +2005,9 @@ impl SessionManager {
     /// Return a snapshot of pane metadata, or `None` if the pane is not found.
     pub fn pane_info(&self, id: PaneId) -> Option<PaneInfo> {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let label = pane_label(&inner.layout, id);
         inner.panes.get(&id).map(|pane| PaneInfo {
+            label,
             id: pane.id,
             pid: pane.pty_bridge.pty.pid(),
             rows: pane.rows,
@@ -1992,7 +2084,9 @@ impl SessionManager {
     /// `self.inner` — that deadlocks. See R-1 in T-059 SPEC.
     pub fn layout(&self) -> SessionLayout {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner.layout.clone()
+        let mut layout = inner.layout.clone();
+        prune_pane_labels(&mut layout, &inner.panes);
+        layout
     }
 
     // -----------------------------------------------------------------------
@@ -2101,6 +2195,13 @@ impl SessionManager {
                         // the user's last-typed pane. `PaneId(Uuid)` → `Uuid`
                         // for the wire/disk shape.
                         active_pane_id: session_tab.active_pane_id.map(|p| p.0),
+                        label: session_tab.label.clone(),
+                        pane_labels: session_tab
+                            .pane_labels
+                            .iter()
+                            .filter(|(id, _)| inner.panes.contains_key(&PaneId(**id)))
+                            .map(|(id, l)| (*id, l.clone()))
+                            .collect(),
                     })
                     .collect();
 
@@ -2515,6 +2616,64 @@ fn publish_status(id: PaneId, pane: &mut PaneState, out: &mut Vec<SessionEvent>)
             message: now.message.clone(),
         });
         pane.osc.published = now;
+    }
+}
+
+/// Longest label, in characters.
+pub const MAX_LABEL_CHARS: usize = 128;
+
+/// Why `set_label` failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LabelError {
+    /// The label is not allowed (too long, control characters, empty workspace).
+    BadLabel(String),
+    /// No workspace, tab or pane has the id.
+    NotFound(String),
+}
+
+impl std::fmt::Display for LabelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LabelError::BadLabel(m) | LabelError::NotFound(m) => f.write_str(m),
+        }
+    }
+}
+
+impl std::error::Error for LabelError {}
+
+/// Trim a label and check it: at most [`MAX_LABEL_CHARS`] characters, no
+/// control characters.
+fn validate_label(raw: &str) -> std::result::Result<String, LabelError> {
+    let label = raw.trim();
+    if label.chars().count() > MAX_LABEL_CHARS {
+        return Err(LabelError::BadLabel(format!(
+            "label is longer than {MAX_LABEL_CHARS} characters"
+        )));
+    }
+    if label.chars().any(char::is_control) {
+        return Err(LabelError::BadLabel("label must not contain control characters".into()));
+    }
+    Ok(label.to_string())
+}
+
+/// Label of a pane, empty when none.
+fn pane_label(layout: &SessionLayout, id: PaneId) -> String {
+    layout
+        .workspaces
+        .iter()
+        .flat_map(|w| w.tabs.iter())
+        .find_map(|t| t.pane_labels.get(&id.0))
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Drop labels of panes that no longer exist.
+fn prune_pane_labels(
+    layout: &mut SessionLayout,
+    panes: &std::collections::HashMap<PaneId, PaneState>,
+) {
+    for tab in layout.workspaces.iter_mut().flat_map(|w| w.tabs.iter_mut()) {
+        tab.pane_labels.retain(|id, _| panes.contains_key(&PaneId(*id)));
     }
 }
 
@@ -4498,6 +4657,67 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         false
+    }
+
+    #[tokio::test]
+    async fn labels_are_set_reported_persisted_and_pruned() {
+        let sm = SessionManager::new();
+        let mut rx = sm.subscribe_meta();
+        let (pane, tab) = sm.create_tab(0, None, small(), None).unwrap();
+        let second = sm.split_pane(pane, "vertical", small(), None).unwrap();
+
+        assert!(sm.set_label(LabelTarget::Pane, pane.0, " build ").unwrap());
+        assert!(!sm.set_label(LabelTarget::Pane, pane.0, "build").unwrap());
+        assert!(sm.set_label(LabelTarget::Tab, tab, "main").unwrap());
+        assert_eq!(sm.pane_info(pane).unwrap().label, "build");
+        assert_eq!(sm.pane_info(second).unwrap().label, "");
+
+        // Events: one LabelChanged per real change, none for the repeat.
+        let mut seen = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let SessionEvent::LabelChanged { target, label, .. } = ev {
+                seen.push((target, label));
+            }
+        }
+        assert_eq!(
+            seen,
+            vec![(LabelTarget::Pane, "build".to_string()), (LabelTarget::Tab, "main".to_string())]
+        );
+
+        // The workspace name is the workspace label and sends WorkspaceRenamed.
+        let ws = sm.layout().workspaces[0].id;
+        assert!(sm.set_label(LabelTarget::Workspace, ws, "home").unwrap());
+        assert_eq!(sm.layout().workspaces[0].name, "home");
+        assert!(sm.set_label(LabelTarget::Workspace, ws, " ").is_err());
+
+        // Labels are part of the persisted state.
+        sm.set_label(LabelTarget::Pane, second.0, "logs").unwrap();
+        let state = sm.snapshot_to_workspace_state();
+        let tab_state = &state.workspaces[0].tabs[0];
+        assert_eq!(tab_state.label, "main");
+        assert_eq!(tab_state.pane_labels.get(&pane.0).map(String::as_str), Some("build"));
+        assert_eq!(tab_state.pane_labels.get(&second.0).map(String::as_str), Some("logs"));
+
+        // A closed pane loses its label.
+        sm.close_pane(second).unwrap();
+        let layout = sm.layout();
+        assert!(!layout.workspaces[0].tabs[0].pane_labels.contains_key(&second.0));
+        assert!(layout.workspaces[0].tabs[0].pane_labels.contains_key(&pane.0));
+
+        // Unknown ids and bad labels are refused.
+        assert!(matches!(
+            sm.set_label(LabelTarget::Pane, Uuid::new_v4(), "x"),
+            Err(LabelError::NotFound(_))
+        ));
+        assert!(matches!(
+            sm.set_label(LabelTarget::Pane, pane.0, "a\u{7}b"),
+            Err(LabelError::BadLabel(_))
+        ));
+        let long = "x".repeat(MAX_LABEL_CHARS + 1);
+        assert!(matches!(sm.set_label(LabelTarget::Tab, tab, &long), Err(LabelError::BadLabel(_))));
+        // Clearing works and reports a change.
+        assert!(sm.set_label(LabelTarget::Pane, pane.0, "").unwrap());
+        assert_eq!(sm.pane_info(pane).unwrap().label, "");
     }
 
     #[tokio::test]

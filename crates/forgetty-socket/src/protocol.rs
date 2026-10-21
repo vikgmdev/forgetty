@@ -181,6 +181,14 @@ pub mod methods {
     pub const CAPTURE: &str = "capture";
     /// P1: attached clients (iroh connections and streaming sockets).
     pub const LIST_CLIENTS: &str = "list_clients";
+    /// P5: list every method with a summary.
+    pub const API_LIST: &str = "api.list";
+    /// P5: schemas, description and examples of one method.
+    /// Params: `{ "method": string }`.
+    pub const API_DESCRIBE: &str = "api.describe";
+    /// P5: set the label of a workspace, tab or pane.
+    /// Params: `{ "target": "workspace"|"tab"|"pane", "id": "<uuid>", "label": string }`.
+    pub const SET_LABEL: &str = "set_label";
 
     // V2-007 fix cycle 2: "is a GUI attached to this daemon?" probe used by
     // restore logic in the launcher to distinguish "daemon running but

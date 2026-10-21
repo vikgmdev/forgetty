@@ -75,6 +75,12 @@ pub struct TabState {
     /// FIX-005B default behaviour).
     #[serde(default)]
     pub active_pane_id: Option<uuid::Uuid>,
+    /// User label of the tab (`set_label`). Empty means none.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub label: String,
+    /// User labels of panes in this tab, by pane id (`set_label`).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub pane_labels: std::collections::BTreeMap<uuid::Uuid, String>,
 }
 
 /// Recursive tree describing the pane layout inside a tab.
@@ -135,9 +141,40 @@ impl Workspace {
                 pane_tree: PaneTreeState::Leaf { cwd: root, pane_id: None },
                 pane_id: None,
                 active_pane_id: None,
+                label: String::new(),
+                pane_labels: Default::default(),
             }],
             active_tab: 0,
             color: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::*;
+
+    #[test]
+    fn old_session_files_have_no_labels() {
+        let old = r#"{"title":"t","pane_tree":{"Leaf":{"cwd":"/","pane_id":null}}}"#;
+        let tab: TabState = serde_json::from_str(old).unwrap();
+        assert!(tab.label.is_empty() && tab.pane_labels.is_empty());
+        // Empty labels are not written, so old readers see the old shape.
+        let json = serde_json::to_string(&tab).unwrap();
+        assert!(!json.contains("label"), "{json}");
+    }
+
+    #[test]
+    fn labels_round_trip() {
+        let id = uuid::Uuid::new_v4();
+        let mut tab: TabState = serde_json::from_str(
+            r#"{"title":"t","pane_tree":{"Leaf":{"cwd":"/","pane_id":null}}}"#,
+        )
+        .unwrap();
+        tab.label = "main".into();
+        tab.pane_labels.insert(id, "build".into());
+        let back: TabState = serde_json::from_str(&serde_json::to_string(&tab).unwrap()).unwrap();
+        assert_eq!(back.label, "main");
+        assert_eq!(back.pane_labels.get(&id).map(String::as_str), Some("build"));
     }
 }

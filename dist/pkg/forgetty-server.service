@@ -1,0 +1,33 @@
+[Unit]
+Description=Forgetty durable terminal server
+Documentation=https://forgetty.dev file:///usr/share/doc/forgetty-server/server.md
+After=default.target
+
+[Service]
+Type=simple
+# Installed by the forgetty-server package. The tarball install uses
+# dist/systemd/forgetty-server.service (binary in ~/.local/bin) instead.
+# Add relays with a drop-in: systemctl --user edit forgetty-server
+#   [Service]
+#   ExecStart=
+#   ExecStart=/usr/bin/forgetty server run --relay-url https://relay.example.org
+# or set relay_urls in ~/.config/forgetty/config.toml (see relay.md).
+ExecStart=/usr/bin/forgetty server run
+Restart=on-failure
+RestartSec=5s
+
+# Logs go to the user journal. Read with: journalctl --user -u forgetty-server -f
+StandardOutput=journal
+StandardError=journal
+
+# On stop, SIGTERM goes to the server process ONLY (mixed). The server freezes
+# the layout, flushes and fsyncs the byte logs and the session file, then
+# exits. Its panes then get SIGHUP from the closing PTY masters, and systemd
+# SIGKILLs whatever is left in the cgroup.
+KillMode=mixed
+TimeoutStopSec=10
+# Exit 75 means another server already holds the lock. Do not restart-loop on it.
+RestartPreventExitStatus=75
+
+[Install]
+WantedBy=default.target

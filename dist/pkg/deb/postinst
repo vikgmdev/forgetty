@@ -1,0 +1,18 @@
+#!/bin/sh
+# forgetty-server post-install (deb and rpm). Prints what to do next. It does
+# not start or enable anything: the server runs as the user, never as root.
+set -e
+
+cat <<'MSG'
+
+forgetty-server is installed. It runs as your own user. To start it now and
+keep it running without a login session, run these two commands as that user:
+
+    loginctl enable-linger "$USER"
+    systemctl --user enable --now forgetty-server
+
+Then pair a phone:  forgetty pair
+Docs: /usr/share/doc/forgetty-server/server.md  and  relay.md (own relay)
+
+MSG
+exit 0
