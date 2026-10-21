@@ -263,7 +263,12 @@ pub(crate) struct Shared {
     /// Input bytes dropped because the server restarted, in total.
     input_lost: AtomicU64,
     shutdown_tx: watch::Sender<bool>,
+    /// Wakes the supervisor: cancels an in-flight dial or a backoff sleep and
+    /// dials at once.
     kick: Notify,
+    /// Set by `network_changed`: the next redial skips the backoff and the
+    /// failure count starts again at 0.
+    reset_backoff: AtomicBool,
     /// Wakes the liveness task for an immediate `Ping`.
     ping_now: Notify,
     next_nonce: AtomicU64,
@@ -363,6 +368,7 @@ impl Client {
             input_lost: AtomicU64::new(0),
             shutdown_tx,
             kick: Notify::new(),
+            reset_backoff: AtomicBool::new(false),
             ping_now: Notify::new(),
             next_nonce: AtomicU64::new(1),
             input_epoch: Uuid::new_v4(),
@@ -598,7 +604,14 @@ impl ClientHandle {
         let link = shared.link_tx.borrow().clone();
         let endpoint = shared.endpoint.clone();
         tokio::spawn(async move { endpoint.network_change().await });
-        let Some(link) = link else { return };
+        let Some(link) = link else {
+            // No connection: a dial is in flight (it may hang on a dead
+            // address) or the supervisor sleeps in a backoff. Abort it, forget
+            // the failures and dial again right away.
+            shared.reset_backoff.store(true, Ordering::SeqCst);
+            shared.kick.notify_one();
+            return;
+        };
         let nonce = shared.next_nonce.fetch_add(1, Ordering::Relaxed);
         let mut pong_rx = link.pong_tx.subscribe();
         if send_ping(&link, nonce).is_err() {
@@ -608,6 +621,7 @@ impl ClientHandle {
         let limit = Duration::from_millis(NETWORK_CHANGE_PONG_MS);
         if !matches!(tokio::time::timeout(limit, wait).await, Ok(Ok(_))) {
             info!("client: no Pong after network change, redialing");
+            shared.reset_backoff.store(true, Ordering::SeqCst);
             link.conn.close(close_code::OK.into(), b"network changed");
         }
     }
@@ -862,10 +876,19 @@ async fn supervise(shared: Arc<Shared>) {
         if *shutdown.borrow() {
             break;
         }
+        // A `network_changed` while a dial is in flight aborts it and starts
+        // a new one at once, with no backoff.
+        if shared.reset_backoff.swap(false, Ordering::SeqCst) {
+            failures = 0;
+        }
         let attempt = tokio::time::timeout(shared.opts.dial_timeout, dial(&shared));
         let result = tokio::select! {
             r = attempt => r,
             _ = shutdown.changed() => continue,
+            _ = shared.kick.notified() => {
+                debug!("client: dial aborted, redialing");
+                continue;
+            }
         };
         let delay = match result {
             Ok(Ok(est)) => {
@@ -914,6 +937,12 @@ async fn supervise(shared: Arc<Shared>) {
                 Some(d)
             }
         };
+        let delay = if shared.reset_backoff.swap(false, Ordering::SeqCst) {
+            failures = 0;
+            None
+        } else {
+            delay
+        };
         if let Some(delay) = delay {
             tokio::select! {
                 _ = tokio::time::sleep(delay) => {}
@@ -927,13 +956,11 @@ async fn supervise(shared: Arc<Shared>) {
     shared.state_tx.send_replace(final_state);
 }
 
-async fn dial(shared: &Shared) -> Result<Established, DialError> {
-    // Cached direct address first; the relay in the server address runs in
-    // parallel (iroh tries every address).
-    let mut target = shared.server.clone();
-    if let Some(ip) = shared.opts.addr_cache.get(target.id) {
-        target = target.with_ip_addr(ip);
-    }
+/// A dial to the cached direct address gives up after this long.
+const DIRECT_DIAL_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Connect to `target` and run the handshake.
+async fn dial_to(shared: &Shared, target: EndpointAddr) -> Result<Established, DialError> {
     let conn = shared
         .endpoint
         .connect(target, ALPN_RPC)
@@ -946,6 +973,44 @@ async fn dial(shared: &Shared) -> Result<Established, DialError> {
             Err(e)
         }
     }
+}
+
+/// The cached direct address and the addresses of the pairing payload (relay
+/// URLs, direct addresses) are dialed in parallel, not one after the other
+/// (happy eyeballs). The direct dial gets 1 s: a dead cached address (the
+/// network changed) must not hold up the relay. The first handshake wins and
+/// the other dial is dropped. A fatal error ends the race at once.
+async fn dial(shared: &Shared) -> Result<Established, DialError> {
+    let Some(ip) = shared.opts.addr_cache.get(shared.server.id) else {
+        return dial_to(shared, shared.server.clone()).await;
+    };
+    let direct = EndpointAddr::new(shared.server.id).with_ip_addr(ip);
+    if shared.server.is_empty() {
+        // Nothing to fall back to: the direct dial has the whole dial timeout.
+        return dial_to(shared, direct).await;
+    }
+    let a = async {
+        match tokio::time::timeout(DIRECT_DIAL_TIMEOUT, dial_to(shared, direct)).await {
+            Ok(r) => r,
+            Err(_) => Err(DialError::Transient("direct dial timed out".into())),
+        }
+    };
+    let b = dial_to(shared, shared.server.clone());
+    tokio::pin!(a, b);
+    let (mut a_done, mut b_done) = (false, false);
+    let mut last = DialError::Transient("no address".into());
+    while !(a_done && b_done) {
+        let r = tokio::select! {
+            r = &mut a, if !a_done => { a_done = true; r }
+            r = &mut b, if !b_done => { b_done = true; r }
+        };
+        match r {
+            Ok(est) => return Ok(est),
+            Err(e @ DialError::Fatal(_)) => return Err(e),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
 }
 
 /// Did the peer close the connection with `not_authorized`?
