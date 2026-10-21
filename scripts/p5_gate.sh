@@ -271,6 +271,17 @@ for combo in "claude user $SH/.claude/skills/forgetty" "claude project $SP/.clau
 done
 has "$(env -u CODEX_HOME bash -c "cd '$SP' && HOME='$SH' '$BIN/forgetty' --state-dir '$STATE' skill status --agent claude --scope user")" 'missing' && ok "status says missing after remove" || bad "status after remove"
 
+# a planted symlink must not redirect a write or a remove
+EVIL="$WORK/evil-proj"; OUT="$WORK/outside"; mkdir -p "$EVIL" "$OUT"
+echo precious >"$OUT/precious"
+ln -s "$OUT" "$EVIL/.claude"
+env -u CODEX_HOME bash -c "cd '$EVIL' && HOME='$SH' '$BIN/forgetty' --state-dir '$STATE' skill setup --scope project" >"$WORK/sym.out" 2>&1
+RC=$?
+[ "$RC" = 1 ] && has "$(cat "$WORK/sym.out")" 'symlink' && ok "setup refuses a symlinked .claude (exit 1)" || bad "setup followed or misreported a symlinked .claude (exit $RC): $(cat "$WORK/sym.out")"
+[ "$(ls "$OUT")" = "precious" ] && ok "nothing was written outside" || bad "files outside changed: $(ls "$OUT")"
+env -u CODEX_HOME bash -c "cd '$EVIL' && HOME='$SH' '$BIN/forgetty' --state-dir '$STATE' skill remove --scope project" >/dev/null 2>&1 && bad "remove followed a symlink" || ok "remove refuses a symlinked .claude"
+[ "$(cat "$OUT/precious")" = "precious" ] && ok "the outside file is intact" || bad "outside file changed"
+
 # ------------------------------------------------------------------ 7. agent test
 say "7. agent test (claude -p --model haiku)"
 AGENT_OK=0
