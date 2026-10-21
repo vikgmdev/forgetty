@@ -79,12 +79,12 @@ async fn main() {
 
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     while let Ok(Some(line)) = lines.next_line().await {
-        let mut parts = line.trim().splitn(3, ' ');
+        let mut parts = line.trim().splitn(4, ' ');
         match parts.next() {
             Some("status") => {
                 let status = parts.next().unwrap_or("waiting");
-                let message = parts.next().unwrap_or("");
-                server.push_status(pane_id(1), status, message);
+                let message = parts.by_ref().collect::<Vec<_>>().join(" ");
+                server.push_status(pane_id(1), status, &message);
                 println!("OK status {status}");
             }
             Some("snapshot") => {
