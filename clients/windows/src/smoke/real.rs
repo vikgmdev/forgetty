@@ -71,6 +71,7 @@ pub struct Real {
     fed_t: Option<Instant>,
     resets_before: u64,
     restarts: u8,
+    port: u16,
     burst_t0: Option<Instant>,
     burst_fed0: u64,
     burst_last: Option<Instant>,
@@ -80,7 +81,7 @@ pub struct Real {
 
 impl Real {
     pub fn new(distro: String) -> Self {
-        Real { distro, ..Default::default() }
+        Real { distro, port: PORT, ..Default::default() }
     }
 }
 
@@ -119,7 +120,7 @@ impl ShellSmoke {
 
     fn real_start_server(&mut self) {
         let d = self.real.distro.clone();
-        let mut c = wsl(&d, &[BIN, "server", "run", "--port", &PORT.to_string()]);
+        let mut c = wsl(&d, &[BIN, "server", "run", "--port", &self.real.port.to_string()]);
         c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
         match c.spawn() {
             Ok(mut ch) => {
@@ -200,9 +201,20 @@ impl ShellSmoke {
                         return;
                     }
                     self.real.last_probe = Some(Instant::now());
+                    // The runner can hold the port back (Windows reserves port ranges): the
+                    // server exits at once, so try the next port.
+                    let exited = self.real.server.as_mut().is_some_and(|c| c.try_wait().map(|s| s.is_some()).unwrap_or(false));
+                    if exited && self.real.restarts < 8 {
+                        self.real.restarts += 1;
+                        self.real.port += 13;
+                        record("real_port_retries", json!(self.real.restarts));
+                        self.real_start_server();
+                        return;
+                    }
                     if !self.real_server_up() {
                         return;
                     }
+                    self.real.restarts = 0;
                     record("real_server_start_ms", json!(ms(self.phase_t0.elapsed())));
                     let d = self.real.distro.clone();
                     let mut c = wsl(&d, &[BIN, "pair", "--ttl", "900"]);
@@ -220,7 +232,7 @@ impl ShellSmoke {
                     let payload = self.real.pair_log.lock().unwrap().iter().find_map(|l| l.strip_prefix("payload: ").map(str::to_string));
                     let Some(payload) = payload else { return };
                     self.real.t_pair = Some(Instant::now());
-                    shell.pair_hint = format!("127.0.0.1:{PORT}").parse().ok();
+                    shell.pair_hint = format!("127.0.0.1:{}", self.real.port).parse().ok();
                     shell.pair_submit_text(&payload, cx);
                     shell.pair_confirm(cx);
                     self.goto(Phase::RealPair);
