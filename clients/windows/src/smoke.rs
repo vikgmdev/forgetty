@@ -63,6 +63,10 @@ static RESULTS: Mutex<Option<Map<String, Value>>> = Mutex::new(None);
 static PHASE: Mutex<&'static str> = Mutex::new("window");
 static SCREEN_DUMP: Mutex<String> = Mutex::new(String::new());
 
+pub fn record_pub(key: &str, value: Value) {
+    record(key, value)
+}
+
 fn record(key: &str, value: Value) {
     let mut g = RESULTS.lock().unwrap();
     g.get_or_insert_with(Map::new).insert(key.to_string(), value);

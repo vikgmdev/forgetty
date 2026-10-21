@@ -34,6 +34,8 @@ fn main() {
         });
     }
 
+    raise_timer_resolution(smoke);
+
     let (mut cfg, cfg_err) = if smoke { (Config::default(), None) } else { Config::load() };
     // Mica needs Windows 11 22H2 (build 22621). Older systems get a solid background.
     if matches!(cfg.backdrop, Backdrop::Mica | Backdrop::MicaAlt) && windows_build() < 22621 {
@@ -137,4 +139,33 @@ fn windows_build() -> u32 {
 #[cfg(not(windows))]
 fn windows_build() -> u32 {
     0
+}
+
+/// Ask Windows for a 1 ms scheduler tick. The default 15.6 ms tick quantizes every
+/// timed wake-up in the process (and, system-wide, other processes' timers such as
+/// the ConPTY host's render pacing), which showed up as 30 ms echo latency.
+fn raise_timer_resolution(smoke: bool) {
+    #[link(name = "winmm")]
+    extern "system" {
+        fn timeBeginPeriod(period: u32) -> u32;
+    }
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn NtQueryTimerResolution(min: *mut u32, max: *mut u32, cur: *mut u32) -> i32;
+    }
+    let query = || {
+        let (mut mn, mut mx, mut cur) = (0u32, 0u32, 0u32);
+        // SAFETY: three valid out pointers.
+        unsafe { NtQueryTimerResolution(&mut mn, &mut mx, &mut cur) };
+        cur
+    };
+    let before = query();
+    if !(smoke && smoke::ab() == 9) {
+        // SAFETY: plain winmm call; process-wide for the process lifetime.
+        unsafe { timeBeginPeriod(1) };
+    }
+    if smoke {
+        smoke::record_pub("timer_before_100ns", serde_json::json!(before));
+        smoke::record_pub("timer_after_100ns", serde_json::json!(query()));
+    }
 }

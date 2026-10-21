@@ -55,7 +55,7 @@ jobs:
         shell: pwsh
         working-directory: clients/windows/target/release
         run: |
-          foreach ($ab in 5,6) {
+          foreach ($ab in 9) {
             $env:FORGETTY_AB = "$ab"
             $out = .\forgetty-win.exe --smoke 2>$null
             $json = ($out | Where-Object { $_ -like '{*' } | Select-Object -Last 1)
