@@ -110,8 +110,8 @@ const MAX_CATCHUP_BACKOFF: Duration = Duration::from_secs(10);
 /// snapshot was late by the build time alone): no backoff, only this floor.
 const KEEPING_PACE_INTERVAL: Duration = Duration::from_millis(100);
 /// Live bytes per second since its last snapshot that put a stream among the
-/// peers that keep pace (a 100 KB/s link does not, a localhost reader does).
-const KEEPING_PACE_RATE: f64 = 4.0 * 1024.0 * 1024.0;
+/// peers that read (a 100 KB/s link does not, a loaded localhost reader does).
+const KEEPING_PACE_RATE: f64 = 1024.0 * 1024.0;
 /// A snapshot that took longer than this to reach the peer says nothing
 /// about the program being fast: the peer is slow.
 const SNAPSHOT_SEND_OK: Duration = Duration::from_millis(500);
@@ -1712,7 +1712,9 @@ async fn pane_stream(
     // any other catch-up of this client and pane.
     if catchup && shared.total().saturating_sub(header.start_offset) > lag_limit {
         tokio::time::sleep(rpc.catchup_delay(conn.remote_id(), pane, false)).await;
-        let Some((h, snap)) = take_snapshot(&rpc, pane, &shared).await else { return };
+        let Some((h, snap)) = take_snapshot(&rpc, conn.remote_id(), pane, &shared).await else {
+            return;
+        };
         header = h;
         snapshot = snap;
     }
@@ -1771,7 +1773,10 @@ async fn pane_stream(
                 tokio::time::sleep(rpc.catchup_delay(conn.remote_id(), pane, keeping_pace)).await;
                 // Stop the old stream, so it queues nothing more for the peer.
                 let _ = send.reset(stream_code::SUPERSEDED.into());
-                let Some((h, snap)) = take_snapshot(&rpc, pane, &shared).await else { return };
+                let Some((h, snap)) = take_snapshot(&rpc, conn.remote_id(), pane, &shared).await
+                else {
+                    return;
+                };
                 header = h;
                 snapshot = snap;
             }
@@ -1793,18 +1798,23 @@ impl Default for CatchupLimiter {
 }
 
 impl CatchupLimiter {
-    /// How long to wait before the next catch-up. Records it as done.
-    /// `keeping_pace`: the peer is not the slow part, so no backoff.
-    fn delay(&mut self, keeping_pace: bool) -> Duration {
+    /// How long until `gap` has passed since the last catch-up.
+    fn floor(&self, gap: Duration) -> Duration {
+        let now = tokio::time::Instant::now();
+        self.last.map_or(Duration::ZERO, |l| (l + gap).saturating_duration_since(now))
+    }
+
+    /// A catch-up that is not backed off happens at `at`.
+    fn mark(&mut self, at: tokio::time::Instant) {
+        self.last = Some(at);
+    }
+
+    /// How long to wait before the next backed off catch-up. Records it as
+    /// done.
+    fn delay(&mut self) -> Duration {
         let now = tokio::time::Instant::now();
         let wait = match self.last {
             None => Duration::ZERO,
-            // A token spent on a keeping-pace claim shortens this wait only.
-            // The backoff stays where it is: the next slow catch-up still
-            // waits the interval the peer has earned.
-            Some(last) if keeping_pace => {
-                (last + KEEPING_PACE_INTERVAL).saturating_duration_since(now)
-            }
             Some(last) => {
                 // Needed again within two intervals: back off. Otherwise start over.
                 self.interval = if now.duration_since(last) < self.interval * 2 {
@@ -1820,29 +1830,37 @@ impl CatchupLimiter {
     }
 }
 
-/// Keeping-pace catch-ups a `(client, pane)` may take in a burst, and per
-/// second after that (one per 10 s). Bytes accepted into the QUIC send buffer prove nothing
-/// about a peer that never reads, so the exception is capped, not trusted.
+/// Catch-ups a `(node, pane)` whose reads keep up may take in a burst, and
+/// per second after that. They never back off: the peer reads what it gets.
 const KEEPING_PACE_BURST: f64 = 6.0;
-const KEEPING_PACE_PER_SEC: f64 = 0.1;
+const KEEPING_PACE_PER_SEC: f64 = 1.0;
 
 /// Pacing state of one `(remote node id, pane)`. Keyed by the node, not by
 /// `client_id`: the id is peer text, a fresh one per connection would reset it.
 struct Pace {
     limiter: CatchupLimiter,
     tokens: f64,
-    /// Tokens earn from here on. Time spent waiting out a delay earns none,
-    /// so a peer that always needs another catch-up settles at the backoff
-    /// rate (one per 10 s) and never gets a fast one on top.
+    /// Tokens earn from here on. Time spent waiting out a delay earns none.
     refilled: tokio::time::Instant,
 }
 
 impl RpcV2 {
-    /// How long `(node, pane)` waits before its next snapshot catch-up. The
-    /// peer's keeping-pace claim counts only while it has tokens left.
+    /// How long `(node, pane)` waits before its next snapshot catch-up.
+    /// `keeping_pace`: the peer read what the server wrote. Such a peer gets a
+    /// burst of 6, then one catch-up per second, and its backoff is left
+    /// alone. A peer whose write stalled, or that reads too slowly to tell,
+    /// waits 1 s, then 2, 4, 8, 10 s while it keeps needing them.
     fn catchup_delay(&self, node: iroh::EndpointId, pane: PaneId, keeping_pace: bool) -> Duration {
+        Self::pace(&mut lock(&self.pacing), node, pane, keeping_pace)
+    }
+
+    fn pace(
+        map: &mut HashMap<(iroh::EndpointId, Uuid), Pace>,
+        node: iroh::EndpointId,
+        pane: PaneId,
+        keeping_pace: bool,
+    ) -> Duration {
         let now = tokio::time::Instant::now();
-        let mut map = lock(&self.pacing);
         if map.len() > 4096 {
             // Only a flood of nodes gets here (each is an authorized device).
             map.retain(|_, p| now.saturating_duration_since(p.refilled) < Duration::from_secs(300));
@@ -1854,11 +1872,23 @@ impl RpcV2 {
         });
         let earned = now.saturating_duration_since(p.refilled).as_secs_f64() * KEEPING_PACE_PER_SEC;
         p.tokens = (p.tokens + earned).min(KEEPING_PACE_BURST);
-        let keeping = keeping_pace && p.tokens >= 1.0;
-        if keeping {
-            p.tokens -= 1.0;
-        }
-        let wait = p.limiter.delay(keeping);
+        let wait = if keeping_pace {
+            // Out of burst: the wait is the time to the next token.
+            let for_token = if p.tokens >= 1.0 {
+                p.tokens -= 1.0;
+                Duration::ZERO
+            } else {
+                let w = Duration::from_secs_f64((1.0 - p.tokens) / KEEPING_PACE_PER_SEC);
+                p.tokens = 0.0;
+                w
+            };
+            let gap = p.limiter.floor(KEEPING_PACE_INTERVAL);
+            let w = for_token.max(gap);
+            p.limiter.mark(now + w);
+            w
+        } else {
+            p.limiter.delay()
+        };
         p.refilled = now + wait;
         wait
     }
@@ -1869,6 +1899,7 @@ impl RpcV2 {
 /// it, and the snapshot bytes.
 async fn take_snapshot(
     rpc: &Arc<RpcV2>,
+    node: iroh::EndpointId,
     pane: PaneId,
     shared: &Arc<LogShared>,
 ) -> Option<(PaneStreamHeader, Vec<u8>)> {
@@ -1880,7 +1911,10 @@ async fn take_snapshot(
         let slack = (shared.ring_capacity() / 8) as u64;
         move |s: &forgetty_session::PaneSnapshot| shared.total().saturating_sub(s.offset) <= slack
     };
-    let snap = rpc.snapshots.get_if(pane, fresh, move || sm.snapshot_pane(pane)).await?;
+    let snap = rpc
+        .snapshots
+        .get_for(*node.as_bytes(), pane, fresh, move || sm.snapshot_pane(pane))
+        .await?;
     rpc.qa.catchups.fetch_add(1, Ordering::SeqCst);
     info!(
         "rpc2: pane {pane} snapshot catch-up at {}: {} bytes (last build {} us)",
@@ -2041,27 +2075,97 @@ mod limiter_tests {
     #[test]
     fn catchups_back_off_up_to_ten_seconds_and_recover() {
         let mut l = CatchupLimiter::default();
-        assert_eq!(l.delay(false), Duration::ZERO, "the first catch-up is immediate");
+        assert_eq!(l.delay(), Duration::ZERO, "the first catch-up is immediate");
         // Needed again at once, over and over (the caller waits each delay
         // before the next call, so the next "now" is the previous slot).
         let mut waits = Vec::new();
         for _ in 0..6 {
-            let w = l.delay(false);
+            let w = l.delay();
             waits.push(w.as_secs_f64().round() as u64);
             l.last = Some(tokio::time::Instant::now()); // the caller waited
         }
         assert_eq!(waits, [2, 4, 8, 10, 10, 10]);
         // A stream that was quiet starts over with the minimum interval.
         l.last = Some(tokio::time::Instant::now() - Duration::from_secs(60));
-        let w = l.delay(false);
+        let w = l.delay();
         assert!(w.is_zero(), "after a quiet minute the next catch-up is immediate: {w:?}");
-        // A peer that keeps pace with the program waits only the floor, and
-        // its run of fast catch-ups does not raise the backoff.
-        l.last = Some(tokio::time::Instant::now());
-        let w = l.delay(true);
+    }
+
+    #[test]
+    fn a_peer_that_reads_gets_a_burst_then_one_per_second_and_no_backoff() {
+        let mut l = CatchupLimiter::default();
+        let floor = |l: &CatchupLimiter| l.floor(KEEPING_PACE_INTERVAL);
+        assert_eq!(floor(&l), Duration::ZERO);
+        l.mark(tokio::time::Instant::now());
+        let w = floor(&l);
         assert!(w <= KEEPING_PACE_INTERVAL && w > Duration::from_millis(50), "{w:?}");
-        l.last = Some(tokio::time::Instant::now());
-        let w = l.delay(false);
-        assert_eq!(w.as_secs_f64().round() as u64, 2, "backoff starts over: {w:?}");
+    }
+}
+
+#[cfg(test)]
+mod pacing_tests {
+    use super::*;
+
+    /// Builds only the pacing map, which is all `catchup_delay` needs.
+    fn pace_map() -> Mutex<HashMap<(iroh::EndpointId, Uuid), Pace>> {
+        Mutex::new(HashMap::new())
+    }
+
+    fn node() -> iroh::EndpointId {
+        iroh::SecretKey::generate(&mut rand::rng()).public()
+    }
+
+    /// The same arithmetic as `RpcV2::catchup_delay`, on a map of its own.
+    fn delay(
+        map: &Mutex<HashMap<(iroh::EndpointId, Uuid), Pace>>,
+        n: iroh::EndpointId,
+        pane: Uuid,
+        keeping: bool,
+    ) -> Duration {
+        RpcV2::pace(&mut lock(map), n, PaneId(pane), keeping)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reading_peer_has_a_burst_of_six_then_one_per_second_without_backoff() {
+        let map = pace_map();
+        let (n, pane) = (node(), Uuid::new_v4());
+        let mut waits = Vec::new();
+        for _ in 0..12 {
+            let w = delay(&map, n, pane, true);
+            waits.push(w);
+            tokio::time::sleep(w).await; // the caller waits, then is served
+        }
+        // The first 6 only wait the 100 ms floor (the first not at all).
+        assert!(waits[0].is_zero());
+        for w in &waits[1..6] {
+            assert!(*w <= KEEPING_PACE_INTERVAL, "{w:?}");
+        }
+        // After that the wait is the time to the next token: 1 s, always.
+        for w in &waits[6..] {
+            assert!(
+                *w >= Duration::from_millis(900) && *w <= Duration::from_millis(1100),
+                "steady state is one per second, no growth: {waits:?}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_peer_backs_off_to_ten_seconds_whatever_its_burst() {
+        let map = pace_map();
+        let (n, pane) = (node(), Uuid::new_v4());
+        let mut waits = Vec::new();
+        for _ in 0..7 {
+            let w = delay(&map, n, pane, false);
+            waits.push(w.as_secs());
+            tokio::time::sleep(w).await;
+        }
+        assert_eq!(waits, [0, 2, 4, 8, 10, 10, 10]);
+        // Reading claims after that still cost a token each: the burst was
+        // not spent, but the backoff is not reset by it either.
+        let w = delay(&map, n, pane, true);
+        assert!(w <= Duration::from_secs(1), "{w:?}");
+        tokio::time::sleep(w).await;
+        let w = delay(&map, n, pane, false);
+        assert!(w >= Duration::from_secs(9), "the backoff survived a reading claim: {w:?}");
     }
 }

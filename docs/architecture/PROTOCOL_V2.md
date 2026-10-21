@@ -292,15 +292,23 @@ known gap, section 12).
 - Triggers: the stream is more than half the ring behind, makes no write
   progress for 2 s, or a resume starts further back than half the ring.
 - Limits: one build shared per pane, a finished snapshot reused only while
-  the log is within 1/8 ring of it, at most 2 concurrent builds server-wide.
-  A slow or stalled stream waits at least 1 s between catch-ups, with backoff
-  to 10 s. A stream that keeps pace (4 MiB/s or more of live bytes since its
-  last snapshot, or a snapshot delivered in under 500 ms that the log outran
-  before any live byte) waits at most 100 ms and gets no backoff, but only
-  within a cap per `(client_id, pane)`: a burst of 6, then one more every 10 s.
-  Past the cap it is paced like a slow stream. The pacing state outlives the
-  stream and the connection, so attaching again does not reset it, and the
-  first snapshot of a far-behind attach is paced the same way.
+  the log is within 1/8 ring of it. At most 2 concurrent builds server-wide,
+  at most 1 per node (the iroh node id of the device, not the peer-chosen
+  `client_id`): a node that asks for many panes gets them one after the other.
+  The 2 build permits go to the waiting nodes in turn (round robin), so one
+  node cannot keep another from a build. A node that joins a build still
+  waiting in another node's queue can start it on its own turn.
+- Pacing, per `(node id, pane)`, kept after the stream and the connection end
+  (attaching again does not reset it; the first snapshot of a far-behind attach
+  is paced the same way):
+  - A stream whose peer reads (it took live bytes at 1 MiB/s or more since its
+    last snapshot, or took a snapshot in under 500 ms that the log outran
+    before any live byte) gets a burst of 6 catch-ups at least 100 ms apart,
+    then one per second. It never backs off.
+  - A stream whose write made no progress for 2 s, or whose peer reads too
+    slowly to show it reads, waits at least 1 s between catch-ups, with backoff
+    to 10 s while it keeps needing them. A catch-up of the first kind does not
+    reset that backoff.
 - Scrollback for a fresh attach is a known gap. A client that attaches to a
   busy pane sees the screen, not the history above it. The server does not
   build it.

@@ -727,3 +727,86 @@ async fn input_without_the_flags_capability_is_user_input() {
     drop(conn_a);
     server.shutdown().await;
 }
+
+/// A hostile node that asks for catch-ups on many panes with a fresh
+/// `client_id` per connection costs one build at a time, and an honest second
+/// node still gets its own catch-up promptly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hostile_node_does_not_starve_an_honest_nodes_catch_up() {
+    if !real_only() {
+        return;
+    }
+    let server = TestServer::start(TestServerConfig::default()).await;
+    let busy: Vec<Uuid> =
+        (0..8).map(|_| server.add_script_pane("exec yes 0123456789abcdef")).collect();
+    let (hostile_panes, honest_panes) = busy.split_at(4);
+    let endpoint = raw_endpoint(&server).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hostile = {
+        let (stop, panes) = (stop.clone(), hostile_panes.to_vec());
+        let endpoint = endpoint.clone();
+        let addr = server.addr();
+        tokio::spawn(async move {
+            let mut conns = Vec::new();
+            while !stop.load(Ordering::SeqCst) {
+                // Same node, fresh client id each time, never reads a pane.
+                let conn = endpoint.connect(addr.clone(), forgetty_client::proto::ALPN_RPC).await;
+                let Ok(conn) = conn else { break };
+                let Ok((mut send, mut recv)) = conn.open_bi().await else { break };
+                let hello = Hello::new(
+                    Uuid::new_v4(),
+                    Uuid::new_v4(),
+                    ClientKind::Cli,
+                    "hostile",
+                    "0.0.0",
+                    vec!["resume".into(), "snapshot_catchup".into()],
+                );
+                write_msg(&mut send, &hello).await.unwrap();
+                let _ = read_msg::<_, HandshakeReply>(&mut recv).await;
+                tokio::spawn(async move {
+                    while let Ok(Some(_)) = read_msg::<_, ControlMsg>(&mut recv).await {}
+                });
+                for (i, pane) in panes.iter().enumerate() {
+                    attach_raw(&mut send, i as u64 + 1, *pane).await;
+                }
+                conns.push(conn);
+                if conns.len() > 3 {
+                    conns.remove(0);
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        })
+    };
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let honest = connect(&server, "honest").await;
+    let mut worst = Duration::ZERO;
+    for pane in honest_panes.iter().take(3) {
+        let t0 = Instant::now();
+        let mut s = honest.attach_pane(*pane).await.unwrap();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(10), s.next()).await {
+                Ok(Some(PaneItem::Snapshot { .. })) => break,
+                Ok(Some(_)) => continue,
+                other => panic!("no snapshot for the honest node: {other:?}"),
+            }
+        }
+        let took = t0.elapsed();
+        println!("honest node catch-up while a hostile node asks: {took:?}");
+        worst = worst.max(took);
+    }
+    stop.store(true, Ordering::SeqCst);
+    let _ = hostile.await;
+    let st = qa_state(&server);
+    println!(
+        "worst {worst:?}, builds {}, max running {}, last build {} us",
+        st["snapshot_builds"], st["snapshot_max_running"], st["last_snapshot_us"]
+    );
+    assert!(st["snapshot_max_running"].as_u64().unwrap() <= 2);
+    assert!(worst < Duration::from_millis(300), "the honest node waited {worst:?}");
+    honest.close().await;
+    endpoint.close().await;
+    server.shutdown().await;
+}
