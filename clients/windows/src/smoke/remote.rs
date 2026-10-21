@@ -463,6 +463,8 @@ impl ShellSmoke {
                             json!({
                                 "log": shell.toast_log.iter().map(|r| format!("{} {:?} {:?}", r.machine, r.pane, r.text.lines)).collect::<Vec<_>>(),
                                 "before": self.w3.toasts_before,
+                                "server_lines": self.w3.server.as_ref().map(|s| s.lines.lock().unwrap().clone()),
+                                "remote_conn": shell.machines.iter().map(|m| format!("{} {:?}", m.name, m.backend.connection())).collect::<Vec<_>>(),
                                 "active_machine": shell.machine.id.to_string(),
                                 "window_active": shell.window_active,
                             }),

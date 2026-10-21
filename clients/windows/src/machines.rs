@@ -270,13 +270,14 @@ impl AppShell {
 
     /// Backend events of one machine, on screen or not.
     pub(crate) fn machine_events(&mut self, id: Uuid, evs: Vec<BackendEvent>, cx: &mut Context<Self>) {
+        let shown = self.machine.id;
         let mut rest = Vec::with_capacity(evs.len());
         for ev in evs {
             match ev {
                 BackendEvent::ConnectionChanged(st) => self.on_conn(id, st, cx),
                 BackendEvent::Notification { pane_id, title, body } => {
                     self.with_machine(id, |s| {
-                        let vis = s.visibility(id, pane_id);
+                        let vis = s.visibility(shown, id, pane_id);
                         if notify::notification_wants_toast(vis) {
                             let tab = s.tab_title_of_pane(pane_id);
                             let text = notify::note_text(&s.machine.name, &tab, &title, &body);
@@ -287,7 +288,7 @@ impl AppShell {
                 BackendEvent::StatusChanged { pane_id, status, message } => {
                     self.with_machine(id, |s| {
                         let prev = s.meta.get(&pane_id).map(|m| m.status).unwrap_or_default();
-                        let vis = s.visibility(id, pane_id);
+                        let vis = s.visibility(shown, id, pane_id);
                         if notify::status_wants_toast(prev, status, vis) {
                             let tab = s.tab_title_of_pane(pane_id);
                             let text = notify::status_text(&s.machine.name, &tab, status, &message);
@@ -467,10 +468,12 @@ impl AppShell {
 
     // ---- toasts --------------------------------------------------------------------
 
-    fn visibility(&self, machine: Uuid, pane: PaneId) -> Visibility {
+    /// `shown` is the machine on screen. Inside `with_machine` the shell fields
+    /// hold the pane's machine, so the caller reads `shown` before the swap.
+    fn visibility(&self, shown: Uuid, machine: Uuid, pane: PaneId) -> Visibility {
         Visibility {
             window_active: self.window_active,
-            machine_active: machine == self.machine.id,
+            machine_active: machine == shown,
             pane_focused: self.active_pane() == Some(pane),
         }
     }
