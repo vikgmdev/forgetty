@@ -114,10 +114,8 @@ impl PaneWriterOwner {
                 };
                 // The real write. It may block for as long as the program
                 // does not read; nothing else waits on it.
-                let res = out
-                    .write_all(&job.data)
-                    .and_then(|()| out.flush())
-                    .map_err(|e| e.to_string());
+                let res =
+                    out.write_all(&job.data).and_then(|()| out.flush()).map_err(|e| e.to_string());
                 let failed = res.is_err();
                 {
                     let mut st = s.lock();
@@ -238,9 +236,8 @@ mod tests {
     async fn a_blocked_pty_blocks_only_its_own_callers() {
         let open = Arc::new(AtomicBool::new(false));
         let out = Arc::new(Mutex::new(Vec::new()));
-        let owner =
-            PaneWriterOwner::spawn(Box::new(Gate { open: open.clone(), out: out.clone() }))
-                .unwrap();
+        let owner = PaneWriterOwner::spawn(Box::new(Gate { open: open.clone(), out: out.clone() }))
+            .unwrap();
         let w = owner.handle();
         // The first job is taken by the thread, which then blocks.
         w.try_queue(vec![1; 10]).unwrap();

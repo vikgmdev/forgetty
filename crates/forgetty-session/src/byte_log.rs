@@ -316,7 +316,8 @@ impl ByteLog {
         // What the file and the sidecar say about the offsets.
         let existing_len = std::fs::metadata(&log_path).map(|m| m.len()).ok();
         let file_len_on_disk = existing_len.unwrap_or(0);
-        let sidecar = if existing_len.is_some() { read_sidecar(&log_path, file_len_on_disk) } else { None };
+        let sidecar =
+            if existing_len.is_some() { read_sidecar(&log_path, file_len_on_disk) } else { None };
         let disk_first = sidecar.map(|s| s.first).unwrap_or(0);
         let file_end = disk_first + file_len_on_disk;
         // A file that does not end where the last graceful stop left it may
@@ -746,15 +747,8 @@ async fn disk_appender_task(
                 // waits, finds out how much of the chunk reached the file, and
                 // writes the rest. The PTY is held by the queue filling up
                 // meanwhile (AD-023), as it is for a slow disk.
-                if !write_with_retry(
-                    &pane_id,
-                    &shared,
-                    &log_path,
-                    &mut writer,
-                    file_len,
-                    &data,
-                )
-                .await
+                if !write_with_retry(&pane_id, &shared, &log_path, &mut writer, file_len, &data)
+                    .await
                 {
                     return; // the pane closed while the disk was failing
                 }
@@ -764,10 +758,7 @@ async fn disk_appender_task(
                 // the write), so a kill -9 loses nothing the pane already
                 // printed (the page cache outlives the process), and publish
                 // the extent to readers behind the ring.
-                shared.set_disk(DiskState {
-                    first: file_first,
-                    flushed_to: file_first + file_len,
-                });
+                shared.set_disk(DiskState { first: file_first, flushed_to: file_first + file_len });
                 shared.disk_progress.notify_waiters();
 
                 if file_len >= max_disk_bytes {

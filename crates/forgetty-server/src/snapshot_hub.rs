@@ -140,7 +140,9 @@ impl SnapshotHub {
             let (b, mut rx) = {
                 let mut map = self.lock();
                 match map.get(&pane) {
-                    Some(Slot::Ready(at, snap)) if at.elapsed() < self.reuse_for && usable(snap) => {
+                    Some(Slot::Ready(at, snap))
+                        if at.elapsed() < self.reuse_for && usable(snap) =>
+                    {
                         self.stats.reuses.fetch_add(1, Ordering::Relaxed);
                         return Some(snap.clone());
                     }

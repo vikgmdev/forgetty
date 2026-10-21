@@ -323,13 +323,11 @@ impl RpcV2 {
         self.inputs_frozen.store(true, Ordering::SeqCst);
         let entries: Vec<serde_json::Value> = lock(&self.inputs)
             .iter()
-            .map(
-                |((c, e), r)| {
-                    serde_json::json!({
-                        "client_id": c, "input_epoch": e, "last": r.last.load(Ordering::SeqCst)
-                    })
-                },
-            )
+            .map(|((c, e), r)| {
+                serde_json::json!({
+                    "client_id": c, "input_epoch": e, "last": r.last.load(Ordering::SeqCst)
+                })
+            })
             .collect();
         let saved_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -370,7 +368,10 @@ impl RpcV2 {
                 ) else {
                     continue;
                 };
-                inputs.insert((c, ep), Arc::new(InputRec { last: AtomicU64::new(last), ..Default::default() }));
+                inputs.insert(
+                    (c, ep),
+                    Arc::new(InputRec { last: AtomicU64::new(last), ..Default::default() }),
+                );
                 loaded += 1;
             }
         }
@@ -716,10 +717,7 @@ impl RpcV2 {
         if self.qa.hold_acks.load(Ordering::SeqCst) {
             return 0;
         }
-        lock(&self.inputs)
-            .get(&(client, epoch))
-            .map(|r| r.last.load(Ordering::SeqCst))
-            .unwrap_or(0)
+        lock(&self.inputs).get(&(client, epoch)).map(|r| r.last.load(Ordering::SeqCst)).unwrap_or(0)
     }
 
     // -----------------------------------------------------------------------
@@ -1135,14 +1133,12 @@ impl Session {
                         // input stream instead of typing into nothing.
                         Err(e) => {
                             warn!("rpc2: bad frame on the input stream: {e}");
-                            let reason: &[u8] = if matches!(
-                                e,
-                                forgetty_proto::FrameError::TooLarge { .. }
-                            ) {
-                                b"frame_too_large"
-                            } else {
-                                b"bad_input_frame"
-                            };
+                            let reason: &[u8] =
+                                if matches!(e, forgetty_proto::FrameError::TooLarge { .. }) {
+                                    b"frame_too_large"
+                                } else {
+                                    b"bad_input_frame"
+                                };
                             s.conn.close(close_code::FRAME_TOO_LARGE.into(), reason);
                             break;
                         }
@@ -1321,27 +1317,30 @@ impl Session {
                 out.push(control_frame(&reply(r)));
             }
             method::RESIZE_PANE => {
-                let Some(guard) = self.begin_task(inflight, out, ANSWER_RESERVE) else { return false };
+                let Some(guard) = self.begin_task(inflight, out, ANSWER_RESERVE) else {
+                    return false;
+                };
                 let s = self.clone();
                 let out = out.clone();
                 work.spawn(async move {
                     let _guard = guard;
-                    let r = from_value::<ResizePaneParams>(params).map_err(bad).and_then(|mut p| {
-                        if p.rows == 0 || p.cols == 0 {
-                            return Err((
-                                error_code::BAD_REQUEST,
-                                "rows and cols must be above 0".into(),
-                            ));
-                        }
-                        // Asked-for sizes are kept per client (size policy), so
-                        // clamp before they are stored, not only when applied.
-                        p.rows = forgetty_session::clamp_pane_dim(p.rows);
-                        p.cols = forgetty_session::clamp_pane_dim(p.cols);
-                        if s.rpc.sm.pane_info(PaneId(p.pane_id)).is_none() {
-                            return Err((error_code::NOT_FOUND, "no such pane".into()));
-                        }
-                        Ok(p)
-                    });
+                    let r =
+                        from_value::<ResizePaneParams>(params).map_err(bad).and_then(|mut p| {
+                            if p.rows == 0 || p.cols == 0 {
+                                return Err((
+                                    error_code::BAD_REQUEST,
+                                    "rows and cols must be above 0".into(),
+                                ));
+                            }
+                            // Asked-for sizes are kept per client (size policy), so
+                            // clamp before they are stored, not only when applied.
+                            p.rows = forgetty_session::clamp_pane_dim(p.rows);
+                            p.cols = forgetty_session::clamp_pane_dim(p.cols);
+                            if s.rpc.sm.pane_info(PaneId(p.pane_id)).is_none() {
+                                return Err((error_code::NOT_FOUND, "no such pane".into()));
+                            }
+                            Ok(p)
+                        });
                     let r = match r {
                         Ok(p) => {
                             let rpc = s.rpc.clone();
@@ -1369,7 +1368,8 @@ impl Session {
                     }));
                     return true;
                 }
-                let reserve = if other == method::CAPTURE { CAPTURE_RESERVE } else { ANSWER_RESERVE };
+                let reserve =
+                    if other == method::CAPTURE { CAPTURE_RESERVE } else { ANSWER_RESERVE };
                 let Some(guard) = self.begin_task(inflight, out, reserve) else { return false };
                 let s = self.clone();
                 let out = out.clone();

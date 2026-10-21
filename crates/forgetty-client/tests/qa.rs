@@ -79,7 +79,8 @@ async fn blocked_input_stalls_nothing(a_script: &str) {
         tokio::task::spawn_blocking(move || {
             use base64::Engine as _;
             let data = base64::engine::general_purpose::STANDARD.encode(vec![b'y'; 1 << 20]);
-            let _ = server.socket_call("send_input", json!({"pane_id": a.to_string(), "data": data}));
+            let _ =
+                server.socket_call("send_input", json!({"pane_id": a.to_string(), "data": data}));
         })
     };
     tokio::time::sleep(Duration::from_millis(700)).await;
@@ -171,7 +172,9 @@ async fn raw_peer(
         other => panic!("handshake: {other:?}"),
     }
     // Keep reading the control stream, so only the pane stream goes unread.
-    tokio::spawn(async move { while let Ok(Some(_)) = read_msg::<_, ControlMsg>(&mut recv).await {} });
+    tokio::spawn(
+        async move { while let Ok(Some(_)) = read_msg::<_, ControlMsg>(&mut recv).await {} },
+    );
     (endpoint, conn, send)
 }
 
@@ -286,14 +289,8 @@ async fn a_device_holds_at_most_four_connections() {
     for i in 0..6 {
         let conn = endpoint.connect(server.addr(), ALPN_RPC).await.unwrap();
         let (mut send, mut recv) = conn.open_bi().await.unwrap();
-        let hello = Hello::new(
-            Uuid::new_v4(),
-            Uuid::new_v4(),
-            ClientKind::Cli,
-            "raw",
-            "0.0.0",
-            vec![],
-        );
+        let hello =
+            Hello::new(Uuid::new_v4(), Uuid::new_v4(), ClientKind::Cli, "raw", "0.0.0", vec![]);
         write_msg(&mut send, &hello).await.unwrap();
         match read_msg::<_, HandshakeReply>(&mut recv).await.unwrap() {
             Some(HandshakeReply::Welcome(_)) => {}
@@ -341,7 +338,8 @@ async fn a_client_that_drips_reads_is_closed_as_stalled() {
         .unwrap();
     let conn = endpoint.connect(server.addr(), ALPN_RPC).await.unwrap();
     let (mut send, mut recv) = conn.open_bi().await.unwrap();
-    let hello = Hello::new(Uuid::new_v4(), Uuid::new_v4(), ClientKind::Cli, "drip", "0.0.0", vec![]);
+    let hello =
+        Hello::new(Uuid::new_v4(), Uuid::new_v4(), ClientKind::Cli, "drip", "0.0.0", vec![]);
     write_msg(&mut send, &hello).await.unwrap();
     assert!(matches!(
         read_msg::<_, HandshakeReply>(&mut recv).await.unwrap(),
@@ -394,7 +392,10 @@ async fn resize_is_clamped_to_1000() {
         (v["rows"].as_u64().unwrap(), v["cols"].as_u64().unwrap())
     };
     server
-        .socket_call("resize_pane", json!({"pane_id": pane.to_string(), "rows": 65537, "cols": 40000}))
+        .socket_call(
+            "resize_pane",
+            json!({"pane_id": pane.to_string(), "rows": 65537, "cols": 40000}),
+        )
         .expect("socket resize");
     assert_eq!(dims(&server), (1000, 1000));
     server
@@ -407,7 +408,11 @@ async fn resize_is_clamped_to_1000() {
     // The resize runs on a blocking task; give it a moment.
     let t0 = Instant::now();
     while dims(&server) != (1000, 1000) {
-        assert!(t0.elapsed() < Duration::from_secs(5), "v2 resize not clamped: {:?}", dims(&server));
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "v2 resize not clamped: {:?}",
+            dims(&server)
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     c.close().await;

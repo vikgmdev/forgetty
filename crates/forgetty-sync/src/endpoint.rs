@@ -92,7 +92,6 @@ pub struct RevokeOutcome {
     pub save_error: Option<crate::registry::RegistryError>,
 }
 
-
 /// Builder for [`SyncEndpoint`].
 ///
 /// Construct via [`SyncEndpoint::builder`], chain zero or more

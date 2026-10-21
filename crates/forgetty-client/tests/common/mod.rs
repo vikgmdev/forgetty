@@ -207,8 +207,8 @@ impl Real {
             if t0.elapsed() >= Duration::from_secs(30) {
                 // The temp dir (and the log with it) goes when this panics, so
                 // say what the server wrote, and do not leave it running.
-                let log = std::fs::read_to_string(dir.path().join("server.log"))
-                    .unwrap_or_default();
+                let log =
+                    std::fs::read_to_string(dir.path().join("server.log")).unwrap_or_default();
                 let tail: Vec<&str> = log.lines().rev().take(40).collect();
                 let exited = child.try_wait().ok().flatten();
                 let _ = child.kill();

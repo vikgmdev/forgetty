@@ -86,7 +86,8 @@ impl DeviceRegistry {
     /// whose revoke could not be saved is not authorized (fail closed).
     pub fn is_authorized(&self, endpoint_id: &EndpointId) -> bool {
         let id_str = endpoint_id.to_string();
-        !self.revoked_unsaved.contains(&id_str) && self.devices.iter().any(|d| d.device_id == id_str)
+        !self.revoked_unsaved.contains(&id_str)
+            && self.devices.iter().any(|d| d.device_id == id_str)
     }
 
     /// Add a new device entry and persist atomically.
