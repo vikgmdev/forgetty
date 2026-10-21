@@ -1,0 +1,60 @@
+name: windows-client
+
+# V3 P3 spike: GPUI + libghostty-vt on Windows. Builds clients/windows, runs the
+# headless smoke mode, uploads the exe plus DLLs.
+on:
+  push:
+    branches: [v3/win-spike]
+    paths:
+      - "clients/windows/**"
+      - "crates/forgetty-vt/**"
+      - "crates/forgetty-core/**"
+      - ".github/workflows/windows-client.yml"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-smoke:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: clients/windows
+
+      - name: Build (release)
+        working-directory: clients/windows
+        run: cargo build --release
+
+      - name: Smoke
+        shell: pwsh
+        working-directory: clients/windows/target/release
+        run: |
+          Get-ChildItem *.exe, *.dll | Format-Table Name, Length
+          .\forgetty-win.exe --smoke | Tee-Object -FilePath smoke.json
+          $code = $LASTEXITCODE
+          Write-Host "forgetty-win --smoke exit code: $code"
+          exit $code
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: forgetty-win
+          if-no-files-found: warn
+          path: |
+            clients/windows/target/release/forgetty-win.exe
+            clients/windows/target/release/*.dll
+            clients/windows/target/release/smoke.json
