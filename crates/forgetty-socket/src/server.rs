@@ -948,32 +948,42 @@ async fn handle_streaming_connection(
         }
 
         // `send_input` may wait up to 10 s for room in a pane whose program
-        // does not read (AD-024). That wait must not hold a runtime worker, so
-        // it runs on the blocking pool. The connection still answers in order.
-        let response = if request.method == methods::SEND_INPUT {
+        // does not read (AD-024), and `capture` feeds the whole ring through a
+        // terminal. Both would hold a runtime worker, so they run on the
+        // blocking pool. The connection still answers in order. A handler that
+        // panics or dies gets an error back, never a closed connection.
+        let heavy = request.method == methods::SEND_INPUT || request.method == methods::CAPTURE;
+        let response = if heavy {
             let (req, sm2, se, sid) = (
                 request.clone(),
                 Arc::clone(&sm),
                 sync_endpoint.as_ref().map(Arc::clone),
                 session_id,
             );
-            tokio::task::spawn_blocking(move || handlers::dispatch(&req, sm2, se, sid))
-                .await
-                .unwrap_or_else(|e| {
+            let method = request.method.clone();
+            match tokio::task::spawn_blocking(move || guarded_dispatch(&req, sm2, se, sid)).await {
+                Ok(r) => r,
+                Err(e) => {
+                    error!("socket: {method}: handler task failed: {e}");
                     Response::error(
                         request.id.clone(),
                         crate::protocol::INTERNAL_ERROR,
-                        format!("send_input task failed: {e}"),
+                        format!("{method}: handler task failed: {e}"),
                     )
-                })
+                }
+            }
         } else {
-            handlers::dispatch(
+            guarded_dispatch(
                 &request,
                 Arc::clone(&sm),
                 sync_endpoint.as_ref().map(Arc::clone),
                 session_id,
             )
         };
+        if let Some(err) = &response.error {
+            // A failed call always says why in the server log.
+            warn!("socket: {} failed: code {}: {}", request.method, err.code, err.message);
+        }
         write_response(&mut writer, &response).await?;
     }
 
@@ -1135,6 +1145,38 @@ pub async fn graceful_exit(
 }
 
 /// Serialize and write a JSON-RPC response as a newline-terminated line.
+/// [`handlers::dispatch`] that turns a panic in a handler into an error
+/// response and a log line. A panic must not close the connection without a
+/// word (the CLI would only say "server closed the connection").
+fn guarded_dispatch(
+    request: &Request,
+    sm: Arc<SessionManager>,
+    se: Option<Arc<SyncEndpoint>>,
+    session_id: Option<uuid::Uuid>,
+) -> Response {
+    guard_handler(request, || handlers::dispatch(request, sm, se, session_id))
+}
+
+/// Run `f`, and answer `request` with an internal error if it panics.
+fn guard_handler(request: &Request, f: impl FnOnce() -> Response) -> Response {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(r) => r,
+        Err(payload) => {
+            let why = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "panic".to_string());
+            error!("socket: {} panicked: {why}", request.method);
+            Response::error(
+                request.id.clone(),
+                crate::protocol::INTERNAL_ERROR,
+                format!("{} failed inside the server: {why}", request.method),
+            )
+        }
+    }
+}
+
 async fn write_response(
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     response: &Response,
@@ -1169,6 +1211,28 @@ fn default_socket_path() -> PathBuf {
 mod tests {
     use super::*;
     use forgetty_session::SessionManager;
+
+    #[test]
+    fn a_panicking_handler_answers_with_an_error() {
+        let req = Request {
+            jsonrpc: "2.0".into(),
+            method: "capture".into(),
+            params: serde_json::Value::Null,
+            id: Some(serde_json::json!(7)),
+        };
+        let resp = guard_handler(&req, || panic!("vt blew up"));
+        let err = resp.error.expect("an error response");
+        assert_eq!(err.code, crate::protocol::INTERNAL_ERROR);
+        assert!(
+            err.message.contains("capture") && err.message.contains("vt blew up"),
+            "{}",
+            err.message
+        );
+        assert_eq!(resp.id, Some(serde_json::json!(7)));
+        // A normal handler passes through.
+        let ok = guard_handler(&req, || Response::success(req.id.clone(), serde_json::json!(1)));
+        assert!(ok.error.is_none());
+    }
 
     #[tokio::test]
     async fn peer_from_another_uid_is_refused() {

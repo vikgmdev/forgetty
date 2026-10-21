@@ -1076,3 +1076,86 @@ async fn the_stream_header_names_the_end_of_the_replay() {
     drop(conn);
     server.shutdown().await;
 }
+
+/// Frames left in a hung pane's queue when the 2 s drain runs out are saved
+/// as unwritten, so the saved dedup state does not claim they were written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_saves_the_frames_that_never_reached_a_hung_pane() {
+    if !real_only() {
+        return;
+    }
+    let server = TestServer::start(TestServerConfig::default()).await;
+    let pane = server.add_script_pane("stty -echo; exec sleep infinity");
+    let c = connect(&server, "typist").await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let chunk = b"xxxxxxxxx\n".repeat(400);
+    for _ in 0..40 {
+        c.send_input(pane, &chunk).await.unwrap();
+    }
+    wait_for("input to reach the queue", || {
+        qa_state(&server)["input_drops"].as_u64().unwrap() > 0
+            || pty_input(&server, pane).len() > 100_000
+    })
+    .await;
+    c.close().await;
+    let dir = server.state_dir().unwrap();
+    let saved = server.stop_for_restart().await;
+    // The state dir layout is the server's: look for the saved table.
+    let found =
+        walk(&dir).into_iter().find(|p| p.file_name().is_some_and(|n| n == "input_seq.json"));
+    let _ = saved;
+    let text = std::fs::read_to_string(found.expect("input_seq.json was saved")).unwrap();
+    let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let unwritten: usize = doc["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["unwritten"].as_array().map_or(0, |a| a.len()))
+        .sum();
+    assert!(unwritten > 0, "frames stuck in the hung pane's queue were saved as written: {text}");
+}
+
+fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                out.extend(walk(&p));
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+/// `capture` right after the ring is full answers with the screen, on the
+/// same connection (B). A 20 MB burst once ended in "server closed the
+/// connection" with nothing in the log.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn capture_right_after_a_full_ring_answers() {
+    if !real_only() {
+        return;
+    }
+    let server = TestServer::start(TestServerConfig::default()).await;
+    // More than the 8 MiB ring, ending with a marker on the screen.
+    let pane = server.add_script_pane(
+        "head -c 12000000 /dev/zero | tr '\\0' 'a' | fold -w 100; echo; echo DONE_MARKER; exec cat",
+    );
+    wait_for("the burst to finish", || {
+        let (first, total) = server.log_bounds(pane);
+        total > 9_000_000 && total.saturating_sub(first) >= 8 * 1024 * 1024
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Several in a row on one connection, none may close it.
+    for i in 0..3 {
+        let r = server
+            .socket_call("capture", json!({"pane_id": pane.to_string(), "trim": true}))
+            .unwrap_or_else(|e| panic!("capture {i} failed: {e}"));
+        let text = r["text"].as_str().expect("text");
+        assert!(text.contains("DONE_MARKER"), "capture {i}: {text:?}");
+    }
+    server.shutdown().await;
+}

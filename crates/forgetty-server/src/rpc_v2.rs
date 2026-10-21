@@ -43,7 +43,7 @@ use forgetty_sync::SyncEndpoint;
 use iroh::endpoint::Connection;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::{AbortHandle, JoinSet};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 /// Application close code of [`RpcV2::drop_connections`] (test harness).
@@ -1087,12 +1087,29 @@ impl RpcV2 {
             params: mp_to_json(params),
             id: Some(serde_json::json!(1)),
         };
-        let resp = forgetty_socket::dispatch(
-            &req,
-            self.sm.clone(),
-            self.sync.get().cloned(),
-            Some(self.server_id),
-        );
+        let (sm, sync, id) = (self.sm.clone(), self.sync.get().cloned(), self.server_id);
+        // A handler that panics answers with an error and a log line, not a
+        // dead request.
+        let resp = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            forgetty_socket::dispatch(&req, sm, sync, Some(id))
+        })) {
+            Ok(r) => r,
+            Err(payload) => {
+                let why = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "panic".to_string());
+                error!("rpc2: {method} panicked: {why}");
+                return Err((
+                    error_code::INTERNAL,
+                    format!("{method} failed inside the server: {why}"),
+                ));
+            }
+        };
+        if let Some(err) = &resp.error {
+            warn!("rpc2: {method} failed: code {}: {}", err.code, err.message);
+        }
         if let Some(err) = resp.error {
             return Err(map_error(err.code, err.message));
         }
