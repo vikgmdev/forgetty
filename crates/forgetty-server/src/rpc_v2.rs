@@ -380,12 +380,12 @@ impl RpcV2 {
             let rpc = self.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(INPUT_KEEP).await;
-                let live: std::collections::HashSet<Uuid> = lock(&rpc.clients)
-                    .iter()
-                    .filter(|(_, r)| r.conns > 0)
-                    .map(|(c, _)| *c)
-                    .collect();
-                lock(&rpc.inputs).retain(|(c, _), _| live.contains(c));
+                // A client that connected since the start has a record, and
+                // its own departure timer drops its state 10 minutes after it
+                // left. This sweep only takes the clients that never came back.
+                let known: std::collections::HashSet<Uuid> =
+                    lock(&rpc.clients).keys().copied().collect();
+                prune_unknown_clients(&mut lock(&rpc.inputs), &known);
             });
         }
     }
@@ -1862,6 +1862,34 @@ async fn stream_from(
                 return StreamEnd::Gone;
             }
         }
+    }
+}
+
+/// Drop input state of clients that are not in `known`.
+fn prune_unknown_clients(
+    inputs: &mut HashMap<(Uuid, Uuid), Arc<InputRec>>,
+    known: &std::collections::HashSet<Uuid>,
+) {
+    inputs.retain(|(c, _), _| known.contains(c));
+}
+
+#[cfg(test)]
+mod prune_tests {
+    use super::*;
+
+    #[test]
+    fn the_restored_input_sweep_keeps_clients_with_a_record() {
+        let (stayed, left, never) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let mut inputs: HashMap<(Uuid, Uuid), Arc<InputRec>> = HashMap::new();
+        for c in [stayed, left, never] {
+            inputs.insert((c, Uuid::new_v4()), Arc::new(InputRec::default()));
+        }
+        // `left` connected and went away less than 10 minutes ago: it has a
+        // client record (conns == 0) and its own timer. `never` has none.
+        let known: std::collections::HashSet<Uuid> = [stayed, left].into_iter().collect();
+        prune_unknown_clients(&mut inputs, &known);
+        let kept: std::collections::HashSet<Uuid> = inputs.keys().map(|(c, _)| *c).collect();
+        assert_eq!(kept, known);
     }
 }
 
