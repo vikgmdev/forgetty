@@ -25,8 +25,8 @@ info()  { printf "${GREEN}[+]${RESET} %s\n" "$1"; }
 error() { printf "${RED}[!]${RESET} %s\n" "$1" >&2; }
 
 # ── Pre-flight checks ──────────────────────────────────────────────
-BINARY="$PROJECT_ROOT/target/release/forgetty"
-DAEMON_BINARY="$PROJECT_ROOT/target/release/forgetty-server"
+BINARY="$PROJECT_ROOT/target/release/forgetty-gtk"
+DAEMON_BINARY="$PROJECT_ROOT/target/release/forgetty"
 SO_FILE="$PROJECT_ROOT/target/release/lib/libghostty-vt.so.0.1.0"
 
 if [ ! -f "$BINARY" ]; then
@@ -81,10 +81,10 @@ mkdir -p "$STAGING/usr/share/doc/forgetty"
 
 # ── Copy files ──────────────────────────────────────────────────────
 info "Copying GTK binary"
-install -Dm755 "$BINARY" "$STAGING/usr/bin/forgetty"
+install -Dm755 "$BINARY" "$STAGING/usr/bin/forgetty-gtk"
 
 info "Copying daemon binary"
-install -Dm755 "$DAEMON_BINARY" "$STAGING/usr/bin/forgetty-server"
+install -Dm755 "$DAEMON_BINARY" "$STAGING/usr/bin/forgetty"
 
 info "Copying shared library"
 install -Dm755 "$SO_FILE" "$STAGING/usr/lib/forgetty/libghostty-vt.so.0.1.0"

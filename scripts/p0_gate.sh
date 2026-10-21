@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# P0 behaviour gate: headless forgetty-server, local socket path + iroh path.
+# P0 behaviour gate: headless `forgetty server`, local socket path + iroh path.
 #
 # Exits 0 only if BOTH paths saw the expected output:
 #   1. Unix socket JSON-RPC: new_tab, send_input, subscribe_output
@@ -32,19 +32,18 @@ fi
 # Short path: unix socket paths are limited to ~108 bytes.
 STATE="$(mktemp -d /tmp/p0gate.XXXXXX)"
 SOCK="$STATE/run/forgetty.sock"
-LOG="$STATE/server.log"
-SERVER_PID=""
+fg() { "$BIN/forgetty" --state-dir "$STATE" "$@"; }
+PAIR_PID=""
 cleanup() {
-  [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null && wait "$SERVER_PID" 2>/dev/null
+  [ -n "$PAIR_PID" ] && kill "$PAIR_PID" 2>/dev/null
+  fg server stop >/dev/null 2>&1
   [ "${KEEP:-0}" = "1" ] || rm -rf "$STATE"
 }
 trap cleanup EXIT
 
 # Isolated identity for the QA client too (pair-test.key lives under XDG_DATA_HOME).
-export XDG_DATA_HOME="$STATE/client-data"
-mkdir -p "$XDG_DATA_HOME"
-
-SRV=("$BIN/forgetty-server" --state-dir "$STATE" --socket-path "$SOCK")
+CLIENT_DATA="$STATE/client-data"
+mkdir -p "$CLIENT_DATA"
 
 # Marker is built so the command echo ("p0-o\"k\"") differs from its output ("p0-ok").
 SEND='echo p0-o"k"'
@@ -54,24 +53,11 @@ EXPECT='p0-ok'
 IROH_SEND='echo p0-ir"oh"'
 IROH_EXPECT='p0-iroh'
 
-# NODE_ID comes from the same state dir (identity is generated on first use).
-NODE_ID="$(env SHELL=/bin/bash "${SRV[@]}" --show-pairing-qr 2>/dev/null | sed -n 's/^node_id: //p')"
-if [ -z "$NODE_ID" ]; then
-  echo "FAIL: could not read node_id" >&2
-  exit 1
-fi
+SHELL=/bin/bash fg server start || { echo "FAIL: server did not start"; exit 1; }
+LOG="$STATE/data/forgetty/server.log"
+NODE_ID="$(fg server status --json | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["node_id"])')"
+[ -n "$NODE_ID" ] || { echo "FAIL: could not read node_id" >&2; exit 1; }
 echo "node_id: $NODE_ID"
-
-# Server env must not see the client's XDG_DATA_HOME override; --state-dir sets its own.
-SHELL=/bin/bash "${SRV[@]}" --foreground --allow-pairing >"$LOG" 2>&1 &
-SERVER_PID=$!
-
-for _ in $(seq 1 100); do
-  [ -S "$SOCK" ] && break
-  kill -0 "$SERVER_PID" 2>/dev/null || { echo "FAIL: server exited early"; cat "$LOG"; exit 1; }
-  sleep 0.1
-done
-[ -S "$SOCK" ] || { echo "FAIL: socket never appeared"; cat "$LOG"; exit 1; }
 
 # ---------------------------------------------------------------- path 1: socket
 SOCKET_RESULT=0
@@ -140,6 +126,17 @@ PY
 
 # ---------------------------------------------------------------- path 2: iroh
 IROH_RESULT=0
+# AD-021: pairing needs the one-time secret from `forgetty pair`.
+pair_with_secret() {
+  fg pair >"$STATE/pair.out" 2>&1 &
+  PAIR_PID=$!
+  for _ in $(seq 1 50); do grep -q '^payload: ' "$STATE/pair.out" 2>/dev/null && break; sleep 0.1; done
+  local payload
+  payload="$(sed -n 's/^payload: //p' "$STATE/pair.out")"
+  XDG_DATA_HOME="$CLIENT_DATA" "$BIN/forgetty-pair-test" --payload "$payload" 2>&1 | tail -3
+  [ "${PIPESTATUS[0]}" = 0 ]
+}
+qa() { local tool="$1"; shift; XDG_DATA_HOME="$CLIENT_DATA" "$BIN/$tool" "$@"; }
 PANE_ID="$(cat "$PANE_FILE" 2>/dev/null || true)"
 if [ -z "$PANE_ID" ]; then
   echo "FAIL iroh: no pane id from socket path"
@@ -147,13 +144,13 @@ if [ -z "$PANE_ID" ]; then
 else
   {
     echo "--- pair"
-    "$BIN/forgetty-pair-test" --dial "$NODE_ID" 2>&1 | tail -3 \
+    pair_with_secret \
       && echo "--- list panes" \
-      && "$BIN/forgetty-stream-test" --dial "$NODE_ID" --list-panes 2>&1 | tee "$STATE/list.out" | tail -5 \
+      && qa forgetty-stream-test --dial "$NODE_ID" --list-panes 2>&1 | tee "$STATE/list.out" | tail -5 \
       && grep -q "$PANE_ID" "$STATE/list.out" \
       && echo "PASS iroh: pane $PANE_ID listed" \
       && echo "--- subscribe + send + expect" \
-      && "$BIN/forgetty-stream-test" --dial "$NODE_ID" --pane-id "$PANE_ID" \
+      && qa forgetty-stream-test --dial "$NODE_ID" --pane-id "$PANE_ID" \
            --send-line "$IROH_SEND" --expect "$IROH_EXPECT" --timeout-secs 40 2>&1 | tail -5
   } > "$STATE/iroh.out" 2>&1
   cat "$STATE/iroh.out"

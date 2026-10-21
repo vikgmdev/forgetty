@@ -7,8 +7,8 @@ set -euo pipefail
 # ────────────────────────────────────────────────────────────────────
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-BINARY="$SCRIPT_DIR/target/release/forgetty"
-DAEMON_BINARY="$SCRIPT_DIR/target/release/forgetty-server"
+BINARY="$SCRIPT_DIR/target/release/forgetty-gtk"
+DAEMON_BINARY="$SCRIPT_DIR/target/release/forgetty"
 
 # ── Colours (no-op when piped) ──────────────────────────────────────
 if [ -t 1 ]; then
@@ -33,7 +33,7 @@ if [ ! -f "$BINARY" ]; then
 fi
 
 if [ ! -f "$DAEMON_BINARY" ]; then
-    error "Build failed: forgetty-server binary not found at $DAEMON_BINARY"
+    error "Build failed: forgetty (server) binary not found at $DAEMON_BINARY"
     exit 1
 fi
 
@@ -70,11 +70,11 @@ fi
 info "Found shared library in: $SO_DIR"
 
 # ── Install binaries (requires sudo) ───────────────────────────────
-info "Installing binary to /usr/local/bin/forgetty"
-sudo install -Dm755 "$BINARY" /usr/local/bin/forgetty
+info "Installing binary to /usr/local/bin/forgetty-gtk"
+sudo install -Dm755 "$BINARY" /usr/local/bin/forgetty-gtk
 
-info "Installing daemon to /usr/local/bin/forgetty-server"
-sudo install -Dm755 "$DAEMON_BINARY" /usr/local/bin/forgetty-server
+info "Installing server and CLI to /usr/local/bin/forgetty"
+sudo install -Dm755 "$DAEMON_BINARY" /usr/local/bin/forgetty
 
 # ── Install shared library (requires sudo) ──────────────────────────
 info "Installing $SO_NAME to /usr/local/lib/"
@@ -106,8 +106,8 @@ gtk-update-icon-cache -f -t "$HOME/.local/share/icons/hicolor/" 2>/dev/null || t
 # ── Done ────────────────────────────────────────────────────────────
 printf "\n${BOLD}${GREEN}Forgetty installed successfully!${RESET}\n"
 echo ""
-echo "  Binary:   /usr/local/bin/forgetty"
-echo "  Daemon:   /usr/local/bin/forgetty-server"
+echo "  Binary:   /usr/local/bin/forgetty-gtk"
+echo "  Server:   /usr/local/bin/forgetty"
 echo "  Library:  /usr/local/lib/$SO_NAME"
 echo "  Desktop:  $DESKTOP_DST"
 echo "  Icon:     $ICON_DST"

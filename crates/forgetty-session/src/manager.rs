@@ -75,6 +75,8 @@ struct SessionManagerInner {
 #[derive(Clone)]
 pub struct SessionManager {
     inner: Arc<Mutex<SessionManagerInner>>,
+    /// Attached clients (AD-017). Shared by every clone.
+    clients: crate::clients::ClientRegistry,
 }
 
 impl SessionManager {
@@ -82,6 +84,7 @@ impl SessionManager {
     pub fn new() -> Self {
         let (event_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         Self {
+            clients: crate::clients::ClientRegistry::new(),
             inner: Arc::new(Mutex::new(SessionManagerInner {
                 panes: HashMap::new(),
                 pane_order: Vec::new(),
@@ -94,6 +97,11 @@ impl SessionManager {
                 byte_log_max_mb: 10,
             })),
         }
+    }
+
+    /// Registry of attached clients (iroh connections and streaming sockets).
+    pub fn clients(&self) -> &crate::clients::ClientRegistry {
+        &self.clients
     }
 
     /// Configure byte-log sizes for subsequently-created panes (V2-007).

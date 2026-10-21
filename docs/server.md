@@ -1,19 +1,19 @@
-# Forgetty server (headless)
+# Forgetty server and CLI
 
-`forgetty-server` is the durable per-user terminal server (AD-017). It needs no
-GTK, no display server and no `pkg-config`.
+`forgetty` is one binary. It is the durable per-user terminal server (AD-017)
+and its CLI. It needs no GTK, no display server and no `pkg-config`.
 
-## Build
+## Build and install
 
 ```sh
 cargo build --release -p forgetty-server
-install -Dm755 target/release/forgetty-server ~/.local/bin/forgetty-server
+install -Dm755 target/release/forgetty ~/.local/bin/forgetty
 ```
 
 The binary finds `libghostty-vt.so` through its RUNPATH (`$ORIGIN/lib`,
 `$ORIGIN`). Keep the `.so` next to the binary or under `~/.local/bin/lib`.
 
-## Install as a systemd user service
+## Run under systemd (user service)
 
 ```sh
 install -Dm644 dist/systemd/forgetty-server.service ~/.config/systemd/user/forgetty-server.service
@@ -30,33 +30,67 @@ systemctl --user status forgetty-server
 journalctl --user -u forgetty-server -f
 ```
 
-## Pair a device
+Without systemd: `forgetty server start` runs the server detached and logs to
+`~/.local/share/forgetty/server.log`.
 
-```sh
-forgetty-server --show-pairing-qr      # ASCII QR and node_id
-systemctl --user stop forgetty-server  # only if you need --allow-pairing
-forgetty-server --allow-pairing        # accepts the next unknown device
-forgetty-server --list-devices
-forgetty-server --revoke <DEVICE_ID>
+## What the server keeps
+
+- One server per user. A second `forgetty server run` exits with "already
+  running" (file lock `server-<id>.lock`).
+- The server id lives in `~/.local/share/forgetty/server_id`. The layout is in
+  `sessions/<id>.json`, byte logs in `logs/`. All survive a restart.
+- A client disconnect never ends a pane or the server. After a server restart
+  the layout is restored and byte logs are replayed into the panes. Processes
+  do not survive a restart (a restored pane starts a fresh shell).
+- Socket: `$XDG_RUNTIME_DIR/forgetty.sock`.
+
+## CLI
+
+```text
+forgetty server run                 foreground (what systemd runs)
+forgetty server start               start detached if not running
+forgetty server stop [--if-idle]    --if-idle refuses while a client is attached
+forgetty server status [--json]     pid, uptime, version, protocol, panes, clients, iroh node id
+forgetty ls [--json]
+forgetty new [--cwd DIR] [-- CMD...]            prints the pane id
+forgetty send -p PANE TEXT [--enter]
+forgetty send-key -p PANE KEY       enter tab esc ctrl+c up down left right
+forgetty client ls [--json]
+forgetty pair                       QR + payload, waits 60 s for one device
+forgetty devices [--json]
+forgetty revoke ID
 ```
 
-The one-time pairing secret (AD-021) is not implemented yet. Until it lands,
-run `--allow-pairing` only on a network you trust and only for the pairing
-window.
+`PANE` is a full id or a unique id suffix of 4+ characters.
 
-## Isolated instance
+Exit codes: 0 ok, 1 failed, 2 bad command line, 3 target not found or
+ambiguous, 4 server unreachable.
 
-`--state-dir <DIR>` keeps identity, paired devices, sessions, byte logs and the
-socket under `<DIR>` (`data/`, `config/`, `run/`). Use it for tests and
-throwaway instances.
+The CLI warns on stderr when the running server has another version than the
+CLI. Restart the server then.
 
-## Behaviour gate
+`--state-dir DIR` (any command) keeps data, config and the socket under `DIR`.
+Use it for tests and throwaway instances.
+
+## Pair a device (AD-021)
 
 ```sh
-scripts/p0_gate.sh
+forgetty pair
 ```
 
-Starts a server in a temp state dir, drives it over the local socket
-(`new_tab`, `send_input`, `subscribe_output`) and over iroh with the QA bins
-(pair, list panes, subscribe, send input). Exits 0 only if both paths see the
-expected echo. Needs outbound internet for iroh relay and discovery.
+This opens a 60 s window with a fresh 128-bit secret and prints the QR code and
+the payload text. One device can pair in the window. A wrong, expired or reused
+secret is refused. The server logs the device name and id. `forgetty devices`
+lists paired devices, `forgetty revoke ID` removes one.
+
+Old apps that dial `forgetty/pair/1` get an "upgrade the app" error.
+
+## Behaviour gates
+
+```sh
+scripts/p0_gate.sh   # local socket and iroh echo
+scripts/p1_gate.sh   # durability, pairing secret, restart, stop --if-idle
+```
+
+Both run a server in a temp state dir as the current user and need outbound
+internet for iroh relay and discovery.

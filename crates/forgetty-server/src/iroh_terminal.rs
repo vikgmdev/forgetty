@@ -336,6 +336,15 @@ pub async fn handle_terminal_stream(
 
     info!("stream: authorized device {device_id} connected");
 
+    // AD-017: this connection is an attached client until it ends. The guard
+    // drops on every exit path of this function.
+    let device_name = {
+        let reg = registry.lock().unwrap();
+        reg.list().iter().find(|d| d.device_id == device_id).map(|d| d.name.clone())
+    };
+    let _client =
+        sm.clients().register(device_id.clone(), "stream1", device_name.unwrap_or_default());
+
     // --- Accept bi-directional streams (one per operation) ---
     loop {
         let (send, recv) = match conn.accept_bi().await {

@@ -245,13 +245,13 @@ fn ensure_daemon(session_id: uuid::Uuid) -> Arc<DaemonClient> {
     // 2. Daemon not running — find the binary.
     let daemon_binary: Option<PathBuf> = std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join("forgetty-server")))
+        .and_then(|exe| exe.parent().map(|dir| dir.join("forgetty")))
         .filter(|p| p.exists())
         .or_else(|| {
             // PATH fallback
             std::env::var("PATH").ok().and_then(|path_var| {
                 path_var.split(':').find_map(|dir| {
-                    let p = PathBuf::from(dir).join("forgetty-server");
+                    let p = PathBuf::from(dir).join("forgetty");
                     if p.exists() {
                         Some(p)
                     } else {
@@ -263,15 +263,18 @@ fn ensure_daemon(session_id: uuid::Uuid) -> Arc<DaemonClient> {
 
     let Some(daemon_path) = daemon_binary else {
         tracing::error!(
-            "ensure_daemon: forgetty-server binary not found on PATH or alongside forgetty; cannot continue"
+            "ensure_daemon: forgetty binary not found on PATH or alongside forgetty-gtk; cannot continue"
         );
         std::process::exit(1);
     };
 
     // 3. Spawn the daemon with the session UUID (non-blocking).
+    // P1: the server is `forgetty server run` (single binary).
     match std::process::Command::new(&daemon_path)
-        .arg("--session-id")
+        .args(["server", "run", "--session-id"])
         .arg(session_id.to_string())
+        .arg("--socket-path")
+        .arg(&socket_path)
         .spawn()
     {
         Ok(child) => {

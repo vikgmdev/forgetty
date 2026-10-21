@@ -35,11 +35,8 @@ const DEFAULT_COLS: u16 = 80;
 /// `sync_endpoint` is `None` when the daemon was started without iroh support;
 /// sync-related methods return a graceful `METHOD_NOT_FOUND` in that case.
 ///
-/// `session_id` is threaded through so `handle_set_pinned` can durably write
-/// the pin state to `sessions/active/{uuid}.json` synchronously before
-/// returning OK (P-018 / AD-016, AC-14). `None` in test/legacy contexts where
-/// no `active/` file is needed; in that case the persistence write is
-/// skipped.
+/// `session_id` is the server's stable id (AD-017). `server_info` reports it.
+/// `None` in test/legacy contexts.
 pub fn dispatch(
     request: &Request,
     sm: Arc<SessionManager>,
@@ -70,13 +67,19 @@ pub fn dispatch(
         methods::SET_ACTIVE_PANE => handle_set_active_pane(request, &sm),
         // Split ratio + pinned session methods (B-002).
         methods::UPDATE_SPLIT_RATIOS => handle_update_split_ratios(request, &sm),
-        methods::SET_PINNED => handle_set_pinned(request, &sm, session_id),
-        methods::GET_PINNED => handle_get_pinned(request, &sm),
+        // AD-017: pinned/trash lifecycle is gone. Compat no-ops.
+        methods::SET_PINNED => handle_set_pinned(request),
+        methods::GET_PINNED => handle_get_pinned(request),
+        methods::SERVER_INFO => {
+            handle_server_info(request, &sm, sync_endpoint.as_deref(), session_id)
+        }
+        methods::LIST_CLIENTS => handle_list_clients(request, &sm),
+        methods::PAIR_OPEN => handle_pair_open(request, sync_endpoint.as_deref()),
+        methods::PAIR_STATUS => handle_pair_status(request, sync_endpoint.as_deref()),
         // Sync / pairing methods — require sync_endpoint.
         methods::LIST_DEVICES => handle_list_devices(request, sync_endpoint.as_deref()),
         methods::REVOKE_DEVICE => handle_revoke_device(request, sync_endpoint.as_deref()),
         methods::GET_PAIRING_INFO => handle_get_pairing_info(request, sync_endpoint.as_deref()),
-        methods::ENABLE_PAIRING => handle_enable_pairing(request, sync_endpoint.as_deref()),
         _ => Response::error(
             request.id.clone(),
             protocol::METHOD_NOT_FOUND,
@@ -804,45 +807,64 @@ fn handle_update_split_ratios(request: &Request, sm: &SessionManager) -> Respons
     Response::success(request.id.clone(), serde_json::json!({ "ok": true }))
 }
 
-fn handle_set_pinned(request: &Request, sm: &SessionManager, session_id: Option<Uuid>) -> Response {
-    let pinned = match request.params.get("pinned").and_then(|v| v.as_bool()) {
-        Some(b) => b,
-        None => {
-            return Response::error(
-                request.id.clone(),
-                protocol::INVALID_PARAMS,
-                "missing param: pinned (bool)".to_string(),
-            )
-        }
-    };
-    sm.set_pinned(pinned);
-
-    // P-018 / AD-016 (AC-14): persist the pin state to `active/{uuid}.json`
-    // synchronously before returning OK. A crash between this write and the
-    // next debounced save would otherwise lose the user's pin toggle, leading
-    // to an unpinned-orphan deletion on next launch.
-    //
-    // `session_id == None` in test/legacy contexts (e.g. unit tests that
-    // bypass the daemon's session-id wiring); skip persistence so the test
-    // path stays in-memory only.
-    if let Some(sid) = session_id {
-        let state = sm.snapshot_to_workspace_state();
-        if let Err(e) = forgetty_workspace::move_to_active(sid, &state) {
-            tracing::warn!("set_pinned: failed to persist active/{sid}.json: {e}");
-            return Response::error(
-                request.id.clone(),
-                protocol::INTERNAL_ERROR,
-                format!("failed to persist pinned state: {e}"),
-            );
-        }
-    }
-
+/// AD-017: the pinned/trash lifecycle no longer exists. Kept so old clients
+/// that still call `set_pinned` get `ok` instead of an error.
+fn handle_set_pinned(request: &Request) -> Response {
     Response::success(request.id.clone(), serde_json::json!({ "ok": true }))
 }
 
-fn handle_get_pinned(request: &Request, sm: &SessionManager) -> Response {
-    let pinned = sm.is_pinned();
-    Response::success(request.id.clone(), serde_json::json!({ "pinned": pinned }))
+/// AD-017 compat: every session is durable, so `pinned` is always `false`
+/// (the flag has no effect).
+fn handle_get_pinned(request: &Request) -> Response {
+    Response::success(request.id.clone(), serde_json::json!({ "pinned": false }))
+}
+
+static STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// Record the server start time. Call once, early. Later calls are no-ops.
+pub fn mark_started() {
+    let _ = STARTED.get_or_init(std::time::Instant::now);
+}
+
+fn handle_server_info(
+    request: &Request,
+    sm: &SessionManager,
+    se: Option<&SyncEndpoint>,
+    session_id: Option<Uuid>,
+) -> Response {
+    let uptime = STARTED.get_or_init(std::time::Instant::now).elapsed().as_secs();
+    Response::success(
+        request.id.clone(),
+        serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "proto_major": protocol::PROTO_MAJOR,
+            "proto_minor": protocol::PROTO_MINOR,
+            "proto_version": format!("{}.{}", protocol::PROTO_MAJOR, protocol::PROTO_MINOR),
+            "server_id": session_id.map(|u| u.to_string()),
+            "pid": std::process::id(),
+            "uptime_secs": uptime,
+            "panes": sm.list_panes().len(),
+            "clients": sm.clients().count(),
+            "node_id": se.map(|e| e.node_id().to_string()),
+        }),
+    )
+}
+
+fn handle_list_clients(request: &Request, sm: &SessionManager) -> Response {
+    let clients: Vec<serde_json::Value> = sm
+        .clients()
+        .list()
+        .into_iter()
+        .map(|c| {
+            serde_json::json!({
+                "client_id": c.client_id,
+                "client_kind": c.client_kind,
+                "client_name": c.client_name,
+                "connected_at": c.connected_at,
+            })
+        })
+        .collect();
+    Response::success(request.id.clone(), serde_json::json!({ "clients": clients }))
 }
 
 fn handle_split_pane(request: &Request, sm: &SessionManager) -> Response {
@@ -1170,7 +1192,7 @@ fn sync_unavailable(request: &Request) -> Response {
     Response::error(
         request.id.clone(),
         protocol::METHOD_NOT_FOUND,
-        "sync endpoint not available (daemon started without --allow-pairing?)".to_string(),
+        "sync endpoint not available (iroh failed to bind)".to_string(),
     )
 }
 
@@ -1227,11 +1249,45 @@ fn handle_revoke_device(request: &Request, se: Option<&SyncEndpoint>) -> Respons
     }
 }
 
-fn handle_enable_pairing(request: &Request, se: Option<&SyncEndpoint>) -> Response {
+fn handle_pair_open(request: &Request, se: Option<&SyncEndpoint>) -> Response {
     let Some(se) = se else { return sync_unavailable(request) };
-    let secs = request.params.get("secs").and_then(|v| v.as_u64()).unwrap_or(120);
-    se.enable_pairing(secs);
-    Response::success(request.id.clone(), serde_json::json!({ "ok": true, "secs": secs }))
+    let ttl = request
+        .params
+        .get("ttl_secs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(forgetty_sync::PAIRING_WINDOW_SECS)
+        .clamp(1, 600);
+    let window = se.open_pairing(std::time::Duration::from_secs(ttl));
+    let payload = forgetty_sync::QrPayload::new(se.node_id().to_string(), window.secret.clone());
+    Response::success(
+        request.id.clone(),
+        serde_json::json!({
+            "window_id": window.id,
+            "ttl_secs": window.ttl_secs,
+            "payload": payload,
+        }),
+    )
+}
+
+fn handle_pair_status(request: &Request, se: Option<&SyncEndpoint>) -> Response {
+    let Some(se) = se else { return sync_unavailable(request) };
+    let Some(id) = request.params.get("window_id").and_then(|v| v.as_u64()) else {
+        return Response::error(
+            request.id.clone(),
+            protocol::INVALID_PARAMS,
+            "missing param: window_id".to_string(),
+        );
+    };
+    let result = match se.pairing_status(id) {
+        forgetty_sync::PairStatus::Open { secs_left } => {
+            serde_json::json!({ "state": "open", "secs_left": secs_left })
+        }
+        forgetty_sync::PairStatus::Paired { device_id, name } => {
+            serde_json::json!({ "state": "paired", "device_id": device_id, "name": name })
+        }
+        forgetty_sync::PairStatus::Expired => serde_json::json!({ "state": "expired" }),
+    };
+    Response::success(request.id.clone(), result)
 }
 
 fn handle_get_pairing_info(request: &Request, se: Option<&SyncEndpoint>) -> Response {
@@ -1242,7 +1298,10 @@ fn handle_get_pairing_info(request: &Request, se: Option<&SyncEndpoint>) -> Resp
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "unknown".to_string());
 
-    let payload = forgetty_sync::QrPayload::new(node_id.clone());
+    // AD-021: the QR carries a one-time secret, so showing it opens a window.
+    let window =
+        se.open_pairing(std::time::Duration::from_secs(forgetty_sync::PAIRING_WINDOW_SECS));
+    let payload = forgetty_sync::QrPayload::new(node_id.clone(), window.secret);
     let png_bytes = match forgetty_sync::qr::qr_to_png(&payload, 8) {
         Ok(b) => b,
         Err(e) => {
@@ -2071,92 +2130,62 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // P-018 / AD-016: handle_set_pinned persists to active/{uuid}.json
+    // AD-017: pinned compat no-ops, server_info, list_clients
     // -----------------------------------------------------------------------
 
-    /// Serialize XDG_DATA_HOME-mutating tests for handle_set_pinned.
-    fn xdg_lock_handlers() -> &'static std::sync::Mutex<()> {
-        use std::sync::OnceLock;
-        static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    fn req(method: &str, params: serde_json::Value) -> Request {
+        Request {
+            jsonrpc: "2.0".to_string(),
+            method: method.to_string(),
+            params,
+            id: Some(serde_json::json!(1)),
+        }
     }
 
     #[test]
-    fn p018_set_pinned_persists_to_active_when_session_id_present() {
-        let lock = xdg_lock_handlers().lock().unwrap_or_else(|e| e.into_inner());
-        let prior = std::env::var_os("XDG_DATA_HOME");
-        let tmp = tempfile::tempdir().unwrap();
-        // SAFETY: serialized by xdg_lock_handlers; this test is the sole
-        // mutator within the socket crate.
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", tmp.path());
+    fn set_pinned_is_a_noop_that_returns_ok() {
+        let sm = make_sm();
+        for params in [serde_json::json!({ "pinned": true }), serde_json::json!({})] {
+            let resp = dispatch(&req("set_pinned", params), Arc::clone(&sm), None, None);
+            assert!(resp.error.is_none());
+            assert_eq!(resp.result.unwrap()["ok"], true);
         }
+        assert!(!sm.is_pinned(), "set_pinned must not change state");
+        let resp = dispatch(&req("get_pinned", serde_json::json!({})), sm, None, None);
+        assert_eq!(resp.result.unwrap()["pinned"], false);
+    }
 
+    #[test]
+    fn server_info_reports_version_proto_and_counts() {
+        let sm = make_sm();
         let sid = Uuid::new_v4();
-        let sm = make_sm();
-
-        // Initial state: pinned=false (default in WorkspaceState).
-        let req = Request {
-            jsonrpc: "2.0".to_string(),
-            method: "set_pinned".to_string(),
-            params: serde_json::json!({ "pinned": true }),
-            id: Some(serde_json::json!(1)),
-        };
-
-        let resp = dispatch(&req, Arc::clone(&sm), None, Some(sid));
-        assert!(resp.error.is_none(), "set_pinned should succeed: {:?}", resp.error);
-        assert!(resp.result.is_some());
-
-        // Verify file exists at active/{sid}.json with pinned: true.
-        let active_path = forgetty_workspace::session_path_active_for(sid);
-        assert!(active_path.exists(), "active/{sid}.json must be written synchronously");
-        let contents = std::fs::read_to_string(&active_path).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&contents).unwrap();
-        assert_eq!(
-            v.get("pinned").and_then(|p| p.as_bool()),
-            Some(true),
-            "persisted file must reflect pinned=true"
-        );
-
-        // Restore env.
-        unsafe {
-            if let Some(p) = prior {
-                std::env::set_var("XDG_DATA_HOME", p);
-            } else {
-                std::env::remove_var("XDG_DATA_HOME");
-            }
-        }
-        drop(lock);
+        let _guard = sm.clients().register("c1", "socket", "test");
+        let resp = dispatch(&req("server_info", serde_json::Value::Null), sm, None, Some(sid));
+        let v = resp.result.expect("server_info result");
+        assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(v["proto_major"], protocol::PROTO_MAJOR);
+        assert_eq!(v["server_id"], sid.to_string());
+        assert_eq!(v["pid"], std::process::id());
+        assert_eq!(v["panes"], 0);
+        assert_eq!(v["clients"], 1);
+        assert!(v["node_id"].is_null());
     }
 
     #[test]
-    fn p018_set_pinned_skips_persistence_when_session_id_none() {
-        // Without session_id (test/legacy contexts) the handler must still
-        // succeed but skip the file write.
+    fn list_clients_returns_registered_clients() {
         let sm = make_sm();
-        let req = Request {
-            jsonrpc: "2.0".to_string(),
-            method: "set_pinned".to_string(),
-            params: serde_json::json!({ "pinned": true }),
-            id: Some(serde_json::json!(1)),
-        };
-        let resp = dispatch(&req, Arc::clone(&sm), None, None);
-        assert!(resp.error.is_none(), "set_pinned with None session_id must succeed");
-        // In-memory state was updated.
-        assert!(sm.is_pinned());
+        let _a = sm.clients().register("dev-1", "stream1", "phone");
+        let resp = dispatch(&req("list_clients", serde_json::Value::Null), sm, None, None);
+        let clients = resp.result.unwrap()["clients"].as_array().unwrap().clone();
+        assert_eq!(clients.len(), 1);
+        assert_eq!(clients[0]["client_name"], "phone");
+        assert_eq!(clients[0]["client_kind"], "stream1");
     }
 
     #[test]
-    fn p018_set_pinned_missing_param_returns_invalid_params() {
+    fn pair_methods_need_the_sync_endpoint() {
         let sm = make_sm();
-        let req = Request {
-            jsonrpc: "2.0".to_string(),
-            method: "set_pinned".to_string(),
-            params: serde_json::json!({}),
-            id: Some(serde_json::json!(1)),
-        };
-        let resp = dispatch(&req, sm, None, Some(Uuid::new_v4()));
+        let resp = dispatch(&req("pair_open", serde_json::Value::Null), sm, None, None);
         assert!(resp.error.is_some());
-        assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
     }
 }

@@ -18,6 +18,7 @@
 //! - [`workspace`] — `WorkspaceLayout` types and `build_workspace_state()`
 
 pub mod byte_log;
+pub mod clients;
 pub mod drain_result;
 pub mod events;
 pub mod layout;
@@ -28,6 +29,7 @@ pub mod workspace;
 
 // Convenient top-level re-exports for downstream crates.
 pub use byte_log::ByteLog;
+pub use clients::{ClientGuard, ClientInfo, ClientRegistry};
 pub use drain_result::DrainResult;
 pub use events::SessionEvent;
 pub use layout::{SessionLayout, SessionTab, SessionWorkspace};

@@ -17,7 +17,7 @@ members = [
 # V3 (AD-022): the GTK client is paused. Default members exclude the root
 # `forgetty` GTK package and `forgetty-gtk`, so plain `cargo build/test/clippy`
 # needs no GTK/pkg-config. Build the GTK app explicitly with
-# `cargo build -p forgetty -p forgetty-gtk`.
+# `cargo build -p forgetty -p forgetty-server` (bin `forgetty-gtk`).
 default-members = [
     "crates/forgetty-core",
     "crates/forgetty-vt",
@@ -70,11 +70,12 @@ edition.workspace = true
 license.workspace = true
 description.workspace = true
 build = "build.rs"
-default-run = "forgetty"
+default-run = "forgetty-gtk"
 
-# GTK client (paused, AD-022). The headless server lives in crates/forgetty-server.
+# GTK client (paused, AD-022). The server and CLI (`forgetty`) live in
+# crates/forgetty-server.
 [[bin]]
-name = "forgetty"
+name = "forgetty-gtk"
 path = "src/main.rs"
 
 [dependencies]

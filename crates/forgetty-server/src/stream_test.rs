@@ -40,10 +40,9 @@ use std::time::Duration;
 
 use clap::Parser;
 use iroh::{endpoint::presets, Endpoint, EndpointAddr, SecretKey};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::AsyncWriteExt;
 
 use forgetty_server::iroh_terminal::{ClientMsg, DaemonMsg, FORGETTY_STREAM_ALPN};
-use forgetty_sync::FORGETTY_PAIRING_ALPN;
 
 /// Maximum frame size accepted from the daemon (must match the
 /// `MAX_FRAME_SIZE` constant in `forgetty_server::iroh_terminal`).
@@ -80,10 +79,27 @@ struct Args {
     #[arg(long)]
     stress: bool,
 
-    /// First pair this identity with the daemon (like `forgetty-pair-test`),
-    /// then connect for streaming. Useful when the identity hasn't been paired yet.
+    /// First pair this identity with the server (like `forgetty-pair-test`),
+    /// then connect for streaming. Needs `--secret` or `--payload`.
     #[arg(long)]
     pair_first: bool,
+
+    /// Pairing secret for `--pair-first`.
+    #[arg(long)]
+    secret: Option<String>,
+
+    /// Payload JSON from `forgetty pair`, an alternative to `--secret`.
+    #[arg(long)]
+    payload: Option<String>,
+
+    /// Identity key file (default `<data dir>/forgetty/pair-test.key`).
+    #[arg(long)]
+    identity: Option<PathBuf>,
+
+    /// Stay attached for this many seconds after subscribing, then exit 0.
+    /// Used to simulate a client that attaches and later leaves.
+    #[arg(long)]
+    hold_secs: Option<u64>,
 
     /// In non-stress mode, exit after this many `PtyBytes` messages have been
     /// observed. Default 5 preserves the historical "PASS: received N PtyBytes
@@ -131,7 +147,7 @@ async fn run() -> anyhow::Result<()> {
 
     // Load or generate identity. We reuse the pair-test.key so the same device_id
     // is recognized without needing a separate pairing step when already paired.
-    let secret_key = load_or_generate_key()?;
+    let secret_key = load_or_generate_key(args.identity.clone())?;
 
     // Bind the client endpoint (no ALPNs needed on dialing side).
     let ep = Endpoint::builder(presets::N0)
@@ -143,7 +159,15 @@ async fn run() -> anyhow::Result<()> {
     // Optionally pair first.
     if args.pair_first {
         eprintln!("stream-test: pairing first with --pair-first ...");
-        pair_with_daemon(&ep, endpoint_id).await?;
+        let secret = match (&args.payload, &args.secret) {
+            (Some(json), _) => serde_json::from_str::<serde_json::Value>(json)?["secret"]
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| anyhow::anyhow!("payload has no secret"))?,
+            (None, Some(s)) => s.clone(),
+            (None, None) => anyhow::bail!("--pair-first needs --secret or --payload"),
+        };
+        pair_with_daemon(&ep, endpoint_id, &secret).await?;
         eprintln!("stream-test: paired ok, now connecting for streaming");
     }
 
@@ -203,7 +227,17 @@ async fn run() -> anyhow::Result<()> {
 
     loop {
         // Read frame length.
-        let msg = if args.expect.is_some() {
+        let msg = if let Some(hold) = args.hold_secs {
+            let left = (start + Duration::from_secs(hold))
+                .saturating_duration_since(std::time::Instant::now());
+            match tokio::time::timeout(left, read_frame(&mut recv)).await {
+                Ok(m) => m?,
+                Err(_) => {
+                    println!("PASS: held attachment for {hold}s");
+                    break;
+                }
+            }
+        } else if args.expect.is_some() {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             match tokio::time::timeout(left, read_frame(&mut recv)).await {
                 Ok(m) => m?,
@@ -237,7 +271,7 @@ async fn run() -> anyhow::Result<()> {
                     seen.push_str(line);
                     seen.push('\n');
                 }
-                if !args.stress && args.expect.is_none() {
+                if !args.stress && args.expect.is_none() && args.hold_secs.is_none() {
                     // In non-stress mode, one snapshot is enough for validation.
                     println!("PASS: FullSnapshot received ({}x{})", rows, cols);
                 }
@@ -264,13 +298,17 @@ async fn run() -> anyhow::Result<()> {
                         );
                         last_report = std::time::Instant::now();
                     }
-                } else if msg_count == 1 && args.expect.is_none() {
+                } else if msg_count == 1 && args.expect.is_none() && args.hold_secs.is_none() {
                     println!("PASS: first PtyBytes received ({} bytes)", data.len());
                 }
 
                 // In non-stress mode, exit after receiving the configured
                 // number of PtyBytes messages (default 5; typometer passes 1).
-                if !args.stress && args.expect.is_none() && msg_count >= args.max_msgs {
+                if !args.stress
+                    && args.expect.is_none()
+                    && args.hold_secs.is_none()
+                    && msg_count >= args.max_msgs
+                {
                     println!("PASS: received {} PtyBytes messages", msg_count);
                     break;
                 }
@@ -361,46 +399,26 @@ async fn read_frame(recv: &mut iroh::endpoint::RecvStream) -> anyhow::Result<Dae
         .map_err(|e| anyhow::anyhow!("failed to deserialize DaemonMsg: {e}"))
 }
 
-/// Pair this identity with the daemon using the `forgetty/pair/1` ALPN.
-/// Mirrors the pair_test.rs logic.
-async fn pair_with_daemon(ep: &Endpoint, endpoint_id: iroh::EndpointId) -> anyhow::Result<()> {
-    let addr = EndpointAddr::from(endpoint_id);
-    let conn = ep
-        .connect(addr, FORGETTY_PAIRING_ALPN)
-        .await
-        .map_err(|e| anyhow::anyhow!("pairing connect failed: {e}"))?;
-
-    // Daemon opens bi-stream and sends greeting line.
-    // Exception: known devices get an immediate close with code 0 ("connected-ok")
-    // without a bi-stream — that means we're already paired, treat as success.
-    let (mut send, mut recv) = match conn.accept_bi().await {
-        Ok(s) => s,
-        Err(e) => {
-            if e.to_string().contains("connected-ok") {
-                eprintln!("stream-test [pair]: already paired (daemon closed with connected-ok)");
-                return Ok(());
-            }
-            return Err(anyhow::anyhow!("accept_bi for pairing failed: {e}"));
-        }
-    };
-
-    let mut lines = BufReader::new(&mut recv).lines();
-    let greeting = lines
-        .next_line()
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("daemon closed stream without greeting"))?;
-    eprintln!("stream-test [pair]: greeting: {greeting}");
-
-    // Send device name.
-    let response = serde_json::json!({ "v": 1, "name": "stream-test-device" });
-    let mut response_line = serde_json::to_string(&response)?;
-    response_line.push('\n');
-    send.write_all(response_line.as_bytes()).await?;
-    send.flush().await?;
-
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    conn.close(0u8.into(), b"paired");
-    Ok(())
+/// Pair with the server on `forgetty/pair/2` (AD-021).
+async fn pair_with_daemon(
+    ep: &Endpoint,
+    endpoint_id: iroh::EndpointId,
+    secret: &str,
+) -> anyhow::Result<()> {
+    let result = forgetty_sync::pairing::request_pairing(
+        ep,
+        EndpointAddr::from(endpoint_id),
+        secret,
+        "stream-test-device",
+        "cli",
+    )
+    .await?;
+    if result.ok {
+        Ok(())
+    } else {
+        println!("pair refused: {}", result.reason.as_deref().unwrap_or("unknown"));
+        anyhow::bail!("pairing refused: {}", result.reason.as_deref().unwrap_or("unknown"))
+    }
 }
 
 /// Load or generate the stream-test key from
@@ -408,11 +426,13 @@ async fn pair_with_daemon(ep: &Endpoint, endpoint_id: iroh::EndpointId) -> anyho
 ///
 /// Reuses `pair-test.key` so that a device paired via `forgetty-pair-test`
 /// is also recognized by `forgetty-stream-test` without a separate pairing step.
-fn load_or_generate_key() -> anyhow::Result<SecretKey> {
-    let path: PathBuf = dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("~/.local/share"))
-        .join("forgetty")
-        .join("pair-test.key");
+fn load_or_generate_key(path: Option<PathBuf>) -> anyhow::Result<SecretKey> {
+    let path: PathBuf = path.unwrap_or_else(|| {
+        dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("~/.local/share"))
+            .join("forgetty")
+            .join("pair-test.key")
+    });
 
     if path.exists() {
         let bytes = std::fs::read(&path)?;

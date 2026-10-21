@@ -18,4 +18,4 @@ pub mod server;
 
 pub use handlers::dispatch;
 pub use protocol::{Request, Response};
-pub use server::SocketServer;
+pub use server::{graceful_exit, save_layout, SocketServer};

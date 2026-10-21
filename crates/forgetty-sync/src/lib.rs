@@ -21,7 +21,12 @@ pub mod registry;
 
 pub use endpoint::{
     AlpnHandler, SyncEndpoint, SyncEndpointBuilder, SyncEvent, FORGETTY_PAIRING_ALPN,
+    FORGETTY_PAIRING_ALPN_V1,
 };
 pub use identity::load_or_generate;
+pub use pairing::{
+    OpenedWindow, PairFailure, PairRequest, PairResult, PairStatus, PairingState,
+    PAIRING_WINDOW_SECS,
+};
 pub use qr::QrPayload;
 pub use registry::{DeviceEntry, DeviceRegistry};

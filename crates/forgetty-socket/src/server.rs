@@ -158,7 +158,9 @@ impl SocketServer {
         let listener = UnixListener::bind(&self.socket_path)?;
         info!("Socket server listening on {:?}", self.socket_path);
 
+        handlers::mark_started();
         let session_id = self.session_id;
+        let socket_path = self.socket_path.clone();
         // Shared live-connection counter, used by `is_attached` to tell
         // "daemon orphaned after V2-005 disconnect" from "daemon actively
         // serving a GUI". One counter per server; incremented per spawned
@@ -171,10 +173,18 @@ impl SocketServer {
                     let sm = Arc::clone(&sm);
                     let se = sync_endpoint.as_ref().map(Arc::clone);
                     let counter = Arc::clone(&conn_counter);
+                    let socket_path = socket_path.clone();
                     tokio::spawn(async move {
                         let _guard = ConnGuard::new(Arc::clone(&counter));
-                        if let Err(e) =
-                            handle_streaming_connection(stream, sm, se, session_id, counter).await
+                        if let Err(e) = handle_streaming_connection(
+                            stream,
+                            sm,
+                            se,
+                            session_id,
+                            counter,
+                            socket_path,
+                        )
+                        .await
                         {
                             warn!("Connection error: {e}");
                         }
@@ -259,6 +269,7 @@ async fn handle_streaming_connection(
     sync_endpoint: Option<Arc<SyncEndpoint>>,
     session_id: Option<uuid::Uuid>,
     conn_counter: Arc<AtomicUsize>,
+    socket_path: PathBuf,
 ) -> std::io::Result<()> {
     let (reader, mut writer) = stream.into_split();
     // V2-007 fix cycle 3: hold `BufReader<OwnedReadHalf>` as a reusable
@@ -361,6 +372,12 @@ async fn handle_streaming_connection(
             // unnecessary. See V2-007 BUILDER_NOTES §"Fix cycle 6".
             // ---------------------------------------------------------------
             let (mut rx, replay_bytes, _replay_hwm) = sm.subscribe_with_snapshot(pane_id);
+            // AD-017: a streaming socket is an attached client until it closes.
+            let _client = sm.clients().register(
+                uuid::Uuid::new_v4().to_string(),
+                "socket",
+                format!("subscribe_output {pane_id}"),
+            );
 
             // Send the initial acknowledgment (last line-mode JSON response
             // on this connection).
@@ -463,6 +480,11 @@ async fn handle_streaming_connection(
             // Reuse the same broadcast channel as subscribe_output; we filter
             // to layout variants in the loop below.
             let mut rx = sm.subscribe_output();
+            let _client = sm.clients().register(
+                uuid::Uuid::new_v4().to_string(),
+                "socket",
+                "subscribe_layout".to_string(),
+            );
 
             // Send the initial acknowledgment.
             let ack = Response::success(request.id.clone(), serde_json::json!({ "ok": true }));
@@ -806,33 +828,35 @@ async fn handle_streaming_connection(
             request.method.as_str(),
             methods::SHUTDOWN_SAVE | methods::SHUTDOWN_CLEAN | methods::DISCONNECT
         ) {
-            let caller: &'static str = match request.method.as_str() {
-                methods::SHUTDOWN_SAVE => "shutdown_save",
-                methods::SHUTDOWN_CLEAN => "shutdown_clean",
-                _ => "disconnect",
-            };
-            info!("Received {caller} RPC — pinned-aware close, exiting");
+            // AD-017: a client leaving never ends the server. These legacy
+            // methods now only make the state durable.
             sm.flush_all_byte_logs().await;
-            info!("{caller}: byte logs flushed");
             if let Some(sid) = session_id {
-                let state = sm.snapshot_to_workspace_state();
-                if let Err(e) = forgetty_workspace::move_to_active(sid, &state) {
-                    warn!("{caller}: failed to refresh active/{sid}.json: {e}");
-                }
-                forgetty_workspace::pinned_aware_exit_move(sid, sm.is_pinned(), caller);
+                save_layout(&sm, sid);
             }
-            // Ack only after the file move has committed.
             let resp = Response::success(request.id.clone(), serde_json::json!({ "ok": true }));
             write_response(&mut writer, &resp).await?;
-            std::process::exit(0);
+            continue;
         }
 
         if request.method == methods::SHUTDOWN {
-            // Acknowledge before exiting so the client doesn't see a broken pipe.
+            let if_idle = request.params.get("if_idle").and_then(|v| v.as_bool()).unwrap_or(false);
+            if if_idle {
+                let attached = sm.clients().count();
+                if attached > 0 {
+                    let resp = Response::error(
+                        request.id.clone(),
+                        crate::protocol::SERVER_BUSY,
+                        format!("{attached} client(s) attached"),
+                    );
+                    write_response(&mut writer, &resp).await?;
+                    continue;
+                }
+            }
             let resp = Response::success(request.id, serde_json::json!({ "ok": true }));
             write_response(&mut writer, &resp).await?;
-            info!("Received shutdown RPC — exiting daemon");
-            std::process::exit(0);
+            info!("Received shutdown RPC, stopping server");
+            graceful_exit(&sm, sync_endpoint.as_deref(), session_id, &socket_path).await;
         }
 
         if request.method == methods::IS_ATTACHED {
@@ -871,6 +895,39 @@ async fn handle_streaming_connection(
 }
 
 /// Serialize and write a JSON-RPC response as a newline-terminated line.
+/// Write the layout to `sessions/{server_id}.json` (AD-017). Failures are logged.
+pub fn save_layout(sm: &SessionManager, session_id: uuid::Uuid) {
+    let state = sm.snapshot_to_workspace_state();
+    if let Err(e) = forgetty_workspace::save_session_for(session_id, &state) {
+        warn!("failed to save session layout: {e}");
+    }
+}
+
+/// Make state durable and exit the process.
+///
+/// Order matters: flush the byte logs, save the layout, close the iroh
+/// endpoint, remove the socket file, exit. PTYs are not killed explicitly.
+/// Killing them would make the drain tasks close panes and rewrite the layout
+/// file as empty. When the process exits the PTY masters close and the shells
+/// get SIGHUP.
+pub async fn graceful_exit(
+    sm: &SessionManager,
+    sync_endpoint: Option<&SyncEndpoint>,
+    session_id: Option<uuid::Uuid>,
+    socket_path: &Path,
+) -> ! {
+    sm.flush_all_byte_logs().await;
+    info!("byte logs flushed");
+    if let Some(sid) = session_id {
+        save_layout(sm, sid);
+    }
+    if let Some(se) = sync_endpoint {
+        se.close().await;
+    }
+    let _ = std::fs::remove_file(socket_path);
+    std::process::exit(0);
+}
+
 async fn write_response(
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     response: &Response,

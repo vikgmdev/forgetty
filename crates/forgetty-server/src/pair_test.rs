@@ -1,39 +1,45 @@
-//! `forgetty-pair-test` — minimal iroh dialer for manual QA testing.
+//! `forgetty-pair-test`: minimal iroh pairing client for QA without a phone.
 //!
-//! Connects to a running `forgetty-server --allow-pairing` instance and
-//! completes the pairing handshake. Used to test AC-6 and AC-14 without
-//! an Android device.
-//!
-//! # Usage
+//! Pairs this machine's QA identity with a running server on ALPN
+//! `forgetty/pair/2` (AD-021). The secret comes from the `payload:` line that
+//! `forgetty pair` prints.
 //!
 //! ```text
-//! # Start daemon with pairing enabled:
-//! forgetty-server --foreground --allow-pairing &
-//!
-//! # Get node_id from daemon output or:
-//! forgetty-server --show-pairing-qr
-//!
-//! # Dial and pair:
-//! forgetty-pair-test --dial <node_id>
+//! forgetty pair                       # prints: payload: {"v":2,"node_id":...,"secret":...}
+//! forgetty-pair-test --payload '<that json>'
+//! forgetty-pair-test --dial <node_id> --secret <secret>
 //! ```
+//!
+//! Exit 0 when paired, 1 when the server refused (the reason is printed).
 
 use std::path::PathBuf;
 
 use clap::Parser;
 use iroh::{endpoint::presets, Endpoint, EndpointAddr, SecretKey};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-
-const FORGETTY_PAIRING_ALPN: &[u8] = b"forgetty/pair/1";
 
 #[derive(Parser, Debug)]
 #[command(name = "forgetty-pair-test")]
 #[command(about = "Minimal iroh pairing test client for QA without an Android device")]
 struct Args {
-    /// The node ID (iroh EndpointId) of the daemon to pair with.
-    ///
-    /// Obtain by running: `forgetty-server --show-pairing-qr`
+    /// Payload JSON from `forgetty pair` (gives node id and secret).
     #[arg(long)]
-    dial: String,
+    payload: Option<String>,
+
+    /// Node id of the server. Needed unless `--payload` is given.
+    #[arg(long)]
+    dial: Option<String>,
+
+    /// Pairing secret. Needed unless `--payload` is given.
+    #[arg(long)]
+    secret: Option<String>,
+
+    /// Device name to register.
+    #[arg(long, default_value = "pair-test-device")]
+    name: String,
+
+    /// Identity key file (default `<data dir>/forgetty/pair-test.key`).
+    #[arg(long)]
+    identity: Option<PathBuf>,
 }
 
 fn main() {
@@ -43,93 +49,86 @@ fn main() {
         .build()
         .expect("failed to build tokio runtime");
 
-    if let Err(e) = runtime.block_on(run()) {
-        eprintln!("pair-test error: {e}");
-        std::process::exit(1);
+    match runtime.block_on(run()) {
+        Ok(true) => {}
+        Ok(false) => std::process::exit(1),
+        Err(e) => {
+            eprintln!("pair-test error: {e}");
+            std::process::exit(1);
+        }
     }
 }
 
-async fn run() -> anyhow::Result<()> {
+async fn run() -> anyhow::Result<bool> {
     let args = Args::parse();
 
-    // Parse the node_id string into an EndpointId (PublicKey), then wrap in
-    // EndpointAddr. iroh 0.97: PublicKey implements FromStr (base32).
-    let endpoint_id: iroh::EndpointId =
-        args.dial.parse().map_err(|e| anyhow::anyhow!("invalid node_id '{}': {e}", args.dial))?;
-    let addr: EndpointAddr = EndpointAddr::from(endpoint_id);
+    let (node_id, secret) = match &args.payload {
+        Some(json) => {
+            let v: serde_json::Value = serde_json::from_str(json)?;
+            let node =
+                v["node_id"].as_str().ok_or_else(|| anyhow::anyhow!("payload has no node_id"))?;
+            let secret =
+                v["secret"].as_str().ok_or_else(|| anyhow::anyhow!("payload has no secret"))?;
+            (node.to_string(), secret.to_string())
+        }
+        None => (
+            args.dial.clone().ok_or_else(|| anyhow::anyhow!("--dial or --payload is required"))?,
+            args.secret
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("--secret or --payload is required"))?,
+        ),
+    };
 
-    // Load or generate a persistent identity so the same device_id is used
-    // across runs, enabling "known device reconnects without re-pairing" (AC-9).
-    let secret_key = load_or_generate_pair_test_key()?;
+    let endpoint_id: iroh::EndpointId =
+        node_id.parse().map_err(|e| anyhow::anyhow!("invalid node_id '{node_id}': {e}"))?;
+
+    let secret_key = load_or_generate_key(args.identity)?;
     let ep = Endpoint::builder(presets::N0)
         .secret_key(secret_key)
         .bind()
         .await
         .map_err(|e| anyhow::anyhow!("failed to bind client endpoint: {e}"))?;
 
-    eprintln!("pair-test: dialing {}", args.dial);
-
-    // Connect to the daemon.
-    let conn = ep
-        .connect(addr, FORGETTY_PAIRING_ALPN)
-        .await
-        .map_err(|e| anyhow::anyhow!("connect failed: {e}"))?;
-
-    eprintln!("pair-test: connected, remote_id={}", conn.remote_id());
-
-    // The daemon opens a bi-directional stream and sends a greeting line.
-    let (mut send, mut recv) =
-        conn.accept_bi().await.map_err(|e| anyhow::anyhow!("accept_bi failed: {e}"))?;
-
-    // Read the daemon's greeting: {"v":1,"status":"ok","machine":"<hostname>"}
-    let mut lines = BufReader::new(&mut recv).lines();
-    let greeting_line = lines
-        .next_line()
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("daemon closed stream without greeting"))?;
-    eprintln!("pair-test: greeting: {greeting_line}");
-
-    // Send back our device name.
-    let response = serde_json::json!({ "v": 1, "name": "pair-test-device" });
-    let mut response_line = serde_json::to_string(&response)?;
-    response_line.push('\n');
-    send.write_all(response_line.as_bytes()).await?;
-    send.flush().await?;
-
-    // Wait for stream to close (daemon closes after pairing).
-    drop(lines);
-    // Give daemon time to process and close.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-    println!("paired ok");
-
-    conn.close(0u8.into(), b"done");
+    eprintln!("pair-test: dialing {node_id} on forgetty/pair/2");
+    let result = forgetty_sync::pairing::request_pairing(
+        &ep,
+        EndpointAddr::from(endpoint_id),
+        &secret,
+        &args.name,
+        "cli",
+    )
+    .await;
     ep.close().await;
-    Ok(())
+
+    let result = result?;
+    if result.ok {
+        println!("paired ok");
+        Ok(true)
+    } else {
+        println!("pair refused: {}", result.reason.as_deref().unwrap_or("unknown"));
+        Ok(false)
+    }
 }
 
-/// Load the pair-test identity from `~/.local/share/forgetty/pair-test.key`,
-/// or generate and persist a new one.
-///
-/// Using a persistent identity means reconnect tests always present the same
-/// device_id, enabling AC-9 (known device reconnects without re-pairing).
-fn load_or_generate_pair_test_key() -> anyhow::Result<SecretKey> {
-    let path: PathBuf = dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("~/.local/share"))
-        .join("forgetty")
-        .join("pair-test.key");
+/// Load the QA identity, or generate and persist a new one.
+fn load_or_generate_key(path: Option<PathBuf>) -> anyhow::Result<SecretKey> {
+    let path = path.unwrap_or_else(|| {
+        dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("~/.local/share"))
+            .join("forgetty")
+            .join("pair-test.key")
+    });
 
     if path.exists() {
         let bytes = std::fs::read(&path)?;
         let arr: [u8; 32] = bytes.try_into().map_err(|_| {
-            anyhow::anyhow!("pair-test.key is not 32 bytes; delete it to regenerate")
+            anyhow::anyhow!("{} is not 32 bytes; delete it to regenerate", path.display())
         })?;
         Ok(SecretKey::from_bytes(&arr))
     } else {
         let key = SecretKey::generate(&mut rand::rng());
-        std::fs::create_dir_all(path.parent().expect("pair-test path has parent"))?;
+        std::fs::create_dir_all(path.parent().expect("identity path has parent"))?;
         std::fs::write(&path, key.to_bytes())?;
-        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;

@@ -49,8 +49,11 @@ jobs:
       - name: Build QA tools
         run: cargo build -p forgetty-server --features qa-tools
 
-      - name: Behaviour gate (socket + iroh)
+      - name: Behaviour gate P0 (socket + iroh)
         run: scripts/p0_gate.sh
+
+      - name: Behaviour gate P1 (durability + pairing)
+        run: scripts/p1_gate.sh
 
   # Separate and non-blocking for the headless line: the GTK client is paused
   # (AD-022) but must keep compiling.
@@ -80,7 +83,7 @@ jobs:
           version: 0.15.2
 
       - name: Check GTK packages
-        run: cargo check -p forgetty -p forgetty-gtk
+        run: cargo check -p forgetty -p forgetty-gtk  # package `forgetty` is the GTK bin `forgetty-gtk`
 
   audit:
     name: Security Audit

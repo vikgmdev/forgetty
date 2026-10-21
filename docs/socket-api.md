@@ -142,9 +142,9 @@ Most methods are request/response and stay in line-JSON mode forever.
    that connection. Any write activity from the client (including the half-
    close that produces EOF) terminates the subscription. To issue additional
    requests while subscribed, open a second connection.
-5. `disconnect`, `shutdown`, `shutdown_save`, and `shutdown_clean` are
-   terminal RPCs: the daemon writes the response line, then either closes the
-   connection (`disconnect`) or exits the process (`shutdown*`).
+5. Only `shutdown` ends the server (P1, AD-017). `disconnect`,
+   `shutdown_save` and `shutdown_clean` are compat calls that make state
+   durable and return `ok`. The server keeps running.
 
 ---
 
@@ -568,23 +568,34 @@ host machine name, along with a PNG of the QR code.
 
 **Request:** `{"jsonrpc":"2.0","method":"get_pairing_info","id":1}`
 
-**Params:** none.
+**Params:** none. Opens a pairing window (see `pair_open`): the QR carries a one-time secret.
 
 **Result:**
 ```json
 {"node_id":"<hex>","machine":"<hostname>","qr_png_base64":"<base64 PNG>"}
 ```
 
-#### `enable_pairing`
+#### `pair_open`
 
-Open a time-limited pairing window. During the window, the daemon accepts
-one inbound pair handshake from an unknown device.
+AD-021. Open a pairing window with a fresh one-time secret. The window lasts
+60 s by default and accepts one device on ALPN `forgetty/pair/2`. A new call
+replaces the open window. `enable_pairing` is removed.
 
-**Request:** `{"jsonrpc":"2.0","method":"enable_pairing","params":{"secs":120},"id":1}`
+**Request:** `{"jsonrpc":"2.0","method":"pair_open","params":{"ttl_secs":60},"id":1}`
 
-**Params:** `{"secs":<number>}` (optional; defaults to `120`).
+**Params:** `{"ttl_secs":<number>}` (optional; default 60, max 600).
 
-**Result:** `{"ok":true,"secs":<number>}`
+**Result:**
+```json
+{"window_id":1,"ttl_secs":60,
+ "payload":{"v":2,"node_id":"<hex>","machine":"<hostname>","relay":"<url>","secret":"<base32>"}}
+```
+
+#### `pair_status`
+
+Poll a window. **Params:** `{"window_id":<number>}`.
+**Result:** `{"state":"open","secs_left":<n>}`,
+`{"state":"paired","device_id":"<hex>","name":"<label>"}` or `{"state":"expired"}`.
 
 ### 5.5 Notifications
 
@@ -608,92 +619,63 @@ state, emit broadcast events, or touch the sync endpoint.
 
 **Result:** `{"ok":true}`
 
-### 5.6 Pinning
+### 5.6 Pinning (removed, compat no-ops)
 
-#### `set_pinned`
+AD-017: every session is durable, so there is nothing to pin.
 
-Mark the session as pinned (persists across `shutdown_clean`; pinned
-sessions are not moved to trash).
-
-**Request:** `{"jsonrpc":"2.0","method":"set_pinned","params":{"pinned":true},"id":1}`
-
-**Params:** `{"pinned":<bool>}` (required).
-
-**Result:** `{"ok":true}`
-
-#### `get_pinned`
-
-Return the current pinned state.
-
-**Request:** `{"jsonrpc":"2.0","method":"get_pinned","id":1}`
-
-**Params:** none.
-
-**Result:** `{"pinned":<bool>}`
+- `set_pinned` returns `{"ok":true}` and changes nothing.
+- `get_pinned` returns `{"pinned":false}`.
 
 ### 5.7 Lifecycle
 
-The four shutdown modes and `disconnect` are summarised in this table. All
-are terminal: the daemon sends its ack line before acting.
+AD-017: one durable server per user. A client disconnect, from the socket or
+iroh, never ends a pane or the server. Only `shutdown` stops the server.
 
-| Method | Saves session file? | Moves to trash? | Kills PTYs? | Daemon exits? |
-|---|---|---|---|---|
-| `disconnect` | yes | no | no | no |
-| `shutdown` | no | no | yes | yes |
-| `shutdown_save` | yes | no | yes | yes |
-| `shutdown_clean` | yes | unless pinned | yes | yes |
-
-#### `disconnect`
-
-V2-005 / AD-012: the client connection goes away but the daemon keeps
-running with all PTYs alive. The daemon flushes byte logs, saves the
-session file, and drops the connection. The `UnixListener` keeps accepting
-new connections.
-
-**Request:** `{"jsonrpc":"2.0","method":"disconnect","id":1}`
-
-**Params:** none.
-
-**Result:** `{"ok":true}` (written before the connection closes).
-
-**Notes:** use `disconnect` when you want to drop your connection but
-leave the session alive for reattachment; use `shutdown_save` when you
-want a normal close with persistence (session saved, daemon exits).
+| Method | Saves layout and byte logs? | Exits? |
+|---|---|---|
+| `disconnect`, `shutdown_save`, `shutdown_clean` | yes | no (compat) |
+| `shutdown` | yes | yes |
 
 #### `shutdown`
 
-Permanent close: daemon exits immediately without saving. Use for
-explicit "quit" from the UI when the user does not want the session
-restored.
+Graceful stop: flush byte logs, save `sessions/<server_id>.json`, close the
+iroh endpoint, remove the socket, exit. The ack line is written first.
 
-**Request:** `{"jsonrpc":"2.0","method":"shutdown","id":1}`
+**Request:** `{"jsonrpc":"2.0","method":"shutdown","params":{"if_idle":true},"id":1}`
 
-**Params:** none.
-
-**Result:** `{"ok":true}` (written before `std::process::exit(0)`).
-
-#### `shutdown_save`
-
-Normal close: daemon flushes byte logs, saves the session JSON, and
-exits. The next launch will restore this session.
-
-**Request:** `{"jsonrpc":"2.0","method":"shutdown_save","id":1}`
-
-**Params:** none.
+**Params:** `{"if_idle":<bool>}` (optional). With `if_idle`, the call fails with
+code `-32001` and message `N client(s) attached` while any client is attached
+(see `list_clients`).
 
 **Result:** `{"ok":true}`
 
-#### `shutdown_clean`
-
-Browser-model close: daemon flushes byte logs, saves the session JSON,
-moves the session JSON to trash, and exits. If the session is pinned
-(see `set_pinned`), the trash step is skipped.
-
-**Request:** `{"jsonrpc":"2.0","method":"shutdown_clean","id":1}`
+#### `server_info`
 
 **Params:** none.
 
-**Result:** `{"ok":true}`
+**Result:**
+```json
+{"version":"0.1.0-beta","proto_major":2,"proto_minor":0,"proto_version":"2.0",
+ "server_id":"<uuid>","pid":1234,"uptime_secs":60,"panes":3,"clients":1,
+ "node_id":"<hex or null>"}
+```
+
+The CLI warns on stderr when `version` differs from its own.
+
+#### `list_clients`
+
+Attached clients: iroh connections and sockets that are streaming
+(`subscribe_output`, `subscribe_layout`). Short request/response sockets are
+not clients.
+
+**Params:** none.
+
+**Result:** `{"clients":[{"client_id":"<id>","client_kind":"stream1"|"socket","client_name":"<label>","connected_at":<unix secs>}]}`
+
+#### `disconnect`, `shutdown_save`, `shutdown_clean`
+
+Compat. Flush byte logs, save the layout, return `{"ok":true}`. The server and
+all PTYs keep running.
 
 #### `is_attached`
 
@@ -735,7 +717,7 @@ The daemon emits exactly these five codes:
 
 **R-2 note.** Code `-32601` is overloaded: the daemon returns it both for
 unknown method names *and* for sync-dependent RPCs (`list_devices`,
-`revoke_device`, `get_pairing_info`, `enable_pairing`) when the iroh
+`revoke_device`, `get_pairing_info`, `pair_open`) when the iroh
 endpoint is not available. Callers should use the `error.message` text to
 disambiguate: `"sync endpoint not available ..."` for the latter vs.
 `"Unknown method: ..."` for the former.

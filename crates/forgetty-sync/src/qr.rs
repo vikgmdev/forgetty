@@ -15,7 +15,7 @@ pub const DEFAULT_RELAY: &str = "https://euw1-1.relay.iroh.network/";
 /// QR payload as encoded in the QR code.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QrPayload {
-    /// Protocol version. Always `1` in T-052.
+    /// Payload version. `2` since AD-021 (adds `secret`).
     pub v: u32,
     /// The daemon's iroh `EndpointId` as a base32 string (spec: "node_id").
     pub node_id: String,
@@ -23,15 +23,18 @@ pub struct QrPayload {
     pub machine: String,
     /// The iroh relay URL.
     pub relay: String,
+    /// One-time pairing secret, 16 random bytes in base32 (AD-021).
+    pub secret: String,
 }
 
 impl QrPayload {
-    /// Build a `QrPayload` from a node ID string and the current hostname.
-    pub fn new(node_id_str: String) -> Self {
+    /// Build a `QrPayload` from a node ID string, a pairing secret and the
+    /// current hostname.
+    pub fn new(node_id_str: String, secret: String) -> Self {
         let machine = hostname::get()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|_| "unknown".to_string());
-        QrPayload { v: 1, node_id: node_id_str, machine, relay: DEFAULT_RELAY.to_string() }
+        QrPayload { v: 2, node_id: node_id_str, machine, relay: DEFAULT_RELAY.to_string(), secret }
     }
 
     /// Serialise the payload to a compact JSON string (used as QR data).
