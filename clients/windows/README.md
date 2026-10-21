@@ -55,3 +55,16 @@ letter it records the time from the PTY write to the end of the paint pass whose
 contains the echoed glyph. Prints one JSON object and exits 0. Exit 1 on a 10 s timeout.
 Keystrokes are injected at the PTY write, below GPUI's OS key dispatch, so the number covers
 PTY round trip + VT parse + vsync-aligned frame + scene build, not the Win32 key event hop.
+
+## Spike result (CI run 39556646718, windows-latest, first attempt green)
+
+```
+{"ok":true,"found":"spike-ok","time_to_first_frame_ms":107.8,"time_to_prompt_ms":178.1,
+ "time_to_echo_found_ms":213.1,"keystrokes":100,"key_to_frame_avg_ms":17.27,
+ "key_to_frame_p50_ms":15.81,"key_to_frame_p95_ms":31.52,"key_to_frame_max_ms":46.85,"frames_drawn":106}
+```
+
+Build: about 10 min cold on the runner (GPUI + Zig DLL). exe 10.4 MB, `ghostty-vt.dll` 1.75 MB.
+The runner has no GPU, so numbers are a software-adapter floor for render cost and include
+ConPTY/conhost latency plus up to one vsync of frame alignment. Not measured: Win32 key event
+hop, real GPU present, resize, scrollback, wide chars.
