@@ -2,7 +2,7 @@ use clap::Parser;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(name = "forgetty")]
+#[command(name = "forgetty-gtk")]
 #[command(about = "The AI-first agentic terminal emulator")]
 #[command(version)]
 pub struct Args {

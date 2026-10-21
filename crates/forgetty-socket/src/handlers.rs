@@ -35,11 +35,8 @@ const DEFAULT_COLS: u16 = 80;
 /// `sync_endpoint` is `None` when the daemon was started without iroh support;
 /// sync-related methods return a graceful `METHOD_NOT_FOUND` in that case.
 ///
-/// `session_id` is threaded through so `handle_set_pinned` can durably write
-/// the pin state to `sessions/active/{uuid}.json` synchronously before
-/// returning OK (P-018 / AD-016, AC-14). `None` in test/legacy contexts where
-/// no `active/` file is needed; in that case the persistence write is
-/// skipped.
+/// `session_id` is the server's stable id (AD-017). `server_info` reports it.
+/// `None` in test/legacy contexts.
 pub fn dispatch(
     request: &Request,
     sm: Arc<SessionManager>,
@@ -70,18 +67,32 @@ pub fn dispatch(
         methods::SET_ACTIVE_PANE => handle_set_active_pane(request, &sm),
         // Split ratio + pinned session methods (B-002).
         methods::UPDATE_SPLIT_RATIOS => handle_update_split_ratios(request, &sm),
-        methods::SET_PINNED => handle_set_pinned(request, &sm, session_id),
-        methods::GET_PINNED => handle_get_pinned(request, &sm),
+        // AD-017: pinned/trash lifecycle is gone. Compat no-ops.
+        methods::SET_PINNED => handle_set_pinned(request),
+        methods::GET_PINNED => handle_get_pinned(request),
+        methods::SERVER_INFO => {
+            handle_server_info(request, &sm, sync_endpoint.as_deref(), session_id)
+        }
+        methods::LIST_CLIENTS => handle_list_clients(request, &sm),
+        methods::PANE_EXIT_STATUS => handle_pane_exit_status(request, &sm),
+        methods::CAPTURE => handle_capture(request, &sm),
+        methods::PAIR_OPEN => handle_pair_open(request, sync_endpoint.as_deref()),
+        methods::PAIR_STATUS => handle_pair_status(request, sync_endpoint.as_deref()),
         // Sync / pairing methods — require sync_endpoint.
         methods::LIST_DEVICES => handle_list_devices(request, sync_endpoint.as_deref()),
         methods::REVOKE_DEVICE => handle_revoke_device(request, sync_endpoint.as_deref()),
         methods::GET_PAIRING_INFO => handle_get_pairing_info(request, sync_endpoint.as_deref()),
-        methods::ENABLE_PAIRING => handle_enable_pairing(request, sync_endpoint.as_deref()),
-        _ => Response::error(
-            request.id.clone(),
-            protocol::METHOD_NOT_FOUND,
-            format!("Unknown method: {}", request.method),
-        ),
+        _ => {
+            #[cfg(feature = "qa-tools")]
+            if let Some(resp) = crate::qa::call(request, &sm) {
+                return resp;
+            }
+            Response::error(
+                request.id.clone(),
+                protocol::METHOD_NOT_FOUND,
+                format!("Unknown method: {}", request.method),
+            )
+        }
     }
 }
 
@@ -149,14 +160,41 @@ fn handle_list_tabs(request: &Request, sm: &SessionManager) -> Response {
                     "pid": info.pid,
                     "rows": info.rows,
                     "cols": info.cols,
-                    "cwd": info.cwd.display().to_string(),
+                    "cwd": info.display_cwd,
+                    "spawn_cwd": info.cwd.display().to_string(),
                     "title": info.title,
+                    "remain_on_exit": info.remain_on_exit,
+                    "exited": info.exited,
+                    "exit_code": info.exit_code,
+                    "status": status_json(&info),
+                    "last_notification": notification_json(&info),
                 })
             })
         })
         .collect();
 
     Response::success(request.id.clone(), serde_json::json!({ "tabs": tabs }))
+}
+
+/// Program status of a pane (OSC 7501) as JSON. `status` is `idle`, `working`,
+/// `waiting`, `done` or `failed`.
+fn status_json(info: &forgetty_session::PaneInfo) -> serde_json::Value {
+    serde_json::json!({
+        "status": info.status.status.as_str(),
+        "message": info.status.message,
+        "kind": info.status.kind,
+        "progress": info.status.progress,
+        "app": info.status.app,
+        "record_id": info.status.record_id,
+    })
+}
+
+/// Last desktop notification of a pane, or `null`.
+fn notification_json(info: &forgetty_session::PaneInfo) -> serde_json::Value {
+    match &info.last_notification {
+        Some(n) => serde_json::json!({ "title": n.title, "body": n.body, "at_ms": n.at_ms }),
+        None => serde_json::Value::Null,
+    }
 }
 
 fn handle_get_layout(request: &Request, sm: &SessionManager) -> Response {
@@ -215,7 +253,18 @@ fn handle_new_tab(request: &Request, sm: &SessionManager) -> Response {
         .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
         .filter(|v: &Vec<String>| !v.is_empty());
 
-    match sm.create_tab(workspace_idx, cwd, size, command) {
+    // Opt-in: keep the pane listed after its process exits.
+    let remain_on_exit =
+        request.params.get("remain_on_exit").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    match sm.create_tab_with_options(
+        workspace_idx,
+        cwd,
+        size,
+        command,
+        PaneId::new(),
+        remain_on_exit,
+    ) {
         Ok((pane_id, tab_id)) => Response::success(
             request.id.clone(),
             serde_json::json!({
@@ -804,45 +853,122 @@ fn handle_update_split_ratios(request: &Request, sm: &SessionManager) -> Respons
     Response::success(request.id.clone(), serde_json::json!({ "ok": true }))
 }
 
-fn handle_set_pinned(request: &Request, sm: &SessionManager, session_id: Option<Uuid>) -> Response {
-    let pinned = match request.params.get("pinned").and_then(|v| v.as_bool()) {
-        Some(b) => b,
-        None => {
-            return Response::error(
-                request.id.clone(),
-                protocol::INVALID_PARAMS,
-                "missing param: pinned (bool)".to_string(),
-            )
-        }
-    };
-    sm.set_pinned(pinned);
-
-    // P-018 / AD-016 (AC-14): persist the pin state to `active/{uuid}.json`
-    // synchronously before returning OK. A crash between this write and the
-    // next debounced save would otherwise lose the user's pin toggle, leading
-    // to an unpinned-orphan deletion on next launch.
-    //
-    // `session_id == None` in test/legacy contexts (e.g. unit tests that
-    // bypass the daemon's session-id wiring); skip persistence so the test
-    // path stays in-memory only.
-    if let Some(sid) = session_id {
-        let state = sm.snapshot_to_workspace_state();
-        if let Err(e) = forgetty_workspace::move_to_active(sid, &state) {
-            tracing::warn!("set_pinned: failed to persist active/{sid}.json: {e}");
-            return Response::error(
-                request.id.clone(),
-                protocol::INTERNAL_ERROR,
-                format!("failed to persist pinned state: {e}"),
-            );
-        }
-    }
-
+/// AD-017: the pinned/trash lifecycle no longer exists. Kept so old clients
+/// that still call `set_pinned` get `ok` instead of an error.
+fn handle_set_pinned(request: &Request) -> Response {
     Response::success(request.id.clone(), serde_json::json!({ "ok": true }))
 }
 
-fn handle_get_pinned(request: &Request, sm: &SessionManager) -> Response {
-    let pinned = sm.is_pinned();
-    Response::success(request.id.clone(), serde_json::json!({ "pinned": pinned }))
+/// AD-017 compat: every session is durable, so `pinned` is always `false`
+/// (the flag has no effect).
+fn handle_get_pinned(request: &Request) -> Response {
+    Response::success(request.id.clone(), serde_json::json!({ "pinned": false }))
+}
+
+static STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// Record the server start time. Call once, early. Later calls are no-ops.
+pub fn mark_started() {
+    let _ = STARTED.get_or_init(std::time::Instant::now);
+}
+
+fn handle_server_info(
+    request: &Request,
+    sm: &SessionManager,
+    se: Option<&SyncEndpoint>,
+    session_id: Option<Uuid>,
+) -> Response {
+    let uptime = STARTED.get_or_init(std::time::Instant::now).elapsed().as_secs();
+    Response::success(
+        request.id.clone(),
+        serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "proto_major": protocol::PROTO_MAJOR,
+            "proto_minor": protocol::PROTO_MINOR,
+            "proto_version": format!("{}.{}", protocol::PROTO_MAJOR, protocol::PROTO_MINOR),
+            "server_id": session_id.map(|u| u.to_string()),
+            "pid": std::process::id(),
+            "uptime_secs": uptime,
+            "panes": sm.list_panes().len(),
+            "clients": sm.clients().count(),
+            "node_id": se.map(|e| e.node_id().to_string()),
+        }),
+    )
+}
+
+fn handle_pane_exit_status(request: &Request, sm: &SessionManager) -> Response {
+    let Some(raw) = request.params.get("pane_id").and_then(|v| v.as_str()) else {
+        return Response::error(
+            request.id.clone(),
+            protocol::INVALID_PARAMS,
+            "missing param: pane_id".to_string(),
+        );
+    };
+    let Ok(uuid) = Uuid::parse_str(raw) else {
+        return Response::error(
+            request.id.clone(),
+            protocol::INVALID_PARAMS,
+            "invalid pane_id".to_string(),
+        );
+    };
+    match sm.pane_exit_status(PaneId(uuid)) {
+        Some((running, code)) => Response::success(
+            request.id.clone(),
+            serde_json::json!({ "running": running, "exit_code": code }),
+        ),
+        None => Response::error(
+            request.id.clone(),
+            protocol::INVALID_PARAMS,
+            "pane not found and no exit recorded".to_string(),
+        ),
+    }
+}
+
+/// `capture`: visible screen text of a pane (AD-019, cold path).
+fn handle_capture(request: &Request, sm: &SessionManager) -> Response {
+    let id = match require_pane_id(request, sm) {
+        Ok(id) => id,
+        Err(e) => return e,
+    };
+    let trim = request.params.get("trim").and_then(|v| v.as_bool()).unwrap_or(false);
+    let last_lines = match request.params.get("last_lines") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => match v.as_u64() {
+            Some(n) => Some(n.min(100_000) as usize),
+            None => {
+                return Response::error(
+                    request.id.clone(),
+                    protocol::INVALID_PARAMS,
+                    "last_lines must be a non-negative integer".to_string(),
+                )
+            }
+        },
+    };
+    match sm.capture_pane(id, trim, last_lines) {
+        Some(text) => Response::success(request.id.clone(), serde_json::json!({ "text": text })),
+        None => Response::error(
+            request.id.clone(),
+            protocol::INVALID_PARAMS,
+            format!("pane not found: {id}"),
+        ),
+    }
+}
+
+fn handle_list_clients(request: &Request, sm: &SessionManager) -> Response {
+    let clients: Vec<serde_json::Value> = sm
+        .clients()
+        .list()
+        .into_iter()
+        .map(|c| {
+            serde_json::json!({
+                "client_id": c.client_id,
+                "client_kind": c.client_kind,
+                "client_name": c.client_name,
+                "connected_at": c.connected_at,
+            })
+        })
+        .collect();
+    Response::success(request.id.clone(), serde_json::json!({ "clients": clients }))
 }
 
 fn handle_split_pane(request: &Request, sm: &SessionManager) -> Response {
@@ -1049,8 +1175,14 @@ fn handle_get_pane_info(request: &Request, sm: &SessionManager) -> Response {
             "rows": info.rows,
             "cols": info.cols,
             "title": info.title,
-            "cwd": info.cwd.display().to_string(),
+            "cwd": info.display_cwd,
+            "spawn_cwd": info.cwd.display().to_string(),
             "pid": info.pid,
+            "remain_on_exit": info.remain_on_exit,
+            "exited": info.exited,
+            "exit_code": info.exit_code,
+            "status": status_json(&info),
+            "last_notification": notification_json(&info),
         }),
     )
 }
@@ -1170,7 +1302,7 @@ fn sync_unavailable(request: &Request) -> Response {
     Response::error(
         request.id.clone(),
         protocol::METHOD_NOT_FOUND,
-        "sync endpoint not available (daemon started without --allow-pairing?)".to_string(),
+        "sync endpoint not available (iroh failed to bind)".to_string(),
     )
 }
 
@@ -1207,18 +1339,14 @@ fn handle_revoke_device(request: &Request, se: Option<&SyncEndpoint>) -> Respons
         }
     };
 
-    let registry = se.registry();
-    let mut reg = registry.lock().unwrap();
-    match reg.remove(&device_id) {
-        Ok(found) => {
-            if found {
-                // Emit revoke event (best-effort; ignore if no receivers).
-                let _ = se
-                    .event_tx
-                    .send(forgetty_sync::SyncEvent::DeviceRevoked { device_id: device_id.clone() });
-            }
-            Response::success(request.id.clone(), serde_json::json!({ "ok": found }))
-        }
+    // Registry removal AND closing every live connection of the device, on
+    // every ALPN. Removing only the registry entry would leave an open
+    // session running (the registry is checked once, at connect).
+    match se.revoke_device(&device_id) {
+        Ok((found, closed)) => Response::success(
+            request.id.clone(),
+            serde_json::json!({ "ok": found, "closed_connections": closed }),
+        ),
         Err(e) => Response::error(
             request.id.clone(),
             protocol::INTERNAL_ERROR,
@@ -1227,11 +1355,45 @@ fn handle_revoke_device(request: &Request, se: Option<&SyncEndpoint>) -> Respons
     }
 }
 
-fn handle_enable_pairing(request: &Request, se: Option<&SyncEndpoint>) -> Response {
+fn handle_pair_open(request: &Request, se: Option<&SyncEndpoint>) -> Response {
     let Some(se) = se else { return sync_unavailable(request) };
-    let secs = request.params.get("secs").and_then(|v| v.as_u64()).unwrap_or(120);
-    se.enable_pairing(secs);
-    Response::success(request.id.clone(), serde_json::json!({ "ok": true, "secs": secs }))
+    let ttl = request
+        .params
+        .get("ttl_secs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(forgetty_sync::PAIRING_WINDOW_SECS)
+        .clamp(1, 600);
+    let window = se.open_pairing(std::time::Duration::from_secs(ttl));
+    let payload = forgetty_sync::QrPayload::new(se.node_id().to_string(), window.secret.clone());
+    Response::success(
+        request.id.clone(),
+        serde_json::json!({
+            "window_id": window.id,
+            "ttl_secs": window.ttl_secs,
+            "payload": payload,
+        }),
+    )
+}
+
+fn handle_pair_status(request: &Request, se: Option<&SyncEndpoint>) -> Response {
+    let Some(se) = se else { return sync_unavailable(request) };
+    let Some(id) = request.params.get("window_id").and_then(|v| v.as_u64()) else {
+        return Response::error(
+            request.id.clone(),
+            protocol::INVALID_PARAMS,
+            "missing param: window_id".to_string(),
+        );
+    };
+    let result = match se.pairing_status(id) {
+        forgetty_sync::PairStatus::Open { secs_left } => {
+            serde_json::json!({ "state": "open", "secs_left": secs_left })
+        }
+        forgetty_sync::PairStatus::Paired { device_id, name } => {
+            serde_json::json!({ "state": "paired", "device_id": device_id, "name": name })
+        }
+        forgetty_sync::PairStatus::Expired => serde_json::json!({ "state": "expired" }),
+    };
+    Response::success(request.id.clone(), result)
 }
 
 fn handle_get_pairing_info(request: &Request, se: Option<&SyncEndpoint>) -> Response {
@@ -1242,7 +1404,10 @@ fn handle_get_pairing_info(request: &Request, se: Option<&SyncEndpoint>) -> Resp
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "unknown".to_string());
 
-    let payload = forgetty_sync::QrPayload::new(node_id.clone());
+    // AD-021: the QR carries a one-time secret, so showing it opens a window.
+    let window =
+        se.open_pairing(std::time::Duration::from_secs(forgetty_sync::PAIRING_WINDOW_SECS));
+    let payload = forgetty_sync::QrPayload::new(node_id.clone(), window.secret);
     let png_bytes = match forgetty_sync::qr::qr_to_png(&payload, 8) {
         Ok(b) => b,
         Err(e) => {
@@ -2071,92 +2236,229 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // P-018 / AD-016: handle_set_pinned persists to active/{uuid}.json
+    // AD-017: pinned compat no-ops, server_info, list_clients
     // -----------------------------------------------------------------------
 
-    /// Serialize XDG_DATA_HOME-mutating tests for handle_set_pinned.
-    fn xdg_lock_handlers() -> &'static std::sync::Mutex<()> {
-        use std::sync::OnceLock;
-        static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    fn req(method: &str, params: serde_json::Value) -> Request {
+        Request {
+            jsonrpc: "2.0".to_string(),
+            method: method.to_string(),
+            params,
+            id: Some(serde_json::json!(1)),
+        }
     }
 
     #[test]
-    fn p018_set_pinned_persists_to_active_when_session_id_present() {
-        let lock = xdg_lock_handlers().lock().unwrap_or_else(|e| e.into_inner());
-        let prior = std::env::var_os("XDG_DATA_HOME");
-        let tmp = tempfile::tempdir().unwrap();
-        // SAFETY: serialized by xdg_lock_handlers; this test is the sole
-        // mutator within the socket crate.
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", tmp.path());
+    fn set_pinned_is_a_noop_that_returns_ok() {
+        let sm = make_sm();
+        for params in [serde_json::json!({ "pinned": true }), serde_json::json!({})] {
+            let resp = dispatch(&req("set_pinned", params), Arc::clone(&sm), None, None);
+            assert!(resp.error.is_none());
+            assert_eq!(resp.result.unwrap()["ok"], true);
         }
+        assert!(!sm.is_pinned(), "set_pinned must not change state");
+        let resp = dispatch(&req("get_pinned", serde_json::json!({})), sm, None, None);
+        assert_eq!(resp.result.unwrap()["pinned"], false);
+    }
 
+    #[test]
+    fn server_info_reports_version_proto_and_counts() {
+        let sm = make_sm();
         let sid = Uuid::new_v4();
-        let sm = make_sm();
-
-        // Initial state: pinned=false (default in WorkspaceState).
-        let req = Request {
-            jsonrpc: "2.0".to_string(),
-            method: "set_pinned".to_string(),
-            params: serde_json::json!({ "pinned": true }),
-            id: Some(serde_json::json!(1)),
-        };
-
-        let resp = dispatch(&req, Arc::clone(&sm), None, Some(sid));
-        assert!(resp.error.is_none(), "set_pinned should succeed: {:?}", resp.error);
-        assert!(resp.result.is_some());
-
-        // Verify file exists at active/{sid}.json with pinned: true.
-        let active_path = forgetty_workspace::session_path_active_for(sid);
-        assert!(active_path.exists(), "active/{sid}.json must be written synchronously");
-        let contents = std::fs::read_to_string(&active_path).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&contents).unwrap();
-        assert_eq!(
-            v.get("pinned").and_then(|p| p.as_bool()),
-            Some(true),
-            "persisted file must reflect pinned=true"
-        );
-
-        // Restore env.
-        unsafe {
-            if let Some(p) = prior {
-                std::env::set_var("XDG_DATA_HOME", p);
-            } else {
-                std::env::remove_var("XDG_DATA_HOME");
-            }
-        }
-        drop(lock);
+        let _guard = sm.clients().register("c1", "socket", "test").unwrap();
+        let resp = dispatch(&req("server_info", serde_json::Value::Null), sm, None, Some(sid));
+        let v = resp.result.expect("server_info result");
+        assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(v["proto_major"], protocol::PROTO_MAJOR);
+        assert_eq!(v["server_id"], sid.to_string());
+        assert_eq!(v["pid"], std::process::id());
+        assert_eq!(v["panes"], 0);
+        assert_eq!(v["clients"], 1);
+        assert!(v["node_id"].is_null());
     }
 
     #[test]
-    fn p018_set_pinned_skips_persistence_when_session_id_none() {
-        // Without session_id (test/legacy contexts) the handler must still
-        // succeed but skip the file write.
+    fn list_clients_returns_registered_clients() {
         let sm = make_sm();
-        let req = Request {
-            jsonrpc: "2.0".to_string(),
-            method: "set_pinned".to_string(),
-            params: serde_json::json!({ "pinned": true }),
-            id: Some(serde_json::json!(1)),
-        };
-        let resp = dispatch(&req, Arc::clone(&sm), None, None);
-        assert!(resp.error.is_none(), "set_pinned with None session_id must succeed");
-        // In-memory state was updated.
-        assert!(sm.is_pinned());
+        let _a = sm.clients().register("dev-1", "stream1", "phone").unwrap();
+        let resp = dispatch(&req("list_clients", serde_json::Value::Null), sm, None, None);
+        let clients = resp.result.unwrap()["clients"].as_array().unwrap().clone();
+        assert_eq!(clients.len(), 1);
+        assert_eq!(clients[0]["client_name"], "phone");
+        assert_eq!(clients[0]["client_kind"], "stream1");
     }
 
     #[test]
-    fn p018_set_pinned_missing_param_returns_invalid_params() {
+    fn pair_methods_need_the_sync_endpoint() {
         let sm = make_sm();
-        let req = Request {
-            jsonrpc: "2.0".to_string(),
-            method: "set_pinned".to_string(),
-            params: serde_json::json!({}),
-            id: Some(serde_json::json!(1)),
-        };
-        let resp = dispatch(&req, sm, None, Some(Uuid::new_v4()));
+        let resp = dispatch(&req("pair_open", serde_json::Value::Null), sm, None, None);
         assert!(resp.error.is_some());
-        assert_eq!(resp.error.unwrap().code, protocol::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn pane_exit_status_unknown_pane_is_an_error() {
+        let sm = make_sm();
+        let params = serde_json::json!({ "pane_id": Uuid::new_v4().to_string() });
+        let resp = dispatch(&req("pane_exit_status", params), sm, None, None);
+        assert!(resp.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn new_tab_keep_flag_is_reported_by_list_tabs() {
+        let sm = make_sm();
+        let params = serde_json::json!({ "workspace_idx": 0, "remain_on_exit": true });
+        let resp = dispatch(&req("new_tab", params), Arc::clone(&sm), None, None);
+        let pane = resp.result.unwrap()["pane_id"].as_str().unwrap().to_string();
+        let tabs =
+            dispatch(&req("list_tabs", serde_json::Value::Null), Arc::clone(&sm), None, None);
+        let tab = &tabs.result.unwrap()["tabs"][0];
+        assert_eq!(tab["pane_id"], pane);
+        assert_eq!(tab["remain_on_exit"], true);
+        assert_eq!(tab["exited"], false);
+        assert!(tab["exit_code"].is_null());
+        let status = dispatch(
+            &req("pane_exit_status", serde_json::json!({ "pane_id": pane })),
+            sm,
+            None,
+            None,
+        );
+        assert_eq!(status.result.unwrap()["running"], true);
+    }
+
+    #[tokio::test]
+    async fn list_tabs_and_get_pane_info_carry_status_and_notification() {
+        let sm = make_sm();
+        let resp = dispatch(
+            &req("new_tab", serde_json::json!({ "workspace_idx": 0 })),
+            Arc::clone(&sm),
+            None,
+            None,
+        );
+        let pane = resp.result.unwrap()["pane_id"].as_str().unwrap().to_string();
+        for result in [
+            dispatch(&req("list_tabs", serde_json::Value::Null), Arc::clone(&sm), None, None)
+                .result
+                .unwrap()["tabs"][0]
+                .clone(),
+            dispatch(
+                &req("get_pane_info", serde_json::json!({ "pane_id": pane })),
+                Arc::clone(&sm),
+                None,
+                None,
+            )
+            .result
+            .unwrap(),
+        ] {
+            assert_eq!(result["status"]["status"], "idle");
+            assert!(result["status"]["message"].is_null());
+            assert!(result["last_notification"].is_null());
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_unknown_pane_is_an_error_and_bad_lines_is_rejected() {
+        let sm = make_sm();
+        let resp = dispatch(
+            &req("capture", serde_json::json!({ "pane_id": uuid::Uuid::new_v4().to_string() })),
+            Arc::clone(&sm),
+            None,
+            None,
+        );
+        assert!(resp.error.is_some());
+
+        let resp = dispatch(
+            &req("new_tab", serde_json::json!({ "workspace_idx": 0 })),
+            Arc::clone(&sm),
+            None,
+            None,
+        );
+        let pane = resp.result.unwrap()["pane_id"].as_str().unwrap().to_string();
+        let resp = dispatch(
+            &req("capture", serde_json::json!({ "pane_id": pane, "last_lines": "x" })),
+            Arc::clone(&sm),
+            None,
+            None,
+        );
+        assert!(resp.error.is_some());
+        let resp = dispatch(
+            &req("capture", serde_json::json!({ "pane_id": pane, "trim": true, "last_lines": 3 })),
+            sm,
+            None,
+            None,
+        );
+        assert!(resp.result.unwrap()["text"].is_string());
+    }
+
+    #[test]
+    fn pane_event_notifications_use_serverevent_names() {
+        use crate::server::pane_event_notification;
+        use forgetty_session::SessionEvent;
+        let id = PaneId::new();
+        let ev = SessionEvent::StatusChanged {
+            pane_id: id,
+            status: "waiting".into(),
+            message: Some("m".into()),
+        };
+        let n = pane_event_notification(&ev).unwrap();
+        assert_eq!(n["method"], "status_changed");
+        assert_eq!(n["params"]["status"], "waiting");
+        assert_eq!(n["params"]["pane_id"], id.to_string());
+        assert_eq!(
+            pane_event_notification(&SessionEvent::PaneClosed { pane_id: id }).unwrap()["method"],
+            "pane_closed"
+        );
+        assert_eq!(
+            pane_event_notification(&SessionEvent::TitleChanged { pane_id: id, title: "t".into() })
+                .unwrap()["method"],
+            "title_changed"
+        );
+        assert_eq!(
+            pane_event_notification(&SessionEvent::CwdChanged { pane_id: id, cwd: "/".into() })
+                .unwrap()["method"],
+            "cwd_changed"
+        );
+        assert!(pane_event_notification(&SessionEvent::ActiveTabChanged {
+            workspace_idx: 0,
+            tab_idx: 0
+        })
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn osc7_hint_does_not_choose_the_split_directory() {
+        let tmp = std::fs::canonicalize("/tmp").unwrap();
+        let sm = make_sm();
+        let params = serde_json::json!({
+            "workspace_idx": 0,
+            "cwd": tmp.display().to_string(),
+            "command": ["sh", "-c", "printf '\\033]7;file://localhost/etc\\007'; sleep 30"],
+        });
+        let resp = dispatch(&req("new_tab", params), Arc::clone(&sm), None, None);
+        let pane = resp.result.unwrap()["pane_id"].as_str().unwrap().to_string();
+        let pane_id = PaneId(Uuid::parse_str(&pane).unwrap());
+        for _ in 0..200 {
+            if sm.pane_info(pane_id).is_some_and(|i| i.display_cwd == "/etc") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        // Display: the hint. Spawn: the real directory.
+        let tabs =
+            dispatch(&req("list_tabs", serde_json::Value::Null), Arc::clone(&sm), None, None);
+        let tab = &tabs.result.unwrap()["tabs"][0];
+        assert_eq!(tab["cwd"], "/etc");
+        assert_eq!(tab["spawn_cwd"], tmp.display().to_string());
+
+        // A split without an explicit cwd opens in the real directory.
+        let resp = dispatch(
+            &req("split_pane", serde_json::json!({ "pane_id": pane, "direction": "vertical" })),
+            Arc::clone(&sm),
+            None,
+            None,
+        );
+        let new_pane = resp.result.expect("split ok")["pane_id"].as_str().unwrap().to_string();
+        let new_id = PaneId(Uuid::parse_str(&new_pane).unwrap());
+        assert_eq!(sm.pane_info(new_id).unwrap().cwd, tmp, "the split opens in /tmp, not /etc");
     }
 }

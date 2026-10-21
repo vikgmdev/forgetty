@@ -41,6 +41,8 @@ pub const INVALID_REQUEST: i32 = -32600;
 pub const METHOD_NOT_FOUND: i32 = -32601;
 pub const INVALID_PARAMS: i32 = -32602;
 pub const INTERNAL_ERROR: i32 = -32603;
+/// `shutdown { if_idle: true }` refused because clients are attached.
+pub const SERVER_BUSY: i32 = -32001;
 
 impl Response {
     /// Create a successful response.
@@ -87,6 +89,11 @@ impl Request {
     }
 }
 
+/// Protocol major version spoken by this server (PROTOCOL_V2).
+pub const PROTO_MAJOR: u32 = 2;
+/// Protocol minor version.
+pub const PROTO_MINOR: u32 = 0;
+
 /// API method names.
 pub mod methods {
     pub const LIST_TABS: &str = "list_tabs";
@@ -104,7 +111,13 @@ pub mod methods {
     pub const LIST_DEVICES: &str = "list_devices";
     pub const REVOKE_DEVICE: &str = "revoke_device";
     pub const GET_PAIRING_INFO: &str = "get_pairing_info";
-    pub const ENABLE_PAIRING: &str = "enable_pairing";
+    /// AD-021: open a 60 s pairing window with a fresh one-time secret.
+    /// Params: `{ "ttl_secs": u64 }` (optional). Result carries the QR
+    /// payload (`v:2`, `node_id`, `machine`, `relay`, `secret`) and `window_id`.
+    pub const PAIR_OPEN: &str = "pair_open";
+    /// AD-021: poll a pairing window. Params: `{ "window_id": u64 }`.
+    /// Result: `{ "state": "open" | "paired" | "expired", ... }`.
+    pub const PAIR_STATUS: &str = "pair_status";
     // Layout query + mutation methods (T-062).
     pub const GET_LAYOUT: &str = "get_layout";
     pub const MOVE_TAB: &str = "move_tab";
@@ -147,10 +160,27 @@ pub mod methods {
     pub const SET_PINNED: &str = "set_pinned";
     pub const GET_PINNED: &str = "get_pinned";
     // Daemon lifecycle (T-070, T-072, B-002, V2-005).
-    pub const SHUTDOWN: &str = "shutdown"; // permanent close: exit immediately, no save
-    pub const SHUTDOWN_SAVE: &str = "shutdown_save"; // normal close: save session then exit
-    pub const SHUTDOWN_CLEAN: &str = "shutdown_clean"; // browser close: save → trash → exit
-    pub const DISCONNECT: &str = "disconnect"; // V2-005 / AD-012: daemon survives window close
+    /// AD-017: graceful server stop (flush byte logs, save layout, exit).
+    /// Params: `{ "if_idle": bool }`; with `if_idle` the call fails while
+    /// clients are attached.
+    pub const SHUTDOWN: &str = "shutdown";
+    /// AD-017 compat: flush byte logs and save the layout. Never exits.
+    pub const SHUTDOWN_SAVE: &str = "shutdown_save";
+    /// AD-017 compat: same as `shutdown_save`.
+    pub const SHUTDOWN_CLEAN: &str = "shutdown_clean";
+    /// AD-017 compat: a client disconnect never ends the server. Same as `shutdown_save`.
+    pub const DISCONNECT: &str = "disconnect";
+    /// P1: server version, protocol version, pid, uptime, pane and client counts.
+    pub const SERVER_INFO: &str = "server_info";
+    /// Exit status of a pane process, live or already closed.
+    /// Params: `{ "pane_id": "<uuid>" }`. Result: `{ "running": bool, "exit_code": i32|null }`.
+    pub const PANE_EXIT_STATUS: &str = "pane_exit_status";
+    /// P4a (AD-019): visible screen text of a pane, built on request from the
+    /// byte-log ring. Params: `{ "pane_id", "trim": bool, "last_lines": u32? }`.
+    /// Result: `{ "text": string }`.
+    pub const CAPTURE: &str = "capture";
+    /// P1: attached clients (iroh connections and streaming sockets).
+    pub const LIST_CLIENTS: &str = "list_clients";
 
     // V2-007 fix cycle 2: "is a GUI attached to this daemon?" probe used by
     // restore logic in the launcher to distinguish "daemon running but

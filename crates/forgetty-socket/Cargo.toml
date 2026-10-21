@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Test-only extension hook for the protocol harness. Never in release builds.
+qa-tools = []
+
 [dependencies]
 forgetty-core = { path = "../forgetty-core" }
 forgetty-pty = { path = "../forgetty-pty" }
@@ -18,6 +22,7 @@ base64 = "0.22"
 bytes = "1"
 uuid = { workspace = true }
 hostname = "0.4"
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true }

@@ -20,14 +20,14 @@
 #   ./launch-dev.sh --clean     # --stop, then wipe sandbox, exit (no launch)
 #
 # Binary discovery: `ensure_daemon` in the GTK client resolves
-# `forgetty-daemon` relative to its own binary path before falling back to
-# $PATH, so running ./target/release/forgetty correctly picks up
-# ./target/release/forgetty-daemon — never the installed one.
+# `forgetty` (server) relative to its own binary path before falling back to
+# $PATH, so running ./target/release/forgetty-gtk correctly picks up
+# ./target/release/forgetty — never the installed one.
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BIN="${REPO_DIR}/target/release/forgetty"
-DAEMON_BIN="${REPO_DIR}/target/release/forgetty-daemon"
+BIN="${REPO_DIR}/target/release/forgetty-gtk"
+DAEMON_BIN="${REPO_DIR}/target/release/forgetty"
 SANDBOX="/tmp/forgetty-dev"
 
 mode="launch"
@@ -80,12 +80,12 @@ fi
 
 if [[ ! -x "$BIN" ]]; then
   echo "error: dev binary not found at $BIN" >&2
-  echo "build first:  cargo build --release" >&2
+  echo "build first:  cargo build --release -p forgetty -p forgetty-server" >&2
   exit 1
 fi
 if [[ ! -x "$DAEMON_BIN" ]]; then
   echo "error: dev daemon not found at $DAEMON_BIN" >&2
-  echo "build first:  cargo build --release" >&2
+  echo "build first:  cargo build --release -p forgetty -p forgetty-server" >&2
   exit 1
 fi
 

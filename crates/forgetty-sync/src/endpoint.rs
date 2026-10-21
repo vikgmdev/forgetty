@@ -19,9 +19,8 @@
 //! by ALPN into the registered handler map.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use iroh::{endpoint::presets, endpoint::Connection, Endpoint, EndpointId, SecretKey};
 use thiserror::Error;
@@ -29,15 +28,21 @@ use tokio::sync::broadcast;
 use tracing::{info, warn};
 
 use crate::{
-    pairing,
+    pairing::{self, OpenedWindow, PairStatus, PairingState},
     registry::{DeviceEntry, DeviceRegistry},
 };
 
-/// ALPN identifier for Forgetty's pairing protocol.
+/// ALPN identifier for the retired pairing protocol (v1).
+///
+/// Still registered so old clients get a clear "upgrade the app" error
+/// instead of a bare QUIC failure. It never pairs a device (AD-021).
+pub const FORGETTY_PAIRING_ALPN_V1: &[u8] = b"forgetty/pair/1";
+
+/// ALPN identifier for Forgetty's pairing protocol (v2, AD-021).
 ///
 /// Owned by `forgetty-sync`; automatically registered by every
 /// `SyncEndpoint` because pairing is the reason this crate exists.
-pub const FORGETTY_PAIRING_ALPN: &[u8] = b"forgetty/pair/1";
+pub const FORGETTY_PAIRING_ALPN: &[u8] = b"forgetty/pair/2";
 
 /// Type-erased handler for a non-pairing ALPN.
 ///
@@ -84,21 +89,12 @@ pub enum SyncError {
 /// The pairing ALPN is always registered; callers do not need to add it.
 pub struct SyncEndpointBuilder {
     secret_key: SecretKey,
-    allow_pairing: bool,
     extra_alpns: HashMap<Vec<u8>, AlpnHandler>,
+    bind_port: Option<u16>,
+    transport: Option<iroh::endpoint::QuicTransportConfig>,
 }
 
 impl SyncEndpointBuilder {
-    /// Enable auto-pair mode for unknown devices at bind time.
-    ///
-    /// Equivalent semantics to the flag previously passed to
-    /// `SyncEndpoint::bind`. Call [`SyncEndpoint::enable_pairing`] post-bind
-    /// for a time-limited pairing window.
-    pub fn allow_pairing(mut self, allow: bool) -> Self {
-        self.allow_pairing = allow;
-        self
-    }
-
     /// Register a handler for a non-pairing ALPN.
     ///
     /// The binary that owns the terminal stream handler (or any future
@@ -113,6 +109,20 @@ impl SyncEndpointBuilder {
         self
     }
 
+    /// Listen on this UDP port (IPv4 and IPv6) instead of random ports, so the
+    /// server's direct address stays the same across restarts. `0` picks a
+    /// free port. IPv6 is skipped when the host cannot bind it.
+    pub fn bind_port(mut self, port: u16) -> Self {
+        self.bind_port = Some(port);
+        self
+    }
+
+    /// QUIC transport settings (keep-alive, idle timeout).
+    pub fn transport_config(mut self, config: iroh::endpoint::QuicTransportConfig) -> Self {
+        self.transport = Some(config);
+        self
+    }
+
     /// Bind the iroh endpoint and construct the [`SyncEndpoint`].
     ///
     /// All registered ALPNs (pairing + extras) are advertised during the
@@ -120,24 +130,51 @@ impl SyncEndpointBuilder {
     pub async fn build(self) -> Result<SyncEndpoint, SyncError> {
         let mut alpn_list: Vec<Vec<u8>> = Vec::with_capacity(self.extra_alpns.len() + 1);
         alpn_list.push(FORGETTY_PAIRING_ALPN.to_vec());
+        alpn_list.push(FORGETTY_PAIRING_ALPN_V1.to_vec());
         alpn_list.extend(self.extra_alpns.keys().cloned());
 
-        let endpoint = Endpoint::builder(presets::N0)
-            .secret_key(self.secret_key)
-            .alpns(alpn_list)
-            .bind()
-            .await
-            .map_err(|e| SyncError::Bind(e.to_string()))?;
+        let make = |dual: bool| -> Result<iroh::endpoint::Builder, SyncError> {
+            let mut builder = Endpoint::builder(presets::N0)
+                .secret_key(self.secret_key.clone())
+                .alpns(alpn_list.clone());
+            if let Some(t) = &self.transport {
+                builder = builder.transport_config(t.clone());
+            }
+            if let Some(port) = self.bind_port {
+                builder = builder
+                    .clear_ip_transports()
+                    .bind_addr(format!("0.0.0.0:{port}").as_str())
+                    .map_err(|e| SyncError::Bind(e.to_string()))?;
+                if dual {
+                    builder = builder
+                        .bind_addr(format!("[::]:{port}").as_str())
+                        .map_err(|e| SyncError::Bind(e.to_string()))?;
+                }
+            }
+            Ok(builder)
+        };
+        // IPv6 on the same port. A host without IPv6 binds IPv4 only.
+        let endpoint = match make(self.bind_port.is_some())?.bind().await {
+            Ok(ep) => ep,
+            Err(e) if self.bind_port.is_some() => {
+                warn!(
+                    "totem-sync: dual-stack bind on port {:?} failed ({e}), using IPv4 only",
+                    self.bind_port
+                );
+                make(false)?.bind().await.map_err(|e| SyncError::Bind(e.to_string()))?
+            }
+            Err(e) => return Err(SyncError::Bind(e.to_string())),
+        };
 
         let registry = Arc::new(Mutex::new(DeviceRegistry::load().map_err(SyncError::Registry)?));
         let (event_tx, _) = broadcast::channel(64);
-        let allow_pairing = Arc::new(AtomicBool::new(self.allow_pairing));
 
         Ok(SyncEndpoint {
             endpoint,
             registry,
-            allow_pairing,
+            pairing: Arc::new(Mutex::new(PairingState::new())),
             extra_alpns: Arc::new(self.extra_alpns),
+            live: crate::connections::LiveConnections::new(),
             event_tx,
         })
     }
@@ -150,8 +187,10 @@ impl SyncEndpointBuilder {
 pub struct SyncEndpoint {
     endpoint: Endpoint,
     registry: Arc<Mutex<DeviceRegistry>>,
-    allow_pairing: Arc<AtomicBool>,
+    pairing: Arc<Mutex<PairingState>>,
     extra_alpns: Arc<HashMap<Vec<u8>, AlpnHandler>>,
+    /// Every open connection by device id, so a revoke can close them all.
+    live: crate::connections::LiveConnections,
     /// Broadcast channel for pairing/connection events. Receivers are vended to
     /// socket RPC handlers via `subscribe()`.
     pub event_tx: broadcast::Sender<SyncEvent>,
@@ -160,12 +199,45 @@ pub struct SyncEndpoint {
 impl SyncEndpoint {
     /// Start configuring a new `SyncEndpoint`.
     pub fn builder(secret_key: SecretKey) -> SyncEndpointBuilder {
-        SyncEndpointBuilder { secret_key, allow_pairing: false, extra_alpns: HashMap::new() }
+        SyncEndpointBuilder {
+            secret_key,
+            extra_alpns: HashMap::new(),
+            bind_port: None,
+            transport: None,
+        }
     }
 
     /// Returns the local `EndpointId` (iroh 0.97 equivalent of spec's `NodeId`).
     pub fn node_id(&self) -> EndpointId {
         self.endpoint.id()
+    }
+
+    /// The local UDP sockets the endpoint listens on.
+    pub fn bound_sockets(&self) -> Vec<std::net::SocketAddr> {
+        self.endpoint.bound_sockets()
+    }
+
+    /// The table of open connections.
+    pub fn live_connections(&self) -> crate::connections::LiveConnections {
+        self.live.clone()
+    }
+
+    /// Revoke a device: remove it from the registry AND close every open
+    /// connection it has, on every ALPN. Returns `(was_registered, closed)`.
+    ///
+    /// The connections are closed even when the device was not in the registry
+    /// (for example it was removed by hand-editing the file).
+    pub fn revoke_device(
+        &self,
+        device_id: &str,
+    ) -> Result<(bool, usize), crate::registry::RegistryError> {
+        let found = self.registry.lock().unwrap_or_else(|e| e.into_inner()).remove(device_id)?;
+        let closed = self.live.revoke(device_id);
+        if found {
+            let _ =
+                self.event_tx.send(SyncEvent::DeviceRevoked { device_id: device_id.to_string() });
+        }
+        Ok((found, closed))
     }
 
     /// Returns a clone of the shared device registry.
@@ -178,17 +250,17 @@ impl SyncEndpoint {
         self.event_tx.subscribe()
     }
 
-    /// Temporarily open a pairing window for `secs` seconds.
+    /// Open a pairing window with a fresh one-time secret (AD-021).
     ///
-    /// Sets `allow_pairing` to `true` and spawns a task that resets it to
-    /// `false` after the timeout. Safe to call from any thread.
-    pub fn enable_pairing(&self, secs: u64) {
-        self.allow_pairing.store(true, Ordering::Relaxed);
-        let flag = Arc::clone(&self.allow_pairing);
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(secs)).await;
-            flag.store(false, Ordering::Relaxed);
-        });
+    /// The window lasts `ttl` and accepts one device. Opening a new window
+    /// replaces the old one. Safe to call from any thread.
+    pub fn open_pairing(&self, ttl: Duration) -> OpenedWindow {
+        self.pairing.lock().unwrap_or_else(|e| e.into_inner()).open(ttl, Instant::now())
+    }
+
+    /// Status of pairing window `id`.
+    pub fn pairing_status(&self, id: u64) -> PairStatus {
+        self.pairing.lock().unwrap_or_else(|e| e.into_inner()).status(id, Instant::now())
     }
 
     /// Close the iroh endpoint gracefully.
@@ -204,7 +276,8 @@ impl SyncEndpoint {
     /// Accepts incoming iroh connections indefinitely, reads the negotiated
     /// ALPN via `Accepting::alpn()`, and dispatches to the appropriate
     /// handler:
-    /// - `forgetty/pair/1` → [`pairing::handle_connection`].
+    /// - `forgetty/pair/2` → [`pairing::handle_pair_v2`].
+    /// - `forgetty/pair/1` → [`pairing::handle_pair_v1`] (refuses unknown devices).
     /// - Any registered non-pairing ALPN → the closure supplied to
     ///   [`SyncEndpointBuilder::register_alpn`].
     /// - Unknown ALPNs → logged and closed with code 1 (`unknown-alpn`).
@@ -243,15 +316,21 @@ impl SyncEndpoint {
             };
 
             let registry = Arc::clone(&self.registry);
-            let allow_pair = self.allow_pairing.load(Ordering::Relaxed);
+            let pairing_state = Arc::clone(&self.pairing);
             let event_tx = self.event_tx.clone();
             let extras = Arc::clone(&self.extra_alpns);
+            let live = self.live.clone();
 
             tokio::spawn(async move {
                 match accepting.await {
                     Ok(conn) => {
+                        // Track before dispatch: a revoke that lands while the
+                        // handler starts still finds this connection.
+                        live.track(conn.remote_id().to_string(), conn.clone());
                         if alpn == FORGETTY_PAIRING_ALPN {
-                            pairing::handle_connection(conn, registry, allow_pair, event_tx).await;
+                            pairing::handle_pair_v2(conn, registry, pairing_state, event_tx).await;
+                        } else if alpn == FORGETTY_PAIRING_ALPN_V1 {
+                            pairing::handle_pair_v1(conn, registry, event_tx).await;
                         } else if let Some(handler) = extras.get(alpn.as_slice()) {
                             handler(conn, registry);
                         } else {

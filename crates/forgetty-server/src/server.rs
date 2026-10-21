@@ -1,30 +1,18 @@
-//! `forgetty-daemon` — headless session daemon.
+//! `forgetty server run` — the durable per-user terminal server (AD-017).
 //!
-//! Starts `SessionManager` and the JSON-RPC socket server without any GTK or
-//! display-server dependency. Intended to run as a systemd user service so
-//! that terminal sessions survive GTK window closures.
-//!
-//! # Usage
-//!
-//! ```text
-//! forgetty-daemon [OPTIONS]
-//!
-//! Options:
-//!   --foreground           Stay in foreground; compact log to stderr
-//!   --show-pairing-qr      Print the device-pairing QR code (ASCII) and exit
-//!   --allow-pairing        Auto-accept next pairing request from any unknown device
-//!   --list-devices         List all paired devices and exit
-//!   --revoke <DEVICE_ID>   Revoke a paired device by device_id and exit
-//!   --socket-path <PATH>   Override the Unix socket path
-//!   --config-file <PATH>   Override the config file path
-//! ```
+//! Starts `SessionManager`, the iroh endpoint and the JSON-RPC socket server
+//! without any GTK or display-server dependency. Intended to run under
+//! `systemd --user` with linger. A client disconnect never ends a pane or the
+//! server. The layout and byte logs are saved under the state dir and restored
+//! on the next start.
 
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use clap::Parser;
+use clap::Args;
 use tokio::signal::unix::{signal, SignalKind};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -34,152 +22,203 @@ use forgetty_core::PaneId;
 use forgetty_pty::PtySize;
 use forgetty_session::{SessionEvent, SessionManager};
 use forgetty_socket::SocketServer;
-use forgetty_sync::{
-    identity::load_or_generate, qr::qr_to_ascii, registry::DeviceRegistry, SyncEndpoint,
-};
+use forgetty_sync::{identity::load_or_generate, SyncEndpoint};
 
-use forgetty_daemon::iroh_terminal::{handle_terminal_stream, FORGETTY_STREAM_ALPN};
+use forgetty_server::iroh_terminal::{handle_terminal_stream, FORGETTY_STREAM_ALPN};
+use forgetty_server::rpc_v2::RpcV2;
+use forgetty_server::sockpath;
 
-// ---------------------------------------------------------------------------
-// CLI
-// ---------------------------------------------------------------------------
-
-#[derive(Parser, Debug)]
-#[command(name = "forgetty-daemon")]
-#[command(about = "Forgetty headless daemon — keeps sessions alive, runs socket server")]
-#[command(version)]
-struct DaemonArgs {
-    /// Stay in foreground and log to stderr (useful for debugging).
-    ///
-    /// By default the daemon logs without ANSI colours and without timestamps
-    /// so that systemd's journal can add its own. With `--foreground` the log
-    /// output is compact and coloured for interactive use.
+/// Options for `forgetty server run`.
+#[derive(Args, Debug, Default)]
+pub struct RunArgs {
+    /// Path to the config file (default `~/.config/forgetty/config.toml`).
     #[arg(long)]
-    foreground: bool,
+    pub config_file: Option<PathBuf>,
 
-    /// Print the device-pairing QR code (ASCII) and exit.
-    ///
-    /// Outputs an ASCII QR code encoding the iroh node ID, machine hostname,
-    /// and relay URL. Scan with the Forgetty Android app to pair.
-    #[arg(long)]
-    show_pairing_qr: bool,
+    /// Override the Unix socket path (default `$XDG_RUNTIME_DIR/forgetty.sock`).
+    #[arg(long, hide = true)]
+    pub socket_path: Option<PathBuf>,
 
-    /// Auto-accept the next pairing request from any unknown device.
-    ///
-    /// Use for initial setup. Do NOT run persistently with this flag in
-    /// untrusted environments — it accepts any connecting device.
-    #[arg(long)]
-    allow_pairing: bool,
+    /// Override the server id (default: the id stored in the state dir).
+    /// Used by the paused GTK client, which runs one server per window.
+    #[arg(long, hide = true)]
+    pub session_id: Option<uuid::Uuid>,
 
-    /// List all paired devices and exit.
+    /// UDP port of the iroh endpoint (default 47297). The port stays the same
+    /// across restarts, so clients can redial the last direct address. `0`
+    /// picks a free port.
     #[arg(long)]
-    list_devices: bool,
-
-    /// Revoke a paired device by device_id and exit.
-    #[arg(long)]
-    revoke: Option<String>,
-
-    /// Session UUID — identifies this daemon instance.
-    ///
-    /// Determines the socket path (`forgetty-{uuid}.sock`) and the session
-    /// file path (`sessions/{uuid}.json`). GTK passes this when spawning the
-    /// daemon. If not provided, a new UUID is generated (useful for manual
-    /// invocation).
-    #[arg(long)]
-    session_id: Option<uuid::Uuid>,
-
-    /// Override the Unix socket path.
-    ///
-    /// Defaults to `$XDG_RUNTIME_DIR/forgetty-{uuid}.sock`, falling back to
-    /// `/tmp/forgetty-{uuid}.sock` when `XDG_RUNTIME_DIR` is unset.
-    #[arg(long)]
-    socket_path: Option<PathBuf>,
-
-    /// Path to the config file.
-    ///
-    /// Defaults to `~/.config/forgetty/config.toml`. If the file does not
-    /// exist the daemon warns and continues with built-in defaults.
-    #[arg(long)]
-    config_file: Option<PathBuf>,
+    pub port: Option<u16>,
 }
 
-// ---------------------------------------------------------------------------
-// Entry point
-// ---------------------------------------------------------------------------
+/// Default UDP port of the iroh endpoint (PROTOCOL_V2 section 1).
+pub const DEFAULT_PORT: u16 = 47297;
 
-fn main() {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
+/// QUIC settings of the server: keep-alive 5 s, idle timeout 30 s (section 1).
+fn quic_config() -> iroh::endpoint::QuicTransportConfig {
+    use forgetty_proto::{IDLE_TIMEOUT_SECS, KEEP_ALIVE_SECS};
+    iroh::endpoint::QuicTransportConfig::builder()
+        .keep_alive_interval(Duration::from_secs(KEEP_ALIVE_SECS))
+        .max_idle_timeout(Some(
+            iroh::endpoint::IdleTimeout::try_from(Duration::from_secs(IDLE_TIMEOUT_SECS))
+                .expect("30 s fits"),
+        ))
         .build()
-        .expect("failed to build tokio runtime");
+}
 
-    if let Err(e) = runtime.block_on(main_async()) {
-        eprintln!("forgetty-daemon error: {e}");
-        std::process::exit(1);
+/// `server run` exit code when another server already holds the instance lock.
+/// `server start` uses it to tell "someone else is starting" from a real failure.
+pub const EXIT_ALREADY_RUNNING: i32 = 75; // keep in step with cli.rs
+
+/// Another server holds the instance lock.
+#[derive(Debug)]
+pub struct AlreadyRunning(pub PathBuf);
+
+impl std::fmt::Display for AlreadyRunning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "another forgetty server is already running (lock {})", self.0.display())
     }
 }
 
-// ---------------------------------------------------------------------------
-// Async main
-// ---------------------------------------------------------------------------
+impl std::error::Error for AlreadyRunning {}
 
-async fn main_async() -> anyhow::Result<()> {
-    let args = DaemonArgs::parse();
+/// Exclusive lock on `<state_dir>/server.lock`. Held while the server reads or
+/// creates its first-run state (`server_id`, `identity.key`), so two servers
+/// that start at once cannot each invent a different identity.
+///
+/// Released on drop, or by the kernel when the process dies.
+pub struct StateLock(#[allow(dead_code)] std::fs::File);
 
-    // --- Early-exit modes that don't need logging or session state ---
-
-    // --list-devices: print and exit.
-    if args.list_devices {
-        let registry = DeviceRegistry::load()?;
-        for d in registry.list() {
-            println!("{}: {} (paired {})", d.device_id, d.name, d.paired_at);
+/// Take the state-dir lock. Waits up to 30 s for another starter to finish.
+pub fn lock_state_dir() -> anyhow::Result<StateLock> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    let dir = forgetty_core::platform::data_dir();
+    forgetty_core::fsutil::ensure_private_dir(&dir)?;
+    let path = dir.join("server.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(forgetty_core::fsutil::FILE_MODE)
+        .open(&path)?;
+    forgetty_core::fsutil::fix_file_mode(&path)?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        // SAFETY: the fd is valid for the lifetime of `file`; flock takes no pointers.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(StateLock(file));
         }
-        return Ok(());
-    }
-
-    // --revoke: remove a device and exit.
-    if let Some(device_id) = &args.revoke {
-        let mut registry = DeviceRegistry::load()?;
-        if registry.remove(device_id)? {
-            println!("Revoked {device_id}");
-        } else {
-            eprintln!("Device not found: {device_id}");
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::WouldBlock {
+            anyhow::bail!("lock {}: {err}", path.display());
         }
-        return Ok(());
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("lock {} is held by another starter for over 30 s", path.display());
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
+}
 
-    // --show-pairing-qr: needs the identity but not the session manager.
-    if args.show_pairing_qr {
-        let secret_key = load_or_generate()?;
-        let node_id = secret_key.public();
-        let payload = forgetty_sync::QrPayload::new(node_id.to_string());
-        let ascii = qr_to_ascii(&payload)?;
-        println!("{ascii}");
-        println!("\nnode_id: {node_id}");
-        return Ok(());
+/// Read the stable server id from `<data_dir>/server_id`, creating it on first run.
+///
+/// Needs the state lock, so the check-then-create cannot race. A file that is
+/// there but unreadable or not a UUID is an error: the server must not start
+/// with a new identity and an empty layout while saved sessions sit under the
+/// old id.
+pub fn load_or_create_server_id(_lock: &StateLock) -> anyhow::Result<uuid::Uuid> {
+    let path = forgetty_core::platform::data_dir().join("server_id");
+    match std::fs::read_to_string(&path) {
+        Ok(text) => {
+            return uuid::Uuid::parse_str(text.trim()).map_err(|_| {
+                anyhow::anyhow!(
+                    "server_id file {} is corrupt (not a UUID). Refusing to start with a new \
+                     identity: saved sessions belong to the old id. Restore the file, or delete \
+                     it to start over with a new identity",
+                    path.display()
+                )
+            });
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => anyhow::bail!("cannot read {}: {e}", path.display()),
     }
+    let id = uuid::Uuid::new_v4();
+    if forgetty_core::fsutil::create_private_if_absent(&path, format!("{id}\n").as_bytes())? {
+        return Ok(id);
+    }
+    // Created by someone else between the read and the create (not possible
+    // under the lock, but cheap to handle): use theirs.
+    let text = std::fs::read_to_string(&path)?;
+    uuid::Uuid::parse_str(text.trim())
+        .map_err(|_| anyhow::anyhow!("server_id file {} is corrupt", path.display()))
+}
 
-    // Resolve or generate the session UUID for this daemon instance.
-    let session_id = args.session_id.unwrap_or_else(uuid::Uuid::new_v4);
+/// Take the single-instance lock `<data_dir>/server-<id>.lock`.
+///
+/// The returned file must stay open for the life of the process. The lock is
+/// released by the kernel when the process exits, however it exits.
+fn acquire_instance_lock(server_id: uuid::Uuid) -> anyhow::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    let dir = forgetty_core::platform::data_dir();
+    forgetty_core::fsutil::ensure_private_dir(&dir)?;
+    let path = dir.join(format!("server-{server_id}.lock"));
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(forgetty_core::fsutil::FILE_MODE)
+        .open(&path)?;
+    // SAFETY: the fd is valid for the lifetime of `file`; flock takes no pointers.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        return Err(AlreadyRunning(path).into());
+    }
+    Ok(file)
+}
 
-    // Configure tracing.
-    //
-    // When --foreground: compact + colour output to stderr for interactive debugging.
-    // Otherwise: no ANSI, no timestamps — systemd's journal adds its own metadata.
-    if args.foreground {
-        tracing_subscriber::fmt()
-            .with_env_filter(EnvFilter::from_default_env())
-            .with_target(false)
-            .compact()
-            .init();
+fn init_tracing() {
+    let builder = tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().unwrap()))
+        .with_target(false);
+    // Interactive terminal: compact and coloured. Otherwise (systemd journal,
+    // log file): plain, and the journal adds its own timestamps.
+    if std::io::stderr().is_terminal() {
+        builder.compact().init();
     } else {
-        tracing_subscriber::fmt()
-            .with_env_filter(EnvFilter::from_default_env())
-            .with_target(false)
-            .with_ansi(false)
-            .without_time()
-            .init();
+        builder.with_ansi(false).without_time().init();
+    }
+}
+
+/// Run the server in the foreground until SIGTERM or SIGINT.
+pub async fn run(args: RunArgs) -> anyhow::Result<()> {
+    init_tracing();
+
+    // First-run state is created under the state-dir lock: the server id, the
+    // instance lock and the identity key. Two servers that start at once
+    // serialize here, the second finds the instance lock taken and exits.
+    let (session_id, secret_key, _instance_lock) = {
+        let state_lock = lock_state_dir()?;
+        // Stable server id: survives restarts, so the session file is found again.
+        let session_id = match args.session_id {
+            Some(id) => id,
+            None => load_or_create_server_id(&state_lock)?,
+        };
+        let instance_lock = acquire_instance_lock(session_id)?;
+        let secret_key = load_or_generate()?;
+        // Credential files written by an older build keep their old mode until here.
+        forgetty_core::fsutil::fix_file_mode(&forgetty_sync::registry::registry_path())?;
+        (session_id, secret_key, instance_lock)
+    };
+
+    // The socket gives a shell. Keep it in a private directory, and refuse to
+    // start if that directory is unsafe (squatted, symlink, wrong owner/mode).
+    // A socket path given with --socket-path is the caller's responsibility.
+    if args.socket_path.is_none() {
+        let dir = sockpath::socket_dir();
+        sockpath::prepare_socket_dir(&dir)
+            .map_err(|e| anyhow::anyhow!("socket directory {} is unsafe: {e}", dir.display()))?;
     }
 
     // Load config (canonicalize path first so relative paths survive CWD changes).
@@ -222,16 +261,10 @@ async fn main_async() -> anyhow::Result<()> {
             Ok(Some(state)) if !state.workspaces.is_empty() => {
                 let total: usize = state.workspaces.iter().map(|ws| ws.tabs.len()).sum();
                 info!(
-                    "cold-start restore: found {} workspace(s), {} tab(s) total, pinned={}",
+                    "cold-start restore: found {} workspace(s), {} tab(s) total",
                     state.workspaces.len(),
                     total,
-                    state.pinned,
                 );
-
-                // Restore pinned state.
-                if state.pinned {
-                    session_manager.set_pinned(true);
-                }
 
                 // Ensure the daemon has enough workspace slots for all saved workspaces.
                 // SessionLayout::new_default() creates workspace[0]; create the rest.
@@ -420,6 +453,11 @@ async fn main_async() -> anyhow::Result<()> {
                         }
                     }
                 }
+                // `remain_on_exit` survives a restart. Pane ids are reused on
+                // restore, so the saved ids still match.
+                for id in &state.remain_on_exit_panes {
+                    session_manager.set_remain_on_exit(PaneId(*id), true);
+                }
                 for (ws_idx, tab_id, pane_id) in restore_targets {
                     if let Err(e) = session_manager.set_active_pane(ws_idx, tab_id, Some(pane_id)) {
                         warn!(
@@ -475,29 +513,16 @@ async fn main_async() -> anyhow::Result<()> {
         );
     }
 
-    // Resolve the socket path: UUID-based by default, override with --socket-path.
-    let socket_path = args.socket_path.unwrap_or_else(|| {
-        if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
-            PathBuf::from(runtime_dir).join(format!("forgetty-{session_id}.sock"))
-        } else {
-            PathBuf::from(format!("/tmp/forgetty-{session_id}.sock"))
-        }
-    });
+    let socket_path = args.socket_path.unwrap_or_else(sockpath::default_socket_path);
 
     // Bind the socket server (with session_id so shutdown_save can write the correct file).
     let socket_server = SocketServer::new_with_session(socket_path.clone(), session_id)?;
 
-    // P-018 / AD-016 (AC-2): write `sessions/active/{uuid}.json` synchronously
-    // BEFORE the socket server starts accepting connections. The first GTK
-    // client must observe a live `active/` file the moment it can read the
-    // socket, so any externally-driven check (`ls active/`, file watcher) sees
-    // the daemon's existence.
-    //
-    // Safety: this runs single-threaded before tokio spawns watchers. There is
-    // no concurrent writer to `active/{session_id}.json` here.
+    // Write the session file before the socket accepts connections, so the
+    // layout on disk always matches what the first client sees.
     save_session_from_layout(&session_manager, session_id);
 
-    info!("forgetty-daemon started, socket at {}", socket_path.display());
+    info!("forgetty-server started, socket at {}", socket_path.display());
 
     // Per-pane drain tasks are spawned by the SessionManager automatically
     // when each pane is created (via spawn_drain_task inside create_pane /
@@ -591,12 +616,15 @@ async fn main_async() -> anyhow::Result<()> {
     //
     // `forgetty-sync` owns only the pairing ALPN. The terminal streaming ALPN
     // is registered here with a closure that forwards to the terminal-side
-    // handler in `forgetty_daemon::iroh_terminal`, keeping all terminal-
+    // handler in `forgetty_server::iroh_terminal`, keeping all terminal-
     // specific behaviour out of the transport crate.
-    let secret_key = load_or_generate()?;
     let sm_for_alpn = Arc::clone(&session_manager);
+    let rpc_v2 = RpcV2::new(Arc::clone(&session_manager), session_id);
+    let port = args.port.unwrap_or(DEFAULT_PORT);
     let sync_endpoint = match SyncEndpoint::builder(secret_key)
-        .allow_pairing(args.allow_pairing)
+        .bind_port(port)
+        .transport_config(quic_config())
+        .register_alpn(forgetty_proto::ALPN_RPC, rpc_v2.alpn_handler())
         .register_alpn(
             FORGETTY_STREAM_ALPN,
             Arc::new(move |conn, registry| {
@@ -611,8 +639,9 @@ async fn main_async() -> anyhow::Result<()> {
     {
         Ok(ep) => {
             info!(
-                "totem-sync: iroh endpoint bound, node_id={}, alpns=[forgetty/pair/1, forgetty/stream/1]",
-                ep.node_id()
+                "iroh endpoint bound, node_id={}, udp={:?}, alpns=[forgetty/rpc/2, forgetty/pair/2, forgetty/pair/1 (refuses), forgetty/stream/1]",
+                ep.node_id(),
+                ep.bound_sockets()
             );
             Arc::new(ep)
         }
@@ -621,6 +650,10 @@ async fn main_async() -> anyhow::Result<()> {
             return Err(anyhow::anyhow!("iroh bind failed: {e}"));
         }
     };
+
+    rpc_v2.set_sync(Arc::clone(&sync_endpoint));
+    #[cfg(feature = "qa-tools")]
+    forgetty_server::qa_hook::install(Arc::clone(&rpc_v2), Arc::clone(&sync_endpoint));
 
     // Spawn iroh accept loop.
     {
@@ -649,48 +682,31 @@ async fn main_async() -> anyhow::Result<()> {
         _ = sigterm.recv() => { info!("Received SIGTERM"); }
         _ = sigint.recv()  => { info!("Received SIGINT");  }
     }
+    // Freeze the layout before anything else. Children that die with the
+    // server (a signal to the whole group) must not shrink the saved layout.
+    session_manager.begin_shutdown();
 
-    info!("forgetty-daemon shutting down");
-    sync_endpoint.close().await;
-    // V2-007 / AD-013: flush per-pane byte-log ring to disk so reconnecting
-    // clients (and next cold-start) see up-to-date scrollback.
-    session_manager.flush_all_byte_logs().await;
-    info!("byte logs flushed");
-    // P-018 / AD-016: snapshot to active/, then pinned-aware move on signal exit.
-    // Same shape as the in-RPC paths (shutdown_clean/disconnect/shutdown_save):
-    // refresh the active/ file with the latest in-memory state, then move it
-    // out based on pin state.
-    save_session_from_layout(&session_manager, session_id);
-    forgetty_workspace::pinned_aware_exit_move(
-        session_id,
-        session_manager.is_pinned(),
-        "signal exit",
-    );
-    session_manager.kill_all();
-
-    Ok(())
+    info!("forgetty-server shutting down");
+    forgetty_socket::graceful_exit(
+        &session_manager,
+        Some(&sync_endpoint),
+        Some(session_id),
+        &socket_path,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Snapshot the live session layout and write it to `sessions/active/{uuid}.json`.
+/// Snapshot the live session layout and write it to `sessions/{server_id}.json`.
 ///
-/// P-018 / AD-016: live daemons write to the `active/` bucket. The file is
-/// only moved into `sessions/{uuid}.json` (pinned) or `sessions/trash/{uuid}.json`
-/// (unpinned) by the daemon's clean-exit path (see `pinned_aware_exit_move`
-/// in `forgetty-socket`).
-///
-/// This is the single call site used by all three save triggers (SIGTERM/SIGINT
-/// shutdown, debounced auto-save, and the periodic safety save). Save failures
-/// are non-fatal: a warning is logged but no error is propagated.
+/// Used by the layout-event watcher, the debounce task and the periodic safety
+/// save. Failures are logged and never propagated.
 fn save_session_from_layout(session_manager: &SessionManager, session_id: uuid::Uuid) {
-    let state = session_manager.snapshot_to_workspace_state();
-    match forgetty_workspace::move_to_active(session_id, &state) {
-        Ok(()) => debug!(session_id = %session_id, "daemon: session layout saved to active/"),
-        Err(e) => warn!("daemon: failed to save session layout: {e}"),
-    }
+    forgetty_socket::save_layout(session_manager, session_id);
+    debug!(session_id = %session_id, "server: session layout saved");
 }
 
 /// Return the CWD of the leftmost (first) leaf in a `PaneTreeState`.
@@ -811,6 +827,58 @@ fn restore_subtree(
                 Err(e) => {
                     warn!("cold-start restore: split_pane_with_ratio failed: {e}");
                 }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One test mutates XDG_DATA_HOME; keep the mutations in a single test.
+    #[test]
+    fn server_id_is_stable_and_lock_is_exclusive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prior = std::env::var_os("XDG_DATA_HOME");
+        // SAFETY: this is the only test in this crate that touches the environment.
+        unsafe { std::env::set_var("XDG_DATA_HOME", tmp.path()) };
+
+        let state = lock_state_dir().unwrap();
+        let first = load_or_create_server_id(&state).unwrap();
+        let second = load_or_create_server_id(&state).unwrap();
+        assert_eq!(first, second, "the id survives a restart");
+
+        let lock = acquire_instance_lock(first).unwrap();
+        let err = acquire_instance_lock(first).unwrap_err();
+        assert!(err.to_string().contains("already running"));
+        assert!(err.downcast_ref::<AlreadyRunning>().is_some());
+        drop(lock);
+        assert!(acquire_instance_lock(first).is_ok(), "lock is free after the holder exits");
+
+        // A corrupt id file is an error. It is not replaced and the file is untouched.
+        let id_path = forgetty_core::platform::data_dir().join("server_id");
+        std::fs::write(&id_path, "garbage").unwrap();
+        let err = load_or_create_server_id(&state).unwrap_err();
+        assert!(err.to_string().contains("corrupt"), "{err}");
+        assert_eq!(std::fs::read_to_string(&id_path).unwrap(), "garbage");
+
+        // The state lock is exclusive between processes: a second lock attempt
+        // from another open file description blocks, so test it with flock(2).
+        {
+            use std::os::unix::io::AsRawFd;
+            let other =
+                std::fs::File::open(forgetty_core::platform::data_dir().join("server.lock"))
+                    .unwrap();
+            // SAFETY: valid fd, no pointers.
+            let rc = unsafe { libc::flock(other.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            assert_ne!(rc, 0, "server.lock is held while the StateLock lives");
+        }
+
+        unsafe {
+            match prior {
+                Some(p) => std::env::set_var("XDG_DATA_HOME", p),
+                None => std::env::remove_var("XDG_DATA_HOME"),
             }
         }
     }

@@ -29,6 +29,10 @@ pub struct WorkspaceState {
     /// Old session files without this field default to `false`.
     #[serde(default)]
     pub pinned: bool,
+    /// Panes created with `remain_on_exit` (`forgetty new --keep`). Such a pane
+    /// stays listed after its process exits. Old files default to empty.
+    #[serde(default)]
+    pub remain_on_exit_panes: Vec<Uuid>,
 }
 
 /// A single workspace — a named group of tabs rooted in one or more directories.
@@ -108,6 +112,7 @@ impl WorkspaceState {
             window_width: None,
             window_height: None,
             pinned: false,
+            remain_on_exit_panes: Vec::new(),
         }
     }
 }

@@ -1,4 +1,4 @@
-//! `forgetty_daemon` — library half of the `forgetty-daemon` crate.
+//! `forgetty_server` — library half of the `forgetty-server` crate.
 //!
 //! Under V2-011 (AD-015) the daemon binary owns the terminal-specific iroh
 //! stream handler. Exposing it from a library target lets QA binaries
@@ -11,3 +11,10 @@
 //! package.
 
 pub mod iroh_terminal;
+
+pub mod sockpath;
+
+pub mod rpc_v2;
+
+#[cfg(feature = "qa-tools")]
+pub mod qa_hook;

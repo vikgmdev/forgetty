@@ -14,8 +14,10 @@
 pub mod framing;
 pub mod handlers;
 pub mod protocol;
+#[cfg(feature = "qa-tools")]
+pub mod qa;
 pub mod server;
 
 pub use handlers::dispatch;
 pub use protocol::{Request, Response};
-pub use server::SocketServer;
+pub use server::{add_shutdown_hook, graceful_exit, save_layout, SocketServer};

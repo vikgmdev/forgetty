@@ -145,7 +145,7 @@ Starts:
   4. Auto-save timer (every 30s, atomic write)
 ```
 
-**systemd user service** (`dist/linux/forgetty-daemon.service`):
+**systemd user service** (`dist/systemd/forgetty-server.service`):
 ```ini
 [Unit]
 Description=Forgetty terminal session daemon

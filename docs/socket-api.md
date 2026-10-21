@@ -55,58 +55,39 @@ file.
 
 ## 2. Connection
 
-The daemon binds to
-`$XDG_RUNTIME_DIR/forgetty-{session_uuid}.sock`,
-falling back to `/tmp/forgetty-{session_uuid}.sock` when `XDG_RUNTIME_DIR`
-is unset.
+The server binds to `$XDG_RUNTIME_DIR/forgetty/forgetty.sock`. When
+`XDG_RUNTIME_DIR` is unset it uses `/tmp/forgetty-<uid>/forgetty.sock`.
 
-Access control is provided by the **parent directory**, not by the socket
-file's own mode. `$XDG_RUNTIME_DIR` is mode `0700` per the XDG Base
-Directory spec — only the owning user can traverse into it, so only the
-owner can reach the socket. The daemon does not `chmod` the socket file
-itself; its mode is whatever `UnixListener::bind` produces under the
-current umask (typically `0775` or `0664`, *not* `0600`). Any local
-process running as the user can connect — this is intentional (it is what
-enables `socat`, scripts, and agents to drive the daemon). The socket has
+Access control (local socket squatting defence):
+
+- The socket directory is created with mode `0700`. The server refuses to
+  start if the directory exists and is not owned by the current uid, is a
+  symlink, or has any group or other permission bit.
+- The socket file is set to mode `0600` right after `bind`.
+- The server checks `SO_PEERCRED` on every accepted connection and drops any
+  peer whose uid is not the server's uid. Nothing is read from that peer.
+- The `forgetty` CLI checks that the socket file is owned by the current uid
+  (and is not a symlink) before it connects, and refuses otherwise.
+
+Any process running as the same user can connect. This is intentional: it is
+what enables `socat`, scripts and agents to drive the server. The socket has
 no network exposure.
 
-**`/tmp` fallback is weaker.** When `$XDG_RUNTIME_DIR` is unset (rare;
-common on some non-systemd setups), the socket lives in `/tmp`, which is
-mode `1777` — sticky but world-traversable. Any local user on the machine
-could connect to the socket in that configuration. Ensure `XDG_RUNTIME_DIR`
-is set in your environment (systemd user sessions and most desktop
-environments set it automatically) so the production path is used.
-
-`{session_uuid}` is a v4 UUID generated at daemon startup (or passed via
-`--session-id`). The daemon logs its full socket path on startup:
-
-```
-INFO forgetty-daemon started, socket at /run/user/1000/forgetty-<uuid>.sock
-```
+The server logs its socket path on startup.
 
 ### Discovery
 
 ```sh
-# Enumerate running daemons for this user:
-ls -t "$XDG_RUNTIME_DIR"/forgetty-*.sock
-
-# Pick the most recent:
-SOCK=$(ls -t "$XDG_RUNTIME_DIR"/forgetty-*.sock | head -n1)
+SOCK="${XDG_RUNTIME_DIR:-/tmp/forgetty-$(id -u)}/forgetty/forgetty.sock"
 ```
+
+`forgetty --state-dir DIR` places the socket under `DIR/run/forgetty/`.
 
 ### Overriding the path
 
-`forgetty-daemon --socket-path <PATH>` overrides the default location.
-Parent directories are created on first bind; any stale socket file at the
+`forgetty server run --socket-path <PATH>` overrides the default location.
+The caller owns the safety of a custom directory. Any stale socket file at the
 target path is removed before re-binding.
-
-### Legacy path (tests only)
-
-`SocketServer::new()` — constructed without a session UUID — binds to
-`$XDG_RUNTIME_DIR/forgetty.sock`. This constructor is used only by
-`forgetty-socket`'s round-trip unit test; the production daemon always
-takes the `{session_uuid}` path described above. Do not rely on the legacy
-path from scripts.
 
 ---
 
@@ -142,9 +123,9 @@ Most methods are request/response and stay in line-JSON mode forever.
    that connection. Any write activity from the client (including the half-
    close that produces EOF) terminates the subscription. To issue additional
    requests while subscribed, open a second connection.
-5. `disconnect`, `shutdown`, `shutdown_save`, and `shutdown_clean` are
-   terminal RPCs: the daemon writes the response line, then either closes the
-   connection (`disconnect`) or exits the process (`shutdown*`).
+5. Only `shutdown` ends the server (P1, AD-017). `disconnect`,
+   `shutdown_save` and `shutdown_clean` are compat calls that make state
+   durable and return `ok`. The server keeps running.
 
 ---
 
@@ -211,8 +192,18 @@ workspaces. Despite the name, this is a pane list, not a tab list; prefer
 **Result:**
 ```json
 {"tabs":[{"pane_id":"<uuid>","pid":12345,"rows":24,"cols":80,
-         "cwd":"/home/user","title":"zsh"}]}
+         "cwd":"/home/user","spawn_cwd":"/home/user","title":"zsh",
+         "remain_on_exit":false,"exited":false,"exit_code":null}]}
 ```
+
+`cwd` is a display hint: the directory the shell reported with OSC 7, accepted
+only when its host is empty, `localhost` or the local host name, else the real
+directory. `spawn_cwd` is always the real directory (`/proc/<pid>/cwd` of the
+pane's foreground process group leader, else of the shell). New tabs and splits
+start in `spawn_cwd`; pane output cannot choose it.
+
+`exited` is true only for a pane kept with `remain_on_exit` whose process has
+ended. `exit_code` is then the process exit code (`null` if unknown).
 
 #### `get_layout`
 
@@ -250,6 +241,7 @@ default size; returns both the new tab UUID and the root pane UUID.
 | `cols` | number | no | PTY columns; defaults to `80`. |
 | `cwd` | string | no | Starting directory; silently ignored if not a directory. |
 | `command` | string[] | no | Profile command argv; empty array ignored. |
+| `remain_on_exit` | bool | no | Default `false`: the pane closes when its process exits. When `true` the pane stays listed with `exited: true` and `exit_code`, shows the exit status, and is removed by `close_pane`. Stored in the session file, so it survives server restarts. |
 
 **Result:** `{"tab_id":"<uuid>","pane_id":"<uuid>"}`
 
@@ -372,7 +364,7 @@ Return metadata for a live pane.
 **Params:** `{"pane_id":"<uuid>"}` (required).
 
 **Result:** `{"pane_id":"<uuid>","rows":24,"cols":80,
-              "title":"<string>","cwd":"<path>","pid":<number>}`
+              "title":"<string>","cwd":"<path>","spawn_cwd":"<path>","pid":<number>}`
 
 #### `resize_pane`
 
@@ -421,6 +413,60 @@ that swallow `0x03` without acting on it (Node.js, pm2 — BUG-001).
 **Params:** `{"pane_id":"<uuid>"}` (required).
 
 **Result:** `{"ok":true}`
+
+#### `pane_exit_status`
+
+Exit status of a pane process, live or already closed. The server records the
+exit code of every pane process (last 1024 kept).
+
+**Params:** `{"pane_id":"<uuid>"}`
+
+**Result:** `{"running":false,"exit_code":5}`. While the process runs it is
+`{"running":true,"exit_code":null}`. An id the server never knew returns an
+error.
+
+#### `capture`
+
+Visible screen of a pane as text (AD-019, cold path). The server builds a
+`forgetty-vt` terminal from the pane's byte-log ring at the pane's current size,
+reads the screen and drops the terminal. Nothing runs on the PTY drain path. It
+works after a server restart, because the ring is reloaded from the disk log.
+
+**Params:** `{"pane_id":"<uuid>","trim":false,"last_lines":null}`
+
+| Field | Type | Description |
+|---|---|---|
+| `pane_id` | string | required |
+| `trim` | bool | Remove trailing whitespace from every line and trailing blank lines. Default `false`. |
+| `last_lines` | number | Keep only the last N lines (after `trim`). Default: all rows. |
+
+**Result:** `{"text":"line 1\nline 2"}` (one line per screen row, joined by `\n`).
+
+**Errors:** unknown pane, or `last_lines` not a non-negative integer.
+
+#### Pane state in `list_tabs` and `get_pane_info`
+
+Both carry, per pane, what the OSC scanner (AD-019) found in the output:
+
+| Field | Description |
+|---|---|
+| `title` | Last OSC 0 or 2 title (sanitised, 256 chars at most). |
+| `cwd` | Last OSC 7 directory. Once a pane has reported one it wins over `/proc/<pid>/cwd`. |
+| `status` | `{ "status", "message", "kind", "progress", "app", "record_id" }` from OSC 7501. |
+| `last_notification` | `{ "title", "body", "at_ms" }` of the last OSC 9, 99 or 777 notification, else `null`. |
+
+`status.status` is `idle` (default, also when nothing was reported), `working`,
+`waiting`, `done` or `failed`. The wire names of the Program Status Protocol map
+as `blocked` to `waiting` and `error` to `failed`. With several records
+(`id=`), the pane shows the most urgent one: waiting, failed, working, done,
+idle. `working` and `waiting` records end when the process exits or a new shell
+prompt begins (OSC 133 `A`). `done` and `failed` stay.
+
+All text is untrusted and sanitised before it is stored: control characters and
+bidi overrides removed, length capped. An OSC 7501 report with a control
+character in `msg` or `title`, or one over the limits of the protocol, is
+discarded whole. The scanner buffers at most 4 KiB per sequence and discards
+longer ones. Notifications are limited to 10 per second per pane.
 
 ### 5.3 Streaming
 
@@ -496,6 +542,20 @@ client, no `id` in the message):
 | `pane_split` | `{"tab_id":"<uuid>","parent_pane_id":"<uuid>","new_pane_id":"<uuid>","direction":"horizontal"\|"vertical"}` |
 | `tab_moved` | `{"workspace_idx":<n>,"tab_id":"<uuid>","new_index":<n>}` |
 | `active_tab_changed` | `{"workspace_idx":<n>,"tab_idx":<n>}` |
+| `active_workspace_changed`, `workspace_created`, `workspace_renamed`, `workspace_deleted`, `workspace_color_changed`, `workspaces_reordered`, `active_pane_changed` | see the layout methods |
+| `pane_created` | `{"pane_id":"<uuid>"}` |
+| `pane_exited` | `{"pane_id":"<uuid>","exit_code":<n>\|null}`, sent before `pane_closed` (and alone for a kept pane) |
+| `pane_closed` | `{"pane_id":"<uuid>"}` |
+| `title_changed` | `{"pane_id":"<uuid>","title":"..."}` |
+| `cwd_changed` | `{"pane_id":"<uuid>","cwd":"/path"}` |
+| `status_changed` | `{"pane_id":"<uuid>","status":"waiting","message":"..."\|null}`, only when the pane status really changes |
+| `notification` | `{"pane_id":"<uuid>","title":"..."\|null,"body":"..."}` |
+
+`pane_closed`, `title_changed`, `cwd_changed` and `status_changed` are the
+snake_case forms of the PROTOCOL_V2 `ServerEvent` names (`PaneClosed`,
+`TitleChanged`, `CwdChanged`, `StatusChanged`). `pane_created`, `pane_exited`
+and `notification` exist on the local socket only for now. `forgetty events
+--json` prints each notification as `{"event":"StatusChanged", ...params}`.
 
 Example emitted line — on the wire this is a single line terminated by
 `\n`; wrapped here for readability:
@@ -507,16 +567,10 @@ Example emitted line — on the wire this is a single line terminated by
  "params":{"workspace_idx":0,"tab_id":"<uuid>","pane_id":"<uuid>"}}
 ```
 
-**Known limitations.** The subscription does not currently emit events for
-pane-closure (there is no pane_closed notification) or workspace lifecycle
-events such as workspace_created or workspace_switched. The underlying
-broadcast channel inside the daemon does carry `PaneCreated`, `PaneClosed`,
-and `Notification` events, but the `subscribe_layout` handler intentionally
-filters to the five layout events above. To detect pane closure or
-workspace changes, call `get_layout` on a new connection when you need a
-fresh snapshot, or open an additional subscription. This is the current
-shape of the API, not a permanent contract — a future task may broaden the
-event set.
+**Slow readers.** The events share the server's broadcast channel with PTY
+output. A reader that falls far behind can miss events. `forgetty wait`
+re-checks `get_pane_info` every 2 s for that reason. A client that must not
+miss a state change should do the same.
 
 **Pipelining contract.** After the ack, the connection is
 server-to-client only: the daemon stops reading the client's write half,
@@ -551,15 +605,20 @@ List paired devices (from `authorized_devices.json`).
 
 #### `revoke_device`
 
-Remove a paired device. Live streams from that device are cut immediately
-and a `DeviceRevoked` event is emitted on the local sync event channel.
+Remove a paired device. Every open connection of that device, on every ALPN
+(pairing, `forgetty/stream/1`, `forgetty/rpc/2` and any later protocol), is
+closed at once with application code 403 `device-revoked`. It leaves the client registry
+(`list_clients`) and a `DeviceRevoked` event is emitted on the local sync event
+channel. Connections are closed even if the device was no longer in the
+registry.
 
 **Request:** `{"jsonrpc":"2.0","method":"revoke_device","params":{"device_id":"<id>"},"id":1}`
 
 **Params:** `{"device_id":"<id>"}` (required).
 
-**Result:** `{"ok":<bool>}` — `true` if the device was in the registry,
-`false` if not found.
+**Result:** `{"ok":<bool>,"closed_connections":<n>}` — `ok` is `true` if the
+device was in the registry, `false` if not found. `closed_connections` is the
+number of live connections that were closed.
 
 #### `get_pairing_info`
 
@@ -568,23 +627,34 @@ host machine name, along with a PNG of the QR code.
 
 **Request:** `{"jsonrpc":"2.0","method":"get_pairing_info","id":1}`
 
-**Params:** none.
+**Params:** none. Opens a pairing window (see `pair_open`): the QR carries a one-time secret.
 
 **Result:**
 ```json
 {"node_id":"<hex>","machine":"<hostname>","qr_png_base64":"<base64 PNG>"}
 ```
 
-#### `enable_pairing`
+#### `pair_open`
 
-Open a time-limited pairing window. During the window, the daemon accepts
-one inbound pair handshake from an unknown device.
+AD-021. Open a pairing window with a fresh one-time secret. The window lasts
+60 s by default and accepts one device on ALPN `forgetty/pair/2`. A new call
+replaces the open window. `enable_pairing` is removed.
 
-**Request:** `{"jsonrpc":"2.0","method":"enable_pairing","params":{"secs":120},"id":1}`
+**Request:** `{"jsonrpc":"2.0","method":"pair_open","params":{"ttl_secs":60},"id":1}`
 
-**Params:** `{"secs":<number>}` (optional; defaults to `120`).
+**Params:** `{"ttl_secs":<number>}` (optional; default 60, max 600).
 
-**Result:** `{"ok":true,"secs":<number>}`
+**Result:**
+```json
+{"window_id":1,"ttl_secs":60,
+ "payload":{"v":2,"node_id":"<hex>","machine":"<hostname>","relay":"<url>","secret":"<base32>"}}
+```
+
+#### `pair_status`
+
+Poll a window. **Params:** `{"window_id":<number>}`.
+**Result:** `{"state":"open","secs_left":<n>}`,
+`{"state":"paired","device_id":"<hex>","name":"<label>"}` or `{"state":"expired"}`.
 
 ### 5.5 Notifications
 
@@ -608,92 +678,68 @@ state, emit broadcast events, or touch the sync endpoint.
 
 **Result:** `{"ok":true}`
 
-### 5.6 Pinning
+### 5.6 Pinning (removed, compat no-ops)
 
-#### `set_pinned`
+AD-017: every session is durable, so there is nothing to pin.
 
-Mark the session as pinned (persists across `shutdown_clean`; pinned
-sessions are not moved to trash).
-
-**Request:** `{"jsonrpc":"2.0","method":"set_pinned","params":{"pinned":true},"id":1}`
-
-**Params:** `{"pinned":<bool>}` (required).
-
-**Result:** `{"ok":true}`
-
-#### `get_pinned`
-
-Return the current pinned state.
-
-**Request:** `{"jsonrpc":"2.0","method":"get_pinned","id":1}`
-
-**Params:** none.
-
-**Result:** `{"pinned":<bool>}`
+- `set_pinned` returns `{"ok":true}` and changes nothing.
+- `get_pinned` returns `{"pinned":false}`.
 
 ### 5.7 Lifecycle
 
-The four shutdown modes and `disconnect` are summarised in this table. All
-are terminal: the daemon sends its ack line before acting.
+AD-017: one durable server per user. A client disconnect, from the socket or
+iroh, never ends a pane or the server. Only `shutdown` stops the server.
 
-| Method | Saves session file? | Moves to trash? | Kills PTYs? | Daemon exits? |
-|---|---|---|---|---|
-| `disconnect` | yes | no | no | no |
-| `shutdown` | no | no | yes | yes |
-| `shutdown_save` | yes | no | yes | yes |
-| `shutdown_clean` | yes | unless pinned | yes | yes |
-
-#### `disconnect`
-
-V2-005 / AD-012: the client connection goes away but the daemon keeps
-running with all PTYs alive. The daemon flushes byte logs, saves the
-session file, and drops the connection. The `UnixListener` keeps accepting
-new connections.
-
-**Request:** `{"jsonrpc":"2.0","method":"disconnect","id":1}`
-
-**Params:** none.
-
-**Result:** `{"ok":true}` (written before the connection closes).
-
-**Notes:** use `disconnect` when you want to drop your connection but
-leave the session alive for reattachment; use `shutdown_save` when you
-want a normal close with persistence (session saved, daemon exits).
+| Method | Saves layout and byte logs? | Exits? |
+|---|---|---|
+| `disconnect`, `shutdown_save`, `shutdown_clean` | yes | no (compat) |
+| `shutdown` | yes | yes |
 
 #### `shutdown`
 
-Permanent close: daemon exits immediately without saving. Use for
-explicit "quit" from the UI when the user does not want the session
-restored.
+Graceful stop: flush byte logs, save `sessions/<server_id>.json`, close the
+iroh endpoint, remove the socket, exit. The ack line is written first.
 
-**Request:** `{"jsonrpc":"2.0","method":"shutdown","id":1}`
+**Request:** `{"jsonrpc":"2.0","method":"shutdown","params":{"if_idle":true},"id":1}`
 
-**Params:** none.
-
-**Result:** `{"ok":true}` (written before `std::process::exit(0)`).
-
-#### `shutdown_save`
-
-Normal close: daemon flushes byte logs, saves the session JSON, and
-exits. The next launch will restore this session.
-
-**Request:** `{"jsonrpc":"2.0","method":"shutdown_save","id":1}`
-
-**Params:** none.
+**Params:** `{"if_idle":<bool>}` (optional). With `if_idle`, the call fails with
+code `-32001` and message `N client(s) attached` while any client is attached
+(see `list_clients`). The idle check and the switch to the stopping state are
+one atomic step: once a stop begins, `subscribe_output`, `subscribe_layout` and
+iroh streams are refused with `server is stopping`. A refused `if_idle` stop
+leaves the server open.
 
 **Result:** `{"ok":true}`
 
-#### `shutdown_clean`
-
-Browser-model close: daemon flushes byte logs, saves the session JSON,
-moves the session JSON to trash, and exits. If the session is pinned
-(see `set_pinned`), the trash step is skipped.
-
-**Request:** `{"jsonrpc":"2.0","method":"shutdown_clean","id":1}`
+#### `server_info`
 
 **Params:** none.
 
-**Result:** `{"ok":true}`
+**Result:**
+```json
+{"version":"0.1.0-beta","proto_major":2,"proto_minor":0,"proto_version":"2.0",
+ "server_id":"<uuid>","pid":1234,"uptime_secs":60,"panes":3,"clients":1,
+ "node_id":"<hex or null>"}
+```
+
+The CLI warns on stderr when `version` differs from its own.
+
+#### `list_clients`
+
+Attached clients: iroh connections (`forgetty/stream/1` and `forgetty/rpc/2`)
+and sockets that are streaming (`subscribe_output`, `subscribe_layout`). Short
+request/response sockets are not clients. A v2 client appears for as long as its
+connection lives and is counted once per `client_id`. Over v2 the same method
+returns the array of client entries directly.
+
+**Params:** none.
+
+**Result:** `{"clients":[{"client_id":"<id>","client_kind":"stream1"|"socket","client_name":"<label>","connected_at":<unix secs>}]}`
+
+#### `disconnect`, `shutdown_save`, `shutdown_clean`
+
+Compat. Flush byte logs, save the layout, return `{"ok":true}`. The server and
+all PTYs keep running.
 
 #### `is_attached`
 
@@ -715,6 +761,19 @@ reattach.
 
 ---
 
+### 5.8 Protocol v2 and test methods
+
+`forgetty/rpc/2` Control requests use the methods in this chapter through the
+same dispatch table. Error codes map to `unknown_method`, `not_found`,
+`bad_request` and `internal`. `send_input`, `resize_pane`, `list_clients` and
+`subscribe_events` have v2 forms of their own, and `pair_*` and
+`get_pairing_info` are not available over v2.
+
+A server built with `--features qa-tools` also answers `qa_*` methods on the
+local socket (`qa_state`, `qa_drop_connections`, `qa_hold_acks`, `qa_append`,
+`qa_read_log` and others). The client test suites use them. A normal build
+returns "method not found".
+
 ## 6. Errors
 
 Error responses follow JSON-RPC 2.0:
@@ -735,7 +794,7 @@ The daemon emits exactly these five codes:
 
 **R-2 note.** Code `-32601` is overloaded: the daemon returns it both for
 unknown method names *and* for sync-dependent RPCs (`list_devices`,
-`revoke_device`, `get_pairing_info`, `enable_pairing`) when the iroh
+`revoke_device`, `get_pairing_info`, `pair_open`) when the iroh
 endpoint is not available. Callers should use the `error.message` text to
 disambiguate: `"sync endpoint not available ..."` for the latter vs.
 `"Unknown method: ..."` for the former.

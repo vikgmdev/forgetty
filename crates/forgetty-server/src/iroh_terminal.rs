@@ -285,7 +285,7 @@ fn build_pane_list(sm: &SessionManager) -> Vec<WirePaneInfo> {
             sm.pane_info(pid).map(|info| WirePaneInfo {
                 id: pid.to_string(),
                 title: info.title,
-                cwd: info.cwd.to_string_lossy().into_owned(),
+                cwd: info.display_cwd,
                 git_branch: String::new(),
                 running_cmd: String::new(),
                 is_active: active_pane_ids.contains(&pid),
@@ -336,6 +336,20 @@ pub async fn handle_terminal_stream(
 
     info!("stream: authorized device {device_id} connected");
 
+    // AD-017: this connection is an attached client until it ends. The guard
+    // drops on every exit path of this function.
+    let device_name = {
+        let reg = registry.lock().unwrap();
+        reg.list().iter().find(|d| d.device_id == device_id).map(|d| d.name.clone())
+    };
+    let Ok(_client) =
+        sm.clients().register(device_id.clone(), "stream1", device_name.unwrap_or_default())
+    else {
+        info!("stream: device {device_id} refused, server is stopping");
+        conn.close(2u8.into(), b"server-stopping");
+        return;
+    };
+
     // --- Accept bi-directional streams (one per operation) ---
     loop {
         let (send, recv) = match conn.accept_bi().await {
@@ -373,8 +387,8 @@ async fn handle_single_stream(
             handle_subscribe_stream(send, recv, sm, device_id, pane_id_str).await;
         }
 
-        Some(other) => {
-            warn!("stream: unexpected first message {:?} from {device_id}", other);
+        Some(_) => {
+            warn!("stream: unexpected first message type from {device_id}");
             let _ = write_msg(
                 &mut send,
                 &DaemonMsg::Error {
@@ -472,7 +486,7 @@ async fn handle_subscribe_stream(
                             .map(PaneId)
                             .unwrap_or(pane_id);
                         if let Err(e) = sm.write_pty(target, &data) {
-                            warn!("stream: write_pty failed for {pid_str}: {e}");
+                            warn!("stream: write_pty failed for pane {target}: {e}");
                         }
                     }
                     Some(ClientMsg::Subscribe { .. }) | Some(ClientMsg::ListPanes) => {

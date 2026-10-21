@@ -8,12 +8,23 @@ description = "Platform-agnostic session manager for Forgetty terminal panes"
 [dependencies]
 forgetty-core = { path = "../forgetty-core" }
 forgetty-pty = { path = "../forgetty-pty" }
+forgetty-vt = { path = "../forgetty-vt" }
 forgetty-workspace = { path = "../forgetty-workspace" }
 tokio = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 bytes = "1"
+memchr = "2"
+base64 = "0.22"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bench]]
+# AD-019: OSC scanner cost against the drain path (target: under 1 %).
+name = "osc_scanner"
+harness = false

@@ -56,6 +56,9 @@ pub struct SocketServer {
     /// Session UUID — used by `shutdown_save` to write the correct session file.
     /// `None` in test/legacy contexts where session_id is not relevant.
     session_id: Option<uuid::Uuid>,
+    /// Only peers with this uid are served. `None` means this process's uid.
+    /// Tests set another uid to simulate a foreign user.
+    allowed_uid: Option<u32>,
 }
 
 impl SocketServer {
@@ -71,7 +74,7 @@ impl SocketServer {
     ///
     /// Removes any stale socket file and creates the parent directory if
     /// needed. Use this when the caller needs to override the default path
-    /// (e.g., `forgetty-daemon --socket-path`).
+    /// (e.g., `forgetty-server --socket-path`).
     pub fn new_with_path(socket_path: PathBuf) -> std::io::Result<Self> {
         // Remove stale socket file if it exists.
         if socket_path.exists() {
@@ -83,7 +86,7 @@ impl SocketServer {
             std::fs::create_dir_all(parent)?;
         }
 
-        Ok(Self { socket_path, session_id: None })
+        Ok(Self { socket_path, session_id: None, allowed_uid: None })
     }
 
     /// Create a new server bound to an explicit socket path with a session UUID.
@@ -94,6 +97,15 @@ impl SocketServer {
         let mut server = Self::new_with_path(socket_path)?;
         server.session_id = Some(session_id);
         Ok(server)
+    }
+
+    /// Serve only peers with this uid instead of the current uid.
+    ///
+    /// For tests: it lets a same-user client act as a foreign user, so the
+    /// refusal path can be exercised without switching accounts.
+    pub fn restrict_to_uid(mut self, uid: u32) -> Self {
+        self.allowed_uid = Some(uid);
+        self
     }
 
     /// Get the socket path.
@@ -115,13 +127,18 @@ impl SocketServer {
         F: Fn(Request) -> Response + Send + Sync + 'static,
     {
         let listener = UnixListener::bind(&self.socket_path)?;
+        restrict_socket(&self.socket_path)?;
         info!("Socket server listening on {:?}", self.socket_path);
 
         let handler = Arc::new(handler);
+        let allowed_uid = self.allowed_uid;
 
         loop {
             match listener.accept().await {
                 Ok((stream, _addr)) => {
+                    if !peer_is_allowed(&stream, allowed_uid) {
+                        continue;
+                    }
                     debug!("Accepted socket connection");
                     let handler = Arc::clone(&handler);
                     tokio::spawn(async move {
@@ -156,9 +173,13 @@ impl SocketServer {
         sync_endpoint: Option<Arc<SyncEndpoint>>,
     ) -> std::io::Result<()> {
         let listener = UnixListener::bind(&self.socket_path)?;
+        restrict_socket(&self.socket_path)?;
         info!("Socket server listening on {:?}", self.socket_path);
 
+        handlers::mark_started();
         let session_id = self.session_id;
+        let allowed_uid = self.allowed_uid;
+        let socket_path = self.socket_path.clone();
         // Shared live-connection counter, used by `is_attached` to tell
         // "daemon orphaned after V2-005 disconnect" from "daemon actively
         // serving a GUI". One counter per server; incremented per spawned
@@ -167,14 +188,25 @@ impl SocketServer {
         loop {
             match listener.accept().await {
                 Ok((stream, _addr)) => {
+                    if !peer_is_allowed(&stream, allowed_uid) {
+                        continue;
+                    }
                     debug!("Accepted socket connection");
                     let sm = Arc::clone(&sm);
                     let se = sync_endpoint.as_ref().map(Arc::clone);
                     let counter = Arc::clone(&conn_counter);
+                    let socket_path = socket_path.clone();
                     tokio::spawn(async move {
                         let _guard = ConnGuard::new(Arc::clone(&counter));
-                        if let Err(e) =
-                            handle_streaming_connection(stream, sm, se, session_id, counter).await
+                        if let Err(e) = handle_streaming_connection(
+                            stream,
+                            sm,
+                            se,
+                            session_id,
+                            counter,
+                            socket_path,
+                        )
+                        .await
                         {
                             warn!("Connection error: {e}");
                         }
@@ -259,6 +291,7 @@ async fn handle_streaming_connection(
     sync_endpoint: Option<Arc<SyncEndpoint>>,
     session_id: Option<uuid::Uuid>,
     conn_counter: Arc<AtomicUsize>,
+    socket_path: PathBuf,
 ) -> std::io::Result<()> {
     let (reader, mut writer) = stream.into_split();
     // V2-007 fix cycle 3: hold `BufReader<OwnedReadHalf>` as a reusable
@@ -361,6 +394,20 @@ async fn handle_streaming_connection(
             // unnecessary. See V2-007 BUILDER_NOTES §"Fix cycle 6".
             // ---------------------------------------------------------------
             let (mut rx, replay_bytes, _replay_hwm) = sm.subscribe_with_snapshot(pane_id);
+            // AD-017: a streaming socket is an attached client until it closes.
+            let Ok(_client) = sm.clients().register(
+                uuid::Uuid::new_v4().to_string(),
+                "socket",
+                format!("subscribe_output {pane_id}"),
+            ) else {
+                let resp = Response::error(
+                    request.id.clone(),
+                    crate::protocol::SERVER_BUSY,
+                    "server is stopping".to_string(),
+                );
+                write_response(&mut writer, &resp).await?;
+                return Ok(());
+            };
 
             // Send the initial acknowledgment (last line-mode JSON response
             // on this connection).
@@ -463,6 +510,19 @@ async fn handle_streaming_connection(
             // Reuse the same broadcast channel as subscribe_output; we filter
             // to layout variants in the loop below.
             let mut rx = sm.subscribe_output();
+            let Ok(_client) = sm.clients().register(
+                uuid::Uuid::new_v4().to_string(),
+                "socket",
+                "subscribe_layout".to_string(),
+            ) else {
+                let resp = Response::error(
+                    request.id.clone(),
+                    crate::protocol::SERVER_BUSY,
+                    "server is stopping".to_string(),
+                );
+                write_response(&mut writer, &resp).await?;
+                return Ok(());
+            };
 
             // Send the initial acknowledgment.
             let ack = Response::success(request.id.clone(), serde_json::json!({ "ok": true }));
@@ -757,9 +817,31 @@ async fn handle_streaming_connection(
                                     break;
                                 }
                             }
+                            Ok(ev @ (SessionEvent::PaneCreated { .. }
+                                | SessionEvent::PaneClosed { .. }
+                                | SessionEvent::PaneExited { .. }
+                                | SessionEvent::TitleChanged { .. }
+                                | SessionEvent::CwdChanged { .. }
+                                | SessionEvent::StatusChanged { .. }
+                                | SessionEvent::Notification { .. })) => {
+                                // P-010: pane lifecycle events used to be dropped
+                                // here. AD-019 adds the pane metadata events.
+                                // Names follow PROTOCOL_V2 `ServerEvent` in
+                                // snake_case (`pane_closed` = `PaneClosed`).
+                                if let Some(notification) = pane_event_notification(&ev) {
+                                    let mut out = serde_json::to_string(&notification)
+                                        .unwrap_or_else(|_| "{}".to_string());
+                                    out.push('\n');
+                                    if writer.write_all(out.as_bytes()).await.is_err() {
+                                        break;
+                                    }
+                                    if writer.flush().await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
                             Ok(_) => {
-                                // Output events (PtyOutput, PaneCreated, PaneClosed,
-                                // Notification) are not forwarded to subscribe_layout clients.
+                                // PtyOutput is not forwarded to subscribe_layout clients.
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                                 // Consumer fell behind; continue from here.
@@ -806,33 +888,40 @@ async fn handle_streaming_connection(
             request.method.as_str(),
             methods::SHUTDOWN_SAVE | methods::SHUTDOWN_CLEAN | methods::DISCONNECT
         ) {
-            let caller: &'static str = match request.method.as_str() {
-                methods::SHUTDOWN_SAVE => "shutdown_save",
-                methods::SHUTDOWN_CLEAN => "shutdown_clean",
-                _ => "disconnect",
-            };
-            info!("Received {caller} RPC — pinned-aware close, exiting");
+            // AD-017: a client leaving never ends the server. These legacy
+            // methods now only make the state durable.
             sm.flush_all_byte_logs().await;
-            info!("{caller}: byte logs flushed");
             if let Some(sid) = session_id {
-                let state = sm.snapshot_to_workspace_state();
-                if let Err(e) = forgetty_workspace::move_to_active(sid, &state) {
-                    warn!("{caller}: failed to refresh active/{sid}.json: {e}");
-                }
-                forgetty_workspace::pinned_aware_exit_move(sid, sm.is_pinned(), caller);
+                save_layout(&sm, sid);
             }
-            // Ack only after the file move has committed.
             let resp = Response::success(request.id.clone(), serde_json::json!({ "ok": true }));
             write_response(&mut writer, &resp).await?;
-            std::process::exit(0);
+            continue;
         }
 
         if request.method == methods::SHUTDOWN {
-            // Acknowledge before exiting so the client doesn't see a broken pipe.
+            let if_idle = request.params.get("if_idle").and_then(|v| v.as_bool()).unwrap_or(false);
+            // Enter the stopping state BEFORE answering. For --if-idle the idle
+            // check and the switch happen under one lock, so a client cannot
+            // attach between the check and the exit and then lose its session
+            // to the exit. If the check fails the state is untouched.
+            if if_idle {
+                if let Err(attached) = sm.clients().begin_stop_if_idle() {
+                    let resp = Response::error(
+                        request.id.clone(),
+                        crate::protocol::SERVER_BUSY,
+                        format!("{attached} client(s) attached"),
+                    );
+                    write_response(&mut writer, &resp).await?;
+                    continue;
+                }
+            } else {
+                sm.clients().begin_stop();
+            }
             let resp = Response::success(request.id, serde_json::json!({ "ok": true }));
             write_response(&mut writer, &resp).await?;
-            info!("Received shutdown RPC — exiting daemon");
-            std::process::exit(0);
+            info!("Received shutdown RPC, stopping server");
+            graceful_exit(&sm, sync_endpoint.as_deref(), session_id, &socket_path).await;
         }
 
         if request.method == methods::IS_ATTACHED {
@@ -868,6 +957,144 @@ async fn handle_streaming_connection(
 
     debug!("Client disconnected");
     Ok(())
+}
+
+/// JSON-RPC notification for a pane lifecycle or metadata event, or `None`
+/// for an event that is not one.
+///
+/// Method names are the snake_case form of the PROTOCOL_V2 `ServerEvent`
+/// names: `pane_closed`, `title_changed`, `cwd_changed`, `status_changed`.
+/// `pane_created`, `pane_exited` and `notification` are local-socket additions.
+pub fn pane_event_notification(ev: &SessionEvent) -> Option<serde_json::Value> {
+    let (method, params) = match ev {
+        SessionEvent::PaneCreated { pane_id } => {
+            ("pane_created", serde_json::json!({ "pane_id": pane_id.to_string() }))
+        }
+        SessionEvent::PaneClosed { pane_id } => {
+            ("pane_closed", serde_json::json!({ "pane_id": pane_id.to_string() }))
+        }
+        SessionEvent::PaneExited { pane_id, exit_code } => (
+            "pane_exited",
+            serde_json::json!({ "pane_id": pane_id.to_string(), "exit_code": exit_code }),
+        ),
+        SessionEvent::TitleChanged { pane_id, title } => {
+            ("title_changed", serde_json::json!({ "pane_id": pane_id.to_string(), "title": title }))
+        }
+        SessionEvent::CwdChanged { pane_id, cwd } => {
+            ("cwd_changed", serde_json::json!({ "pane_id": pane_id.to_string(), "cwd": cwd }))
+        }
+        SessionEvent::StatusChanged { pane_id, status, message } => (
+            "status_changed",
+            serde_json::json!({
+                "pane_id": pane_id.to_string(),
+                "status": status,
+                "message": message,
+            }),
+        ),
+        SessionEvent::Notification { pane_id, title, body } => (
+            "notification",
+            serde_json::json!({
+                "pane_id": pane_id.to_string(),
+                "title": title,
+                "body": body,
+            }),
+        ),
+        _ => return None,
+    };
+    Some(serde_json::json!({ "jsonrpc": "2.0", "method": method, "params": params }))
+}
+
+/// `chmod 0600` the socket so only the owner can connect, whatever the umask.
+fn restrict_socket(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+/// Is the peer's uid `expected_uid`? Reads `SO_PEERCRED`. A peer whose
+/// credentials cannot be read is refused.
+pub fn peer_matches_uid(stream: &tokio::net::UnixStream, expected_uid: u32) -> bool {
+    match stream.peer_cred() {
+        Ok(cred) => cred.uid() == expected_uid,
+        Err(e) => {
+            warn!("socket: cannot read peer credentials, dropping connection: {e}");
+            false
+        }
+    }
+}
+
+/// Accept-time check: drop any connection that is not from the allowed user
+/// (default: the user this process runs as). Logs the refused uid.
+fn peer_is_allowed(stream: &tokio::net::UnixStream, allowed_uid: Option<u32>) -> bool {
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let expected = allowed_uid.unwrap_or_else(|| unsafe { libc::getuid() });
+    if peer_matches_uid(stream, expected) {
+        return true;
+    }
+    let peer = stream.peer_cred().map(|c| c.uid().to_string()).unwrap_or_else(|_| "?".into());
+    warn!("socket: refused connection from uid {peer} (only uid {expected} is served)");
+    false
+}
+
+/// Write the layout to `sessions/{server_id}.json` (AD-017). Failures are logged.
+///
+/// Does nothing once the server is shutting down: from then on only
+/// [`graceful_exit`] writes the file, so a late pane exit cannot save a
+/// smaller layout over the good one.
+pub fn save_layout(sm: &SessionManager, session_id: uuid::Uuid) {
+    if sm.is_shutting_down() {
+        return;
+    }
+    save_layout_final(sm, session_id);
+}
+
+/// Write the layout even in the shutdown state. Only the shutdown path calls this.
+fn save_layout_final(sm: &SessionManager, session_id: uuid::Uuid) {
+    let state = sm.snapshot_to_workspace_state();
+    if let Err(e) = forgetty_workspace::save_session_for(session_id, &state) {
+        warn!("failed to save session layout: {e}");
+    }
+}
+
+/// Make state durable and exit the process.
+///
+/// Order matters: flush the byte logs, save the layout, close the iroh
+/// endpoint, remove the socket file, exit. PTYs are not killed explicitly.
+/// Killing them would make the drain tasks close panes and rewrite the layout
+/// file as empty. When the process exits the PTY masters close and the shells
+/// get SIGHUP.
+/// Callbacks that run during [`graceful_exit`], after the byte logs are
+/// flushed and before the endpoint closes (the v2 server saves its input
+/// state here).
+static SHUTDOWN_HOOKS: std::sync::Mutex<Vec<Box<dyn Fn() + Send + Sync>>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Register a callback for [`graceful_exit`].
+pub fn add_shutdown_hook(hook: Box<dyn Fn() + Send + Sync>) {
+    SHUTDOWN_HOOKS.lock().unwrap_or_else(|e| e.into_inner()).push(hook);
+}
+
+pub async fn graceful_exit(
+    sm: &SessionManager,
+    sync_endpoint: Option<&SyncEndpoint>,
+    session_id: Option<uuid::Uuid>,
+    socket_path: &Path,
+) -> ! {
+    // Freeze the layout first: nothing that happens from here on (a child
+    // dying with the server, a late PaneClosed) may rewrite the saved layout.
+    sm.begin_shutdown();
+    sm.flush_all_byte_logs().await;
+    info!("byte logs flushed");
+    for hook in SHUTDOWN_HOOKS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        hook();
+    }
+    if let Some(sid) = session_id {
+        save_layout_final(sm, sid);
+    }
+    if let Some(se) = sync_endpoint {
+        se.close().await;
+    }
+    let _ = std::fs::remove_file(socket_path);
+    std::process::exit(0);
 }
 
 /// Serialize and write a JSON-RPC response as a newline-terminated line.
@@ -906,6 +1133,48 @@ mod tests {
     use super::*;
     use forgetty_session::SessionManager;
 
+    #[tokio::test]
+    async fn peer_from_another_uid_is_refused() {
+        // A socketpair peer is this process, so its uid is ours. Judging it
+        // against any other expected uid is exactly the "different user" case.
+        let (a, _b) = tokio::net::UnixStream::pair().unwrap();
+        let me = unsafe { libc::getuid() };
+        assert!(peer_matches_uid(&a, me));
+        assert!(!peer_matches_uid(&a, me + 1));
+        assert!(!peer_matches_uid(&a, 0) || me == 0);
+        assert!(peer_is_allowed(&a, None));
+        assert!(!peer_is_allowed(&a, Some(me + 1)));
+    }
+
+    #[tokio::test]
+    async fn bound_socket_is_mode_0600_and_still_serves_the_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.sock");
+        let server = SocketServer::new_with_path(path.clone()).unwrap();
+        let sm = Arc::new(SessionManager::new());
+        let task = tokio::spawn(async move {
+            let _ = server.run_with_streaming(sm, None).await;
+        });
+        for _ in 0..100 {
+            if path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        let mut c = tokio::net::UnixStream::connect(&path).await.unwrap();
+        c.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"list_tabs\",\"id\":1}\n").await.unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = c.read(&mut buf).await.unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).contains("\"result\""));
+        task.abort();
+    }
+
     #[test]
     fn default_socket_path_with_xdg() {
         // Just verify the function returns a path ending with forgetty.sock.
@@ -925,7 +1194,8 @@ mod tests {
         // Clean up from previous test runs.
         let _ = std::fs::remove_file(&sock_path);
 
-        let _server = SocketServer { socket_path: sock_path.clone(), session_id: None };
+        let _server =
+            SocketServer { socket_path: sock_path.clone(), session_id: None, allowed_uid: None };
 
         let listener = UnixListener::bind(&sock_path).unwrap();
         let sm = Arc::new(SessionManager::new());
