@@ -38,9 +38,38 @@ pub fn trace(tag: &str, extra: usize) {
     }
     let t0 = t0();
     let mut g = TRACE.lock().unwrap();
-    if g.len() < 700 {
+    if g.len() < 4000 {
         g.push(format!("{tag}{:.1}{}", t0.elapsed().as_secs_f64() * 1000.0, if extra > 0 { format!("({extra})") } else { String::new() }));
     }
+}
+
+
+/// Move the collected frame/read/write traces into the result under `name`.
+fn dump_trace(name: &str) {
+    use std::sync::atomic::Ordering;
+    TRACE_ON.store(false, Ordering::Relaxed);
+    forgetty_shell_core::conpty::READ_TRACE.store(false, Ordering::Relaxed);
+    let base = t0();
+    let frames: Vec<String> = std::mem::take(&mut *TRACE.lock().unwrap());
+    record(&format!("{name}_trace"), json!(frames.join(" ")));
+    let reads: Vec<String> = std::mem::take(&mut *forgetty_shell_core::conpty::READ_LOG.lock().unwrap())
+        .iter()
+        .filter(|(_, n, _)| *n != 90)
+        .map(|(a, n, b)| format!("r{:.1}({n})>{:.1}", a.saturating_duration_since(base).as_secs_f64() * 1000.0, b.saturating_duration_since(base).as_secs_f64() * 1000.0))
+        .collect();
+    record(&format!("{name}_reads"), json!(reads.join(" ")));
+    let writes: Vec<String> = std::mem::take(&mut *forgetty_shell_core::conpty::WRITE_LOG.lock().unwrap())
+        .iter()
+        .map(|(a, b)| format!("w{:.1}:{}", a.saturating_duration_since(base).as_secs_f64() * 1000.0, b.iter().map(|x| format!("{x:02x}")).collect::<String>()))
+        .collect();
+    record(&format!("{name}_writes"), json!(writes.join(" ")));
+}
+
+fn trace_start() {
+    use std::sync::atomic::Ordering;
+    let _ = t0();
+    TRACE_ON.store(true, Ordering::Relaxed);
+    forgetty_shell_core::conpty::READ_TRACE.store(true, Ordering::Relaxed);
 }
 
 /// Diagnostic A/B switch for frame-rate experiments (env FORGETTY_AB). 0 = normal.
@@ -401,6 +430,7 @@ impl ShellSmoke {
                         record("time_to_echo_found_ms", json!(ms(now - self.start)));
                         check("echo_found", true);
                         self.start_probe(v, cr, cc);
+                        trace_start();
                         self.goto(Phase::Keys);
                     }
                 }
@@ -416,6 +446,7 @@ impl ShellSmoke {
                     self.max_reshaped_per_key = self.max_reshaped_per_key.max(v.rows_reshaped_last);
                     if self.lat_ms.len() >= KEYSTROKES {
                         let (p50, reshaped) = summarize_keys(&self.lat_ms, self.max_reshaped_per_key, "");
+                        dump_trace("keys");
                         check("key_p50_le_18ms", p50 <= 18.0);
                         check("damage_only_redraw", reshaped <= 3);
                         self.lat_ms.clear();
@@ -490,9 +521,7 @@ impl ShellSmoke {
                         v.send_bytes(format!("type {BIG_FILE} & echo THRU-DONE\r").as_bytes());
                         self.thr_t0 = Instant::now();
                         self.thr_last = None;
-                        TRACE_ON.store(true, std::sync::atomic::Ordering::Relaxed);
-                        forgetty_shell_core::conpty::READ_TRACE.store(true, std::sync::atomic::Ordering::Relaxed);
-                        let _ = t0();
+                        trace_start();
                         self.goto(Phase::Throughput);
                     }
                 }
@@ -506,8 +535,7 @@ impl ShellSmoke {
                 if let Some(fr) = find_exact("THRU-DONE") {
                     if at_prompt && cr > fr {
                         let secs = (now - self.thr_t0).as_secs_f64();
-                        TRACE_ON.store(false, std::sync::atomic::Ordering::Relaxed);
-                        forgetty_shell_core::conpty::READ_TRACE.store(false, std::sync::atomic::Ordering::Relaxed);
+                        dump_trace("thr");
                         record("conpty_drain_s", json!((secs * 1000.0).round() / 1000.0));
                         record("conpty_mb_per_s", json!(((CONPTY_BYTES / 1e6 / secs) * 100.0).round() / 100.0));
                         record("conpty_max_frame_gap_ms", json!(self.thr_max_gap));
@@ -1136,22 +1164,6 @@ impl ShellSmoke {
     fn finish(&mut self, shell: &mut AppShell) -> ! {
         record("total_s", json!(ms(self.start.elapsed()) / 1000.0));
         record("frames_drawn", json!(shell.frames));
-        record("trace", json!(TRACE.lock().unwrap().join(" ")));
-        {
-            let base = t0();
-            let log = forgetty_shell_core::conpty::READ_LOG.lock().unwrap();
-            let txt: Vec<String> = log
-                .iter()
-                .map(|(a, n, b)| format!("r{:.1}({n})>{:.1}", a.saturating_duration_since(base).as_secs_f64() * 1000.0, b.saturating_duration_since(base).as_secs_f64() * 1000.0))
-                .collect();
-            record("read_trace", json!(txt.join(" ")));
-            let w = forgetty_shell_core::conpty::WRITE_LOG.lock().unwrap();
-            let wt: Vec<String> = w
-                .iter()
-                .map(|(a, b)| format!("w{:.1}:{}", a.saturating_duration_since(base).as_secs_f64() * 1000.0, b.iter().map(|x| format!("{x:02x}")).collect::<String>()))
-                .collect();
-            record("write_trace", json!(wt.join(" ")));
-        }
         for (name, v) in [("frame_cpu", &mut shell.cpu_ms), ("frame_idle", &mut shell.idle_ms)] {
             if !v.is_empty() {
                 v.sort_by(|a, b| a.partial_cmp(b).unwrap());

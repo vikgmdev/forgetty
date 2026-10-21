@@ -98,7 +98,7 @@ impl LocalConPty {
                             }
                             if READ_TRACE.load(Ordering::Relaxed) {
                                 if let Ok(mut g) = READ_LOG.lock() {
-                                    if g.len() < 600 {
+                                    if g.len() < 6000 {
                                         g.push((t_read, n, std::time::Instant::now()));
                                     }
                                 }
@@ -158,7 +158,7 @@ impl LocalConPty {
     pub fn write_input(&self, bytes: &[u8]) {
         if READ_TRACE.load(Ordering::Relaxed) {
             if let Ok(mut g) = WRITE_LOG.lock() {
-                if g.len() < 300 {
+                if g.len() < 600 {
                     g.push((std::time::Instant::now(), bytes.iter().take(24).copied().collect()));
                 }
             }
