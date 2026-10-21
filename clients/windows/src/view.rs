@@ -12,6 +12,7 @@ use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
 
 use forgetty_core::Rgba as CoreRgba;
+use forgetty_shell_core::{PaneEvent, PaneId, PaneSource};
 use forgetty_vt::ffi;
 use forgetty_vt::screen::{CellAttributes, Color};
 use forgetty_vt::{Screen, Terminal};
@@ -26,8 +27,6 @@ use gpui::{
 use crate::config::Config;
 use crate::element::TerminalElement;
 use crate::encoder::{self, Input};
-use crate::smoke::Smoke;
-use crate::source::{PaneEvent, PaneSource};
 
 pub const INITIAL_ROWS: usize = 30;
 pub const INITIAL_COLS: usize = 120;
@@ -126,13 +125,15 @@ pub struct TerminalView {
     pub cursor_on: bool,
     pub bounds: Bounds<Pixels>,
     pub window_active: bool,
-    pub title: String,
-    pub applied_title: String,
+    /// Set by the shell: the pane is on screen (tab active and not hidden by zoom).
+    pub visible: bool,
+    /// Set by the shell: this is the active pane of the active tab.
+    pub focused: bool,
+    pub pane_id: PaneId,
     pub closed: Option<String>,
     pub frames: u64,
     pub resizes: u64,
     pub last_paint: Option<Instant>,
-    pub smoke: Option<Box<Smoke>>,
     /// Smoke only: dry-run key encoding writes here instead of the source.
     pub capture_input: Option<Vec<u8>>,
     pub pending_paste: Option<PendingPaste>,
@@ -166,8 +167,11 @@ impl Future for YieldNow {
 impl TerminalView {
     pub fn new(
         cfg: Config,
+        pane_id: PaneId,
         source: Box<dyn PaneSource>,
-        smoke: Option<Box<Smoke>>,
+        rows: usize,
+        cols: usize,
+        smoke_mode: bool,
         cx: &mut Context<Self>,
     ) -> Self {
         let metrics = Metrics::measure(cx, &cfg);
@@ -175,8 +179,9 @@ impl TerminalView {
             let h = cfg.ansi[i];
             CoreRgba::rgb((h >> 16) as u8, (h >> 8) as u8, h as u8)
         });
-        // libghostty-vt budgets scrollback in bytes: ~2 KB per line of up to 128 columns.
-        let term = Terminal::with_scrollback(INITIAL_ROWS, INITIAL_COLS, palette, cfg.scrollback_lines * 2048);
+        // libghostty-vt budgets scrollback in bytes (default 10 MiB per pane).
+        let (rows, cols) = (rows.clamp(1, 500), cols.clamp(2, 1000));
+        let term = Terminal::with_scrollback(rows, cols, palette, cfg.scrollback_bytes);
 
         // Pump source output into the VT on the UI thread. Batches are capped
         // and the task yields between them so frames keep flowing while a
@@ -206,8 +211,7 @@ impl TerminalView {
         })
         .detach();
 
-        let is_smoke = smoke.is_some();
-        if !is_smoke {
+        if !smoke_mode {
             // Cursor blink: repaint only while the cursor actually blinks.
             cx.spawn(async move |this, cx| loop {
                 cx.background_executor().timer(Duration::from_millis(530)).await;
@@ -224,10 +228,10 @@ impl TerminalView {
             source,
             input: Input::new(),
             metrics,
-            rows: INITIAL_ROWS,
-            cols: INITIAL_COLS,
-            row_hash: vec![0; INITIAL_ROWS],
-            rows_shaped: vec![None; INITIAL_ROWS],
+            rows,
+            cols,
+            row_hash: vec![0; rows],
+            rows_shaped: vec![None; rows],
             shape_cache: HashMap::new(),
             shape_misses: 0,
             rows_reshaped_last: 0,
@@ -241,13 +245,13 @@ impl TerminalView {
             cursor_on: true,
             bounds: Bounds::default(),
             window_active: true,
-            title: String::new(),
-            applied_title: String::new(),
+            visible: true,
+            focused: false,
+            pane_id,
             closed: None,
             frames: 0,
             resizes: 0,
             last_paint: None,
-            smoke,
             capture_input: None,
             pending_paste: None,
             fed_bytes: 0,
@@ -270,34 +274,49 @@ impl TerminalView {
             for resp in self.term.drain_write_pty() {
                 self.source.write_input(&resp);
             }
-            for ev in self.term.drain_events() {
-                if let forgetty_vt::TerminalEvent::TitleChanged(t) = ev {
-                    self.title = t;
-                }
-            }
+            // Titles and cwd come from the backend (it scans the same bytes).
+            self.term.drain_events().for_each(drop);
         }
         if let Some(reason) = closed {
-            self.closed = Some(reason.clone());
-            if self.smoke.is_some() {
-                crate::smoke::fail(&format!("pane closed: {reason}"));
-            }
-            cx.quit();
+            self.closed = Some(reason);
         }
-        cx.notify();
+        // Panes on hidden tabs keep their VT current but do not ask for frames.
+        if self.visible {
+            cx.notify();
+        }
     }
 
-    pub fn on_activation(&mut self, active: bool, cx: &mut Context<Self>) {
-        self.window_active = active;
+    /// The pane gained or lost the user's focus (active pane, window active).
+    /// Sends DECSET 1004 focus events when the program asked for them.
+    pub fn set_focused(&mut self, focused: bool, cx: &mut Context<Self>) {
+        if self.focused == focused {
+            return;
+        }
+        self.focused = focused;
         self.cursor_on = true;
         if self.term.is_focus_reporting() {
-            if let Some(b) = Input::encode_focus(active) {
+            if let Some(b) = Input::encode_focus(focused) {
                 self.send_bytes(&b);
             }
         }
         cx.notify();
     }
 
+    pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if self.visible != visible {
+            self.visible = visible;
+            if visible {
+                self.last_gen = 0;
+                cx.notify();
+            }
+        }
+    }
+
     fn blink_tick(&mut self, cx: &mut Context<Self>) {
+        if !self.visible || !self.focused {
+            self.cursor_on = true;
+            return;
+        }
         if self.term.cursor_visible() && self.term.cursor_blinking() && self.window_active {
             self.cursor_on = !self.cursor_on;
             cx.notify();
@@ -798,14 +817,9 @@ impl TerminalView {
     /// Called right after the element painted a frame (scene built, present
     /// follows in the same draw call).
     pub fn after_paint(&mut self, window: &mut Window) {
+        let _ = window;
         self.frames += 1;
-        if self.title != self.applied_title {
-            self.applied_title = self.title.clone();
-            window.set_window_title(&self.title);
-        }
-        let now = Instant::now();
-        self.smoke_step(window, now);
-        self.last_paint = Some(now);
+        self.last_paint = Some(Instant::now());
     }
 
     /// Preedit width in cells (wide glyphs count 2).

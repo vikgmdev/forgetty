@@ -40,7 +40,9 @@ impl LocalConPty {
             cmd.arg(a);
         }
         if let Some(cwd) = cwd {
-            if std::path::Path::new(cwd).is_dir() {
+            // Never stat or enter a UNC/device path: on Windows that can send
+            // NTLM credentials to a server named by program output.
+            if crate::osc::is_safe_local_path(cwd) && std::path::Path::new(cwd).is_dir() {
                 cmd.cwd(cwd);
             }
         }
@@ -80,7 +82,11 @@ impl LocalConPty {
                     match reader.read(&mut buf) {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
-                            on_output(&buf[..n]);
+                            // A bad sequence must never kill the reader: log and drop.
+                            let chunk = &buf[..n];
+                            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| on_output(chunk))).is_err() {
+                                eprintln!("forgetty: output hook panicked, chunk dropped from scanning");
+                            }
                             if tx.send_blocking(PaneEvent::Output(buf[..n].to_vec())).is_err() {
                                 return;
                             }

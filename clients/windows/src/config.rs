@@ -2,7 +2,9 @@
 //!
 //! ```toml
 //! shell = "pwsh.exe"
-//! scrollback = 10000     # lines
+//! scrollback_bytes = 10485760   # libghostty bytes per pane (default 10 MiB)
+//! backdrop = "mica"             # mica | mica_alt | blur | none
+//! sidebar = false               # start with the sidebar open
 //! [font]
 //! family = "Cascadia Mono"
 //! size = 11.0            # points
@@ -11,20 +13,40 @@
 //! background = "#0c0c0c"
 //! cursor     = "#ffffff"
 //! selection  = "#264f78"
+//! accent     = "#60cdff"
 //! ansi = ["#0c0c0c", "#c50f1f", ... 16 entries]
+//! [keybindings]            # action = "chord" | ["chord", ...] | "none"
+//! new_tab = "ctrl+shift+t"
+//! split_right = ["alt+shift+plus", "ctrl+shift+d"]
+//! close_pane = "none"
 //! ```
+//! Action names: see `forgetty_shell_core::keys::ACTIONS`.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
+use forgetty_vt::DEFAULT_MAX_SCROLLBACK_BYTES;
 use serde::Deserialize;
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct FileConfig {
     shell: Option<String>,
+    /// Legacy W1 key, in lines. `scrollback_bytes` wins when both are set.
     scrollback: Option<usize>,
+    scrollback_bytes: Option<usize>,
+    backdrop: Option<String>,
+    sidebar: Option<bool>,
+    keybindings: HashMap<String, KeyValue>,
     font: FontSection,
     theme: ThemeSection,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum KeyValue {
+    One(String),
+    Many(Vec<String>),
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -41,14 +63,28 @@ struct ThemeSection {
     background: Option<String>,
     cursor: Option<String>,
     selection: Option<String>,
+    accent: Option<String>,
     ansi: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backdrop {
+    Mica,
+    MicaAlt,
+    Blur,
+    None,
 }
 
 #[derive(Debug, Clone)]
 pub struct Config {
     pub shell: Option<String>,
-    /// Scrollback target in lines (converted to libghostty-vt's byte budget).
-    pub scrollback_lines: usize,
+    /// Scrollback budget per pane in libghostty-vt bytes.
+    pub scrollback_bytes: usize,
+    pub backdrop: Backdrop,
+    pub sidebar_open: bool,
+    /// Action name to chords, from `[keybindings]`. Overrides the defaults.
+    pub keybindings: HashMap<String, Vec<String>>,
+    pub accent: u32,
     pub font_family: String,
     /// Points. GPUI sizes are px at 96 dpi, so px = pt * 96 / 72.
     pub font_size_pt: f32,
@@ -69,7 +105,11 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             shell: None,
-            scrollback_lines: 10_000,
+            scrollback_bytes: DEFAULT_MAX_SCROLLBACK_BYTES,
+            backdrop: Backdrop::Mica,
+            sidebar_open: false,
+            keybindings: HashMap::new(),
+            accent: 0x60cdff,
             font_family: "Cascadia Mono".into(),
             font_size_pt: 11.0,
             foreground: 0xcccccc,
@@ -112,7 +152,30 @@ impl Config {
         let mut c = Self::default();
         c.shell = f.shell;
         if let Some(n) = f.scrollback.filter(|n| *n <= 1_000_000) {
-            c.scrollback_lines = n;
+            // W1 compatibility: ~2 KB of libghostty page memory per line.
+            c.scrollback_bytes = n * 2048;
+        }
+        if let Some(n) = f.scrollback_bytes.filter(|n| (64 * 1024..=4usize << 30).contains(n)) {
+            c.scrollback_bytes = n;
+        }
+        if let Some(b) = f.backdrop.as_deref() {
+            c.backdrop = match b.to_ascii_lowercase().as_str() {
+                "mica" => Backdrop::Mica,
+                "mica_alt" | "micaalt" => Backdrop::MicaAlt,
+                "blur" | "acrylic" => Backdrop::Blur,
+                "none" | "solid" | "opaque" => Backdrop::None,
+                other => return Err(format!("backdrop: unknown value '{other}'")),
+            };
+        }
+        if let Some(v) = f.sidebar {
+            c.sidebar_open = v;
+        }
+        for (name, v) in f.keybindings {
+            let keys = match v {
+                KeyValue::One(s) => vec![s],
+                KeyValue::Many(v) => v,
+            };
+            c.keybindings.insert(name, keys);
         }
         if let Some(v) = f.font.family {
             c.font_family = v;
@@ -129,6 +192,7 @@ impl Config {
         set(&mut c.background, f.theme.background);
         set(&mut c.cursor, f.theme.cursor);
         set(&mut c.selection, f.theme.selection);
+        set(&mut c.accent, f.theme.accent);
         if let Some(list) = f.theme.ansi {
             for (i, s) in list.iter().take(16).enumerate() {
                 if let Some(v) = hex(s) {

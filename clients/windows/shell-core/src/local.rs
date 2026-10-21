@@ -34,7 +34,10 @@ struct Pane {
     rows: u16,
     cols: u16,
     title: String,
+    /// Display hint reported by the program (OSC 7 / 9;9). Never used to spawn.
     cwd: String,
+    /// Where this pane's process was started. New tabs and splits inherit this.
+    spawn_cwd: Option<String>,
     status: PaneStatus,
 }
 
@@ -136,12 +139,24 @@ impl Inner {
         let w_exit = weak;
         let hooks = Hooks {
             on_output: Box::new(move |bytes| {
-                let events = scanner.feed(bytes);
+                // A panic inside the scanner may leave it half-updated: log,
+                // drop this chunk, and start from a fresh scanner.
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scanner.feed(bytes)));
+                let events = match r {
+                    Ok(e) => e,
+                    Err(_) => {
+                        eprintln!("forgetty: OSC scanner panicked, sequence dropped");
+                        scanner = OscScanner::new();
+                        return;
+                    }
+                };
                 if events.is_empty() {
                     return;
                 }
                 if let Some(inner) = w_out.upgrade() {
-                    inner.apply_osc(id, events);
+                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inner.apply_osc(id, events))).is_err() {
+                        eprintln!("forgetty: OSC handler panicked, events dropped");
+                    }
                 }
             }),
             on_exit: Box::new(move |_why| {
@@ -152,15 +167,27 @@ impl Inner {
         };
         let rows = rows.max(1);
         let cols = cols.max(2);
-        let pty = LocalConPty::spawn(&argv, cwd.as_deref(), rows, cols, hooks)
+        // Spawn directory: the caller's (the parent pane's spawn cwd), else the
+        // configured default, else the user profile. Never taken from escape
+        // codes, and never a UNC/device path.
+        let spawn_cwd = [cwd, self.cfg.default_cwd.clone(), user_profile_dir()]
+            .into_iter()
+            .flatten()
+            .find(|c| crate::osc::is_safe_local_path(c));
+        let pty = LocalConPty::spawn(&argv, spawn_cwd.as_deref(), rows, cols, hooks)
             .map_err(|e| BackendError::Spawn(format!("{e:#}")))?;
-        let cwd_s = cwd
-            .or_else(|| self.cfg.default_cwd.clone())
-            .or_else(|| std::env::current_dir().ok().map(|p| p.display().to_string()))
-            .unwrap_or_default();
+        let cwd_s = spawn_cwd.clone().unwrap_or_default();
         st.panes.insert(
             id,
-            Pane { pty: Arc::new(pty), rows, cols, title: String::new(), cwd: cwd_s, status: PaneStatus::None },
+            Pane {
+                pty: Arc::new(pty),
+                rows,
+                cols,
+                title: String::new(),
+                cwd: cwd_s,
+                spawn_cwd,
+                status: PaneStatus::None,
+            },
         );
         Ok(id)
     }
@@ -227,6 +254,10 @@ impl Inner {
         self.emit(BackendEvent::PaneClosed { pane_id: id });
         self.emit_layout(&st);
     }
+}
+
+fn user_profile_dir() -> Option<String> {
+    ["USERPROFILE", "HOME"].iter().find_map(|k| std::env::var(k).ok()).filter(|s| !s.is_empty())
 }
 
 fn remove_tab_at(layout: &mut Layout, w: usize, t: usize) {
@@ -321,8 +352,7 @@ impl SessionBackend for LocalBackend {
                     st.layout.workspaces.len()
                 )));
             }
-            let cwd = req.cwd.clone().or_else(|| inner.cfg.default_cwd.clone());
-            let pane = inner.spawn_pane(&mut st, req.command.clone(), cwd, req.rows, req.cols)?;
+            let pane = inner.spawn_pane(&mut st, req.command.clone(), req.cwd.clone(), req.rows, req.cols)?;
             let tab_id = Uuid::new_v4();
             let ws = &mut st.layout.workspaces[req.workspace_idx];
             ws.tabs.push(Tab {
@@ -390,8 +420,7 @@ impl SessionBackend for LocalBackend {
         let inner = &self.inner;
         let mut st = inner.lock();
         let r = (|| {
-            let cwd = inner.cfg.default_cwd.clone();
-            let pane = inner.spawn_pane(&mut st, Vec::new(), cwd, rows, cols)?;
+            let pane = inner.spawn_pane(&mut st, Vec::new(), None, rows, cols)?;
             let (workspace_id, tab_id) = (Uuid::new_v4(), Uuid::new_v4());
             let n = st.layout.workspaces.len();
             st.layout.workspaces.push(Workspace {
@@ -444,10 +473,8 @@ impl SessionBackend for LocalBackend {
             let Some((w, t)) = st.layout.find_pane(req.pane_id) else {
                 return Err(BackendError::NotFound(format!("pane {}", req.pane_id.0)));
             };
-            let cwd = req
-                .cwd
-                .clone()
-                .or_else(|| st.panes.get(&req.pane_id).map(|p| p.cwd.clone()).filter(|c| !c.is_empty()));
+            // The parent's spawn cwd, not the display cwd the program reported.
+            let cwd = req.cwd.clone().or_else(|| st.panes.get(&req.pane_id).and_then(|p| p.spawn_cwd.clone()));
             let new_pane = inner.spawn_pane(&mut st, Vec::new(), cwd, req.rows, req.cols)?;
             let tab = &mut st.layout.workspaces[w].tabs[t];
             tab.pane_tree.split_leaf(req.pane_id, req.direction, new_pane);
@@ -657,6 +684,35 @@ mod tests {
         src.write_input(b"exit\n");
         wait_for(|| now(b.get_layout()).unwrap().tab_count() == 0, "tab removed after exit");
         assert!(matches!(now(b.get_pane_info(t.pane_id)), Err(BackendError::NotFound(_))));
+    }
+
+    #[test]
+    fn escape_code_cwd_never_spawns() {
+        let b = backend();
+        let t = now(b.new_tab(NewTab { workspace_idx: 0, rows: 24, cols: 80, ..Default::default() })).unwrap();
+        let src = now(b.attach_pane(t.pane_id)).unwrap();
+        // Hostile OSC 7 (remote host), OSC 9;9 (UNC) and a device path.
+        src.write_input(
+            b"printf '\\033]7;file://evil/share\\007\\033]9;9;\"\\\\\\\\evil\\\\share\"\\007\\033]7;file:///%%2F%%2Fevil/x\\007'; echo HOSTILE-DONE\n",
+        );
+        read_until(&src.events(), "HOSTILE-DONE");
+        let info = now(b.get_pane_info(t.pane_id)).unwrap();
+        assert_eq!(info.cwd, "/tmp", "hostile cwd must not become the display cwd");
+        // A safe local OSC 7 updates the display only.
+        src.write_input(b"printf '\\033]7;file:///usr\\007'; echo SAFE-DONE\n");
+        read_until(&src.events(), "SAFE-DONE");
+        wait_for(|| now(b.get_pane_info(t.pane_id)).unwrap().cwd == "/usr", "display cwd");
+        // The split starts where the parent was started, not in /usr and not on a share.
+        let p2 = now(b.split_pane(SplitPane { pane_id: t.pane_id, direction: SplitDir::Vertical, rows: 24, cols: 80, cwd: None })).unwrap();
+        let s2 = now(b.attach_pane(p2)).unwrap();
+        s2.write_input(b"echo PWD=$(pwd)=END\n");
+        let mut out = read_until(&s2.events(), "PWD=/");
+        std::thread::sleep(Duration::from_millis(300));
+        while let Ok(PaneEvent::Output(b)) = s2.events().try_recv() {
+            out.push_str(&String::from_utf8_lossy(&b));
+        }
+        assert!(out.contains("PWD=/tmp=END"), "split cwd: {out:?}");
+        b.shutdown_all();
     }
 
     #[test]
