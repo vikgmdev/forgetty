@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use forgetty_proto::{
-    cap, close_code, error_code, from_value, method, read_input_frame, read_msg, to_value,
+    cap, close_code, error_code, from_value, method, read_input_frame, read_input_frame_flags, read_msg, to_value, INPUT_FLAG_AUTO,
     write_msg, write_output_frame, AttachPaneParams, ClientEntry, ControlMsg, DetachPaneParams,
     ErrorMsg, HandshakeReply, Hello, OkResult, PairRequest, PairResult, PaneStreamHeader,
     ResizePaneParams, ServerEvent, SubscribeResult, Value, Welcome, ALPN_PAIR, ALPN_RPC,
@@ -69,6 +69,7 @@ impl Default for TestServerConfig {
                 cap::RESUME.to_string(),
                 cap::LAYOUT_EVENTS.to_string(),
                 cap::SIZE_POLICY_LATEST.to_string(),
+                cap::INPUT_FLAGS.to_string(),
             ],
             pair_secret: None,
             echo_input: true,
@@ -220,6 +221,10 @@ struct PaneLog {
     input: Vec<u8>,
     /// VT snapshot the next `attach_pane` answers with (AD-023), once.
     snapshot: Option<Vec<u8>>,
+    /// The snapshot stream announces `.0` bytes, sends the snapshot (a part of it) and stalls.
+    snapshot_total: Option<u32>,
+    /// Input frames flagged `auto` (AD-025), in arrival order. They are not in `input`.
+    auto_input: Vec<u8>,
 }
 
 struct State {
@@ -331,6 +336,8 @@ impl TestServer {
                     cols: 80,
                     input: Vec::new(),
                     snapshot: None,
+                    snapshot_total: None,
+                    auto_input: Vec::new(),
                 },
             );
             lock(&state.layout).tabs.push(TabNode {
@@ -377,6 +384,8 @@ impl TestServer {
                 cols: 80,
                 input: Vec::new(),
                 snapshot: None,
+                snapshot_total: None,
+                auto_input: Vec::new(),
             },
         );
         id
@@ -435,6 +444,20 @@ impl TestServer {
         if let Some(p) = lock(&self.state.panes).get_mut(&pane) {
             p.snapshot = Some(bytes.to_vec());
         }
+    }
+
+    /// Like [`queue_snapshot`](Self::queue_snapshot), but the stream announces `total` bytes,
+    /// sends only `first` and then stalls. Drop the connection to cut it off mid-snapshot.
+    pub fn queue_partial_snapshot(&self, pane: Uuid, total: u32, first: &[u8]) {
+        if let Some(p) = lock(&self.state.panes).get_mut(&pane) {
+            p.snapshot = Some(first.to_vec());
+            p.snapshot_total = Some(total);
+        }
+    }
+
+    /// Input bytes that arrived in frames flagged `auto` (AD-025).
+    pub fn received_auto_input(&self, pane: Uuid) -> Vec<u8> {
+        lock(&self.state.panes).get(&pane).expect("pane exists").auto_input.clone()
     }
 
     /// Total bytes ever written to the pane.
@@ -634,9 +657,17 @@ async fn handle_rpc(conn: Connection, state: Arc<State>) {
         let state = state.clone();
         let client_id = hello.client_id;
         let input_epoch = hello.input_epoch;
+        let flags = state.cfg.capabilities.iter().any(|c| c == cap::INPUT_FLAGS)
+            && hello.capabilities.iter().any(|c| c == cap::INPUT_FLAGS);
         tasks.spawn(async move {
             let Ok(mut input) = conn.accept_uni().await else { return };
-            while let Ok(Some((pane, seq, bytes))) = read_input_frame(&mut input).await {
+            loop {
+                let next = if flags {
+                    read_input_frame_flags(&mut input).await
+                } else {
+                    read_input_frame(&mut input).await.map(|o| o.map(|(p, s, b)| (p, s, 0u8, b)))
+                };
+                let Ok(Some((pane, seq, flag_bits, bytes))) = next else { break };
                 // Dedup and write under one lock, so a resend on a new
                 // connection can never overtake or double a frame.
                 let mut seqs = lock(&state.input_seq);
@@ -649,9 +680,13 @@ async fn handle_rpc(conn: Connection, state: Arc<State>) {
                 let notify = {
                     let mut panes = lock(&state.panes);
                     let Some(p) = panes.get_mut(&pane) else { continue };
-                    p.input.extend_from_slice(&bytes);
-                    if state.cfg.echo_input {
-                        p.data.extend_from_slice(&bytes);
+                    if flag_bits & INPUT_FLAG_AUTO != 0 {
+                        p.auto_input.extend_from_slice(&bytes);
+                    } else {
+                        p.input.extend_from_slice(&bytes);
+                        if state.cfg.echo_input {
+                            p.data.extend_from_slice(&bytes);
+                        }
                     }
                     p.notify.clone()
                 };
@@ -725,7 +760,7 @@ fn handle_request(
         }
         method::ATTACH_PANE => {
             let p: AttachPaneParams = from_value(params).map_err(bad)?;
-            let (start, reset, rows, cols, notify, snapshot) = {
+            let (start, reset, rows, cols, notify, snapshot, snapshot_total) = {
                 let mut panes = lock(&state.panes);
                 let Some(log) = panes.get_mut(&p.pane_id) else {
                     return Err((error_code::NOT_FOUND, "no such pane".into()));
@@ -741,8 +776,11 @@ fn handle_request(
                 // A queued snapshot answers this attach: reset, then the snapshot,
                 // then live bytes from the end of the log.
                 match log.snapshot.take() {
-                    Some(snap) => (total, true, log.rows, log.cols, log.notify.clone(), snap),
-                    None => (start, reset, log.rows, log.cols, log.notify.clone(), Vec::new()),
+                    Some(snap) => {
+                        let announced = log.snapshot_total.take().unwrap_or(snap.len() as u32);
+                        (total, true, log.rows, log.cols, log.notify.clone(), snap, announced)
+                    }
+                    None => (start, reset, log.rows, log.cols, log.notify.clone(), Vec::new(), 0),
                 }
             };
             lock(&state.attaches).push((p.pane_id, p.from_offset));
@@ -759,7 +797,7 @@ fn handle_request(
                     reset,
                     rows,
                     cols,
-                    snapshot_len: snapshot.len() as u32,
+                    snapshot_len: snapshot_total,
                 },
                 snapshot,
             ));
@@ -1028,6 +1066,8 @@ fn new_pane_log(state: &Arc<State>, rows: u16, cols: u16) -> Uuid {
             cols,
             input: Vec::new(),
             snapshot: None,
+            snapshot_total: None,
+            auto_input: Vec::new(),
         },
     );
     id
@@ -1116,6 +1156,10 @@ async fn pane_stream(
     }
     if !snapshot.is_empty() && write_output_frame(&mut send, &snapshot).await.is_err() {
         return;
+    }
+    if header.snapshot_len as usize > snapshot.len() {
+        // A snapshot that never completes: wait for the connection to drop.
+        std::future::pending::<()>().await;
     }
     let mut next = header.start_offset;
     loop {
