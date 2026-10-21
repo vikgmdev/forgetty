@@ -94,3 +94,11 @@ tracing-subscriber = { workspace = true }
 serde_json = { workspace = true }
 dirs = { workspace = true }
 uuid = { workspace = true }
+
+# Keep dev and test builds small on the single build box: line tables for our
+# crates (backtraces still name file:line), no debuginfo for dependencies.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
