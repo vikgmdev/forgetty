@@ -32,8 +32,11 @@ pub enum RegistryError {
     Json(#[from] serde_json::Error),
 }
 
+/// Revoked devices `revoked.pending` has room for without growing: 1024 ids
+/// of 64 hex characters and a newline. A longer list makes the file grow.
+const PENDING_IDS: usize = 1024;
 /// Size reserved for `revoked.pending`.
-const PENDING_BYTES: usize = 4096;
+const PENDING_BYTES: usize = PENDING_IDS * 65;
 
 /// What [`DeviceRegistry::revoke`] did.
 #[derive(Debug)]
@@ -59,6 +62,8 @@ pub struct DeviceRegistry {
     revoked_unsaved: std::collections::HashSet<String>,
     /// `revoked.pending` was written and not removed yet.
     pending_written: bool,
+    /// The ids the record on disk names (or would name, after a failed write).
+    pending_ids: std::collections::BTreeSet<String>,
     /// A save-retry thread runs for this registry.
     retry_running: bool,
 }
@@ -100,6 +105,7 @@ impl DeviceRegistry {
             devices,
             revoked_unsaved: Default::default(),
             pending_written: false,
+            pending_ids: Default::default(),
             retry_running: false,
         };
         // A revoke whose save failed before the last stop is applied again.
@@ -132,6 +138,7 @@ impl DeviceRegistry {
             return;
         }
         self.pending_written = true;
+        self.pending_ids.extend(ids.iter().cloned());
         self.devices.retain(|d| !ids.contains(&d.device_id));
         self.revoked_unsaved.extend(ids);
         let list = self.devices.clone();
@@ -180,7 +187,7 @@ impl DeviceRegistry {
             .open(&path)?;
         let old_len = f.metadata()?.len() as usize;
         let mut buf: Vec<u8> =
-            self.revoked_unsaved.iter().map(|id| format!("{id}\n")).collect::<String>().into();
+            self.pending_ids.iter().map(|id| format!("{id}\n")).collect::<String>().into();
         if buf.len() < old_len {
             buf.resize(old_len, b'\n');
         }
@@ -195,15 +202,31 @@ impl DeviceRegistry {
         Ok(())
     }
 
-    /// The registry file has the removals: blank the record, in place.
-    fn clear_pending(&mut self) {
+    /// The registry file has the removals: blank the record, in place, and
+    /// fsync it. When that fails the record stays (and `pending_ids` with it):
+    /// a device that is paired again later is taken out of it by [`Self::add`],
+    /// so an old record cannot revoke a new pairing.
+    fn clear_pending(&mut self) -> std::io::Result<()> {
         use std::os::unix::fs::FileExt;
-        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(self.pending_path()) {
-            if let Ok(m) = f.metadata() {
-                let _ = f.write_all_at(&vec![b'\n'; m.len() as usize], 0);
+        let result = (|| {
+            let f = match std::fs::OpenOptions::new().write(true).open(self.pending_path()) {
+                Ok(f) => f,
+                // No record on disk, nothing to clear.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => return Err(e),
+            };
+            let len = f.metadata()?.len() as usize;
+            f.write_all_at(&vec![b'\n'; len], 0)?;
+            f.sync_all()
+        })();
+        match &result {
+            Ok(()) => {
+                self.pending_ids.clear();
+                self.pending_written = false;
             }
+            Err(e) => tracing::warn!("registry: could not clear revoked.pending: {e}"),
         }
-        self.pending_written = false;
+        result
     }
 
     /// `true` while a revoke is denied in memory but not saved.
@@ -225,6 +248,7 @@ impl DeviceRegistry {
             devices: Vec::new(),
             revoked_unsaved: Default::default(),
             pending_written: false,
+            pending_ids: Default::default(),
             retry_running: false,
         }
     }
@@ -245,9 +269,26 @@ impl DeviceRegistry {
     /// pairing could not be saved is not authorized.
     pub fn add(&mut self, mut entry: DeviceEntry) -> Result<(), RegistryError> {
         entry.name = crate::sanitize::untrusted(&entry.name);
+        // A device that was revoked and pairs again must not be in the revoke
+        // record: a restart would revoke it a second time. Take it out first
+        // (durably). If that fails the pairing fails, so the record stays true.
+        let id = entry.device_id.clone();
+        let in_record = self.pending_ids.remove(&id);
+        if in_record {
+            if let Err(e) = self.write_pending() {
+                self.pending_ids.insert(id);
+                return Err(e.into());
+            }
+        }
         let mut next = self.devices.clone();
         next.push(entry);
-        self.commit(next)
+        let res = self.commit(next);
+        if res.is_err() && in_record {
+            // Not paired after all: the revoke stands, on disk as well.
+            self.pending_ids.insert(id);
+            let _ = self.write_pending();
+        }
+        res
     }
 
     /// Remove a device by its `device_id` string. Returns `true` if found.
@@ -278,6 +319,7 @@ impl DeviceRegistry {
             return RevokeResult { found, durable: true, save_error: None };
         }
         self.revoked_unsaved.insert(device_id.to_string());
+        self.pending_ids.insert(device_id.to_string());
         let recorded = match self.write_pending() {
             Ok(()) => true,
             Err(e) => {
@@ -319,9 +361,11 @@ impl DeviceRegistry {
         if !self.revoked_unsaved.is_empty() {
             self.revoked_unsaved.clear();
         }
-        // Whatever was pending is in the file now.
+        // Whatever was pending is in the file now. A record that cannot be
+        // blanked stays harmless (it only names devices the file lacks) and is
+        // logged; `add` keeps it from revoking a device that pairs again.
         if self.pending_written {
-            self.clear_pending();
+            let _ = self.clear_pending();
         }
         Ok(())
     }
@@ -600,6 +644,70 @@ mod tests {
         reg3.devices.push(entry(&id));
         let out = reg3.revoke(&id);
         assert!(out.found && out.save_error.is_none() && out.durable);
+    }
+
+    #[test]
+    fn a_device_paired_again_is_not_revoked_by_an_old_record() {
+        let id = iroh::SecretKey::from_bytes(&[12u8; 32]).public().to_string();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state/authorized_devices.json");
+        let mut reg = DeviceRegistry::empty_at(path.clone());
+        reg.add(entry(&id)).unwrap();
+        // The save fails, so the record keeps the id.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("keep"), b"x").unwrap();
+        assert!(reg.remove(&id).is_err());
+        let pending = path.with_file_name("revoked.pending");
+        assert!(std::fs::read_to_string(&pending).unwrap().contains(&id));
+        // The disk works again and the device pairs again.
+        std::fs::remove_dir_all(&path).unwrap();
+        reg.add(entry(&id)).unwrap();
+        assert!(
+            !std::fs::read_to_string(&pending).unwrap().contains(&id),
+            "the record still names a device that paired again"
+        );
+        let again = DeviceRegistry::load_from(path).unwrap();
+        let key: iroh::EndpointId = id.parse().unwrap();
+        assert!(again.is_authorized(&key), "a restart revoked the new pairing");
+    }
+
+    #[test]
+    fn a_failed_pairing_leaves_the_revoke_in_the_record() {
+        let id = iroh::SecretKey::from_bytes(&[13u8; 32]).public().to_string();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state/authorized_devices.json");
+        let mut reg = DeviceRegistry::empty_at(path.clone());
+        reg.add(entry(&id)).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("keep"), b"x").unwrap();
+        assert!(reg.remove(&id).is_err());
+        // The pairing cannot be saved either.
+        assert!(reg.add(entry(&id)).is_err());
+        let pending = path.with_file_name("revoked.pending");
+        assert!(std::fs::read_to_string(&pending).unwrap().contains(&id));
+    }
+
+    #[test]
+    fn the_revoke_record_has_room_for_a_thousand_devices_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state/authorized_devices.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut reg = DeviceRegistry::load_from(path.clone()).unwrap();
+        let ids: Vec<String> = (0..PENDING_IDS)
+            .map(|i| {
+                let mut b = [0u8; 32];
+                b[..8].copy_from_slice(&(i as u64 + 1).to_le_bytes());
+                iroh::SecretKey::from_bytes(&b).public().to_string()
+            })
+            .collect();
+        for id in &ids {
+            reg.pending_ids.insert(id.clone());
+        }
+        reg.write_pending().unwrap();
+        let len = std::fs::metadata(path.with_file_name("revoked.pending")).unwrap().len();
+        assert_eq!(len as usize, PENDING_BYTES, "1024 ids must fit without growing the file");
     }
 
     #[test]

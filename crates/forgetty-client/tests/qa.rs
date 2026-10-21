@@ -1022,6 +1022,57 @@ async fn an_interrupt_drops_the_stale_input_behind_it_and_reports_the_hole() {
     let _ = std::fs::remove_file(&file);
 }
 
+/// Ctrl+C to a signal forwarder (ssh, mosh) that is busy: the server does not
+/// kill a forwarder, it relies on the interrupt byte going into the tty. The
+/// byte must go in even when the interrupt had to skip the queue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ctrl_c_to_a_busy_forwarder_still_reaches_it_through_the_tty() {
+    use forgetty_client::proto::write_input_frame_flags;
+    use std::os::unix::fs::PermissionsExt;
+    if !real_only() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("forgetty-fwd-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("got");
+    // The script is named `ssh`: the foreground group's leader has that name
+    // in /proc/<pid>/comm, so `send_sigint` leaves it alone. It never reads.
+    let prog = dir.join("ssh");
+    std::fs::write(
+        &prog,
+        format!(
+            "#!/bin/sh\ntrap 'echo GOT_INT >> {}' INT\nstty -echo\nwhile :; do sleep 0.1; done\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&prog, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let server = TestServer::start(TestServerConfig::default()).await;
+    let pane = server.add_script_pane(&format!("exec {}", prog.display()));
+    let (_e, conn, mut ctl, _events) = flag_peer(&server).await;
+    attach_raw(&mut ctl, 1, pane).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut input = conn.open_uni().await.unwrap();
+    let mut seq = 0;
+    let line = b"echo STALE\n".repeat(700);
+    for _ in 0..140 {
+        seq += 1;
+        write_input_frame_flags(&mut input, pane, seq, 0, &line).await.unwrap();
+    }
+    wait_for("frames to be dropped", || qa_state(&server)["input_drops"].as_u64().unwrap() > 0)
+        .await;
+    assert!(!log.exists(), "the program was interrupted before Ctrl+C");
+    seq += 1;
+    write_input_frame_flags(&mut input, pane, seq, 0, &[0x03]).await.unwrap();
+    wait_for("the forwarder to get Ctrl+C", || {
+        std::fs::read_to_string(&log).is_ok_and(|t| t.contains("GOT_INT"))
+    })
+    .await;
+    drop(conn);
+    server.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// With ISIG off the program gets Ctrl+C as plain input: nothing signals it,
 /// not even when its queue is full.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1077,10 +1128,10 @@ async fn the_stream_header_names_the_end_of_the_replay() {
     server.shutdown().await;
 }
 
-/// Frames left in a hung pane's queue when the 2 s drain runs out are saved
-/// as unwritten, so the saved dedup state does not claim they were written.
+/// Input never crosses a restart: a stop saves the dedup table and no list of
+/// frames to take again, even with frames left in a hung pane's queue.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_stop_saves_the_frames_that_never_reached_a_hung_pane() {
+async fn a_stop_carries_no_unwritten_frames_over() {
     if !real_only() {
         return;
     }
@@ -1106,13 +1157,12 @@ async fn a_stop_saves_the_frames_that_never_reached_a_hung_pane() {
     let _ = saved;
     let text = std::fs::read_to_string(found.expect("input_seq.json was saved")).unwrap();
     let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
-    let unwritten: usize = doc["entries"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|e| e["unwritten"].as_array().map_or(0, |a| a.len()))
-        .sum();
-    assert!(unwritten > 0, "frames stuck in the hung pane's queue were saved as written: {text}");
+    let entries = doc["entries"].as_array().unwrap();
+    assert!(!entries.is_empty(), "the dedup table was saved: {text}");
+    assert!(
+        entries.iter().all(|e| e.get("unwritten").is_none()),
+        "frames to take again after the restart were saved: {text}"
+    );
 }
 
 fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {

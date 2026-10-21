@@ -1304,7 +1304,7 @@ fn sync_unavailable(request: &Request) -> Response {
 pub(crate) fn handle_list_devices(request: &Request, se: Option<&SyncEndpoint>) -> Response {
     let Some(se) = se else { return sync_unavailable(request) };
     let registry = se.registry();
-    let reg = registry.lock().unwrap();
+    let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
     let devices: Vec<serde_json::Value> = reg
         .list()
         .iter()

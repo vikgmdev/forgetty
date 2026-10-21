@@ -420,8 +420,11 @@ build or the laptop's view of it.
 - One pane that does not read never delays a client's input to other panes,
   Control or Pong.
 - Graceful stop closes the queues, waits up to 2 s for them to drain, and then
-  saves the dedup state. It saves the `seq`s still queued as unwritten, so a
-  resend of one is taken after the restart.
+  saves the dedup state. Input never crosses a restart: processes do not
+  survive it (AD-017), so a resent frame would type into a fresh shell. The
+  server carries no unwritten frames over. `Welcome.boot_id` (new for each run)
+  tells a client that the server restarted, and the client drops the input it
+  had not seen acked and shows the user how many bytes were not sent.
 - There is one ack counter per client epoch (`Pong.input_acked`), not one per
   pane. Because a dropped frame is acked, the server must not let later input
   of that client reach the same pane with a hole in front of it: after the

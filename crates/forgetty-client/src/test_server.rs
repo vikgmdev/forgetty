@@ -195,6 +195,8 @@ struct State {
     dedup_drops: AtomicU64,
     hold_acks: AtomicBool,
     server_id: Uuid,
+    /// New for each start of the server, like the real one's.
+    boot_id: Uuid,
     panes: Mutex<HashMap<Uuid, PaneLog>>,
     conns: Mutex<Vec<Connection>>,
     events: broadcast::Sender<(u64, ServerEvent)>,
@@ -267,6 +269,7 @@ impl TestServer {
             dedup_drops: AtomicU64::new(0),
             hold_acks: AtomicBool::new(false),
             server_id: Uuid::new_v4(),
+            boot_id: Uuid::new_v4(),
             panes: Mutex::new(HashMap::new()),
             conns: Mutex::new(Vec::new()),
             events,
@@ -542,6 +545,7 @@ async fn handle_rpc(conn: Connection, state: Arc<State>) {
         server_version: "test".into(),
         hostname: "test-host".into(),
         capabilities: state.cfg.capabilities.clone(),
+        boot_id: Some(state.boot_id),
     };
     if write_msg(&mut send, &HandshakeReply::Welcome(welcome)).await.is_err() {
         return;

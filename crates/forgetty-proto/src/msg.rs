@@ -33,6 +33,29 @@ pub mod uuid_str {
     }
 }
 
+/// Optional UUID as a string, for fields an old peer does not send.
+pub mod uuid_str_opt {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use uuid::Uuid;
+
+    /// Serialize `Some` as the hyphenated string (`None` is skipped by the
+    /// field's `skip_serializing_if`).
+    pub fn serialize<S: Serializer>(id: &Option<Uuid>, s: S) -> Result<S::Ok, S::Error> {
+        match id {
+            Some(id) => s.collect_str(&id.hyphenated()),
+            None => s.serialize_none(),
+        }
+    }
+
+    /// Parse the string form, or `None`.
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Uuid>, D::Error> {
+        match Option::<String>::deserialize(d)? {
+            Some(s) => Uuid::parse_str(&s).map(Some).map_err(serde::de::Error::custom),
+            None => Ok(None),
+        }
+    }
+}
+
 /// Kind of client, sent in `Hello` and `PairRequest`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -122,6 +145,13 @@ pub struct Welcome {
     pub hostname: String,
     /// Capability names the server supports.
     pub capabilities: Vec<String>,
+    /// New for every run of the server process (not stable across a restart,
+    /// unlike `server_id`). A client that sees a different value than on its
+    /// last connection knows the server restarted: its programs are gone, so
+    /// it drops the input it had not seen acked. `None` from a server that
+    /// does not send it (an old decoder ignores the field).
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "uuid_str_opt")]
+    pub boot_id: Option<Uuid>,
 }
 
 /// `Error { code, message }` of the handshake and pairing paths.

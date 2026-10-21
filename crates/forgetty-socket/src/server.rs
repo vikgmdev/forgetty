@@ -948,11 +948,14 @@ async fn handle_streaming_connection(
         }
 
         // `send_input` may wait up to 10 s for room in a pane whose program
-        // does not read (AD-024), and `capture` feeds the whole ring through a
-        // terminal. Both would hold a runtime worker, so they run on the
-        // blocking pool. The connection still answers in order. A handler that
+        // does not read (AD-024), `capture` feeds the whole ring through a
+        // terminal, and `send_sigint` waits for a stuck writer to stop before
+        // it signals. All three would hold a runtime worker, so they run on
+        // the blocking pool. The connection still answers in order. A handler that
         // panics or dies gets an error back, never a closed connection.
-        let heavy = request.method == methods::SEND_INPUT || request.method == methods::CAPTURE;
+        let heavy = request.method == methods::SEND_INPUT
+            || request.method == methods::CAPTURE
+            || request.method == methods::SEND_SIGINT;
         let response = if heavy {
             let (req, sm2, se, sid) = (
                 request.clone(),

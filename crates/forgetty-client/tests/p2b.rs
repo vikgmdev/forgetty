@@ -121,8 +121,9 @@ async fn exactly_once_across_five_drops_and_one_restart() {
 
     // One restart. Typing stops first and the echo catches up, so no byte is
     // in flight inside the dying PTY. Frames the server wrote but did not ack
-    // yet are still in the client buffer: the new process must not write them
-    // again.
+    // yet are still in the client buffer: input never crosses a restart, so
+    // the client drops them when it sees the new `boot_id`, and the new
+    // process never gets them (their programs are gone).
     pause.store(true, Ordering::SeqCst);
     tokio::time::sleep(Duration::from_millis(50)).await;
     wait_for("echo to catch up", Duration::from_secs(10), || {
@@ -132,10 +133,16 @@ async fn exactly_once_across_five_drops_and_one_restart() {
     let t_stop = Instant::now();
     let unacked = h.unacked_input_bytes();
     let saved = server.stop_for_restart().await;
-    pause.store(false, Ordering::SeqCst); // typing goes on while the server is down
     let started = Instant::now();
     let fresh = TestServer::start_again(saved, port).await;
     let stop_time = started.duration_since(t_stop);
+    wait_for("the client to drop its unacked input", Duration::from_secs(15), || {
+        h.state().is_connected() && h.lost_input_bytes() > 0
+    })
+    .await;
+    assert_eq!(h.lost_input_bytes(), unacked as u64, "what the user is told was not sent");
+    assert_eq!(h.unacked_input_bytes(), 0);
+    pause.store(false, Ordering::SeqCst); // typing goes on with the new process
 
     typist.await.unwrap();
     let (data, resets) = tokio::time::timeout(Duration::from_secs(30), consumer)
@@ -152,6 +159,74 @@ async fn exactly_once_across_five_drops_and_one_restart() {
         "exactly-once: {FRAMES} frames, 5 drops, 1 restart ({unacked} bytes unacked at the restart, \
          new process up {stop_time:?} after the stop); output and input identical"
     );
+    h.close().await;
+    fresh.shutdown().await;
+}
+
+/// Input never crosses a server restart (AD-017, `Welcome.boot_id`): what the
+/// client held unacked is dropped and counted, an event says so, the new
+/// process gets none of it, and input typed afterwards works. A reconnect to
+/// the same run drops nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unacked_input_is_dropped_and_reported_when_the_server_restarts() {
+    let server = TestServer::start(TestServerConfig::default()).await;
+    let port = server.udp_addr().port();
+    let pane = server.add_pane();
+    let h = connect(&server, "typist").await;
+    let first_boot = h.welcome().unwrap().boot_id;
+    assert!(first_boot.is_some(), "the server sends a boot_id");
+    let mut events = h.events().await.unwrap();
+
+    // A reconnect to the same run keeps the buffer and drops nothing.
+    server.hold_acks(true);
+    h.send_input(pane, b"one\n").await.unwrap();
+    wait_for("the server to get the input", Duration::from_secs(5), || {
+        server.received_input(pane).ends_with(b"one\n")
+    })
+    .await;
+    server.drop_connections();
+    wait_for("the same run again", Duration::from_secs(10), || {
+        server.handshakes() >= 2 && h.state().is_connected()
+    })
+    .await;
+    assert_eq!(h.welcome().unwrap().boot_id, first_boot);
+    assert_eq!(h.lost_input_bytes(), 0, "a reconnect to the same run lost input");
+    assert_eq!(h.unacked_input_bytes(), 4);
+
+    // A restart drops it, and says how much.
+    let saved = server.stop_for_restart().await;
+    h.send_input(pane, b"two\n").await.unwrap(); // typed while the server is down
+    let fresh = TestServer::start_again(saved, port).await;
+    wait_for("the client to see the restart", Duration::from_secs(15), || {
+        h.state().is_connected() && h.lost_input_bytes() > 0
+    })
+    .await;
+    assert_ne!(h.welcome().unwrap().boot_id, first_boot, "a new run has a new boot_id");
+    assert_eq!(h.lost_input_bytes(), 8);
+    assert_eq!(h.unacked_input_bytes(), 0);
+    let lost = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(EventItem::InputLost { bytes }) = events.next().await {
+                return bytes;
+            }
+        }
+    })
+    .await
+    .expect("no InputLost event");
+    assert_eq!(lost, 8);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let got = fresh.received_input(pane);
+    assert!(
+        !got.windows(3).any(|w| w == b"one" || w == b"two"),
+        "input crossed the restart: {:?}",
+        String::from_utf8_lossy(&got)
+    );
+    // Input typed after the restart goes through.
+    h.send_input(pane, b"three\n").await.unwrap();
+    wait_for("new input", Duration::from_secs(5), || {
+        fresh.received_input(pane).ends_with(b"three\n")
+    })
+    .await;
     h.close().await;
     fresh.shutdown().await;
 }

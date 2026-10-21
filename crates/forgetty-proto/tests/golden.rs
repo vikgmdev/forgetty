@@ -38,9 +38,25 @@ fn golden_hello() {
 #[test]
 fn golden_welcome() {
     golden::<HandshakeReply>(
-        HandshakeReply::Welcome(Welcome { proto_major: 2, proto_minor: 0, server_id: id(2), server_version: "3.0.0".into(), hostname: "ovh".into(), capabilities: vec!["resume".into()] }),
+        HandshakeReply::Welcome(Welcome { proto_major: 2, proto_minor: 0, server_id: id(2), server_version: "3.0.0".into(), hostname: "ovh".into(), capabilities: vec!["resume".into()], boot_id: None }),
         "81a757656c636f6d6586ab70726f746f5f6d616a6f7202ab70726f746f5f6d696e6f7200a97365727665725f6964d92430323032303230322d303230322d303230322d303230322d303230323032303230323032ae7365727665725f76657273696f6ea5332e302e30a8686f73746e616d65a36f7668ac6361706162696c697469657391a6726573756d65",
     );
+}
+
+#[test]
+fn golden_welcome_with_boot_id() {
+    let w = Welcome {
+        proto_major: 2,
+        proto_minor: 0,
+        server_id: id(2),
+        server_version: "3.0.0".into(),
+        hostname: "ovh".into(),
+        capabilities: vec!["resume".into()],
+        boot_id: Some(id(7)),
+    };
+    // The new field is the last key. `golden_welcome` (no `boot_id`) is
+    // unchanged, so a server that sends none decodes with `None`.
+    golden::<HandshakeReply>(HandshakeReply::Welcome(w), "81a757656c636f6d6587ab70726f746f5f6d616a6f7202ab70726f746f5f6d696e6f7200a97365727665725f6964d92430323032303230322d303230322d303230322d303230322d303230323032303230323032ae7365727665725f76657273696f6ea5332e302e30a8686f73746e616d65a36f7668ac6361706162696c697469657391a6726573756d65a7626f6f745f6964d92430373037303730372d303730372d303730372d303730372d303730373037303730373037");
 }
 
 #[test]

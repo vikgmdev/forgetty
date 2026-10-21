@@ -51,8 +51,16 @@ Welcome {
   proto_major: 2, proto_minor: u16,
   server_id: Uuid, server_version: String, hostname: String,
   capabilities: Vec<String>,
+  boot_id: Option<Uuid>,   // optional, new for every run of the server process
 }
 ```
+
+`server_id` is stable across restarts. `boot_id` is not: the server makes a new
+one at each start and sends it in every `Welcome` of that run. A client that
+sees a `boot_id` different from the one it saw on its last connection knows the
+server restarted (section 9). The field is optional: an old server does not
+send it, an old decoder ignores it, and a client that gets none changes
+nothing.
 
 Rules: a different `proto_major` gets `Error { code: "proto_mismatch" }`. The
 server then calls `finish()` on the stream and waits up to 2 s for the client to
@@ -160,10 +168,15 @@ sends SIGINT to the foreground process group. Bytes of the frame after the
 last interrupt byte are queued. Otherwise the frame goes in order and the tty
 does the interrupt. `auto` input never interrupts.
 
-**Graceful stop.** After the drain (up to 2 s) the server saves, for each
-client epoch, the `seq`s that were queued and never written. A resend of one
-of them after the restart is queued once. A frame that arrives while the stop
-is under way is not recorded and not acked, so the client resends it.
+**Graceful stop.** The server freezes input, closes the pane queues, waits up
+to 2 s for them to drain, and saves the `seq` state. Input never crosses a
+restart: processes do not survive it (AD-017), so a frame resent after it would
+type into a fresh shell. The server does not carry unwritten frames over.
+Frames still in a queue after the drain limit are lost (logged). A frame that
+arrives while the stop is under way is not recorded and not acked. A client
+that sees the new `boot_id` drops what it holds (section 9). An old client
+without that rule still resends, and the server takes the frames above the
+saved `last`.
 
 The client keeps every frame until a `Pong.input_acked` covers it (cap 64 KiB).
 After a reconnect it resends all unacked frames in order. Input from a
@@ -267,6 +280,14 @@ known gap, section 12).
   The client tells iroh about the change and sends an immediate `Ping`. Without
   a `Pong` in 1 s it redials.
 - Input typed while disconnected is buffered (cap 64 KiB) and sent after resume.
+- **Restart rule.** The client remembers `Welcome.boot_id`. When a new
+  `Welcome` has a `boot_id` different from the last one, the server restarted
+  and its programs are gone. The client drops its whole unacked input buffer,
+  does not send it, and tells the user how many bytes were not sent (the Rust
+  client raises `EventItem::InputLost { bytes }` and counts them in
+  `lost_input_bytes()`; the Windows and Android apps show it). Input typed
+  after the new `Welcome` is sent as usual. If either `Welcome` has no
+  `boot_id`, nothing is dropped.
 
 ## 10. Crates
 
@@ -280,8 +301,9 @@ known gap, section 12).
 ## 11. Amendments (2026-10-21, from the P2b implementation)
 
 1. Input dedup table (section 5) is persisted to `input_seq.json` on graceful
-   stop and loaded on start. After `kill -9` it is lost, and a resend after a
-   crash can repeat input once. This is accepted.
+   stop and loaded on start. After `kill -9` it is lost. Clients that know
+   `boot_id` (section 9) never resend across a restart. An older client can
+   repeat input once after a crash. This is accepted.
 2. A reader that falls behind the whole log gets its pane stream reset with
    QUIC stream error code `0x11 log_lost` (same name as in section 12). The
    client re-attaches with `from_offset` and gets `reset = true`.

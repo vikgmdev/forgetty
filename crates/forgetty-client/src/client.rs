@@ -101,6 +101,14 @@ pub enum EventItem {
     },
     /// Events may have been missed (reconnect or lag). Refetch `get_layout`.
     Resynced,
+    /// The server restarted (its `Welcome.boot_id` changed) while this client
+    /// held input it had not seen acked. The programs that input was for are
+    /// gone, so the client dropped it instead of typing it into a fresh shell.
+    /// The user should be told that `bytes` bytes were not sent.
+    InputLost {
+        /// Bytes of input dropped.
+        bytes: u64,
+    },
 }
 
 /// Stream of server events. Created by [`ClientHandle::events`].
@@ -250,6 +258,10 @@ pub(crate) struct Shared {
     events_gen: Arc<tokio::sync::Mutex<u64>>,
     ever_connected: AtomicBool,
     welcome: Mutex<Option<Welcome>>,
+    /// `Welcome.boot_id` of the last connection.
+    boot_id: Mutex<Option<Uuid>>,
+    /// Input bytes dropped because the server restarted, in total.
+    input_lost: AtomicU64,
     shutdown_tx: watch::Sender<bool>,
     kick: Notify,
     /// Wakes the liveness task for an immediate `Ping`.
@@ -347,6 +359,8 @@ impl Client {
             events_gen: Arc::new(tokio::sync::Mutex::new(0)),
             ever_connected: AtomicBool::new(false),
             welcome: Mutex::new(None),
+            boot_id: Mutex::new(None),
+            input_lost: AtomicU64::new(0),
             shutdown_tx,
             kick: Notify::new(),
             ping_now: Notify::new(),
@@ -541,6 +555,13 @@ impl ClientHandle {
             }
         }
         Ok(())
+    }
+
+    /// Input bytes dropped so far because the server restarted before they
+    /// were acked (PROTOCOL_V2 section 9). Also reported once per restart as
+    /// [`EventItem::InputLost`].
+    pub fn lost_input_bytes(&self) -> u64 {
+        self.shared().input_lost.load(Ordering::SeqCst)
     }
 
     /// Input bytes sent or buffered but not yet acked by the server.
@@ -996,6 +1017,7 @@ async fn run_session(
 ) -> (SessionEnd, bool) {
     let Established { conn, send, recv, welcome } = est;
     let gen = shared.next_gen.fetch_add(1, Ordering::SeqCst) + 1;
+    note_boot(shared, welcome.boot_id);
 
     let caps: HashSet<String> = welcome
         .capabilities
@@ -1188,6 +1210,31 @@ async fn session_init(
     link.resumed.store(true, Ordering::SeqCst);
     let _ = resumed.send(());
     TaskEnd::Done
+}
+
+/// A server run with another `boot_id` than the last connection's is a
+/// restart: its programs are gone, so the input held here, which the old run
+/// never acked, must not be typed into the fresh shells (AD-017). Drop it and
+/// report how much.
+fn note_boot(shared: &Shared, boot: Option<Uuid>) {
+    let prev = std::mem::replace(&mut *lock(&shared.boot_id), boot);
+    let (Some(prev), Some(boot)) = (prev, boot) else { return };
+    if prev == boot {
+        return;
+    }
+    let bytes = {
+        let mut st = lock(&shared.input.state);
+        let bytes = st.bytes as u64;
+        st.frames.clear();
+        st.bytes = 0;
+        bytes
+    };
+    shared.input.space.notify_waiters();
+    if bytes > 0 {
+        warn!("client: the server restarted, {bytes} bytes of unacked input were not sent");
+        shared.input_lost.fetch_add(bytes, Ordering::SeqCst);
+        let _ = shared.events_tx.send(EventItem::InputLost { bytes });
+    }
 }
 
 /// Send every unacked frame in `seq` order. After a reconnect `sent` starts
