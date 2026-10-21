@@ -156,17 +156,20 @@ mod win {
                     let mut written = 0u32;
                     let w = WriteFile(h, Some(bytes), Some(&mut written), None);
                     let _ = CloseHandle(h);
-                    match w {
+                    let r = match w {
                         Ok(()) if written as usize == bytes.len() => Ok(()),
                         Ok(()) => Err(io::Error::other("short write")),
                         Err(e) => Err(err(e)),
+                    };
+                    // Only a file this call created may be removed. A failed CreateFileW (the file
+                    // exists) must leave the winner's file alone.
+                    if r.is_err() {
+                        let _ = std::fs::remove_file(path);
                     }
+                    r
                 }
             };
             let _ = LocalFree(Some(HLOCAL(sd.0)));
-            if result.is_err() {
-                let _ = std::fs::remove_file(path);
-            }
             result
         }
     }

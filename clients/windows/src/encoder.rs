@@ -106,6 +106,16 @@ impl Input {
             )
         };
         if rc == ffi::GHOSTTY_SUCCESS && written > 0 {
+            // The legacy Alt encoding is ESC plus the character cast to one byte. For a letter
+            // above U+007F that byte is Latin-1 and breaks UTF-8, so send ESC plus the UTF-8 text.
+            if let (Some(c), true) = (letter, written == 2 && buf[0] == 0x1b && buf[1] >= 0x80) {
+                if mods & ffi::GHOSTTY_MODS_ALT != 0 && mods & (ffi::GHOSTTY_MODS_CTRL | ffi::GHOSTTY_MODS_SUPER) == 0 {
+                    let mut out = vec![0x1b];
+                    let mut tmp = [0u8; 4];
+                    out.extend_from_slice(c.encode_utf8(&mut tmp).as_bytes());
+                    return Some(out);
+                }
+            }
             return Some(buf[..written].to_vec());
         }
         // Encoder had nothing but the key makes text: send it raw. Alt puts an ESC in front
