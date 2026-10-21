@@ -162,6 +162,8 @@ pub struct AppShell {
     pub pair: Option<PairDialog>,
     pub toast_limiter: ToastLimiter,
     pub toast_log: Vec<ToastRecord>,
+    /// "Check for updates": idle until the user asks.
+    pub update: crate::update::UpdateState,
     /// While false, `apply_layout` does not attach panes (a machine that is not on screen).
     pub(crate) attach_enabled: bool,
     pub win_handle: gpui::AnyWindowHandle,
@@ -251,6 +253,7 @@ impl AppShell {
             pair: None,
             toast_limiter: ToastLimiter::default(),
             toast_log: Vec::new(),
+            update: crate::update::UpdateState::Idle,
             attach_enabled: true,
             win_handle: window.window_handle(),
             net_pokes: 0,
@@ -751,6 +754,40 @@ impl AppShell {
         self.call(cx, fut, |_, _, _| {});
     }
 
+    /// Ask GitHub Releases whether a newer Windows build exists. Runs only from
+    /// the user's click or the palette; nothing is downloaded or installed.
+    pub fn check_for_updates(&mut self, cx: &mut Context<Self>) {
+        if self.update == crate::update::UpdateState::Checking {
+            return;
+        }
+        self.update = crate::update::UpdateState::Checking;
+        self.sidebar_open = true;
+        let (tx, rx) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let _ = tx.send_blocking(crate::update::check(env!("CARGO_PKG_VERSION")));
+        });
+        cx.spawn(async move |this, cx| {
+            let st = rx.recv().await.unwrap_or_else(|_| crate::update::UpdateState::Failed("the check stopped".into()));
+            let _ = this.update(cx, |s, cx| {
+                s.update = st;
+                s.request_sync(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// The sidebar line was clicked: a found update opens its page, else check again.
+    pub fn update_line_clicked(&mut self, cx: &mut Context<Self>) {
+        match &self.update {
+            crate::update::UpdateState::Available { url, .. } => {
+                let _ = crate::update::open_release_page(url);
+            }
+            _ => self.check_for_updates(cx),
+        }
+    }
+
     pub fn begin_rename(&mut self, tab: Uuid, cx: &mut Context<Self>) {
         let Some((w, t)) = self.layout.find_tab(tab) else { return };
         let current = self.tab_title(&self.layout.workspaces[w].tabs[t]);
@@ -791,6 +828,7 @@ impl AppShell {
                     self.begin_rename(t, cx);
                 }
             }
+            Action::CheckUpdates => self.check_for_updates(cx),
             Action::RenamePane => self.begin_rename_pane(cx),
             Action::RenameWorkspace => self.begin_rename_workspace(self.layout.active_workspace, cx),
             Action::SplitRight => self.split(SplitDir::Horizontal, cx),

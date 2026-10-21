@@ -755,8 +755,25 @@ impl ShellSmoke {
                 let ok_ws = shell.layout.workspaces[0].name == "wlab";
                 if ok_tab && ok_pane && ok_ws {
                     check("remote_labels_roundtrip", true);
-                    self.finish_w3(shell);
+                    self.sub = 10;
+                    self.sub_t0 = Instant::now();
                 }
+            }
+            // "Check for updates" never runs by itself, and a click ends with an answer.
+            10 => {
+                check("update_check_idle_until_asked", shell.update == forgetty_shell_core::update::UpdateState::Idle);
+                shell.check_for_updates(cx);
+                self.sub = 11;
+                self.sub_t0 = Instant::now();
+            }
+            11 => {
+                if shell.update == forgetty_shell_core::update::UpdateState::Checking {
+                    stuck(self, "update check");
+                    return;
+                }
+                record("update_check_result", json!(format!("{:?}", shell.update)));
+                check("update_check_finishes", true);
+                self.finish_w3(shell);
             }
             _ => {}
         }

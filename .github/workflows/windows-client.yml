@@ -55,7 +55,7 @@ jobs:
         working-directory: clients/windows
         run: |
           # The ConPTY tests in shell-core's local module are covered by the smoke.
-          cargo test --release -p forgetty-shell-core --lib -- notify:: layout:: keys:: osc:: fuzzy::
+          cargo test --release -p forgetty-shell-core --lib -- notify:: layout:: keys:: osc:: fuzzy:: update::
           cargo test --release -p forgetty-remote
 
       - name: Smoke
@@ -172,3 +172,68 @@ jobs:
           name: forgetty-win-real
           if-no-files-found: warn
           path: win/real-smoke.json
+
+  # W4: per-user MSI (WiX v4). MSI and not MSIX: an unsigned MSIX needs its
+  # certificate trusted machine-wide (admin) or Developer Mode before it
+  # installs; a per-user MSI installs with no admin rights and no setup.
+  installer:
+    needs: build-and-smoke
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: forgetty-win
+          path: payload
+
+      - name: Build the MSI
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 4.0.5
+          $env:PATH += ";$env:USERPROFILE\.dotnet\tools"
+          $ver = (Select-String -Path clients/windows/Cargo.toml -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value
+          Write-Host "version $ver"
+          New-Item -ItemType Directory -Force out | Out-Null
+          wix build -arch x64 -d Version=$ver -d Payload=payload clients/windows/installer/Package.wxs -o "out/forgetty-win-$ver-x64.msi"
+          Get-ChildItem out | Format-Table Name, Length
+
+      - name: Install, check, uninstall
+        shell: pwsh
+        run: |
+          $msi = (Get-ChildItem out/*.msi | Select-Object -First 1).FullName
+          # The package asks for no elevation: Word Count bit 8 ("elevated privileges") is clear, no ALLUSERS.
+          $wi = New-Object -ComObject WindowsInstaller.Installer
+          $db = $wi.GetType().InvokeMember("OpenDatabase", "InvokeMethod", $null, $wi, @($msi, 0))
+          $si = $db.GetType().InvokeMember("SummaryInformation", "GetProperty", $null, $db, @(0))
+          $wc = [int]$si.GetType().InvokeMember("Property", "GetProperty", $null, $si, @(15))
+          Write-Host "summary word count: $wc"
+          if (($wc -band 8) -ne 0) { throw "the package asks for elevation" }
+          $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /l*v install.log" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Get-Content install.log -Tail 60; throw "install failed: $($p.ExitCode)" }
+          $dir = Join-Path $env:LOCALAPPDATA "Programs\Forgetty"
+          foreach ($f in "forgetty-win.exe","forgetty.exe","ghostty-vt.dll") { if (-not (Test-Path (Join-Path $dir $f))) { throw "missing $f" } }
+          $lnk = Join-Path ([Environment]::GetFolderPath("Programs")) "Forgetty.lnk"
+          if (-not (Test-Path $lnk)) { throw "no Start menu entry at $lnk" }
+          $path = (Get-ItemProperty "HKCU:\Environment").Path
+          if ($path -notlike "*$dir*") { throw "install folder is not on the user PATH" }
+          if (Test-Path "C:\Program Files\Forgetty") { throw "wrote to Program Files" }
+          if (Test-Path "HKLM:\Software\Forgetty") { throw "wrote to HKLM" }
+          Write-Host "installed to $dir"
+          $p = Start-Process msiexec.exe -ArgumentList "/x `"$msi`" /qn /l*v uninstall.log" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Get-Content uninstall.log -Tail 60; throw "uninstall failed: $($p.ExitCode)" }
+          if (Test-Path $dir) { throw "install folder left behind" }
+          if (Test-Path $lnk) { throw "Start menu entry left behind" }
+          if ((Get-ItemProperty "HKCU:\Environment").Path -like "*$dir*") { throw "PATH entry left behind" }
+          Write-Host "install and uninstall are clean"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: forgetty-win-msi
+          if-no-files-found: error
+          path: |
+            out/*.msi
+            install.log
+            uninstall.log

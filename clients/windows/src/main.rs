@@ -11,6 +11,7 @@ mod machines;
 mod screenshot;
 mod shell;
 mod smoke;
+mod update;
 mod view;
 mod winsys;
 

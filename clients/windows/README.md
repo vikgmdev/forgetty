@@ -175,6 +175,68 @@ Known limits: the server has no `set_label` yet, so tab rename stays client-side
 server answers only part of the method set (no `move_tab`, `set_active_pane`, `update_split_ratios`);
 the real server answers all of them.
 
+## Catch-up, labels, real server (W4)
+
+- **Snapshot catch-up (AD-023).** A `PaneItem::Snapshot` always follows a
+  `Reset`. The pane's VT is reset, one dim line `-- earlier output not loaded --`
+  is pushed into scrollback, then the snapshot paints the screen. The snapshot
+  has no scrollback, so nothing above the marker is lost, it was never sent.
+- **Labels.** Tab, pane and workspace renames go through `set_label`
+  (`Ctrl+Shift+R` for the tab, palette "Rename pane", double click on a
+  workspace in the sidebar). Labels show before titles: tab label, then the
+  active pane's label, then the program title.
+- **Relays.** Every relay in a pairing payload (`relay` and `relays`) is stored
+  per machine. A `machines.json` from W3 with one `relay` string still loads.
+- **Test server.** `v2-test-server` now answers `focus_tab` (moves the active
+  tab), `set_active_pane`, `update_split_ratios` and `set_label`, and takes the
+  stdin commands `snapshot <text>` and `drop`. The smoke reads each of them back
+  from the layout.
+- **Reconnect time.** After a server restart the client was connected again
+  about 0.9 s after the new server accepted (CI), against 2.1 s from the loss.
+  The 1.1 s the overlay needs and the test server start were most of the gap.
+  The client side is the dial attempt: a machine reached directly before gets a
+  1 s dial timeout (a fresh first packet every second, instead of QUIC's
+  growing retry gaps) and the backoff wait is cut to 400 ms for the first
+  minute of an outage.
+- **Real server end to end.** CI builds the real Linux `forgetty` and runs it
+  in WSL on `windows-latest` (WSL1, the only kind a hosted runner has). The
+  Windows client pairs with it through the dialog's code path, opens two panes,
+  types, measures key-to-frame, kills and restarts the server, pushes a
+  20 MB burst (`seq 1 2500000`) through one pane and compares its final screen
+  with `forgetty capture` run inside WSL. Result: artifact
+  `forgetty-win-real` (`real-smoke.json`).
+
+## Install and update (W4)
+
+`forgetty-win-<version>-x64.msi` (CI artifact `forgetty-win-msi`) is a
+**per-user MSI** built with WiX v4:
+
+- installs to `%LOCALAPPDATA%\Programs\Forgetty`, needs no admin rights and
+  shows no UAC prompt, writes nothing to Program Files or HKLM;
+- adds a Start menu entry "Forgetty";
+- puts the install folder on the user PATH (`HKCU\Environment`). `forgetty.exe`
+  there is reserved for the future Windows CLI and starts the app for now;
+- uninstall removes all of it and keeps `%APPDATA%\forgetty` (paired machines,
+  device key).
+
+Why MSI and not MSIX: an unsigned MSIX only installs after its certificate is
+trusted machine-wide (admin) or Developer Mode is on. A per-user MSI installs
+with nothing set up. Revisit MSIX when the package is signed.
+
+**SmartScreen.** The installer and the exe are unsigned. Windows shows "Windows
+protected your PC, Microsoft Defender SmartScreen prevented an unrecognized app
+from starting" with publisher "Unknown publisher". Click "More info", then "Run
+anyway". The MSI's own dialog may also say "Unknown publisher". This goes away
+once the files are signed with a code signing certificate.
+
+**Updates.** The app never checks on its own. "Check for updates" (sidebar,
+or the palette) makes one HTTPS request to the GitHub Releases API of this
+repository (WinHTTP, so the system proxy and certificate store apply) and looks
+for the newest `win-v<major>.<minor>.<patch>` release. If one is newer, the
+sidebar says so, and a click opens its page in the browser. Nothing is
+downloaded or installed by the app. No telemetry: the request carries only a
+`User-Agent: forgetty-win/<version>`.
+
 ## Smoke mode
 
 `--smoke` opens the window, drives `cmd.exe` through ConPTY and prints one JSON object. Exit 0

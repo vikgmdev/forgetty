@@ -428,6 +428,39 @@ impl AppShell {
                 );
             }
         }
+
+        // About: the update check runs only when this is clicked.
+        let line = self.update.line(env!("CARGO_PKG_VERSION"));
+        sb = sb.child(header("ABOUT"));
+        sb = sb.child(
+            div()
+                .id("check-updates")
+                .mx(px(8.0))
+                .px(px(8.0))
+                .h(px(26.0))
+                .flex()
+                .items_center()
+                .rounded(px(5.0))
+                .cursor_pointer()
+                .text_color(hsla(th.dim))
+                .hover(move |s| s.bg(hover))
+                .on_mouse_down(MouseButton::Left, cx.listener(|s, _e, _w, cx| s.check_for_updates(cx)))
+                .child("Check for updates"),
+        );
+        if !line.is_empty() {
+            let found = matches!(self.update, crate::update::UpdateState::Available { .. });
+            sb = sb.child(
+                div()
+                    .id("update-status")
+                    .mx(px(8.0))
+                    .px(px(8.0))
+                    .py(px(4.0))
+                    .text_size(px(11.0))
+                    .text_color(hsla(if found { th.accent } else { th.dim }))
+                    .when(found, |d| d.cursor_pointer().on_mouse_down(MouseButton::Left, cx.listener(|s, _e, _w, cx| s.update_line_clicked(cx))))
+                    .child(SharedString::from(line)),
+            );
+        }
         sb
     }
 
