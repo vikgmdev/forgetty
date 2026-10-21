@@ -185,7 +185,26 @@ impl SyncEndpointBuilder {
                     "totem-sync: dual-stack bind on port {:?} failed ({e}), using IPv4 only",
                     self.bind_port
                 );
-                make(false)?.bind().await.map_err(|e| SyncError::Bind(e.to_string()))?
+                // The failed dual-stack attempt can still hold the IPv4 port for a moment
+                // (WSL1 releases it late), so the IPv4-only bind retries briefly.
+                let mut last = None;
+                let mut bound = None;
+                for attempt in 0..8u32 {
+                    if attempt > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    }
+                    match make(false)?.bind().await {
+                        Ok(ep) => {
+                            bound = Some(ep);
+                            break;
+                        }
+                        Err(e) => last = Some(e.to_string()),
+                    }
+                }
+                match bound {
+                    Some(ep) => ep,
+                    None => return Err(SyncError::Bind(last.unwrap_or_default())),
+                }
             }
             Err(e) => return Err(SyncError::Bind(e.to_string())),
         };
