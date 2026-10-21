@@ -274,6 +274,18 @@ pub enum ServerEvent {
         /// Exit code, `None` when unknown.
         exit_code: Option<i32>,
     },
+    /// Input this client sent to a pane was dropped because the pane did not
+    /// read it (AD-024). Sent once the pane's queue is empty again, to the
+    /// client that lost the input only, with the current event `seq`. Only
+    /// with capability `input_flags`. Anything the client typed before this
+    /// event may be missing in part.
+    InputDropped {
+        /// Pane id.
+        #[serde(with = "uuid_str")]
+        pane_id: Uuid,
+        /// Bytes dropped.
+        bytes: u64,
+    },
     /// Another client attached.
     ClientConnected {
         /// Client id.
@@ -315,6 +327,13 @@ pub struct PaneStreamHeader {
     /// that follow start at `start_offset`. `0` for a normal stream.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub snapshot_len: u32,
+    /// The pane offset at which the replay ends: the log's `total_written` at
+    /// the moment the stream starts. Bytes before it are history the client
+    /// is catching up on, bytes from it on are live. A snapshot stream sets it
+    /// to the snapshot's offset, so all its pane bytes are live. `None` from a
+    /// server that does not send it (an old decoder ignores the field).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_end: Option<u64>,
 }
 
 /// Client to server, first frame on a `forgetty/pair/2` bi stream (section 7).

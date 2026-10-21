@@ -947,12 +947,33 @@ async fn handle_streaming_connection(
             continue;
         }
 
-        let response = handlers::dispatch(
-            &request,
-            Arc::clone(&sm),
-            sync_endpoint.as_ref().map(Arc::clone),
-            session_id,
-        );
+        // `send_input` may wait up to 10 s for room in a pane whose program
+        // does not read (AD-024). That wait must not hold a runtime worker, so
+        // it runs on the blocking pool. The connection still answers in order.
+        let response = if request.method == methods::SEND_INPUT {
+            let (req, sm2, se, sid) = (
+                request.clone(),
+                Arc::clone(&sm),
+                sync_endpoint.as_ref().map(Arc::clone),
+                session_id,
+            );
+            tokio::task::spawn_blocking(move || handlers::dispatch(&req, sm2, se, sid))
+                .await
+                .unwrap_or_else(|e| {
+                    Response::error(
+                        request.id.clone(),
+                        crate::protocol::INTERNAL_ERROR,
+                        format!("send_input task failed: {e}"),
+                    )
+                })
+        } else {
+            handlers::dispatch(
+                &request,
+                Arc::clone(&sm),
+                sync_endpoint.as_ref().map(Arc::clone),
+                session_id,
+            )
+        };
         write_response(&mut writer, &response).await?;
     }
 

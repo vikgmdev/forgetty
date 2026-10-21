@@ -107,6 +107,7 @@ async fn pane_stream_shape() {
         rows: 24,
         cols: 80,
         snapshot_len: 0,
+        replay_end: None,
     };
     write_msg(&mut a, &h).await.unwrap();
     write_output_frame(&mut a, b"\x1b[31mred").await.unwrap();

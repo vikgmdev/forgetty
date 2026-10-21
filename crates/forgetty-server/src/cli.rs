@@ -703,8 +703,11 @@ pub fn revoke(target: &str) -> Result<()> {
         .filter_map(|d| d.get("device_id").and_then(Value::as_str).map(String::from))
         .collect();
     let id = resolve_target("device", target, &ids)?;
-    client.call("revoke_device", json!({ "device_id": id }))?;
+    let out = client.call("revoke_device", json!({ "device_id": id }))?;
     println!("revoked {id}");
+    if let Some(w) = out.get("warning").and_then(Value::as_str) {
+        eprintln!("forgetty: warning: {w}");
+    }
     Ok(())
 }
 

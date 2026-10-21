@@ -428,6 +428,8 @@ async fn resize_is_clamped_to_1000() {
     assert_eq!(dims(&server), (24, 80));
 
     let c = connect(&server, "big").await;
+    // A client owns a pane's size only while it has a stream on it (AD-025).
+    let _stream = c.attach_pane(pane).await.unwrap();
     c.resize(pane, 60_000, 2_000).await.expect("v2 resize");
     // The resize runs on a blocking task; give it a moment.
     let t0 = Instant::now();
@@ -515,7 +517,8 @@ async fn a_hung_pane_costs_only_its_own_input_and_ctrl_c_still_works() {
         return;
     }
     let server = TestServer::start(TestServerConfig::default()).await;
-    let a = server.add_script_pane("stty raw -echo; exec sleep infinity");
+    // A keeps ISIG on (no `raw`), so Ctrl+C can reach it as a signal.
+    let a = server.add_script_pane("stty -echo; exec sleep infinity");
     let b = server.add_script_pane("stty raw -echo; exec cat");
     let c = connect(&server, "typist").await;
     let mut stream_b = c.attach_pane(b).await.unwrap();
@@ -533,7 +536,8 @@ async fn a_hung_pane_costs_only_its_own_input_and_ctrl_c_still_works() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // 1 MiB into A. The queue (256 KiB) fills and the rest is dropped.
-    let chunk = vec![b'x'; 4096];
+    // Lines, so the tty (canonical mode) holds them and then blocks the writer.
+    let chunk = b"xxxxxxxxx\n".repeat(400);
     for _ in 0..256 {
         c.send_input(a, &chunk).await.unwrap();
     }
@@ -808,5 +812,267 @@ async fn a_hostile_node_does_not_starve_an_honest_nodes_catch_up() {
     assert!(worst < Duration::from_millis(300), "the honest node waited {worst:?}");
     honest.close().await;
     endpoint.close().await;
+    server.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Writer thread and shell behaviour on stop and on close
+// ---------------------------------------------------------------------------
+
+/// A graceful stop must not run what is half typed at a prompt. portable-pty's
+/// own writer sends `\n` and EOF to the terminal when it is dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_graceful_stop_does_not_run_half_typed_input() {
+    if !real_only() {
+        return;
+    }
+    let ran = std::env::temp_dir().join(format!("forgetty-ran-{}", Uuid::new_v4()));
+    let script =
+        format!("stty -echo; while IFS= read -r l; do echo \"RAN:$l\" >> {}; done", ran.display());
+    let server = TestServer::start(TestServerConfig::default()).await;
+    let pane = server.add_script_pane(&script);
+    let c = connect(&server, "typist").await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // A full line runs, as the control: the pane does read lines.
+    c.send_input(pane, b"echo CONTROL\n").await.unwrap();
+    wait_for("the control line", || {
+        std::fs::read_to_string(&ran).is_ok_and(|t| t.contains("RAN:echo CONTROL"))
+    })
+    .await;
+    // Half a line, no Enter.
+    c.send_input(pane, b"echo SHOULD_NOT_RUN").await.unwrap();
+    wait_for("the typing to reach the PTY", || {
+        contains(&pty_input(&server, pane), b"SHOULD_NOT_RUN")
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    c.close().await;
+    let port = server.udp_addr().port();
+    let saved = server.stop_for_restart().await;
+    let after_stop = std::fs::read_to_string(&ran).unwrap_or_default();
+    assert!(!after_stop.contains("SHOULD_NOT_RUN"), "the stop ran half-typed input: {after_stop}");
+    let again = TestServer::start_again(saved, port).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let after_restart = std::fs::read_to_string(&ran).unwrap_or_default();
+    assert!(!after_restart.contains("SHOULD_NOT_RUN"), "ran after the restart: {after_restart}");
+    again.shutdown().await;
+    let _ = std::fs::remove_file(&ran);
+}
+
+/// Linux cuts a thread name to 15 characters.
+fn proc_threads_named(pid: i32, name: &str) -> usize {
+    std::fs::read_dir(format!("/proc/{pid}/task"))
+        .unwrap()
+        .flatten()
+        .filter(|t| std::fs::read_to_string(t.path().join("comm")).is_ok_and(|c| c.trim() == name))
+        .count()
+}
+
+fn proc_fds(pid: i32) -> usize {
+    std::fs::read_dir(format!("/proc/{pid}/fd")).unwrap().count()
+}
+
+/// Closing a pane frees its writer thread and PTY fd although the program
+/// never read its input and another process still holds the slave open (N8).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closing_a_pane_frees_its_writer_thread_and_fd_with_the_slave_held() {
+    if !real_only() {
+        return;
+    }
+    let server = TestServer::start(TestServerConfig::default()).await;
+    let pid = server.pid().expect("real server pid");
+    let c = connect(&server, "typist").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let threads0 = proc_threads_named(pid, "session-pty-wri");
+    let fds0 = proc_fds(pid);
+    // A background `sleep` keeps the slave open after the pane's own program
+    // is gone, and nothing reads it.
+    let pane = server.add_script_pane("stty raw -echo; sleep 12 & exec sleep infinity");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let chunk = vec![b'x'; 4096];
+    for _ in 0..256 {
+        c.send_input(pane, &chunk).await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(proc_threads_named(pid, "session-pty-wri"), threads0 + 1);
+    let fds_open = proc_fds(pid);
+    server.close_pane(pane);
+    let t0 = Instant::now();
+    loop {
+        let (threads, fds) = (proc_threads_named(pid, "session-pty-wri"), proc_fds(pid));
+        if threads == threads0 && fds <= fds0 {
+            break;
+        }
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "writer threads {threads} (was {threads0}), fds {fds} (was {fds0}, open {fds_open})"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    c.close().await;
+    server.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Interrupts, holes and ISIG (AD-024)
+// ---------------------------------------------------------------------------
+
+/// A raw peer with `input_flags` that keeps the events it is sent.
+async fn flag_peer(
+    server: &TestServer,
+) -> (
+    iroh::Endpoint,
+    iroh::endpoint::Connection,
+    iroh::endpoint::SendStream,
+    Arc<std::sync::Mutex<Vec<forgetty_client::proto::ServerEvent>>>,
+) {
+    let endpoint = raw_endpoint(server).await;
+    let conn = endpoint.connect(server.addr(), ALPN_RPC).await.unwrap();
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    let hello = Hello::new(
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        ClientKind::Cli,
+        "flags",
+        "0.0.0",
+        vec!["input_flags".into(), "size_policy_latest".into()],
+    );
+    write_msg(&mut send, &hello).await.unwrap();
+    match read_msg::<_, HandshakeReply>(&mut recv).await.unwrap() {
+        Some(HandshakeReply::Welcome(_)) => {}
+        other => panic!("handshake: {other:?}"),
+    }
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let e2 = events.clone();
+    tokio::spawn(async move {
+        while let Ok(Some(m)) = read_msg::<_, ControlMsg>(&mut recv).await {
+            if let ControlMsg::Event { event, .. } = m {
+                e2.lock().unwrap().push(event);
+            }
+        }
+    });
+    (endpoint, conn, send, events)
+}
+
+/// Pane script: `sleep` does not read, then a shell loop appends every line
+/// it reads to `file`. `trap :` lets Ctrl+C end the sleep and not the script.
+fn hung_then_reading(file: &std::path::Path, hang: &str) -> String {
+    format!(
+        "trap : INT; stty -echo; {hang}; while IFS= read -r l; do echo \"RAN:$l\" >> {}; done",
+        file.display()
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_interrupt_drops_the_stale_input_behind_it_and_reports_the_hole() {
+    use forgetty_client::proto::{write_input_frame_flags, ServerEvent};
+    if !real_only() {
+        return;
+    }
+    let file = std::env::temp_dir().join(format!("forgetty-stale-{}", Uuid::new_v4()));
+    let server = TestServer::start(TestServerConfig::default()).await;
+    let pane = server.add_script_pane(&hung_then_reading(&file, "sleep 60"));
+    let (_e, conn, mut ctl, events) = flag_peer(&server).await;
+    attach_raw(&mut ctl, 1, pane).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut input = conn.open_uni().await.unwrap();
+    let mut seq = 0;
+    // 1 MiB of command lines for a program that does not read: they stall in
+    // the tty, fill the pane queue, and the rest is dropped.
+    let line = b"echo STALE\n".repeat(700);
+    for _ in 0..140 {
+        seq += 1;
+        write_input_frame_flags(&mut input, pane, seq, 0, &line).await.unwrap();
+    }
+    wait_for("frames to be dropped", || qa_state(&server)["input_drops"].as_u64().unwrap() > 0)
+        .await;
+    // A frame behind the hole is dropped too, however small.
+    seq += 1;
+    write_input_frame_flags(&mut input, pane, seq, 0, b"echo HOLE\n").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!contains(&pty_input(&server, pane), b"HOLE"), "a frame behind the hole was queued");
+    assert!(events.lock().unwrap().is_empty(), "reported while the pane still does not read");
+
+    // Ctrl+C: ends the sleep, throws away what was queued behind it.
+    seq += 1;
+    write_input_frame_flags(&mut input, pane, seq, 0, &[0x03]).await.unwrap();
+    wait_for("the loss to be reported", || {
+        events.lock().unwrap().iter().any(
+            |e| matches!(e, ServerEvent::InputDropped { pane_id, bytes } if *pane_id == pane && *bytes > 0),
+        )
+    })
+    .await;
+    // The shell loop now reads. It must see the fresh line and no stale one.
+    seq += 1;
+    write_input_frame_flags(&mut input, pane, seq, 0, b"echo FRESH\n").await.unwrap();
+    wait_for("the fresh line", || {
+        std::fs::read_to_string(&file).is_ok_and(|t| t.contains("RAN:echo FRESH"))
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let ran = std::fs::read_to_string(&file).unwrap_or_default();
+    assert!(
+        !ran.contains("STALE"),
+        "a stale paste ran after the interrupt: {} lines",
+        ran.lines().count()
+    );
+    assert!(!ran.contains("HOLE"), "input behind the hole ran");
+    drop(conn);
+    server.shutdown().await;
+    let _ = std::fs::remove_file(&file);
+}
+
+/// With ISIG off the program gets Ctrl+C as plain input: nothing signals it,
+/// not even when its queue is full.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ctrl_c_is_data_when_isig_is_off() {
+    if !real_only() {
+        return;
+    }
+    let server = TestServer::start(TestServerConfig::default()).await;
+    let pane = server.add_script_pane("stty raw -echo; exec sleep infinity");
+    let c = connect(&server, "typist").await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let chunk = vec![b'x'; 4096];
+    for _ in 0..256 {
+        c.send_input(pane, &chunk).await.unwrap();
+    }
+    wait_for("the queue to fill", || qa_state(&server)["input_drops"].as_u64().unwrap() > 0).await;
+    c.send_input(pane, &[0x03]).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let info = server.socket_call("get_pane_info", json!({"pane_id": pane.to_string()})).unwrap();
+    assert!(info["exit_code"].is_null(), "Ctrl+C signalled a pane with ISIG off: {info}");
+    // The local `send_sigint` still signals, as asked.
+    server.socket_call("send_sigint", json!({"pane_id": pane.to_string()})).unwrap();
+    wait_for("send_sigint to end the program", || {
+        match server.socket_call("get_pane_info", json!({"pane_id": pane.to_string()})) {
+            Err(_) => true,
+            Ok(v) => !v["exit_code"].is_null(),
+        }
+    })
+    .await;
+    c.close().await;
+    server.shutdown().await;
+}
+
+/// The pane stream header says where replay ends (section 8).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_stream_header_names_the_end_of_the_replay() {
+    use forgetty_client::proto::PaneStreamHeader;
+    if !real_only() {
+        return;
+    }
+    let server = TestServer::start(TestServerConfig::default()).await;
+    let pane = server.add_script_pane("printf 'history'; exec cat");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let (first, total) = server.log_bounds(pane);
+    assert!(total >= 7, "the pane should have printed: {total}");
+    let (_e, conn, mut ctl) = raw_peer(&server, &["resume"], Uuid::new_v4()).await;
+    attach_raw(&mut ctl, 1, pane).await;
+    let mut s = conn.accept_uni().await.unwrap();
+    let h: PaneStreamHeader = read_msg(&mut s).await.unwrap().unwrap();
+    assert_eq!(h.start_offset, first);
+    assert_eq!(h.replay_end, Some(total), "history is replay, what comes after is live");
+    drop(conn);
     server.shutdown().await;
 }

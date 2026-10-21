@@ -176,9 +176,49 @@ fn golden_ev_cdisc() {
 }
 
 #[test]
+fn golden_header_with_replay_end() {
+    let h = PaneStreamHeader {
+        pane_id: id(3),
+        start_offset: 65536,
+        reset: false,
+        rows: 24,
+        cols: 80,
+        snapshot_len: 0,
+        replay_end: Some(70000),
+    };
+    // The new field is the last key. The header without it is unchanged
+    // (`golden_header`), and a decoder that does not know the field skips it.
+    let bytes = rmp_serde::to_vec_named(&h).unwrap();
+    golden::<PaneStreamHeader>(h.clone(), "86a770616e655f6964d92430333033303330332d303330332d303330332d303330332d303330333033303330333033ac73746172745f6f6666736574ce00010000a57265736574c2a4726f777318a4636f6c7350aa7265706c61795f656e64ce00011170");
+    // Old header (no field) decodes with `None`.
+    let old = unhex("85a770616e655f6964d92430333033303330332d303330332d303330332d303330332d303330333033303330333033ac73746172745f6f6666736574ce00010000a57265736574c2a4726f777318a4636f6c7350");
+    let d = rmp_serde::from_slice::<PaneStreamHeader>(&old).unwrap();
+    assert_eq!(d.replay_end, None);
+    // A decoder from before the field reads the new header: it is a plain
+    // map with one more key. Mimic it with a struct that lacks the field.
+    #[derive(serde::Deserialize, Debug, PartialEq)]
+    struct Old {
+        start_offset: u64,
+        reset: bool,
+        rows: u16,
+        cols: u16,
+    }
+    let o = rmp_serde::from_slice::<Old>(&bytes).unwrap();
+    assert_eq!((o.start_offset, o.reset, o.rows, o.cols), (65536, false, 24, 80));
+}
+
+#[test]
+fn golden_ev_input_dropped() {
+    golden::<ControlMsg>(
+        ControlMsg::Event { seq: 11, event: ServerEvent::InputDropped { pane_id: id(3), bytes: 4096 } },
+        "81a54576656e7482a37365710ba56576656e7481ac496e70757444726f7070656482a770616e655f6964d92430333033303330332d303330332d303330332d303330332d303330333033303330333033a56279746573cd1000",
+    );
+}
+
+#[test]
 fn golden_header() {
     golden::<PaneStreamHeader>(
-        PaneStreamHeader { pane_id: id(3), start_offset: 65536, reset: false, rows: 24, cols: 80, snapshot_len: 0 },
+        PaneStreamHeader { pane_id: id(3), start_offset: 65536, reset: false, rows: 24, cols: 80, snapshot_len: 0, replay_end: None },
         "85a770616e655f6964d92430333033303330332d303330332d303330332d303330332d303330333033303330333033ac73746172745f6f6666736574ce00010000a57265736574c2a4726f777318a4636f6c7350",
     );
 }
@@ -326,6 +366,7 @@ fn uuids_are_strings_not_bin() {
         rows: 1,
         cols: 1,
         snapshot_len: 0,
+        replay_end: None,
     };
     let bytes = encode_msg(&h).unwrap();
     assert!(bytes.windows(2).any(|w| w == [0xd9, 0x24]));
@@ -359,6 +400,7 @@ fn snapshot_header_roundtrips_and_a_plain_one_has_no_snapshot_field() {
         rows: 24,
         cols: 80,
         snapshot_len: 0,
+        replay_end: None,
     };
     let snap = PaneStreamHeader { reset: true, snapshot_len: 5000, ..plain.clone() };
     let a = rmp_serde::to_vec_named(&plain).unwrap();

@@ -90,6 +90,10 @@ pub struct RevokeOutcome {
     /// Set when the registry file could not be saved. The device is revoked
     /// anyway (denied in memory) and the next successful save persists it.
     pub save_error: Option<crate::registry::RegistryError>,
+    /// A restart cannot bring the device back: the revoke record in
+    /// `revoked.pending` or the registry file has it on disk. `false` means
+    /// the device is denied in memory only.
+    pub durable: bool,
 }
 
 /// Builder for [`SyncEndpoint`].
@@ -286,13 +290,10 @@ impl SyncEndpoint {
     /// connections are closed even when the device was not in the registry
     /// (for example it was removed by hand-editing the file).
     pub fn revoke_device(&self, device_id: &str) -> RevokeOutcome {
-        let removed = self.registry.lock().unwrap_or_else(|e| e.into_inner()).remove(device_id);
+        let removed = self.registry.lock().unwrap_or_else(|e| e.into_inner()).revoke(device_id);
         let closed = self.live.revoke(device_id);
         // Removed in memory counts as found even when the save failed.
-        let (found, save_error) = match removed {
-            Ok(found) => (found, None),
-            Err(e) => (true, Some(e)),
-        };
+        let (found, save_error, durable) = (removed.found, removed.save_error, removed.durable);
         if found {
             let _ =
                 self.event_tx.send(SyncEvent::DeviceRevoked { device_id: device_id.to_string() });
@@ -304,7 +305,7 @@ impl SyncEndpoint {
                 std::time::Duration::from_secs(5),
             );
         }
-        RevokeOutcome { found, closed, save_error }
+        RevokeOutcome { found, closed, save_error, durable }
     }
 
     /// Returns a clone of the shared device registry.

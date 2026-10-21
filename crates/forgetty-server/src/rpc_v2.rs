@@ -57,6 +57,10 @@ pub const LOG_LOST_CODE: u32 = stream_code::LOG_LOST;
 const CHUNK: usize = 128 * 1024;
 /// How long a silent peer may hold the handshake open.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Most unwritten `seq`s a graceful stop saves per client epoch.
+const INPUT_REDO_KEPT: usize = 4096;
+/// How often a session looks for lost input to report.
+const INPUT_LOSS_POLL: Duration = Duration::from_millis(200);
 /// Graceful stop waits this long for the pane input queues to drain (AD-024).
 const INPUT_DRAIN_LIMIT: Duration = Duration::from_secs(2);
 /// Input `seq` state is kept this long after a client leaves (section 5).
@@ -170,7 +174,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 // Shared state
 // ---------------------------------------------------------------------------
 
-/// Last input `seq` written for one `(client_id, input_epoch)`.
+/// Input state of one `(client_id, input_epoch)`.
 #[derive(Default)]
 struct InputRec {
     /// Last `seq` that entered its pane's queue (or was dropped by a full one):
@@ -179,6 +183,26 @@ struct InputRec {
     /// Held across dedup and the enqueue, so frames of one client epoch stay
     /// in order and are queued once, even on overlapping connections.
     gate: tokio::sync::Mutex<()>,
+    /// `seq`s that are in a pane queue and have not been written, discarded
+    /// or given up yet. A graceful stop saves them: the PTY never got those
+    /// bytes, so a resend after the restart is accepted.
+    unwritten: Arc<Mutex<std::collections::BTreeSet<u64>>>,
+    /// `seq`s from the saved state that were queued and never written. A
+    /// resend of one is queued again, once.
+    redo: Mutex<std::collections::BTreeSet<u64>>,
+    /// Panes where a frame of this client was dropped (AD-024). Later frames
+    /// for that pane are dropped too until its queue is empty, so the program
+    /// never sees input with a hole in the middle.
+    holes: Mutex<HashMap<Uuid, Hole>>,
+}
+
+/// Input of one client dropped for one pane.
+struct Hole {
+    /// Bytes dropped so far.
+    bytes: u64,
+    /// The pane queue is empty again: input flows, the loss is due to be
+    /// reported to the client.
+    closed: bool,
 }
 
 /// One connected client, by `client_id` (several connections can overlap
@@ -236,8 +260,11 @@ impl PaneSizes {
     /// pane without an owner takes its first attached client as owner.
     fn auto_allowed(&self, client: Uuid) -> bool {
         match self.active {
-            Some(owner) => owner == client,
-            None => self.attached.first() == Some(&client),
+            // An owner counts only while it has a stream on the pane. One
+            // that does not (it focused a tab it never attached) hands the
+            // answer to the first attached client.
+            Some(owner) if self.attached.contains(&owner) => owner == client,
+            _ => self.attached.first() == Some(&client),
         }
     }
 }
@@ -379,13 +406,19 @@ impl RpcV2 {
         self.inputs_frozen.store(true, Ordering::SeqCst);
         let undrained = self.sm.close_input_queues_and_drain(INPUT_DRAIN_LIMIT);
         if undrained > 0 {
+            // What stays in those queues was acked but never written. Its
+            // `seq`s are saved as unwritten, so a client that still has the
+            // frames can resend them after the restart.
             warn!("rpc2: {undrained} pane input queue(s) did not drain in {INPUT_DRAIN_LIMIT:?}");
         }
         let entries: Vec<serde_json::Value> = lock(&self.inputs)
             .iter()
             .map(|((c, e), r)| {
+                let unwritten: Vec<u64> =
+                    lock(&r.unwritten).iter().copied().take(INPUT_REDO_KEPT).collect();
                 serde_json::json!({
-                    "client_id": c, "input_epoch": e, "last": r.last.load(Ordering::SeqCst)
+                    "client_id": c, "input_epoch": e, "last": r.last.load(Ordering::SeqCst),
+                    "unwritten": unwritten,
                 })
             })
             .collect();
@@ -428,9 +461,20 @@ impl RpcV2 {
                 ) else {
                     continue;
                 };
+                let redo: std::collections::BTreeSet<u64> = e["unwritten"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|v| v.as_u64())
+                    .filter(|q| *q <= last)
+                    .collect();
                 inputs.insert(
                     (c, ep),
-                    Arc::new(InputRec { last: AtomicU64::new(last), ..Default::default() }),
+                    Arc::new(InputRec {
+                        last: AtomicU64::new(last),
+                        redo: Mutex::new(redo),
+                        ..Default::default()
+                    }),
                 );
                 loaded += 1;
             }
@@ -759,7 +803,10 @@ impl RpcV2 {
             if self.inputs_frozen.load(Ordering::SeqCst) {
                 return; // shutting down: not recorded, so not acked, so resent
             }
-            if seq <= rec.last.load(Ordering::SeqCst) {
+            // A frame the saved state says was queued but never written is
+            // taken once more.
+            let redo = seq <= rec.last.load(Ordering::SeqCst) && lock(&rec.redo).remove(&seq);
+            if seq <= rec.last.load(Ordering::SeqCst) && !redo {
                 self.qa.dedup_drops.fetch_add(1, Ordering::SeqCst);
                 return;
             }
@@ -768,37 +815,93 @@ impl RpcV2 {
                 // another VT answers the same query (AD-025). Spent, acked,
                 // never written, and never a sign of life for the size policy.
                 self.qa.auto_drops.fetch_add(1, Ordering::SeqCst);
-                rec.last.store(seq, Ordering::SeqCst);
+                rec.last.fetch_max(seq, Ordering::SeqCst);
                 return;
             }
-            #[cfg(feature = "qa-tools")]
-            let copy = bytes.clone();
-            let vintr = self.sm.intr_byte(PaneId(pane)).unwrap_or(0x03);
-            let interrupt = bytes.contains(&vintr);
             let len = bytes.len();
-            match self.sm.queue_input(PaneId(pane), bytes) {
-                InputOutcome::Queued => {
-                    #[cfg(feature = "qa-tools")]
-                    lock(&self.qa.input_log).entry(pane).or_default().extend_from_slice(&copy);
-                }
-                InputOutcome::Full => {
-                    // The program in that pane has not read 256 KiB of input.
-                    // Drop this frame, say so, and still let Ctrl+C through.
-                    let n = self.qa.input_drops.fetch_add(1, Ordering::SeqCst) + 1;
-                    if n.is_power_of_two() {
-                        warn!(
-                            "rpc2: pane {pane} input queue full, dropped {len} bytes from client \
-                             {client} ({n} frames dropped so far)"
-                        );
+            // The byte that makes the tty signal the program, only while ISIG
+            // is on. Terminal replies never interrupt.
+            let interrupt_at = if auto {
+                None
+            } else {
+                self.sm.intr_byte(PaneId(pane)).and_then(|v| bytes.iter().rposition(|b| *b == v))
+            };
+            let busy = self.sm.queued_input_bytes(PaneId(pane)).unwrap_or(0) > 0;
+            // Is this client's input to the pane in a hole? It stays so until
+            // the pane's queue is empty.
+            let in_hole = {
+                let mut holes = lock(&rec.holes);
+                match holes.get_mut(&pane) {
+                    Some(h) if !h.closed && busy => true,
+                    Some(h) => {
+                        h.closed = true; // empty again: flows, loss to be reported
+                        false
                     }
-                    if interrupt {
-                        self.sm.send_sigint(PaneId(pane));
+                    None => false,
+                }
+            };
+            // A Ctrl+C must work although the program does not read: the
+            // write is stuck, so the byte would wait behind it. Signal now and
+            // drop what was queued for the program that is being interrupted.
+            let (queue_bytes, interrupted) = match interrupt_at {
+                Some(at) if in_hole || busy => {
+                    self.interrupt_pane(pane).await;
+                    (bytes[at + 1..].to_vec(), true)
+                }
+                _ => (bytes, false),
+            };
+            let in_hole = in_hole && !interrupted;
+            #[cfg(feature = "qa-tools")]
+            let copy = queue_bytes.clone();
+            let mut dropped = in_hole;
+            if !in_hole && !queue_bytes.is_empty() {
+                let unwritten = rec.unwritten.clone();
+                lock(&unwritten).insert(seq);
+                let on_end: forgetty_session::OnEnd = Box::new(move || {
+                    lock(&unwritten).remove(&seq);
+                });
+                match self.sm.queue_input_tracked(PaneId(pane), queue_bytes, on_end) {
+                    InputOutcome::Queued => {
+                        #[cfg(feature = "qa-tools")]
+                        lock(&self.qa.input_log).entry(pane).or_default().extend_from_slice(&copy);
+                    }
+                    InputOutcome::Full => {
+                        lock(&rec.unwritten).remove(&seq);
+                        dropped = true;
+                        // The program in that pane has not read 256 KiB of
+                        // input. Drop this frame and, to keep the stream free
+                        // of holes, the ones behind it.
+                        if interrupt_at.is_some() {
+                            self.interrupt_pane(pane).await;
+                        }
+                    }
+                    // A pane that is gone takes no more input; the frame is
+                    // spent. During a stop the queue is closed on purpose:
+                    // the frame was not written, so it is not recorded and
+                    // the client resends it.
+                    InputOutcome::Gone => {
+                        lock(&rec.unwritten).remove(&seq);
+                        if self.inputs_frozen.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        debug!("rpc2: input for pane {pane}: pane is gone");
                     }
                 }
-                // A pane that is gone takes no more input; the frame is spent.
-                InputOutcome::Gone => debug!("rpc2: input for pane {pane}: pane is gone"),
             }
-            rec.last.store(seq, Ordering::SeqCst);
+            if dropped {
+                let n = self.qa.input_drops.fetch_add(1, Ordering::SeqCst) + 1;
+                if n.is_power_of_two() {
+                    warn!(
+                        "rpc2: pane {pane} input queue full, dropped {len} bytes from client \
+                         {client} ({n} frames dropped so far)"
+                    );
+                }
+                let mut holes = lock(&rec.holes);
+                let h = holes.entry(pane).or_insert(Hole { bytes: 0, closed: false });
+                h.closed = false;
+                h.bytes += len as u64;
+            }
+            rec.last.fetch_max(seq, Ordering::SeqCst);
         }
         // `auto` input is no sign that the user is here (AD-025).
         if !auto {
@@ -807,6 +910,37 @@ impl RpcV2 {
                 self.touch_active(client, pane);
             }
         }
+    }
+
+    /// Ctrl+C for a pane that cannot take it in order: drop the input queued
+    /// behind the interrupted program, then signal its foreground group. In
+    /// that order, so the shell that gets the prompt back finds no stale
+    /// paste waiting. The drop waits for a stuck write, so it runs on the
+    /// blocking pool.
+    async fn interrupt_pane(&self, pane: Uuid) {
+        let sm = self.sm.clone();
+        let dropped = tokio::task::spawn_blocking(move || {
+            let dropped = sm.discard_queued_input(PaneId(pane));
+            sm.send_sigint(PaneId(pane));
+            dropped
+        })
+        .await
+        .unwrap_or(0);
+        debug!("rpc2: interrupt for pane {pane}, {dropped} queued bytes dropped");
+    }
+
+    /// Losses of input to report to the client of `rec`: the holes whose pane
+    /// queue is empty again. Each is reported once.
+    fn take_input_losses(&self, rec: &InputRec) -> Vec<(Uuid, u64)> {
+        let mut holes = lock(&rec.holes);
+        let ready: Vec<Uuid> = holes
+            .iter()
+            .filter(|(pane, h)| {
+                h.closed || self.sm.queued_input_bytes(PaneId(**pane)).is_none_or(|b| b == 0)
+            })
+            .map(|(p, _)| *p)
+            .collect();
+        ready.into_iter().filter_map(|p| holes.remove(&p).map(|h| (p, h.bytes))).collect()
     }
 
     fn auto_allowed(&self, client: Uuid, pane: Uuid) -> bool {
@@ -821,10 +955,26 @@ impl RpcV2 {
 
     /// `client` attached a stream on `pane`.
     fn note_attached(&self, client: Uuid, pane: Uuid) {
-        let mut sizes = lock(&self.sizes);
-        let ps = sizes.entry(pane).or_default();
-        if !ps.attached.contains(&client) {
-            ps.attached.push(client);
+        let apply = {
+            let mut sizes = lock(&self.sizes);
+            let ps = sizes.entry(pane).or_default();
+            if !ps.attached.contains(&client) {
+                ps.attached.push(client);
+            }
+            // No owner with a stream, and this client came first and already
+            // asked for a size (its resize came before its attach): it owns
+            // the pane now.
+            let owned = ps.active.is_some_and(|a| ps.attached.contains(&a));
+            if !owned && ps.attached.first() == Some(&client) && ps.by_client.contains_key(&client)
+            {
+                ps.active = Some(client);
+                ps.by_client.get(&client).copied()
+            } else {
+                None
+            }
+        };
+        if let Some((rows, cols)) = apply {
+            self.apply_size(pane, rows, cols);
         }
     }
 
@@ -856,6 +1006,10 @@ impl RpcV2 {
             if ps.active == Some(client) {
                 return;
             }
+            // A client with no stream on the pane cannot own it (AD-025).
+            if !ps.attached.contains(&client) {
+                return;
+            }
             ps.active = Some(client);
             ps.by_client.get(&client).copied()
         };
@@ -876,11 +1030,15 @@ impl RpcV2 {
             let mut sizes = lock(&self.sizes);
             let ps = sizes.entry(p.pane_id).or_default();
             ps.by_client.insert(client, (p.rows, p.cols));
-            match ps.active {
-                None => {
+            let attached = ps.attached.contains(&client);
+            // An owner with no stream on the pane is no owner.
+            match ps.active.filter(|a| ps.attached.contains(a)) {
+                // Only a client that has a stream on the pane takes it.
+                None if attached => {
                     ps.active = Some(client);
                     true
                 }
+                None => false,
                 Some(a) => a == client,
             }
         } else {
@@ -1185,6 +1343,22 @@ impl Session {
             });
         }
         core.spawn(watchdog(queue.clone(), session.conn.clone(), session.rpc.clone()));
+        // Tell a client that lost input (AD-024) once its pane reads again.
+        if session.has(cap::INPUT_FLAGS) {
+            let (s, q) = (session.clone(), queue.clone());
+            core.spawn(async move {
+                let rec = lock(&s.rpc.inputs).entry((s.client_id, s.epoch)).or_default().clone();
+                let mut tick = tokio::time::interval(INPUT_LOSS_POLL);
+                loop {
+                    tick.tick().await;
+                    for (pane_id, bytes) in s.rpc.take_input_losses(&rec) {
+                        let seq = s.rpc.current_seq();
+                        let event = ServerEvent::InputDropped { pane_id, bytes };
+                        q.push(control_frame(&ControlMsg::Event { seq, event }));
+                    }
+                }
+            });
+        }
 
         // Control reader. It reads only while the queue is under its byte
         // budget. A full queue leaves the requests in the QUIC receive
@@ -1573,6 +1747,8 @@ impl Session {
             rows: info.rows,
             cols: info.cols,
             snapshot_len: 0,
+            // Everything the log holds now is replay. What comes after is live.
+            replay_end: Some(total),
         };
         let catchup = self.has(cap::SNAPSHOT_CATCHUP);
         // One live stream per (connection, pane): the old one was aborted above.
@@ -1726,6 +1902,10 @@ async fn pane_stream(
         let after_snapshot = !sent_snapshot.is_empty();
         let cycle_start = tokio::time::Instant::now();
         header.snapshot_len = sent_snapshot.len() as u32;
+        if sent_snapshot.is_empty() {
+            // Replay ends where the log stands as this stream starts.
+            header.replay_end = Some(shared.total().max(header.start_offset));
+        }
         if write_msg(&mut send, &header).await.is_err() {
             return;
         }
@@ -1929,6 +2109,8 @@ async fn take_snapshot(
         rows: snap.rows,
         cols: snap.cols,
         snapshot_len: 0,
+        // The snapshot stands at its offset: every pane byte after it is live.
+        replay_end: Some(snap.offset),
     };
     Some((header, snap.bytes.clone()))
 }
@@ -2167,5 +2349,41 @@ mod pacing_tests {
         tokio::time::sleep(w).await;
         let w = delay(&map, n, pane, false);
         assert!(w >= Duration::from_secs(9), "the backoff survived a reading claim: {w:?}");
+    }
+}
+
+#[cfg(test)]
+mod owner_tests {
+    use super::*;
+
+    #[test]
+    fn an_owner_without_a_stream_on_the_pane_does_not_own_the_auto_replies() {
+        let (a, b, ghost) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let mut ps = PaneSizes { attached: vec![a, b], ..Default::default() };
+        // No owner yet: the first attached client answers.
+        assert!(ps.auto_allowed(a) && !ps.auto_allowed(b));
+        // An owner that is attached answers.
+        ps.active = Some(b);
+        assert!(ps.auto_allowed(b) && !ps.auto_allowed(a));
+        // An owner with no stream here (it focused a tab it never attached)
+        // is no owner: the first attached client answers again.
+        ps.active = Some(ghost);
+        assert!(ps.auto_allowed(a) && !ps.auto_allowed(b) && !ps.auto_allowed(ghost));
+    }
+
+    #[test]
+    fn the_owner_leaving_hands_the_pane_to_the_most_recent_typist() {
+        let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let mut ps = PaneSizes { attached: vec![a, b, c], active: Some(a), ..Default::default() };
+        ps.by_client.insert(b, (30, 100));
+        ps.by_client.insert(c, (40, 120));
+        ps.last_user.insert(b, 5);
+        ps.last_user.insert(c, 9);
+        assert_eq!(ps.leave(a, false), Some((40, 120)));
+        assert_eq!(ps.active, Some(c));
+        // Nobody left attached: no owner.
+        ps.leave(b, false);
+        ps.leave(c, false);
+        assert_eq!(ps.active, None);
     }
 }

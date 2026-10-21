@@ -11,7 +11,7 @@
 
 use std::collections::VecDeque;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -40,9 +40,28 @@ impl std::fmt::Display for QueueError {
     }
 }
 
+/// Runs when a job leaves the queue for good: written, discarded, or given up
+/// because the pane is gone. A job still queued when the process exits never
+/// runs it.
+pub type OnEnd = Box<dyn FnOnce() + Send>;
+
 struct Job {
     data: Vec<u8>,
     done: Option<oneshot::Sender<Result<(), String>>>,
+    on_end: Option<OnEnd>,
+}
+
+impl Job {
+    fn new(data: Vec<u8>) -> Self {
+        Job { data, done: None, on_end: None }
+    }
+
+    /// The job is over. Called outside the state lock.
+    fn end(mut self) {
+        if let Some(f) = self.on_end.take() {
+            f();
+        }
+    }
 }
 
 #[derive(Default)]
@@ -62,6 +81,9 @@ struct Shared {
     progress: Condvar,
     /// Set when the pane is gone: an interrupted write gives up.
     abort: AtomicBool,
+    /// Bumped by [`PaneWriter::discard_pending`]. A job under way when it
+    /// changes stops writing what is left of it.
+    generation: AtomicU64,
     /// The writer thread has returned.
     exited: AtomicBool,
     /// The writer thread, while it runs, so a pane that closes can interrupt a
@@ -106,9 +128,20 @@ impl Shared {
 /// Write all of `data` and flush. Unlike `write_all`, an interrupted write
 /// ends the job when the pane is gone (`abort`), so a thread blocked on a
 /// program that never reads can be woken and stopped.
-fn write_job(out: &mut dyn Write, data: &[u8], abort: &AtomicBool) -> Result<(), String> {
+fn write_job(
+    out: &mut dyn Write,
+    data: &[u8],
+    abort: &AtomicBool,
+    generation: &AtomicU64,
+    started_at: u64,
+) -> Result<(), String> {
     let mut off = 0;
     while off < data.len() {
+        // The input was discarded (an interrupt): what is left of this job is
+        // stale and must not reach the program.
+        if generation.load(Ordering::SeqCst) != started_at {
+            return Ok(());
+        }
         match out.write(&data[off..]) {
             Ok(0) => return Err("write returned 0".to_string()),
             Ok(n) => off += n,
@@ -176,6 +209,7 @@ impl PaneWriterOwner {
             space: Notify::new(),
             progress: Condvar::new(),
             abort: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
             exited: AtomicBool::new(false),
             #[cfg(unix)]
             thread: Mutex::new(None),
@@ -207,24 +241,34 @@ impl PaneWriterOwner {
                 // The real write. It may block for as long as the program
                 // does not read; nothing else waits on it. A pane that closes
                 // interrupts it (see `PaneWriterOwner::drop`).
-                let res = write_job(&mut *out, &job.data, &s.abort);
+                let started_at = s.generation.load(Ordering::SeqCst);
+                let res = write_job(&mut *out, &job.data, &s.abort, &s.generation, started_at);
                 let failed = res.is_err();
+                let mut ended = Vec::new();
                 {
                     let mut st = s.lock();
                     st.bytes = st.bytes.saturating_sub(job.data.len());
                     if failed {
                         // The PTY is gone: refuse new bytes, fail the rest.
                         st.closed = true;
-                        for rest in st.queue.drain(..) {
-                            if let Some(d) = rest.done {
+                        for mut rest in st.queue.drain(..) {
+                            if let Some(d) = rest.done.take() {
                                 let _ = d.send(Err("pane input closed".to_string()));
                             }
+                            ended.push(rest);
                         }
                         st.bytes = 0;
                     }
                 }
-                if let Some(d) = job.done {
+                let Job { done, on_end, .. } = job;
+                if let Some(d) = done {
                     let _ = d.send(res);
+                }
+                if let Some(f) = on_end {
+                    f();
+                }
+                for rest in ended {
+                    rest.end();
                 }
                 s.space.notify_waiters();
                 s.progress.notify_all();
@@ -247,13 +291,18 @@ impl Drop for PaneWriterOwner {
     fn drop(&mut self) {
         let mut st = self.shared.lock();
         st.closed = true;
-        for rest in st.queue.drain(..) {
-            if let Some(d) = rest.done {
+        let mut ended = Vec::new();
+        for mut rest in st.queue.drain(..) {
+            if let Some(d) = rest.done.take() {
                 let _ = d.send(Err("pane closed".to_string()));
             }
+            ended.push(rest);
         }
         st.bytes = 0;
         drop(st);
+        for rest in ended {
+            rest.end();
+        }
         self.shared.abort.store(true, Ordering::SeqCst);
         self.shared.work.notify_all();
         self.shared.space.notify_waiters();
@@ -265,21 +314,19 @@ impl Drop for PaneWriterOwner {
         #[cfg(unix)]
         {
             let shared = self.shared.clone();
-            let _ = std::thread::Builder::new().name("session-pty-writer-kick".into()).spawn(
-                move || {
-                    for _ in 0..100 {
-                        if shared.exited.load(Ordering::SeqCst) {
-                            return;
-                        }
-                        if let Some(t) = *shared.thread.lock().unwrap_or_else(|e| e.into_inner()) {
-                            // SAFETY: `t` is the id of the live writer thread
-                            // (cleared under this lock before it returns).
-                            unsafe { libc::pthread_kill(t, WAKE_SIGNAL) };
-                        }
-                        std::thread::sleep(Duration::from_millis(50));
+            let _ = std::thread::Builder::new().name("pty-writer-kick".into()).spawn(move || {
+                for _ in 0..100 {
+                    if shared.exited.load(Ordering::SeqCst) {
+                        return;
                     }
-                },
-            );
+                    if let Some(t) = *shared.thread.lock().unwrap_or_else(|e| e.into_inner()) {
+                        // SAFETY: `t` is the id of the live writer thread
+                        // (cleared under this lock before it returns).
+                        unsafe { libc::pthread_kill(t, WAKE_SIGNAL) };
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            });
         }
     }
 }
@@ -287,19 +334,26 @@ impl Drop for PaneWriterOwner {
 impl PaneWriter {
     /// Queue `data` without waiting. `Err(Full)` when the queue is over its cap.
     pub fn try_queue(&self, data: Vec<u8>) -> Result<(), QueueError> {
-        self.shared.try_push(Job { data, done: None }).map_err(|(e, _)| e)
+        self.shared.try_push(Job::new(data)).map_err(|(e, _)| e)
+    }
+
+    /// [`Self::try_queue`] that runs `on_end` when the bytes leave the queue
+    /// for good (written, discarded or given up). Not run when refused.
+    pub fn try_queue_tracked(&self, data: Vec<u8>, on_end: OnEnd) -> Result<(), QueueError> {
+        let job = Job { data, done: None, on_end: Some(on_end) };
+        self.shared.try_push(job).map_err(|(e, _)| e)
     }
 
     /// Queue `data`, waiting for room. Returns once the bytes are queued, not
     /// once they are written.
     pub async fn queue(&self, data: Vec<u8>) -> Result<(), QueueError> {
-        self.push_waiting(Job { data, done: None }).await
+        self.push_waiting(Job::new(data)).await
     }
 
     /// Queue `data` and wait until the PTY has taken all of it.
     pub async fn write(&self, data: Vec<u8>) -> Result<(), QueueError> {
         let (tx, rx) = oneshot::channel();
-        self.push_waiting(Job { data, done: Some(tx) }).await?;
+        self.push_waiting(Job { data, done: Some(tx), on_end: None }).await?;
         match rx.await {
             Ok(Ok(())) => Ok(()),
             _ => Err(QueueError::Closed),
@@ -311,7 +365,7 @@ impl PaneWriter {
     /// the time ran out.
     pub fn queue_blocking(&self, data: Vec<u8>, timeout: Duration) -> Result<(), QueueError> {
         let deadline = Instant::now() + timeout;
-        let job = Job { data, done: None };
+        let job = Job::new(data);
         let mut st = self.shared.lock();
         loop {
             if st.closed {
@@ -345,6 +399,70 @@ impl PaneWriter {
         let mut st = self.shared.lock();
         st.closed = true;
         self.shared.work.notify_all();
+        loop {
+            if st.bytes == 0 && st.queue.is_empty() {
+                return true;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            st = self.shared.progress.wait_timeout(st, left).unwrap_or_else(|e| e.into_inner()).0;
+        }
+    }
+
+    /// Throw away everything queued and what is left of the write under way.
+    /// For an interrupt: input typed or pasted before Ctrl+C must not reach
+    /// the shell after the program it was meant for is gone. Returns the
+    /// bytes that were waiting.
+    pub fn discard_pending(&self) -> usize {
+        let mut ended = Vec::new();
+        let mut freed = 0;
+        {
+            let mut st = self.shared.lock();
+            self.shared.generation.fetch_add(1, Ordering::SeqCst);
+            for mut job in st.queue.drain(..) {
+                if let Some(d) = job.done.take() {
+                    let _ = d.send(Err("input discarded".to_string()));
+                }
+                freed += job.data.len();
+                ended.push(job);
+            }
+            // The job in the thread, if any, still counts until it returns.
+            st.bytes = st.bytes.saturating_sub(freed);
+        }
+        for job in ended {
+            job.end();
+        }
+        self.shared.space.notify_waiters();
+        self.shared.progress.notify_all();
+        // A write blocked on a program that does not read is woken, so it can
+        // see the change and stop.
+        #[cfg(unix)]
+        {
+            let shared = self.shared.clone();
+            let _ = std::thread::Builder::new().name("pty-writer-kick".into()).spawn(move || {
+                for pause in [0u64, 25, 50, 100, 200] {
+                    std::thread::sleep(Duration::from_millis(pause));
+                    if shared.exited.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    if let Some(t) = *shared.thread.lock().unwrap_or_else(|e| e.into_inner()) {
+                        // SAFETY: `t` is the live writer thread (cleared
+                        // under this lock before it returns).
+                        unsafe { libc::pthread_kill(t, WAKE_SIGNAL) };
+                    }
+                }
+            });
+        }
+        freed
+    }
+
+    /// Wait until nothing is queued and no write is under way, up to
+    /// `timeout`. Returns `true` when idle.
+    pub fn wait_idle(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut st = self.shared.lock();
         loop {
             if st.bytes == 0 && st.queue.is_empty() {
                 return true;
@@ -485,6 +603,72 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         open.store(true, Ordering::SeqCst);
         waiting.await.unwrap().unwrap();
+        drop(owner);
+    }
+
+    #[tokio::test]
+    async fn discarding_drops_the_queue_and_the_rest_of_the_job_under_way() {
+        /// Takes 4 bytes per `write`, and only when told to.
+        struct Slow {
+            tokens: Arc<std::sync::atomic::AtomicUsize>,
+            out: Arc<Mutex<Vec<u8>>>,
+        }
+        impl Write for Slow {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                loop {
+                    let t = self.tokens.load(Ordering::SeqCst);
+                    if t > 0
+                        && self
+                            .tokens
+                            .compare_exchange(t, t - 1, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok()
+                    {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                let n = buf.len().min(4);
+                self.out.lock().unwrap().extend_from_slice(&buf[..n]);
+                Ok(n)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let tokens = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let owner =
+            PaneWriterOwner::spawn(Box::new(Slow { tokens: tokens.clone(), out: out.clone() }))
+                .unwrap();
+        let w = owner.handle();
+        let ended = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let track = |ended: &Arc<std::sync::atomic::AtomicUsize>| -> OnEnd {
+            let e = ended.clone();
+            Box::new(move || {
+                e.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+        // A paste: the first 4 bytes go out, the thread then waits to write
+        // the rest. Two more jobs wait behind it.
+        w.try_queue_tracked(b"PASTEPASTEPASTE".to_vec(), track(&ended)).unwrap();
+        w.try_queue_tracked(b"second".to_vec(), track(&ended)).unwrap();
+        w.try_queue_tracked(b"third".to_vec(), track(&ended)).unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(out.lock().unwrap().len(), 4);
+        // The interrupt: what is queued is thrown away at once.
+        let freed = w.discard_pending();
+        assert_eq!(freed, "second".len() + "third".len());
+        assert_eq!(ended.load(Ordering::SeqCst), 2, "the discarded jobs report their end");
+        // The write under way finishes its current call and stops.
+        tokens.store(100, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(out.lock().unwrap().len(), 8, "the rest of the paste was still written");
+        assert_eq!(ended.load(Ordering::SeqCst), 3);
+        assert_eq!(w.queued_bytes(), 0);
+        // New input goes through.
+        w.try_queue(b"fresh".to_vec()).unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(out.lock().unwrap().ends_with(b"fresh"));
         drop(owner);
     }
 

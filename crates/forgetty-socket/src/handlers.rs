@@ -1232,18 +1232,18 @@ pub(crate) fn handle_send_sigint(request: &Request, sm: &SessionManager) -> Resp
         Err(e) => return e,
     };
 
-    // Resolve the byte the kernel's line discipline treats as the interrupt
-    // character (c_cc[VINTR]). Falls back to 0x03 (POSIX default) if the
-    // termios read fails. Writing this byte — instead of hardcoded 0x03 —
-    // makes Ctrl+C work for local users who have remapped VINTR (e.g.,
-    // `stty intr ^X`), and for ssh sessions where the remote PTY inherits
-    // the local VINTR via ssh's pty-modes payload (FIX-017).
-    let intr_byte = sm.intr_byte(id).unwrap_or(0x03);
+    // Input queued before the interrupt is stale once the program it was
+    // for is gone: a paste behind Ctrl+C must not run in the shell after it.
+    sm.discard_queued_input(id);
 
-    // The signal always goes out. The byte is best effort: a pane whose queue
-    // is full (a program that never reads) must still be interruptible.
-    if let Err(e) = sm.write_pty(id, &[intr_byte]) {
-        tracing::debug!(pane = %id, "send_sigint: intr byte not queued: {e}");
+    // The byte the line discipline turns into SIGINT (c_cc[VINTR]), written
+    // only while ISIG is on and VINTR is set (FIX-017). It is best effort: a
+    // pane whose queue is full (a program that never reads) must still be
+    // interruptible, so the signal below always goes out.
+    if let Some(intr_byte) = sm.intr_byte(id) {
+        if let Err(e) = sm.write_pty(id, &[intr_byte]) {
+            tracing::debug!(pane = %id, "send_sigint: intr byte not queued: {e}");
+        }
     }
     // For non-forwarder foreground processes (e.g., Node.js, pm2 in raw mode
     // that swallow the byte), also kill(-pgid, SIGINT) so the signal reaches
@@ -1338,17 +1338,34 @@ pub(crate) fn handle_revoke_device(request: &Request, se: Option<&SyncEndpoint>)
     // every ALPN. Removing only the registry entry would leave an open
     // session running (the registry is checked once, at connect).
     let out = se.revoke_device(&device_id);
-    if let Some(e) = &out.save_error {
-        // Revoked and cut all the same. Only the device list file is stale.
+    if !out.durable {
+        // Revoked and cut all the same, but only in memory: a restart before
+        // the retry succeeds could allow the device again. Say so.
+        let why = out.save_error.as_ref().map(|e| e.to_string()).unwrap_or_default();
         return Response::error(
             request.id.clone(),
             protocol::INTERNAL_ERROR,
             format!(
-                "device revoked and {} connection(s) closed, but the device list could not be \
-                 saved: {e}. The device stays denied, and the server retries the save every 5 s \
-                 (it is also recorded in revoked.pending).",
+                "device revoked and {} connection(s) closed, but NOT durable: neither the \
+                 device list nor revoked.pending could be written ({why}). The device stays \
+                 denied while the server runs, and the server retries the save every 5 s. \
+                 Free disk space and run the revoke again to be sure.",
                 out.closed
             ),
+        );
+    }
+    if let Some(e) = &out.save_error {
+        // Durable through revoked.pending, the device list file is stale.
+        return Response::success(
+            request.id.clone(),
+            serde_json::json!({
+                "ok": out.found,
+                "closed_connections": out.closed,
+                "warning": format!(
+                    "recorded in revoked.pending; the device list could not be saved yet ({e}), \
+                     the server retries every 5 s"
+                ),
+            }),
         );
     }
     Response::success(

@@ -665,7 +665,7 @@ fn handle_request(
         }
         method::ATTACH_PANE => {
             let p: AttachPaneParams = from_value(params).map_err(bad)?;
-            let (start, reset, rows, cols, notify) = {
+            let (start, reset, rows, cols, notify, total) = {
                 let panes = lock(&state.panes);
                 let Some(log) = panes.get(&p.pane_id) else {
                     return Err((error_code::NOT_FOUND, "no such pane".into()));
@@ -678,7 +678,7 @@ fn handle_request(
                     Some(o) if o < log.first => (log.first, true),
                     Some(o) => (o, false),
                 };
-                (start, reset, log.rows, log.cols, log.notify.clone())
+                (start, reset, log.rows, log.cols, log.notify.clone(), total)
             };
             lock(&state.attaches).push((p.pane_id, p.from_offset));
             if let Some(old) = streams.remove(&p.pane_id) {
@@ -695,6 +695,7 @@ fn handle_request(
                     rows,
                     cols,
                     snapshot_len: 0,
+                    replay_end: Some(total),
                 },
             ));
             streams.insert(p.pane_id, handle);

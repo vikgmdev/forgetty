@@ -32,6 +32,21 @@ pub enum RegistryError {
     Json(#[from] serde_json::Error),
 }
 
+/// Size reserved for `revoked.pending`.
+const PENDING_BYTES: usize = 4096;
+
+/// What [`DeviceRegistry::revoke`] did.
+#[derive(Debug)]
+pub struct RevokeResult {
+    /// The device was in the list.
+    pub found: bool,
+    /// A restart cannot bring the device back: the record in
+    /// `revoked.pending` or the registry file itself has the removal on disk.
+    pub durable: bool,
+    /// The registry file could not be saved.
+    pub save_error: Option<RegistryError>,
+}
+
 /// In-memory view of `authorized_devices.json`.
 ///
 /// Wrap in `Arc<Mutex<DeviceRegistry>>` in the daemon so the pairing handler
@@ -89,6 +104,9 @@ impl DeviceRegistry {
         };
         // A revoke whose save failed before the last stop is applied again.
         reg.apply_pending_revokes();
+        // Reserve the disk blocks the next revoke record needs now, so a full
+        // disk cannot keep it from being written later.
+        reg.preallocate_pending();
         Ok(reg)
     }
 
@@ -99,16 +117,21 @@ impl DeviceRegistry {
     }
 
     /// Read `revoked.pending`: take those devices out of the list and deny
-    /// them, then try to save. The file goes once a save works.
+    /// them, then try to save. The record is cleared once a save works.
     fn apply_pending_revokes(&mut self) {
         let Ok(text) = std::fs::read_to_string(self.pending_path()) else { return };
-        self.pending_written = true;
-        let ids: Vec<String> =
-            text.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect();
+        // The file is preallocated and rewritten in place: padding is newlines
+        // or NULs, not ids.
+        let ids: Vec<String> = text
+            .lines()
+            .map(|l| l.trim_matches(|c: char| c.is_whitespace() || c == '\0'))
+            .filter(|l| !l.is_empty())
+            .map(String::from)
+            .collect();
         if ids.is_empty() {
-            let _ = std::fs::remove_file(self.pending_path());
             return;
         }
+        self.pending_written = true;
         self.devices.retain(|d| !ids.contains(&d.device_id));
         self.revoked_unsaved.extend(ids);
         let list = self.devices.clone();
@@ -117,14 +140,70 @@ impl DeviceRegistry {
         }
     }
 
-    /// Record the denylist in `revoked.pending` (atomic, fsynced), so a
-    /// restart before the registry file is saved still denies these devices.
-    fn write_pending(&mut self) {
-        let text: String = self.revoked_unsaved.iter().map(|id| format!("{id}\n")).collect();
-        match forgetty_core::fsutil::write_private_atomic(&self.pending_path(), text.as_bytes()) {
-            Ok(()) => self.pending_written = true,
-            Err(e) => tracing::warn!("registry: could not write revoked.pending: {e}"),
+    /// Make `revoked.pending` exist with [`PENDING_BYTES`] of blocks behind
+    /// it, so recording a revoke later is a write in place.
+    fn preallocate_pending(&self) {
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = self.pending_path();
+        if path.exists() {
+            return;
         }
+        let made = (|| -> std::io::Result<()> {
+            use std::io::Write;
+            let mut f =
+                std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path)?;
+            f.write_all(&[b'\n'; PENDING_BYTES])?;
+            f.sync_all()?;
+            if let Some(dir) = path.parent() {
+                std::fs::File::open(dir)?.sync_all()?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = made {
+            tracing::warn!("registry: could not preallocate revoked.pending: {e}");
+        }
+    }
+
+    /// Record the denylist in `revoked.pending` by writing over the file in
+    /// place, then fsync. No new file and no rename: it needs no free inode
+    /// and, with the preallocated blocks, no free space. A restart before the
+    /// registry file is saved still denies these devices.
+    fn write_pending(&mut self) -> std::io::Result<()> {
+        use std::os::unix::fs::{FileExt, OpenOptionsExt};
+        let path = self.pending_path();
+        let existed = path.exists();
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&path)?;
+        let old_len = f.metadata()?.len() as usize;
+        let mut buf: Vec<u8> =
+            self.revoked_unsaved.iter().map(|id| format!("{id}\n")).collect::<String>().into();
+        if buf.len() < old_len {
+            buf.resize(old_len, b'\n');
+        }
+        f.write_all_at(&buf, 0)?;
+        f.sync_all()?;
+        if !existed {
+            if let Some(dir) = path.parent() {
+                std::fs::File::open(dir)?.sync_all()?;
+            }
+        }
+        self.pending_written = true;
+        Ok(())
+    }
+
+    /// The registry file has the removals: blank the record, in place.
+    fn clear_pending(&mut self) {
+        use std::os::unix::fs::FileExt;
+        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(self.pending_path()) {
+            if let Ok(m) = f.metadata() {
+                let _ = f.write_all_at(&vec![b'\n'; m.len() as usize], 0);
+            }
+        }
+        self.pending_written = false;
     }
 
     /// `true` while a revoke is denied in memory but not saved.
@@ -179,18 +258,38 @@ impl DeviceRegistry {
     /// successful registry write (any `add`, `remove` or `update_last_seen`)
     /// saves the list without it.
     pub fn remove(&mut self, device_id: &str) -> Result<bool, RegistryError> {
+        let out = self.revoke(device_id);
+        match out.save_error {
+            Some(e) => Err(e),
+            None => Ok(out.found),
+        }
+    }
+
+    /// [`Self::remove`] with the whole outcome. The record in
+    /// `revoked.pending` is written and fsynced before the registry file is
+    /// saved, so once this returns with `durable`, a crash or a restart cannot
+    /// bring the device back. Without `durable` the device is still denied in
+    /// memory, but a restart could allow it again.
+    pub fn revoke(&mut self, device_id: &str) -> RevokeResult {
         let before = self.devices.len();
         self.devices.retain(|d| d.device_id != device_id);
-        let removed = self.devices.len() < before;
-        if removed {
-            self.revoked_unsaved.insert(device_id.to_string());
-            let list = self.devices.clone();
-            if let Err(e) = self.commit(list) {
-                self.write_pending();
-                return Err(e);
-            }
+        let found = self.devices.len() < before;
+        if !found {
+            return RevokeResult { found, durable: true, save_error: None };
         }
-        Ok(removed)
+        self.revoked_unsaved.insert(device_id.to_string());
+        let recorded = match self.write_pending() {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!("registry: could not record the revoke in revoked.pending: {e}");
+                false
+            }
+        };
+        let list = self.devices.clone();
+        match self.commit(list) {
+            Ok(()) => RevokeResult { found, durable: true, save_error: None },
+            Err(e) => RevokeResult { found, durable: recorded, save_error: Some(e) },
+        }
     }
 
     /// Return all current entries (read-only).
@@ -222,8 +321,7 @@ impl DeviceRegistry {
         }
         // Whatever was pending is in the file now.
         if self.pending_written {
-            let _ = std::fs::remove_file(self.pending_path());
-            self.pending_written = false;
+            self.clear_pending();
         }
         Ok(())
     }
@@ -356,12 +454,18 @@ mod tests {
         let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&path), 0o600);
         assert_eq!(mode(path.parent().unwrap()), 0o700);
-        let names: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+        let mut names: Vec<_> = std::fs::read_dir(path.parent().unwrap())
             .unwrap()
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(names, vec!["authorized_devices.json".to_string()], "{names:?}");
+        names.sort();
+        // The revoke record is a fixed file, written in place: no temp names.
+        assert_eq!(
+            names,
+            vec!["authorized_devices.json".to_string(), "revoked.pending".to_string()],
+            "{names:?}"
+        );
     }
 
     #[test]
@@ -434,7 +538,10 @@ mod tests {
         std::fs::write(&path, old).unwrap();
         let again = DeviceRegistry::load_from(path.clone()).unwrap();
         assert!(!again.is_authorized(&id), "a revoke lost to a failed save came back");
-        assert!(!pending.exists(), "the pending file stays after a good save");
+        assert!(
+            !std::fs::read_to_string(&pending).unwrap().contains(&id.to_string()),
+            "the revoke record stays after a good save"
+        );
         assert!(!std::fs::read_to_string(&path).unwrap().contains(&id.to_string()));
         assert!(!again.has_unsaved_revokes());
 
@@ -457,5 +564,51 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         assert!(!std::fs::read_to_string(&p2).unwrap().contains(&id.to_string()));
+    }
+
+    #[test]
+    fn a_revoke_is_durable_only_when_the_record_or_the_registry_file_has_it() {
+        let key = iroh::SecretKey::from_bytes(&[11u8; 32]);
+        let id = key.public().to_string();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state/authorized_devices.json");
+        let mut reg = DeviceRegistry::empty_at(path.clone());
+        reg.add(entry(&id)).unwrap();
+        // The registry file cannot be saved, the record can: durable.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("keep"), b"x").unwrap();
+        let out = reg.revoke(&id);
+        assert!(out.found && out.save_error.is_some() && out.durable);
+        let pending = path.with_file_name("revoked.pending");
+        assert!(std::fs::read_to_string(&pending).unwrap().contains(&id));
+
+        // Neither can be written: the revoke holds in memory, not durable.
+        reg.add(entry("x")).ok();
+        let mut reg2 = DeviceRegistry::empty_at(path.clone());
+        reg2.devices.push(entry(&id));
+        std::fs::remove_file(&pending).unwrap();
+        std::fs::create_dir(&pending).unwrap();
+        let out = reg2.revoke(&id);
+        assert!(out.found && out.save_error.is_some() && !out.durable);
+        let other = iroh::SecretKey::from_bytes(&[11u8; 32]).public();
+        assert!(!reg2.is_authorized(&other), "an unrecorded revoke must still deny the device");
+
+        // Only the pending record fails but the registry file saves: durable.
+        std::fs::remove_dir_all(&path).unwrap();
+        let mut reg3 = DeviceRegistry::empty_at(path.clone());
+        reg3.devices.push(entry(&id));
+        let out = reg3.revoke(&id);
+        assert!(out.found && out.save_error.is_none() && out.durable);
+    }
+
+    #[test]
+    fn a_loaded_registry_reserves_its_revoke_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state/authorized_devices.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let _ = DeviceRegistry::load_from(path.clone()).unwrap();
+        let len = std::fs::metadata(path.with_file_name("revoked.pending")).unwrap().len();
+        assert_eq!(len as usize, PENDING_BYTES);
     }
 }

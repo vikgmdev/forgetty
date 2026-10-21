@@ -1661,15 +1661,14 @@ impl SessionManager {
     // I/O
     // -----------------------------------------------------------------------
 
-    /// Read the byte the kernel's line discipline treats as the interrupt
-    /// character (`c_cc[VINTR]`) for the given pane's PTY.
+    /// The byte the kernel's line discipline turns into SIGINT for this
+    /// pane's PTY right now (`c_cc[VINTR]`).
     ///
-    /// Returns `None` if the pane is unknown or the termios read fails;
-    /// callers should fall back to `0x03` (POSIX default). The daemon's
-    /// Ctrl+C path uses this so it can write the byte the line discipline
-    /// will actually translate to `SIGINT` — both locally and (because ssh
-    /// forwards `VINTR` via `pty-modes`) on the remote end of an SSH
-    /// session (FIX-017).
+    /// `None` if the pane is unknown, the termios read fails, `ISIG` is off
+    /// (an editor in raw mode takes Ctrl+C as input) or VINTR is disabled.
+    /// The caller then sends no interrupt byte and signals nothing for a
+    /// plain byte. Users who remap VINTR (`stty intr ^X`) and ssh sessions
+    /// that forward it through pty-modes are covered (FIX-017).
     pub fn intr_byte(&self, id: PaneId) -> Option<u8> {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let pane = inner.panes.get(&id)?;
@@ -1729,6 +1728,45 @@ impl SessionManager {
             Err(crate::pane_writer::QueueError::Full) => InputOutcome::Full,
             Err(crate::pane_writer::QueueError::Closed) => InputOutcome::Gone,
         }
+    }
+
+    /// [`Self::queue_input`] that runs `on_end` when the bytes leave the queue
+    /// for good (written, discarded or given up). Not run unless `Queued`.
+    pub fn queue_input_tracked(
+        &self,
+        id: PaneId,
+        data: Vec<u8>,
+        on_end: crate::pane_writer::OnEnd,
+    ) -> InputOutcome {
+        let Some(w) = self.pane_writer(id) else { return InputOutcome::Gone };
+        match w.try_queue_tracked(data, on_end) {
+            Ok(()) => InputOutcome::Queued,
+            Err(crate::pane_writer::QueueError::Full) => InputOutcome::Full,
+            Err(crate::pane_writer::QueueError::Closed) => InputOutcome::Gone,
+        }
+    }
+
+    /// Throw away input meant for the program an interrupt ends (a stale
+    /// paste must not run in the shell after Ctrl+C): what the pane queued,
+    /// what the writer has half written, and what the terminal holds unread.
+    /// Blocks up to 300 ms for a stuck write to let go. Returns the bytes
+    /// dropped from the queue.
+    pub fn discard_queued_input(&self, id: PaneId) -> usize {
+        let Some(w) = self.pane_writer(id) else { return 0 };
+        let freed = w.discard_pending();
+        // The write under way is woken and stops. Flush the terminal only
+        // after that, or the room it makes lets the write go on.
+        w.wait_idle(std::time::Duration::from_millis(300));
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pane) = inner.panes.get(&id) {
+            pane.pty_bridge.pty.flush_pending_input();
+        }
+        freed
+    }
+
+    /// Bytes waiting in a pane's input queue, `None` for an unknown pane.
+    pub fn queued_input_bytes(&self, id: PaneId) -> Option<usize> {
+        self.pane_writer(id).map(|w| w.queued_bytes())
     }
 
     /// Close every pane's input queue and wait up to `timeout` in all for what

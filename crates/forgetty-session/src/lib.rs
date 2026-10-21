@@ -48,7 +48,7 @@ pub use manager::{
     MAX_PANE_DIM,
 };
 pub use pane::{DuplicatedTab, NotificationInfo, PaneInfo, PaneOsc, PaneState};
-pub use pane_writer::{PaneWriter, QueueError, INPUT_QUEUE_BYTES};
+pub use pane_writer::{OnEnd, PaneWriter, QueueError, INPUT_QUEUE_BYTES};
 pub use pty_bridge::PtyBridge;
 pub use status::{PaneStatus, StatusSnapshot};
 pub use workspace::{

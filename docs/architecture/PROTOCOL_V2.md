@@ -141,6 +141,30 @@ While the server stops, it freezes input, closes the queues, waits up to 2 s
 for them to drain, and only then saves the `seq` state. Frames it did not
 queue are not acked, so the client resends them to the next server.
 
+**One ack counter, no holes (AD-024).** `Pong.input_acked` is one counter per
+client epoch, not per pane. A dropped frame is acked, so the server keeps a
+pane's input free of holes: after it drops a frame of a client for a pane, it
+drops every later frame of that client for that pane until the pane's queue is
+empty. It then sends that client one event
+`InputDropped { pane_id, bytes }` (capability `input_flags` only; it goes to
+that client alone, carries the current event `seq`, and flows without
+`subscribe_events`). `bytes` is what was dropped. Input the client sent before
+the event may be missing in part, so a client shows the loss.
+
+**Interrupts.** A frame holds an interrupt when it has the pane's VINTR byte
+and the pane's tty has `ISIG` on and VINTR set. If the byte cannot go in order
+(the queue is full, the client is in a hole, or the writer is busy with bytes
+the program does not read), the server drops the input queued for the pane,
+stops what the writer has half written, flushes the tty's unread input, and
+sends SIGINT to the foreground process group. Bytes of the frame after the
+last interrupt byte are queued. Otherwise the frame goes in order and the tty
+does the interrupt. `auto` input never interrupts.
+
+**Graceful stop.** After the drain (up to 2 s) the server saves, for each
+client epoch, the `seq`s that were queued and never written. A resend of one
+of them after the restart is queued once. A frame that arrives while the stop
+is under way is not recorded and not acked, so the client resends it.
+
 The client keeps every frame until a `Pong.input_acked` covers it (cap 64 KiB).
 After a reconnect it resends all unacked frames in order. Input from a
 client also marks that client as the pane's latest active client (section 6),
@@ -161,9 +185,14 @@ except `auto` input (below).
   `user`. A client must not send a flags byte unless the server's `Welcome`
   lists `input_flags`.
 - An `auto` frame never makes its client the pane's latest active client.
+- A client that did not negotiate `input_flags` sends the old frame with no
+  flags byte, and the server treats all of it as `user` input, as before. All
+  clients of this repo send the capability.
 - The server writes an `auto` frame to the PTY only when its sender is the
-  pane's size owner (the latest active client, section 6). A pane with no
-  owner yet takes its first attached client as owner. `auto` frames from every
+  pane's size owner (the latest active client, section 6) and that owner has a
+  stream attached to the pane. If the owner has none, or the pane has no owner
+  yet, the first attached client is the owner. Only a client with a stream on
+  the pane can become owner, by `user` input, `resize_pane` or `focus_tab`. `auto` frames from every
   other client are dropped, but they still go through dedup and are acked like
   any other frame.
 - When the owner detaches (`detach_pane`) or disconnects, the client among
@@ -189,9 +218,20 @@ window. The registry stores the device. The server logs the device name and id.
 
 ## 8. Pane output stream and resume
 
-First frame (MessagePack): `PaneStreamHeader { pane_id, start_offset: u64, reset: bool, rows, cols }`.
+First frame (MessagePack): `PaneStreamHeader { pane_id, start_offset: u64, reset: bool, rows, cols }`,
+plus the optional fields `snapshot_len` (section 12) and `replay_end`.
 All following frames are raw PTY bytes. Byte `n` of the stream after the header
 is pane offset `start_offset + n`.
+
+`replay_end: u64`, optional: the pane offset where replay ends. For a stream
+without a snapshot it is the log's `total_written` at the moment the stream
+starts. Pane bytes before that offset are history the client is catching up on
+(a client must not answer terminal queries that appear in them), and bytes from
+that offset on are live (it answers them). For a snapshot stream it is the
+snapshot's offset, which is `start_offset`, so every pane byte after the
+snapshot is live. The field is omitted when absent. A decoder that does not know
+it ignores it (the header is a map and no decoder uses `deny_unknown_fields`),
+and a client that gets no `replay_end` uses its old rule.
 
 Server byte log keeps absolute offsets: `total_written: u64` per pane, and the
 ring/disk log remember the offset of their first byte.
