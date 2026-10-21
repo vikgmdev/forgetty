@@ -432,6 +432,33 @@ is hung, and Ctrl+C must still reach it. A fresh attach must paint fast.
 
 ---
 
+## AD-025: Only the size owner's terminal replies reach the PTY (amends AD-007 and AD-020)
+
+**Decision:**
+- Every client keeps its VT at the PTY size (AD-020 letterbox) and answers
+  terminal queries, as AD-007 says.
+- An input frame carries a flag: `user` (keys, paste, mouse) or `auto` (VT
+  replies such as DA, CPR and kitty-keyboard answers, and focus reports).
+  Clients send the flag only when both sides list the capability
+  `input_flags`.
+- An `auto` frame never makes its client the latest active client.
+- The server writes an `auto` frame to the PTY only when it comes from the
+  pane's size owner. If the pane has no owner yet, the first attached client
+  counts as owner. The server drops `auto` frames from every other client, and
+  still acks them.
+- When the owner leaves, the client among those still attached whose input
+  came most recently becomes the owner.
+
+**Why:** with several clients attached, every VT answers the same query.
+Without this rule, an idle window takes the PTY size from the phone, and the
+extra answers show up as typed text at the prompt. The server cannot answer
+queries itself, because CPR needs full VT state, which AD-019 keeps off the
+hot path.
+
+**Decided:** 2026-10-21.
+
+---
+
 ## Superseded / rejected decisions
 
 The following concepts are **explicitly rejected**. Do not reintroduce without a new AD that supersedes the rejection.
