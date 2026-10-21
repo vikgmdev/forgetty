@@ -475,9 +475,14 @@ impl ShellSmoke {
                         }
                     }
                     1 => {
-                        let Some(s) = snap(shell, cx, self.w3.panes[0]) else { return };
-                        if s.rows.iter().any(|r| r.contains("OFFLINE-OK")) {
-                            check("typing_during_reconnect_buffered", true);
+                        // A new server run (`boot_id`) drops what was typed while the link was down: the
+                        // programs it was for are gone. The pane says so, without a modal.
+                        let notice = view.read(cx).notice_text();
+                        if notice.as_deref() == Some("Server restarted, 10 bytes of input not sent") {
+                            record("input_lost_notice_restart", json!(notice));
+                            check("input_lost_notice_after_restart", true);
+                            let typed_again = snap(shell, cx, self.w3.panes[0]).is_some_and(|s| s.rows.iter().any(|r| r.contains("OFFLINE-OK")));
+                            check("typing_during_restart_not_replayed", !typed_again);
                             let resets = view.read(cx).resets;
                             check("vt_reset_after_restart", resets > self.w3.resets_before);
                             view.update(cx, |v, _| v.send_bytes(b"AFTER-RESTART"));
@@ -487,7 +492,7 @@ impl ShellSmoke {
                     }
                     _ => {
                         let Some(s) = snap(shell, cx, self.w3.panes[0]) else { return };
-                        if s.rows.iter().any(|r| r.contains("OFFLINE-OKAFTER-RESTART")) {
+                        if s.rows.iter().any(|r| r.contains("AFTER-RESTART")) && !s.rows.iter().any(|r| r.contains("OFFLINE-OK")) {
                             check("input_continues_after_restart", true);
                             self.goto(Phase::RToast);
                         }

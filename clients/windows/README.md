@@ -143,7 +143,7 @@ The same shell now talks to real servers over protocol v2 (`docs/architecture/PR
   name, restricted, then renamed. On Windows "restricted" is a protected DACL with one entry (the
   current user, full access); on Unix mode 0600. The pairing secret is never stored.
 - Reliability: the reconnecting overlay covers the machine's panes only after 1 s without a
-  connection (`ConnState::show_overlay`). Typing meanwhile is buffered by the client. A
+  connection (`ConnState::show_overlay`). Typing meanwhile is buffered by the client, and dropped with a notice in the pane if the server restarted (new `boot_id`). A
   `NotifyIpInterfaceChange` callback and a `PowerRegisterSuspendResumeNotification` callback (the
   `PBT_APMRESUMEAUTOMATIC` event of `WM_POWERBROADCAST`, without subclassing the GPUI window) call
   `network_changed()` on every remote backend after a 400 ms quiet period (`winsys.rs`).
@@ -167,7 +167,7 @@ the toast paths and checks the Windows hooks registered. Checks: `pane_padding`,
 `machine_stored`, `store_files_user_only`, `remote_echo_2_panes`, `remote_echo_isolated`,
 `remote_vt_reset_on_attach`, `key_p50_remote_le_25ms`, `remote_resize_reaches_server`, `no_overlay_before_1s`,
 `overlay_after_1s`, `sidebar_shows_reconnecting`, `network_poke_reaches_backends`, `reconnected_after_restart`,
-`overlay_gone_after_reconnect`, `typing_during_reconnect_buffered`, `vt_reset_after_restart`,
+`overlay_gone_after_reconnect`, `input_lost_notice_after_restart`, `typing_during_restart_not_replayed`, `vt_reset_after_restart`,
 `input_continues_after_restart`, `toast_*`, `no_toast_when_focused`, `net_change_hook_registered`,
 `power_resume_hook_registered`, `toast_requests_processed`.
 
