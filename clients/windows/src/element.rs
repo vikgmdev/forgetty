@@ -214,6 +214,32 @@ impl Element for TerminalElement {
             let _ = line.paint(origin, lh, TextAlign::Left, None, window, cx);
         }
 
+        // Rasterize printable ASCII at each of the four subpixel offsets into the glyph
+        // atlas, clipped to nothing. The first keystroke of every glyph/offset pair
+        // otherwise pays the rasterize and atlas upload inside the frame that shows it.
+        let step = self.view.read(cx).prewarm;
+        if step < 4 {
+            self.view.update(cx, |v, _| v.prewarm += 1);
+            let scale = window.scale_factor();
+            let ox = step as f32 * 0.25 / scale;
+            let run_font = self.view.read(cx).metrics.font.clone();
+            let mask = gpui::ContentMask { bounds: Bounds::new(bounds.origin, size(px(0.0), px(0.0))) };
+            window.with_content_mask(Some(mask), |window| {
+                for ch in ' '..='~' {
+                    let text: String = ch.to_string();
+                    let run = TextRun {
+                        len: text.len(),
+                        font: run_font.clone(),
+                        color: hsla(self.view.read(cx).cfg.foreground),
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    };
+                    let line = window.text_system().shape_line(text.into(), font_size, &[run], Some(cw));
+                    let _ = line.paint(point(bounds.origin.x + px(ox), bounds.origin.y), lh, TextAlign::Left, None, window, cx);
+                }
+            });
+        }
         crate::smoke::trace("G", 0);
         self.view.update(cx, |v, _cx| v.after_paint(window));
     }
