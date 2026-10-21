@@ -597,11 +597,12 @@ fn selection_check(v: &mut TerminalView, rows: &[String]) {
     };
     let abs = v.term.scrollbar_state().1 as usize + fr;
     let word = v.word_bounds(fr, 3);
+    let cur_row = v.term.cursor().0.max(fr);
     let last = v.cols - 1;
     v.sel = Some(Sel { mode: SelMode::Line, a0: (abs, 0), a1: (abs, last), h0: (abs, 0), h1: (abs, last) });
     let line = v.selection_text();
-    // Two rows: the DONE line and the prompt below it, joined by a newline.
-    v.sel = Some(Sel { mode: SelMode::Line, a0: (abs, 0), a1: (abs + 1, last), h0: (abs, 0), h1: (abs + 1, last) });
+    // The DONE line through the prompt row, joined by newlines.
+    v.sel = Some(Sel { mode: SelMode::Line, a0: (abs, 0), a1: (abs + (cur_row - fr), last), h0: (abs, 0), h1: (abs + (cur_row - fr), last) });
     let two = v.selection_text().unwrap_or_default();
     v.sel = None;
     let wrapped = v.term.screen().is_row_wrapped(fr);
