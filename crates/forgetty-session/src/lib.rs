@@ -43,7 +43,9 @@ pub use clients::{ClientGuard, ClientInfo, ClientRegistry};
 pub use drain_result::DrainResult;
 pub use events::{LabelTarget, SessionEvent};
 pub use layout::{SessionLayout, SessionTab, SessionWorkspace};
-pub use manager::{LabelError, PaneSnapshot, SessionManager, MAX_LABEL_CHARS};
+pub use manager::{
+    clamp_pane_dim, LabelError, PaneSnapshot, SessionManager, MAX_LABEL_CHARS, MAX_PANE_DIM,
+};
 pub use pane::{DuplicatedTab, NotificationInfo, PaneInfo, PaneOsc, PaneState};
 pub use pane_writer::{PaneWriter, QueueError, INPUT_QUEUE_BYTES};
 pub use pty_bridge::PtyBridge;

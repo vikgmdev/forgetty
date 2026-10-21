@@ -1318,13 +1318,17 @@ impl Session {
                 let out = out.clone();
                 work.spawn(async move {
                     let _guard = guard;
-                    let r = from_value::<ResizePaneParams>(params).map_err(bad).and_then(|p| {
+                    let r = from_value::<ResizePaneParams>(params).map_err(bad).and_then(|mut p| {
                         if p.rows == 0 || p.cols == 0 {
                             return Err((
                                 error_code::BAD_REQUEST,
                                 "rows and cols must be above 0".into(),
                             ));
                         }
+                        // Asked-for sizes are kept per client (size policy), so
+                        // clamp before they are stored, not only when applied.
+                        p.rows = forgetty_session::clamp_pane_dim(p.rows);
+                        p.cols = forgetty_session::clamp_pane_dim(p.cols);
                         if s.rpc.sm.pane_info(PaneId(p.pane_id)).is_none() {
                             return Err((error_code::NOT_FOUND, "no such pane".into()));
                         }

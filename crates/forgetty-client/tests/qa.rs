@@ -377,3 +377,39 @@ async fn a_client_that_drips_reads_is_closed_as_stalled() {
     endpoint.close().await;
     server.shutdown().await;
 }
+
+/// A client asks for a huge size: v2 and the local socket both clamp to 1000.
+/// The socket used to cut 65537 down to 1 with an `as u16` cast.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resize_is_clamped_to_1000() {
+    if !real_only() {
+        return;
+    }
+    let server = TestServer::start(TestServerConfig::default()).await;
+    let pane = server.add_pane();
+    let dims = |server: &TestServer| {
+        let v = server
+            .socket_call("get_pane_info", json!({"pane_id": pane.to_string()}))
+            .expect("get_pane_info");
+        (v["rows"].as_u64().unwrap(), v["cols"].as_u64().unwrap())
+    };
+    server
+        .socket_call("resize_pane", json!({"pane_id": pane.to_string(), "rows": 65537, "cols": 40000}))
+        .expect("socket resize");
+    assert_eq!(dims(&server), (1000, 1000));
+    server
+        .socket_call("resize_pane", json!({"pane_id": pane.to_string(), "rows": 24, "cols": 80}))
+        .expect("socket resize back");
+    assert_eq!(dims(&server), (24, 80));
+
+    let c = connect(&server, "big").await;
+    c.resize(pane, 60_000, 2_000).await.expect("v2 resize");
+    // The resize runs on a blocking task; give it a moment.
+    let t0 = Instant::now();
+    while dims(&server) != (1000, 1000) {
+        assert!(t0.elapsed() < Duration::from_secs(5), "v2 resize not clamped: {:?}", dims(&server));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    c.close().await;
+    server.shutdown().await;
+}

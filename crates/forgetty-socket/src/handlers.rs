@@ -13,7 +13,7 @@ use forgetty_core::PaneId;
 use forgetty_pty::PtySize;
 use forgetty_session::layout::{SessionLayout, SessionTab};
 use forgetty_session::workspace::PaneTreeLayout;
-use forgetty_session::SessionManager;
+use forgetty_session::{SessionManager, MAX_PANE_DIM};
 use forgetty_sync::SyncEndpoint;
 use uuid::Uuid;
 
@@ -1186,7 +1186,7 @@ pub(crate) fn handle_resize_pane(request: &Request, sm: &SessionManager) -> Resp
     };
 
     let rows = match request.params.get("rows").and_then(|v| v.as_u64()) {
-        Some(r) => r as u16,
+        Some(r) => r.clamp(1, u64::from(MAX_PANE_DIM)) as u16,
         None => {
             return Response::error(
                 request.id.clone(),
@@ -1197,7 +1197,7 @@ pub(crate) fn handle_resize_pane(request: &Request, sm: &SessionManager) -> Resp
     };
 
     let cols = match request.params.get("cols").and_then(|v| v.as_u64()) {
-        Some(c) => c as u16,
+        Some(c) => c.clamp(1, u64::from(MAX_PANE_DIM)) as u16,
         None => {
             return Response::error(
                 request.id.clone(),

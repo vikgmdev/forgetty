@@ -145,6 +145,15 @@ pub struct SessionManager {
     clients: crate::clients::ClientRegistry,
 }
 
+/// Largest rows or columns a pane takes. A client can ask for any `u16`; the
+/// grid memory and the VT work of a pane grow with its size.
+pub const MAX_PANE_DIM: u16 = 1000;
+
+/// Clamp a requested rows or columns value to `1..=MAX_PANE_DIM`.
+pub fn clamp_pane_dim(n: u16) -> u16 {
+    n.clamp(1, MAX_PANE_DIM)
+}
+
 impl SessionManager {
     /// Create a new, empty session manager.
     pub fn new() -> Self {
@@ -1687,7 +1696,9 @@ impl SessionManager {
     /// parsers in response to the next `PtyOutput` (or ahead of it, via local
     /// UI state). The PTY resize ioctl propagates the new size to the child
     /// process, which will emit appropriate redraws on SIGWINCH.
-    pub fn resize_pane(&self, id: PaneId, size: PtySize) -> Result<()> {
+    pub fn resize_pane(&self, id: PaneId, mut size: PtySize) -> Result<()> {
+        size.rows = clamp_pane_dim(size.rows);
+        size.cols = clamp_pane_dim(size.cols);
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let pane = inner
             .panes
