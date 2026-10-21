@@ -297,6 +297,13 @@ impl SyncEndpoint {
             let _ =
                 self.event_tx.send(SyncEvent::DeviceRevoked { device_id: device_id.to_string() });
         }
+        if save_error.is_some() {
+            // Denied in memory meanwhile. Keep trying to put it on disk.
+            crate::registry::spawn_save_retry(
+                Arc::clone(&self.registry),
+                std::time::Duration::from_secs(5),
+            );
+        }
         RevokeOutcome { found, closed, save_error }
     }
 

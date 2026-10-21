@@ -42,14 +42,21 @@ pub struct DeviceRegistry {
     /// Devices removed in memory whose removal is not on disk yet (the save
     /// failed). Never authorized. Cleared by the next successful save.
     revoked_unsaved: std::collections::HashSet<String>,
+    /// `revoked.pending` was written and not removed yet.
+    pending_written: bool,
+    /// A save-retry thread runs for this registry.
+    retry_running: bool,
 }
 
 impl DeviceRegistry {
     /// Load the registry from disk, creating an empty one if the file does not
     /// exist. Stale `.tmp` files (crash recovery) are removed on load.
     pub fn load() -> Result<Self, RegistryError> {
-        let path = registry_path();
+        Self::load_from(registry_path())
+    }
 
+    /// [`Self::load`] for a registry file at `path`.
+    pub(crate) fn load_from(path: PathBuf) -> Result<Self, RegistryError> {
         // Remove the shared temp file an older build could leave behind.
         let tmp = path.with_extension("json.tmp");
         if tmp.exists() {
@@ -73,13 +80,74 @@ impl DeviceRegistry {
             d.name = crate::sanitize::untrusted(&d.name);
         }
 
-        Ok(Self { path, devices, revoked_unsaved: Default::default() })
+        let mut reg = Self {
+            path,
+            devices,
+            revoked_unsaved: Default::default(),
+            pending_written: false,
+            retry_running: false,
+        };
+        // A revoke whose save failed before the last stop is applied again.
+        reg.apply_pending_revokes();
+        Ok(reg)
+    }
+
+    /// File next to the registry that names revoked devices whose removal is
+    /// not in the registry file yet.
+    fn pending_path(&self) -> PathBuf {
+        self.path.with_file_name("revoked.pending")
+    }
+
+    /// Read `revoked.pending`: take those devices out of the list and deny
+    /// them, then try to save. The file goes once a save works.
+    fn apply_pending_revokes(&mut self) {
+        let Ok(text) = std::fs::read_to_string(self.pending_path()) else { return };
+        self.pending_written = true;
+        let ids: Vec<String> =
+            text.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect();
+        if ids.is_empty() {
+            let _ = std::fs::remove_file(self.pending_path());
+            return;
+        }
+        self.devices.retain(|d| !ids.contains(&d.device_id));
+        self.revoked_unsaved.extend(ids);
+        let list = self.devices.clone();
+        if let Err(e) = self.commit(list) {
+            tracing::warn!("registry: revoked devices are denied but the list is not saved: {e}");
+        }
+    }
+
+    /// Record the denylist in `revoked.pending` (atomic, fsynced), so a
+    /// restart before the registry file is saved still denies these devices.
+    fn write_pending(&mut self) {
+        let text: String = self.revoked_unsaved.iter().map(|id| format!("{id}\n")).collect();
+        match forgetty_core::fsutil::write_private_atomic(&self.pending_path(), text.as_bytes()) {
+            Ok(()) => self.pending_written = true,
+            Err(e) => tracing::warn!("registry: could not write revoked.pending: {e}"),
+        }
+    }
+
+    /// `true` while a revoke is denied in memory but not saved.
+    pub fn has_unsaved_revokes(&self) -> bool {
+        !self.revoked_unsaved.is_empty()
+    }
+
+    /// Try to save the current list again (the retry after a failed revoke).
+    pub fn retry_save(&mut self) -> Result<(), RegistryError> {
+        let list = self.devices.clone();
+        self.commit(list)
     }
 
     /// An empty registry persisted at `path` (tests).
     #[cfg(test)]
     pub(crate) fn empty_at(path: PathBuf) -> Self {
-        Self { path, devices: Vec::new(), revoked_unsaved: Default::default() }
+        Self {
+            path,
+            devices: Vec::new(),
+            revoked_unsaved: Default::default(),
+            pending_written: false,
+            retry_running: false,
+        }
     }
 
     /// Check whether an iroh `EndpointId` is in the authorized list. A device
@@ -117,7 +185,10 @@ impl DeviceRegistry {
         if removed {
             self.revoked_unsaved.insert(device_id.to_string());
             let list = self.devices.clone();
-            self.commit(list)?;
+            if let Err(e) = self.commit(list) {
+                self.write_pending();
+                return Err(e);
+            }
         }
         Ok(removed)
     }
@@ -146,7 +217,14 @@ impl DeviceRegistry {
     fn commit(&mut self, next: Vec<DeviceEntry>) -> Result<(), RegistryError> {
         Self::save(&self.path, &next)?;
         self.devices = next;
-        self.revoked_unsaved.clear();
+        if !self.revoked_unsaved.is_empty() {
+            self.revoked_unsaved.clear();
+        }
+        // Whatever was pending is in the file now.
+        if self.pending_written {
+            let _ = std::fs::remove_file(self.pending_path());
+            self.pending_written = false;
+        }
         Ok(())
     }
 
@@ -214,6 +292,43 @@ fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
 
 fn is_leap(y: u64) -> bool {
     (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
+}
+
+/// Keep trying to save `registry` every `every` until it works, on a thread of
+/// its own. For a revoke whose save failed (see [`DeviceRegistry::remove`]):
+/// the device is denied meanwhile. One retry thread per registry.
+pub fn spawn_save_retry(
+    registry: std::sync::Arc<std::sync::Mutex<DeviceRegistry>>,
+    every: std::time::Duration,
+) {
+    {
+        let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+        if reg.retry_running {
+            return;
+        }
+        reg.retry_running = true;
+    }
+    let reg2 = registry.clone();
+    let spawned =
+        std::thread::Builder::new().name("registry-save-retry".into()).spawn(move || loop {
+            std::thread::sleep(every);
+            let mut reg = reg2.lock().unwrap_or_else(|e| e.into_inner());
+            if !reg.has_unsaved_revokes() {
+                reg.retry_running = false;
+                break;
+            }
+            match reg.retry_save() {
+                Ok(()) => {
+                    tracing::info!("registry: the pending revoke is saved");
+                    reg.retry_running = false;
+                    break;
+                }
+                Err(e) => tracing::warn!("registry: save still failing: {e}"),
+            }
+        });
+    if spawned.is_err() {
+        registry.lock().unwrap_or_else(|e| e.into_inner()).retry_running = false;
+    }
 }
 
 #[cfg(test)]
@@ -294,5 +409,53 @@ mod tests {
         assert!(!reg.is_authorized(&id));
         let on_disk = std::fs::read_to_string(dir.join("authorized_devices.json")).unwrap();
         assert!(!on_disk.contains(&id.to_string()), "the revoked device is back on disk");
+    }
+
+    #[test]
+    fn a_revoke_that_cannot_be_saved_survives_a_restart_and_is_retried() {
+        let key = iroh::SecretKey::from_bytes(&[9u8; 32]);
+        let id = key.public();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state/authorized_devices.json");
+        let mut reg = DeviceRegistry::empty_at(path.clone());
+        reg.add(entry(&id.to_string())).unwrap();
+        // The next save fails: a non-empty directory sits where the file goes.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("keep"), b"x").unwrap();
+        assert!(reg.remove(&id.to_string()).is_err());
+        let pending = path.with_file_name("revoked.pending");
+        assert!(std::fs::read_to_string(&pending).unwrap().contains(&id.to_string()));
+        assert!(reg.has_unsaved_revokes());
+
+        // The process dies and starts again with the old file content on disk.
+        let old = serde_json::to_string(&[entry(&id.to_string())]).unwrap();
+        std::fs::remove_dir_all(&path).unwrap();
+        std::fs::write(&path, old).unwrap();
+        let again = DeviceRegistry::load_from(path.clone()).unwrap();
+        assert!(!again.is_authorized(&id), "a revoke lost to a failed save came back");
+        assert!(!pending.exists(), "the pending file stays after a good save");
+        assert!(!std::fs::read_to_string(&path).unwrap().contains(&id.to_string()));
+        assert!(!again.has_unsaved_revokes());
+
+        // The retry thread saves once the disk works again.
+        let mut reg = DeviceRegistry::empty_at(tmp.path().join("r2/authorized_devices.json"));
+        reg.add(entry(&id.to_string())).unwrap();
+        let p2 = tmp.path().join("r2/authorized_devices.json");
+        std::fs::remove_file(&p2).unwrap();
+        std::fs::create_dir(&p2).unwrap();
+        std::fs::write(p2.join("keep"), b"x").unwrap();
+        assert!(reg.remove(&id.to_string()).is_err());
+        let reg = std::sync::Arc::new(std::sync::Mutex::new(reg));
+        spawn_save_retry(reg.clone(), std::time::Duration::from_millis(50));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(reg.lock().unwrap().has_unsaved_revokes(), "still failing, still denied");
+        std::fs::remove_dir_all(&p2).unwrap();
+        let t0 = std::time::Instant::now();
+        while reg.lock().unwrap().has_unsaved_revokes() {
+            assert!(t0.elapsed() < std::time::Duration::from_secs(3), "the retry never saved");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(!std::fs::read_to_string(&p2).unwrap().contains(&id.to_string()));
     }
 }
