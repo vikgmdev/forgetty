@@ -10,6 +10,9 @@
   application error code `0x01 not_authorized`.
 - Pairing moves to ALPN `forgetty/pair/2` (AD-021, section 7).
 - QUIC transport config, both sides: keep-alive 5 s, max idle timeout 30 s.
+- The server binds a fixed UDP port (default 47297, `--port`), so its direct
+  address stays the same across restarts. Clients cache the last direct
+  address and dial it first, with the relay in parallel.
 - All framing: `[u32 BE length][payload]`. Length cap 4 MiB. A frame over the
   cap closes the stream with error `0x02 frame_too_large`.
 
@@ -31,6 +34,7 @@ First frame on Control, client to server:
 Hello {
   proto_major: 2, proto_minor: u16,
   client_id: Uuid,            // persisted by the client, stable across reconnects
+  input_epoch: Uuid,          // random per client process start
   client_kind: "windows" | "android" | "cli" | "gtk",
   client_name: String,        // device name shown in `client ls`
   client_version: String,
@@ -110,9 +114,11 @@ New methods:
 ## 5. Input stream
 
 Each frame payload: `[16 bytes pane uuid][u64 BE seq][input bytes]`. No
-MessagePack, no base64. `seq` starts at 1 per `client_id` and increases by 1 per
-frame, across reconnects. The server keeps the last written `seq` per
-`client_id` (in memory, kept 10 min after the client leaves) and drops any frame
+MessagePack, no base64. `seq` starts at 1 per `(client_id, input_epoch)` and increases by 1
+per frame, across reconnects of the same process. A new process sends a new
+`input_epoch`, so its counter starts fresh. The server keeps the last written
+`seq` per `(client_id, input_epoch)` (in memory, kept 10 min after the client
+leaves) and drops any frame
 with `seq <=` that value, so a resent frame is never written twice. The server
 writes the bytes to the PTY in arrival order.
 
