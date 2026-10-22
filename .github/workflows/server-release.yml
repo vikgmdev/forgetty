@@ -44,12 +44,15 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
+          key: ${{ matrix.target }}-zig-cpu-baseline-1
 
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
           version: 0.15.2
+
+      - name: Install the disassembler for the CPU-baseline check
+        run: sudo apt-get update && sudo apt-get install -y binutils binutils-aarch64-linux-gnu
 
       - name: Install packaging tools
         run: cargo install --locked cargo-zigbuild cargo-deb cargo-generate-rpm
