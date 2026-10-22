@@ -727,11 +727,16 @@ async fn input_without_the_flags_capability_is_user_input() {
 /// A hostile node that asks for catch-ups on many panes with a fresh
 /// `client_id` per connection costs one build at a time, and an honest second
 /// node still gets its own catch-up promptly.
+/// The tests that burn CPU for a while (8 busy panes, full-ring captures) take
+/// turns: the timing limit of the catch-up test does not hold next to them.
+static HEAVY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_hostile_node_does_not_starve_an_honest_nodes_catch_up() {
     if !real_only() {
         return;
     }
+    let _heavy = HEAVY.lock().await;
     let server = TestServer::start(TestServerConfig::default()).await;
     let busy: Vec<Uuid> =
         (0..8).map(|_| server.add_script_pane("exec yes 0123456789abcdef")).collect();
@@ -1301,6 +1306,7 @@ async fn capture_right_after_a_full_ring_answers() {
     if !real_only() {
         return;
     }
+    let _heavy = HEAVY.lock().await;
     let server = TestServer::start(TestServerConfig::default()).await;
     // More than the 8 MiB ring, ending with a marker on the screen.
     let pane = server.add_script_pane(
@@ -1337,6 +1343,7 @@ async fn parallel_captures_of_a_short_line_ring_survive() {
     if !real_only() {
         return;
     }
+    let _heavy = HEAVY.lock().await;
     let server = TestServer::start(TestServerConfig::default()).await;
     let pane = server.add_script_pane("seq 1 1300000; echo DONE_MARKER; exec cat");
     wait_for("the burst to finish", || {

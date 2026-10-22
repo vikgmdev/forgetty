@@ -49,6 +49,30 @@ async fn wait_for(what: &str, limit: Duration, mut f: impl FnMut() -> bool) {
 /// the input, byte for byte. If one input frame were written twice or lost,
 /// or one output byte skipped or repeated, the output would differ from the
 /// typed sequence.
+/// Put a directory where the registry file goes, so the next save is refused.
+///
+/// The server saves `last_seen` in the background after each handshake. That
+/// save can land between the remove and the `create_dir` and put the file back
+/// (this made the tests fail about 3 runs in 20), so go again until the
+/// directory is in place. A save that comes after that fails, as intended.
+fn block_with_a_directory(file: &std::path::Path) {
+    for _ in 0..50 {
+        match std::fs::remove_file(file) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => panic!("remove {}: {e}", file.display()),
+        }
+        match std::fs::create_dir(file) {
+            Ok(()) => return,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(e) => panic!("create_dir {}: {e}", file.display()),
+        }
+    }
+    panic!("the server kept re-creating {}", file.display());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn exactly_once_across_five_drops_and_one_restart() {
     if !real_only() {
@@ -382,8 +406,7 @@ async fn a_revoke_that_cannot_be_saved_still_cuts_and_denies_the_device() {
     // Make the next save fail: a directory sits where the file goes, so the
     // rename of the temp file onto it is refused.
     let file = server.state_dir().unwrap().join("data/forgetty/authorized_devices.json");
-    std::fs::remove_file(&file).expect("the registry file exists after pairing");
-    std::fs::create_dir(&file).unwrap();
+    block_with_a_directory(&file);
     std::fs::write(file.join("keep"), b"x").unwrap();
 
     // The record in `revoked.pending` is written in place first, so the revoke
@@ -429,8 +452,7 @@ async fn a_revoke_that_cannot_be_saved_still_cuts_and_denies_the_device() {
     .await
     .unwrap();
     let h2 = Client::connect(server.addr(), k2.clone(), info("revoke-undurable")).await.unwrap();
-    std::fs::remove_file(&file).expect("the registry file exists after pairing");
-    std::fs::create_dir(&file).unwrap();
+    block_with_a_directory(&file);
     std::fs::write(file.join("keep"), b"x").unwrap();
     std::fs::remove_file(&pending).unwrap();
     std::fs::create_dir(&pending).unwrap();

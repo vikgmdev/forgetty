@@ -2350,11 +2350,9 @@ impl SessionManager {
                 inner.byte_logs.get_mut(&id).map(|log| log.ring_snapshot().0).unwrap_or_default();
             (rows, cols, replay)
         };
-        // Only the tail the screen needs leaves the lock, and only two VT
-        // builds run at once, capture and snapshot together.
-        let replay = crate::capture::replay_tail(&replay);
+        // Only two VT builds run at once, capture and snapshot together.
         let _permit = crate::vt_gate::vt_gate().acquire();
-        Some(crate::capture::capture_text(replay, rows, cols, trim, last_lines))
+        Some(crate::capture::capture_text(&replay, rows, cols, trim, last_lines))
     }
 
     /// Snapshot catch-up (AD-023): the pane's current screen as VT bytes, built

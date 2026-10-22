@@ -9,50 +9,50 @@ use forgetty_vt::{Terminal, ANSI_PALETTE_BLACK};
 /// Feed size per `vt_write` call.
 const FEED_CHUNK: usize = 64 * 1024;
 
-/// Scrollback of the throwaway terminal: none. Capture reads the visible
-/// screen only, and a scrollback makes libghostty allocate, prune and recycle
-/// pages for every line that scrolls off (10 MiB by default).
-const SCRATCH_SCROLLBACK: usize = 0;
+/// Most bytes of scrollback the capture terminal gets, for `last_lines` beyond
+/// the screen height. libghostty counts scrollback in bytes of page memory.
+const MAX_SCRATCH_SCROLLBACK: usize = 2 * 1024 * 1024;
 
-/// Most bytes of the ring that capture parses. The screen is a function of the
-/// last full redraw, so the older part of a long ring does not change it, but
-/// it costs time and memory. A pane that wrote more than this since its last
-/// full-screen clear shows what the tail paints.
-pub const TAIL_CAP: usize = 2 * 1024 * 1024;
+/// Bytes of page memory budgeted for one scrollback cell, with slack for the
+/// page granularity (see `Terminal::with_scrollback`).
+const SCROLLBACK_BYTES_PER_CELL: usize = 24;
 
-/// Sequences that start a screen from scratch: reset (RIS), erase display,
-/// and the alternate screen switches.
-const RESET_MARKERS: [&[u8]; 4] = [b"\x1bc", b"\x1b[2J", b"\x1b[?1049h", b"\x1b[?1047h"];
+/// Sequences that clear the whole screen: reset (RIS) and erase display.
+const RESET_MARKERS: [&[u8]; 2] = [b"\x1bc", b"\x1b[2J"];
 
-/// The part of `replay` that capture parses: all of it up to [`TAIL_CAP`],
-/// else the last [`TAIL_CAP`] bytes, cut at the last reset marker inside them
-/// or, with none, after the first line break (and on a UTF-8 boundary).
-pub fn replay_tail(replay: &[u8]) -> &[u8] {
-    replay_tail_capped(replay, TAIL_CAP)
+/// Alternate screen mode switches (1049, 1047 and 47, set or reset).
+const ALT_SCREEN_PREFIXES: [&[u8]; 3] = [b"\x1b[?1049", b"\x1b[?1047", b"\x1b[?47"];
+
+/// Scrollback bytes for a request of `last_lines` on a `rows` x `cols` screen:
+/// none unless the request reaches past the screen, then enough for the extra
+/// lines, up to [`MAX_SCRATCH_SCROLLBACK`].
+fn scrollback_for(rows: usize, cols: usize, last_lines: Option<usize>) -> usize {
+    match last_lines {
+        Some(n) if n > rows => ((n - rows) * cols * SCROLLBACK_BYTES_PER_CELL)
+            .saturating_add(64 * 1024)
+            .min(MAX_SCRATCH_SCROLLBACK),
+        _ => 0,
+    }
 }
 
-fn replay_tail_capped(replay: &[u8], cap: usize) -> &[u8] {
-    if replay.len() <= cap {
-        return replay;
+/// Where parsing starts. The whole ring when scrollback is wanted (history
+/// before a clear is part of it). Otherwise the last full-screen clear, since
+/// nothing before it shows on the screen, unless an alternate screen switch
+/// follows it (leaving the alternate screen shows the older primary screen).
+/// The ring start when there is no clear.
+fn parse_start(replay: &[u8], want_scrollback: bool) -> usize {
+    if want_scrollback {
+        return 0;
     }
-    let window = &replay[replay.len() - cap..];
-    let mut start = None;
-    for m in RESET_MARKERS {
-        if let Some(i) = window.windows(m.len()).rposition(|w| w == m) {
-            start = start.max(Some(i));
-        }
+    let last = |pat: &[u8]| replay.windows(pat.len()).rposition(|w| w == pat);
+    let Some(mark) = RESET_MARKERS.iter().filter_map(|m| last(m)).max() else { return 0 };
+    let after = &replay[mark..];
+    let switched = ALT_SCREEN_PREFIXES.iter().any(|p| after.windows(p.len()).any(|w| w == *p));
+    if switched {
+        0
+    } else {
+        mark
     }
-    let start = match start {
-        Some(i) => i,
-        None => {
-            let mut i = window.iter().position(|&b| b == b'\n').map_or(0, |n| n + 1);
-            while i < window.len() && (window[i] & 0xC0) == 0x80 {
-                i += 1;
-            }
-            i
-        }
-    };
-    &window[start..]
 }
 
 /// Render `replay` (raw PTY bytes) on a `rows` x `cols` screen and return its
@@ -61,7 +61,8 @@ fn replay_tail_capped(replay: &[u8], cap: usize) -> &[u8] {
 /// - one output line per screen row, joined with `\n`
 /// - `trim`: remove trailing whitespace from every line and trailing blank
 ///   lines from the end
-/// - `last_lines`: keep only the last N lines (after `trim`)
+/// - `last_lines`: keep only the last N lines (after `trim`). Past the screen
+///   height the lines come from a scrollback sized for the request.
 pub fn capture_text(
     replay: &[u8],
     rows: u16,
@@ -71,24 +72,22 @@ pub fn capture_text(
 ) -> String {
     let rows = rows.max(1) as usize;
     let cols = cols.max(1) as usize;
-    let mut term =
-        Terminal::with_scrollback(rows, cols, [ANSI_PALETTE_BLACK; 16], SCRATCH_SCROLLBACK);
-    for chunk in replay_tail(replay).chunks(FEED_CHUNK) {
+    let scrollback = scrollback_for(rows, cols, last_lines);
+    let start = parse_start(replay, scrollback > 0);
+    let mut term = Terminal::with_scrollback(rows, cols, [ANSI_PALETTE_BLACK; 16], scrollback);
+    for chunk in replay[start..].chunks(FEED_CHUNK) {
         term.feed(chunk);
     }
-    let screen = term.screen();
     let mut lines: Vec<String> = Vec::with_capacity(rows);
-    for r in 0..screen.rows() {
-        let mut line = String::new();
-        for cell in screen.row(r) {
-            line.push_str(&cell.grapheme);
-        }
-        if trim {
-            line.truncate(line.trim_end().len());
-        }
-        lines.push(line);
+    if scrollback > 0 {
+        collect_with_history(&mut term, rows, &mut lines);
+    } else {
+        collect_viewport(&term, &mut lines);
     }
     if trim {
+        for line in &mut lines {
+            line.truncate(line.trim_end().len());
+        }
         while lines.last().is_some_and(String::is_empty) {
             lines.pop();
         }
@@ -98,6 +97,48 @@ pub fn capture_text(
         lines.drain(..keep_from);
     }
     lines.join("\n")
+}
+
+/// Append the rows now in the viewport.
+fn collect_viewport(term: &Terminal, lines: &mut Vec<String>) {
+    let screen = term.screen();
+    for r in 0..screen.rows() {
+        let mut line = String::new();
+        for cell in screen.row(r) {
+            line.push_str(&cell.grapheme);
+        }
+        lines.push(line);
+    }
+}
+
+/// Append every line, scrollback first: the viewport is moved to the top and
+/// down a page at a time.
+fn collect_with_history(term: &mut Terminal, rows: usize, lines: &mut Vec<String>) {
+    let _ = term.screen(); // refreshes the scrollbar
+    let (total, _, _) = term.scrollbar_state();
+    let total = total as usize;
+    if total <= rows {
+        collect_viewport(term, lines);
+        return;
+    }
+    term.scroll_viewport_delta(isize::MIN / 2);
+    let _ = term.screen();
+    let mut have = 0usize;
+    // A page at a time; the last page overlaps the one before it.
+    for _ in 0..=(total / rows + 1) {
+        let _ = term.screen();
+        let (_, offset, _) = term.scrollbar_state();
+        let offset = offset as usize;
+        let mut page = Vec::with_capacity(rows);
+        collect_viewport(term, &mut page);
+        let skip = have.saturating_sub(offset);
+        lines.extend(page.into_iter().skip(skip));
+        have = lines.len();
+        if offset + rows >= total {
+            break;
+        }
+        term.scroll_viewport_delta(rows as isize);
+    }
 }
 
 #[cfg(test)]
@@ -155,48 +196,81 @@ mod tests {
         assert_eq!(out, "text");
     }
 
-    #[test]
-    fn long_ring_parses_only_the_tail() {
-        // 6 MiB of short lines, then a clear and a screen. The result is the
-        // same as for the screen alone, and no scrollback is kept.
+    /// A vim-like screen: drawn once, then only cursor-addressed updates.
+    fn vim_like_ring(updates_bytes: usize) -> Vec<u8> {
         let mut ring = Vec::new();
-        let mut n = 0u64;
-        while ring.len() < 6 * 1024 * 1024 {
-            ring.extend_from_slice(format!("{n}\r\n").as_bytes());
-            n += 1;
+        ring.extend_from_slice(b"\x1b[?1049h\x1b[H\x1b[2J");
+        for r in 1..=24 {
+            ring.extend_from_slice(format!("\x1b[{r};1Hrow {r} static text").as_bytes());
         }
-        ring.extend_from_slice(b"\x1b[2J\x1b[Hscreen one\r\nscreen two");
-        let out = capture_text(&ring, 5, 40, true, None);
-        assert_eq!(out, "screen one\nscreen two");
-        // No clear in the tail: the cut falls after a line break, so the first
-        // line is whole and the last lines are the ring's last lines.
-        let mut ring = Vec::new();
-        let mut n = 0u64;
-        while ring.len() < 6 * 1024 * 1024 {
-            ring.extend_from_slice(format!("line {n}\r\n").as_bytes());
-            n += 1;
+        let mut i = 0u64;
+        let start = ring.len();
+        while ring.len() - start < updates_bytes {
+            // Rewrite one cell of row 24 column 60.. only.
+            ring.extend_from_slice(format!("\x1b[24;60H{:>8}", i % 100_000_000).as_bytes());
+            i += 1;
         }
-        let out = capture_text(&ring, 3, 40, true, None);
-        assert_eq!(out, format!("line {}\nline {}", n - 2, n - 1));
+        ring
     }
 
     #[test]
-    fn tail_cut_never_starts_inside_a_character() {
-        let mut ring = "é".repeat(3 * 1024 * 1024).into_bytes();
-        ring.extend_from_slice("\nend".as_bytes());
-        let tail = replay_tail_capped(&ring, 1000);
-        assert!(std::str::from_utf8(tail).is_ok());
-        assert!(tail.ends_with(b"end"));
+    fn a_screen_drawn_once_survives_megabytes_of_small_updates() {
+        let ring = vim_like_ring(5 * 1024 * 1024);
+        let out = capture_text(&ring, 24, 80, true, None);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 24);
+        for (i, l) in lines.iter().take(23).enumerate() {
+            assert_eq!(*l, format!("row {} static text", i + 1));
+        }
+        assert!(lines[23].starts_with("row 24 static text"));
+        // The updates stay whole too.
+        assert!(lines[23].trim_end().len() > "row 24 static text".len());
     }
 
     #[test]
-    fn tail_starts_at_the_last_reset_marker() {
+    fn last_lines_past_the_screen_comes_from_history() {
+        let mut ring = Vec::new();
+        for i in 0..3000 {
+            ring.extend_from_slice(format!("line {i}\r\n").as_bytes());
+        }
+        ring.extend_from_slice(b"last");
+        let out = capture_text(&ring, 24, 80, true, Some(500));
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 500);
+        assert_eq!(lines[0], "line 2501");
+        assert_eq!(lines[498], "line 2999");
+        assert_eq!(lines[499], "last");
+        // Without history: only the screen.
+        assert_eq!(capture_text(&ring, 24, 80, true, Some(24)).lines().count(), 24);
+        assert_eq!(capture_text(&ring, 24, 80, true, None).lines().count(), 24);
+    }
+
+    #[test]
+    fn last_lines_on_a_wide_pane_is_still_whole_up_to_the_cap() {
+        let mut ring = Vec::new();
+        for i in 0..2000 {
+            ring.extend_from_slice(format!("{i} {}\r\n", "w".repeat(150)).as_bytes());
+        }
+        let out = capture_text(&ring, 24, 200, true, Some(500));
+        assert_eq!(out.lines().count(), 500);
+    }
+
+    #[test]
+    fn a_clear_cuts_the_parse_unless_the_alternate_screen_switches_after_it() {
         let mut ring = vec![b'x'; 5000];
-        ring.extend_from_slice(b"\x1b[2Jtext\r\n");
-        ring.extend_from_slice(&[b'y'; 100]);
-        let tail = replay_tail_capped(&ring, 1000);
-        assert!(tail.starts_with(b"\x1b[2J"));
-        assert_eq!(replay_tail_capped(&ring, 1_000_000).len(), ring.len());
+        ring.extend_from_slice(b"\x1b[2Jtext");
+        assert_eq!(parse_start(&ring, false), 5000);
+        assert_eq!(parse_start(&ring, true), 0);
+        ring.extend_from_slice(b"\x1b[?1049l");
+        assert_eq!(parse_start(&ring, false), 0);
+        assert_eq!(parse_start(b"plain", false), 0);
+    }
+
+    #[test]
+    fn leaving_the_alternate_screen_shows_the_primary_screen() {
+        let out =
+            capture_text(b"\x1b[2Jprompt $\x1b[?1049h\x1b[2Jvim\x1b[?1049l", 4, 20, true, None);
+        assert_eq!(out, "prompt $");
     }
 
     #[test]
