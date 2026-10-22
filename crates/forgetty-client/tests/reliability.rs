@@ -833,3 +833,73 @@ async fn network_changed_with_a_silent_link_replaces_the_endpoint_after_the_fall
     h.close().await;
     server.shutdown().await;
 }
+
+/// The answer-once server with the apps' nudger: `reconnect_now` every 400 ms
+/// (Windows and Android restart it at each `Reconnecting`). It must not set the
+/// dial rate: the empty-bucket sleep ignores it. Same bound as without it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reconnect_now_every_400_ms_does_not_speed_up_a_server_that_answers_once() {
+    if common::real_only() {
+        return;
+    }
+    let server = TestServer::start(TestServerConfig {
+        die_mode: forgetty_client::test_server::DIE_AFTER_EVENT,
+        ..Default::default()
+    })
+    .await;
+    let h = client_with_events(&server, "nudged").await;
+    let nudger = {
+        let h = h.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                h.reconnect_now();
+            }
+        })
+    };
+    let mut d = Dials::new();
+    while d.t0.elapsed() < Duration::from_secs(30) {
+        d.poll(&server);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    nudger.abort();
+    println!("nudged: {} dials, longest gap {:?}", d.at.len(), d.longest_gap());
+    assert!(d.at.len() <= 25, "{} dials in 30 s with reconnect_now every 400 ms", d.at.len());
+    h.close().await;
+    server.shutdown().await;
+}
+
+/// The same server with `network_changed` every 200 ms (a flapping network):
+/// it cuts an empty-bucket sleep at most once per 3 s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn network_changed_every_200_ms_does_not_set_the_dial_rate() {
+    if common::real_only() {
+        return;
+    }
+    let server = TestServer::start(TestServerConfig {
+        die_mode: forgetty_client::test_server::DIE_AFTER_EVENT,
+        ..Default::default()
+    })
+    .await;
+    let h = client_with_events(&server, "flapping").await;
+    let flapper = {
+        let h = h.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                h.network_changed().await;
+            }
+        })
+    };
+    let mut d = Dials::new();
+    while d.t0.elapsed() < Duration::from_secs(30) {
+        d.poll(&server);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    flapper.abort();
+    println!("flapping: {} dials, longest gap {:?}", d.at.len(), d.longest_gap());
+    // 30 on an idle host; two more of margin for a loaded one.
+    assert!(d.at.len() <= 32, "{} dials in 30 s with network_changed every 200 ms", d.at.len());
+    h.close().await;
+    server.shutdown().await;
+}

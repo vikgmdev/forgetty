@@ -60,8 +60,10 @@ const INPUT_CHUNK: usize = 16 * 1024;
 ///   of short sessions, heard or not. The bucket does not refill during that
 ///   sleep.
 ///
-/// `reconnect_now` and `network_changed` can cut a sleep but never add a
-/// token. So a server that answers once and closes cannot make the client
+/// `reconnect_now` and `network_changed` never add a token. `reconnect_now`
+/// cuts a normal backoff but has no effect on the empty-bucket sleep (the apps
+/// call it every 400 ms). `network_changed` cuts the empty-bucket sleep at most
+/// once per `EP_MIN_AGE`. So a server that answers once and closes cannot make the client
 /// redial in a tight loop, and a single drop is still redialed at once.
 const MIN_HEALTHY_SESSION: Duration = Duration::from_secs(5);
 const REDIAL_BURST: f64 = 10.0;
@@ -1303,6 +1305,8 @@ async fn supervise(shared: Arc<Shared>) {
     let mut tokens = REDIAL_BURST;
     let mut refilled = Instant::now();
     let mut streak = 0usize;
+    // When `network_changed` last cut an empty-bucket sleep.
+    let mut last_cut: Option<Instant> = None;
     loop {
         if *shutdown.borrow() {
             break;
@@ -1363,6 +1367,8 @@ async fn supervise(shared: Arc<Shared>) {
                 continue;
             }
         };
+        // The sleep that follows is the empty-bucket one (see `MIN_HEALTHY_SESSION`).
+        let mut empty_sleep = false;
         let delay = match result {
             Ok(Ok(est)) => {
                 debug!(
@@ -1415,6 +1421,7 @@ async fn supervise(shared: Arc<Shared>) {
                         // The sleep earns no tokens: a broken server settles at
                         // the ladder cap instead of drawing on the refill.
                         refilled = now + step;
+                        empty_sleep = true;
                         Some(step)
                     }
                 }
@@ -1443,19 +1450,45 @@ async fn supervise(shared: Arc<Shared>) {
                 Some(d)
             }
         };
+        // `network_changed` forgets the failures and dials at once, but an
+        // empty-bucket sleep it cuts at most once per `EP_MIN_AGE`: a network
+        // that flaps must not set the dial rate.
+        let cut_ok = last_cut.is_none_or(|t| t.elapsed() >= EP_MIN_AGE);
         let delay = if shared.reset_backoff.swap(false, Ordering::SeqCst) {
             failures = 0;
-            None
+            if empty_sleep && !cut_ok {
+                delay
+            } else {
+                if empty_sleep {
+                    last_cut = Some(Instant::now());
+                }
+                None
+            }
         } else {
             delay
         };
         if let Some(delay) = delay {
             debug!("client: backoff {delay:?} before dial #{}", attempt_no + 1);
-            tokio::select! {
-                _ = tokio::time::sleep(delay) => {}
-                _ = shutdown.changed() => {}
-                _ = shared.kick.notified() => {}
-                _ = shared.wake_backoff.notified() => {}
+            let sleep = tokio::time::sleep(delay);
+            tokio::pin!(sleep);
+            loop {
+                tokio::select! {
+                    () = &mut sleep => break,
+                    _ = shutdown.changed() => break,
+                    _ = shared.kick.notified() => {
+                        // Not in an empty-bucket sleep that was cut lately.
+                        if !empty_sleep {
+                            break;
+                        }
+                        if last_cut.is_none_or(|t| t.elapsed() >= EP_MIN_AGE) {
+                            last_cut = Some(Instant::now());
+                            break;
+                        }
+                    }
+                    // `reconnect_now` cuts a normal backoff, never the
+                    // empty-bucket sleep (the apps call it every 400 ms).
+                    _ = shared.wake_backoff.notified(), if !empty_sleep => break,
+                }
             }
         }
     }

@@ -7,6 +7,10 @@
 //! network change. With `RUST_LOG=forgetty_client=debug` the client's own dial
 //! log shows where the time goes.
 //!
+//! `--direct-addr IP:PORT` seeds the direct address cache (a server that is
+//! reachable directly). Point the payload relay at a closed port to model a relay
+//! that never comes up.
+//!
 //! `--gate FILE --usable-after-ms N` models a network that is not usable yet: the
 //! file is created before `network_changed()` and removed N ms later (a test
 //! relay proxy refuses connections while the file exists). The line
@@ -61,6 +65,12 @@ async fn run(args: &[String]) -> Result<(), String> {
     let client_id =
         load_or_generate_client_id(&dir.join("client_id")).map_err(|e| e.to_string())?;
     let opts = ClientOptions { relay_only, ..ClientOptions::default() };
+    // `--direct-addr IP:PORT` seeds the address cache, as a previous direct
+    // connection would have left it (the pairing payload names no direct address).
+    if let Some(a) = arg(args, "--direct-addr") {
+        let a: std::net::SocketAddr = a.parse().map_err(|e| format!("--direct-addr: {e}"))?;
+        opts.addr_cache.insert(addr.id, a);
+    }
     if !no_pair {
         pair_with_addr(
             addr.clone(),
@@ -79,7 +89,11 @@ async fn run(args: &[String]) -> Result<(), String> {
     let mut state = h.watch_state();
     wait_connected(&mut state, Duration::from_secs(30)).await?;
     println!("MARK first connect {:?} after spawn", t_spawn.elapsed());
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // `--settle-ms N`: wait this long after the first connect (default 2000). A
+    // short wait keeps a seeded direct address in the cache: later iroh learns
+    // the server's real addresses and the cache follows the selected path.
+    let settle: u64 = arg(args, "--settle-ms").and_then(|v| v.parse().ok()).unwrap_or(2000);
+    tokio::time::sleep(Duration::from_millis(settle)).await;
 
     let gate = arg(args, "--gate").map(PathBuf::from);
     let usable_after: Option<u64> = arg(args, "--usable-after-ms").and_then(|v| v.parse().ok());
