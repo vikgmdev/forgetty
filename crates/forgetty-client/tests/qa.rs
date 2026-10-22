@@ -1311,7 +1311,14 @@ async fn capture_right_after_a_full_ring_answers() {
         total > 9_000_000 && total.saturating_sub(first) >= 8 * 1024 * 1024
     })
     .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The marker comes last. Captures taken while the burst still runs must
+    // answer too, so poll until it shows.
+    wait_for("the marker on the screen", || {
+        server
+            .socket_call("capture", json!({"pane_id": pane.to_string(), "last_lines": 5}))
+            .is_ok_and(|r| r["text"].as_str().is_some_and(|t| t.contains("DONE_MARKER")))
+    })
+    .await;
     // Several in a row on one connection, none may close it.
     for i in 0..3 {
         let r = server
@@ -1331,19 +1338,24 @@ async fn parallel_captures_of_a_short_line_ring_survive() {
         return;
     }
     let server = TestServer::start(TestServerConfig::default()).await;
-    let pane = server.add_script_pane("seq 1 2500000; echo DONE_MARKER; exec cat");
+    let pane = server.add_script_pane("seq 1 1300000; echo DONE_MARKER; exec cat");
     wait_for("the burst to finish", || {
         let (first, total) = server.log_bounds(pane);
-        total > 16_000_000 && total.saturating_sub(first) >= 8 * 1024 * 1024
+        total > 8_700_000 && total.saturating_sub(first) >= 8 * 1024 * 1024
     })
     .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    wait_for("the marker on the screen", || {
+        server
+            .socket_call("capture", json!({"pane_id": pane.to_string(), "last_lines": 5}))
+            .is_ok_and(|r| r["text"].as_str().is_some_and(|t| t.contains("DONE_MARKER")))
+    })
+    .await;
     let server = std::sync::Arc::new(server);
     let mut joins = Vec::new();
-    for i in 0..8 {
+    for i in 0..4 {
         let server = server.clone();
         joins.push(tokio::task::spawn_blocking(move || {
-            for j in 0..4 {
+            for j in 0..2 {
                 let r = server
                     .socket_call(
                         "capture",

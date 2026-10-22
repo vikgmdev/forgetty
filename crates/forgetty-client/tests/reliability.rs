@@ -471,3 +471,57 @@ async fn network_changed_aborts_a_hung_dial_and_connects_at_once() {
     h.close().await;
     server.shutdown().await;
 }
+
+/// The socket of the client's endpoint goes away (Android airplane mode): no
+/// dial on it connects, and iroh would take 4 to 52 s to rebind. After
+/// `network_changed` the client must bind a fresh endpoint with the same key
+/// and be Connected within 1.5 s. Input typed before, during and after the
+/// outage reaches the pane once, in order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn network_changed_with_a_stuck_socket_connects_on_a_fresh_endpoint() {
+    let server =
+        TestServer::start(TestServerConfig { own_runtime: true, ..Default::default() }).await;
+    let pane = server.add_pane();
+    let h = connect_to(server.addr()).await;
+    let device = h.endpoint_id();
+    h.send_input(pane, b"before-").await.unwrap();
+    wait_until("first input", Duration::from_secs(5), || server.received_input(pane) == b"before-")
+        .await;
+
+    h.blackhole_endpoint_for_tests();
+    let handshakes = server.handshakes();
+    let t0 = Instant::now();
+    h.network_changed().await;
+    h.send_input(pane, b"during-").await.unwrap();
+    loop {
+        if server.handshakes() > handshakes && h.state().is_connected() {
+            break;
+        }
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "not connected {:?} after network_changed, state {:?}",
+            t0.elapsed(),
+            h.state()
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    let took = t0.elapsed();
+    println!("network_changed with a stuck socket: Connected after {took:?}");
+    assert!(took < Duration::from_millis(1500), "Connected after {took:?}");
+    assert_eq!(h.endpoint_id(), device, "the fresh endpoint keeps the device id");
+
+    h.send_input(pane, b"after").await.unwrap();
+    wait_until("all input", Duration::from_secs(5), || {
+        server.received_input(pane) == b"before-during-after"
+    })
+    .await;
+    // The session continued on the new endpoint: a later drop redials at once.
+    let before = server.handshakes();
+    server.drop_connections();
+    wait_until("redial on the new endpoint", Duration::from_secs(5), || {
+        server.handshakes() > before && h.state().is_connected()
+    })
+    .await;
+    h.close().await;
+    server.shutdown().await;
+}
