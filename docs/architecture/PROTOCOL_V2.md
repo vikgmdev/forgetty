@@ -121,6 +121,10 @@ is answered, and no longer. The answer comes when the stream is set up. The
 pacing wait and the snapshot build of a far-behind pane happen after it, on the
 stream's own task, so they do not hold a slot.
 
+A `detach_pane` is answered within 250 ms at most. The stream stops at once;
+the size policy (who owns the pane size) follows, and if a lock it needs is
+busy the answer does not wait for it. The server finishes the update later.
+
 Events may arrive before the answer of `subscribe_events`. The server starts
 the subscription first and puts the answer in the queue after it, so an event
 with a `seq` above the `seq` of the answer can come ahead of the answer. A

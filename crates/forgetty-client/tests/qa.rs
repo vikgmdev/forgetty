@@ -2145,3 +2145,151 @@ async fn a_connection_that_drops_with_its_attach_leaves_no_client_on_the_pane() 
     endpoint.close().await;
     server.shutdown().await;
 }
+
+/// A `detach_pane` always gets its answer, within a second, however busy the
+/// size policy is. Attach and detach churn on one pane while the size policy
+/// lock is held for seconds (as a busy pane holds it): the attaches wait for
+/// that lock, the detaches must not. Then the link drops in the middle of the
+/// churn, a new connection churns again, and no client stays attached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_detach_is_answered_within_a_second_while_attaches_churn_and_the_link_drops() {
+    if !real_only() {
+        return;
+    }
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    type Times = Arc<Mutex<HashMap<u64, Instant>>>;
+
+    /// A connection that records when each request was sent and answered.
+    struct Churner {
+        send: iroh::endpoint::SendStream,
+        conn: iroh::endpoint::Connection,
+        sent: Times,
+        answered: Times,
+        next_id: u64,
+    }
+    impl Churner {
+        async fn start(endpoint: &iroh::Endpoint, server: &TestServer) -> Churner {
+            let conn = endpoint.connect(server.addr(), ALPN_RPC).await.unwrap();
+            let (mut send, mut recv) = conn.open_bi().await.unwrap();
+            let hello = Hello::new(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                ClientKind::Cli,
+                "churn",
+                "0.0.0",
+                vec!["resume".to_string(), "snapshot_catchup".to_string()],
+            );
+            write_msg(&mut send, &hello).await.unwrap();
+            match read_msg::<_, HandshakeReply>(&mut recv).await.unwrap() {
+                Some(HandshakeReply::Welcome(_)) => {}
+                other => panic!("handshake: {other:?}"),
+            }
+            let answered: Times = Arc::default();
+            let seen = answered.clone();
+            tokio::spawn(async move {
+                while let Ok(Some(msg)) = read_msg::<_, ControlMsg>(&mut recv).await {
+                    if let ControlMsg::Response { id, .. } | ControlMsg::Failure { id, .. } = msg {
+                        seen.lock().unwrap().entry(id).or_insert_with(Instant::now);
+                    }
+                }
+            });
+            Churner { send, conn, sent: Arc::default(), answered, next_id: 1 }
+        }
+
+        /// One attach and the detach right behind it. Returns the detach id.
+        async fn round(&mut self, pane: Uuid) -> Option<u64> {
+            let id = self.next_id;
+            self.next_id += 2;
+            let attach = ControlMsg::Request {
+                id,
+                method: "attach_pane".into(),
+                params: to_value(&json!({"pane_id": pane.to_string(), "from_offset": null}))
+                    .unwrap(),
+            };
+            let detach = ControlMsg::Request {
+                id: id + 1,
+                method: "detach_pane".into(),
+                params: to_value(&json!({"pane_id": pane.to_string()})).unwrap(),
+            };
+            self.sent.lock().unwrap().insert(id + 1, Instant::now());
+            write_msg(&mut self.send, &attach).await.ok()?;
+            write_msg(&mut self.send, &detach).await.ok()?;
+            Some(id + 1)
+        }
+
+        /// The slowest answer among `ids`, and the ids with none.
+        fn latency(&self, ids: &[u64]) -> (Duration, Vec<u64>) {
+            let (sent, answered) = (self.sent.lock().unwrap(), self.answered.lock().unwrap());
+            let mut worst = Duration::ZERO;
+            let mut missing = Vec::new();
+            for id in ids {
+                match answered.get(id) {
+                    Some(a) => worst = worst.max(a.duration_since(sent[id])),
+                    None => missing.push(*id),
+                }
+            }
+            (worst, missing)
+        }
+    }
+
+    let server = TestServer::start(TestServerConfig::default()).await;
+    let pane = server.add_script_pane("stty raw -echo; exec cat");
+    let endpoint = raw_endpoint(&server).await;
+    let mut a = Churner::start(&endpoint, &server).await;
+    let mut b = Churner::start(&endpoint, &server).await;
+
+    // The size policy is busy for 2.5 s.
+    server.socket_call("qa_hold_sizes", json!({"ms": 2500})).unwrap();
+    let mut a_ids = Vec::new();
+    for _ in 0..30 {
+        a_ids.extend(a.round(pane).await);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let (worst, missing) = a.latency(&a_ids);
+    println!("busy size policy: {} detaches, slowest {worst:?}, unanswered {}", a_ids.len(), missing.len());
+    assert!(missing.is_empty(), "detaches without an answer after 1.2 s: {missing:?}");
+    assert!(worst < Duration::from_secs(1), "a detach took {worst:?}");
+
+    // The link drops in the middle of a churn on the second connection.
+    let dropper = {
+        let server_ref = &server;
+        async move {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            server_ref.drop_connections();
+        }
+    };
+    let churn_b = async {
+        for _ in 0..40 {
+            if b.round(pane).await.is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::join!(dropper, churn_b);
+
+    // A new connection churns again, after the lock was let go.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let mut c = Churner::start(&endpoint, &server).await;
+    let mut c_ids = Vec::new();
+    for _ in 0..30 {
+        c_ids.extend(c.round(pane).await);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let (worst, missing) = c.latency(&c_ids);
+    println!("after the drop: {} detaches, slowest {worst:?}, unanswered {}", c_ids.len(), missing.len());
+    assert!(missing.is_empty(), "detaches without an answer: {missing:?}");
+    assert!(worst < Duration::from_secs(1), "a detach took {worst:?}");
+
+    c.conn.close(0u32.into(), b"done");
+    a.conn.close(0u32.into(), b"done");
+    wait_for("the size policy to forget every client", || {
+        qa_state(&server)["attached_clients"].as_u64().unwrap() == 0
+    })
+    .await;
+    endpoint.close().await;
+    server.shutdown().await;
+}

@@ -85,6 +85,16 @@ const EVENT_BUFFER: usize = 256;
 const CONTROL_QUEUE_BYTES: usize = 8 * 1024 * 1024;
 /// Requests a connection may have running at once. One more closes it.
 const MAX_INFLIGHT: usize = 64;
+
+/// A `detach_pane` is answered after this long at most, whatever the size
+/// policy or the session manager is doing.
+const DETACH_ANSWER_BOUND: Duration = Duration::from_millis(250);
+
+/// Marks of detached panes one connection keeps before it drops the old ones,
+/// and how many requests old a mark must be to go: no attach that can still be
+/// running is that old (at most [`MAX_INFLIGHT`] requests run at once).
+const MARKS_KEPT: usize = 256;
+const MARK_AGE: u64 = 128;
 /// A connection whose Control queue stays (half) full this long without
 /// draining at least [`MIN_DRAIN_RATE`] is closed. The client reconnects and
 /// gets the state again.
@@ -1146,6 +1156,19 @@ impl RpcV2 {
         self.sm.set_size_owner(PaneId(pane), info);
     }
 
+    /// Harness: hold the size policy lock for `ms`, as a busy pane would.
+    #[cfg(feature = "qa-tools")]
+    pub(crate) fn hold_sizes(self: &Arc<Self>, ms: u64) {
+        let rpc = self.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _held = lock(&rpc.sizes);
+            let _ = tx.send(());
+            std::thread::sleep(Duration::from_millis(ms));
+        });
+        let _ = rx.recv();
+    }
+
     /// Harness: how many (pane, client) pairs the size policy holds as
     /// attached. Zero when no client is connected.
     #[cfg(feature = "qa-tools")]
@@ -1978,14 +2001,26 @@ impl Session {
                 let n = self.req_n.fetch_add(1, Ordering::SeqCst);
                 work.spawn(async move {
                     let _guard = guard;
-                    let r = tokio::task::spawn_blocking(move || {
-                        from_value::<DetachPaneParams>(params).map_err(bad).and_then(|p| {
-                            s.detach(n, p.pane_id);
+                    let r = match from_value::<DetachPaneParams>(params).map_err(bad) {
+                        Ok(p) => {
+                            // The stream stops now. The size policy follows on
+                            // the blocking pool, and the answer waits for it
+                            // only for DETACH_ANSWER_BOUND: a lock a busy pane
+                            // holds must not keep a detach unanswered.
+                            s.detach_stream(n, p.pane_id);
+                            let s2 = s.clone();
+                            let job = tokio::task::spawn_blocking(move || s2.sync_attached(p.pane_id));
+                            if tokio::time::timeout(DETACH_ANSWER_BOUND, job).await.is_err() {
+                                warn!(
+                                    "rpc2: detach_pane {} of client {} answered before the size \
+                                     policy was updated (a lock is busy)",
+                                    p.pane_id, s.client_id
+                                );
+                            }
                             to_value(&OkResult { ok: true }).map_err(bad)
-                        })
-                    })
-                    .await
-                    .unwrap_or_else(|e| Err((error_code::INTERNAL, format!("handler failed: {e}"))));
+                        }
+                        Err(e) => Err(e),
+                    };
                     out.push(control_frame(&reply(r)));
                 });
             }
@@ -2160,35 +2195,62 @@ impl Session {
             ))
             .abort_handle();
             ops.map.insert(p.pane_id, (n, Some(handle)));
-            // Still under `ops`: the close of the connection sets `closed`
-            // under the same lock and only then forgets the client's panes,
-            // so a stream that was started is always noted.
-            self.rpc.note_attached(self.client_id, p.pane_id);
         }
         // The request is done: its slot is free before the answer goes out.
         drop(guard);
+        self.sync_attached(p.pane_id);
         to_value(&OkResult { ok: true }).map_err(|e| (error_code::INTERNAL, e.to_string()))
     }
 
     /// `detach_pane`: stop the stream of a pane. See [`Self::attach`] for `n`.
-    fn detach(self: &Arc<Self>, n: u64, pane: Uuid) {
-        let known = self.rpc.sm.pane_info(PaneId(pane)).is_some();
-        {
-            let mut ops = lock(&self.ops);
-            if ops.map.get(&pane).is_some_and(|(seq, _)| *seq > n) {
+    /// This is the part that answers: it only touches the `ops` map and takes
+    /// no other lock, so it cannot wait on a pane, a snapshot or the session
+    /// manager. [`Self::sync_attached`] follows.
+    fn detach_stream(&self, n: u64, pane: Uuid) {
+        let mut ops = lock(&self.ops);
+        if ops.map.get(&pane).is_some_and(|(seq, _)| *seq > n) {
+            return;
+        }
+        if let Some((_, Some(old))) = ops.map.remove(&pane) {
+            old.abort();
+        }
+        if ops.closed {
+            return;
+        }
+        // A mark for an attach of this pane that is still on its way (one with
+        // a lower number does nothing). Marks older than any request that can
+        // still be running are dropped, so a peer cannot grow the map.
+        ops.map.insert(pane, (n, None));
+        if ops.map.len() > MARKS_KEPT {
+            ops.map.retain(|_, (seq, h)| h.is_some() || *seq + MARK_AGE > n);
+        }
+    }
+
+    /// Make the size policy's view of this client on `pane` match the stream
+    /// state: attached when a stream runs, detached when none does or the
+    /// connection is ending. It runs outside `ops` (it takes the size policy,
+    /// the clients table and the session manager locks), so it re-reads the
+    /// state afterwards and goes again if it changed: the last caller always
+    /// applies the final state, and a client that closed in between is left
+    /// as no one's.
+    fn sync_attached(&self, pane: Uuid) {
+        loop {
+            let want = {
+                let ops = lock(&self.ops);
+                !ops.closed && matches!(ops.map.get(&pane), Some((_, Some(_))))
+            };
+            if want {
+                self.rpc.note_attached(self.client_id, pane);
+            } else {
+                self.rpc.note_detached(self.client_id, pane);
+            }
+            let now = {
+                let ops = lock(&self.ops);
+                !ops.closed && matches!(ops.map.get(&pane), Some((_, Some(_))))
+            };
+            if now == want {
                 return;
             }
-            if let Some((_, Some(old))) = ops.map.remove(&pane) {
-                old.abort();
-            }
-            // A mark for an attach of this pane that is still on its way. Only
-            // for panes that exist, so a peer cannot grow the map.
-            if known && !ops.closed {
-                ops.map.insert(pane, (n, None));
-            }
-            // Under `ops`, like `note_attached`, so a newer attach is never
-            // noted before this older detach.
-            self.rpc.note_detached(self.client_id, pane);
         }
     }
 }
@@ -2736,7 +2798,10 @@ async fn write_live(
     match tokio::time::timeout(NO_PROGRESS, write_output_frame(send, bytes)).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(_)) => Err(StreamEnd::Gone),
-        Err(_) => Err(StreamEnd::Catchup { next: 0, stalled: true }),
+        Err(_) => {
+            info!("rpc2: a live write made no progress for {NO_PROGRESS:?}, catching up");
+            Err(StreamEnd::Catchup { next: 0, stalled: true })
+        }
     }
 }
 
@@ -2770,6 +2835,11 @@ async fn stream_from(
                 target == pane.0
             };
             if forced || (lag_check && shared.total().saturating_sub(next) > lag_limit) {
+                info!(
+                    "rpc2: pane {pane} catch-up ({}): reader at {next}, log at {}, limit {lag_limit}",
+                    if forced { "forced by the harness" } else { "reader is over the lag limit" },
+                    shared.total()
+                );
                 return StreamEnd::Catchup { next, stalled: false };
             }
         }
@@ -2819,7 +2889,11 @@ async fn stream_from(
                 if catchup {
                     // The log moved past the offset while a snapshot was built
                     // or the reader stalled: take a newer snapshot.
-                    debug!("rpc2: pane {pane} reader at {next} is behind the log ({first}), catching up");
+                    info!(
+                        "rpc2: pane {pane} catch-up (log lost the reader's offset): reader at \
+                         {next}, log starts at {first}, ends at {}",
+                        shared.total()
+                    );
                     return StreamEnd::Catchup { next, stalled: false };
                 }
                 warn!("rpc2: pane {pane} reader at {next} is behind the log (starts at {first})");
