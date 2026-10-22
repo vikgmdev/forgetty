@@ -676,6 +676,14 @@ impl TestServer {
         }
     }
 
+    /// Mock only: what new connections do after the `Welcome`.
+    pub fn set_die_mode(&self, mode: u8) {
+        match &self.inner {
+            Inner::Mock { server, .. } => server.set_die_mode(mode),
+            Inner::Real(_) => panic!("set_die_mode is a mock server option"),
+        }
+    }
+
     pub fn pause_handshakes(&self, paused: bool) {
         match &self.inner {
             Inner::Mock { server, .. } => server.pause_handshakes(paused),

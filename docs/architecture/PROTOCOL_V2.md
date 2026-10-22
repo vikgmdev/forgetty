@@ -307,6 +307,16 @@ known gap, section 12).
 
 - On connection loss: redial at once, then backoff 100 ms, 250 ms, 500 ms, 1 s,
   2 s, then every 2 s. Never give up while the app is in the foreground.
+- **Redial budget.** A session that lasted 5 s or more is redialed at once and
+  ends the streak of short sessions. Every other redial takes a token from a
+  bucket of 10 that refills at one token per 3 s. While a token is left, a link
+  the server answered (a response, an event or pane data, but not a `Failure`
+  to a `session_init` request) or that finished `session_init` is redialed at
+  once, and a silent link climbs the ladder above. With no token the client
+  sleeps the ladder step for the current streak of short sessions, heard or
+  not. `reconnect_now()` and `network_changed()` can cut a sleep and never add
+  a token. So a server that answers once and closes gets about 10 dials, then
+  one every 2 s plus the refill (about 35 in 30 s), not a tight loop.
 - **Redial speed.** Once the server is reachable again the client is connected
   within 1 s. A QUIC connect that gets no answer repeats its first packet only
   after a timeout that starts near 1 s and doubles, so one long attempt would

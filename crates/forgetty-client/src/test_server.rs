@@ -11,7 +11,7 @@
 //! real iroh endpoints.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -32,6 +32,13 @@ use crate::config::transport_config;
 
 /// Application close code used by [`TestServer::drop_connections`].
 pub const TEST_DROP_CODE: u32 = 0x10;
+/// `die_mode`: answer nothing and close 30 ms after the `Welcome`.
+pub const DIE_SILENT: u8 = 1;
+/// `die_mode`: push one event, then close 30 ms after the `Welcome`.
+pub const DIE_AFTER_EVENT: u8 = 2;
+/// `die_mode`: answer the first request with a `Failure`, then close 30 ms
+/// after the `Welcome` (a server that refuses the session).
+pub const DIE_AFTER_FAILURE: u8 = 3;
 
 /// Test server configuration.
 #[derive(Debug, Clone)]
@@ -60,9 +67,10 @@ pub struct TestServerConfig {
     pub own_runtime: bool,
     /// Wait this long between reading `Hello` and answering `Welcome`.
     pub handshake_delay: Duration,
-    /// Answer no request: close the connection 30 ms after the `Welcome`.
-    /// The client's dial succeeds and the link dies before it resumes.
-    pub die_at_once: bool,
+    /// What a connection does after the `Welcome` (see [`DIE_SILENT`] and
+    /// [`DIE_AFTER_EVENT`]); [`TestServer::set_die_mode`] changes it while
+    /// the server runs. 0 serves normally.
+    pub die_mode: u8,
 }
 
 impl Default for TestServerConfig {
@@ -85,7 +93,7 @@ impl Default for TestServerConfig {
             panes: Vec::new(),
             own_runtime: false,
             handshake_delay: Duration::ZERO,
-            die_at_once: false,
+            die_mode: 0,
         }
     }
 }
@@ -257,6 +265,7 @@ struct State {
     attaches: Mutex<Vec<(Uuid, Option<u64>)>>,
     handshakes: AtomicU64,
     paused: AtomicBool,
+    die_mode: AtomicU8,
     layout: Mutex<Layout>,
 }
 
@@ -329,6 +338,7 @@ impl TestServer {
             attaches: Mutex::new(Vec::new()),
             handshakes: AtomicU64::new(0),
             paused: AtomicBool::new(false),
+            die_mode: AtomicU8::new(cfg.die_mode),
             layout: Mutex::new(Layout {
                 workspace: "Default".into(),
                 tabs: Vec::new(),
@@ -512,6 +522,11 @@ impl TestServer {
         self.state.handshakes.load(Ordering::SeqCst)
     }
 
+    /// Change what new connections do after the `Welcome` (`die_mode`).
+    pub fn set_die_mode(&self, mode: u8) {
+        self.state.die_mode.store(mode, Ordering::SeqCst);
+    }
+
     /// While paused, new connections stall before the handshake reply, as if
     /// the server were unreachable. Existing connections are not touched.
     pub fn pause_handshakes(&self, paused: bool) {
@@ -667,7 +682,30 @@ async fn handle_rpc(conn: Connection, state: Arc<State>) {
         return;
     }
     state.handshakes.fetch_add(1, Ordering::SeqCst);
-    if state.cfg.die_at_once {
+    let die = state.die_mode.load(Ordering::SeqCst);
+    if die != 0 {
+        if die == DIE_AFTER_EVENT {
+            let event = ControlMsg::Event {
+                seq: 1,
+                event: ServerEvent::PaneClosed { pane_id: Uuid::nil() },
+            };
+            let _ = write_msg(&mut send, &event).await;
+        }
+        if die == DIE_AFTER_FAILURE {
+            let first = tokio::time::timeout(
+                Duration::from_millis(300),
+                read_msg::<_, ControlMsg>(&mut recv),
+            )
+            .await;
+            if let Ok(Ok(Some(ControlMsg::Request { id, .. }))) = first {
+                let failure = ControlMsg::Failure {
+                    id,
+                    code: error_code::BAD_REQUEST.into(),
+                    message: "test: session refused".into(),
+                };
+                let _ = write_msg(&mut send, &failure).await;
+            }
+        }
         tokio::time::sleep(Duration::from_millis(30)).await;
         conn.close(TEST_DROP_CODE.into(), b"test die at once");
         return;

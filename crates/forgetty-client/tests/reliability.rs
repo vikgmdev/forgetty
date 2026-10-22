@@ -620,7 +620,7 @@ async fn a_reconnect_request_during_a_dial_cuts_the_backoff_after_a_link_that_di
     }
     let server = TestServer::start(TestServerConfig {
         handshake_delay: Duration::from_millis(400),
-        die_at_once: true,
+        die_mode: forgetty_client::test_server::DIE_SILENT,
         ..Default::default()
     })
     .await;
@@ -665,6 +665,140 @@ async fn a_reconnect_request_during_a_dial_cuts_the_backoff_after_a_link_that_di
     wait_dial(&mut at, Duration::from_millis(1200));
     let seventh = sixth.elapsed();
     println!("dials at {at:?}, the seventh {seventh:?} after the sixth");
+    h.close().await;
+    server.shutdown().await;
+}
+
+/// Dial times seen by a mock server. One dial can show as two handshakes a few
+/// ms apart (the client races its paths), so a handshake less than 15 ms after
+/// the last one is the same dial. Dials of a dying link are 30 ms or more apart.
+struct Dials {
+    seen: u64,
+    t0: Instant,
+    at: Vec<Duration>,
+}
+
+impl Dials {
+    fn new() -> Self {
+        Dials { seen: 0, t0: Instant::now(), at: Vec::new() }
+    }
+    fn poll(&mut self, server: &TestServer) {
+        let n = server.handshakes();
+        if n > self.seen {
+            self.seen = n;
+            let now = self.t0.elapsed();
+            if self.at.last().is_none_or(|l| now - *l >= Duration::from_millis(15)) {
+                self.at.push(now);
+            }
+        }
+    }
+    fn longest_gap(&self) -> Duration {
+        self.at.windows(2).map(|w| w[1] - w[0]).max().unwrap_or_default()
+    }
+}
+
+async fn client_with_events(server: &TestServer, name: &str) -> ClientHandle {
+    let key = SecretKey::generate(&mut rand::rng());
+    let info = ClientInfo::new(Uuid::new_v4(), ClientKind::Cli, name, "0");
+    let h = Client::spawn(server.addr(), key, info, ClientOptions::default()).await.unwrap();
+    // The session subscribes to events first. Without a link this returns at once.
+    let _ = h.events().await.unwrap();
+    h
+}
+
+/// A server that refuses the session (a `Failure` to `subscribe_events`) and
+/// closes is not healthy: the client climbs the ladder, it does not redial in a
+/// tight loop. Over 10 s the ladder allows about 9 dials.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_server_that_refuses_the_session_is_not_redialed_in_a_loop() {
+    if common::real_only() {
+        return;
+    }
+    let server = TestServer::start(TestServerConfig {
+        die_mode: forgetty_client::test_server::DIE_AFTER_FAILURE,
+        ..Default::default()
+    })
+    .await;
+    let h = client_with_events(&server, "refused").await;
+    let mut d = Dials::new();
+    while d.t0.elapsed() < Duration::from_secs(10) {
+        d.poll(&server);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    println!("refused: dials at {:?}", d.at);
+    assert!(d.at.len() >= 4, "too few dials: {:?}", d.at);
+    assert!(d.at.len() < 14, "a loop: {} dials in 10 s", d.at.len());
+    h.close().await;
+    server.shutdown().await;
+}
+
+/// A server that pushes one event and closes: the link was heard, so the
+/// redial is at once, but only while the bucket (10, one more per 3 s) has
+/// tokens. With none left the client sleeps the ladder cap (2 s), and the
+/// bucket refills during that sleep. In 30 s that is about 10 (burst) + 10
+/// (refill) + 15 (sleeps) = 35 dials, against thousands for a tight loop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_server_that_answers_once_and_closes_is_redialed_at_a_bounded_rate() {
+    if common::real_only() {
+        return;
+    }
+    let server = TestServer::start(TestServerConfig {
+        die_mode: forgetty_client::test_server::DIE_AFTER_EVENT,
+        ..Default::default()
+    })
+    .await;
+    let h = client_with_events(&server, "answers-once").await;
+    let mut d = Dials::new();
+    while d.t0.elapsed() < Duration::from_secs(30) {
+        d.poll(&server);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    println!("answers once: {} dials, longest gap {:?}", d.at.len(), d.longest_gap());
+    assert!(d.at.len() >= 10, "the burst did not happen: {:?}", d.at);
+    assert!(d.at.len() < 42, "{} dials in 30 s", d.at.len());
+    assert!(d.longest_gap() >= Duration::from_millis(1800), "gap {:?}", d.longest_gap());
+    h.close().await;
+    server.shutdown().await;
+}
+
+/// A link that lived 5 s or more is redialed at once even when the bucket is
+/// empty, and does not take a token.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_link_that_lived_long_is_redialed_at_once_with_an_empty_bucket() {
+    if common::real_only() {
+        return;
+    }
+    let server = TestServer::start(TestServerConfig {
+        die_mode: forgetty_client::test_server::DIE_AFTER_EVENT,
+        ..Default::default()
+    })
+    .await;
+    let h = client_with_events(&server, "long-link").await;
+    let mut d = Dials::new();
+    // Empty the bucket: after the burst a dial comes a ladder step (2 s) late.
+    while d.longest_gap() < Duration::from_millis(1800) {
+        assert!(d.t0.elapsed() < Duration::from_secs(20), "bucket never ran out: {:?}", d.at);
+        d.poll(&server);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    // A normal server now. Its link stays up for more than 5 s.
+    server.set_die_mode(0);
+    let up = Instant::now();
+    while !h.state().is_connected() {
+        assert!(up.elapsed() < Duration::from_secs(5), "never connected");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(5500)).await;
+    assert!(h.state().is_connected());
+    let before = server.handshakes();
+    let t = Instant::now();
+    server.drop_connections();
+    while server.handshakes() <= before || !h.state().is_connected() {
+        assert!(t.elapsed() < Duration::from_millis(1000), "no instant redial after a long link");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    println!("long link: redialed after {:?}", t.elapsed());
+    assert!(t.elapsed() < Duration::from_millis(500));
     h.close().await;
     server.shutdown().await;
 }

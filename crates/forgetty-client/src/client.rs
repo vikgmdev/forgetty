@@ -48,8 +48,23 @@ const HIGH_PRIORITY: i32 = 100;
 /// frames.
 const INPUT_CHUNK: usize = 16 * 1024;
 
-/// A session shorter than this counts as a failed dial for backoff purposes.
-const MIN_HEALTHY_SESSION: Duration = Duration::from_secs(1);
+/// Redial rules after a session ends (PROTOCOL_V2 section 9).
+///
+/// A session that lasted at least `MIN_HEALTHY_SESSION` is redialed at once,
+/// costs no token, and ends the streak of short sessions. Every other redial
+/// takes a token from a bucket of `REDIAL_BURST` that refills at one token per
+/// `REDIAL_REFILL`:
+/// - While a token is left, a link the server answered (`heard`, or resumed)
+///   is redialed at once and a silent one climbs the backoff ladder.
+/// - With no token, the client sleeps the ladder step for the current streak
+///   of short sessions, heard or not.
+///
+/// `reconnect_now` and `network_changed` can cut a sleep but never add a
+/// token. So a server that answers once and closes cannot make the client
+/// redial in a tight loop, and a single drop is still redialed at once.
+const MIN_HEALTHY_SESSION: Duration = Duration::from_secs(5);
+const REDIAL_BURST: f64 = 10.0;
+const REDIAL_REFILL: Duration = Duration::from_secs(3);
 
 // ---------------------------------------------------------------------------
 // Public item types
@@ -146,6 +161,9 @@ pub(crate) struct Link {
     conn: Connection,
     /// Set when `session_init` finished: events and panes are resumed.
     resumed: AtomicBool,
+    /// Ids of the requests `session_init` sent. A `Failure` to one of them
+    /// means the server refuses the session: it does not count as heard.
+    init_ids: Mutex<HashSet<u64>>,
     /// When the last `Pong` arrived (session start counts as one).
     last_pong: Mutex<Instant>,
     /// Highest `Ping` nonce answered so far.
@@ -733,7 +751,7 @@ impl ClientHandle {
         let link = shared.link_tx.borrow().clone();
         if let Some(link) = link {
             let deadline = tokio::time::Instant::now() + shared.opts.request_timeout;
-            match ensure_subscribed(shared, &link, deadline).await {
+            match ensure_subscribed(shared, &link, deadline, false).await {
                 Ok(()) => {}
                 // The supervisor subscribes again on the next connection.
                 Err(ClientError::ConnectionLost | ClientError::Timeout) => {}
@@ -1111,13 +1129,18 @@ async fn wait_link(
 }
 
 /// Queue a request on `link`. The receiver resolves with the answer.
-fn send_request(
+/// `init`: the request belongs to `session_init` (see `Link::init_ids`).
+fn send_request_as(
     shared: &Shared,
     link: &Link,
     method: &str,
     params: Value,
+    init: bool,
 ) -> Result<(u64, oneshot::Receiver<Pending>), ClientError> {
     let id = shared.next_req.fetch_add(1, Ordering::Relaxed);
+    if init {
+        lock(&link.init_ids).insert(id);
+    }
     let frame = encode_msg(&ControlMsg::Request { id, method: method.to_string(), params })?;
     let (tx, rx) = oneshot::channel();
     lock(&link.pending).insert(id, tx);
@@ -1151,7 +1174,18 @@ async fn call(
     params: Value,
     deadline: tokio::time::Instant,
 ) -> Result<Value, ClientError> {
-    let (id, rx) = send_request(shared, link, method, params)?;
+    call_as(shared, link, method, params, deadline, false).await
+}
+
+async fn call_as(
+    shared: &Shared,
+    link: &Link,
+    method: &str,
+    params: Value,
+    deadline: tokio::time::Instant,
+    init: bool,
+) -> Result<Value, ClientError> {
+    let (id, rx) = send_request_as(shared, link, method, params, init)?;
     await_answer(link, id, rx, deadline).await
 }
 
@@ -1159,12 +1193,13 @@ async fn ensure_subscribed(
     shared: &Shared,
     link: &Arc<Link>,
     deadline: tokio::time::Instant,
+    init: bool,
 ) -> Result<(), ClientError> {
     let mut guard = shared.events_gen.lock().await;
     if *guard == link.gen {
         return Ok(());
     }
-    call(shared, link, method::SUBSCRIBE_EVENTS, Value::Map(vec![]), deadline).await?;
+    call_as(shared, link, method::SUBSCRIBE_EVENTS, Value::Map(vec![]), deadline, init).await?;
     *guard = link.gen;
     Ok(())
 }
@@ -1236,6 +1271,10 @@ async fn supervise(shared: Arc<Shared>) {
     let mut final_state = ConnectionState::Closed;
     let mut attempt_no = 0u64;
     let mut bind_failures = 0u32;
+    // Redial bucket and the streak of short sessions (see MIN_HEALTHY_SESSION).
+    let mut tokens = REDIAL_BURST;
+    let mut refilled = Instant::now();
+    let mut streak = 0usize;
     loop {
         if *shutdown.borrow() {
             break;
@@ -1320,15 +1359,33 @@ async fn supervise(shared: Arc<Shared>) {
                 shared
                     .state_tx
                     .send_replace(ConnectionState::Reconnecting { since: Instant::now() });
-                // A session that resumed (or lasted) counts as healthy, so the
-                // redial is immediate. One that died before it resumed backs
-                // off, so a broken server is not hammered.
-                if resumed || started.elapsed() >= MIN_HEALTHY_SESSION {
+                let lasted = started.elapsed();
+                if lasted >= MIN_HEALTHY_SESSION {
+                    // A long session: redial at once, no token, streak over.
                     failures = 0;
+                    streak = 0;
                     None
                 } else {
-                    failures += 1;
-                    Some(backoff(failures - 1))
+                    let now = Instant::now();
+                    tokens = (tokens
+                        + now.duration_since(refilled).as_secs_f64() / REDIAL_REFILL.as_secs_f64())
+                    .min(REDIAL_BURST);
+                    refilled = now;
+                    let step = backoff(streak);
+                    streak += 1;
+                    // `resumed` here also covers a link the server answered.
+                    if resumed {
+                        failures = 0;
+                    } else {
+                        failures += 1;
+                    }
+                    if tokens >= 1.0 {
+                        tokens -= 1.0;
+                        if resumed { None } else { Some(backoff(failures - 1)) }
+                    } else {
+                        info!("client: redial bucket empty, sleeping {step:?}");
+                        Some(step)
+                    }
                 }
             }
             Ok(Err(DialError::Fatal(reason))) => {
@@ -1636,6 +1693,7 @@ async fn run_session(
         caps,
         conn: conn.clone(),
         resumed: AtomicBool::new(false),
+        init_ids: Mutex::new(HashSet::new()),
         last_pong: Mutex::new(Instant::now()),
         pong_tx: watch::channel(0).0,
     });
@@ -1771,7 +1829,10 @@ async fn control_reader(link: Arc<Link>, shared: Arc<Shared>, mut recv: RecvStre
                     link.complete(id, Ok(result))
                 }
                 Ok(ControlMsg::Failure { id, code, message }) => {
-                    shared.heard_gen.store(link.gen, Ordering::SeqCst);
+                    // A refusal of `session_init` is not a healthy server.
+                    if !lock(&link.init_ids).contains(&id) {
+                        shared.heard_gen.store(link.gen, Ordering::SeqCst);
+                    }
                     link.complete(id, Err(ClientError::Server { code, message }))
                 }
                 Ok(ControlMsg::Event { seq, event }) => {
@@ -1820,7 +1881,7 @@ async fn session_init(
     let first = link.gen == 1;
 
     if shared.events_wanted.load(Ordering::SeqCst) {
-        match ensure_subscribed(&shared, &link, deadline).await {
+        match ensure_subscribed(&shared, &link, deadline, true).await {
             Ok(()) => {
                 if !first {
                     let _ = shared.events_tx.send(EventItem::Resynced);
@@ -1838,7 +1899,9 @@ async fn session_init(
             continue;
         }
         let sent = attach_params(&link, &pane)
-            .and_then(|params| send_request(&shared, &link, method::ATTACH_PANE, params));
+            .and_then(|params| {
+                send_request_as(&shared, &link, method::ATTACH_PANE, params, true)
+            });
         match sent {
             Ok((id, rx)) => inflight.push((pane, guard, id, rx)),
             Err(e) => return TaskEnd::Lost(format!("attach_pane: {e}")),
