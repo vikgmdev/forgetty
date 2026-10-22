@@ -58,6 +58,8 @@ pub struct TestServerConfig {
     /// Run the server on its own 2-thread runtime, so [`TestServer::freeze`]
     /// can stop it without closing anything.
     pub own_runtime: bool,
+    /// Wait this long between reading `Hello` and answering `Welcome`.
+    pub handshake_delay: Duration,
 }
 
 impl Default for TestServerConfig {
@@ -79,6 +81,7 @@ impl Default for TestServerConfig {
             secret_key: None,
             panes: Vec::new(),
             own_runtime: false,
+            handshake_delay: Duration::ZERO,
         }
     }
 }
@@ -631,6 +634,9 @@ async fn handle_rpc(conn: Connection, state: Arc<State>) {
     };
     while state.paused.load(Ordering::SeqCst) {
         tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    if !state.cfg.handshake_delay.is_zero() {
+        tokio::time::sleep(state.cfg.handshake_delay).await;
     }
     if hello.proto_major != PROTO_MAJOR {
         let reply = HandshakeReply::Error(ErrorMsg {

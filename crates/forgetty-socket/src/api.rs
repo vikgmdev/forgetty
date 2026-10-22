@@ -342,10 +342,8 @@ static METHODS: &[MethodSpec] = &[
         "The server builds the screen from the pane's byte log on request. It needs no \
          attached client. `trim` removes trailing spaces and blank lines. `last_lines` \
          keeps the last N lines (past the screen height they come from history). The work \
-         has a 1 s limit. If it runs out, the server retries once from the last reset or \
-         home-and-erase in the final quarter of the log, when that is a safe place to start. \
-         If that runs out too, or there is no safe place, `incomplete` is true and `text` is \
-         the screen as far as it got, which may be older than the current screen. The limit \
+         has a 1 s limit. If it runs out, `incomplete` is true and `text` is the screen as far \
+         as it got, which may be older than the current screen. The limit \
          covers the work only. Captures wait in line first (first come, first served, one \
          capture at a time, and never ahead of a snapshot build) and that wait is not counted.",
         t::CaptureParams,

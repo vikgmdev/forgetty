@@ -537,3 +537,38 @@ async fn network_changed_with_a_stuck_socket_connects_on_a_fresh_endpoint() {
     h.close().await;
     server.shutdown().await;
 }
+
+/// Windows and Android call `reconnect_now` every 400 ms while Reconnecting.
+/// Without a link it must only cut a backoff sleep: a handshake that takes
+/// longer than the interval (a relay path) must not be aborted again and again.
+/// Here the handshake takes 700 ms and the call comes every 100 ms.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reconnect_now_every_100_ms_does_not_abort_a_slow_handshake() {
+    if common::real_only() {
+        return; // the delay is a mock server option
+    }
+    let server = TestServer::start(TestServerConfig {
+        handshake_delay: Duration::from_millis(700),
+        ..Default::default()
+    })
+    .await;
+    let key = SecretKey::generate(&mut rand::rng());
+    let info = ClientInfo::new(Uuid::new_v4(), ClientKind::Cli, "slow-handshake", "0");
+    let h = Client::spawn(server.addr(), key, info, ClientOptions::default()).await.unwrap();
+    let t0 = Instant::now();
+    while !h.state().is_connected() {
+        h.reconnect_now();
+        assert!(
+            t0.elapsed() < Duration::from_secs(4),
+            "never connected, state {:?}, handshakes {}",
+            h.state(),
+            server.handshakes()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let took = t0.elapsed();
+    println!("reconnect_now every 100 ms, 700 ms handshake: Connected after {took:?}");
+    assert!(took < Duration::from_millis(2500), "Connected after {took:?}");
+    h.close().await;
+    server.shutdown().await;
+}

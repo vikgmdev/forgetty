@@ -407,8 +407,7 @@ pub struct CaptureResult {
     /// Visible screen as text, one line per row.
     pub text: String,
     /// `true` when the 1 s work limit ran out before the whole byte log was
-    /// read, even after a retry from a safe clear in the final quarter of
-    /// the log (or when there is none). `text` is the screen as far as it got and may be older than
+    /// read. `text` is the screen as far as it got and may be older than
     /// the current screen. Always present.
     pub incomplete: bool,
 }

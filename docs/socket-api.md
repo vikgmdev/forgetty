@@ -714,7 +714,7 @@ Kind: call. Protocol v2: yes.
 
 Read the visible screen of a pane as text.
 
-The server builds the screen from the pane's byte log on request. It needs no attached client. `trim` removes trailing spaces and blank lines. `last_lines` keeps the last N lines (past the screen height they come from history). The work has a 1 s limit. If it runs out, the server retries once from the last reset or home-and-erase in the final quarter of the log, when that is a safe place to start. If that runs out too, or there is no safe place, `incomplete` is true and `text` is the screen as far as it got, which may be older than the current screen. The limit covers the work only. Captures wait in line first (first come, first served, one capture at a time, and never ahead of a snapshot build) and that wait is not counted.
+The server builds the screen from the pane's byte log on request. It needs no attached client. `trim` removes trailing spaces and blank lines. `last_lines` keeps the last N lines (past the screen height they come from history). The work has a 1 s limit. If it runs out, `incomplete` is true and `text` is the screen as far as it got, which may be older than the current screen. The limit covers the work only. Captures wait in line first (first come, first served, one capture at a time, and never ahead of a snapshot build) and that wait is not counted.
 
 Kind: call. Protocol v2: yes.
 
@@ -730,7 +730,7 @@ Kind: call. Protocol v2: yes.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `incomplete` | boolean | yes | `true` when the 1 s work limit ran out before the whole byte log was read, even after a retry from a safe clear in the final quarter of the log (or when there is none). `text` is the screen as far as it got and may be older than the current screen. Always present. |
+| `incomplete` | boolean | yes | `true` when the 1 s work limit ran out before the whole byte log was read. `text` is the screen as far as it got and may be older than the current screen. Always present. |
 | `text` | string | yes | Visible screen as text, one line per row. |
 
 **Example**

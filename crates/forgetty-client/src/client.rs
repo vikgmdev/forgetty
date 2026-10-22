@@ -21,11 +21,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use forgetty_proto::{
-    cap, close_code, decode_msg, encode_input_frame, encode_input_frame_flags, encode_msg, error_code, from_value, method,
-    read_frame_into, read_msg, read_output_frame, to_value, write_frame, write_msg,
-    AttachPaneParams, ControlMsg, DetachPaneParams, HandshakeReply, Hello, PaneStreamHeader,
-    ResizePaneParams, ServerEvent, Value, Welcome, ALPN_RPC, INPUT_BUFFER_CAP, INPUT_FLAG_AUTO,
-    NETWORK_CHANGE_PONG_MS, PING_INTERVAL_MS, PONG_DEAD_AFTER_MS, PROTO_MAJOR,
+    cap, close_code, decode_msg, encode_input_frame, encode_input_frame_flags, encode_msg,
+    error_code, from_value, method, read_frame_into, read_msg, read_output_frame, to_value,
+    write_frame, write_msg, AttachPaneParams, ControlMsg, DetachPaneParams, HandshakeReply, Hello,
+    PaneStreamHeader, ResizePaneParams, ServerEvent, Value, Welcome, ALPN_RPC, INPUT_BUFFER_CAP,
+    INPUT_FLAG_AUTO, NETWORK_CHANGE_PONG_MS, PING_INTERVAL_MS, PONG_DEAD_AFTER_MS, PROTO_MAJOR,
     RECONNECT_BACKOFF_MS,
 };
 use iroh::endpoint::{Connection, ConnectionError, RecvStream, SendStream};
@@ -226,7 +226,12 @@ impl InFrame {
     /// Wire payload for a link that did (`flags`) or did not negotiate `input_flags`.
     fn payload(&self, flags: bool) -> Vec<u8> {
         if flags {
-            encode_input_frame_flags(self.pane, self.seq, if self.auto { INPUT_FLAG_AUTO } else { 0 }, &self.bytes)
+            encode_input_frame_flags(
+                self.pane,
+                self.seq,
+                if self.auto { INPUT_FLAG_AUTO } else { 0 },
+                &self.bytes,
+            )
         } else {
             encode_input_frame(self.pane, self.seq, &self.bytes)
         }
@@ -251,7 +256,9 @@ fn cut_point(b: &[u8], max: usize) -> usize {
             None => true,
             Some(b'[') => !seq[2..].iter().any(|c| (0x40..=0x7e).contains(c)),
             Some(b'O') => seq.len() < 3,
-            Some(b']') => !seq[2..].iter().any(|&c| c == 0x07) && !seq.windows(2).any(|w| w == [0x1b, b'\\']),
+            Some(b']') => {
+                !seq[2..].contains(&0x07) && !seq.windows(2).any(|w| w == [0x1b, b'\\'])
+            }
             Some(_) => false,
         };
         if open && i > 0 {
@@ -411,6 +418,10 @@ pub(crate) struct Shared {
     /// Wakes the supervisor: cancels an in-flight dial or a backoff sleep and
     /// dials at once.
     kick: Notify,
+    /// Wakes the supervisor from a backoff sleep only. Never aborts a dial in
+    /// flight: an app that calls `reconnect_now` every few hundred ms while
+    /// Reconnecting must not cancel a handshake that takes longer than that.
+    wake_backoff: Notify,
     /// Set by `network_changed`: the next redial skips the backoff and the
     /// failure count starts again at 0.
     reset_backoff: AtomicBool,
@@ -516,6 +527,7 @@ impl Client {
             input_lost: AtomicU64::new(0),
             shutdown_tx,
             kick: Notify::new(),
+            wake_backoff: Notify::new(),
             reset_backoff: AtomicBool::new(false),
             ping_now: Notify::new(),
             next_nonce: AtomicU64::new(1),
@@ -587,8 +599,16 @@ impl Shared {
             // Bind only when every clone is gone. The aborted tasks drop theirs
             // as soon as the runtime runs them.
             let waited = Instant::now();
+            let mut shutdown = self.shutdown_tx.subscribe();
             while weak.strong_count() > 0 && waited.elapsed() < CLONES_WAIT {
-                tokio::time::sleep(Duration::from_millis(5)).await;
+                if *shutdown.borrow() {
+                    return Err("shutting down".into());
+                }
+                tokio::select! {
+                    () = tokio::time::sleep(Duration::from_millis(5)) => {}
+                    // `close()` must not wait for this.
+                    _ = shutdown.changed() => return Err("shutting down".into()),
+                }
             }
             let left = weak.strong_count();
             if left > 0 {
@@ -719,7 +739,13 @@ impl ClientHandle {
         let pane = Arc::new(PaneShared {
             id: pane_id,
             tx,
-            state: Mutex::new(PaneState { gen: 0, offset: None, stream: 0, reset_stream: 0, replay_end: None }),
+            state: Mutex::new(PaneState {
+                gen: 0,
+                offset: None,
+                stream: 0,
+                reset_stream: 0,
+                replay_end: None,
+            }),
             attached_gen: Arc::new(tokio::sync::Mutex::new(0)),
         });
         {
@@ -758,7 +784,12 @@ impl ClientHandle {
     ///
     /// A buffer is accepted whole or refused whole (`InputBufferFull`), never in part. It is cut
     /// into frames only at character and escape sequence boundaries.
-    pub async fn send_input_flagged(&self, pane_id: Uuid, bytes: &[u8], auto: bool) -> Result<(), ClientError> {
+    pub async fn send_input_flagged(
+        &self,
+        pane_id: Uuid,
+        bytes: &[u8],
+        auto: bool,
+    ) -> Result<(), ClientError> {
         let shared = self.shared();
         if self.state() == ConnectionState::Closed {
             return Err(ClientError::Closed);
@@ -780,7 +811,12 @@ impl ClientHandle {
                         let seq = st.next_seq;
                         st.next_seq += 1;
                         st.bytes += piece.len();
-                        st.frames.push_back(InFrame { seq, pane: pane_id, bytes: Arc::from(*piece), auto });
+                        st.frames.push_back(InFrame {
+                            seq,
+                            pane: pane_id,
+                            bytes: Arc::from(*piece),
+                            auto,
+                        });
                     }
                     drop(st);
                     shared.input.ready.notify_one();
@@ -835,9 +871,17 @@ impl ClientHandle {
         // Probe first: `network_change` can take long on a dead network, and
         // must not delay the Ping.
         let link = shared.link_tx.borrow().clone();
-        if let Some(ep) = shared.ep() {
-            let probe = tokio::spawn(async move { ep.ep.network_change().await });
-            shared.holders.add(probe.abort_handle());
+        {
+            // The probe holds a clone of the endpoint. Register it under the
+            // endpoint lock: a replace takes the endpoint under the same lock
+            // and aborts the holders after, so either the probe is registered
+            // before the take (and aborted) or there is no endpoint and no
+            // probe. No holder appears after the abort.
+            let slot = lock(&shared.endpoint);
+            if let Some(ep) = slot.clone() {
+                let probe = tokio::spawn(async move { ep.ep.network_change().await });
+                shared.holders.add(probe.abort_handle());
+            }
         }
         // iroh may need many seconds to rebind a socket that went away. If
         // there is no connection after a second, dial with a fresh endpoint.
@@ -898,13 +942,16 @@ impl ClientHandle {
         }
     }
 
-    /// Drop the current connection (if any) and redial at once.
+    /// With a live connection: drop it and redial at once. Without one: cut
+    /// the backoff sleep short and dial now. A dial or probe burst already in
+    /// flight is left alone (call it as often as you like while Reconnecting;
+    /// [`ClientHandle::network_changed`] is what aborts a dial).
     pub fn reconnect_now(&self) {
         let shared = self.shared();
         let link = shared.link_tx.borrow().clone();
         match link {
             Some(link) => link.conn.close(close_code::OK.into(), b"reconnect"),
-            None => shared.kick.notify_one(),
+            None => shared.wake_backoff.notify_one(),
         }
     }
 
@@ -1167,6 +1214,7 @@ async fn supervise(shared: Arc<Shared>) {
                     shared.replace_for.store(u64::MAX, Ordering::SeqCst);
                     bind_failures = 0;
                 }
+                Err(_) if *shutdown.borrow() => continue, // the loop top ends it
                 Err(e) => {
                     bind_failures += 1;
                     // The first failure, then every 20th: a bind that keeps
@@ -1277,6 +1325,7 @@ async fn supervise(shared: Arc<Shared>) {
                 _ = tokio::time::sleep(delay) => {}
                 _ = shutdown.changed() => {}
                 _ = shared.kick.notified() => {}
+                _ = shared.wake_backoff.notified() => {}
             }
         }
     }
@@ -1565,7 +1614,12 @@ async fn run_session(
     let mut tasks: JoinSet<TaskEnd> = JoinSet::new();
     tasks.spawn(control_writer(send, control_rx));
     tasks.spawn(control_reader(link.clone(), shared.clone(), recv));
-    tasks.spawn(input_writer(shared.clone(), input_send, resumed_rx, link.has_cap(cap::INPUT_FLAGS)));
+    tasks.spawn(input_writer(
+        shared.clone(),
+        input_send,
+        resumed_rx,
+        link.has_cap(cap::INPUT_FLAGS),
+    ));
     tasks.spawn(accept_streams(conn.clone(), stream_tx));
     tasks.spawn(session_init(shared.clone(), link.clone(), resumed_tx));
     tasks.spawn(liveness(shared.clone(), link.clone()));

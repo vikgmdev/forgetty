@@ -31,8 +31,7 @@ pub const CAPTURE_DEADLINE: Duration = Duration::from_secs(1);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Captured {
     pub text: String,
-    /// The [`CAPTURE_DEADLINE`] ran out before the whole ring was read (also
-    /// after the retry from the last clear). The screen may be older than the
+    /// The [`CAPTURE_DEADLINE`] ran out before the whole ring was read . The screen may be older than the
     /// current one.
     pub incomplete: bool,
 }
@@ -109,45 +108,32 @@ fn first_persistent_change(buf: &[u8]) -> Option<usize> {
     None
 }
 
-/// The cut rules, shared by the first pass and the retry. The last RIS (it
-/// resets every mode, so nothing before it matters) or the last `ESC[H ESC[2J`
-/// at or after `min_pos`. The `ESC[H ESC[2J` counts only when no scroll region,
-/// charset or auto-wrap change comes before it in the ring (a clear does not
-/// reset those, so text after it would land differently). Neither counts when
-/// an alternate screen switch follows it: leaving the alternate screen shows
-/// the older primary screen. A bare `ESC[2J` is never a cut. `None` if no cut
-/// is valid.
-fn find_cut(
-    replay: &[u8],
-    min_pos: usize,
-    first_change: &std::cell::OnceCell<Option<usize>>,
-) -> Option<usize> {
-    let tail = &replay[min_pos.min(replay.len())..];
-    let last = |pat: &[u8]| tail.windows(pat.len()).rposition(|w| w == pat).map(|i| i + min_pos);
-    let ris = last(RIS);
-    // The scan of the whole ring is done once, for both passes.
-    let clear = last(HOME_CLEAR).filter(|&m| {
-        let first = *first_change.get_or_init(|| first_persistent_change(replay));
-        first.is_none_or(|c| c >= m)
-    });
-    let mark = ris.max(clear)?;
-    let after = &replay[mark..];
-    let switched = ALT_SCREEN_PREFIXES.iter().any(|p| after.windows(p.len()).any(|w| w == *p));
-    (!switched).then_some(mark)
-}
-
 /// Where parsing starts. The whole ring when scrollback is wanted (history
-/// before a clear is part of it). Otherwise the last valid cut ([`find_cut`]),
-/// or the ring start.
-fn parse_start(
-    replay: &[u8],
-    want_scrollback: bool,
-    first_change: &std::cell::OnceCell<Option<usize>>,
-) -> usize {
+/// before a clear is part of it). Otherwise the last valid cut, or the ring
+/// start.
+///
+/// A cut is the last RIS (it resets every mode, so nothing before it matters)
+/// or the last `ESC[H ESC[2J`. The `ESC[H ESC[2J` counts only when no scroll
+/// region, charset or auto-wrap change comes before it in the ring (a clear
+/// does not reset those, so text after it would land differently). Neither
+/// counts when an alternate screen switch follows it: leaving the alternate
+/// screen shows the older primary screen. A bare `ESC[2J` is never a cut.
+fn parse_start(replay: &[u8], want_scrollback: bool) -> usize {
     if want_scrollback {
         return 0;
     }
-    find_cut(replay, 0, first_change).unwrap_or(0)
+    let last = |pat: &[u8]| replay.windows(pat.len()).rposition(|w| w == pat);
+    let ris = last(RIS);
+    let clear =
+        last(HOME_CLEAR).filter(|&m| first_persistent_change(replay).is_none_or(|c| c >= m));
+    let Some(mark) = ris.max(clear) else { return 0 };
+    let after = &replay[mark..];
+    let switched = ALT_SCREEN_PREFIXES.iter().any(|p| after.windows(p.len()).any(|w| w == *p));
+    if switched {
+        0
+    } else {
+        mark
+    }
 }
 
 /// Render `replay` (raw PTY bytes) on a `rows` x `cols` screen and return its
@@ -193,30 +179,14 @@ pub fn capture_with_deadline(
     let begun = Instant::now();
     // The deadline is for the whole call. Feeding stops early enough to read
     // the screen and free the terminal: that work grows with the cell count
-    // ([`read_reserve`]). The first pass gets three quarters of the feed time,
-    // so the retry has time left.
+    // ([`read_reserve`]). If feeding runs out, the screen so far is returned and
+    // marked incomplete. The parse already starts at the last valid cut, so
+    // there is no cheaper place to start again.
     let feed_end = begun + deadline.saturating_sub(read_reserve(rows, cols));
-    let first_until = begun + (feed_end - begun).mul_f32(FIRST_PASS_SHARE);
-    let first_change = std::cell::OnceCell::new();
-    let start = parse_start(replay, scrollback > 0, &first_change);
-    let (mut term, mut ran_out) = feed(replay, start, rows, cols, scrollback, first_until);
-    if ran_out && scrollback == 0 {
-        // Retry once from a valid cut ([`find_cut`]) in the final quarter of
-        // the ring, with what is left of the budget: the screen is rebuilt
-        // from there, which is cheap when the ring is full of redraws. No cut,
-        // or no time left to build another terminal: the first pass stays and
-        // the result is incomplete. Not with scrollback: the history before the
-        // clear is what was asked for.
-        let from = replay.len() - replay.len() / 4;
-        if let Some(cut) = find_cut(replay, from, &first_change) {
-            if Instant::now() + terminal_cost(rows, cols) < feed_end {
-                drop(term);
-                let (t, out) = feed(replay, cut, rows, cols, 0, feed_end);
-                term = t;
-                ran_out = out;
-            }
-        }
-    }
+    let start = parse_start(replay, scrollback > 0);
+    let (term, ran_out) = feed(replay, start, rows, cols, scrollback, feed_end);
+    let mut ran_out = ran_out;
+    let mut term = term;
     let mut lines: Vec<String> = Vec::with_capacity(rows);
     if scrollback > 0 {
         ran_out |= collect_with_history(&mut term, rows, &mut lines, begun + deadline);
@@ -238,9 +208,6 @@ pub fn capture_with_deadline(
     Captured { text: lines.join("\n"), incomplete: ran_out }
 }
 
-/// Share of the feed time for the first pass over the ring.
-const FIRST_PASS_SHARE: f32 = 0.75;
-
 /// Time kept back from the deadline for reading the screen and dropping the
 /// terminal, which grow with the cell count (about 0.1 ms per 1000 cells in a
 /// release build, more in a debug build), and for the last chunk fed.
@@ -249,13 +216,7 @@ fn read_reserve(rows: usize, cols: usize) -> Duration {
         + Duration::from_millis(5)
 }
 
-/// What building a terminal of this size costs, about.
-fn terminal_cost(rows: usize, cols: usize) -> Duration {
-    Duration::from_nanos((rows.saturating_mul(cols) as u64).saturating_mul(NEW_NS_PER_CELL))
-}
-
 const READ_NS_PER_CELL: u64 = 250;
-const NEW_NS_PER_CELL: u64 = 100;
 
 /// Feed `replay[start..]` to a new terminal until `until`. True if it ran out.
 fn feed(
@@ -343,7 +304,7 @@ mod tests {
 
     /// For tests of what the screen shows, not of the deadline.
     fn start_of(replay: &[u8], want_scrollback: bool) -> usize {
-        parse_start(replay, want_scrollback, &std::cell::OnceCell::new())
+        parse_start(replay, want_scrollback)
     }
 
     /// Bound on a whole capture. Generous by default, the deadline plus 150 ms
@@ -527,27 +488,21 @@ mod tests {
         assert_eq!(&lines[20..], ["l1", "l2", "l3", "Progress: 50%"]);
     }
 
+    /// The parse starts at the last valid cut, so a ring of redraws that ends
+    /// in a home-and-erase is cheap and complete: nothing is left to retry.
     #[test]
-    fn a_timeout_retries_from_the_last_clear_in_the_final_quarter() {
+    fn a_ring_of_redraws_ending_in_a_valid_clear_is_complete() {
         let _heavy = heavy();
-        // Redraw spam that cannot be read in time, then a clear and a short
-        // screen at the end. The retry starts at that clear and finishes.
         let mut ring = b"\x1b[2J".repeat(1_500_000);
-        let marker_at = ring.len();
         ring.extend_from_slice(b"\x1b[H\x1b[2J");
         for i in 0..2000 {
             ring.extend_from_slice(format!("tail line {i}\r\n").as_bytes());
         }
-        assert!(marker_at >= ring.len() / 4 * 3);
         let t0 = Instant::now();
         let got = capture(&ring, 1000, 1000, true, Some(3));
         assert!(t0.elapsed() < bound(), "took {:?}", t0.elapsed());
-        assert!(!got.incomplete, "the retry should finish");
+        assert!(!got.incomplete);
         assert!(got.text.contains("tail line 1999"), "{:?}", got.text);
-        // No clear in the final quarter: no retry, still incomplete.
-        let mut spam = b"\x1b[2J".repeat(1_500_000);
-        spam.extend_from_slice(&vec![b'x'; 4_000_000]);
-        assert!(capture(&spam, 1000, 1000, true, None).incomplete);
     }
 
     #[test]
@@ -577,10 +532,10 @@ mod tests {
     }
 
     /// htop or vim redraws past the first pass, then the user quits. The
-    /// screen is the shell's, which the redraws do not show: no retry from a
-    /// clear inside the alternate screen.
+    /// screen is the shell's, which the redraws do not show: no cut at a clear
+    /// inside the alternate screen, so the parse runs out and says so.
     #[test]
-    fn the_retry_does_not_cut_inside_an_alternate_screen_that_was_left() {
+    fn no_cut_inside_an_alternate_screen_that_was_left() {
         let _heavy = heavy();
         let mut ring = b"$ before vim\r\n\x1b[?1049h".to_vec();
         ring.extend_from_slice(&b"\x1b[H\x1b[2Jredraw".repeat(900_000));
@@ -589,14 +544,14 @@ mod tests {
         let got = capture(&ring, 1000, 1000, true, None);
         let took = t0.elapsed();
         assert!(took < bound(), "took {took:?}");
-        assert!(got.incomplete, "a blank retry screen must not pass for complete");
-        assert!(find_cut(&ring, ring.len() - ring.len() / 4, &Default::default()).is_none());
+        assert!(got.incomplete);
+        assert_eq!(start_of(&ring, false), 0);
     }
 
     /// apt: a scroll region set before the redraws. A clear does not reset it,
-    /// so a retry from the clear would lay the text out differently.
+    /// so a parse from the clear would lay the text out differently.
     #[test]
-    fn the_retry_does_not_cut_after_a_scroll_region_change() {
+    fn no_cut_after_a_scroll_region_change() {
         let _heavy = heavy();
         let mut ring = b"\x1b[1;999r".to_vec();
         ring.extend_from_slice(&b"\x1b[H\x1b[2Jredraw".repeat(900_000));
@@ -606,10 +561,10 @@ mod tests {
         let took = t0.elapsed();
         assert!(took < bound(), "took {took:?}");
         assert!(got.incomplete);
-        assert!(find_cut(&ring, ring.len() - ring.len() / 4, &Default::default()).is_none());
+        assert_eq!(start_of(&ring, false), 0);
         // RIS resets the region: a cut at it is fine.
         ring.extend_from_slice(b"\x1bcfresh");
-        assert!(find_cut(&ring, ring.len() - ring.len() / 4, &Default::default()).is_some());
+        assert_eq!(start_of(&ring, false), ring.len() - "\x1bcfresh".len());
     }
 
     #[test]
