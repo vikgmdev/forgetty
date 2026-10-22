@@ -903,3 +903,165 @@ async fn network_changed_every_200_ms_does_not_set_the_dial_rate() {
     h.close().await;
     server.shutdown().await;
 }
+
+/// Poll until the client starts a new dial, up to `limit`. Returns how long it
+/// took. (The server sees a dial a while later: the handshake takes time.)
+async fn next_dial_start(h: &ClientHandle, since: u64, limit: Duration) -> Option<Duration> {
+    let t = Instant::now();
+    while t.elapsed() < limit {
+        if h.dial_starts_for_tests() > since {
+            return Some(t.elapsed());
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    None
+}
+
+/// Empty the bucket of a client on the answer-once server, and return just
+/// after its twelfth dial: the next one is a ladder step (2 s) away.
+async fn client_with_an_empty_bucket(server: &TestServer, name: &str) -> (ClientHandle, Dials) {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
+    let h = client_with_events(server, name).await;
+    let mut d = Dials::new();
+    while d.at.len() < 12 {
+        assert!(d.t0.elapsed() < Duration::from_secs(40), "bucket never ran out: {:?}", d.at);
+        d.poll(server);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    (h, d)
+}
+
+/// The first dial after a real change of the network does not wait for the
+/// empty-bucket sleep (the apps call `network_changed` at network up). A
+/// repeat of the event before it neither cuts the sleep nor uses up the one
+/// cut a real change may have.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_real_network_change_cuts_the_empty_bucket_sleep_and_a_repeat_does_not() {
+    if common::real_only() {
+        return;
+    }
+    let server = TestServer::start(TestServerConfig {
+        die_mode: forgetty_client::test_server::DIE_AFTER_EVENT,
+        ..Default::default()
+    })
+    .await;
+    let (h, d) = client_with_an_empty_bucket(&server, "net-real").await;
+    let t0 = Instant::now();
+    // The same event again: the network is the one it was.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let n0 = h.dial_starts_for_tests();
+    h.network_changed().await;
+    let early = next_dial_start(&h, n0, Duration::from_millis(600)).await;
+    assert!(early.is_none(), "a repeat of the event cut the empty-bucket sleep: {:?}", d.at);
+    // A real change: one dial at once, with no token.
+    h.set_network_for_tests(Some(1));
+    let before_call = t0.elapsed();
+    let n0 = h.dial_starts_for_tests();
+    h.network_changed().await;
+    let cut = next_dial_start(&h, n0, Duration::from_millis(400)).await;
+    println!("empty bucket, real change at {before_call:?} after the dial: next dial {cut:?}");
+    assert!(cut.is_some(), "no dial after a real network change: {:?}", d.at);
+    assert!(before_call < Duration::from_millis(1200), "the test started late: {before_call:?}");
+    h.close().await;
+    server.shutdown().await;
+}
+
+/// One immediate dial per 3 s: a second real change inside that time does not
+/// cut the sleep, one after it does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_network_changes_cut_the_sleep_at_most_once_per_three_seconds() {
+    if common::real_only() {
+        return;
+    }
+    let server = TestServer::start(TestServerConfig {
+        die_mode: forgetty_client::test_server::DIE_AFTER_EVENT,
+        ..Default::default()
+    })
+    .await;
+    let (h, d) = client_with_an_empty_bucket(&server, "net-rate").await;
+    // The first real change cuts the sleep.
+    h.set_network_for_tests(Some(1));
+    let n0 = h.dial_starts_for_tests();
+    h.network_changed().await;
+    let first = next_dial_start(&h, n0, Duration::from_millis(400)).await;
+    assert!(first.is_some(), "no dial after the first real change: {:?}", d.at);
+    let g = Instant::now();
+    // Back in a sleep (the dial and the short session came first): a second
+    // real change, less than 3 s after the first. No cut.
+    wait_sleeping(&h, Duration::from_secs(5)).await;
+    assert!(g.elapsed() < Duration::from_millis(2500), "the test started late: {:?}", g.elapsed());
+    h.set_network_for_tests(Some(2));
+    let n1 = h.dial_starts_for_tests();
+    h.network_changed().await;
+    let soon = next_dial_start(&h, n1, Duration::from_millis(600)).await;
+    assert!(soon.is_none(), "a second real change inside 3 s cut the sleep: {:?}", g.elapsed());
+    // The sleep ends by its timer. Wait for a sleep that starts 3 s or more
+    // after the first cut, and change the network again early in it.
+    let into_sleep = loop {
+        assert!(g.elapsed() < Duration::from_secs(15), "no sleep began 3 s after the first cut");
+        match h.sleeping_for_tests() {
+            Some(age) if age < Duration::from_millis(300) && g.elapsed() >= Duration::from_secs(3) => {
+                break age;
+            }
+            _ => tokio::time::sleep(Duration::from_millis(5)).await,
+        }
+    };
+    h.set_network_for_tests(Some(3));
+    let n2 = h.dial_starts_for_tests();
+    h.network_changed().await;
+    let cut = next_dial_start(&h, n2, Duration::from_millis(500)).await;
+    println!("third change {into_sleep:?} into a sleep, {:?} after the first cut: {cut:?}", g.elapsed());
+    assert!(cut.is_some(), "a real change 3 s after the last cut did not cut the sleep");
+    h.close().await;
+    server.shutdown().await;
+}
+
+async fn wait_sleeping(h: &ClientHandle, limit: Duration) {
+    let t = Instant::now();
+    while h.sleeping_for_tests().is_none() {
+        assert!(t.elapsed() < limit, "the client never went to sleep");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
+/// The crash-loop bound holds when the network seems to change all the time:
+/// the answer-once server, a new network every 200 ms. The bound without
+/// `network_changed` is 25 dials in 30 s. Each 3 s may add one more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_network_that_changes_every_200_ms_still_has_a_bounded_dial_rate() {
+    if common::real_only() {
+        return;
+    }
+    let server = TestServer::start(TestServerConfig {
+        die_mode: forgetty_client::test_server::DIE_AFTER_EVENT,
+        ..Default::default()
+    })
+    .await;
+    let h = client_with_events(&server, "net-storm").await;
+    let flapper = {
+        let h = h.clone();
+        tokio::spawn(async move {
+            let mut n = 1u64;
+            loop {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                n += 1;
+                h.set_network_for_tests(Some(n));
+                h.network_changed().await;
+            }
+        })
+    };
+    let mut d = Dials::new();
+    while d.t0.elapsed() < Duration::from_secs(30) {
+        d.poll(&server);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    flapper.abort();
+    println!("network storm: {} dials, longest gap {:?}", d.at.len(), d.longest_gap());
+    // 25 for the bucket and the ladder, 10 for one cut per 3 s, 2 of margin.
+    assert!(d.at.len() <= 37, "{} dials in 30 s", d.at.len());
+    h.close().await;
+    server.shutdown().await;
+}

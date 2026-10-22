@@ -384,6 +384,41 @@ async fn an_honest_far_behind_phone_gets_every_snapshot_in_under_300_ms() {
     server.shutdown().await;
 }
 
+/// `attach_pane` and `detach_pane` run as tasks of their own. A detach that
+/// the server took after an attach, but finished before it, still wins: the
+/// attach finds a newer request for its pane and opens no stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_detach_that_finishes_first_still_wins_over_the_attach_before_it() {
+    if !real_only() {
+        return;
+    }
+    let server = TestServer::start(TestServerConfig::default()).await;
+    let pane = server.add_script_pane("exec yes 0123456789abcdef");
+    let (endpoint, conn, mut ctl) =
+        raw_peer(&server, &["resume", "snapshot_catchup"], Uuid::new_v4()).await;
+    server.socket_call("qa_attach_delay", json!({"ms": 300})).unwrap();
+    attach_raw(&mut ctl, 1, pane).await;
+    let params = to_value(&json!({"pane_id": pane.to_string()})).unwrap();
+    let msg = ControlMsg::Request { id: 2, method: "detach_pane".into(), params };
+    write_msg(&mut ctl, &msg).await.unwrap();
+    // The attach is still in its lookups when the detach is done.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let stream = tokio::time::timeout(Duration::from_millis(500), conn.accept_uni()).await;
+    server.socket_call("qa_attach_delay", json!({"ms": 0})).unwrap();
+    assert!(stream.is_err(), "a stream opened after the detach");
+    // A later attach works.
+    attach_raw(&mut ctl, 3, pane).await;
+    let mut s = tokio::time::timeout(Duration::from_secs(5), conn.accept_uni())
+        .await
+        .expect("no stream for the later attach")
+        .unwrap();
+    let h: forgetty_client::proto::PaneStreamHeader = read_msg(&mut s).await.unwrap().unwrap();
+    assert_eq!(h.pane_id, pane);
+    drop(conn);
+    endpoint.close().await;
+    server.shutdown().await;
+}
+
 /// A bad frame on the input stream closes the connection (0x02), so the
 /// client redials instead of typing into a dead stream.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

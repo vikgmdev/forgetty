@@ -21,6 +21,8 @@ const ITEM_OVERHEAD: usize = 64;
 
 struct State {
     items: VecDeque<Vec<u8>>,
+    /// When each item was queued (same order as `items`).
+    stamps: VecDeque<std::time::Instant>,
     /// Payload bytes plus [`ITEM_OVERHEAD`] per item.
     bytes: usize,
     /// Items taken off the front so far. The item pushed as number `n` sits at
@@ -57,6 +59,7 @@ impl ControlQueue {
         ControlQueue {
             state: Mutex::new(State {
                 items: VecDeque::new(),
+                stamps: VecDeque::new(),
                 bytes: 0,
                 popped: 0,
                 pushed: 0,
@@ -80,6 +83,7 @@ impl ControlQueue {
             let mut st = self.lock();
             st.bytes += frame.len() + ITEM_OVERHEAD;
             st.items.push_back(frame);
+            st.stamps.push_back(std::time::Instant::now());
             st.pushed += 1;
         }
         self.changed.notify_waiters();
@@ -103,6 +107,7 @@ impl ControlQueue {
                 None => {
                     st.bytes += frame.len() + ITEM_OVERHEAD;
                     st.items.push_back(frame);
+                    st.stamps.push_back(std::time::Instant::now());
                     st.layout = Some(st.pushed);
                     st.pushed += 1;
                 }
@@ -113,6 +118,11 @@ impl ControlQueue {
 
     /// Take the next frame, waiting for one. `None` once the queue is closed.
     pub async fn pop(&self) -> Option<Vec<u8>> {
+        self.pop_timed().await.map(|(frame, _)| frame)
+    }
+
+    /// [`Self::pop`], with how long the frame sat in the queue.
+    pub async fn pop_timed(&self) -> Option<(Vec<u8>, std::time::Duration)> {
         loop {
             let notified = self.changed.notified();
             tokio::pin!(notified);
@@ -120,6 +130,7 @@ impl ControlQueue {
             {
                 let mut st = self.lock();
                 if let Some(frame) = st.items.pop_front() {
+                    let waited = st.stamps.pop_front().map_or(std::time::Duration::ZERO, |t| t.elapsed());
                     st.bytes -= frame.len() + ITEM_OVERHEAD;
                     if st.layout.is_some_and(|n| n == st.popped) {
                         st.layout = None;
@@ -127,7 +138,7 @@ impl ControlQueue {
                     st.popped += 1;
                     drop(st);
                     self.changed.notify_waiters();
-                    return Some(frame);
+                    return Some((frame, waited));
                 }
                 if self.closed.load(Ordering::SeqCst) {
                     return None;

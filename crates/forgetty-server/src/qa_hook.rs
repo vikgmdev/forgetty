@@ -131,6 +131,11 @@ fn handle(
             rpc.qa.hold_acks.store(hold, Ordering::SeqCst);
             ok(json!({ "ok": true }))
         }
+        "qa_attach_delay" => {
+            let ms = req.params.get("ms").and_then(|v| v.as_u64()).unwrap_or(0);
+            rpc.qa.attach_delay_ms.store(ms, Ordering::SeqCst);
+            ok(json!({ "ok": true }))
+        }
         "qa_stopping" => {
             let on = req.params.get("on").and_then(|v| v.as_bool()).unwrap_or(true);
             if on {

@@ -106,6 +106,16 @@ shapes as the local socket API (`docs/socket-api.md`): `list_tabs`,
 `get_pane_info`, `resize_pane`, `send_sigint`, `list_devices`, `revoke_device`.
 Base64 fields of the JSON socket API are raw `bin` in v2.
 
+The server handles requests of one connection side by side, not one after the
+other: the control loop only hands each request to a task, and every method
+answers when it is done (`Ping` as well). Methods that take locks the program
+output also takes (`subscribe_events`, `attach_pane`, `detach_pane`) run on the
+blocking pool, so a lock wait does not stall the
+runtime thread that reads the control stream. The order of `attach_pane` and
+`detach_pane` for one pane still holds: each request has a number in the order
+it was read, and one with a lower number than the last one applied to the
+pane does nothing.
+
 New methods:
 
 | Method | Params | Result |
@@ -316,9 +326,14 @@ known gap, section 12).
   sleeps the ladder step for the current streak of short sessions, heard or
   not, and the bucket does not refill during that sleep. `reconnect_now()` and
   `network_changed()` never add a token. `reconnect_now()` cuts a normal backoff
-  but not the empty-bucket sleep, and `network_changed()` cuts that sleep at
-  most once per 3 s. So a server that answers once and closes gets about 10
-  dials, then one every 2 s (about 25 in 30 s), not a tight loop.
+  but not the empty-bucket sleep. A `network_changed()` that follows a real
+  change of the network (the local address the system picks for a route to
+  the internet, over IPv4 or IPv6, is another one than at the last call) earns
+  one immediate dial with no token, and that dial cuts the empty-bucket sleep.
+  It happens at most once per 3 s. A repeat of the same event cuts nothing and
+  does not use up that one cut. So a server that answers once and closes gets
+  about 10 dials, then one every 2 s (about 25 in 30 s), not a tight loop, and
+  a network that seems to change all the time adds at most one dial per 3 s.
 - **Redial speed.** Once the server is reachable again the client is connected
   within 1 s. A QUIC connect that gets no answer repeats its first packet only
   after a timeout that starts near 1 s and doubles, so one long attempt would
@@ -342,8 +357,11 @@ known gap, section 12).
 - On `close()` the client waits up to 300 ms for the server to ack the input it
   sent (a `Ping` asks for the ack), then closes. What is not acked by then is
   dropped.
-- After `Welcome`: re-send `subscribe_events`, then `attach_pane` with the last
-  known offset for every pane the UI shows.
+- After `Welcome`: send `subscribe_events` and then `attach_pane` with the last
+  known offset for every pane the UI shows, all at once, without waiting for an
+  answer in between. The server takes them in that order and answers each as it
+  is done. A request of the app goes out on the same stream at once and does
+  not wait for any of them.
 - The UI shows "reconnecting" after 1 s without a connection, never sooner.
 - Initial state is `Reconnecting { since }`. States: `Connected`,
   `Reconnecting { since }`, `Failed(reason)`, `Closed` (after `close()`).

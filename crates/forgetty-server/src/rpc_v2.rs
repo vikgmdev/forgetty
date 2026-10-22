@@ -313,6 +313,9 @@ pub struct Qa {
     pub dedup_drops: AtomicU64,
     /// While set, `Pong.input_acked` stays 0.
     pub hold_acks: AtomicBool,
+    /// Milliseconds an `attach_pane` sleeps in its pane lookups (stands for a
+    /// lock a busy pane holds).
+    pub attach_delay_ms: AtomicU64,
     /// Completed handshakes.
     pub handshakes: AtomicU64,
     /// Handshakes answered `server_stopping`.
@@ -403,6 +406,7 @@ impl RpcV2 {
             qa: Qa {
                 dedup_drops: AtomicU64::new(0),
                 hold_acks: AtomicBool::new(false),
+                attach_delay_ms: AtomicU64::new(0),
                 handshakes: AtomicU64::new(0),
                 stopping_refusals: AtomicU64::new(0),
                 paused,
@@ -1546,6 +1550,28 @@ struct Session {
     epoch: Uuid,
     /// Capabilities both sides listed.
     caps: Vec<String>,
+    /// Number of the next request, in the order the control reader gave them.
+    req_n: AtomicU64,
+    /// The pane streams of this connection, by the request that made them.
+    ops: Mutex<PaneOps>,
+    /// A `subscribe_events` was taken. The receiver goes to the control loop
+    /// through `events_tx`.
+    subscribed: AtomicBool,
+    events_tx: mpsc::UnboundedSender<EventRx>,
+    events_rx: Mutex<Option<mpsc::UnboundedReceiver<EventRx>>>,
+}
+
+type EventRx = broadcast::Receiver<(u64, ServerEvent)>;
+
+/// The pane streams of one connection. `attach_pane` and `detach_pane` run
+/// as tasks of their own, so two of them for one pane can finish out of
+/// order. Each entry keeps the number of the request that made it, and a
+/// request with a lower number than the entry does nothing.
+#[derive(Default)]
+struct PaneOps {
+    /// The connection is ending: no stream starts any more.
+    closed: bool,
+    map: HashMap<Uuid, (u64, Option<AbortHandle>)>,
 }
 
 impl Session {
@@ -1556,6 +1582,7 @@ impl Session {
         caps: Vec<String>,
         born: std::time::Instant,
     ) -> Self {
+        let (events_tx, events_rx) = mpsc::unbounded_channel();
         Session {
             rpc,
             conn,
@@ -1564,6 +1591,11 @@ impl Session {
             client_id: hello.client_id,
             epoch: hello.input_epoch,
             caps,
+            req_n: AtomicU64::new(0),
+            ops: Mutex::new(PaneOps::default()),
+            subscribed: AtomicBool::new(false),
+            events_tx,
+            events_rx: Mutex::new(Some(events_rx)),
         }
     }
 
@@ -1584,13 +1616,26 @@ impl Session {
 
         // Control writer.
         {
-            let q = queue.clone();
+            let (q, s) = (queue.clone(), session.clone());
             core.spawn(async move {
-                while let Some(frame) = q.pop().await {
+                while let Some((frame, queued)) = q.pop_timed().await {
+                    let t = std::time::Instant::now();
                     if write_frame(&mut send, &frame).await.is_err() {
                         break;
                     }
                     q.wrote(frame.len());
+                    // A frame that waited or took long to write holds up
+                    // every answer behind it on this stream.
+                    if queued > Duration::from_millis(20) || t.elapsed() > Duration::from_millis(20) {
+                        tl!(
+                            s.born,
+                            s.name,
+                            "control frame of {} bytes waited {} ms in the queue, written in {} ms",
+                            frame.len(),
+                            queued.as_millis(),
+                            t.elapsed().as_millis()
+                        );
+                    }
                 }
             });
         }
@@ -1618,12 +1663,15 @@ impl Session {
         // server any further (QUIC flow control, no buffering here).
         let (req_tx, mut req_rx) = mpsc::channel::<ControlMsg>(1);
         {
-            let (q, conn) = (queue.clone(), session.conn.clone());
+            let (q, conn, s) = (queue.clone(), session.conn.clone(), session.clone());
             core.spawn(async move {
                 loop {
                     q.wait_below_committed(CONTROL_QUEUE_BYTES).await;
                     match read_msg::<_, ControlMsg>(&mut recv).await {
                         Ok(Some(m)) => {
+                            if let ControlMsg::Request { id, .. } = &m {
+                                tl!(s.born, s.name, "request id {id} read from the control stream");
+                            }
                             if req_tx.send(m).await.is_err() {
                                 break;
                             }
@@ -1707,9 +1755,11 @@ impl Session {
             });
         }
 
-        // Control request loop.
-        let mut streams: HashMap<Uuid, AbortHandle> = HashMap::new();
+        // Control request loop. It only hands requests on: every method runs
+        // as a task of its own and answers when it is done, so a slow one
+        // (a lock held by a busy pane, a snapshot build) holds up no other.
         let mut events: Option<broadcast::Receiver<(u64, ServerEvent)>> = None;
+        let mut events_in = lock(&session.events_rx).take().expect("events channel taken once");
         // A lag resync is owed at this time (coalesced, section 7).
         let mut resync_due: Option<tokio::time::Instant> = None;
         let mut last_resync: Option<tokio::time::Instant> = None;
@@ -1729,16 +1779,14 @@ impl Session {
                             queue.push(control_frame(&ControlMsg::Pong { nonce, input_acked }));
                         }
                         ControlMsg::Request { id, method: m, params } => {
-                            if !session.on_request(
-                                id, m, params, &queue, &inflight, &mut work, &mut streams,
-                                &mut events,
-                            ) {
+                            if !session.on_request(id, m, params, &queue, &inflight, &mut work) {
                                 break;
                             }
                         }
                         _ => {} // Response, Failure, Event, Pong come from the server only.
                     }
                 }
+                Some(rx) = events_in.recv() => events = Some(rx),
                 // Take the next event only while the queue is under half its
                 // budget. A client that does not read leaves the events in the
                 // hub's ring (it lags, it does not grow a queue).
@@ -1785,8 +1833,14 @@ impl Session {
             }
         }
         queue.close();
-        for (_, h) in streams {
-            h.abort();
+        {
+            let mut ops = lock(&session.ops);
+            ops.closed = true;
+            for (_, (_, h)) in ops.map.drain() {
+                if let Some(h) = h {
+                    h.abort();
+                }
+            }
         }
         work.abort_all();
         core.abort_all();
@@ -1840,8 +1894,6 @@ impl Session {
         out: &Arc<ControlQueue>,
         inflight: &Arc<AtomicUsize>,
         work: &mut JoinSet<()>,
-        streams: &mut HashMap<Uuid, AbortHandle>,
-        events: &mut Option<broadcast::Receiver<(u64, ServerEvent)>>,
     ) -> bool {
         let bad = |e: forgetty_proto::FrameError| (error_code::BAD_REQUEST, e.to_string());
         let reply = move |r: Result<Value, (&'static str, String)>| match r {
@@ -1853,36 +1905,81 @@ impl Session {
         let m_log = forgetty_core::sanitize::untrusted_max(&m, 64);
         tl!(born, name, "request {m_log:?} id {id} received");
         match m.as_str() {
+            // The methods below take locks the program output also takes. A
+            // lock wait on a runtime thread would hold up every task that
+            // thread has queued, the control reader among them, so each runs
+            // on the blocking pool and answers when it is done.
             method::SUBSCRIBE_EVENTS => {
-                let seq = if events.is_some() {
-                    self.rpc.current_seq()
-                } else {
-                    let (seq, rx) = self.rpc.subscribe();
-                    *events = Some(rx);
-                    seq
-                };
-                out.push(control_frame(&reply(to_value(&SubscribeResult { seq }).map_err(bad))));
-                tl!(born, name, "subscribe_events id {id} answered");
+                let Some(guard) = self.begin_task(inflight, out, 0) else { return false };
+                let (s, out) = (self.clone(), out.clone());
+                work.spawn(async move {
+                    let _guard = guard;
+                    let t = std::time::Instant::now();
+                    let s2 = s.clone();
+                    let seq = tokio::task::spawn_blocking(move || {
+                        if s2.subscribed.swap(true, Ordering::SeqCst) {
+                            s2.rpc.current_seq()
+                        } else {
+                            let (seq, rx) = s2.rpc.subscribe();
+                            let _ = s2.events_tx.send(rx);
+                            seq
+                        }
+                    })
+                    .await;
+                    let r = match seq {
+                        Ok(seq) => to_value(&SubscribeResult { seq }).map_err(bad),
+                        Err(e) => Err((error_code::INTERNAL, format!("handler failed: {e}"))),
+                    };
+                    out.push(control_frame(&reply(r)));
+                    tl!(
+                        born,
+                        s.name,
+                        "subscribe_events id {id} answered, handled in {} us",
+                        t.elapsed().as_micros()
+                    );
+                });
             }
             method::ATTACH_PANE => {
                 // An attach counts as a request in flight until its stream is
                 // open (a stream may start with a snapshot build).
                 let Some(guard) = self.begin_task(inflight, out, 0) else { return false };
-                let r = from_value::<AttachPaneParams>(params)
-                    .map_err(bad)
-                    .and_then(|p| self.attach(p, work, streams, guard));
-                out.push(control_frame(&reply(r)));
-                tl!(born, name, "attach_pane id {id} answered");
+                let (s, out) = (self.clone(), out.clone());
+                let n = self.req_n.fetch_add(1, Ordering::SeqCst);
+                work.spawn(async move {
+                    let t = std::time::Instant::now();
+                    let s2 = s.clone();
+                    let r = tokio::task::spawn_blocking(move || {
+                        from_value::<AttachPaneParams>(params)
+                            .map_err(bad)
+                            .and_then(|p| s2.attach(n, p, guard))
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err((error_code::INTERNAL, format!("handler failed: {e}"))));
+                    out.push(control_frame(&reply(r)));
+                    tl!(
+                        born,
+                        s.name,
+                        "attach_pane id {id} answered, handled in {} us",
+                        t.elapsed().as_micros()
+                    );
+                });
             }
             method::DETACH_PANE => {
-                let r = from_value::<DetachPaneParams>(params).map_err(bad).and_then(|p| {
-                    if let Some(h) = streams.remove(&p.pane_id) {
-                        h.abort();
-                    }
-                    self.rpc.note_detached(self.client_id, p.pane_id);
-                    to_value(&OkResult { ok: true }).map_err(bad)
+                let Some(guard) = self.begin_task(inflight, out, 0) else { return false };
+                let (s, out) = (self.clone(), out.clone());
+                let n = self.req_n.fetch_add(1, Ordering::SeqCst);
+                work.spawn(async move {
+                    let _guard = guard;
+                    let r = tokio::task::spawn_blocking(move || {
+                        from_value::<DetachPaneParams>(params).map_err(bad).and_then(|p| {
+                            s.detach(n, p.pane_id);
+                            to_value(&OkResult { ok: true }).map_err(bad)
+                        })
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err((error_code::INTERNAL, format!("handler failed: {e}"))));
+                    out.push(control_frame(&reply(r)));
                 });
-                out.push(control_frame(&reply(r)));
             }
             method::RESIZE_PANE => {
                 let Some(guard) = self.begin_task(inflight, out, ANSWER_RESERVE) else {
@@ -1924,6 +2021,9 @@ impl Session {
                     out.push(control_frame(&reply(r)));
                 });
             }
+            // Cheap, answered here: the clients table has short locks and no
+            // program output on it. A flood of these fills the byte budget
+            // and the stall watchdog closes the connection.
             method::LIST_CLIENTS => {
                 out.push(control_frame(&reply(self.rpc.list_clients())));
             }
@@ -1968,14 +2068,16 @@ impl Session {
     }
 
     /// `attach_pane`: pick the start offset (section 8) and open the stream.
+    /// `n` is the number of the request. A newer attach or detach of the same
+    /// pane that already ran wins over this one.
     fn attach(
         self: &Arc<Self>,
+        n: u64,
         p: AttachPaneParams,
-        work: &mut JoinSet<()>,
-        streams: &mut HashMap<Uuid, AbortHandle>,
         guard: InflightGuard,
     ) -> Result<Value, (&'static str, String)> {
         let pane = PaneId(p.pane_id);
+        let t = std::time::Instant::now();
         let Some(info) = self.rpc.sm.pane_info(pane) else {
             return Err((error_code::NOT_FOUND, "no such pane".into()));
         };
@@ -1984,6 +2086,7 @@ impl Session {
         else {
             return Err((error_code::INTERNAL, "pane has no byte log".into()));
         };
+        let looked_up = t.elapsed();
         let from = if self.has(cap::RESUME) { p.from_offset } else { None };
         let (start, reset) = match from {
             None => (first, true),
@@ -1999,8 +2102,10 @@ impl Session {
             }
             attaches.push((p.pane_id, p.from_offset));
         }
-        if let Some(old) = streams.remove(&p.pane_id) {
-            old.abort();
+        // Harness: a pane lookup that takes long (a lock a busy pane holds).
+        let ms = self.rpc.qa.attach_delay_ms.load(Ordering::SeqCst);
+        if ms > 0 {
+            std::thread::sleep(Duration::from_millis(ms));
         }
         let header = PaneStreamHeader {
             pane_id: p.pane_id,
@@ -2016,25 +2121,61 @@ impl Session {
         tl!(
             self.born,
             self.name,
-            "attach_pane {} from {:?}: start {start} reset {reset} gap {} (limit {})",
+            "attach_pane {} from {:?}: start {start} reset {reset} gap {} (limit {}), lookups {} us",
             p.pane_id,
             p.from_offset,
             total.saturating_sub(start),
-            shared.ring_capacity() / 2
+            shared.ring_capacity() / 2,
+            looked_up.as_micros()
         );
-        // One live stream per (connection, pane): the old one was aborted above.
-        let handle = work.spawn(pane_stream(
-            self.rpc.clone(),
-            self.conn.clone(),
-            shared,
-            header,
-            catchup,
-            guard,
-            (self.born, self.name.clone()),
-        ));
-        streams.insert(p.pane_id, handle);
+        // One live stream per (connection, pane): the old one is aborted.
+        {
+            let mut ops = lock(&self.ops);
+            if ops.closed {
+                return Err((error_code::INTERNAL, "connection is closing".into()));
+            }
+            if ops.map.get(&p.pane_id).is_some_and(|(seq, _)| *seq > n) {
+                // A newer request for this pane ran first.
+                return to_value(&OkResult { ok: true })
+                    .map_err(|e| (error_code::INTERNAL, e.to_string()));
+            }
+            if let Some((_, Some(old))) = ops.map.remove(&p.pane_id) {
+                old.abort();
+            }
+            let handle = tokio::spawn(pane_stream(
+                self.rpc.clone(),
+                self.conn.clone(),
+                shared,
+                header,
+                catchup,
+                guard,
+                (self.born, self.name.clone()),
+            ))
+            .abort_handle();
+            ops.map.insert(p.pane_id, (n, Some(handle)));
+        }
         self.rpc.note_attached(self.client_id, p.pane_id);
         to_value(&OkResult { ok: true }).map_err(|e| (error_code::INTERNAL, e.to_string()))
+    }
+
+    /// `detach_pane`: stop the stream of a pane. See [`Self::attach`] for `n`.
+    fn detach(self: &Arc<Self>, n: u64, pane: Uuid) {
+        let known = self.rpc.sm.pane_info(PaneId(pane)).is_some();
+        {
+            let mut ops = lock(&self.ops);
+            if ops.map.get(&pane).is_some_and(|(seq, _)| *seq > n) {
+                return;
+            }
+            if let Some((_, Some(old))) = ops.map.remove(&pane) {
+                old.abort();
+            }
+            // A mark for an attach of this pane that is still on its way. Only
+            // for panes that exist, so a peer cannot grow the map.
+            if known && !ops.closed {
+                ops.map.insert(pane, (n, None));
+            }
+        }
+        self.rpc.note_detached(self.client_id, pane);
     }
 }
 

@@ -200,3 +200,58 @@ async fn reconnect_timeline_with_two_panes_after_many_catchups() {
     h2.close().await;
     server.shutdown().await;
 }
+
+/// A request of the app, sent as soon as the client is Connected, is answered
+/// at once while the resume of two panes runs. Each `attach_pane` is made to
+/// take 400 ms on the server (it stands for a lock a busy pane holds). The
+/// control loop used to do the attaches one after the other before it took
+/// the next request, so `list_tabs` came after 800 ms.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_right_after_connected_does_not_wait_for_the_resume() {
+    if !real_only() {
+        return;
+    }
+    let server = TestServer::start(TestServerConfig::default()).await;
+    let a = server.add_script_pane("stty raw -echo; exec cat");
+    let b = server.add_script_pane("stty raw -echo; exec cat");
+    let h = client_for(&server).await;
+    let sa = follow(h.attach_pane(a).await.unwrap());
+    let sb = follow(h.attach_pane(b).await.unwrap());
+    let _events = h.events().await.unwrap();
+
+    // Idle: what one request costs on this host.
+    let mut idle = Duration::ZERO;
+    for _ in 0..10 {
+        let t = Instant::now();
+        h.request("list_tabs", Value::Map(vec![])).await.unwrap();
+        idle = idle.max(t.elapsed());
+    }
+
+    server.socket_call("qa_attach_delay", json!({"ms": 400})).unwrap();
+    let before = server.handshakes();
+    server.drop_connections();
+    until("a new connection", Duration::from_secs(30), || {
+        server.handshakes() > before && h.state().is_connected()
+    })
+    .await;
+    let connected_at = Instant::now();
+    h.request("list_tabs", Value::Map(vec![])).await.expect("list_tabs");
+    let list_tabs = connected_at.elapsed();
+    // Both panes come back with the resume, together, not one after the other.
+    h.send_input(a, b"resumed-a\n").await.unwrap();
+    h.send_input(b, b"resumed-b\n").await.unwrap();
+    until("both panes echo", Duration::from_secs(30), || {
+        has(&sa, "resumed-a") && has(&sb, "resumed-b")
+    })
+    .await;
+    let resumed = connected_at.elapsed();
+    println!("list_tabs {list_tabs:?} (idle {idle:?}), both panes back after {resumed:?}");
+    server.socket_call("qa_attach_delay", json!({"ms": 0})).unwrap();
+    assert!(
+        list_tabs < Duration::from_millis(100).max(idle * 4 + Duration::from_millis(20)),
+        "list_tabs waited {list_tabs:?} for the resume (idle {idle:?})"
+    );
+    assert!(resumed < Duration::from_millis(750), "the attaches ran one by one: {resumed:?}");
+    h.close().await;
+    server.shutdown().await;
+}

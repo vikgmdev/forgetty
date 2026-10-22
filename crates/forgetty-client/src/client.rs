@@ -62,9 +62,12 @@ const INPUT_CHUNK: usize = 16 * 1024;
 ///
 /// `reconnect_now` and `network_changed` never add a token. `reconnect_now`
 /// cuts a normal backoff but has no effect on the empty-bucket sleep (the apps
-/// call it every 400 ms). `network_changed` cuts the empty-bucket sleep at most
-/// once per `EP_MIN_AGE`. So a server that answers once and closes cannot make the client
-/// redial in a tight loop, and a single drop is still redialed at once.
+/// call it every 400 ms). A `network_changed` that follows a real change of
+/// the network (the address the default route uses is another one than at the
+/// last call) cuts the empty-bucket sleep, once per `EP_MIN_AGE`; a repeat of
+/// the same event never does, and does not use up that one cut. So a server
+/// that answers once and closes cannot make the client redial in a tight
+/// loop, and a single drop is still redialed at once.
 const MIN_HEALTHY_SESSION: Duration = Duration::from_secs(5);
 const REDIAL_BURST: f64 = 10.0;
 const REDIAL_REFILL: Duration = Duration::from_secs(3);
@@ -415,6 +418,31 @@ macro_rules! tl {
     };
 }
 
+/// A number that changes when the network the device uses changes: the local
+/// address the system picks for a route to the internet, over IPv4 and over
+/// IPv6. No packet is sent. A device with no network gives the same number
+/// every time.
+fn net_fingerprint() -> u64 {
+    use std::hash::{Hash, Hasher};
+    let local = |bind: &str, to: &str| -> Option<std::net::IpAddr> {
+        let sock = std::net::UdpSocket::bind(bind).ok()?;
+        sock.connect(to).ok()?;
+        sock.local_addr().ok().map(|a| a.ip())
+    };
+    let v4 = local("0.0.0.0:0", "192.0.2.1:9");
+    let v6 = local("[::]:0", "[2001:db8::1]:9");
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (v4, v6).hash(&mut h);
+    h.finish()
+}
+
+/// See `Shared::immediate`.
+#[derive(Default)]
+struct ImmediateDial {
+    granted: Option<Instant>,
+    last_grant: Option<Instant>,
+}
+
 pub(crate) struct Shared {
     /// When the link that runs now was established (timeline).
     link_born: Mutex<Instant>,
@@ -478,6 +506,20 @@ pub(crate) struct Shared {
     /// Set by `network_changed`: the next redial skips the backoff and the
     /// failure count starts again at 0.
     reset_backoff: AtomicBool,
+    /// Dials started so far (test hook).
+    dial_starts: AtomicU64,
+    /// When the supervisor went to sleep before its next dial, if it sleeps
+    /// (test hook).
+    sleeping_since: Mutex<Option<Instant>>,
+    /// What `network_changed` last saw of the network (see [`net_fingerprint`]),
+    /// and the test override of it.
+    net_fp: Mutex<u64>,
+    net_fp_test: Mutex<Option<u64>>,
+    /// The immediate dial a real network change earned: when it was granted,
+    /// and when the last one was (at most one per `EP_MIN_AGE`).
+    immediate: Mutex<ImmediateDial>,
+    /// The redial state the supervisor last decided on (timeline text).
+    redial_note: Mutex<String>,
     /// Wakes the liveness task for an immediate `Ping`.
     ping_now: Notify,
     next_nonce: AtomicU64,
@@ -586,6 +628,12 @@ impl Client {
             kick: Notify::new(),
             wake_backoff: Notify::new(),
             reset_backoff: AtomicBool::new(false),
+            dial_starts: AtomicU64::new(0),
+            sleeping_since: Mutex::new(None),
+            net_fp: Mutex::new(net_fingerprint()),
+            net_fp_test: Mutex::new(None),
+            immediate: Mutex::new(ImmediateDial::default()),
+            redial_note: Mutex::new(String::new()),
             ping_now: Notify::new(),
             next_nonce: AtomicU64::new(1),
             input_epoch: Uuid::new_v4(),
@@ -948,6 +996,26 @@ impl ClientHandle {
     /// the call if nothing connected before.
     pub async fn network_changed(&self) {
         let shared = self.shared();
+        // A real change of the network earns one immediate dial, with no
+        // token, at most once per `EP_MIN_AGE`. A repeat of the same event
+        // earns nothing, and does not use up the one a real change may need.
+        let fp = lock(&shared.net_fp_test).unwrap_or_else(net_fingerprint);
+        let real = std::mem::replace(&mut *lock(&shared.net_fp), fp) != fp;
+        let granted = real && {
+            let mut im = lock(&shared.immediate);
+            let ok = im.last_grant.is_none_or(|t| t.elapsed() >= EP_MIN_AGE);
+            if ok {
+                im.granted = Some(Instant::now());
+                im.last_grant = im.granted;
+            }
+            ok
+        };
+        tl!(
+            shared,
+            "network_changed: real {real}, immediate dial {granted}, link {}, {}",
+            shared.link_tx.borrow().is_some(),
+            lock(&shared.redial_note)
+        );
         // Probe first: `network_change` can take long on a dead network, and
         // must not delay the Ping.
         let link = shared.link_tx.borrow().clone();
@@ -997,6 +1065,26 @@ impl ClientHandle {
             shared.reset_backoff.store(true, Ordering::SeqCst);
             link.conn.close(close_code::OK.into(), b"network changed");
         }
+    }
+
+    /// Test hook: how long the supervisor has slept before its next dial, or
+    /// `None` when it does not sleep.
+    #[doc(hidden)]
+    pub fn sleeping_for_tests(&self) -> Option<Duration> {
+        lock(&self.shared().sleeping_since).map(|t| t.elapsed())
+    }
+
+    /// Test hook: dials the supervisor started so far.
+    #[doc(hidden)]
+    pub fn dial_starts_for_tests(&self) -> u64 {
+        self.shared().dial_starts.load(Ordering::SeqCst)
+    }
+
+    /// Test hook: the number `network_changed` takes for the network (see
+    /// `net_fingerprint`). `None` goes back to the real one.
+    #[doc(hidden)]
+    pub fn set_network_for_tests(&self, fp: Option<u64>) {
+        *lock(&self.shared().net_fp_test) = fp;
     }
 
     /// Test hook: endpoints bound and not closed now, and the most at once.
@@ -1316,6 +1404,14 @@ fn backoff(failures: usize) -> Duration {
     Duration::from_millis(RECONNECT_BACKOFF_MS[failures.min(RECONNECT_BACKOFF_MS.len() - 1)])
 }
 
+/// The immediate dial a real network change earned, if it is still fresh.
+fn take_immediate(shared: &Shared) -> bool {
+    let mut im = lock(&shared.immediate);
+    let fresh = im.granted.is_some_and(|t| t.elapsed() < EP_MIN_AGE);
+    im.granted = None;
+    fresh
+}
+
 /// Take a stored `notify_one` permit, if there is one.
 async fn drain_permit(n: &Notify) {
     tokio::select! {
@@ -1335,8 +1431,8 @@ async fn supervise(shared: Arc<Shared>) {
     let mut tokens = REDIAL_BURST;
     let mut refilled = Instant::now();
     let mut streak = 0usize;
-    // When `network_changed` last cut an empty-bucket sleep.
-    let mut last_cut: Option<Instant> = None;
+    // When the last redial decision was made (timeline).
+    let mut decided_at: Option<Instant> = None;
     loop {
         if *shutdown.borrow() {
             break;
@@ -1373,8 +1469,15 @@ async fn supervise(shared: Arc<Shared>) {
             }
         }
         attempt_no += 1;
+        shared.dial_starts.store(attempt_no, Ordering::SeqCst);
         let attempt_started = Instant::now();
         debug!("client: dial #{attempt_no} starts (failures so far {failures})");
+        tl!(
+            shared,
+            "dial #{attempt_no} starts: tokens {tokens:.1}, streak {streak}, failures {failures}, \
+             {:?} after the last redial decision",
+            decided_at.map(|t| t.elapsed())
+        );
         // A `network_changed` while a dial is in flight aborts it and starts
         // a new one at once, with no backoff.
         if shared.reset_backoff.swap(false, Ordering::SeqCst) {
@@ -1399,6 +1502,7 @@ async fn supervise(shared: Arc<Shared>) {
         };
         // The sleep that follows is the empty-bucket one (see `MIN_HEALTHY_SESSION`).
         let mut empty_sleep = false;
+        let mut why: &str;
         let delay = match result {
             Ok(Ok(est)) => {
                 debug!(
@@ -1428,6 +1532,7 @@ async fn supervise(shared: Arc<Shared>) {
                     // A long session: redial at once, no token, streak over.
                     failures = 0;
                     streak = 0;
+                    why = "long session";
                     None
                 } else {
                     let now = Instant::now();
@@ -1445,8 +1550,15 @@ async fn supervise(shared: Arc<Shared>) {
                     }
                     if tokens >= 1.0 {
                         tokens -= 1.0;
-                        if resumed { None } else { Some(backoff(failures - 1)) }
+                        if resumed {
+                            why = "token, link was heard";
+                            None
+                        } else {
+                            why = "token, silent link: ladder";
+                            Some(backoff(failures - 1))
+                        }
                     } else {
+                        why = "empty bucket";
                         info!("client: redial bucket empty, sleeping {step:?}");
                         // The sleep earns no tokens: a broken server settles at
                         // the ladder cap instead of drawing on the refill.
@@ -1468,6 +1580,7 @@ async fn supervise(shared: Arc<Shared>) {
                 );
                 let d = backoff(failures);
                 failures += 1;
+                why = "dial failed: ladder";
                 Some(d)
             }
             Err(_) => {
@@ -1477,49 +1590,63 @@ async fn supervise(shared: Arc<Shared>) {
                 );
                 let d = backoff(failures);
                 failures += 1;
+                why = "dial timed out: ladder";
                 Some(d)
             }
         };
-        // `network_changed` forgets the failures and dials at once, but an
-        // empty-bucket sleep it cuts at most once per `EP_MIN_AGE`: a network
-        // that flaps must not set the dial rate.
-        let cut_ok = last_cut.is_none_or(|t| t.elapsed() >= EP_MIN_AGE);
-        let delay = if shared.reset_backoff.swap(false, Ordering::SeqCst) {
+        // `network_changed` forgets the failures and dials at once. An
+        // empty-bucket sleep is cut only by the immediate dial a real change of
+        // the network earned (at most once per `EP_MIN_AGE`): a flapping
+        // network, or the same event again, must not set the dial rate.
+        let reset = shared.reset_backoff.swap(false, Ordering::SeqCst);
+        if reset {
             failures = 0;
-            if empty_sleep && !cut_ok {
-                delay
-            } else {
-                if empty_sleep {
-                    last_cut = Some(Instant::now());
-                }
+        }
+        let delay = if empty_sleep {
+            if take_immediate(&shared) {
+                why = "empty bucket, cut by a real network change";
                 None
+            } else {
+                delay
             }
+        } else if reset {
+            why = "network_changed";
+            None
         } else {
             delay
         };
+        decided_at = Some(Instant::now());
+        let note = format!(
+            "tokens {tokens:.1}, streak {streak}, failures {failures}, sleep {delay:?} ({why})"
+        );
+        tl!(shared, "redial decision: {note}");
+        *lock(&shared.redial_note) = note;
         if let Some(delay) = delay {
             debug!("client: backoff {delay:?} before dial #{}", attempt_no + 1);
+            let slept = Instant::now();
+            *lock(&shared.sleeping_since) = Some(slept);
             let sleep = tokio::time::sleep(delay);
             tokio::pin!(sleep);
-            loop {
+            let ended_by = loop {
                 tokio::select! {
-                    () = &mut sleep => break,
-                    _ = shutdown.changed() => break,
+                    () = &mut sleep => break "timer",
+                    _ = shutdown.changed() => break "shutdown",
                     _ = shared.kick.notified() => {
-                        // Not in an empty-bucket sleep that was cut lately.
+                        // An empty-bucket sleep is cut only by a real change.
                         if !empty_sleep {
-                            break;
+                            break "network_changed";
                         }
-                        if last_cut.is_none_or(|t| t.elapsed() >= EP_MIN_AGE) {
-                            last_cut = Some(Instant::now());
-                            break;
+                        if take_immediate(&shared) {
+                            break "real network change";
                         }
                     }
                     // `reconnect_now` cuts a normal backoff, never the
                     // empty-bucket sleep (the apps call it every 400 ms).
-                    _ = shared.wake_backoff.notified(), if !empty_sleep => break,
+                    _ = shared.wake_backoff.notified(), if !empty_sleep => break "reconnect_now",
                 }
-            }
+            };
+            *lock(&shared.sleeping_since) = None;
+            tl!(shared, "redial sleep over after {:?}: {ended_by}", slept.elapsed());
         }
     }
     shared.link_tx.send_replace(None);
@@ -1967,8 +2094,11 @@ async fn accept_streams(conn: Connection, tx: mpsc::UnboundedSender<RecvStream>)
     }
 }
 
-/// Resume after a (re)connect: events first, then every live pane with its
-/// last offset, then release the input writer (PROTOCOL_V2 section 9).
+/// Resume after a (re)connect: the events subscription and every live pane
+/// with its last offset, then release the input writer (PROTOCOL_V2 section 9).
+/// All the requests go out at once, the subscribe first, so the server takes
+/// them in that order and answers each as it is done. A request of the app
+/// does not wait for any of them: it goes out on the same stream at once.
 async fn session_init(
     shared: Arc<Shared>,
     link: Arc<Link>,
@@ -1978,15 +2108,20 @@ async fn session_init(
     let first = link.gen == 1;
     tl!(shared, "session_init starts");
 
+    // The subscribe goes out first, and takes the events lock until it is
+    // answered, as `ensure_subscribed` does.
+    let mut subscribe = None;
     if shared.events_wanted.load(Ordering::SeqCst) {
-        match ensure_subscribed(&shared, &link, deadline, true).await {
-            Ok(()) => {
-                tl!(shared, "session_init: events subscribed");
-                if !first {
-                    let _ = shared.events_tx.send(EventItem::Resynced);
+        let guard = shared.events_gen.clone().lock_owned().await;
+        if *guard != link.gen {
+            match send_request_as(&shared, &link, method::SUBSCRIBE_EVENTS, Value::Map(vec![]), true)
+            {
+                Ok((id, rx)) => {
+                    tl!(shared, "session_init: subscribe_events sent (id {id})");
+                    subscribe = Some((guard, id, rx));
                 }
+                Err(e) => return TaskEnd::Lost(format!("subscribe_events: {e}")),
             }
-            Err(e) => return TaskEnd::Lost(format!("subscribe_events: {e}")),
         }
     }
 
@@ -2007,6 +2142,19 @@ async fn session_init(
                 inflight.push((pane, guard, id, rx));
             }
             Err(e) => return TaskEnd::Lost(format!("attach_pane: {e}")),
+        }
+    }
+
+    if let Some((mut guard, id, rx)) = subscribe {
+        match await_answer(&link, id, rx, deadline).await {
+            Ok(_) => {
+                *guard = link.gen;
+                tl!(shared, "session_init: events subscribed (id {id})");
+                if !first {
+                    let _ = shared.events_tx.send(EventItem::Resynced);
+                }
+            }
+            Err(e) => return TaskEnd::Lost(format!("subscribe_events: {e}")),
         }
     }
     for (pane, mut guard, id, rx) in inflight {
