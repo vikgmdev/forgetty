@@ -243,10 +243,13 @@ jobs:
             install.log
             uninstall.log
 
-  # Can the runner install a Japanese or Chinese IME? This job only reports (ime-probe.json).
+  # Can the runner install a Japanese or Chinese IME? Run by hand (workflow_dispatch). Result: it
+  # already has Microsoft IME (ja) and Pinyin (zh) and the language packs, so the smoke drives them
+  # (`ime_real_*`). This job only reports (ime-probe.json).
   # It does not gate: a hosted runner may refuse language packs, and then the IME checks are the
   # handler-level ones in the smoke plus clients/windows/docs/manual-tests.md.
   ime-probe:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
     timeout-minutes: 45
     continue-on-error: true

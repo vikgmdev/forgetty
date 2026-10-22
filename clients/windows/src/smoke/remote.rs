@@ -895,8 +895,9 @@ impl ShellSmoke {
 }
 
 /// Text service profiles of the Microsoft IMEs: (language, CLSID, profile GUID).
-const IME_JA: (u16, &str, &str) = (0x0411, "03B5835F-F03C-411B-9CE2-AA23E1171E36", "A76C93D9-5523-4E90-AAFA-4DB112F9AC76");
-const IME_ZH: (u16, &str, &str) = (0x0804, "81D4E9C9-1D3B-41BC-9E6C-4B40BF79E35E", "FA550B04-5AD7-411F-A5AC-CA038EC515D7");
+/// (language, CLSID, profile GUID, keyboard layout id of the IME).
+const IME_JA: (u16, &str, &str, &str) = (0x0411, "03B5835F-F03C-411B-9CE2-AA23E1171E36", "A76C93D9-5523-4E90-AAFA-4DB112F9AC76", "E0010411");
+const IME_ZH: (u16, &str, &str, &str) = (0x0804, "81D4E9C9-1D3B-41BC-9E6C-4B40BF79E35E", "FA550B04-5AD7-411F-A5AC-CA038EC515D7", "E00E0804");
 
 impl ShellSmoke {
     /// Real Japanese and Chinese IME through the window's message loop: activate the text
@@ -918,29 +919,33 @@ impl ShellSmoke {
                 })
             })
         };
-        let begin = |name: &str, prof: (u16, &str, &str), hwnd: Option<windows::Win32::Foundation::HWND>, cx: &mut Context<AppShell>| {
+        let begin = |name: &str, prof: (u16, &str, &str, &str), cx: &mut Context<AppShell>| {
             t.update(cx, |v, _| {
                 v.capture_input = Some(Vec::new());
                 v.ime_log.clear();
                 v.marked = None;
             });
+            // The IME's own keyboard layout handle first (what the language bar switches to),
+            // then the text service profile.
+            let hkl = inject::activate_layout(prof.3);
             let act = inject::activate_text_service(prof.0, prof.1, prof.2);
-            let open = hwnd.map(inject::ime_open_native).unwrap_or_else(|| "no window handle".into());
-            record(&format!("ime_real_{name}_activate"), json!({"result": act.clone().map(|_| "ok".to_string()), "imm": open, "hkl": format!("{:x}", inject::current_hkl())}));
-            act.is_ok()
+            record(&format!("ime_real_{name}_activate"), json!({"layout": hkl.map(|h| format!("{h:x}")), "profile": act.clone().map(|_| "ok".to_string())}));
         };
+        // The layout switch lands through the message loop: wait until the thread has it.
+        let on_layout = |want: u16| (inject::current_hkl() & 0xffff) as u16 == want;
         match self.sub {
             80 => {
-                self.w7.real_ok = begin("ja", IME_JA, hwnd, cx);
+                begin("ja", IME_JA, cx);
                 self.sub = 81;
                 self.sub_t0 = Instant::now();
             }
             81 => {
-                if !lap(self, 800) {
+                if !lap(self, 800) || (!on_layout(IME_JA.0) && !lap(self, 4000)) {
                     return;
                 }
+                let imm = hwnd.map(inject::ime_open_native).unwrap_or_else(|| "no window handle".into());
                 let sent = inject::tap_word(inject::current_hkl(), "nihongo");
-                record("ime_real_ja_typed", json!({"sent": sent, "hkl": format!("{:x}", inject::current_hkl())}));
+                record("ime_real_ja_typed", json!({"sent": sent, "on_layout": on_layout(IME_JA.0), "imm": imm, "hkl": format!("{:x}", inject::current_hkl())}));
                 self.sub = 82;
                 self.sub_t0 = Instant::now();
             }
@@ -969,16 +974,17 @@ impl ShellSmoke {
                 }
                 record("ime_real_ja_committed", snapshot(cx));
                 // Chinese.
-                self.w7.real_ok &= begin("zh", IME_ZH, hwnd, cx);
+                begin("zh", IME_ZH, cx);
                 self.sub = 85;
                 self.sub_t0 = Instant::now();
             }
             85 => {
-                if !lap(self, 800) {
+                if !lap(self, 800) || (!on_layout(IME_ZH.0) && !lap(self, 4000)) {
                     return;
                 }
+                let imm = hwnd.map(inject::ime_open_native).unwrap_or_else(|| "no window handle".into());
                 let sent = inject::tap_word(inject::current_hkl(), "zhongwen");
-                record("ime_real_zh_typed", json!({"sent": sent, "hkl": format!("{:x}", inject::current_hkl())}));
+                record("ime_real_zh_typed", json!({"sent": sent, "on_layout": on_layout(IME_ZH.0), "imm": imm, "hkl": format!("{:x}", inject::current_hkl())}));
                 self.sub = 86;
                 self.sub_t0 = Instant::now();
             }
@@ -1013,12 +1019,11 @@ pub struct W7 {
     denied_sent: u8,
     nonce: u64,
     dropped_before: u32,
-    real_ok: bool,
 }
 
 impl Default for W7 {
     fn default() -> Self {
-        W7 { machine: uuid::Uuid::new_v4(), auto_before: 0, denied_sent: 0, nonce: 0, dropped_before: 0, real_ok: false }
+        W7 { machine: uuid::Uuid::new_v4(), auto_before: 0, denied_sent: 0, nonce: 0, dropped_before: 0 }
     }
 }
 
