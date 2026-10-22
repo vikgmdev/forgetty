@@ -122,10 +122,11 @@ async fn round(
             assert!(*d < Duration::from_millis(500), "{label} {n}: pane {i} echo after {d:?}");
         }
     }
-    // A node and pane have 6 resume tokens and this idle pane gives no live
-    // byte to prove a read, so none comes back. The first attach of the
-    // client spent one: 5 far-behind resumes are left, and they wait for the
-    // snapshot build only, not for the pacing (1 s and more).
+    // A node and pane have 6 resume tokens. This idle pane gives no live byte
+    // to prove a read, and the test lasts seconds, so the refill (one token
+    // per 5 minutes, or per strong claim) brings none back. The first attach
+    // of the client spent one: 5 far-behind resumes are left, and they wait
+    // for the snapshot build only, not for the pacing (1 s and more).
     if label == "far behind" && n < 5 {
         assert!(echo[0] < Duration::from_millis(1000), "{label} {n}: pane A echo after {:?}", echo[0]);
     }
@@ -172,7 +173,8 @@ async fn reconnect_timeline_with_two_panes_after_many_catchups() {
     // 5 MiB of output arrive, so it resumes more than half a ring behind.
     // The first 6 far-behind attaches of a node and pane (the first attach
     // counts) spend a token each and wait for nothing but the snapshot; the
-    // rest wait out the backoff.
+    // rest wait out the backoff (a token comes back every 5 minutes; the
+    // unit tests in rpc_v2.rs cover that, a test of seconds cannot).
     let h2 = client_for(&server).await;
     let sa2 = follow(h2.attach_pane(a).await.unwrap());
     let sb2 = follow(h2.attach_pane(b).await.unwrap());

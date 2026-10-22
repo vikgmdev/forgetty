@@ -2368,20 +2368,37 @@ impl CatchupLimiter {
 /// per second after that. They never back off: the peer reads what it gets.
 const KEEPING_PACE_BURST: f64 = 6.0;
 const KEEPING_PACE_PER_SEC: f64 = 1.0;
+/// One resume token comes back per this much time, on top of the `Strong`
+/// refill. A phone whose pane printed 10 MB while it was away and then went
+/// quiet shows no live byte to prove a read; this is its refill. A peer that
+/// never reads gets one extra snapshot per pane per 5 minutes from it.
+const RESUME_TOKEN_EVERY: Duration = Duration::from_secs(300);
 
 /// Pacing state of one `(remote node id, pane)`. Keyed by the node, not by
 /// `client_id`: the id is peer text, a fresh one per connection would reset it.
 struct Pace {
     limiter: CatchupLimiter,
     tokens: f64,
-    /// Far-behind resumes left before the backoff. A `Strong` claim adds one
-    /// (at most [`KEEPING_PACE_BURST`]). Time adds none: a peer that never
-    /// reads must not earn them by waiting.
+    /// Far-behind resumes left before the backoff. A `Strong` claim adds one,
+    /// and time adds one per [`RESUME_TOKEN_EVERY`] (at most
+    /// [`KEEPING_PACE_BURST`] in all).
     resume_tokens: f64,
+    /// Time up to which `resume_tokens` has the slow refill.
+    resume_clock: tokio::time::Instant,
     /// Tokens earn from here on. Time spent waiting out a delay earns none.
     refilled: tokio::time::Instant,
     /// Tiny claims since the last strong one.
     tiny_streak: u32,
+}
+
+impl Pace {
+    /// Add the resume tokens that time has earned since the last call.
+    fn top_up_resume_tokens(&mut self, now: tokio::time::Instant) {
+        let earned = now.saturating_duration_since(self.resume_clock).as_secs_f64()
+            / RESUME_TOKEN_EVERY.as_secs_f64();
+        self.resume_tokens = (self.resume_tokens + earned).min(KEEPING_PACE_BURST);
+        self.resume_clock = now;
+    }
 }
 
 impl RpcV2 {
@@ -2397,10 +2414,12 @@ impl RpcV2 {
     /// How long an attach that resumes far behind waits for its snapshot. A
     /// phone that sat in a pocket while a build printed 10 MB is the normal
     /// case, so the resume spends a resume token first: 6 per `(node, pane)`,
-    /// at the 100 ms floor between snapshots. Time earns no token. A `Strong`
-    /// claim (a peer that reads live bytes at a good rate) earns one. With no
+    /// at the 100 ms floor between snapshots. A `Strong` claim (a peer that
+    /// reads live bytes at a good rate) earns one, and so does each 5 minutes
+    /// of time. With no
     /// token left the resume waits out the doubling backoff (1 s up to 10 s),
-    /// so a peer that never reads gets 6 snapshots in all, then the backoff.
+    /// so a peer that never reads gets 6 snapshots, then the backoff and one
+    /// more per 5 minutes.
     fn resume_delay(&self, node: iroh::EndpointId, pane: PaneId) -> Duration {
         Self::resume(&mut lock(&self.pacing), node, pane)
     }
@@ -2412,6 +2431,7 @@ impl RpcV2 {
     ) -> Duration {
         let now = tokio::time::Instant::now();
         let p = Self::slot(map, node, pane, now);
+        p.top_up_resume_tokens(now);
         if p.resume_tokens < 1.0 {
             // No token: the doubling backoff, whatever the time since.
             let w = p.limiter.delay_sticky();
@@ -2444,6 +2464,7 @@ impl RpcV2 {
             limiter: CatchupLimiter::default(),
             tokens: KEEPING_PACE_BURST,
             resume_tokens: KEEPING_PACE_BURST,
+            resume_clock: now,
             refilled: now,
             tiny_streak: 0,
         })
@@ -2467,7 +2488,8 @@ impl RpcV2 {
         match claim {
             Claim::Strong => {
                 p.tiny_streak = 0;
-                // The one thing that earns a resume token: proof of a read.
+                // Proof of a read earns a resume token.
+                p.top_up_resume_tokens(now);
                 p.resume_tokens = (p.resume_tokens + 1.0).min(KEEPING_PACE_BURST);
             }
             Claim::Tiny => p.tiny_streak += 1,
@@ -2892,27 +2914,74 @@ mod pacing_tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn time_earns_no_resume_token_but_a_strong_claim_earns_one() {
+    async fn a_strong_claim_earns_a_resume_token_and_time_one_per_five_minutes() {
         let map = pace_map();
         let (n, pane) = (node(), Uuid::new_v4());
+        let tokens = |map: &Mutex<HashMap<(iroh::EndpointId, Uuid), Pace>>| {
+            lock(map).get(&(n, pane)).map(|p| p.resume_tokens).unwrap()
+        };
         for _ in 0..6 {
             let w = RpcV2::resume(&mut lock(&map), n, PaneId(pane));
             tokio::time::sleep(w).await;
         }
-        // A quiet minute earns no token.
+        // A quiet minute earns no whole token.
         tokio::time::sleep(Duration::from_secs(60)).await;
         let w = RpcV2::resume(&mut lock(&map), n, PaneId(pane));
         tokio::time::sleep(w).await;
-        let tokens = lock(&map).get(&(n, pane)).map(|p| p.resume_tokens);
-        assert_eq!(tokens, Some(0.0), "a quiet minute earned a token");
+        assert!(tokens(&map) < 1.0, "a quiet minute earned a token: {}", tokens(&map));
         // One strong claim earns one resume, at the floor.
         let w = delay(&map, n, pane, true);
         tokio::time::sleep(w).await;
+        assert!(tokens(&map) >= 1.0 && tokens(&map) < 2.0, "{}", tokens(&map));
         let w = RpcV2::resume(&mut lock(&map), n, PaneId(pane));
         assert!(w <= KEEPING_PACE_INTERVAL, "{w:?}");
         tokio::time::sleep(w).await;
-        let tokens = lock(&map).get(&(n, pane)).map(|p| p.resume_tokens);
-        assert_eq!(tokens, Some(0.0), "one claim, one token");
+        // No token again. Five minutes of quiet earn one, and only one.
+        tokio::time::sleep(Duration::from_secs(300)).await;
+        let w = RpcV2::resume(&mut lock(&map), n, PaneId(pane));
+        assert!(w <= KEEPING_PACE_INTERVAL, "five minutes earned no token: {w:?}");
+        tokio::time::sleep(w).await;
+        let w = RpcV2::resume(&mut lock(&map), n, PaneId(pane));
+        assert!(w >= Duration::from_millis(900), "five minutes earned two tokens: {w:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_phone_with_an_idle_pane_gets_a_token_back_every_five_minutes() {
+        let map = pace_map();
+        let (n, pane) = (node(), Uuid::new_v4());
+        // Eight far-behind resumes in a day, a few hours apart, no live byte
+        // after any of them (so no strong claim): none waits for the pacing.
+        for i in 0..8 {
+            let w = RpcV2::resume(&mut lock(&map), n, PaneId(pane));
+            assert!(w <= KEEPING_PACE_INTERVAL, "resume {i} waits {w:?}");
+            tokio::time::sleep(w + Duration::from_secs(3 * 3600)).await;
+        }
+        // The 6 tokens used up in a burst, a phone that comes back every five
+        // minutes finds a token each time.
+        let map = pace_map();
+        for _ in 0..6 {
+            let w = RpcV2::resume(&mut lock(&map), n, PaneId(pane));
+            tokio::time::sleep(w).await;
+        }
+        for i in 0..10 {
+            tokio::time::sleep(Duration::from_secs(301)).await;
+            let w = RpcV2::resume(&mut lock(&map), n, PaneId(pane));
+            assert!(w <= KEEPING_PACE_INTERVAL, "return {i} after 5 minutes waits {w:?}");
+        }
+        // A never-reading peer that comes back every 2 s for 15 minutes gets
+        // its 6, the early backoff slots and a few more, not one per backoff.
+        let map = pace_map();
+        let t0 = tokio::time::Instant::now();
+        let mut served = 0;
+        while t0.elapsed() < Duration::from_secs(15 * 60) {
+            let w = RpcV2::resume(&mut lock(&map), n, PaneId(pane));
+            if w <= Duration::from_secs(2) {
+                served += 1;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        eprintln!("never-reader, 15 minutes: {served}");
+        assert!(served <= 6 + 2 + 3, "{served} snapshots in 15 minutes");
     }
 
     #[tokio::test(start_paused = true)]

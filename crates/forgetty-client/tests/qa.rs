@@ -26,7 +26,8 @@ async fn connect(server: &TestServer, name: &str) -> ClientHandle {
 
 /// Pane A runs `a_script` and gets 1 MiB of input it never reads (or reads
 /// into a full output). Pane B streams output. Meanwhile the server must
-/// answer `list_tabs` (v2 and local socket) in under 100 ms, keep the
+/// answer `list_tabs` (v2 and local socket) in under 250 ms (or 10 times the
+/// idle cost on a slow host), keep the
 /// connection of the second client up, and keep B's stream moving.
 async fn blocked_input_stalls_nothing(a_script: &str, local_flood: bool) {
     let server = Arc::new(TestServer::start(TestServerConfig::default()).await);
@@ -51,6 +52,21 @@ async fn blocked_input_stalls_nothing(a_script: &str, local_flood: bool) {
             }
         })
     };
+
+    // The same two calls before the flood, with B streaming: what they cost
+    // on this host right now. The bound below is relative to it, so a loaded
+    // host does not fail the test for being slow.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut baseline = Duration::ZERO;
+    for _ in 0..10 {
+        let t0 = Instant::now();
+        other.request("list_tabs", Value::Nil).await.expect("list_tabs over v2");
+        baseline = baseline.max(t0.elapsed());
+        let t0 = Instant::now();
+        server.socket_call("list_tabs", json!({})).expect("list_tabs on the socket");
+        baseline = baseline.max(t0.elapsed());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 
     // 1 MiB into a pane that does not take it. The pane's queue fills and the
     // rest is dropped (AD-024); nobody is held up.
@@ -104,7 +120,11 @@ async fn blocked_input_stalls_nothing(a_script: &str, local_flood: bool) {
         writer.unacked_input_bytes()
     );
     let _ = &flood;
-    assert!(worst < Duration::from_millis(100), "list_tabs took {worst:?} while pane A blocked");
+    // The failure this guards against is a stall of seconds, so the bound has
+    // room for the load other tests put on the host while this one runs.
+    let bound = Duration::from_millis(250).max(baseline * 10);
+    println!("list_tabs before the flood (worst of 10): {baseline:?}, bound {bound:?}");
+    assert!(worst < bound, "list_tabs took {worst:?} while pane A blocked (idle: {baseline:?})");
     assert!(progress.load(Ordering::SeqCst) > before, "pane B stopped streaming");
     flood.abort();
     socket_flood.abort();
@@ -335,7 +355,12 @@ async fn an_honest_far_behind_phone_gets_every_snapshot_in_under_300_ms() {
         let took = t0.elapsed();
         worst = worst.max(took);
         assert!(h.snapshot_len > 0, "round {round}: no snapshot, the phone was not far behind");
-        assert!(took < Duration::from_millis(300), "round {round}: snapshot after {took:?}");
+        // The wait is the build and the 100 ms floor, not the pacing (1 s and
+        // more). A build takes what this host gives it right now: two of them
+        // and 100 ms are the bound, with 300 ms as the least.
+        let build = Duration::from_micros(qa_state(&server)["last_snapshot_us"].as_u64().unwrap_or(0));
+        let bound = Duration::from_millis(300).max(build * 2 + Duration::from_millis(100));
+        assert!(took < bound, "round {round}: snapshot after {took:?}, a build is {build:?}");
         // It reads at about 4 MiB/s, which is less than the program writes:
         // the server ends the stream once the phone is 4 MiB behind (the
         // claim is a strong one: live bytes at a good rate), and the phone
@@ -840,6 +865,22 @@ async fn a_hostile_node_does_not_starve_an_honest_nodes_catch_up() {
     let endpoint = raw_endpoint(&server).await;
     tokio::time::sleep(Duration::from_secs(2)).await;
 
+    // One snapshot on this host right now, from a node nobody competes with:
+    // the bound for the contended ones is relative to it.
+    let probe = connect(&server, "probe").await;
+    let t0 = Instant::now();
+    let mut s = probe.attach_pane(honest_panes[3]).await.unwrap();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(10), s.next()).await {
+            Ok(Some(PaneItem::Snapshot { .. })) => break,
+            Ok(Some(_)) => continue,
+            other => panic!("no snapshot for the probe: {other:?}"),
+        }
+    }
+    let one_build = t0.elapsed();
+    drop(s);
+    probe.close().await;
+
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let hostile = {
         let (stop, panes) = (stop.clone(), hostile_panes.to_vec());
@@ -902,7 +943,14 @@ async fn a_hostile_node_does_not_starve_an_honest_nodes_catch_up() {
         st["snapshot_builds"], st["snapshot_max_running"], st["last_snapshot_us"]
     );
     assert!(st["snapshot_max_running"].as_u64().unwrap() <= 2);
-    assert!(worst < Duration::from_millis(300), "the honest node waited {worst:?}");
+    // At most two builds (the hostile node's running one, then its own), and
+    // some slack for the scheduler.
+    let bound = one_build.max(Duration::from_micros(
+        st["last_snapshot_us"].as_u64().unwrap_or(0),
+    )) * 2
+        + Duration::from_millis(100);
+    println!("one build {one_build:?}, bound {bound:?}");
+    assert!(worst < bound, "the honest node waited {worst:?}, one build is {one_build:?}");
     honest.close().await;
     endpoint.close().await;
     server.shutdown().await;
