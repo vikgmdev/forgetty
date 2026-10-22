@@ -58,7 +58,7 @@ jobs:
         working-directory: clients/windows
         run: |
           # The ConPTY tests in shell-core's local module are covered by the smoke.
-          cargo test --release -p forgetty-shell-core --lib -- notify:: layout:: keys:: osc:: fuzzy:: update::
+          cargo test --release -p forgetty-shell-core --lib -- notify:: layout:: keys:: osc:: osc52:: fuzzy:: update::
           cargo test --release -p forgetty-remote
 
       - name: Smoke
@@ -242,3 +242,23 @@ jobs:
             out/*.msi
             install.log
             uninstall.log
+
+  # Can the runner install a Japanese or Chinese IME? This job only reports (ime-probe.json).
+  # It does not gate: a hosted runner may refuse language packs, and then the IME checks are the
+  # handler-level ones in the smoke plus clients/windows/docs/manual-tests.md.
+  ime-probe:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Try to install ja-JP and zh-CN input methods
+        shell: pwsh
+        run: ./clients/windows/ci/ime-probe.ps1
+      - name: Upload probe result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ime-probe
+          if-no-files-found: warn
+          path: ime-probe.json

@@ -691,13 +691,17 @@ impl AppShell {
 
 impl AppShell {
     /// A program asks to set the clipboard and the machine's policy is `ask`. The banner does not
-    /// take the keyboard and does not cover the terminal, only its own corner.
+    /// take the keyboard and does not cover the terminal, only its own corner. It shows the size,
+    /// the line count and the first and last lines with the line breaks visible, and warns when
+    /// pasting would end with Enter. The buttons carry the prompt's nonce and are dim (and do
+    /// nothing) for the first 500 ms.
     fn render_clip_prompt(&self, cx: &mut Context<Self>) -> Option<Div> {
         let p = self.clip_prompt.as_ref()?;
         let th = self.theme;
         let name = self.machine_name(p.machine);
-        let chars = p.text.chars().count();
-        let preview: String = p.text.chars().take(60).map(|c| if c.is_control() { ' ' } else { c }).collect();
+        let nonce = p.nonce;
+        let live = p.shown_at.elapsed() >= crate::clipboard::CLICK_GUARD;
+        let pv = &p.preview;
         let button = |id: &'static str, label: &'static str, primary: bool| {
             div()
                 .id(id)
@@ -706,43 +710,57 @@ impl AppShell {
                 .flex()
                 .items_center()
                 .rounded(px(5.0))
-                .cursor_pointer()
                 .text_size(px(12.5))
                 .border_1()
                 .border_color(alpha(th.border, 1.0))
-                .when(primary, |b| b.bg(alpha(th.accent, 0.25)).border_color(hsla(th.accent)))
-                .hover(move |s| s.bg(alpha(th.hover, 1.0)))
+                .when(!live, |b| b.opacity(0.45))
+                .when(live, |b| {
+                    b.cursor_pointer()
+                        .when(primary, |b| b.bg(alpha(th.accent, 0.25)).border_color(hsla(th.accent)))
+                        .hover(move |s| s.bg(alpha(th.hover, 1.0)))
+                })
                 .child(label)
         };
+        let mono = |t: String| {
+            div().text_size(px(12.0)).font_family("Cascadia Mono").text_color(hsla(th.fg)).truncate().child(SharedString::from(t))
+        };
+        let mut panel = div()
+            .absolute()
+            .bottom(px(16.0))
+            .right(px(16.0))
+            .w(px(420.0).min(px(self.viewport.0 - 32.0)))
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .p(px(12.0))
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(alpha(th.border, 1.0))
+            .bg(alpha(blend(th.chrome, th.bg, 0.2), 0.98))
+            .shadow_lg()
+            .text_color(hsla(th.fg))
+            .child(div().text_size(px(13.0)).child(SharedString::from(format!(
+                "A program on {name} wants to copy {} line{} ({} bytes) to your clipboard.",
+                pv.lines,
+                if pv.lines == 1 { "" } else { "s" },
+                pv.bytes
+            ))));
+        for l in &pv.head {
+            panel = panel.child(mono(l.clone()));
+        }
+        if pv.hidden > 0 {
+            panel = panel.child(div().text_size(px(12.0)).text_color(hsla(th.dim)).child(SharedString::from(format!("... {} more lines ...", pv.hidden))));
+        }
+        for l in &pv.tail {
+            panel = panel.child(mono(l.clone()));
+        }
+        if pv.ends_with_enter {
+            panel = panel.child(
+                div().text_size(px(12.5)).font_weight(FontWeight::SEMIBOLD).text_color(hsla(th.accent)).child("Ends with Enter: pasting it runs a command"),
+            );
+        }
         Some(
-            div()
-                .absolute()
-                .bottom(px(16.0))
-                .right(px(16.0))
-                .w(px(380.0).min(px(self.viewport.0 - 32.0)))
-                .flex()
-                .flex_col()
-                .gap(px(8.0))
-                .p(px(12.0))
-                .rounded(px(8.0))
-                .border_1()
-                .border_color(alpha(th.border, 1.0))
-                .bg(alpha(blend(th.chrome, th.bg, 0.2), 0.98))
-                .shadow_lg()
-                .text_color(hsla(th.fg))
-                .child(
-                    div().text_size(px(13.0)).child(SharedString::from(format!(
-                        "A program on {name} wants to copy {chars} characters to your clipboard."
-                    ))),
-                )
-                .child(
-                    div()
-                        .text_size(px(12.0))
-                        .font_family("Cascadia Mono")
-                        .text_color(hsla(th.dim))
-                        .truncate()
-                        .child(SharedString::from(preview)),
-                )
+            panel
                 .child(div().text_size(px(12.0)).text_color(hsla(th.dim)).child("Your answer is kept for this machine."))
                 .child(
                     div()
@@ -750,8 +768,8 @@ impl AppShell {
                         .flex_row()
                         .gap(px(8.0))
                         .justify_end()
-                        .child(button("clip-deny", "Deny", false).on_mouse_down(MouseButton::Left, cx.listener(|s, _e, _w, cx| s.clip_answer(false, cx))))
-                        .child(button("clip-allow", "Allow", true).on_mouse_down(MouseButton::Left, cx.listener(|s, _e, _w, cx| s.clip_answer(true, cx)))),
+                        .child(button("clip-deny", "Deny", false).on_mouse_down(MouseButton::Left, cx.listener(move |s, _e, _w, cx| s.clip_answer(false, nonce, cx))))
+                        .child(button("clip-allow", "Allow", true).on_mouse_down(MouseButton::Left, cx.listener(move |s, _e, _w, cx| s.clip_answer(true, nonce, cx)))),
                 ),
         )
     }
@@ -807,8 +825,26 @@ impl AppShell {
                             .border_color(alpha(th.border, 1.0))
                             .text_color(hsla(th.dim))
                             .text_size(px(12.5))
-                            .child("Copy the text and it is picked up here, or press Ctrl+V"),
+                            .child("Copy the text and it is offered here, or press Ctrl+V"),
                     )
+                    .children(d.prefill.as_ref().map(|(_, o)| {
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(4.0))
+                            .p(px(10.0))
+                            .rounded(px(5.0))
+                            .border_1()
+                            .border_color(hsla(th.accent))
+                            .child(line("Found on the clipboard:".into(), true))
+                            .child(row("Machine", o.machine.clone()))
+                            .child(row("Node ID", format!("{}...", o.node_short)))
+                            .child(
+                                div().flex().flex_row().justify_end().child(
+                                    button("pair-use", "Pair", true).on_mouse_down(MouseButton::Left, cx.listener(|s, _e, _w, cx| s.pair_use_prefill(cx))),
+                                ),
+                            )
+                    }))
                     .child(
                         div()
                             .flex()
@@ -822,7 +858,22 @@ impl AppShell {
                 body = body
                     .child(line("Pair with this machine?".into(), true))
                     .child(row("Machine", o.machine.clone()))
-                    .child(row("Node ID", format!("{}...", o.node_short)))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap(px(10.0))
+                            .child(div().w(px(76.0)).flex_none().text_size(px(12.5)).text_color(hsla(th.dim)).child("Node ID"))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_size(px(13.0))
+                                    .font_family("Cascadia Mono")
+                                    .child(SharedString::from(o.node_grouped.clone())),
+                            ),
+                    )
+                    .child(line("Compare the Node ID with `forgetty pair` on the server. If it differs, cancel.".into(), true))
                     .child(row("Relay", if o.relay.is_empty() { "none".to_string() } else { o.relay.clone() }))
                     .child(line("Pairing gives this PC full access to the sessions on that machine.".into(), false))
                     .child(

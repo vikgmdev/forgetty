@@ -50,14 +50,22 @@ CI: `.github/workflows/windows-client.yml` (branch `v3/win-spike`).
   NOTE: libghostty-vt counts `max_scrollback` in BYTES. `Terminal::new` passes 10_000, which keeps
   only about 1000 rows. The GTK client has the same limit.
 
-## IME (out of scope for the spike)
+## IME
 
 GPUI exposes the Windows IME (TSF/IMM) path through `Window::handle_input` with an
 `ElementInputHandler` over an `EntityInputHandler` (`replace_text_in_range`,
-`replace_and_mark_text_in_range`, `marked_text_range`, `bounds_for_range`, ...). See
-`crates/gpui/examples/input.rs` in the Zed repo. The terminal element would register that
-handler in `paint` and report the cursor cell via `bounds_for_range` so the candidate window
-anchors at the cursor. Marked text can be drawn with `UnderlineStyle`.
+`replace_and_mark_text_in_range`, `marked_text_range`, `bounds_for_range`, ...). `TerminalView`
+implements it (`view.rs`): the preedit is drawn underlined at the cursor cell, `bounds_for_range`
+anchors the candidate window on that cell, commit sends the text once as typed input, cancel
+sends nothing. The smoke checks all of this at the handler level (`ime_*`). A real Japanese or
+Chinese IME on the hosted runner is probed by the `ime-probe` job (`ci/ime-probe.ps1`,
+artifact `ime-probe`). What it finds is in the task report. The on-screen test with a real IME
+is in `docs/manual-tests.md` (A4).
+
+## Manual tests
+
+`docs/manual-tests.md`: a one-time run (install, pairing, OSC 52, IME, Win-key chords, wifi to
+tether, sleep and resume, mixed-DPI monitors) and a checklist for a week of daily use.
 
 ## App shell (W2)
 
@@ -134,8 +142,12 @@ The same shell now talks to real servers over protocol v2 (`docs/architecture/PR
   (`connected`, `connecting`, `reconnecting` after 1 s, `offline`). The shell keeps the machine on
   screen in its own fields and parks the others (`machines.rs`), so every machine keeps receiving
   events (status, notifications, layout) while it is not shown.
-- Pairing: command palette "Pair machine..." (or the sidebar link) opens a dialog. Paste the text
-  `forgetty pair` prints (the QR payload JSON may sit among other lines). A confirm step shows the
+- Pairing: command palette "Pair machine..." (or the sidebar link) opens a dialog. Pairing is by
+  paste only (no camera). Copy the whole output of `forgetty pair`: while the dialog is open the
+  clipboard is watched (every 400 ms, each text judged once) and a payload is only OFFERED in the
+  dialog (the user presses Pair, then Confirm), or press Ctrl+V. The QR block and
+  other lines around the payload JSON are fine (`store::find_payload` picks the first valid
+  payload object; up to 64 KiB). A confirm step shows the
   machine name, the first 8 characters of the node id and the relay. Nothing is contacted before
   Confirm. `store::parse_offer` strips control characters and bounds lengths.
 - Storage in `%APPDATA%\forgetty\` (`FORGETTY_DATA_DIR` overrides): `identity.key`, `client_id`,
@@ -236,6 +248,29 @@ for the newest `win-v<major>.<minor>.<patch>` release. If one is newer, the
 sidebar says so, and a click opens its page in the browser. Nothing is
 downloaded or installed by the app. No telemetry: the request carries only a
 `User-Agent: forgetty-win/<version>`.
+
+## Clipboard writes from programs (OSC 52)
+
+Write only. A program can set the Windows clipboard with `ESC ] 52 ; c ; <base64> BEL`.
+libghostty-vt does not surface OSC 52, so `TerminalView` scans the byte stream itself
+(`shell-core/src/osc52.rs`, a scanner that survives split reads and keeps bounded memory).
+
+- Policy per machine: `off`, `ask` (default), `allow`, kept in `%APPDATA%\forgetty\osc52.json`.
+  Palette: "Clipboard writes from programs on this machine: off / ask / allow".
+- `ask`: a non-modal prompt at the bottom right (Allow, Deny) the first time. The answer is
+  stored as `allow` or `off` for that machine. The prompt shows the line count and size, the first
+  and last 3 lines (line breaks as a return symbol, tabs as an arrow) and warns when the text ends
+  with Enter. While a prompt shows, new requests from any machine are dropped (and counted); the
+  buttons carry a nonce and ignore clicks in the first 500 ms.
+- The pair dialog never takes a clipboard text on its own: a pairing offer on the clipboard is shown
+  with a Pair button, and the confirm step shows the whole node id in groups of 8. Text that our own
+  OSC 52 path put on the clipboard (clipboard change counter, `GetClipboardSequenceNumber`) is ignored.
+- A request to read the clipboard (`?`) is never answered. Text over 1 MiB (decoded) is dropped.
+  The text is cleaned like a paste: C0 controls other than TAB, CR and LF, DEL, C1 controls and
+  bidi controls are removed.
+- Replayed output (after a reset or reconnect) never writes the clipboard.
+- Smoke checks `osc52_*` (view to shell to clipboard) and `ime_*`; `toast_reaches_action_center`
+  reads `ToastNotificationManager::History()` for the app and finds every toast the shell asked for.
 
 ## Smoke mode
 

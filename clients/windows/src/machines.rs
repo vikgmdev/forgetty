@@ -104,6 +104,9 @@ pub struct PairDialog {
     pub stage: PairStage,
     /// What was pasted, as typed (never shown in full).
     pub raw: String,
+    /// A pairing offer found on the clipboard while the dialog waits. It is only SHOWN: the user
+    /// presses Pair to review it. The watcher never moves the dialog on by itself.
+    pub prefill: Option<(String, store::PairingOffer)>,
 }
 
 impl AppShell {
@@ -532,7 +535,7 @@ impl AppShell {
 
     pub fn open_pair(&mut self, cx: &mut Context<Self>) {
         self.palette = None;
-        self.pair = Some(PairDialog { stage: PairStage::Input, raw: String::new() });
+        self.pair = Some(PairDialog { stage: PairStage::Input, raw: String::new(), prefill: None });
         self.pair_clip_seen = None;
         // While the dialog is open, a pairing payload that lands on the clipboard (the user
         // copied the output of `forgetty pair`) is taken without a paste.
@@ -547,9 +550,13 @@ impl AppShell {
         cx.notify();
     }
 
-    /// One look at the clipboard for the pair dialog. `false` once the dialog is gone. Only a
-    /// text that parses as a pairing payload is taken, and only while the dialog waits for
-    /// text. Nothing is contacted until the user confirms.
+    /// One look at the clipboard for the pair dialog. `false` once the dialog is gone. A text that
+    /// parses as a pairing payload is only OFFERED in the dialog (`prefill`): the user presses
+    /// Pair, then Confirm. The watcher never submits.
+    ///
+    /// Text that our own OSC 52 path put on the clipboard is ignored: a program in a pane could
+    /// otherwise plant an offer for a server of its own. That is checked by the clipboard change
+    /// counter (the number right after our write) and by the text itself.
     pub fn pair_clipboard_tick(&mut self, cx: &mut Context<Self>) -> bool {
         match &self.pair {
             None => return false,
@@ -561,11 +568,23 @@ impl AppShell {
             return true;
         }
         self.pair_clip_seen = Some(text.clone());
-        if store::parse_offer(&text).is_ok() {
+        if self.clipboard_is_from_osc52(&text) {
+            return true;
+        }
+        if let Ok(offer) = store::parse_offer(&text) {
             let t: String = text.chars().take(65536).collect();
-            self.pair_submit_text(&t, cx);
+            if let Some(d) = self.pair.as_mut() {
+                d.prefill = Some((t, offer));
+            }
+            cx.notify();
         }
         true
+    }
+
+    /// The user pressed Pair on the offered text: review it (still nothing contacted).
+    pub fn pair_use_prefill(&mut self, cx: &mut Context<Self>) {
+        let Some(text) = self.pair.as_mut().and_then(|d| d.prefill.take()).map(|(t, _)| t) else { return };
+        self.pair_submit_text(&text, cx);
     }
 
     /// The pasted text: parse it and ask for confirmation. Nothing is contacted.
@@ -579,7 +598,7 @@ impl AppShell {
                 d.raw = text.to_string();
                 d.stage = stage;
             }
-            None => self.pair = Some(PairDialog { stage, raw: text.to_string() }),
+            None => self.pair = Some(PairDialog { stage, raw: text.to_string(), prefill: None }),
         }
         cx.notify();
     }

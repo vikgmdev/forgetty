@@ -130,6 +130,8 @@ pub struct W3 {
     exe: PathBuf,
     args: Vec<String>,
     node_id: String,
+    /// The payload of `forgetty pair` as the test server printed it.
+    qr_text: String,
     local_id: Option<Uuid>,
     remote_id: Option<Uuid>,
     panes: Vec<PaneId>,
@@ -215,6 +217,7 @@ impl ShellSmoke {
                         fail("test server printed READY without NODE_ID, ADDR and QR");
                     };
                     self.w3.node_id = node.clone();
+                    self.w3.qr_text = qr.clone();
                     self.w3.local_id = Some(shell.machine.id);
                     self.w3.t_start = Some(Instant::now());
                     record("test_server_addr", json!(addr));
@@ -235,8 +238,14 @@ impl ShellSmoke {
                     )));
                     shell.pair_clip_seen = None;
                     let more = shell.pair_clipboard_tick(cx);
-                    let taken = matches!(shell.pair.as_ref().map(|d| &d.stage), Some(PairStage::Confirm(o)) if o.machine == "ci-remote");
-                    check("pair_clipboard_watch_takes_pair_output", more && taken);
+                    // The watcher only offers it: the dialog stays at the input step.
+                    let offered = matches!(shell.pair.as_ref(), Some(d) if matches!(d.stage, PairStage::Input) && d.prefill.as_ref().is_some_and(|(_, o)| o.machine == "ci-remote"));
+                    check("pair_clipboard_watch_offers_pair_output", more && offered);
+                    // The user presses Pair: now the confirm step shows, with the whole node id.
+                    shell.pair_use_prefill(cx);
+                    let taken = matches!(shell.pair.as_ref().map(|d| &d.stage), Some(PairStage::Confirm(o)) if o.machine == "ci-remote"
+                        && o.node_grouped.replace(' ', "") == node && o.node_grouped.replace(' ', "").len() >= 16);
+                    check("pair_prefill_pair_button_goes_to_confirm", taken);
 
                     // The real payload: parse and show the offer. Nothing is paired yet.
                     shell.pair_hint = addr.parse().ok();
@@ -891,11 +900,13 @@ pub struct W7 {
     machine: uuid::Uuid,
     auto_before: usize,
     denied_sent: u8,
+    nonce: u64,
+    dropped_before: u32,
 }
 
 impl Default for W7 {
     fn default() -> Self {
-        W7 { machine: uuid::Uuid::new_v4(), auto_before: 0, denied_sent: 0 }
+        W7 { machine: uuid::Uuid::new_v4(), auto_before: 0, denied_sent: 0, nonce: 0, dropped_before: 0 }
     }
 }
 
@@ -912,7 +923,7 @@ fn clip_text(cx: &mut Context<AppShell>) -> Option<String> {
 impl ShellSmoke {
     /// OSC 52 through a pane view: the policy per machine (off, ask, allow), the prompt that keeps
     /// its answer, no answer to a read, the 1 MiB cap, a paste-style clean and no effect from
-    /// replayed output. Steps 50 to 59 of the W5 view phase; the spy view is the pane.
+    /// replayed output. Steps 50 to 61 of the W5 view phase; the spy view is the pane.
     fn w7_clipboard(&mut self, shell: &mut AppShell, cx: &mut Context<AppShell>) {
         use forgetty_shell_core::osc52::{encode_base64, Policies, Policy, MAX_BYTES};
         let Some(spy) = self.w5.spy.clone() else { fail("osc52 smoke needs the spy view") };
@@ -936,46 +947,100 @@ impl ShellSmoke {
                 self.sub = 51;
                 self.sub_t0 = Instant::now();
             }
-            // ask: a prompt, nothing copied yet. Allow copies and is remembered.
+            // ask: a prompt, nothing copied yet. A second request while it shows is dropped.
             51 => {
                 if seen(cx).writes < 1 {
                     return;
                 }
                 check("osc52_ask_does_not_copy_before_answer", clip_text(cx).as_deref() == Some("SENTINEL"));
                 check("osc52_ask_shows_prompt", shell.clip_prompt.as_ref().is_some_and(|p| p.machine == m && p.text == "first"));
-                shell.clip_answer(true, cx);
+                self.w7.nonce = shell.clip_prompt.as_ref().map(|p| p.nonce).unwrap_or(0);
+                self.w7.dropped_before = shell.clip_stats.dropped_while_prompt;
+                send(PaneEvent::Output(osc52_seq(&encode_base64(b"swap"))));
+                self.sub = 52;
+                self.sub_t0 = Instant::now();
+            }
+            // The swap attempt, a stale nonce and an early click do nothing. A real answer copies.
+            52 => {
+                if seen(cx).writes < 2 {
+                    return;
+                }
+                let Some(p) = shell.clip_prompt.clone() else { fail("osc52: the prompt vanished") };
+                check(
+                    "osc52_prompt_not_swapped_by_later_request",
+                    p.text == "first" && p.nonce == self.w7.nonce && shell.clip_stats.dropped_while_prompt == self.w7.dropped_before + 1,
+                );
+                let ignored_before = shell.clip_stats.answers_ignored;
+                shell.clip_answer_at(true, p.nonce + 1, p.shown_at + Duration::from_millis(600), cx);
+                let stale_ignored = shell.clip_prompt.is_some() && shell.clip_stats.answers_ignored == ignored_before + 1;
+                check("osc52_answer_with_wrong_nonce_ignored", stale_ignored);
+                shell.clip_answer_at(true, p.nonce, p.shown_at + Duration::from_millis(100), cx);
+                let early_ignored = shell.clip_prompt.is_some() && shell.clip_stats.answers_ignored == ignored_before + 2;
+                check("osc52_click_in_first_500ms_ignored", early_ignored && clip_text(cx).as_deref() == Some("SENTINEL"));
+                shell.clip_answer_at(true, p.nonce, p.shown_at + Duration::from_millis(600), cx);
                 check("osc52_allow_copies", clip_text(cx).as_deref() == Some("first"));
                 check("osc52_answer_remembered", shell.osc52.get(&m.to_string()) == Policy::Allow && shell.clip_prompt.is_none());
                 let on_disk = shell.remote.as_ref().map(|r| Policies::open(r.store.dir()).get(&m.to_string()));
                 check("osc52_answer_persisted", on_disk == Some(Policy::Allow));
                 send(PaneEvent::Output(osc52_seq(&encode_base64(b"second"))));
-                self.sub = 52;
-                self.sub_t0 = Instant::now();
-            }
-            // allow: no prompt the second time.
-            52 => {
-                if seen(cx).writes < 2 {
-                    return;
-                }
-                check("osc52_allow_needs_no_prompt", shell.clip_prompt.is_none() && clip_text(cx).as_deref() == Some("second"));
-                shell.set_clip_policy(m, Policy::Off, None, cx);
-                send(PaneEvent::Output(osc52_seq(&encode_base64(b"third"))));
                 self.sub = 53;
                 self.sub_t0 = Instant::now();
             }
-            // off: dropped.
+            // allow: no prompt the second time. Then a pairing offer arrives through OSC 52
+            // while the pair dialog is open.
             53 => {
                 if seen(cx).writes < 3 {
+                    return;
+                }
+                check("osc52_allow_needs_no_prompt", shell.clip_prompt.is_none() && clip_text(cx).as_deref() == Some("second"));
+                shell.open_pair(cx);
+                let offer = format!("Scan or paste:\npayload: {}\n", self.w3.qr_text);
+                send(PaneEvent::Output(osc52_seq(&encode_base64(offer.as_bytes()))));
+                self.sub = 54;
+                self.sub_t0 = Instant::now();
+            }
+            54 => {
+                // The dialog's own watcher ticks every 400 ms: give it time, then tick by hand.
+                if seen(cx).writes < 4 || self.sub_t0.elapsed() < Duration::from_millis(900) {
+                    return;
+                }
+                let on_clip = clip_text(cx).is_some_and(|t| t.contains("payload:"));
+                shell.pair_clipboard_tick(cx);
+                let (input, prefilled) = match shell.pair.as_ref() {
+                    Some(d) => (matches!(d.stage, PairStage::Input), d.prefill.is_some()),
+                    None => (false, false),
+                };
+                check("osc52_pairing_offer_reaches_clipboard", on_clip);
+                check("osc52_offer_not_submitted_or_prefilled", input && !prefilled);
+                // The user copies the same text themself: it is offered (prefilled), never submitted.
+                let user_text = format!("copied by the user\npayload: {}\n", self.w3.qr_text);
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(user_text));
+                shell.pair_clipboard_tick(cx);
+                let (input, prefilled) = match shell.pair.as_ref() {
+                    Some(d) => (matches!(d.stage, PairStage::Input), d.prefill.as_ref().is_some_and(|(_, o)| o.machine == "ci-remote")),
+                    None => (false, false),
+                };
+                check("pair_user_copy_is_offered_not_submitted", input && prefilled);
+                shell.pair_cancel(cx);
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string("second".to_string()));
+                shell.set_clip_policy(m, Policy::Off, None, cx);
+                send(PaneEvent::Output(osc52_seq(&encode_base64(b"third"))));
+                self.sub = 55;
+                self.sub_t0 = Instant::now();
+            }
+            // off: dropped.
+            55 => {
+                if seen(cx).writes < 5 {
                     return;
                 }
                 check("osc52_off_drops", clip_text(cx).as_deref() == Some("second") && shell.clip_prompt.is_none());
                 shell.set_clip_policy(m, Policy::Allow, None, cx);
                 // A read is never answered, and even `allow` does not make it a write.
                 send(PaneEvent::Output(b"\x1b]52;c;?\x1b\\".to_vec()));
-                self.sub = 54;
+                self.sub = 56;
                 self.sub_t0 = Instant::now();
             }
-            54 => {
+            56 => {
                 if seen(cx).reads_denied < 1 {
                     return;
                 }
@@ -986,47 +1051,47 @@ impl ShellSmoke {
                 check("osc52_read_never_answered", self.w5.log.lock().unwrap().len() == self.w7.auto_before && clip_text(cx).as_deref() == Some("second"));
                 // More than 1 MiB is dropped, exactly 1 MiB is not.
                 send(PaneEvent::Output(osc52_seq(&encode_base64(&vec![b'a'; MAX_BYTES + 1]))));
-                self.sub = 55;
+                self.sub = 57;
                 self.sub_t0 = Instant::now();
             }
-            55 => {
+            57 => {
                 if seen(cx).too_large < 1 {
                     return;
                 }
                 check("osc52_over_1mib_dropped", clip_text(cx).as_deref() == Some("second"));
                 send(PaneEvent::Output(osc52_seq(&encode_base64(&vec![b'b'; MAX_BYTES]))));
-                self.sub = 56;
+                self.sub = 58;
                 self.sub_t0 = Instant::now();
             }
-            56 => {
-                if seen(cx).writes < 4 {
+            58 => {
+                if seen(cx).writes < 6 {
                     return;
                 }
                 check("osc52_exactly_1mib_copied", clip_text(cx).is_some_and(|t| t.len() == MAX_BYTES));
-                // Sanitized like a paste: escapes and bells go, line breaks stay.
+                // Cleaned like a paste: escapes and bells go, line breaks stay.
                 send(PaneEvent::Output(osc52_seq(&encode_base64(b"ls\x1b[31m\x07 -la\r\nok\x7f"))));
-                self.sub = 57;
+                self.sub = 59;
                 self.sub_t0 = Instant::now();
             }
-            57 => {
-                if seen(cx).writes < 5 {
+            59 => {
+                if seen(cx).writes < 7 {
                     return;
                 }
                 check("osc52_text_sanitized_like_paste", clip_text(cx).as_deref() == Some("ls[31m -la\r\nok"));
                 // A replay (after a reset) re-runs old output: it must not touch the clipboard.
                 send(PaneEvent::Reset { rows: 10, cols: 40, exact_replay: false });
                 send(PaneEvent::Output(osc52_seq(&encode_base64(b"from a replay"))));
-                self.sub = 58;
+                self.sub = 60;
                 self.sub_t0 = Instant::now();
             }
-            58 => {
+            60 => {
                 if seen(cx).replayed < 1 {
                     return;
                 }
-                check("osc52_replay_does_not_copy", clip_text(cx).as_deref() == Some("ls[31m -la\r\nok") && seen(cx).writes == 5);
+                check("osc52_replay_does_not_copy", clip_text(cx).as_deref() == Some("ls[31m -la\r\nok") && seen(cx).writes == 7);
                 // Back to ask. The replay ends when the channel drains: then output is live again.
                 shell.set_clip_policy(m, Policy::Ask, None, cx);
-                self.sub = 59;
+                self.sub = 61;
                 self.sub_t0 = Instant::now();
             }
             _ => {
@@ -1035,17 +1100,118 @@ impl ShellSmoke {
                 }
                 if self.w7.denied_sent == 0 {
                     self.w7.denied_sent = 1;
-                    send(PaneEvent::Output(osc52_seq(&encode_base64(b"deny me"))));
+                    send(PaneEvent::Output(osc52_seq(&encode_base64(b"echo hi\n"))));
                     return;
                 }
-                if seen(cx).writes < 6 {
+                if seen(cx).writes < 8 {
                     return;
                 }
-                check("osc52_ask_prompts_again_after_reset_to_ask", shell.clip_prompt.as_ref().is_some_and(|p| p.text == "deny me"));
-                shell.clip_answer(false, cx);
+                // The prompt shows what the text will do: size, lines, and the Enter at the end.
+                let pv = shell.clip_prompt.as_ref().map(|p| p.preview.clone());
+                check(
+                    "osc52_prompt_flags_trailing_enter",
+                    pv.as_ref().is_some_and(|p| p.ends_with_enter && p.lines == 1 && p.bytes == 8 && p.head == vec!["echo hi\u{23ce}".to_string()]),
+                );
+                check("osc52_ask_prompts_again_after_reset_to_ask", shell.clip_prompt.as_ref().is_some_and(|p| p.text == "echo hi\n"));
+                let p = shell.clip_prompt.clone().unwrap_or_else(|| fail("osc52: no prompt"));
+                shell.clip_answer_at(false, p.nonce, p.shown_at + Duration::from_millis(600), cx);
                 check("osc52_deny_remembered_as_off", shell.osc52.get(&m.to_string()) == Policy::Off && clip_text(cx).as_deref() == Some("ls[31m -la\r\nok"));
                 let st = shell.clip_stats;
-                record("osc52_stats", json!({"copied": st.copied, "dropped_off": st.dropped_off, "prompted": st.prompted, "too_large": st.too_large, "reads_denied": st.reads_denied}));
+                record(
+                    "osc52_stats",
+                    json!({"copied": st.copied, "dropped_off": st.dropped_off, "prompted": st.prompted, "too_large": st.too_large,
+                           "reads_denied": st.reads_denied, "dropped_while_prompt": st.dropped_while_prompt, "answers_ignored": st.answers_ignored}),
+                );
+                self.sub = 70;
+                self.sub_t0 = Instant::now();
+            }
+        }
+    }
+
+    /// The IME handler (what TSF drives): preedit, commit, cancel, and the candidate window
+    /// anchored on the cursor cell. This is the handler level. A real Japanese or Chinese IME is
+    /// tried by the `ime-probe` step of the workflow. Steps 70 to 72 of the W5 view phase.
+    fn w7_ime(&mut self, window: &mut Window, cx: &mut Context<AppShell>) {
+        use gpui::EntityInputHandler as _;
+        let Some(spy) = self.w5.spy.clone() else { fail("ime smoke needs the spy view") };
+        let Some(tx) = self.w5.tx.clone() else { fail("ime smoke needs the spy channel") };
+        match self.sub {
+            70 => {
+                // The cursor to row 3, column 5 (zero-based 2, 4).
+                let _ = tx.try_send(PaneEvent::Output(b"\x1b[2J\x1b[3;5H".to_vec()));
+                self.sub = 71;
+                self.sub_t0 = Instant::now();
+            }
+            71 => {
+                if spy.read(cx).term.cursor() != (2, 4) {
+                    return;
+                }
+                let sent_before = self.w5.log.lock().unwrap().len();
+                let (cw, lh) = {
+                    let m = &spy.read(cx).metrics;
+                    (f32::from(m.cell_w), f32::from(m.line_h))
+                };
+                let origin = gpui::point(gpui::px(100.0), gpui::px(50.0));
+                let eb = gpui::Bounds::new(origin, gpui::size(gpui::px(600.0), gpui::px(300.0)));
+                let near = |a: gpui::Pixels, b: f32| (f32::from(a) - b).abs() < 0.01;
+                let mut cand_ok = true;
+                let mut ranges_ok = true;
+                // Composition grows: each step replaces the preedit.
+                for (text, cells, units) in [("\u{306b}", 2usize, 1usize), ("\u{306b}\u{307b}", 4, 2), ("\u{306b}\u{307b}\u{3093}", 6, 3), ("\u{20bb7}a", 3, 3)] {
+                    let b = spy.update(cx, |v, cx| {
+                        v.replace_and_mark_text_in_range(None, text, None, window, cx);
+                        let r = v.marked_text_range(window, cx);
+                        ranges_ok &= r == Some(0..units);
+                        ranges_ok &= v.selected_text_range(false, window, cx).map(|s| s.range) == Some(units..units);
+                        v.bounds_for_range(0..units, eb, window, cx)
+                    });
+                    match b {
+                        Some(b) => {
+                            cand_ok &= near(b.origin.x, 100.0 + cw * 4.0)
+                                && near(b.origin.y, 50.0 + lh * 2.0)
+                                && near(b.size.width, cw * cells as f32)
+                                && near(b.size.height, lh);
+                        }
+                        None => cand_ok = false,
+                    }
+                }
+                check("ime_composition_marks_preedit", ranges_ok);
+                check("ime_candidate_window_at_cursor_cell", cand_ok);
+                check("ime_composition_sends_nothing", self.w5.log.lock().unwrap().len() == sent_before);
+                // Cancel (Esc in the IME): the preedit goes, nothing is sent.
+                spy.update(cx, |v, cx| v.unmark_text(window, cx));
+                check("ime_cancel_clears_preedit", spy.read(cx).marked.is_none() && self.w5.log.lock().unwrap().len() == sent_before);
+                // Commit: the composed text goes to the pane once, as typed input (not auto).
+                spy.update(cx, |v, cx| {
+                    v.replace_and_mark_text_in_range(None, "\u{306b}\u{307b}\u{3093}", None, window, cx);
+                    v.replace_text_in_range(None, "\u{65e5}\u{672c}\u{8a9e}", window, cx);
+                });
+                let log = self.w5.log.lock().unwrap().clone();
+                let last = log.last().cloned();
+                check("ime_commit_sends_text_once", log.len() == sent_before + 1 && last == Some((false, "\u{65e5}\u{672c}\u{8a9e}".as_bytes().to_vec())));
+                check("ime_commit_clears_preedit", spy.read(cx).marked.is_none());
+                // With the cursor on the last column the candidate window is still placed at the cell.
+                let _ = tx.try_send(PaneEvent::Output(b"\x1b[1;40H".to_vec()));
+                self.sub = 72;
+                self.sub_t0 = Instant::now();
+            }
+            _ => {
+                if spy.read(cx).term.cursor() != (0, 39) {
+                    return;
+                }
+                let (cw, lh) = {
+                    let m = &spy.read(cx).metrics;
+                    (f32::from(m.cell_w), f32::from(m.line_h))
+                };
+                let eb = gpui::Bounds::new(gpui::point(gpui::px(0.0), gpui::px(0.0)), gpui::size(gpui::px(400.0), gpui::px(200.0)));
+                let b = spy.update(cx, |v, cx| {
+                    v.replace_and_mark_text_in_range(None, "\u{3042}", None, window, cx);
+                    let b = v.bounds_for_range(0..1, eb, window, cx);
+                    v.unmark_text(window, cx);
+                    b
+                });
+                let ok = b.is_some_and(|b| (f32::from(b.origin.x) - cw * 39.0).abs() < 0.01 && f32::from(b.origin.y).abs() < 0.01 && f32::from(b.size.height) == lh);
+                check("ime_candidate_window_last_column", ok);
                 self.w5.spy = None;
                 self.w5.tx = None;
                 self.sub = 9;
@@ -1250,7 +1416,8 @@ impl ShellSmoke {
                 self.sub_t0 = Instant::now();
             }
             // ---- OSC 52 (a program sets the clipboard): write only, per machine ----------------
-            50..=59 => self.w7_clipboard(shell, cx),
+            50..=61 => self.w7_clipboard(shell, cx),
+            70..=72 => self.w7_ime(window, cx),
             // Real keys through SendInput: does the injection reach the pane at all?
             9 => {
                 let Some(pane) = shell.active_pane() else { return };

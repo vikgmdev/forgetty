@@ -171,6 +171,10 @@ pub struct AppShell {
     /// Per-machine OSC 52 (clipboard write) policy and the prompt that waits for an answer.
     pub osc52: forgetty_shell_core::osc52::Policies,
     pub clip_prompt: Option<crate::clipboard::ClipPrompt>,
+    pub clip_nonce: u64,
+    /// The clipboard change counter and text right after our last OSC 52 write.
+    pub osc52_clip_seq: Option<u32>,
+    pub osc52_last_text: Option<String>,
     pub clip_stats: crate::clipboard::ClipStats,
     pub toast_log: Vec<ToastRecord>,
     /// "Check for updates": idle until the user asks.
@@ -266,6 +270,9 @@ impl AppShell {
             toast_limiter: ToastLimiter::default(),
             osc52: forgetty_shell_core::osc52::Policies::memory(),
             clip_prompt: None,
+            clip_nonce: 0,
+            osc52_clip_seq: None,
+            osc52_last_text: None,
             clip_stats: Default::default(),
             toast_log: Vec::new(),
             update: crate::update::UpdateState::Idle,

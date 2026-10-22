@@ -199,6 +199,8 @@ pub struct PairingOffer {
     pub machine: String,
     /// First 8 characters of the node id.
     pub node_short: String,
+    /// The whole node id in groups of 8, to compare with what `forgetty pair` prints.
+    pub node_grouped: String,
     /// Relay URLs as shown, joined with ", " (each at most 96 chars; empty
     /// means none).
     pub relay: String,
@@ -232,6 +234,12 @@ fn find_payload(text: &str) -> Result<QrPayload, String> {
     Err(first_err.unwrap_or_else(|| "No pairing payload found. Paste the text that `forgetty pair` prints.".into()))
 }
 
+/// `abcdefghij` in groups of 4 becomes `abcd efgh ij`.
+pub fn group_id(id: &str, n: usize) -> String {
+    let chars: Vec<char> = id.chars().filter(|c| !c.is_control() && !c.is_whitespace()).collect();
+    chars.chunks(n).map(|c| c.iter().collect::<String>()).collect::<Vec<_>>().join(" ")
+}
+
 /// Parse the text `forgetty pair` prints (the QR payload JSON, possibly with
 /// other lines around it). Nothing is contacted.
 pub fn parse_offer(text: &str) -> Result<PairingOffer, String> {
@@ -248,6 +256,7 @@ pub fn parse_offer(text: &str) -> Result<PairingOffer, String> {
     let relays = qr.relay_urls();
     Ok(PairingOffer {
         node_short: qr.node_id.chars().take(8).collect(),
+        node_grouped: group_id(&qr.node_id, 8),
         relay: relays.iter().map(|r| clean(r, 96)).collect::<Vec<_>>().join(", "),
         relays,
         machine,
@@ -330,6 +339,7 @@ mod tests {
         let o = parse_offer(&text).unwrap();
         assert_eq!(o.machine, "build-box");
         assert_eq!(o.node_short, n[..8]);
+        assert!(o.node_grouped.replace(' ', "") == n && o.node_grouped.split(' ').all(|g| g.len() <= 8));
         assert_eq!(o.relay, "https://relay.example.com/");
     }
 

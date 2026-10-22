@@ -2,8 +2,11 @@
 //!
 //! - `Scanner` finds `ESC ] 52 ; <selection> ; <base64> (BEL | ESC \)` in a pane's output. Sequences
 //!   may be split across reads. A query (`?`) is a read: it is counted and never answered.
-//! - The text is capped at `MAX_BYTES` and cleaned like a paste (control characters removed), so
-//!   what lands on the clipboard cannot run commands when it is pasted later.
+//! - The text is capped at `MAX_BYTES` and cleaned like a paste: escapes, other control characters,
+//!   DEL, C1 and bidi controls are removed. Line breaks (CR, LF) and tabs STAY, so text with a line
+//!   break can still run a command when it is pasted into a shell. That is why the "ask" prompt
+//!   shows the size, the line count, the first and last lines with the breaks visible, and a warning
+//!   when the text ends with Enter (`preview`).
 //! - `Policies` is the per-machine choice: `Off`, `Ask` (the default) or `Allow`. It is kept in a
 //!   small JSON file next to the paired machines.
 
@@ -201,6 +204,47 @@ pub fn encode_base64(s: &[u8]) -> String {
     o
 }
 
+/// What the "ask" prompt shows, so a copy request cannot hide what it will paste.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Preview {
+    pub bytes: usize,
+    pub lines: usize,
+    /// The first 3 lines, with line breaks as `\u{23ce}` and tabs as `\u{2192}`.
+    pub head: Vec<String>,
+    /// The last 3 lines (empty when `head` already shows every line).
+    pub tail: Vec<String>,
+    /// Lines between `head` and `tail`.
+    pub hidden: usize,
+    /// Pasting this ends with Enter: a shell runs it at once.
+    pub ends_with_enter: bool,
+}
+
+const PREVIEW_LINE_CHARS: usize = 100;
+
+pub fn preview(text: &str) -> Preview {
+    let norm = text.replace("\r\n", "\n").replace('\r', "\n");
+    let shown = |l: &str| -> String {
+        let broke = l.ends_with('\n');
+        let body = l.trim_end_matches('\n');
+        let mut s: String = body.chars().map(|c| if c == '\t' { '\u{2192}' } else { c }).take(PREVIEW_LINE_CHARS).collect();
+        if body.chars().count() > PREVIEW_LINE_CHARS {
+            s.push('\u{2026}');
+        }
+        if broke {
+            s.push('\u{23ce}');
+        }
+        s
+    };
+    let all: Vec<&str> = norm.split_inclusive('\n').collect();
+    let lines = all.len();
+    let (head, tail, hidden) = if lines <= 6 {
+        (all.iter().map(|l| shown(l)).collect(), Vec::new(), 0)
+    } else {
+        (all[..3].iter().map(|l| shown(l)).collect(), all[lines - 3..].iter().map(|l| shown(l)).collect(), lines - 6)
+    };
+    Preview { bytes: text.len(), lines, head, tail, hidden, ends_with_enter: norm.ends_with('\n') }
+}
+
 fn decode_base64(data: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(data.len() / 4 * 3);
     let (mut acc, mut bits) = (0u32, 0u32);
@@ -341,6 +385,26 @@ mod tests {
         assert!(s.feed(&osc("c", "", "\x07")).is_empty());
         // And the scanner still works after all that.
         assert_eq!(s.feed(&osc("c", &b64(b"ok"), "\x07")).len(), 1);
+    }
+
+    #[test]
+    fn preview_shows_breaks_size_and_a_trailing_enter() {
+        let p = preview("ls -la\n");
+        assert_eq!((p.lines, p.bytes, p.ends_with_enter), (1, 7, true));
+        assert_eq!(p.head, vec!["ls -la\u{23ce}".to_string()]);
+        let p = preview("a\tb\r\nc");
+        assert_eq!((p.lines, p.ends_with_enter), (2, false));
+        assert_eq!(p.head, vec!["a\u{2192}b\u{23ce}".to_string(), "c".to_string()]);
+        let many: String = (1..=10).map(|i| format!("l{i}\n")).collect();
+        let p = preview(&many);
+        assert_eq!((p.lines, p.hidden), (10, 4));
+        assert_eq!(p.head.len(), 3);
+        assert_eq!(p.tail.last().map(String::as_str), Some("l10\u{23ce}"));
+        assert!(p.ends_with_enter);
+        // A lone CR is Enter too.
+        assert!(preview("x\r").ends_with_enter);
+        // A long line is cut for display only.
+        assert!(preview(&"y".repeat(500)).head[0].chars().count() <= PREVIEW_LINE_CHARS + 1);
     }
 
     #[test]

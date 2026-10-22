@@ -98,6 +98,12 @@ fn xml_escape(s: &str) -> String {
     o
 }
 
+/// The clipboard change counter. It goes up with every change of the clipboard, by any program.
+/// 0 where there is no such counter.
+pub fn clipboard_sequence() -> u32 {
+    imp::clipboard_sequence()
+}
+
 /// What the Action Center holds for this app: `(launch argument, title)` of each toast.
 /// The smoke uses it to see that a toast really arrived, not only that one was requested.
 pub fn action_center() -> Result<Vec<(String, String)>, String> {
@@ -242,6 +248,10 @@ mod imp {
         Ok(toast)
     }
 
+    pub fn clipboard_sequence() -> u32 {
+        unsafe { windows::Win32::System::DataExchange::GetClipboardSequenceNumber() }
+    }
+
     pub fn history() -> Result<Vec<(String, String)>, String> {
         let run = || -> windows::core::Result<Vec<(String, String)>> {
             let list = ToastNotificationManager::History()?.GetHistoryWithId(&HSTRING::from(AUMID))?;
@@ -295,6 +305,10 @@ mod imp {
 #[cfg(not(windows))]
 mod imp {
     use super::*;
+
+    pub fn clipboard_sequence() -> u32 {
+        0
+    }
 
     pub fn history() -> Result<Vec<(String, String)>, String> {
         Err("not Windows".into())
