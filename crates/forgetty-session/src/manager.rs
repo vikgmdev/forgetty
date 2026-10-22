@@ -1916,23 +1916,34 @@ impl SessionManager {
     /// What every pane's input queue, writer thread, PTY reader and child
     /// are doing. Panes with an empty queue are included.
     pub fn input_reports(&self) -> Vec<crate::input_watch::InputReport> {
-        let mut out = Vec::new();
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let inner = &mut *inner;
-        for (id, pane) in inner.panes.iter_mut() {
-            let reader = inner
-                .byte_logs
-                .get(id)
-                .map_or(crate::byte_log::ReaderState::Reading, |l| l.shared().reader_state());
-            out.push(crate::input_watch::InputReport {
-                pane_id: *id,
-                writer: pane.pty_bridge.writer.handle().stats(),
-                reader,
-                child_pid: pane.pty_bridge.pty.pid(),
-                child_alive: pane.pty_bridge.pty.is_alive(),
-            });
-        }
-        out
+        // Copy what is needed and let go of `inner`: the writer locks and the
+        // child check below must not run under it.
+        let panes: Vec<_> = {
+            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            inner
+                .panes
+                .iter()
+                .map(|(id, pane)| {
+                    (
+                        *id,
+                        pane.pty_bridge.writer.handle(),
+                        inner.byte_logs.get(id).map(|l| l.shared()),
+                        pane.pty_bridge.pty.pid(),
+                    )
+                })
+                .collect()
+        };
+        panes
+            .into_iter()
+            .map(|(pane_id, writer, log, child_pid)| crate::input_watch::InputReport {
+                pane_id,
+                writer: writer.stats(),
+                reader: log
+                    .map_or(crate::byte_log::ReaderState::Reading, |l| l.reader_state()),
+                child_pid,
+                child_alive: child_pid.is_some_and(crate::input_watch::child_alive),
+            })
+            .collect()
     }
 
     /// Close every pane's input queue and wait up to `timeout` in all for what

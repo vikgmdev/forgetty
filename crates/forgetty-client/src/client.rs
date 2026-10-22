@@ -402,7 +402,22 @@ async fn bind_endpoint(
         .map_err(|e| e.to_string())
 }
 
+/// One line of the connect timeline (`RUST_LOG=timeline=debug`): what the
+/// client did, in milliseconds since the current link was established.
+macro_rules! tl {
+    ($shared:expr, $($arg:tt)*) => {
+        debug!(
+            target: "timeline",
+            "client +{}ms {}",
+            lock(&$shared.link_born).elapsed().as_millis(),
+            format_args!($($arg)*)
+        )
+    };
+}
+
 pub(crate) struct Shared {
+    /// When the link that runs now was established (timeline).
+    link_born: Mutex<Instant>,
     /// The endpoint dials use now. Swapped when a fresh one wins the race.
     endpoint: Mutex<Option<Ep>>,
     /// The key every endpoint of this client is bound with.
@@ -532,6 +547,7 @@ impl Client {
         let (events_tx, _) = broadcast::channel(opts.event_buffer.max(16));
         let (shutdown_tx, _) = watch::channel(false);
         let shared = Arc::new(Shared {
+            link_born: Mutex::new(Instant::now()),
             endpoint: Mutex::new(Some(Ep { ep: Arc::new(endpoint), gen: 0, born: first_born() })),
             identity,
             replace_for: AtomicU64::new(u64::MAX),
@@ -741,8 +757,22 @@ impl ClientHandle {
     ) -> Result<Value, ClientError> {
         let deadline = tokio::time::Instant::now() + timeout;
         let shared = self.shared();
+        let asked = Instant::now();
         let link = wait_link(shared, deadline).await?;
-        call(shared, &link, method, params, deadline).await
+        tl!(
+            shared,
+            "request {method}: link gen {} after {} ms waiting",
+            link.gen,
+            asked.elapsed().as_millis()
+        );
+        let result = call(shared, &link, method, params, deadline).await;
+        tl!(
+            shared,
+            "request {method}: {} after {} ms in total",
+            if result.is_ok() { "answered" } else { "failed" },
+            asked.elapsed().as_millis()
+        );
+        result
     }
 
     /// Typed variant of [`ClientHandle::request`].
@@ -1740,6 +1770,8 @@ async fn run_session(
     shutdown: &mut watch::Receiver<bool>,
 ) -> (SessionEnd, bool) {
     let Established { conn, send, recv, welcome } = est;
+    *lock(&shared.link_born) = Instant::now();
+    tl!(shared, "welcome received, session starts");
     let gen = shared.next_gen.fetch_add(1, Ordering::SeqCst) + 1;
     note_boot(shared, welcome.boot_id);
 
@@ -1791,6 +1823,7 @@ async fn run_session(
     *lock(&shared.welcome) = Some(welcome);
     shared.link_tx.send_replace(Some(link.clone()));
     shared.state_tx.send_replace(ConnectionState::Connected);
+    tl!(shared, "state Connected");
     shared.ever_connected.store(true, Ordering::SeqCst);
 
     let end = loop {
@@ -1943,10 +1976,12 @@ async fn session_init(
 ) -> TaskEnd {
     let deadline = tokio::time::Instant::now() + shared.opts.request_timeout;
     let first = link.gen == 1;
+    tl!(shared, "session_init starts");
 
     if shared.events_wanted.load(Ordering::SeqCst) {
         match ensure_subscribed(&shared, &link, deadline, true).await {
             Ok(()) => {
+                tl!(shared, "session_init: events subscribed");
                 if !first {
                     let _ = shared.events_tx.send(EventItem::Resynced);
                 }
@@ -1967,12 +2002,17 @@ async fn session_init(
                 send_request_as(&shared, &link, method::ATTACH_PANE, params, true)
             });
         match sent {
-            Ok((id, rx)) => inflight.push((pane, guard, id, rx)),
+            Ok((id, rx)) => {
+                tl!(shared, "session_init: attach_pane {} sent (id {id})", pane.id);
+                inflight.push((pane, guard, id, rx));
+            }
             Err(e) => return TaskEnd::Lost(format!("attach_pane: {e}")),
         }
     }
     for (pane, mut guard, id, rx) in inflight {
-        match await_answer(&link, id, rx, deadline).await {
+        let answer = await_answer(&link, id, rx, deadline).await;
+        tl!(shared, "session_init: attach_pane {} answered (id {id})", pane.id);
+        match answer {
             Ok(_) => *guard = link.gen,
             Err(ClientError::Server { code, message }) => {
                 warn!("client: pane {} cannot be re-attached: {code} {message}", pane.id);
@@ -1987,6 +2027,7 @@ async fn session_init(
     }
     link.resumed.store(true, Ordering::SeqCst);
     let _ = resumed.send(());
+    tl!(shared, "session_init done, input released");
     TaskEnd::Done
 }
 
@@ -2121,6 +2162,7 @@ async fn pane_reader(shared: Arc<Shared>, gen: u64, mut recv: RecvStream) -> Tas
         "client: pane {} stream {mine}: reset={} start={} snapshot_len={}",
         pane.id, header.reset, header.start_offset, header.snapshot_len
     );
+    tl!(shared, "pane {} stream {mine} header (reset {}, snapshot {} bytes)", pane.id, header.reset, header.snapshot_len);
     // A reset item must reach the consumer before any byte, so reserve the
     // channel slot first.
     let Ok(permit) = pane.tx.reserve().await else {

@@ -49,20 +49,22 @@ async fn a_pane_whose_program_does_not_read_is_named_after_5_s_and_clears_when_t
     }
     let t0 = Instant::now();
 
-    // Within 6 s of the last byte the PTY took, the WARN names the pane and
+    // Within 6 s of the last byte the PTY took, the log line names the pane and
     // the blocked write.
     let warn = loop {
         let log = server_log(&server);
         if let Some(line) = log.lines().find(|l| l.contains("pane input stalled")) {
             break line.to_string();
         }
-        assert!(t0.elapsed() < Duration::from_secs(8), "no stall WARN after 8 s; log:\n{log}");
+        assert!(t0.elapsed() < Duration::from_secs(8), "no stall line after 8 s; log:\n{log}");
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
     let took = t0.elapsed();
-    assert!(took >= Duration::from_secs(4), "WARN too early ({took:?}): {warn}");
-    assert!(took <= Duration::from_secs(7), "WARN too late ({took:?}): {warn}");
-    println!("stall WARN after {took:?}: {warn}");
+    assert!(took >= Duration::from_secs(4), "stall line too early ({took:?}): {warn}");
+    assert!(took <= Duration::from_secs(7), "stall line too late ({took:?}): {warn}");
+    println!("stall line after {took:?}: {warn}");
+    // The program is the one that does not read, so the line is INFO.
+    assert!(warn.trim_start().starts_with("INFO"), "{warn}");
     assert!(warn.contains(&pane.to_string()), "{warn}");
     assert!(warn.contains("writer blocked in write()"), "{warn}");
     assert!(warn.contains("pty reader reading"), "{warn}");

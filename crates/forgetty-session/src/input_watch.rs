@@ -36,6 +36,46 @@ impl InputReport {
     pub fn stalled(&self) -> bool {
         self.writer.stalled(STALL_AFTER)
     }
+
+    /// The program in the pane does not read its input: the writer is inside
+    /// `write()`, the child lives and the PTY reader runs. That is the
+    /// program's doing (`sleep`, a stuck job), so it is news, not a fault.
+    /// Anything else (an idle writer with bytes queued, a PTY reader held in
+    /// `wait_room`, a writer that exited, a dead child) points at the server.
+    pub fn program_not_reading(&self) -> bool {
+        self.writer.in_write.is_some()
+            && !self.writer.exited
+            && self.child_alive
+            && self.reader == ReaderState::Reading
+    }
+}
+
+/// Is the child process still running? Looks without reaping and without
+/// needing the PTY object, so it can run outside any server lock. A child
+/// that was reaped, or is not ours, counts as gone.
+pub fn child_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: `info` is zeroed plain data that `waitid` fills in; the
+        // flags make it return at once and leave the child waitable.
+        unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            let rc = libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            );
+            // 0 with no pid in the answer: still running. 0 with the pid:
+            // exited, not yet reaped. An error (ECHILD): reaped or not ours.
+            rc == 0 && info.si_pid() == 0
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
 }
 
 impl std::fmt::Display for InputReport {
@@ -165,6 +205,42 @@ mod tests {
         dog.tick(at(50), &[report(id, 10, Duration::from_secs(9))]);
         let ev = dog.tick(at(51), &[]);
         assert!(matches!(ev.as_slice(), [WatchEvent::Cleared { .. }]));
+    }
+
+    #[test]
+    fn only_a_program_that_does_not_read_is_news() {
+        let id = PaneId::new();
+        let r = report(id, 5, Duration::from_secs(7));
+        assert!(r.program_not_reading(), "blocked write, child alive, reader running");
+        let mut idle = r;
+        idle.writer.in_write = None;
+        assert!(!idle.program_not_reading(), "idle writer with a queue is a wakeup bug");
+        let mut full = r;
+        full.reader = ReaderState::WaitingForRoom(Duration::from_secs(6));
+        assert!(!full.program_not_reading(), "a held PTY reader is the server's");
+        let mut gone = r;
+        gone.writer.exited = true;
+        assert!(!gone.program_not_reading(), "an exited writer is a fault");
+        let mut dead = r;
+        dead.child_alive = false;
+        assert!(!dead.program_not_reading(), "a dead child is not just a quiet program");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn child_alive_sees_a_running_and_an_exited_child() {
+        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        assert!(child_alive(pid));
+        child.kill().unwrap();
+        // Exited but not reaped yet: already gone for the check.
+        let t0 = std::time::Instant::now();
+        while child_alive(pid) {
+            assert!(t0.elapsed() < Duration::from_secs(5), "still alive after the kill");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        child.wait().unwrap();
+        assert!(!child_alive(pid), "reaped");
     }
 
     #[test]

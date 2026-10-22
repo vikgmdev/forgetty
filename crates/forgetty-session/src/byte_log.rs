@@ -191,7 +191,10 @@ impl LogShared {
                 || !self.disk_enabled
                 || self.queued.load(Ordering::Acquire) < DISK_HIGH_WATER
             {
-                self.room_wait_since_ms.store(u64::MAX, Ordering::SeqCst);
+                // Hot path (every chunk): read first, write only on a change.
+                if self.room_wait_since_ms.load(Ordering::Relaxed) != u64::MAX {
+                    self.room_wait_since_ms.store(u64::MAX, Ordering::SeqCst);
+                }
                 return;
             }
             if self.room_wait_since_ms.load(Ordering::SeqCst) == u64::MAX {

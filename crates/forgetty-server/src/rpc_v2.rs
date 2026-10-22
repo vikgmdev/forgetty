@@ -54,6 +54,20 @@ pub const DROP_CODE: u32 = 0x10;
 /// redials and resumes with a reset.
 pub const LOG_LOST_CODE: u32 = stream_code::LOG_LOST;
 
+/// One line of the connect timeline (`RUST_LOG=timeline=debug`): what a
+/// connection did, in milliseconds since the server accepted it.
+macro_rules! tl {
+    ($born:expr, $who:expr, $($arg:tt)*) => {
+        debug!(
+            target: "timeline",
+            "server {} +{}ms {}",
+            $who,
+            $born.elapsed().as_millis(),
+            format_args!($($arg)*)
+        )
+    };
+}
+
 /// Bytes per pane output frame.
 const CHUNK: usize = 128 * 1024;
 /// How long a silent peer may hold the handshake open.
@@ -590,6 +604,7 @@ impl RpcV2 {
 
     /// Serve one connection until it ends.
     pub async fn serve(self: Arc<Self>, conn: Connection, registry: Arc<Mutex<DeviceRegistry>>) {
+        let born = std::time::Instant::now();
         let remote = conn.remote_id();
         let device_id = remote.to_string();
 
@@ -616,6 +631,7 @@ impl RpcV2 {
         // client events: strip control characters and cap the length.
         hello.client_name =
             forgetty_core::sanitize::untrusted_max(&hello.client_name, MAX_CLIENT_NAME_CHARS);
+        tl!(born, hello.client_name, "hello read");
 
         // `local` names the server's own socket clients. A remote client is
         // not one, and must not pass for it in `list_clients` or as a size
@@ -730,7 +746,8 @@ impl RpcV2 {
             "rpc2: client connected"
         );
 
-        Session::new(self.clone(), conn.clone(), &hello, caps).run(send, recv).await;
+        tl!(born, hello.client_name, "welcome sent, session starts");
+        Session::new(self.clone(), conn.clone(), &hello, caps, born).run(send, recv).await;
 
         lock(&self.live).retain(|(k, _)| *k != conn_key);
         self.client_left(&hello);
@@ -1521,6 +1538,9 @@ fn pump_event(rpc: &RpcV2, ev: SessionEvent, layout_dirty: &mut bool) {
 
 struct Session {
     rpc: Arc<RpcV2>,
+    /// When the server accepted the connection, and the client's name (timeline).
+    born: std::time::Instant,
+    name: String,
     conn: Connection,
     client_id: Uuid,
     epoch: Uuid,
@@ -1529,8 +1549,22 @@ struct Session {
 }
 
 impl Session {
-    fn new(rpc: Arc<RpcV2>, conn: Connection, hello: &Hello, caps: Vec<String>) -> Self {
-        Session { rpc, conn, client_id: hello.client_id, epoch: hello.input_epoch, caps }
+    fn new(
+        rpc: Arc<RpcV2>,
+        conn: Connection,
+        hello: &Hello,
+        caps: Vec<String>,
+        born: std::time::Instant,
+    ) -> Self {
+        Session {
+            rpc,
+            conn,
+            born,
+            name: hello.client_name.clone(),
+            client_id: hello.client_id,
+            epoch: hello.input_epoch,
+            caps,
+        }
     }
 
     fn has(&self, c: &str) -> bool {
@@ -1814,6 +1848,8 @@ impl Session {
             Ok(result) => ControlMsg::Response { id, result },
             Err((code, message)) => ControlMsg::Failure { id, code: code.into(), message },
         };
+        let (born, name) = (self.born, self.name.clone());
+        tl!(born, name, "request {m} id {id} received");
         match m.as_str() {
             method::SUBSCRIBE_EVENTS => {
                 let seq = if events.is_some() {
@@ -1824,6 +1860,7 @@ impl Session {
                     seq
                 };
                 out.push(control_frame(&reply(to_value(&SubscribeResult { seq }).map_err(bad))));
+                tl!(born, name, "subscribe_events id {id} answered");
             }
             method::ATTACH_PANE => {
                 // An attach counts as a request in flight until its stream is
@@ -1833,6 +1870,7 @@ impl Session {
                     .map_err(bad)
                     .and_then(|p| self.attach(p, work, streams, guard));
                 out.push(control_frame(&reply(r)));
+                tl!(born, name, "attach_pane id {id} answered");
             }
             method::DETACH_PANE => {
                 let r = from_value::<DetachPaneParams>(params).map_err(bad).and_then(|p| {
@@ -1902,6 +1940,7 @@ impl Session {
                 let s = self.clone();
                 let out = out.clone();
                 let other = other.to_string();
+                let who = name.clone();
                 work.spawn(async move {
                     let _guard = guard;
                     let rpc = s.rpc.clone();
@@ -1918,6 +1957,7 @@ impl Session {
                         Err((error_code::INTERNAL, format!("handler failed: {e}")))
                     });
                     out.push(control_frame(&reply(r)));
+                    tl!(born, who, "request {other} id {id} answered");
                 });
             }
         }
@@ -1970,6 +2010,15 @@ impl Session {
             replay_end: Some(total),
         };
         let catchup = self.has(cap::SNAPSHOT_CATCHUP);
+        tl!(
+            self.born,
+            self.name,
+            "attach_pane {} from {:?}: start {start} reset {reset} gap {} (limit {})",
+            p.pane_id,
+            p.from_offset,
+            total.saturating_sub(start),
+            shared.ring_capacity() / 2
+        );
         // One live stream per (connection, pane): the old one was aborted above.
         let handle = work.spawn(pane_stream(
             self.rpc.clone(),
@@ -1978,6 +2027,7 @@ impl Session {
             header,
             catchup,
             guard,
+            (self.born, self.name.clone()),
         ));
         streams.insert(p.pane_id, handle);
         self.rpc.note_attached(self.client_id, p.pane_id);
@@ -2079,16 +2129,6 @@ impl StreamEnd {
     }
 }
 
-/// One Pane output stream: the header, then raw frames pulled from the pane
-/// byte log by offset.
-///
-/// A slow reader never slows the program (AD-023). The log keeps filling no
-/// matter what this task does. With `snapshot_catchup`, a reader that falls
-/// more than half the ring behind, or whose write makes no progress for
-/// [`NO_PROGRESS`], gets its stream reset (`SUPERSEDED`) and a new one that
-/// starts with a VT snapshot of the screen, then continues live. Without the
-/// capability the old rule stands: bytes come from the ring or the disk file,
-/// and a reader behind everything is reset with `LOG_LOST`.
 /// How often the input watchdog looks at the panes.
 const INPUT_WATCH_TICK: Duration = Duration::from_millis(500);
 
@@ -2103,6 +2143,11 @@ async fn input_watchdog(sm: Arc<SessionManager>) {
         let reports = sm.input_reports();
         for event in dog.tick(std::time::Instant::now(), &reports) {
             match event {
+                // A program that does not read is its own business: INFO.
+                // Everything else about a stall points at the server: WARN.
+                WatchEvent::Stalled(r) if r.program_not_reading() => {
+                    info!("rpc2: pane input stalled: {r}");
+                }
                 WatchEvent::Stalled(r) => warn!("rpc2: pane input stalled: {r}"),
                 WatchEvent::Cleared { pane_id, stalled_for } => {
                     info!("rpc2: pane input moves again: pane {pane_id} after {stalled_for:?}");
@@ -2112,6 +2157,16 @@ async fn input_watchdog(sm: Arc<SessionManager>) {
     }
 }
 
+/// One Pane output stream: the header, then raw frames pulled from the pane
+/// byte log by offset.
+///
+/// A slow reader never slows the program (AD-023). The log keeps filling no
+/// matter what this task does. With `snapshot_catchup`, a reader that falls
+/// more than half the ring behind, or whose write makes no progress for
+/// [`NO_PROGRESS`], gets its stream reset (`SUPERSEDED`) and a new one that
+/// starts with a VT snapshot of the screen, then continues live. Without the
+/// capability the old rule stands: bytes come from the ring or the disk file,
+/// and a reader behind everything is reset with `LOG_LOST`.
 async fn pane_stream(
     rpc: Arc<RpcV2>,
     conn: Connection,
@@ -2119,6 +2174,7 @@ async fn pane_stream(
     first: PaneStreamHeader,
     catchup: bool,
     guard: InflightGuard,
+    (born, name): (std::time::Instant, String),
 ) {
     let pane = PaneId(first.pane_id);
     let lag_limit = (shared.ring_capacity() / 2) as u64;
@@ -2129,10 +2185,13 @@ async fn pane_stream(
     // A client that resumes far behind starts with the snapshot, paced like
     // any other catch-up of this client and pane.
     if catchup && shared.total().saturating_sub(header.start_offset) > lag_limit {
-        tokio::time::sleep(rpc.resume_delay(conn.remote_id(), pane)).await;
+        let wait = rpc.resume_delay(conn.remote_id(), pane);
+        tl!(born, name, "pane {pane}: resume far behind, pacing wait {wait:?}");
+        tokio::time::sleep(wait).await;
         let Some((h, snap)) = take_snapshot(&rpc, conn.remote_id(), pane, &shared).await else {
             return;
         };
+        tl!(born, name, "pane {pane}: snapshot ready, {} bytes", snap.len());
         header = h;
         snapshot = snap;
     }
@@ -2151,6 +2210,7 @@ async fn pane_stream(
         if write_msg(&mut send, &header).await.is_err() {
             return;
         }
+        tl!(born, name, "pane {pane}: stream header written (snapshot {} bytes)", sent_snapshot.len());
         for part in sent_snapshot.chunks(CHUNK) {
             if write_output_frame(&mut send, part).await.is_err() {
                 return;
@@ -2211,7 +2271,9 @@ async fn pane_stream(
                 } else {
                     Claim::Stalled
                 };
-                tokio::time::sleep(rpc.catchup_delay(conn.remote_id(), pane, claim)).await;
+                let wait = rpc.catchup_delay(conn.remote_id(), pane, claim);
+                tl!(born, name, "pane {pane}: catch-up {claim:?}, pacing wait {wait:?}");
+                tokio::time::sleep(wait).await;
                 // Stop the old stream, so it queues nothing more for the peer.
                 let _ = send.reset(stream_code::SUPERSEDED.into());
                 let Some((h, snap)) = take_snapshot(&rpc, conn.remote_id(), pane, &shared).await
