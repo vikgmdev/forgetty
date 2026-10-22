@@ -894,6 +894,117 @@ impl ShellSmoke {
     }
 }
 
+/// Text service profiles of the Microsoft IMEs: (language, CLSID, profile GUID).
+const IME_JA: (u16, &str, &str) = (0x0411, "03B5835F-F03C-411B-9CE2-AA23E1171E36", "A76C93D9-5523-4E90-AAFA-4DB112F9AC76");
+const IME_ZH: (u16, &str, &str) = (0x0804, "81D4E9C9-1D3B-41BC-9E6C-4B40BF79E35E", "FA550B04-5AD7-411F-A5AC-CA038EC515D7");
+
+impl ShellSmoke {
+    /// Real Japanese and Chinese IME through the window's message loop: activate the text
+    /// service, turn it on, type romaji, read the preedit the IME pushed into the view, ask for
+    /// candidates, commit, and read the bytes the pane got. Steps 80 to 89 of the W5 view phase.
+    fn w7_real_ime(&mut self, window: &mut Window, cx: &mut Context<AppShell>) {
+        let Some(t) = self.w5.target.clone() else { fail("real ime: no target view") };
+        let lap = |this: &Self, ms: u64| this.sub_t0.elapsed() >= Duration::from_millis(ms);
+        let hwnd = inject::hwnd(window);
+        let snapshot = |cx: &mut Context<AppShell>| {
+            t.update(cx, |v, _| {
+                json!({
+                    "marked": v.marked,
+                    "log": v.ime_log,
+                    "bounds_calls": v.ime_bounds_calls,
+                    "bounds_last": v.ime_bounds_last.map(|b| vec![b.0 as f32, b.1 as f32, b.2, b.3, b.4, b.5]),
+                    "cursor": [v.term.cursor().0, v.term.cursor().1],
+                    "input": v.capture_input.as_ref().map(|b| String::from_utf8_lossy(b).to_string()),
+                })
+            })
+        };
+        let begin = |name: &str, prof: (u16, &str, &str), hwnd: Option<windows::Win32::Foundation::HWND>, cx: &mut Context<AppShell>| {
+            t.update(cx, |v, _| {
+                v.capture_input = Some(Vec::new());
+                v.ime_log.clear();
+                v.marked = None;
+            });
+            let act = inject::activate_text_service(prof.0, prof.1, prof.2);
+            let open = hwnd.map(inject::ime_open_native).unwrap_or_else(|| "no window handle".into());
+            record(&format!("ime_real_{name}_activate"), json!({"result": act.clone().map(|_| "ok".to_string()), "imm": open, "hkl": format!("{:x}", inject::current_hkl())}));
+            act.is_ok()
+        };
+        match self.sub {
+            80 => {
+                self.w7.real_ok = begin("ja", IME_JA, hwnd, cx);
+                self.sub = 81;
+                self.sub_t0 = Instant::now();
+            }
+            81 => {
+                if !lap(self, 800) {
+                    return;
+                }
+                let sent = inject::tap_word(inject::current_hkl(), "nihongo");
+                record("ime_real_ja_typed", json!({"sent": sent, "hkl": format!("{:x}", inject::current_hkl())}));
+                self.sub = 82;
+                self.sub_t0 = Instant::now();
+            }
+            82 => {
+                if !lap(self, 1200) {
+                    return;
+                }
+                record("ime_real_ja_composing", snapshot(cx));
+                // Space asks for candidates.
+                inject::send_keys(inject::current_hkl(), &[Step::Tap(inject::VK_SPACE)]);
+                self.sub = 83;
+                self.sub_t0 = Instant::now();
+            }
+            83 => {
+                if !lap(self, 1000) {
+                    return;
+                }
+                record("ime_real_ja_candidates", snapshot(cx));
+                inject::send_keys(inject::current_hkl(), &[Step::Tap(inject::VK_RETURN)]);
+                self.sub = 84;
+                self.sub_t0 = Instant::now();
+            }
+            84 => {
+                if !lap(self, 1000) {
+                    return;
+                }
+                record("ime_real_ja_committed", snapshot(cx));
+                // Chinese.
+                self.w7.real_ok &= begin("zh", IME_ZH, hwnd, cx);
+                self.sub = 85;
+                self.sub_t0 = Instant::now();
+            }
+            85 => {
+                if !lap(self, 800) {
+                    return;
+                }
+                let sent = inject::tap_word(inject::current_hkl(), "zhongwen");
+                record("ime_real_zh_typed", json!({"sent": sent, "hkl": format!("{:x}", inject::current_hkl())}));
+                self.sub = 86;
+                self.sub_t0 = Instant::now();
+            }
+            86 => {
+                if !lap(self, 1200) {
+                    return;
+                }
+                record("ime_real_zh_composing", snapshot(cx));
+                inject::send_keys(inject::current_hkl(), &[Step::Tap(inject::VK_SPACE)]);
+                self.sub = 87;
+                self.sub_t0 = Instant::now();
+            }
+            _ => {
+                if !lap(self, 1000) {
+                    return;
+                }
+                record("ime_real_zh_committed", snapshot(cx));
+                t.update(cx, |v, _| v.capture_input = None);
+                inject::activate_layout("00000409");
+                self.sub = 20;
+                self.sub_t0 = Instant::now();
+            }
+        }
+    }
+}
+
 /// State of the OSC 52 checks.
 pub struct W7 {
     /// A machine id of its own, so the checks never touch the policy of a real machine.
@@ -902,11 +1013,12 @@ pub struct W7 {
     denied_sent: u8,
     nonce: u64,
     dropped_before: u32,
+    real_ok: bool,
 }
 
 impl Default for W7 {
     fn default() -> Self {
-        W7 { machine: uuid::Uuid::new_v4(), auto_before: 0, denied_sent: 0, nonce: 0, dropped_before: 0 }
+        W7 { machine: uuid::Uuid::new_v4(), auto_before: 0, denied_sent: 0, nonce: 0, dropped_before: 0, real_ok: false }
     }
 }
 
@@ -1456,7 +1568,8 @@ impl ShellSmoke {
                 let Some(case) = KEY_CASES.get(self.w5.case_i) else {
                     t.update(cx, |v, _| v.capture_input = None);
                     inject::activate_layout("00000409");
-                    self.sub = 20;
+                    // The runner has Microsoft IME (Japanese) and Pinyin installed: drive them.
+                    self.sub = 80;
                     self.sub_t0 = Instant::now();
                     return;
                 };
@@ -1493,6 +1606,8 @@ impl ShellSmoke {
                 self.sub = 11;
                 self.sub_t0 = Instant::now();
             }
+            // ---- a real IME (Microsoft IME Japanese, Microsoft Pinyin) driven by SendInput ---------
+            80..=89 => self.w7_real_ime(window, cx),
             // A button released outside the pane still ends the selection.
             20 => {
                 shell.sidebar_open = true;

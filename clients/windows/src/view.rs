@@ -174,6 +174,12 @@ pub struct TerminalView {
     pub last_paint: Option<Instant>,
     /// Smoke only: dry-run key encoding writes here instead of the source.
     pub capture_input: Option<Vec<u8>>,
+    /// What the IME handler was asked, in order (the smoke reads it; at most 200 entries).
+    pub ime_log: Vec<String>,
+    /// How many times the IME asked where to put its candidate window, and the last answer
+    /// `(cursor row, cursor col, x, y, w, h)`.
+    pub ime_bounds_calls: u32,
+    pub ime_bounds_last: Option<(usize, usize, f32, f32, f32, f32)>,
     pub pending_paste: Option<PendingPaste>,
     /// 0.0 normal, otherwise the share of brightness removed (unfocused pane in a split).
     pub dim: f32,
@@ -334,6 +340,9 @@ impl TerminalView {
             resizes: 0,
             last_paint: None,
             capture_input: None,
+            ime_log: Vec::new(),
+            ime_bounds_calls: 0,
+            ime_bounds_last: None,
             pending_paste: None,
             dim: 0.0,
             force_size: false,
@@ -1191,6 +1200,12 @@ impl TerminalView {
         self.last_paint = Some(Instant::now());
     }
 
+    fn ime_note(&mut self, what: String) {
+        if self.ime_log.len() < 200 {
+            self.ime_log.push(what);
+        }
+    }
+
     /// Preedit width in cells (wide glyphs count 2).
     pub fn marked_cells(&self) -> usize {
         self.marked
@@ -1316,6 +1331,7 @@ impl gpui::EntityInputHandler for TerminalView {
     }
 
     fn unmark_text(&mut self, _w: &mut Window, cx: &mut Context<Self>) {
+        self.ime_note("unmark".into());
         if self.marked.take().is_some() {
             cx.notify();
         }
@@ -1329,6 +1345,7 @@ impl gpui::EntityInputHandler for TerminalView {
         cx: &mut Context<Self>,
     ) {
         // Commit: composed text (or plain typed text the key path did not handle).
+        self.ime_note(format!("commit:{text}"));
         self.marked = None;
         if !text.is_empty() {
             self.snap_to_bottom();
@@ -1345,6 +1362,7 @@ impl gpui::EntityInputHandler for TerminalView {
         _w: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.ime_note(format!("mark:{new_text}"));
         self.marked = (!new_text.is_empty()).then(|| new_text.to_string());
         cx.notify();
     }
@@ -1361,10 +1379,13 @@ impl gpui::EntityInputHandler for TerminalView {
         let _ = self.term.screen();
         let (r, c) = self.term.cursor();
         let m = &self.metrics;
-        Some(Bounds::new(
+        let b = Bounds::new(
             point(element_bounds.origin.x + m.cell_w * c as f32, element_bounds.origin.y + m.line_h * r as f32),
             size(m.cell_w * self.marked_cells().max(1) as f32, m.line_h),
-        ))
+        );
+        self.ime_bounds_calls += 1;
+        self.ime_bounds_last = Some((r, c, f32::from(b.origin.x), f32::from(b.origin.y), f32::from(b.size.width), f32::from(b.size.height)));
+        Some(b)
     }
 
     fn character_index_for_point(

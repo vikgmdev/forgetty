@@ -111,3 +111,61 @@ pub fn left_down() -> bool {
 pub fn left_up() -> bool {
     unsafe { SendInput(&[mouse(MOUSEEVENTF_LEFTUP)], std::mem::size_of::<INPUT>() as i32) == 1 }
 }
+
+pub const VK_RETURN: u16 = 0x0D;
+
+/// Tap the letters of `word` (a-z).
+pub fn tap_word(hkl: isize, word: &str) -> bool {
+    let steps: Vec<Step> = word.bytes().filter(u8::is_ascii_lowercase).map(|b| Step::Tap(u16::from(b.to_ascii_uppercase()))).collect();
+    send_keys(hkl, &steps)
+}
+
+pub fn current_hkl() -> isize {
+    unsafe { GetKeyboardLayout(0) }.0 as isize
+}
+
+/// Switch the input method of this process to a text service profile (a TSF IME), as the
+/// language bar does. `langid` is the language (0x0411 Japanese, 0x0804 Chinese Simplified).
+pub fn activate_text_service(langid: u16, clsid: &str, profile: &str) -> Result<(), String> {
+    use windows::core::GUID;
+    use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+    use windows::Win32::UI::TextServices::{
+        CLSID_TF_InputProcessorProfiles, ITfInputProcessorProfileMgr, TF_IPPMF_DONTCARECURRENTINPUTLANGUAGE, TF_IPPMF_FORPROCESS,
+        TF_PROFILETYPE_INPUTPROCESSOR,
+    };
+    let clsid = GUID::try_from(clsid).map_err(|e| e.to_string())?;
+    let profile = GUID::try_from(profile).map_err(|e| e.to_string())?;
+    unsafe {
+        let mgr: ITfInputProcessorProfileMgr =
+            CoCreateInstance(&CLSID_TF_InputProcessorProfiles, None, CLSCTX_INPROC_SERVER).map_err(|e| format!("CoCreateInstance: {e}"))?;
+        mgr.ActivateProfile(
+            TF_PROFILETYPE_INPUTPROCESSOR,
+            langid,
+            &clsid,
+            &profile,
+            HKL::default(),
+            TF_IPPMF_FORPROCESS | TF_IPPMF_DONTCARECURRENTINPUTLANGUAGE,
+        )
+        .map_err(|e| format!("ActivateProfile: {e}"))
+    }
+}
+
+/// Turn the IME on in the window's input context, in the native (kana or Chinese) mode. Returns
+/// a line saying what Windows reported.
+pub fn ime_open_native(hwnd: HWND) -> String {
+    use windows::Win32::UI::Input::Ime::{
+        ImmGetContext, ImmGetOpenStatus, ImmReleaseContext, ImmSetConversionStatus, ImmSetOpenStatus, IME_CMODE_FULLSHAPE,
+        IME_CMODE_NATIVE, IME_SMODE_PHRASEPREDICT,
+    };
+    unsafe {
+        let himc = ImmGetContext(hwnd);
+        if himc.is_invalid() {
+            return "no input context".into();
+        }
+        let set = ImmSetOpenStatus(himc, true).as_bool();
+        let mode = ImmSetConversionStatus(himc, IME_CMODE_NATIVE | IME_CMODE_FULLSHAPE, IME_SMODE_PHRASEPREDICT).as_bool();
+        let open = ImmGetOpenStatus(himc).as_bool();
+        let _ = ImmReleaseContext(hwnd, himc);
+        format!("set_open={set} set_mode={mode} open={open}")
+    }
+}
