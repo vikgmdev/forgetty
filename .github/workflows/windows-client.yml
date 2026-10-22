@@ -61,6 +61,17 @@ jobs:
           cargo test --release -p forgetty-shell-core --lib -- notify:: layout:: keys:: osc:: osc52:: fuzzy:: update::
           cargo test --release -p forgetty-remote
 
+      - name: Turn on the Japanese and Chinese input methods for the smoke
+        # The runner image already has the language packs and Microsoft IME / Pinyin. They only
+        # need to be enabled for the user, so the smoke can switch to them like the language bar.
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $list = Get-WinUserLanguageList
+          foreach ($tag in 'ja-JP', 'zh-Hans-CN') { if (-not ($list | Where-Object LanguageTag -eq $tag)) { $list.Add($tag) } }
+          Set-WinUserLanguageList $list -Force
+          Get-WinUserLanguageList | ForEach-Object { "$($_.LanguageTag): $($_.InputMethodTips -join ' ')" }
+
       - name: Smoke
         shell: pwsh
         working-directory: clients/windows/target/release
