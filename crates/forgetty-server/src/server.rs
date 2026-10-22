@@ -226,6 +226,7 @@ fn init_tracing() {
 /// Run the server in the foreground until SIGTERM or SIGINT.
 pub async fn run(args: RunArgs) -> anyhow::Result<()> {
     init_tracing();
+    forgetty_server::crash::install();
 
     // First-run state is created under the state-dir lock: the server id, the
     // instance lock and the identity key. Two servers that start at once

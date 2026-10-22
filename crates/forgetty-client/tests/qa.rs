@@ -1323,6 +1323,46 @@ async fn capture_right_after_a_full_ring_answers() {
     server.shutdown().await;
 }
 
+/// Capture of a ring of many short lines, from several callers at once while
+/// a snapshot catch-up builds. The server must survive and answer every call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn parallel_captures_of_a_short_line_ring_survive() {
+    if !real_only() {
+        return;
+    }
+    let server = TestServer::start(TestServerConfig::default()).await;
+    let pane = server.add_script_pane("seq 1 2500000; echo DONE_MARKER; exec cat");
+    wait_for("the burst to finish", || {
+        let (first, total) = server.log_bounds(pane);
+        total > 16_000_000 && total.saturating_sub(first) >= 8 * 1024 * 1024
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let server = std::sync::Arc::new(server);
+    let mut joins = Vec::new();
+    for i in 0..8 {
+        let server = server.clone();
+        joins.push(tokio::task::spawn_blocking(move || {
+            for j in 0..4 {
+                let r = server
+                    .socket_call(
+                        "capture",
+                        json!({"pane_id": pane.to_string(), "trim": true, "last_lines": 5}),
+                    )
+                    .unwrap_or_else(|e| panic!("capture {i}.{j} failed: {e}"));
+                let text = r["text"].as_str().expect("text");
+                assert!(text.contains("DONE_MARKER"), "capture {i}.{j}: {text:?}");
+            }
+        }));
+    }
+    for j in joins {
+        j.await.unwrap();
+    }
+    // The server still answers.
+    server.socket_call("list_tabs", json!({})).expect("server alive");
+    std::sync::Arc::into_inner(server).expect("sole owner").shutdown().await;
+}
+
 // ---------------------------------------------------------------------------
 // AD-020: the size owner is visible to clients
 // ---------------------------------------------------------------------------

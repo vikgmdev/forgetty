@@ -15,6 +15,7 @@ pub mod iroh_terminal;
 pub mod sockpath;
 
 pub mod control_queue;
+pub mod crash;
 pub mod rpc_v2;
 pub mod snapshot_hub;
 

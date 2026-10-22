@@ -36,6 +36,7 @@ pub mod pty_bridge;
 pub mod sizes;
 pub mod snapshot;
 pub mod status;
+pub mod vt_gate;
 pub mod workspace;
 
 // Convenient top-level re-exports for downstream crates.
@@ -53,6 +54,7 @@ pub use pane_writer::{OnEnd, PaneWriter, QueueError, INPUT_QUEUE_BYTES};
 pub use pty_bridge::PtyBridge;
 pub use sizes::{SizeGovernor, SizeOwner};
 pub use status::{PaneStatus, StatusSnapshot};
+pub use vt_gate::{vt_gate, VtGate, VtPermit, MAX_VT_BUILDS};
 pub use workspace::{
     build_workspace_state, PaneTreeLayout, TabLayoutEntry, WorkspaceLayout, WorkspaceLayoutEntry,
 };
