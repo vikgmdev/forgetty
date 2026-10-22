@@ -6,6 +6,13 @@
 //! the default handler prints nothing. The handler here writes one line to
 //! stderr (the log file, or the journal under systemd) with `write(2)` only,
 //! then lets the old handler or the default action go on.
+//!
+//! The line names the library that holds the fault address and the instruction
+//! pointer, with the offset in it (`dladdr`). A crash in a shared library (the
+//! Zig terminal library, for example) then says which one and where, and the
+//! offset can be looked up with `objdump` or `addr2line`. `dladdr` is not
+//! strictly async-signal-safe (it takes the loader lock). This is a one-shot
+//! line written just before the process dies, so the small risk is accepted.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -62,7 +69,7 @@ extern "C" fn on_fatal_signal(
     ctx: *mut libc::c_void,
 ) {
     if IN_HANDLER.fetch_add(1, Ordering::SeqCst) == 0 {
-        let mut buf = [0u8; 160];
+        let mut buf = [0u8; 640];
         let mut n = 0;
         n = put(&mut buf, n, b"forgetty-server: fatal signal ");
         n = put_num(&mut buf, n, sig as u64);
@@ -76,6 +83,12 @@ extern "C" fn on_fatal_signal(
             let addr = unsafe { (*info).si_addr() } as usize;
             n = put(&mut buf, n, b" addr 0x");
             n = put_hex(&mut buf, n, addr as u64);
+            n = put_module(&mut buf, n, addr);
+        }
+        if let Some(pc) = fault_pc(ctx) {
+            n = put(&mut buf, n, b" pc 0x");
+            n = put_hex(&mut buf, n, pc as u64);
+            n = put_module(&mut buf, n, pc);
         }
         n = put(&mut buf, n, b"\n");
         // SAFETY: write(2) on fd 2 with a buffer of `n` valid bytes.
@@ -108,6 +121,46 @@ extern "C" fn on_fatal_signal(
         libc::sigaction(sig, &dfl, std::ptr::null_mut());
         libc::raise(sig);
     }
+}
+
+/// The instruction pointer at the time of the fault, from the signal context.
+#[allow(unused_variables)]
+fn fault_pc(ctx: *mut libc::c_void) -> Option<usize> {
+    if ctx.is_null() {
+        return None;
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        // SAFETY: with SA_SIGINFO the third argument points at a ucontext_t.
+        let uc = unsafe { &*(ctx as *const libc::ucontext_t) };
+        return Some(uc.uc_mcontext.gregs[libc::REG_RIP as usize] as usize);
+    }
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    {
+        // SAFETY: as above.
+        let uc = unsafe { &*(ctx as *const libc::ucontext_t) };
+        return Some(uc.uc_mcontext.pc as usize);
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
+/// ` in <library>+0x<offset>` for the library that holds `addr`, or ` in ?`.
+fn put_module(buf: &mut [u8], at: usize, addr: usize) -> usize {
+    let mut n = put(buf, at, b" in ");
+    // SAFETY: dladdr only reads the loader's tables and fills `info`. `dli_fname`, when set,
+    // is a NUL-terminated string owned by the loader.
+    unsafe {
+        let mut info: libc::Dl_info = std::mem::zeroed();
+        if libc::dladdr(addr as *const libc::c_void, &mut info) != 0 && !info.dli_fname.is_null() {
+            let name = std::ffi::CStr::from_ptr(info.dli_fname).to_bytes();
+            n = put(buf, n, name);
+            n = put(buf, n, b"+0x");
+            n = put_hex(buf, n, addr.wrapping_sub(info.dli_fbase as usize) as u64);
+            return n;
+        }
+    }
+    put(buf, n, b"?")
 }
 
 fn name(sig: libc::c_int) -> &'static [u8] {
@@ -153,4 +206,56 @@ fn put_hex(buf: &mut [u8], at: usize, mut v: u64) -> usize {
         }
     }
     put(buf, at, &tmp[i..])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn module_and_offset_name_the_library() {
+        let mut buf = [0u8; 512];
+        // `getpid` lives in libc, a shared library.
+        let n = put_module(&mut buf, 0, libc::getpid as usize);
+        let line = String::from_utf8_lossy(&buf[..n]).to_string();
+        assert!(line.starts_with(" in "), "{line}");
+        assert!(line.contains("+0x"), "{line}");
+        assert!(line.contains("libc") || line.contains("libpthread"), "{line}");
+        // An address in no library is marked, not garbage.
+        let n = put_module(&mut buf, 0, 8);
+        assert_eq!(&buf[..n], b" in ?");
+    }
+
+    /// The child half of `a_fatal_signal_line_names_module_and_pc`. It dies of SIGILL.
+    #[test]
+    fn child_dies_of_sigill() {
+        if std::env::var_os("FORGETTY_CRASH_CHILD").is_none() {
+            return;
+        }
+        install();
+        // SAFETY: an undefined instruction on purpose, to raise SIGILL.
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::asm!("ud2");
+        }
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            std::arch::asm!("udf #0");
+        }
+    }
+
+    #[test]
+    fn a_fatal_signal_line_names_module_and_pc() {
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new(exe)
+            .args(["--exact", "crash::tests::child_dies_of_sigill", "--nocapture", "--test-threads=1"])
+            .env("FORGETTY_CRASH_CHILD", "1")
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr).to_string();
+        let line = err.lines().find(|l| l.contains("fatal signal")).unwrap_or_else(|| panic!("no crash line in: {err}"));
+        assert!(line.contains("(SIGILL)"), "{line}");
+        assert!(line.contains(" pc 0x") && line.contains(" in ") && line.contains("+0x"), "{line}");
+        assert!(!out.status.success());
+    }
 }

@@ -117,12 +117,24 @@ jobs:
         with:
           version: 0.15.2
 
+      # The key carries the Zig CPU policy: a cached target dir from before `-Dcpu=baseline`
+      # holds a libghostty-vt built for the CPU of whichever runner built it (SIGILL elsewhere).
       - uses: Swatinem/rust-cache@v2
         with:
-          key: linux-server
+          key: linux-server-zig-cpu-baseline-1
 
       - name: Build forgetty (release) and the server tarball
         run: scripts/build-server-dist.sh --target x86_64-unknown-linux-gnu --no-zigbuild --skip-deb --skip-rpm --out dist-out
+
+      # The library that ships must run on any x86-64 CPU: wsl-e2e runs it on another machine
+      # than the one that built it. AVX or AVX-512 outside the run-time dispatched code is SIGILL there.
+      - name: libghostty-vt has no native-CPU instructions
+        run: |
+          mkdir -p lib-check
+          tar -xzf dist-out/*.tar.gz -C lib-check --wildcards '*/lib/libghostty-vt.so.0'
+          so="$(ls lib-check/*/lib/libghostty-vt.so.0)"
+          echo "CPU of this runner: $(grep -m1 'model name' /proc/cpuinfo)"; grep -m1 -o 'avx512[a-z]*' /proc/cpuinfo | head -1 || true
+          crates/forgetty-vt/scripts/check-no-native-simd.sh "$so"
 
       - uses: actions/upload-artifact@v4
         with:

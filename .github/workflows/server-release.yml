@@ -44,7 +44,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
+          key: ${{ matrix.target }}-zig-cpu-baseline-1
 
       - name: Install Zig
         uses: mlugg/setup-zig@v2

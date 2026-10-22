@@ -88,6 +88,18 @@ fn main() {
         cmd.arg(format!("-Dtarget={zig_triple}"));
     }
 
+    // CPU: ALWAYS explicit. Without `-Dcpu`, a build with no `-Dtarget` (a host build, for
+    // example the CI `linux-server` job) is tuned for the machine that builds it, and its
+    // AVX2 or AVX-512 instructions raise SIGILL on any older CPU that runs the library
+    // later (a build runner's CPU is not the CPU of the machine that deploys it).
+    // `baseline` is the generic CPU of the architecture (x86-64: SSE2). Code that profits from
+    // newer instructions (simdutf, ghostty's N_AVX2 kernels) chooses its CPU at run time.
+    // `FORGETTY_ZIG_CPU` overrides it, for example `native` for a local benchmark.
+    println!("cargo:rerun-if-env-changed=FORGETTY_ZIG_CPU");
+    let zig_cpu = env::var("FORGETTY_ZIG_CPU").ok().filter(|c| !c.is_empty()).unwrap_or_else(|| "baseline".to_string());
+    println!("cargo:warning=zig cpu for libghostty-vt: {zig_cpu}");
+    cmd.arg(format!("-Dcpu={zig_cpu}"));
+
     let status = cmd
         .status()
         .expect("Failed to run zig build. Is Zig installed? Get it from https://ziglang.org");

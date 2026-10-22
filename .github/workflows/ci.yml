@@ -26,6 +26,8 @@ jobs:
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: zig-cpu-baseline-1
 
       - name: Install Zig
         uses: mlugg/setup-zig@v2
@@ -74,6 +76,8 @@ jobs:
           components: clippy
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: zig-cpu-baseline-1
 
       - name: Install system dependencies
         run: |

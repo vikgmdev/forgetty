@@ -59,6 +59,13 @@ BIN="$ROOT/target/$TARGET/release/forgetty"
 LIB="$ROOT/target/$TARGET/release/lib/libghostty-vt.so.0.1.0"
 [ -x "$BIN" ] && [ -f "$LIB" ] || { echo "build output missing: $BIN / $LIB" >&2; exit 1; }
 
+# 1b. The library must run on any CPU of its architecture. `crates/forgetty-vt/build.rs` builds it
+# for the baseline CPU unless FORGETTY_ZIG_CPU says otherwise. Check the file that ships.
+if [ -z "${FORGETTY_ZIG_CPU:-}" ] && [ "$ZIG_ARCH" = x86_64 ] && command -v objdump >/dev/null; then
+  say "check libghostty-vt for native-CPU instructions"
+  "$ROOT/crates/forgetty-vt/scripts/check-no-native-simd.sh" "$LIB"
+fi
+
 # 2. deb.
 if [ "$DEB" = 1 ]; then
   say "deb"
