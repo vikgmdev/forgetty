@@ -295,12 +295,26 @@ async fn attach_from_none_then_exactly_once_across_drops() {
             }
         }
     };
-    // Drop the connection three times while data flows.
+    // Drop the connection three times while data flows. Each drop waits for
+    // what it needs: the client connected and attached again, so there is a
+    // connection to drop, and the pane moved on since.
     let dropper = {
-        let server_ref = &server;
+        let (server_ref, h_ref) = (&server, &h);
         async move {
-            for _ in 0..3 {
-                tokio::time::sleep(Duration::from_millis(80)).await;
+            for k in 0..3usize {
+                let t0 = Instant::now();
+                while !(h_ref.state().is_connected()
+                    && server_ref.live_connections() == 1
+                    && server_ref.attaches().len() > k)
+                {
+                    assert!(t0.elapsed() < Duration::from_secs(20), "no connection to drop (drop {k})");
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+                let total = server_ref.log_bounds(pane).1;
+                while server_ref.log_bounds(pane).1 < (total + 6 * CHUNK).min(CHUNKS * CHUNK) {
+                    assert!(t0.elapsed() < Duration::from_secs(20), "the pane stopped (drop {k})");
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
                 server_ref.drop_connections();
             }
         }
@@ -337,8 +351,13 @@ async fn offset_older_than_log_gives_reset() {
     server.pause_handshakes(true);
     server.drop_connections();
     wait_state(&h, is_reconnecting, "reconnecting").await;
+    // The log changes only while no connection is open: a live stream whose
+    // offset the log loses is caught up with a snapshot, by design. This test
+    // is about the resume of a client that is away.
+    server.wait_no_live_connection().await;
     server.append(pane, &pattern_bytes(10_000, 110_000));
     server.truncate_log_before(pane, 50_000);
+    assert_eq!(server.live_connections(), 0, "a connection opened while the log changed");
     server.pause_handshakes(false);
 
     // Reset, then the log from its first byte.
@@ -373,6 +392,7 @@ async fn input_sent_while_disconnected_arrives_in_order() {
     init_log();
     let server = TestServer::start(TestServerConfig::default()).await;
     let pane = server.add_pane();
+    server.wait_pane_ready(pane).await;
     let h = connect(&server).await;
     let mut stream = h.attach_pane(pane).await.unwrap();
 

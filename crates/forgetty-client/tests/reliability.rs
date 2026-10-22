@@ -429,6 +429,10 @@ async fn server_restart_on_the_cached_port_reconnects_every_time() {
 /// backoff, so the client is Connected well under a second later.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn network_changed_aborts_a_hung_dial_and_connects_at_once() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
     let first = TestServer::start(TestServerConfig::default()).await;
     let node_id = first.node_id();
     let port = first.udp_addr().port();
@@ -466,8 +470,30 @@ async fn network_changed_aborts_a_hung_dial_and_connects_at_once() {
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
     let took = t0.elapsed();
-    println!("network_changed during a hung dial: Connected after {took:?}");
-    assert!(took < Duration::from_millis(300), "redial took {took:?}");
+    // The redial replaces the endpoint, and replacing waits the close grace
+    // (250 ms, `REPLACE_CLOSE_GRACE`) because the old socket's peer does not
+    // ack. Then it dials. The bound is that grace, plus the time a fresh
+    // client needs to dial this server in this run (endpoint, dial,
+    // handshake, so the host's load is in it), plus 150 ms.
+    let key2 = SecretKey::generate(&mut rand::rng());
+    server.authorize(key2.public());
+    let tb = Instant::now();
+    let h2 = tokio::time::timeout(
+        Duration::from_secs(10),
+        Client::connect(
+            server.addr(),
+            key2,
+            ClientInfo::new(Uuid::new_v4(), ClientKind::Cli, "baseline", "0"),
+        ),
+    )
+    .await
+    .expect("baseline connect timed out")
+    .expect("baseline connect failed");
+    let dial = tb.elapsed();
+    h2.close().await;
+    let bound = Duration::from_millis(250) + dial + Duration::from_millis(150);
+    println!("network_changed during a hung dial: Connected after {took:?} (fresh dial {dial:?}, bound {bound:?})");
+    assert!(took < bound, "redial took {took:?}, a fresh dial {dial:?}, bound {bound:?}");
     h.close().await;
     server.shutdown().await;
 }

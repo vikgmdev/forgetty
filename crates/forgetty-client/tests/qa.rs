@@ -2106,10 +2106,18 @@ async fn attaches_of_far_behind_panes_are_answered_before_their_snapshots() {
     let sent = Instant::now();
     let msg = ControlMsg::Request { id: PANES + 1, method: "list_tabs".into(), params: Value::Map(vec![]) };
     write_msg(&mut send, &msg).await.unwrap();
-    wait_for("every attach and the list_tabs to be answered", || {
-        answered.load(Ordering::SeqCst) == PANES && list_tabs_at.lock().unwrap().is_some()
-    })
-    .await;
+    // Every answer, however loaded the host: this test is about whether they
+    // come, not how fast (the 90 snapshot builds share the host's cores).
+    let t0 = Instant::now();
+    while !(answered.load(Ordering::SeqCst) == PANES && list_tabs_at.lock().unwrap().is_some()) {
+        assert!(
+            t0.elapsed() < Duration::from_secs(60),
+            "{} of {PANES} attaches answered, list_tabs {}",
+            answered.load(Ordering::SeqCst),
+            list_tabs_at.lock().unwrap().is_some()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     let list_tabs = list_tabs_at.lock().unwrap().unwrap().duration_since(sent);
     println!("{PANES} far-behind attaches at once: all answered, list_tabs after {list_tabs:?}");
     assert!(conn.close_reason().is_none(), "the server closed the connection");

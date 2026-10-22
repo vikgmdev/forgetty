@@ -652,6 +652,53 @@ impl TestServer {
         }
     }
 
+    /// Client connections open at the server now.
+    pub fn live_connections(&self) -> usize {
+        match &self.inner {
+            Inner::Mock { server, .. } => server.live_connections(),
+            Inner::Real(r) => r.state()["connections"].as_u64().unwrap() as usize,
+        }
+    }
+
+    /// Wait until the server holds no client connection. A test that changes
+    /// the log while a client is away needs this: a live connection would
+    /// see the change as a stream, not as a resume.
+    pub async fn wait_no_live_connection(&self) {
+        let t0 = std::time::Instant::now();
+        while self.live_connections() != 0 {
+            assert!(
+                t0.elapsed() < Duration::from_secs(10),
+                "{} connection(s) still open at the server",
+                self.live_connections()
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    /// Wait until the program of a pane reads its input raw. A fresh real pane
+    /// runs `stty raw -echo; exec cat`; input typed before that is echoed by
+    /// the terminal as well as by `cat`. The test server has no program.
+    pub async fn wait_pane_ready(&self, pane: Uuid) {
+        let Inner::Real(r) = &self.inner else { return };
+        let t0 = std::time::Instant::now();
+        loop {
+            let pid = r.state()["pane_input"]
+                .as_array()
+                .and_then(|a| {
+                    a.iter().find(|p| p["pane_id"].as_str() == Some(&pane.to_string())).cloned()
+                })
+                .and_then(|p| p["child_pid"].as_i64());
+            if let Some(pid) = pid {
+                let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+                if comm.trim() == "cat" {
+                    return;
+                }
+            }
+            assert!(t0.elapsed() < Duration::from_secs(10), "the pane program never started");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     /// Handshakes the server answered with `server_stopping` (real server).
     pub fn stopping_refusals(&self) -> u64 {
         match &self.inner {

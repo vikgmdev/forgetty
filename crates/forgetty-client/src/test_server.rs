@@ -522,6 +522,11 @@ impl TestServer {
         self.state.handshakes.load(Ordering::SeqCst)
     }
 
+    /// Client connections that are open now.
+    pub fn live_connections(&self) -> usize {
+        lock(&self.state.conns).iter().filter(|c| c.close_reason().is_none()).count()
+    }
+
     /// Change what new connections do after the `Welcome` (`die_mode`).
     pub fn set_die_mode(&self, mode: u8) {
         self.state.die_mode.store(mode, Ordering::SeqCst);
