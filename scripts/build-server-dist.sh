@@ -46,6 +46,12 @@ say() { printf '[dist] %s\n' "$*"; }
 cd "$ROOT"
 mkdir -p "$OUT"
 
+# A dist build is always for the baseline CPU: the package runs on machines other than this one.
+if [ -n "${FORGETTY_ZIG_CPU:-}" ]; then
+  say "note: ignoring FORGETTY_ZIG_CPU=$FORGETTY_ZIG_CPU (a dist build is always baseline)"
+  unset FORGETTY_ZIG_CPU
+fi
+
 # 1. Binary and libghostty-vt.
 if [ "$ZIGBUILD" = 1 ]; then
   say "cargo zigbuild $TARGET (glibc $GLIBC_FLOOR)"
@@ -60,11 +66,10 @@ LIB="$ROOT/target/$TARGET/release/lib/libghostty-vt.so.0.1.0"
 [ -x "$BIN" ] && [ -f "$LIB" ] || { echo "build output missing: $BIN / $LIB" >&2; exit 1; }
 
 # 1b. The library must run on any CPU of its architecture. `crates/forgetty-vt/build.rs` builds it
-# for the baseline CPU unless FORGETTY_ZIG_CPU says otherwise. Check the file that ships.
-if [ -z "${FORGETTY_ZIG_CPU:-}" ] && [ "$ZIG_ARCH" = x86_64 ] && command -v objdump >/dev/null; then
-  say "check libghostty-vt for native-CPU instructions"
-  "$ROOT/crates/forgetty-vt/scripts/check-no-native-simd.sh" "$LIB"
-fi
+# for the baseline CPU. Check the file that ships. A missing disassembler fails the build: a check
+# that cannot run is not a pass (aarch64 needs aarch64-linux-gnu-objdump or llvm-objdump).
+say "check libghostty-vt for native-CPU instructions"
+"$ROOT/crates/forgetty-vt/scripts/check-no-native-simd.sh" "$LIB"
 
 # 2. deb.
 if [ "$DEB" = 1 ]; then
