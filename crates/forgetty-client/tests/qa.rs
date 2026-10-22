@@ -27,7 +27,7 @@ async fn connect(server: &TestServer, name: &str) -> ClientHandle {
 /// Pane A runs `a_script` and gets 1 MiB of input it never reads (or reads
 /// into a full output). Pane B streams output. Meanwhile the server must
 /// answer `list_tabs` (v2 and local socket) in under 250 ms (or 10 times the
-/// idle cost on a slow host), keep the
+/// idle cost on a slow host, never over 2 s), keep the
 /// connection of the second client up, and keep B's stream moving.
 async fn blocked_input_stalls_nothing(a_script: &str, local_flood: bool) {
     let server = Arc::new(TestServer::start(TestServerConfig::default()).await);
@@ -121,8 +121,10 @@ async fn blocked_input_stalls_nothing(a_script: &str, local_flood: bool) {
     );
     let _ = &flood;
     // The failure this guards against is a stall of seconds, so the bound has
-    // room for the load other tests put on the host while this one runs.
-    let bound = Duration::from_millis(250).max(baseline * 10);
+    // room for the load other tests put on the host while this one runs. It
+    // has a ceiling, or a regression that slows every call would raise it.
+    assert!(baseline < Duration::from_millis(250), "list_tabs is slow when idle: {baseline:?}");
+    let bound = Duration::from_millis(250).max(baseline * 10).min(Duration::from_secs(2));
     println!("list_tabs before the flood (worst of 10): {baseline:?}, bound {bound:?}");
     assert!(worst < bound, "list_tabs took {worst:?} while pane A blocked (idle: {baseline:?})");
     assert!(progress.load(Ordering::SeqCst) > before, "pane B stopped streaming");
@@ -355,12 +357,14 @@ async fn an_honest_far_behind_phone_gets_every_snapshot_in_under_300_ms() {
         let took = t0.elapsed();
         worst = worst.max(took);
         assert!(h.snapshot_len > 0, "round {round}: no snapshot, the phone was not far behind");
-        // The wait is the build and the 100 ms floor, not the pacing (1 s and
-        // more). A build takes what this host gives it right now: two of them
-        // and 100 ms are the bound, with 300 ms as the least.
+        // The wait is this round's build and the 100 ms floor, not the pacing
+        // (1 s and more): a build and 900 ms is the bound, so a 1 s pacing
+        // wait fails however long the build took.
         let build = Duration::from_micros(qa_state(&server)["last_snapshot_us"].as_u64().unwrap_or(0));
-        let bound = Duration::from_millis(300).max(build * 2 + Duration::from_millis(100));
-        assert!(took < bound, "round {round}: snapshot after {took:?}, a build is {build:?}");
+        assert!(
+            took < build + Duration::from_millis(900),
+            "round {round}: snapshot after {took:?}, this round's build is {build:?}"
+        );
         // It reads at about 4 MiB/s, which is less than the program writes:
         // the server ends the stream once the phone is 4 MiB behind (the
         // claim is a strong one: live bytes at a good rate), and the phone
