@@ -67,10 +67,15 @@ async fn run(args: &[String]) -> Result<(), String> {
     let opts = ClientOptions { relay_only, ..ClientOptions::default() };
     // `--direct-addr IP:PORT` seeds the address cache, as a previous direct
     // connection would have left it (the pairing payload names no direct address).
-    if let Some(a) = arg(args, "--direct-addr") {
-        let a: std::net::SocketAddr = a.parse().map_err(|e| format!("--direct-addr: {e}"))?;
-        opts.addr_cache.insert(addr.id, a);
+    let cache = opts.addr_cache.clone();
+    let direct: Option<std::net::SocketAddr> = match arg(args, "--direct-addr") {
+        Some(a) => Some(a.parse().map_err(|e| format!("--direct-addr: {e}"))?),
+        None => None,
+    };
+    if let Some(a) = direct {
+        cache.insert(addr.id, a);
     }
+    let server_id = addr.id;
     if !no_pair {
         pair_with_addr(
             addr.clone(),
@@ -95,6 +100,12 @@ async fn run(args: &[String]) -> Result<(), String> {
     let settle: u64 = arg(args, "--settle-ms").and_then(|v| v.parse().ok()).unwrap_or(2000);
     tokio::time::sleep(Duration::from_millis(settle)).await;
 
+    // The first connection may have taught the cache the server's real address
+    // (iroh learns it in the handshake). Put the seeded one back, so the replace
+    // dials it (a delaying test proxy then shows the cost of the direct path).
+    if let Some(a) = direct {
+        cache.insert(server_id, a);
+    }
     let gate = arg(args, "--gate").map(PathBuf::from);
     let usable_after: Option<u64> = arg(args, "--usable-after-ms").and_then(|v| v.parse().ok());
     if let Some(g) = &gate {
