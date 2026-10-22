@@ -5,6 +5,7 @@
 //! buffer, and handling text selection.
 
 pub mod ffi;
+pub mod paste;
 pub mod screen;
 pub mod selection;
 pub mod terminal;

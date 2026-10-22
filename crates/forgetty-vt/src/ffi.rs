@@ -191,6 +191,7 @@ pub const GHOSTTY_CELL_CONTENT_CODEPOINT_GRAPHEME: i32 = 1;
 
 // Cell wide values
 pub const GHOSTTY_CELL_WIDE_NARROW: i32 = 0;
+pub const GHOSTTY_CELL_WIDE_WIDE: i32 = 1;
 pub const GHOSTTY_CELL_WIDE_SPACER_TAIL: i32 = 2;
 pub const GHOSTTY_CELL_WIDE_SPACER_HEAD: i32 = 3;
 
@@ -1025,6 +1026,14 @@ extern "C" {
         buf_len: usize,
         out_written: *mut usize,
     ) -> GhosttyResult;
+
+    // -----------------------------------------------------------------------
+    // Paste safety
+    // -----------------------------------------------------------------------
+
+    /// libghostty's paste-safety check: false if the data holds a newline or
+    /// the bracketed-paste end sequence.
+    pub fn ghostty_paste_is_safe(data: *const u8, len: usize) -> bool;
 }
 
 // ---------------------------------------------------------------------------

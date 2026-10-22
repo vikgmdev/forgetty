@@ -21,10 +21,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use forgetty_proto::{
-    cap, close_code, decode_msg, encode_input_frame, encode_msg, error_code, from_value, method,
+    cap, close_code, decode_msg, encode_input_frame, encode_input_frame_flags, encode_msg, error_code, from_value, method,
     read_frame_into, read_msg, read_output_frame, to_value, write_frame, write_msg,
     AttachPaneParams, ControlMsg, DetachPaneParams, HandshakeReply, Hello, PaneStreamHeader,
-    ResizePaneParams, ServerEvent, Value, Welcome, ALPN_RPC, INPUT_BUFFER_CAP,
+    ResizePaneParams, ServerEvent, Value, Welcome, ALPN_RPC, INPUT_BUFFER_CAP, INPUT_FLAG_AUTO,
     NETWORK_CHANGE_PONG_MS, PING_INTERVAL_MS, PONG_DEAD_AFTER_MS, PROTO_MAJOR,
     RECONNECT_BACKOFF_MS,
 };
@@ -182,6 +182,9 @@ pub(crate) struct PaneState {
     /// Counts the pane streams read so far. A newer stream (snapshot
     /// catch-up, re-attach) takes the pane over from an older one.
     stream: u64,
+    /// `PaneStreamHeader.replay_end` of the newest stream: the pane offset where the replay
+    /// ends and live bytes start. `None` from a server that does not send it.
+    replay_end: Option<u64>,
 }
 
 /// A queued item with the number of the stream it came from.
@@ -205,10 +208,72 @@ pub(crate) struct PaneShared {
 /// One input frame kept until the server acks it.
 struct InFrame {
     seq: u64,
-    /// Encoded payload `[uuid][seq][bytes]`.
-    payload: Arc<Vec<u8>>,
-    /// Input bytes inside (what the 64 KiB cap counts).
-    len: usize,
+    pane: Uuid,
+    /// The input bytes. The wire payload is built when the frame is sent, because a reconnect
+    /// can land on a server with a different `input_flags` answer.
+    bytes: Arc<[u8]>,
+    /// AD-025: a terminal reply or focus report, not typing. The wire flag is sent only
+    /// when both sides list `input_flags`.
+    auto: bool,
+}
+
+impl InFrame {
+    /// `len` counts toward the 64 KiB buffer.
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// Wire payload for a link that did (`flags`) or did not negotiate `input_flags`.
+    fn payload(&self, flags: bool) -> Vec<u8> {
+        if flags {
+            encode_input_frame_flags(self.pane, self.seq, if self.auto { INPUT_FLAG_AUTO } else { 0 }, &self.bytes)
+        } else {
+            encode_input_frame(self.pane, self.seq, &self.bytes)
+        }
+    }
+}
+
+/// Where to cut `b` so that a piece of at most `max` bytes never ends inside a UTF-8 character
+/// or inside an escape sequence (CSI, SS3, OSC). A piece is queued, sent and acked whole, so
+/// the PTY never sees half a sequence between two frames.
+fn cut_point(b: &[u8], max: usize) -> usize {
+    if b.len() <= max {
+        return b.len();
+    }
+    let mut n = max;
+    while n > 0 && (b[n] & 0xC0) == 0x80 {
+        n -= 1;
+    }
+    let lo = n.saturating_sub(64);
+    if let Some(i) = b[lo..n].iter().rposition(|&c| c == 0x1b).map(|i| lo + i) {
+        let seq = &b[i..n];
+        let open = match seq.get(1) {
+            None => true,
+            Some(b'[') => !seq[2..].iter().any(|c| (0x40..=0x7e).contains(c)),
+            Some(b'O') => seq.len() < 3,
+            Some(b']') => !seq[2..].iter().any(|&c| c == 0x07) && !seq.windows(2).any(|w| w == [0x1b, b'\\']),
+            Some(_) => false,
+        };
+        if open && i > 0 {
+            return i;
+        }
+    }
+    if n == 0 {
+        max
+    } else {
+        n
+    }
+}
+
+fn split_input(mut b: &[u8]) -> Vec<&[u8]> {
+    let mut out = Vec::new();
+    while !b.is_empty() {
+        let n = cut_point(b, INPUT_CHUNK);
+        let (head, tail) = b.split_at(n);
+        out.push(head);
+        b = tail;
+    }
+    out
 }
 
 struct InputState {
@@ -232,7 +297,7 @@ impl InputQueue {
         let mut freed = false;
         while st.frames.front().is_some_and(|f| f.seq <= acked) {
             let f = st.frames.pop_front().expect("front checked");
-            st.bytes -= f.len;
+            st.bytes -= f.len();
             freed = true;
         }
         drop(st);
@@ -654,7 +719,7 @@ impl ClientHandle {
         let pane = Arc::new(PaneShared {
             id: pane_id,
             tx,
-            state: Mutex::new(PaneState { gen: 0, offset: None, stream: 0, reset_stream: 0 }),
+            state: Mutex::new(PaneState { gen: 0, offset: None, stream: 0, reset_stream: 0, replay_end: None }),
             attached_gen: Arc::new(tokio::sync::Mutex::new(0)),
         });
         {
@@ -684,43 +749,51 @@ impl ClientHandle {
     /// cap would be exceeded while disconnected. While connected the call
     /// waits for room instead.
     pub async fn send_input(&self, pane_id: Uuid, bytes: &[u8]) -> Result<(), ClientError> {
+        self.send_input_flagged(pane_id, bytes, false).await
+    }
+
+    /// Like [`send_input`](Self::send_input) with the AD-025 flag: `auto` marks terminal
+    /// replies (DA, CPR, kitty answers) and focus reports. An `auto` frame never counts as
+    /// typing. The flag goes on the wire only when the server lists `input_flags`.
+    ///
+    /// A buffer is accepted whole or refused whole (`InputBufferFull`), never in part. It is cut
+    /// into frames only at character and escape sequence boundaries.
+    pub async fn send_input_flagged(&self, pane_id: Uuid, bytes: &[u8], auto: bool) -> Result<(), ClientError> {
         let shared = self.shared();
         if self.state() == ConnectionState::Closed {
             return Err(ClientError::Closed);
         }
-        let disconnected = !self.state().is_connected();
-        if disconnected && lock(&shared.input.state).bytes + bytes.len() > INPUT_BUFFER_CAP {
-            return Err(ClientError::InputBufferFull);
+        if bytes.is_empty() {
+            return Ok(());
         }
-        for chunk in bytes.chunks(INPUT_CHUNK) {
-            loop {
-                let space = shared.input.space.notified();
-                tokio::pin!(space);
-                space.as_mut().enable();
-                {
-                    let mut st = lock(&shared.input.state);
-                    if st.bytes + chunk.len() <= INPUT_BUFFER_CAP || st.frames.is_empty() {
+        let pieces = split_input(bytes);
+        loop {
+            let space = shared.input.space.notified();
+            tokio::pin!(space);
+            space.as_mut().enable();
+            {
+                // All pieces go in under one lock, or none do: a buffer is never cut by a full
+                // queue or by a connection that drops while this call waits.
+                let mut st = lock(&shared.input.state);
+                if st.bytes + bytes.len() <= INPUT_BUFFER_CAP || st.frames.is_empty() {
+                    for piece in &pieces {
                         let seq = st.next_seq;
                         st.next_seq += 1;
-                        st.bytes += chunk.len();
-                        st.frames.push_back(InFrame {
-                            seq,
-                            payload: Arc::new(encode_input_frame(pane_id, seq, chunk)),
-                            len: chunk.len(),
-                        });
-                        shared.input.ready.notify_one();
-                        break;
+                        st.bytes += piece.len();
+                        st.frames.push_back(InFrame { seq, pane: pane_id, bytes: Arc::from(*piece), auto });
                     }
+                    drop(st);
+                    shared.input.ready.notify_one();
+                    return Ok(());
                 }
-                if !self.state().is_connected() {
-                    return Err(ClientError::InputBufferFull);
-                }
-                // Full of unacked frames: ask for an ack now, then wait.
-                shared.ping_now.notify_one();
-                space.await;
             }
+            if !self.state().is_connected() {
+                return Err(ClientError::InputBufferFull);
+            }
+            // Full of unacked frames: ask for an ack now, then wait.
+            shared.ping_now.notify_one();
+            space.await;
         }
-        Ok(())
     }
 
     /// Input bytes dropped so far because the server restarted before they
@@ -890,6 +963,13 @@ impl PaneStream {
     /// the first stream header arrived.
     pub fn offset(&self) -> Option<u64> {
         lock(&self.pane.state).offset
+    }
+
+    /// Pane offset where the replay of the newest stream ends and live bytes start
+    /// (`PaneStreamHeader.replay_end`). `None` before the first header, or from a server that
+    /// does not send it.
+    pub fn replay_end(&self) -> Option<u64> {
+        lock(&self.pane.state).replay_end
     }
 }
 
@@ -1485,7 +1565,7 @@ async fn run_session(
     let mut tasks: JoinSet<TaskEnd> = JoinSet::new();
     tasks.spawn(control_writer(send, control_rx));
     tasks.spawn(control_reader(link.clone(), shared.clone(), recv));
-    tasks.spawn(input_writer(shared.clone(), input_send, resumed_rx));
+    tasks.spawn(input_writer(shared.clone(), input_send, resumed_rx, link.has_cap(cap::INPUT_FLAGS)));
     tasks.spawn(accept_streams(conn.clone(), stream_tx));
     tasks.spawn(session_init(shared.clone(), link.clone(), resumed_tx));
     tasks.spawn(liveness(shared.clone(), link.clone()));
@@ -1711,6 +1791,7 @@ async fn input_writer(
     shared: Arc<Shared>,
     mut send: SendStream,
     resumed: oneshot::Receiver<()>,
+    flags: bool,
 ) -> TaskEnd {
     if resumed.await.is_err() {
         return TaskEnd::Done; // init failed, the session is ending
@@ -1724,7 +1805,7 @@ async fn input_writer(
         let next = {
             let st = lock(&q.state);
             let i = st.frames.partition_point(|f| f.seq <= sent);
-            st.frames.get(i).map(|f| (f.seq, f.payload.clone()))
+            st.frames.get(i).map(|f| (f.seq, f.payload(flags)))
         };
         let Some((seq, payload)) = next else {
             ready.await;
@@ -1820,7 +1901,9 @@ async fn pane_reader(shared: Arc<Shared>, gen: u64, mut recv: RecvStream) -> Tas
             return TaskEnd::Done; // an even newer stream already took over
         }
         if header.reset {
-            st.offset = Some(header.start_offset);
+            // A snapshot is not complete until its last byte arrived: a drop before that
+            // must reattach from scratch, not resume at an offset the VT never reached.
+            st.offset = if header.snapshot_len > 0 { None } else { Some(header.start_offset) };
         } else if st.offset.is_some_and(|o| o != header.start_offset) {
             return TaskEnd::Lost(format!(
                 "pane {} resumed at {} but expected {:?}",
@@ -1830,6 +1913,7 @@ async fn pane_reader(shared: Arc<Shared>, gen: u64, mut recv: RecvStream) -> Tas
             st.offset = Some(header.start_offset);
         }
         st.gen = gen;
+        st.replay_end = header.replay_end;
         if header.reset {
             permit.send(Tagged {
                 stream: mine,
@@ -1850,7 +1934,7 @@ async fn pane_reader(shared: Arc<Shared>, gen: u64, mut recv: RecvStream) -> Tas
                 if st.gen != gen || st.stream != mine {
                     return TaskEnd::Done; // a newer stream owns the pane
                 }
-                let offset = st.offset.unwrap_or(0);
+                let offset = st.offset.unwrap_or(header.start_offset);
                 if snapshot_left > 0 {
                     if buf.len() > snapshot_left || !header.reset {
                         return TaskEnd::Lost(format!(
@@ -1859,6 +1943,10 @@ async fn pane_reader(shared: Arc<Shared>, gen: u64, mut recv: RecvStream) -> Tas
                         ));
                     }
                     snapshot_left -= buf.len();
+                    if snapshot_left == 0 {
+                        // Complete: from here a reconnect may resume at the pane offset.
+                        st.offset = Some(header.start_offset);
+                    }
                     permit.send(Tagged {
                         stream: mine,
                         item: PaneItem::Snapshot { offset, bytes: std::mem::take(&mut buf) },
@@ -1909,6 +1997,36 @@ fn is_superseded(e: &forgetty_proto::FrameError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_is_cut_only_at_character_and_escape_boundaries() {
+        // 3-byte characters: no cut may fall inside one.
+        let text = "\u{20ac}".repeat(INPUT_CHUNK);
+        let pieces = split_input(text.as_bytes());
+        assert!(pieces.len() > 1);
+        for p in &pieces {
+            assert!(std::str::from_utf8(p).is_ok(), "a piece ends inside a UTF-8 character");
+            assert!(p.len() <= INPUT_CHUNK);
+        }
+        assert_eq!(pieces.concat(), text.as_bytes());
+        // A CSI that would straddle the cut moves whole into the next piece.
+        let mut b = vec![b'a'; INPUT_CHUNK - 3];
+        b.extend_from_slice(b"\x1b[200~");
+        b.extend_from_slice(&[b'b'; 100]);
+        let pieces = split_input(&b);
+        assert_eq!(pieces[0].len(), INPUT_CHUNK - 3);
+        assert!(pieces[1].starts_with(b"\x1b[200~"));
+        assert_eq!(pieces.concat(), b);
+        // A finished sequence at the edge stays where it is.
+        let mut b = vec![b'a'; INPUT_CHUNK - 4];
+        b.extend_from_slice(b"\x1b[1m");
+        b.extend_from_slice(&[b'b'; 10]);
+        assert_eq!(split_input(&b)[0].len(), INPUT_CHUNK);
+        // Short input is one piece, and a lone ESC run cannot loop forever.
+        assert_eq!(split_input(b"ls\r").len(), 1);
+        let esc = vec![0x1b; INPUT_CHUNK * 2 + 5];
+        assert_eq!(split_input(&esc).concat(), esc);
+    }
 
     #[test]
     fn backoff_follows_the_contract() {

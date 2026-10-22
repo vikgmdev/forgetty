@@ -18,6 +18,13 @@
 //!      RUNPATH; jniLibs packaging is handled by forgetty-android's build.rs).
 //!   4. Emits `cargo:LIB_DIR=<path>` so the dependent forgetty-android build.rs
 //!      can copy libghostty-vt.so into the APK's jniLibs directory.
+//!
+//! # Windows (V3 P3 spike)
+//!
+//! When `CARGO_CFG_TARGET_OS=windows`, this script passes
+//! `-Dtarget=x86_64-windows-gnu` to Zig (C ABI only, so it links into an MSVC
+//! Rust binary), links the import library `ghostty-vt.lib`, and copies
+//! `ghostty-vt.dll` next to the exe (`target/<profile>/` and `deps/`).
 
 use std::env;
 use std::path::PathBuf;
@@ -31,6 +38,7 @@ fn main() {
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let is_android = target_os == "android";
+    let is_windows = target_os == "windows";
 
     // Check if the ghostty submodule exists
     if !ghostty_dir.join("build.zig").exists() {
@@ -68,6 +76,15 @@ fn main() {
         // example `x86_64-linux-gnu.2.28`, pins the C library version the
         // library needs. A cross-compile to another CPU gets a default.
         println!("cargo:warning=zig target for libghostty-vt: {zig_triple}");
+        cmd.arg(format!("-Dtarget={zig_triple}"));
+    }
+
+    // Windows: always pass an explicit Zig target so the build is identical
+    // whether the host is Windows (CI) or Linux (cross-compile). The DLL only
+    // exposes a C ABI, so the gnu ABI DLL links fine into an MSVC-targeted
+    // Rust binary through the import library Zig emits (ghostty-vt.lib).
+    if is_windows {
+        let zig_triple = windows_zig_triple(&target_arch);
         cmd.arg(format!("-Dtarget={zig_triple}"));
     }
 
@@ -126,7 +143,8 @@ fn main() {
                 println!("cargo:rustc-link-lib=dylib=c++");
             }
             _ => {
-                // Windows and others: MSVC links C++ runtime automatically.
+                // Windows and others: ghostty-vt.dll bundles its own C++
+                // runtime (Zig's libc++), nothing extra to link.
             }
         }
     }
@@ -135,7 +153,13 @@ fn main() {
     // On Android the dynamic linker resolves .so files from the APK's lib/<abi>/
     // directory — RUNPATH is not used. The forgetty-android build.rs copies
     // libghostty-vt.so into jniLibs using the LIB_DIR metadata below.
-    if !is_android {
+    if is_windows {
+        // Windows: the import library is `lib/ghostty-vt.lib`, the DLL is in
+        // `bin/`. Copy the DLL next to the final exe (and into `deps/` so
+        // test binaries find it too).
+        copy_dll_next_to_exe(&out_dir, &install_prefix.join("bin"));
+        println!("cargo:BIN_DIR={}", install_prefix.join("bin").display());
+    } else if !is_android {
         #[cfg(unix)]
         copy_so_to_target_lib(&out_dir, &lib_dir);
     }
@@ -193,6 +217,43 @@ fn android_zig_triple(arch: &str) -> &'static str {
         "x86_64" => "x86_64-linux-android",
         "x86" => "x86-linux-android",
         _ => panic!("Unsupported Android architecture for Zig cross-compile: {arch}"),
+    }
+}
+
+/// Map a Rust target architecture name to the corresponding Zig Windows target triple.
+fn windows_zig_triple(arch: &str) -> &'static str {
+    match arch {
+        "x86_64" => "x86_64-windows-gnu",
+        "aarch64" => "aarch64-windows-gnu",
+        _ => panic!("Unsupported Windows architecture for Zig cross-compile: {arch}"),
+    }
+}
+
+/// Copy `ghostty-vt.dll` next to the final executable (`target/<profile>/`)
+/// and into `target/<profile>/deps/` (test binaries).
+fn copy_dll_next_to_exe(out_dir: &std::path::Path, zig_bin_dir: &std::path::Path) {
+    use std::fs;
+
+    let dll = "ghostty-vt.dll";
+    let src = zig_bin_dir.join(dll);
+    if !src.exists() {
+        println!("cargo:warning=Post-build: {} not found, skipping copy", src.display());
+        return;
+    }
+    let Some(profile_dir) = find_target_profile_dir(out_dir) else {
+        println!(
+            "cargo:warning=Post-build: could not determine target/<profile>/ from OUT_DIR={}",
+            out_dir.display()
+        );
+        return;
+    };
+    for dest_dir in [profile_dir.clone(), profile_dir.join("deps")] {
+        let _ = fs::create_dir_all(&dest_dir);
+        let tmp = dest_dir.join(format!("{dll}.tmp"));
+        let dest = dest_dir.join(dll);
+        if let Err(e) = fs::copy(&src, &tmp).and_then(|_| fs::rename(&tmp, &dest)) {
+            println!("cargo:warning=Post-build: failed to copy {dll} to {}: {e}", dest.display());
+        }
     }
 }
 
@@ -284,7 +345,6 @@ fn copy_so_to_target_lib(out_dir: &std::path::Path, zig_lib_dir: &std::path::Pat
 /// OUT_DIR layout: `<workspace>/target/<profile>/build/<crate>-<hash>/out`
 /// We walk up looking for a parent that contains a `build/` child (the "build"
 /// directory is always directly under `target/<profile>/`).
-#[cfg(unix)]
 fn find_target_profile_dir(out_dir: &std::path::Path) -> Option<PathBuf> {
     let mut dir = out_dir.to_path_buf();
     // Walk up at most 10 levels to avoid infinite loops

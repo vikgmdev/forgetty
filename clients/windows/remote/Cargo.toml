@@ -1,0 +1,30 @@
+[package]
+name = "forgetty-remote"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+description = "Forgetty Windows client: RemoteBackend on forgetty-client (protocol v2), machine store, pairing. No UI code."
+
+[dependencies]
+forgetty-shell-core = { path = "../shell-core" }
+forgetty-client = { path = "../../../crates/forgetty-client" }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+async-channel = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+rand = "0.9"
+
+[dev-dependencies]
+forgetty-client = { path = "../../../crates/forgetty-client", features = ["test-util"] }
+tempfile = "3"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+] }

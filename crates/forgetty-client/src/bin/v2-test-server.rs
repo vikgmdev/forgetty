@@ -12,7 +12,9 @@
 //!
 //! Commands on stdin, one per line:
 //! `status <waiting|done|failed> [message]` sends `StatusChanged` for the
-//! first pane, `quit` stops the server.
+//! first pane, `snapshot <text>` queues a VT snapshot (AD-023) for the first pane,
+//! `size <rows> <cols> [name]` makes another client own the PTY size of the first pane
+//! (AD-020), `drop` closes every connection and `quit` stops the server.
 
 use std::path::PathBuf;
 
@@ -49,6 +51,11 @@ async fn main() {
         secret_key: Some(key),
         pair_secret: Some(secret.clone()),
         echo_input: true,
+        capabilities: {
+            let mut caps = TestServerConfig::default().capabilities;
+            caps.push(forgetty_client::proto::cap::SNAPSHOT_CATCHUP.to_string());
+            caps
+        },
         own_runtime: false,
         panes: (1..=panes)
             .map(|n| (pane_id(n), format!("forgetty v2 test server, pane {n}\r\n$ ").into_bytes()))
@@ -72,13 +79,31 @@ async fn main() {
 
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     while let Ok(Some(line)) = lines.next_line().await {
-        let mut parts = line.trim().splitn(3, ' ');
+        let mut parts = line.trim().splitn(4, ' ');
         match parts.next() {
             Some("status") => {
                 let status = parts.next().unwrap_or("waiting");
-                let message = parts.next().unwrap_or("");
-                server.push_status(pane_id(1), status, message);
+                let message = parts.by_ref().collect::<Vec<_>>().join(" ");
+                server.push_status(pane_id(1), status, &message);
                 println!("OK status {status}");
+            }
+            Some("snapshot") => {
+                let mut bytes = b"\x1b[2J\x1b[H".to_vec();
+                bytes.extend_from_slice(line.trim().strip_prefix("snapshot").unwrap_or("").trim().as_bytes());
+                server.queue_snapshot(pane_id(1), &bytes);
+                println!("OK snapshot");
+            }
+            Some("size") => {
+                // size <rows> <cols> [owner name]: another client takes the PTY size (AD-020).
+                let rows: u16 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(24);
+                let cols: u16 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(80);
+                let owner = parts.next().unwrap_or("other-client");
+                server.force_size(pane_id(1), rows, cols, owner);
+                println!("OK size {rows} {cols}");
+            }
+            Some("drop") => {
+                server.drop_connections();
+                println!("OK drop");
             }
             Some("quit") => {
                 server.shutdown().await;

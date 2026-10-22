@@ -43,6 +43,7 @@ impl ClientInfo {
                 cap::SIZE_POLICY_LATEST.to_string(),
                 cap::SNAPSHOT_CATCHUP.to_string(),
                 cap::SIZE_OWNER.to_string(),
+                cap::INPUT_FLAGS.to_string(),
             ],
         }
     }

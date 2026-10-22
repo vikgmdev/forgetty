@@ -1,0 +1,278 @@
+name: windows-client
+
+# V3 Windows client: GPUI app shell + libghostty-vt + ConPTY + protocol v2 client.
+# Builds clients/windows and the v2-test-server, runs the headless smoke mode
+# (W1, W2 and W3 checks; W3 pairs with the test server running as a separate
+# process, kills and restarts it), uploads the exe, DLLs, smoke.json and a
+# screenshot of the 4-pane layout.
+on:
+  push:
+    branches: [v3/win-spike]
+    paths:
+      - "clients/windows/**"
+      - "crates/forgetty-vt/**"
+      - "crates/forgetty-core/**"
+      - "crates/forgetty-client/**"
+      - "crates/forgetty-proto/**"
+      - "crates/forgetty-sync/**"
+      - "crates/forgetty-server/**"
+      - "crates/forgetty-session/**"
+      - ".github/workflows/windows-client.yml"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-smoke:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            clients/windows
+            .
+
+      - name: Build (release)
+        working-directory: clients/windows
+        run: cargo build --release
+
+      - name: Build the protocol v2 test server (separate process for the W3 smoke)
+        run: |
+          cargo build --release -p forgetty-client --features test-util --bin v2-test-server
+          Copy-Item target/release/v2-test-server.exe clients/windows/target/release/
+        shell: pwsh
+
+      - name: Unit tests (shell core, remote backend)
+        working-directory: clients/windows
+        run: |
+          # The ConPTY tests in shell-core's local module are covered by the smoke.
+          cargo test --release -p forgetty-shell-core --lib -- notify:: layout:: keys:: osc:: osc52:: fuzzy:: update::
+          cargo test --release -p forgetty-remote
+
+      - name: Turn on the Japanese and Chinese input methods for the smoke
+        # The runner image already has the language packs and Microsoft IME / Pinyin. They only
+        # need to be enabled for the user, so the smoke can switch to them like the language bar.
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $list = Get-WinUserLanguageList
+          foreach ($tag in 'ja-JP', 'zh-Hans-CN') { if (-not ($list | Where-Object LanguageTag -eq $tag)) { $list.Add($tag) } }
+          Set-WinUserLanguageList $list -Force
+          Get-WinUserLanguageList | ForEach-Object { "$($_.LanguageTag): $($_.InputMethodTips -join ' ')" }
+
+      - name: Smoke
+        shell: pwsh
+        working-directory: clients/windows/target/release
+        run: |
+          Get-ChildItem *.exe, *.dll | Format-Table Name, Length
+          .\forgetty-win.exe --smoke | Tee-Object -FilePath smoke.json
+          $code = $LASTEXITCODE
+          Write-Host "forgetty-win --smoke exit code: $code"
+          exit $code
+
+      - name: Upload layout screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: forgetty-win-layout-4pane
+          if-no-files-found: warn
+          path: clients/windows/target/release/layout-4pane.png
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: forgetty-win
+          if-no-files-found: warn
+          path: |
+            clients/windows/target/release/forgetty-win.exe
+            clients/windows/target/release/*.dll
+            clients/windows/target/release/v2-test-server.exe
+            clients/windows/target/release/smoke.json
+
+  # The real Linux server, built here, for the WSL end-to-end test below.
+  linux-server:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-server
+
+      - name: Build forgetty (release) and the server tarball
+        run: scripts/build-server-dist.sh --target x86_64-unknown-linux-gnu --no-zigbuild --skip-deb --skip-rpm --out dist-out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: forgetty-server-linux
+          path: dist-out/*.tar.gz
+          if-no-files-found: error
+
+  # W4: the Windows client against the real `forgetty server run` inside WSL.
+  # WSL1 is what a GitHub-hosted Windows runner can run (no nested
+  # virtualization). If WSL cannot host the server, the step output says why.
+  wsl-e2e:
+    needs: [build-and-smoke, linux-server]
+    if: ${{ !cancelled() && needs.linux-server.result == 'success' }}
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: forgetty-win
+          path: win
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: forgetty-server-linux
+          path: srv
+
+      - uses: Vampire/setup-wsl@v6
+        with:
+          distribution: Ubuntu-24.04
+          wsl-version: 1
+
+      - name: Install the server in WSL
+        shell: pwsh
+        run: |
+          $d = "Ubuntu-24.04"
+          wsl --status
+          wsl -l -v
+          $srv = (Resolve-Path srv).Path -replace '\\','/'
+          $u = (wsl -d $d -u root --exec wslpath -u "$srv").Trim()
+          wsl -d $d -u root --exec bash -c "set -e; mkdir -p /opt/fg; tar -xzf $u/*.tar.gz -C /opt/fg --strip-components=1; install -m755 /opt/fg/bin/forgetty /usr/local/bin/forgetty; install -m644 /opt/fg/lib/libghostty-vt.so.0 /usr/local/lib/; ldconfig; ldd /usr/local/bin/forgetty | grep -i ghostty; /usr/local/bin/forgetty --version; uname -a; id"
+
+      - name: Smoke against the real server
+        shell: pwsh
+        working-directory: win
+        run: |
+          $env:FORGETTY_REAL_WSL_DISTRO = "Ubuntu-24.04"
+          .\forgetty-win.exe --smoke | Tee-Object -FilePath real-smoke.json
+          $code = $LASTEXITCODE
+          Write-Host "forgetty-win real smoke exit code: $code"
+          exit $code
+
+      - name: Server log
+        if: always()
+        shell: pwsh
+        run: |
+          wsl -d Ubuntu-24.04 -u root --exec bash -c 'ls -la /root/.local/share/forgetty/logs 2>&1 | head -20; for f in $(ls -t /root/.local/share/forgetty/logs/* 2>/dev/null | head -3); do echo ==== $f; tail -n 60 $f; done; exit 0'
+
+      - name: Upload real-server smoke result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: forgetty-win-real
+          if-no-files-found: warn
+          path: win/real-smoke.json
+
+  # W4: per-user MSI (WiX v4). MSI and not MSIX: an unsigned MSIX needs its
+  # certificate trusted machine-wide (admin) or Developer Mode before it
+  # installs; a per-user MSI installs with no admin rights and no setup.
+  installer:
+    needs: build-and-smoke
+    if: ${{ !cancelled() }}
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: forgetty-win
+          path: payload
+
+      - name: Build the MSI
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 4.0.5
+          $env:PATH += ";$env:USERPROFILE\.dotnet\tools"
+          $ver = (Select-String -Path clients/windows/Cargo.toml -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value
+          Write-Host "version $ver"
+          New-Item -ItemType Directory -Force out | Out-Null
+          wix build -arch x64 -d Version=$ver -d Payload=payload clients/windows/installer/Package.wxs -o "out/forgetty-win-$ver-x64.msi"
+          Get-ChildItem out | Format-Table Name, Length
+
+      - name: Install, check, uninstall
+        shell: pwsh
+        run: |
+          $msi = (Get-ChildItem out/*.msi | Select-Object -First 1).FullName
+          # Word Count bit 8 set means "elevated privileges are not required to install".
+          $wi = New-Object -ComObject WindowsInstaller.Installer
+          $db = $wi.GetType().InvokeMember("OpenDatabase", "InvokeMethod", $null, $wi, @($msi, 0))
+          $si = $db.GetType().InvokeMember("SummaryInformation", "GetProperty", $null, $db, @(0))
+          $wc = [int]$si.GetType().InvokeMember("Property", "GetProperty", $null, $si, @(15))
+          Write-Host "summary word count: $wc"
+          if (($wc -band 8) -eq 0) { throw "the package asks for elevation" }
+          $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /l*v install.log" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Get-Content install.log -Tail 60; throw "install failed: $($p.ExitCode)" }
+          $dir = Join-Path $env:LOCALAPPDATA "Programs\Forgetty"
+          foreach ($f in "forgetty-win.exe","forgetty.exe","ghostty-vt.dll") { if (-not (Test-Path (Join-Path $dir $f))) { throw "missing $f" } }
+          $lnk = Join-Path ([Environment]::GetFolderPath("Programs")) "Forgetty.lnk"
+          if (-not (Test-Path $lnk)) { throw "no Start menu entry at $lnk" }
+          $path = (Get-ItemProperty "HKCU:\Environment").Path
+          if ($path -notlike "*$dir*") { throw "install folder is not on the user PATH" }
+          if (Test-Path "C:\Program Files\Forgetty") { throw "wrote to Program Files" }
+          if (Test-Path "HKLM:\Software\Forgetty") { throw "wrote to HKLM" }
+          Write-Host "installed to $dir"
+          $p = Start-Process msiexec.exe -ArgumentList "/x `"$msi`" /qn /l*v uninstall.log" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Get-Content uninstall.log -Tail 60; throw "uninstall failed: $($p.ExitCode)" }
+          if (Test-Path $dir) { throw "install folder left behind" }
+          if (Test-Path $lnk) { throw "Start menu entry left behind" }
+          if ((Get-ItemProperty "HKCU:\Environment").Path -like "*$dir*") { throw "PATH entry left behind" }
+          Write-Host "install and uninstall are clean"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: forgetty-win-msi
+          if-no-files-found: error
+          path: |
+            out/*.msi
+            install.log
+            uninstall.log
+
+  # Can the runner install a Japanese or Chinese IME? Run by hand (workflow_dispatch). Result: it
+  # already has Microsoft IME (ja) and Pinyin (zh) and the language packs, so the smoke drives them
+  # (`ime_real_*`). This job only reports (ime-probe.json).
+  # It does not gate: a hosted runner may refuse language packs, and then the IME checks are the
+  # handler-level ones in the smoke plus clients/windows/docs/manual-tests.md.
+  ime-probe:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    timeout-minutes: 45
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Try to install ja-JP and zh-CN input methods
+        shell: pwsh
+        run: ./clients/windows/ci/ime-probe.ps1
+      - name: Upload probe result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ime-probe
+          if-no-files-found: warn
+          path: ime-probe.json

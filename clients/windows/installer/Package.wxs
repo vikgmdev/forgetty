@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Forgetty for Windows: per-user MSI (WiX v4).
+
+  - Scope="perUser": installs to %LOCALAPPDATA%\Programs\Forgetty with no admin
+    rights and no UAC prompt. Nothing is written to Program Files or HKLM.
+  - Start menu entry "Forgetty".
+  - The install folder is added to the user PATH (HKCU). forgetty.exe there is
+    reserved for the Windows CLI; for now it starts the same app.
+  - Unsigned for now: Windows SmartScreen shows "Unknown publisher" (README).
+  - Uninstall leaves %APPDATA%\forgetty (paired machines, device key) alone.
+
+  Build: wix build -arch x64 -d Version=0.0.1 -d Payload=<dir> Package.wxs -o forgetty-win-0.0.1-x64.msi
+  <dir> holds forgetty-win.exe and ghostty-vt.dll.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="Forgetty" Manufacturer="Forgetty" Version="$(Version)"
+           UpgradeCode="6B1F3C2A-5E0B-4B7B-9D5A-2C8A1E7F4D10"
+           Scope="perUser" Language="1033" InstallerVersion="500">
+    <SummaryInformation Description="Forgetty terminal for Windows" />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Forgetty is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="ProgramsDir" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="Forgetty" />
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder" />
+
+    <Feature Id="Main" Title="Forgetty" Level="1">
+      <ComponentGroupRef Id="AppFiles" />
+    </Feature>
+  </Package>
+
+  <Fragment>
+    <ComponentGroup Id="AppFiles" Directory="INSTALLFOLDER">
+      <Component Id="AppExe" Guid="718F72D1-69C5-491E-A8B6-9861A06611A4">
+        <File Id="AppExeFile" Source="$(Payload)\forgetty-win.exe" />
+        <RegistryValue Root="HKCU" Key="Software\Forgetty\Installer" Name="AppExe" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+      <Component Id="VtDll" Guid="81C61D4D-A86C-4516-960B-6E149D71BED2">
+        <File Id="VtDllFile" Source="$(Payload)\ghostty-vt.dll" />
+        <RegistryValue Root="HKCU" Key="Software\Forgetty\Installer" Name="VtDll" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+      <Component Id="CliName" Guid="7DD9C4D4-D9BF-446C-B2AB-5EBEAEEDA997">
+        <File Id="CliExeFile" Name="forgetty.exe" Source="$(Payload)\forgetty-win.exe" />
+        <RegistryValue Root="HKCU" Key="Software\Forgetty\Installer" Name="CliName" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+      <Component Id="UserPath" Guid="*">
+        <Environment Id="UserPathEntry" Name="PATH" Action="set" Part="last" Value="[INSTALLFOLDER]" System="no" Permanent="no" />
+        <RegistryValue Root="HKCU" Key="Software\Forgetty\Installer" Name="UserPath" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+      <Component Id="StartMenu" Guid="*" Directory="ProgramMenuFolder">
+        <Shortcut Id="StartMenuShortcut" Name="Forgetty" Description="Forgetty terminal"
+                  Target="[INSTALLFOLDER]forgetty-win.exe" WorkingDirectory="INSTALLFOLDER" />
+        <RegistryValue Root="HKCU" Key="Software\Forgetty\Installer" Name="StartMenu" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+      <Component Id="InstallDirCleanup" Guid="*">
+        <RemoveFolder Id="RemoveInstallDir" On="uninstall" />
+        <RegistryValue Root="HKCU" Key="Software\Forgetty\Installer" Name="Dir" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+</Wix>
