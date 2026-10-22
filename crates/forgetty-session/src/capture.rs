@@ -172,11 +172,15 @@ pub fn capture_with_deadline(
     let cols = cols.max(1) as usize;
     let scrollback = scrollback_for(rows, cols, last_lines);
     let begun = Instant::now();
-    // The first pass gets three quarters of the budget, so there is time left
-    // for the retry.
-    let first_until = begun + deadline.mul_f32(FIRST_PASS_SHARE);
+    // The deadline is for the whole call. Feeding stops at 80% of it, which
+    // leaves time to read a big screen (a 1000x1000 grid takes 100 ms or more
+    // in a slow build). The first pass gets three quarters of the feed time, so
+    // there is time left for the retry.
+    let feed_budget = deadline.mul_f32(FEED_SHARE);
+    let first_until = begun + feed_budget.mul_f32(FIRST_PASS_SHARE);
     let start = parse_start(replay, scrollback > 0);
-    let (mut term, mut ran_out) = feed(replay, start, rows, cols, scrollback, first_until);
+    let (mut term, mut ran_out) =
+        feed(replay, start, rows, cols, scrollback, first_until, Duration::ZERO);
     if ran_out && scrollback == 0 && Instant::now() < begun + deadline {
         // Retry once from the last clear in the final quarter of the ring: the
         // screen is rebuilt from there, which is cheap when the ring is full
@@ -184,7 +188,7 @@ pub fn capture_with_deadline(
         // what was asked for.
         if let Some(from) = last_clear_in_final_quarter(replay) {
             drop(term);
-            let (t, out) = feed(replay, from, rows, cols, 0, begun + deadline);
+            let (t, out) = feed(replay, from, rows, cols, 0, begun + feed_budget, RETRY_MIN_FEED);
             term = t;
             ran_out = out;
         }
@@ -210,10 +214,19 @@ pub fn capture_with_deadline(
     Captured { text: lines.join("\n"), incomplete: ran_out }
 }
 
-/// Share of the deadline for the first pass over the ring.
+/// Share of the deadline for feeding the ring (the rest is for reading the
+/// screen).
+const FEED_SHARE: f32 = 0.8;
+
+/// Share of the feed time for the first pass over the ring.
 const FIRST_PASS_SHARE: f32 = 0.75;
 
-/// Feed `replay[start..]` to a new terminal until `until`. True if it ran out.
+/// The retry feeds for at least this long, counted from when its terminal is
+/// ready: allocating a huge pane takes a while on a busy machine.
+const RETRY_MIN_FEED: Duration = Duration::from_millis(150);
+
+/// Feed `replay[start..]` to a new terminal until `until`, or until `at_least`
+/// after the terminal is ready if that is later. True if it ran out.
 fn feed(
     replay: &[u8],
     start: usize,
@@ -221,8 +234,10 @@ fn feed(
     cols: usize,
     scrollback: usize,
     until: Instant,
+    at_least: Duration,
 ) -> (Terminal, bool) {
     let mut term = Terminal::with_scrollback(rows, cols, [ANSI_PALETTE_BLACK; 16], scrollback);
+    let until = until.max(Instant::now() + at_least);
     for chunk in replay[start..].chunks(feed_chunk(rows, cols)) {
         if Instant::now() >= until {
             return (term, true);
@@ -296,6 +311,20 @@ fn collect_with_history(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Tests that parse megabytes or fill huge panes take turns: the deadline
+    /// tests measure wall time and the others must not eat their CPU.
+    static HEAVY: Mutex<()> = Mutex::new(());
+
+    fn heavy() -> std::sync::MutexGuard<'static, ()> {
+        HEAVY.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// For tests of what the screen shows, not of the deadline.
+    fn no_deadline() -> Duration {
+        Duration::from_secs(60)
+    }
 
     #[test]
     fn plain_text_lands_on_the_screen() {
@@ -367,8 +396,9 @@ mod tests {
 
     #[test]
     fn a_screen_drawn_once_survives_megabytes_of_small_updates() {
+        let _heavy = heavy();
         let ring = vim_like_ring(5 * 1024 * 1024);
-        let out = capture_text(&ring, 24, 80, true, None);
+        let out = capture_with_deadline(&ring, 24, 80, true, None, no_deadline()).text;
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 24);
         for (i, l) in lines.iter().take(23).enumerate() {
@@ -381,6 +411,7 @@ mod tests {
 
     #[test]
     fn last_lines_past_the_screen_comes_from_history() {
+        let _heavy = heavy();
         let mut ring = Vec::new();
         for i in 0..3000 {
             ring.extend_from_slice(format!("line {i}\r\n").as_bytes());
@@ -399,6 +430,7 @@ mod tests {
 
     #[test]
     fn last_lines_on_a_wide_pane_is_still_whole_up_to_the_cap() {
+        let _heavy = heavy();
         let mut ring = Vec::new();
         for i in 0..2000 {
             ring.extend_from_slice(format!("{i} {}\r\n", "w".repeat(150)).as_bytes());
@@ -463,6 +495,7 @@ mod tests {
 
     #[test]
     fn a_timeout_retries_from_the_last_clear_in_the_final_quarter() {
+        let _heavy = heavy();
         // Redraw spam that cannot be read in time, then a clear and a short
         // screen at the end. The retry starts at that clear and finishes.
         let mut ring = b"\x1b[2J".repeat(1_500_000);
@@ -485,6 +518,7 @@ mod tests {
 
     #[test]
     fn a_ring_of_clears_on_a_huge_pane_answers_within_the_deadline() {
+        let _heavy = heavy();
         let ring = b"\x1b[2J".repeat(1_500_000); // 7.5 MB
         let t0 = Instant::now();
         let got = capture(&ring, 1000, 1000, true, None);
