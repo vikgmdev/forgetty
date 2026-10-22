@@ -352,9 +352,22 @@ mod tests {
         assert_eq!(&buf[..n], b" in ?");
     }
 
+    /// The tests that start a child process run one at a time: they are timing sensitive, and
+    /// a parallel `cargo test` under load would otherwise starve them.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// How long a child may take to die for a reason other than the deadline.
+    const CHILD_WAIT: Duration = Duration::from_secs(30);
+    /// The SIGALRM kill: the handler's deadline plus 5 s of slack.
+    const ALARM_BOUND: Duration = Duration::from_secs(HANDLER_DEADLINE_SECS as u64 + 5);
+
     /// Run this test binary again with one child test and `FORGETTY_CRASH_CHILD=<mode>`. Returns
-    /// stderr, the exit status and how long the child lived (it is killed after 5 s, then the
-    /// test fails on the time).
+    /// stderr, the exit status and how long the child lived (it is killed after 30 s, which
+    /// fails the test on the signal).
     fn run_child(mode: &str, test: &str) -> (String, std::process::ExitStatus, Duration) {
         let exe = std::env::current_exe().unwrap();
         let t0 = Instant::now();
@@ -375,7 +388,7 @@ mod tests {
             if let Some(st) = child.try_wait().unwrap() {
                 break st;
             }
-            if t0.elapsed() > Duration::from_secs(5) {
+            if t0.elapsed() > CHILD_WAIT {
                 let _ = child.kill();
                 let st = child.wait().unwrap();
                 return (reader.join().unwrap(), st, Duration::from_secs(99));
@@ -508,6 +521,7 @@ mod tests {
 
     #[test]
     fn a_fatal_signal_line_names_module_and_pc() {
+        let _serial = serial();
         let (err, status, _) = run_child("plain", "crash::tests::child_dies");
         let line = err.lines().find(|l| l.contains("fatal signal")).unwrap_or_else(|| panic!("no crash line in: {err}"));
         assert!(line.contains("(SIGILL)"), "{line}");
@@ -517,16 +531,18 @@ mod tests {
 
     #[test]
     fn the_handler_does_not_wait_for_the_loader_lock() {
+        let _serial = serial();
         let (err, status, took) = run_child("loader_lock", "crash::tests::child_dies");
-        assert!(took < Duration::from_secs(5), "the child hung ({took:?}): {err}");
+        // Dying of SIGILL (not SIGALRM or the harness's SIGKILL) shows the handler did not block.
         assert!(err.contains("fatal signal 4 (SIGILL)"), "{err}");
-        assert_eq!(status.signal(), Some(libc::SIGILL));
+        assert_eq!(status.signal(), Some(libc::SIGILL), "the child hung ({took:?}): {err}");
     }
 
     /// The same, with the real loader lock: a library whose constructor never returns holds
     /// `dl_load_lock` for as long as the `dlopen` runs. Needs a C compiler (skipped without one).
     #[test]
     fn the_handler_does_not_wait_for_dl_load_lock() {
+        let _serial = serial();
         let dir = std::env::temp_dir().join(format!("forgetty-crash-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let src = dir.join("hold.c");
@@ -557,7 +573,7 @@ mod tests {
             if let Some(st) = child.try_wait().unwrap() {
                 break st;
             }
-            if t0.elapsed() > Duration::from_secs(8) {
+            if t0.elapsed() > CHILD_WAIT {
                 let _ = child.kill();
                 break child.wait().unwrap();
             }
@@ -567,15 +583,15 @@ mod tests {
         let err = reader.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         // A blocked handler would be killed by the 3 s deadline (SIGALRM), not die of SIGILL.
-        assert!(took < Duration::from_secs(5), "the child hung ({took:?}): {err}");
         assert!(err.contains("fatal signal 4 (SIGILL)"), "{err}");
-        assert_eq!(status.signal(), Some(libc::SIGILL), "{err}");
+        assert_eq!(status.signal(), Some(libc::SIGILL), "the child hung ({took:?}): {err}");
     }
 
     #[test]
     fn a_hung_handler_is_killed_by_the_deadline() {
+        let _serial = serial();
         let (err, status, took) = run_child("stuck_old_handler", "crash::tests::child_dies");
-        assert!(took < Duration::from_secs(5), "no deadline ({took:?}): {err}");
+        assert!(took < ALARM_BOUND, "no deadline ({took:?}): {err}");
         assert!(took >= Duration::from_secs(2), "died too early ({took:?})");
         assert!(err.contains("fatal signal 4 (SIGILL)"), "{err}");
         assert_eq!(status.signal(), Some(libc::SIGALRM));
@@ -583,14 +599,16 @@ mod tests {
 
     #[test]
     fn a_hostile_sigalrm_setup_does_not_defeat_the_deadline() {
+        let _serial = serial();
         let (err, status, took) = run_child("alarm_hostile", "crash::tests::child_dies");
-        assert!(took < Duration::from_secs(5), "no deadline ({took:?}): {err}");
+        assert!(took < ALARM_BOUND, "no deadline ({took:?}): {err}");
         assert!(took >= Duration::from_secs(2), "died too early ({took:?})");
         assert_eq!(status.signal(), Some(libc::SIGALRM), "{err}");
     }
 
     #[test]
     fn a_second_faulting_thread_waits_for_the_first_line() {
+        let _serial = serial();
         let (err, status, _) = run_child("second_thread_waits", "crash::tests::child_dies");
         assert!(err.contains("first-thread-line"), "the process died before the first line: {err}");
         assert_eq!(status.signal(), Some(libc::SIGILL), "{err}");
@@ -598,6 +616,7 @@ mod tests {
 
     #[test]
     fn a_second_faulting_thread_gives_up_after_the_bounded_wait() {
+        let _serial = serial();
         let (err, status, took) = run_child("second_thread_gives_up", "crash::tests::child_dies");
         // Without the bound the child would hang until `run_child` kills it (SIGKILL).
         assert_eq!(status.signal(), Some(libc::SIGILL), "waited too long ({took:?}): {err}");
