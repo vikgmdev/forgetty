@@ -246,6 +246,8 @@ mod tests {
 
     #[test]
     fn default_path_lives_in_a_forgetty_subdir() {
+        // The test must not resolve the real socket directory.
+        forgetty_core::platform::isolate_state_for_tests();
         let p = default_socket_path();
         assert!(
             p.ends_with("forgetty/forgetty.sock") || p.to_string_lossy().contains("/tmp/forgetty-")

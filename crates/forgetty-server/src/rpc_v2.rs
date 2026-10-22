@@ -1685,11 +1685,34 @@ impl SyncSlots {
         }
     }
 
+    /// The runner of `pane` ended without [`SyncSlots::pass_done`] (a panic):
+    /// free the slot so later syncs and `wait_idle` do not wait for ever.
+    fn abandon(&self, pane: Uuid) {
+        lock(&self.running).remove(&pane);
+        self.done.notify_all();
+    }
+
     /// Block until no sync runs for `pane`.
     fn wait_idle(&self, pane: Uuid) {
         let mut running = lock(&self.running);
         while running.contains_key(&pane) {
             running = self.done.wait(running).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+/// Frees the claimed slot of a pane when its runner unwinds.
+struct SyncSlotGuard<'a> {
+    slots: &'a SyncSlots,
+    pane: Uuid,
+    /// `pass_done` already removed the slot.
+    ended: bool,
+}
+
+impl Drop for SyncSlotGuard<'_> {
+    fn drop(&mut self) {
+        if !self.ended {
+            self.slots.abandon(self.pane);
         }
     }
 }
@@ -2351,9 +2374,12 @@ impl Session {
     /// [`SyncSlots::claim`]. Goes again while others marked it dirty.
     fn run_claimed_sync(&self, pane: Uuid) {
         self.rpc.qa.sync_jobs.fetch_add(1, Ordering::SeqCst);
+        // If a pass panics, the guard frees the slot while the stack unwinds.
+        let mut slot = SyncSlotGuard { slots: &self.syncs, pane, ended: false };
         loop {
             self.sync_pass(pane);
             if !self.syncs.pass_done(pane) {
+                slot.ended = true;
                 return;
             }
         }
@@ -3503,5 +3529,40 @@ mod owner_tests {
         ] {
             assert_eq!(wire_owner(&o(s)).client_kind, k, "{s}");
         }
+    }
+}
+
+#[cfg(test)]
+mod sync_slot_tests {
+    use super::*;
+
+    #[test]
+    fn a_panicking_runner_frees_its_slot() {
+        let slots = SyncSlots::default();
+        let pane = Uuid::new_v4();
+        assert!(slots.claim(pane));
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _slot = SyncSlotGuard { slots: &slots, pane, ended: false };
+            panic!("a pass panics");
+        }));
+        assert!(crashed.is_err());
+        // No one waits for ever, and the next request claims the slot.
+        slots.wait_idle(pane);
+        assert!(slots.claim(pane));
+    }
+
+    #[test]
+    fn a_runner_that_ended_normally_leaves_the_slot_to_pass_done() {
+        let slots = SyncSlots::default();
+        let pane = Uuid::new_v4();
+        assert!(slots.claim(pane));
+        assert!(!slots.claim(pane)); // marks it dirty
+        {
+            let mut slot = SyncSlotGuard { slots: &slots, pane, ended: false };
+            assert!(slots.pass_done(pane)); // dirty: go again
+            assert!(!slots.pass_done(pane));
+            slot.ended = true;
+        }
+        assert!(slots.claim(pane));
     }
 }

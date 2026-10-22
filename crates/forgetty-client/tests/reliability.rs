@@ -768,8 +768,10 @@ async fn a_server_that_refuses_the_session_is_not_redialed_in_a_loop() {
 /// redial is at once, but only while the bucket (10, one more per 3 s) has
 /// tokens. With none left the client sleeps the ladder cap (2 s), and the
 /// bucket does not refill during that sleep. In 30 s that is about 10 (burst)
-/// + 15 (sleeps) = 25 dials (a few more on a loaded host), against thousands
-/// for a tight loop.
+/// + 15 (sleeps) = 25 dials, against thousands for a tight loop. Dials are
+/// counted where the client starts them (`dial_starts_for_tests`), not by the
+/// server's handshakes, which a loaded host can miss or merge. Without the
+/// "no refill during the sleep" rule the count goes past 30.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_server_that_answers_once_and_closes_is_redialed_at_a_bounded_rate() {
     if common::real_only() {
@@ -781,18 +783,22 @@ async fn a_server_that_answers_once_and_closes_is_redialed_at_a_bounded_rate() {
     })
     .await;
     let h = client_with_events(&server, "answers-once").await;
-    let mut d = Dials::new();
-    while d.t0.elapsed() < Duration::from_secs(30) {
-        d.poll(&server);
+    let t0 = Instant::now();
+    let mut seen = 0u64;
+    let mut at: Vec<Duration> = Vec::new();
+    while t0.elapsed() < Duration::from_secs(30) {
+        let n = h.dial_starts_for_tests();
+        if n > seen {
+            seen = n;
+            at.push(t0.elapsed());
+        }
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
-    println!("answers once: {} dials, longest gap {:?}", d.at.len(), d.longest_gap());
-    assert!(d.at.len() >= 10, "the burst did not happen: {:?}", d.at);
-    // 10 (burst) + 15 (ladder sleeps of 2 s) + the tokens that refill in 30 s
-    // and are spent when a sleep is cut or a dial ends early: 26 was seen on
-    // a loaded host. A tight loop makes thousands.
-    assert!(d.at.len() <= 30, "{} dials in 30 s", d.at.len());
-    assert!(d.longest_gap() >= Duration::from_millis(1800), "gap {:?}", d.longest_gap());
+    let longest_gap = at.windows(2).map(|w| w[1] - w[0]).max().unwrap_or_default();
+    println!("answers once: {seen} dials started, longest gap {longest_gap:?}");
+    assert!(seen >= 10, "the burst did not happen: {at:?}");
+    assert!(seen <= 27, "{seen} dials in 30 s");
+    assert!(longest_gap >= Duration::from_millis(1800), "gap {longest_gap:?}");
     h.close().await;
     server.shutdown().await;
 }

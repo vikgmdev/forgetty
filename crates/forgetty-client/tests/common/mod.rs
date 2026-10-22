@@ -820,8 +820,14 @@ impl TestServer {
                             stat.rsplit(')').next().is_some_and(|r| r.trim_start().starts_with('T'))
                         })
                     });
-                    if stopped || t0.elapsed() > Duration::from_secs(5) {
+                    if stopped {
                         break;
+                    }
+                    if t0.elapsed() > Duration::from_secs(5) {
+                        // Do not leave the server stopped, and do not run a
+                        // freeze test against a server that never froze.
+                        unsafe { libc::kill(pid, libc::SIGCONT) };
+                        panic!("server {pid} did not stop within 5 s of SIGSTOP");
                     }
                     std::thread::sleep(Duration::from_micros(200));
                 }
