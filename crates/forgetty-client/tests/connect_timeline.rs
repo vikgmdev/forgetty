@@ -255,3 +255,74 @@ async fn a_request_right_after_connected_does_not_wait_for_the_resume() {
     h.close().await;
     server.shutdown().await;
 }
+
+/// 100 panes, every one far behind, and one reconnect. The resume sends at
+/// most 16 attaches at a time, and the server frees an attach's slot when it
+/// answers, so the connection is not closed for too many requests (64 in
+/// flight) and a request of the app answers while the resume runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resume_of_100_far_behind_panes_does_not_close_and_does_not_block_a_request() {
+    if !real_only() {
+        return;
+    }
+    const PANES: usize = 100;
+    // A 1 MiB ring: more than 512 KiB behind is far behind.
+    let server = TestServer::start_with(TestServerConfig::default(), Some(4)).await;
+    let h = client_for(&server).await;
+    let mut panes = Vec::new();
+    for _ in 0..PANES {
+        let pane = server.add_script_pane("stty raw -echo; exec cat");
+        panes.push((pane, follow(h.attach_pane(pane).await.unwrap())));
+    }
+    let _events = h.events().await.unwrap();
+    let mut idle = Duration::ZERO;
+    for _ in 0..10 {
+        let t = Instant::now();
+        h.request("list_tabs", Value::Map(vec![])).await.unwrap();
+        idle = idle.max(t.elapsed());
+    }
+    let closes = |s: &TestServer| {
+        s.socket_call("qa_state", json!({})).unwrap()["too_many_closes"].as_u64().unwrap()
+    };
+    let closes_before = closes(&server);
+
+    // The client is cut off while every pane gets more than half a ring.
+    let before = server.handshakes();
+    server.pause_handshakes(true);
+    server.drop_connections();
+    until("the client to notice", Duration::from_secs(10), || !h.state().is_connected()).await;
+    for (pane, _) in &panes {
+        server.append(*pane, &vec![b'z'; 700_000]);
+    }
+    let snapshots_before: u64 = panes.iter().map(|(_, s)| s.snapshots.load(Ordering::SeqCst)).sum();
+    server.pause_handshakes(false);
+    until("a new connection", Duration::from_secs(60), || {
+        server.handshakes() > before && h.state().is_connected()
+    })
+    .await;
+    let connected_at = Instant::now();
+    let handshakes_at_connect = server.handshakes();
+    h.request("list_tabs", Value::Map(vec![])).await.expect("list_tabs");
+    let list_tabs = connected_at.elapsed();
+    until("every pane to get its snapshot", Duration::from_secs(120), || {
+        panes.iter().map(|(_, s)| s.snapshots.load(Ordering::SeqCst)).sum::<u64>()
+            >= snapshots_before + PANES as u64
+    })
+    .await;
+    let resumed = connected_at.elapsed();
+    println!(
+        "100 far-behind panes: list_tabs {list_tabs:?} (idle {idle:?}), all snapshots after \
+         {resumed:?}, connections {}",
+        server.handshakes() - before
+    );
+    assert_eq!(closes(&server), closes_before, "the server closed the connection for requests");
+    // A resume that was closed for too many requests would dial again.
+    assert_eq!(server.handshakes(), handshakes_at_connect, "the client connected again");
+    assert!(h.state().is_connected(), "the client is not connected after the resume");
+    assert!(
+        list_tabs < Duration::from_millis(100).max(idle * 4 + Duration::from_millis(20)),
+        "list_tabs waited {list_tabs:?} for the resume (idle {idle:?})"
+    );
+    h.close().await;
+    server.shutdown().await;
+}

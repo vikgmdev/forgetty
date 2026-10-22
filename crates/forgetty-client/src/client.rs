@@ -2125,9 +2125,18 @@ async fn session_init(
         }
     }
 
+    // At most INIT_ATTACHES attaches wait for an answer at once (the server
+    // counts every request in flight and closes the connection at 64). When
+    // the window is full, the oldest answer is taken before the next goes out.
     let panes: Vec<Arc<PaneShared>> = lock(&shared.panes).values().cloned().collect();
-    let mut inflight = Vec::new();
+    let mut inflight = VecDeque::new();
     for pane in panes {
+        if inflight.len() >= INIT_ATTACHES {
+            let oldest = inflight.pop_front().expect("window is full");
+            if let Some(end) = finish_attach(&shared, &link, oldest, deadline).await {
+                return end;
+            }
+        }
         let guard = pane.attached_gen.clone().lock_owned().await;
         if *guard == link.gen {
             continue;
@@ -2139,7 +2148,7 @@ async fn session_init(
         match sent {
             Ok((id, rx)) => {
                 tl!(shared, "session_init: attach_pane {} sent (id {id})", pane.id);
-                inflight.push((pane, guard, id, rx));
+                inflight.push_back((pane, guard, id, rx));
             }
             Err(e) => return TaskEnd::Lost(format!("attach_pane: {e}")),
         }
@@ -2157,26 +2166,49 @@ async fn session_init(
             Err(e) => return TaskEnd::Lost(format!("subscribe_events: {e}")),
         }
     }
-    for (pane, mut guard, id, rx) in inflight {
-        let answer = await_answer(&link, id, rx, deadline).await;
-        tl!(shared, "session_init: attach_pane {} answered (id {id})", pane.id);
-        match answer {
-            Ok(_) => *guard = link.gen,
-            Err(ClientError::Server { code, message }) => {
-                warn!("client: pane {} cannot be re-attached: {code} {message}", pane.id);
-                lock(&shared.panes).remove(&pane.id);
-                let tx = pane.tx.clone();
-                tokio::spawn(async move {
-                    let _ = tx.send(Tagged { stream: ALWAYS, item: PaneItem::Ended }).await;
-                });
-            }
-            Err(e) => return TaskEnd::Lost(format!("attach_pane: {e}")),
+    for item in inflight {
+        if let Some(end) = finish_attach(&shared, &link, item, deadline).await {
+            return end;
         }
     }
     link.resumed.store(true, Ordering::SeqCst);
     let _ = resumed.send(());
     tl!(shared, "session_init done, input released");
     TaskEnd::Done
+}
+
+/// Most attaches `session_init` has sent and not seen answered.
+const INIT_ATTACHES: usize = 16;
+
+type InitAttach = (
+    Arc<PaneShared>,
+    tokio::sync::OwnedMutexGuard<u64>,
+    u64,
+    oneshot::Receiver<Pending>,
+);
+
+/// Take the answer of one attach of `session_init`. `Some` ends the session.
+async fn finish_attach(
+    shared: &Arc<Shared>,
+    link: &Arc<Link>,
+    (pane, mut guard, id, rx): InitAttach,
+    deadline: tokio::time::Instant,
+) -> Option<TaskEnd> {
+    let answer = await_answer(link, id, rx, deadline).await;
+    tl!(shared, "session_init: attach_pane {} answered (id {id})", pane.id);
+    match answer {
+        Ok(_) => *guard = link.gen,
+        Err(ClientError::Server { code, message }) => {
+            warn!("client: pane {} cannot be re-attached: {code} {message}", pane.id);
+            lock(&shared.panes).remove(&pane.id);
+            let tx = pane.tx.clone();
+            tokio::spawn(async move {
+                let _ = tx.send(Tagged { stream: ALWAYS, item: PaneItem::Ended }).await;
+            });
+        }
+        Err(e) => return Some(TaskEnd::Lost(format!("attach_pane: {e}"))),
+    }
+    None
 }
 
 /// A server run with another `boot_id` than the last connection's is a

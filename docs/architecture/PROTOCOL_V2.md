@@ -116,6 +116,16 @@ runtime thread that reads the control stream. The order of `attach_pane` and
 it was read, and one with a lower number than the last one applied to the
 pane does nothing.
 
+An `attach_pane` counts as a request in flight (limit 64, section 9) until it
+is answered, and no longer. The answer comes when the stream is set up. The
+pacing wait and the snapshot build of a far-behind pane happen after it, on the
+stream's own task, so they do not hold a slot.
+
+Events may arrive before the answer of `subscribe_events`. The server starts
+the subscription first and puts the answer in the queue after it, so an event
+with a `seq` above the `seq` of the answer can come ahead of the answer. A
+client takes events as they arrive and does not wait for the answer.
+
 New methods:
 
 | Method | Params | Result |
@@ -359,7 +369,10 @@ known gap, section 12).
   dropped.
 - After `Welcome`: send `subscribe_events` and then `attach_pane` with the last
   known offset for every pane the UI shows, all at once, without waiting for an
-  answer in between. The server takes them in that order and answers each as it
+  answer in between. At most 16 `attach_pane` requests wait for an answer at the
+  same time: when 16 are out, the client takes the oldest answer before it sends
+  the next. With the subscribe that is 17 of the 64 requests in flight, so the
+  app's own requests have room during a resume of any number of panes. The server takes them in that order and answers each as it
   is done. A request of the app goes out on the same stream at once and does
   not wait for any of them.
 - The UI shows "reconnecting" after 1 s without a connection, never sooner.

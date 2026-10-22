@@ -2045,3 +2045,103 @@ async fn an_aborted_dial_leaves_no_connection_on_the_server() {
     assert_eq!(count("handshake_failures"), 0, "a connect attempt was dropped mid-handshake");
     server.shutdown().await;
 }
+
+/// An attach is a request in flight until it is answered, and no longer. A
+/// peer that sends 90 attaches of far-behind panes at once (more than the 64
+/// in flight allowed) is not closed: the server answers each attach as its
+/// stream is set up, and the snapshot waits happen on the streams' own tasks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn attaches_of_far_behind_panes_are_answered_before_their_snapshots() {
+    if !real_only() {
+        return;
+    }
+    const PANES: u64 = 90;
+    // A 1 MiB ring: more than 512 KiB behind is far behind.
+    let server = TestServer::start_with(TestServerConfig::default(), Some(4)).await;
+    let mut panes = Vec::new();
+    for _ in 0..PANES {
+        let pane = server.add_script_pane("stty raw -echo; exec cat");
+        server.append(pane, &vec![b'z'; 700_000]);
+        panes.push(pane);
+    }
+    let endpoint = raw_endpoint(&server).await;
+    let conn = endpoint.connect(server.addr(), ALPN_RPC).await.unwrap();
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    let hello = Hello::new(
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        ClientKind::Cli,
+        "raw",
+        "0.0.0",
+        vec!["resume".to_string(), "snapshot_catchup".to_string()],
+    );
+    write_msg(&mut send, &hello).await.unwrap();
+    match read_msg::<_, HandshakeReply>(&mut recv).await.unwrap() {
+        Some(HandshakeReply::Welcome(_)) => {}
+        other => panic!("handshake: {other:?}"),
+    }
+    let answered = Arc::new(AtomicU64::new(0));
+    let list_tabs_at = Arc::new(std::sync::Mutex::new(None::<Instant>));
+    {
+        let (answered, list_tabs_at) = (answered.clone(), list_tabs_at.clone());
+        tokio::spawn(async move {
+            while let Ok(Some(msg)) = read_msg::<_, ControlMsg>(&mut recv).await {
+                match msg {
+                    ControlMsg::Response { id, .. } if id == PANES + 1 => {
+                        *list_tabs_at.lock().unwrap() = Some(Instant::now());
+                    }
+                    ControlMsg::Response { .. } => {
+                        answered.fetch_add(1, Ordering::SeqCst);
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+    let closes = |s: &TestServer| qa_state(s)["too_many_closes"].as_u64().unwrap();
+    let closes_before = closes(&server);
+    for (i, pane) in panes.iter().enumerate() {
+        attach_raw(&mut send, i as u64 + 1, *pane).await;
+    }
+    let sent = Instant::now();
+    let msg = ControlMsg::Request { id: PANES + 1, method: "list_tabs".into(), params: Value::Map(vec![]) };
+    write_msg(&mut send, &msg).await.unwrap();
+    wait_for("every attach and the list_tabs to be answered", || {
+        answered.load(Ordering::SeqCst) == PANES && list_tabs_at.lock().unwrap().is_some()
+    })
+    .await;
+    let list_tabs = list_tabs_at.lock().unwrap().unwrap().duration_since(sent);
+    println!("{PANES} far-behind attaches at once: all answered, list_tabs after {list_tabs:?}");
+    assert!(conn.close_reason().is_none(), "the server closed the connection");
+    assert_eq!(closes(&server), closes_before, "a connection was closed for requests");
+    drop(conn);
+    endpoint.close().await;
+    server.shutdown().await;
+}
+
+/// A connection that drops right after its attach leaves no client on the
+/// pane. `note_attached` runs under the lock the close takes, so the attach
+/// is either noted before the close forgets the client, or it does not run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_connection_that_drops_with_its_attach_leaves_no_client_on_the_pane() {
+    if !real_only() {
+        return;
+    }
+    let server = TestServer::start(TestServerConfig::default()).await;
+    let pane = server.add_script_pane("stty raw -echo; exec cat");
+    let endpoint = raw_endpoint(&server).await;
+    for round in 0..150u64 {
+        let (conn, mut send) = raw_peer_on(&endpoint, &server, &["resume"], Uuid::new_v4()).await;
+        attach_raw(&mut send, 1, pane).await;
+        // Let the request reach the server, then cut the connection at a
+        // different moment each round.
+        tokio::time::sleep(Duration::from_micros(round * 40)).await;
+        conn.close(0u32.into(), b"gone");
+    }
+    wait_for("the server to forget every client", || {
+        qa_state(&server)["attached_clients"].as_u64().unwrap() == 0
+    })
+    .await;
+    endpoint.close().await;
+    server.shutdown().await;
+}

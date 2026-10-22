@@ -1146,6 +1146,13 @@ impl RpcV2 {
         self.sm.set_size_owner(PaneId(pane), info);
     }
 
+    /// Harness: how many (pane, client) pairs the size policy holds as
+    /// attached. Zero when no client is connected.
+    #[cfg(feature = "qa-tools")]
+    pub(crate) fn attached_total(&self) -> usize {
+        lock(&self.sizes).values().map(|ps| ps.attached.len()).sum()
+    }
+
     /// A client left the server: its sizes no longer count and the panes it
     /// owned go to the attached client that typed last.
     fn forget_client_sizes(&self, client: Uuid) {
@@ -1940,8 +1947,9 @@ impl Session {
                 });
             }
             method::ATTACH_PANE => {
-                // An attach counts as a request in flight until its stream is
-                // open (a stream may start with a snapshot build).
+                // An attach counts as a request in flight until it is answered.
+                // Its stream then runs on its own task (a far-behind pane waits
+                // for the pacing and the snapshot gate there, not here).
                 let Some(guard) = self.begin_task(inflight, out, 0) else { return false };
                 let (s, out) = (self.clone(), out.clone());
                 let n = self.req_n.fetch_add(1, Ordering::SeqCst);
@@ -2148,13 +2156,17 @@ impl Session {
                 shared,
                 header,
                 catchup,
-                guard,
                 (self.born, self.name.clone()),
             ))
             .abort_handle();
             ops.map.insert(p.pane_id, (n, Some(handle)));
+            // Still under `ops`: the close of the connection sets `closed`
+            // under the same lock and only then forgets the client's panes,
+            // so a stream that was started is always noted.
+            self.rpc.note_attached(self.client_id, p.pane_id);
         }
-        self.rpc.note_attached(self.client_id, p.pane_id);
+        // The request is done: its slot is free before the answer goes out.
+        drop(guard);
         to_value(&OkResult { ok: true }).map_err(|e| (error_code::INTERNAL, e.to_string()))
     }
 
@@ -2174,8 +2186,10 @@ impl Session {
             if known && !ops.closed {
                 ops.map.insert(pane, (n, None));
             }
+            // Under `ops`, like `note_attached`, so a newer attach is never
+            // noted before this older detach.
+            self.rpc.note_detached(self.client_id, pane);
         }
-        self.rpc.note_detached(self.client_id, pane);
     }
 }
 
@@ -2317,7 +2331,6 @@ async fn pane_stream(
     shared: Arc<LogShared>,
     first: PaneStreamHeader,
     catchup: bool,
-    guard: InflightGuard,
     (born, name): (std::time::Instant, String),
 ) {
     let pane = PaneId(first.pane_id);
@@ -2339,8 +2352,6 @@ async fn pane_stream(
         header = h;
         snapshot = snap;
     }
-    // From here the attach no longer counts as a request in flight.
-    drop(guard);
     loop {
         let Ok(mut send) = conn.open_uni().await else { return };
         let sent_snapshot = std::mem::take(&mut snapshot);

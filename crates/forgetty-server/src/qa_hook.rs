@@ -110,6 +110,7 @@ fn handle(
                 "stall_closes": rpc.qa.stall_closes.load(Ordering::SeqCst),
                 "alive_tasks": tokio::runtime::Handle::current().metrics().num_alive_tasks(),
                 "connections": rpc.connection_count(),
+                "attached_clients": rpc.attached_total(),
                 "quic_open": sync.quic_open(),
                 "handshake_failures": sync.handshake_failures(),
                 "attaches": attaches,
