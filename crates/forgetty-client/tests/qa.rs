@@ -245,15 +245,17 @@ async fn re_attaching_does_not_reset_the_catch_up_backoff() {
     while t0.elapsed() < Duration::from_secs(30) {
         attach_raw(&mut send, id, pane).await;
         id += 1;
-        // Long enough for each attach's snapshot to be built and sent.
-        tokio::time::sleep(Duration::from_millis(1200)).await;
+        // A flood: 4 attaches a second. At 1 a second or less they would be
+        // served by the tokens (6 free, then one per second) all the time.
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
     tokio::time::sleep(Duration::from_millis(500)).await;
     let st = qa_state(&server);
     let catchups = st["catchups"].as_u64().unwrap();
     println!("{} re-attaches in 30 s: {catchups} catch-ups", id - 1);
-    // A peer may claim to keep pace 6 times in a burst; after that, one per 10 s.
-    assert!(catchups <= 11, "{catchups} snapshot catch-ups for {} re-attaches", id - 1);
+    // 6 free in a burst; with the tokens gone, the backoff (1 s doubling to
+    // 10 s) sets the pace.
+    assert!(catchups <= 16, "{catchups} snapshot catch-ups for {} re-attaches", id - 1);
     drop(conn);
     endpoint.close().await;
     server.shutdown().await;
@@ -487,15 +489,15 @@ async fn a_fresh_client_id_per_connection_does_not_reset_the_catch_up_backoff() 
             raw_peer_on(&endpoint, &server, &["resume", "snapshot_catchup"], Uuid::new_v4()).await;
         attach_raw(&mut send, 1, pane).await;
         n += 1;
-        tokio::time::sleep(Duration::from_millis(1200)).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
         drop(conn);
     }
     let st = qa_state(&server);
     let catchups = st["catchups"].as_u64().unwrap();
     println!("{n} connections with fresh client ids in 30 s: {catchups} catch-ups");
-    // Burst of 6 fast ones, then one per 10 s. Per client id it would be one
-    // per connection (about 25).
-    assert!(catchups <= 11, "{catchups} catch-ups for {n} reconnects of one node");
+    // Burst of 6 fast ones, then the backoff. Per client id it would be one
+    // per connection (about 120).
+    assert!(catchups <= 16, "{catchups} catch-ups for {n} reconnects of one node");
     endpoint.close().await;
     server.shutdown().await;
 }

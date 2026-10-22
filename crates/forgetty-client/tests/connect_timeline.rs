@@ -122,6 +122,11 @@ async fn round(
             assert!(*d < Duration::from_millis(500), "{label} {n}: pane {i} echo after {d:?}");
         }
     }
+    // The first 6 far-behind resumes of a node and pane spend a token: only
+    // the snapshot build is waited for, not the pacing (1 s and more).
+    if label == "far behind" && n < 6 {
+        assert!(echo[0] < Duration::from_millis(1000), "{label} {n}: pane A echo after {:?}", echo[0]);
+    }
     println!(
         "{label} round {n}: Connected {} ms, list_tabs {} ms after that, echo A {} ms, echo B {} ms, \
          total {} ms",
@@ -161,18 +166,23 @@ async fn reconnect_timeline_with_two_panes_after_many_catchups() {
         round("small gap", &h, &server, [(a, &sa), (b, &sb)], n, None).await;
     }
 
-    // Far behind: the client is cut off while 5 MiB of output arrive, so it
-    // resumes more than half a ring behind.
-    for n in 0..3 {
+    // Far behind, from a node with no history: the client is cut off while
+    // 5 MiB of output arrive, so it resumes more than half a ring behind.
+    // The first 6 far-behind attaches of a node and pane (the first attach
+    // counts) spend a token each and wait for nothing but the snapshot; the
+    // rest wait out the backoff.
+    let h2 = client_for(&server).await;
+    let sa2 = follow(h2.attach_pane(a).await.unwrap());
+    let sb2 = follow(h2.attach_pane(b).await.unwrap());
+    for n in 0..9 {
         let before = server.handshakes();
         server.pause_handshakes(true);
         server.drop_connections();
-        until("the client to notice", Duration::from_secs(10), || !h.state().is_connected()).await;
-        let big = vec![b'z'; 5 << 20];
-        server.append(a, &big);
+        until("the client to notice", Duration::from_secs(10), || !h2.state().is_connected()).await;
+        server.append(a, &vec![b'z'; 5 << 20]);
         server.append(b, b"gap-fill\n");
         server.pause_handshakes(false);
-        round("far behind", &h, &server, [(a, &sa), (b, &sb)], n, Some(before)).await;
+        round("far behind", &h2, &server, [(a, &sa2), (b, &sb2)], n, Some(before)).await;
     }
 
     // The server's timeline, for the log of the run.
@@ -183,5 +193,6 @@ async fn reconnect_timeline_with_two_panes_after_many_catchups() {
         }
     }
     h.close().await;
+    h2.close().await;
     server.shutdown().await;
 }

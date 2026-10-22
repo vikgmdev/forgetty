@@ -433,10 +433,17 @@ known gap, section 12).
   node cannot keep another from a build. A node that joins a build still
   waiting in another node's queue can start it on its own turn.
 - Pacing, per `(node id, pane)`, kept after the stream and the connection end
-  (attaching again does not reset it). The first snapshot of a far-behind
-  attach goes through the same token path as a reading peer, unless the last
-  catch-up of that node and pane was a stall: then the backoff below applies.
-  So a client that drops after it kept pace resumes within about a second:
+  (attaching again does not reset it). A far-behind attach (a resume further
+  back than half the ring, or a first attach to a pane with that much
+  history) spends a token of the same bucket as the catch-ups below: 6 free
+  per node and pane, then one more each second. A phone that sat in a pocket
+  while a build printed 10 MB is the normal case, so such an attach waits
+  for nothing but the snapshot build, whatever the last catch-up of that
+  node and pane was. With no token left it waits for the next token and at
+  least the backoff below (1 s, doubling to 10 s), and the waits of attaches
+  that come one after the other add up, so 30 far-behind attaches in a row
+  are served at about a dozen in the first 30 s. A resume with a small gap
+  (less than half the ring) never waits on the pacing.
   - A stream whose peer reads (it took live bytes at 1 MiB/s or more since its
     last snapshot, or took a snapshot in under 500 ms that the log outran
     before any live byte) gets a burst of 6 catch-ups at least 100 ms apart,
@@ -451,7 +458,7 @@ known gap, section 12).
     microseconds is what a peer that never reads shows too: 4 of them in a
     row, with no proven read between, are believed, the next are treated as a
     stall. After a proven read the next stall
-    starts again from 1 s, and a far-behind attach takes the token path once.
+    starts again from 1 s.
 - Scrollback for a fresh attach is a known gap. A client that attaches to a
   busy pane sees the screen, not the history above it. The server does not
   build it.
