@@ -917,7 +917,6 @@ impl ShellSmoke {
                 bounds_last: v.ime_bounds_last,
                 cursor: v.term.cursor(),
                 input: String::from_utf8_lossy(v.capture_input.as_deref().unwrap_or_default()).to_string(),
-                view_origin: (f32::from(v.bounds.origin.x), f32::from(v.bounds.origin.y)),
                 cell: (f32::from(v.metrics.cell_w), f32::from(v.metrics.line_h)),
             })
         };
@@ -939,7 +938,7 @@ impl ShellSmoke {
         let rec = |name: &str, st: &ImeState| {
             record(
                 name,
-                json!({"marked": st.marked, "log": st.log, "bounds_calls": st.bounds_calls, "bounds_last": st.bounds_last.map(|b| vec![b.0 as f32, b.1 as f32, b.2, b.3, b.4, b.5]),
+                json!({"marked": st.marked, "log": st.log, "bounds_calls": st.bounds_calls, "bounds_last": st.bounds_last.map(|b| vec![b.0 as f32, b.1 as f32, b.2, b.3, b.4, b.5, b.6, b.7]),
                        "cursor": [st.cursor.0, st.cursor.1], "input": st.input}),
             )
         };
@@ -971,10 +970,10 @@ impl ShellSmoke {
                 // Nothing reaches the pane while composing.
                 check("ime_real_ja_preedit_sends_nothing", st.input.is_empty());
                 // Where the IME put its candidate window: the cursor cell of the pane.
-                let at_cell = st.bounds_last.is_some_and(|(r, c, x, y, _, h)| {
+                let at_cell = st.bounds_last.is_some_and(|(r, c, x, y, _, h, ex, ey)| {
                     (r, c) == st.cursor
-                        && (x - (st.view_origin.0 + st.cell.0 * c as f32)).abs() < 1.5
-                        && (y - (st.view_origin.1 + st.cell.1 * r as f32)).abs() < 1.5
+                        && (x - (ex + st.cell.0 * c as f32)).abs() < 1.5
+                        && (y - (ey + st.cell.1 * r as f32)).abs() < 1.5
                         && (h - st.cell.1).abs() < 1.5
                 });
                 check("ime_real_ja_candidate_window_at_cursor_cell", st.bounds_calls > 0 && at_cell);
@@ -1056,10 +1055,9 @@ struct ImeState {
     marked: Option<String>,
     log: Vec<String>,
     bounds_calls: u32,
-    bounds_last: Option<(usize, usize, f32, f32, f32, f32)>,
+    bounds_last: Option<(usize, usize, f32, f32, f32, f32, f32, f32)>,
     cursor: (usize, usize),
     input: String,
-    view_origin: (f32, f32),
     cell: (f32, f32),
 }
 

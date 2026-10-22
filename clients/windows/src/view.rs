@@ -177,9 +177,9 @@ pub struct TerminalView {
     /// What the IME handler was asked, in order (the smoke reads it; at most 200 entries).
     pub ime_log: Vec<String>,
     /// How many times the IME asked where to put its candidate window, and the last answer
-    /// `(cursor row, cursor col, x, y, w, h)`.
+    /// `(cursor row, cursor col, x, y, w, h, element x, element y)`.
     pub ime_bounds_calls: u32,
-    pub ime_bounds_last: Option<(usize, usize, f32, f32, f32, f32)>,
+    pub ime_bounds_last: Option<(usize, usize, f32, f32, f32, f32, f32, f32)>,
     pub pending_paste: Option<PendingPaste>,
     /// 0.0 normal, otherwise the share of brightness removed (unfocused pane in a split).
     pub dim: f32,
@@ -1384,7 +1384,16 @@ impl gpui::EntityInputHandler for TerminalView {
             size(m.cell_w * self.marked_cells().max(1) as f32, m.line_h),
         );
         self.ime_bounds_calls += 1;
-        self.ime_bounds_last = Some((r, c, f32::from(b.origin.x), f32::from(b.origin.y), f32::from(b.size.width), f32::from(b.size.height)));
+        self.ime_bounds_last = Some((
+            r,
+            c,
+            f32::from(b.origin.x),
+            f32::from(b.origin.y),
+            f32::from(b.size.width),
+            f32::from(b.size.height),
+            f32::from(element_bounds.origin.x),
+            f32::from(element_bounds.origin.y),
+        ));
         Some(b)
     }
 
