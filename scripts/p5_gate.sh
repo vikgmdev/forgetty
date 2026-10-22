@@ -244,6 +244,9 @@ cp "$DOC_BACKUP" docs/socket-api.md; DOC_BACKUP=""
 
 # ------------------------------------------------------------------ 5. protocol v2
 say "5. protocol v2 (real server)"
+# Step 1's `cargo test -p forgetty-server` rebuilt the binary without qa-tools,
+# and the real-server harness needs `qa_state`. Build it again with the feature.
+cargo build -p forgetty-server --features qa-tools >"$WORK/build2.log" 2>&1 || { tail -20 "$WORK/build2.log"; exit 2; }
 if FORGETTY_REQUIRE_REAL=1 FORGETTY_REAL_SERVER="$BIN/forgetty" cargo test -p forgetty-client --test p5 -- --nocapture >"$WORK/v2.log" 2>&1 && qgrep "1 passed" "$WORK/v2.log"; then
   ok "v2: api.list, api.describe, set_label, LayoutChanged with the label, refused methods"
 else bad "v2 test"; tail -15 "$WORK/v2.log"; fi
