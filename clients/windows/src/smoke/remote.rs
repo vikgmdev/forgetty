@@ -900,23 +900,25 @@ const IME_JA: (u16, &str, &str, &str) = (0x0411, "03B5835F-F03C-411B-9CE2-AA23E1
 const IME_ZH: (u16, &str, &str, &str) = (0x0804, "81D4E9C9-1D3B-41BC-9E6C-4B40BF79E35E", "FA550B04-5AD7-411F-A5AC-CA038EC515D7", "E00E0804");
 
 impl ShellSmoke {
-    /// Real Japanese and Chinese IME through the window's message loop: activate the text
+    /// Real Japanese and Chinese IME through the window's message loop: switch to the text
     /// service, turn it on, type romaji, read the preedit the IME pushed into the view, ask for
-    /// candidates, commit, and read the bytes the pane got. Steps 80 to 89 of the W5 view phase.
+    /// candidates, commit, and read the bytes the pane got. The IME is slow and its dictionary is
+    /// the runner's, so each step waits for its condition (up to 6 s) instead of a fixed delay.
+    /// Steps 80 to 89 of the W5 view phase.
     fn w7_real_ime(&mut self, window: &mut Window, cx: &mut Context<AppShell>) {
         let Some(t) = self.w5.target.clone() else { fail("real ime: no target view") };
         let lap = |this: &Self, ms: u64| this.sub_t0.elapsed() >= Duration::from_millis(ms);
         let hwnd = inject::hwnd(window);
-        let snapshot = |cx: &mut Context<AppShell>| {
-            t.update(cx, |v, _| {
-                json!({
-                    "marked": v.marked,
-                    "log": v.ime_log,
-                    "bounds_calls": v.ime_bounds_calls,
-                    "bounds_last": v.ime_bounds_last.map(|b| vec![b.0 as f32, b.1 as f32, b.2, b.3, b.4, b.5]),
-                    "cursor": [v.term.cursor().0, v.term.cursor().1],
-                    "input": v.capture_input.as_ref().map(|b| String::from_utf8_lossy(b).to_string()),
-                })
+        let state = |cx: &mut Context<AppShell>| -> ImeState {
+            t.update(cx, |v, _| ImeState {
+                marked: v.marked.clone(),
+                log: v.ime_log.clone(),
+                bounds_calls: v.ime_bounds_calls,
+                bounds_last: v.ime_bounds_last,
+                cursor: v.term.cursor(),
+                input: String::from_utf8_lossy(v.capture_input.as_deref().unwrap_or_default()).to_string(),
+                view_origin: (f32::from(v.bounds.origin.x), f32::from(v.bounds.origin.y)),
+                cell: (f32::from(v.metrics.cell_w), f32::from(v.metrics.line_h)),
             })
         };
         let begin = |name: &str, prof: (u16, &str, &str, &str), cx: &mut Context<AppShell>| {
@@ -933,6 +935,15 @@ impl ShellSmoke {
         };
         // The layout switch lands through the message loop: wait until the thread has it.
         let on_layout = |want: u16| (inject::current_hkl() & 0xffff) as u16 == want;
+        let timeout = |this: &Self| this.sub_t0.elapsed() > Duration::from_secs(6);
+        let rec = |name: &str, st: &ImeState| {
+            record(
+                name,
+                json!({"marked": st.marked, "log": st.log, "bounds_calls": st.bounds_calls, "bounds_last": st.bounds_last.map(|b| vec![b.0 as f32, b.1 as f32, b.2, b.3, b.4, b.5]),
+                       "cursor": [st.cursor.0, st.cursor.1], "input": st.input}),
+            )
+        };
+        let non_ascii = |s: &str| !s.is_empty() && s.chars().all(|c| (c as u32) > 0x7f);
         match self.sub {
             80 => {
                 begin("ja", IME_JA, cx);
@@ -940,68 +951,97 @@ impl ShellSmoke {
                 self.sub_t0 = Instant::now();
             }
             81 => {
-                if !lap(self, 800) || (!on_layout(IME_JA.0) && !lap(self, 4000)) {
+                if !lap(self, 500) || (!on_layout(IME_JA.0) && !timeout(self)) {
                     return;
                 }
+                check("ime_real_ja_layout_active", on_layout(IME_JA.0));
                 let imm = hwnd.map(inject::ime_open_native).unwrap_or_else(|| "no window handle".into());
                 let sent = inject::tap_word(inject::current_hkl(), "nihongo");
-                record("ime_real_ja_typed", json!({"sent": sent, "on_layout": on_layout(IME_JA.0), "imm": imm, "hkl": format!("{:x}", inject::current_hkl())}));
+                record("ime_real_ja_typed", json!({"sent": sent, "imm": imm, "hkl": format!("{:x}", inject::current_hkl())}));
                 self.sub = 82;
                 self.sub_t0 = Instant::now();
             }
             82 => {
-                if !lap(self, 1200) {
+                let st = state(cx);
+                if st.marked.as_deref() != Some("\u{306b}\u{307b}\u{3093}\u{3054}") && !timeout(self) {
                     return;
                 }
-                record("ime_real_ja_composing", snapshot(cx));
-                // Space asks for candidates.
+                rec("ime_real_ja_composing", &st);
+                check("ime_real_ja_preedit_in_view", st.marked.as_deref() == Some("\u{306b}\u{307b}\u{3093}\u{3054}"));
+                // Nothing reaches the pane while composing.
+                check("ime_real_ja_preedit_sends_nothing", st.input.is_empty());
+                // Where the IME put its candidate window: the cursor cell of the pane.
+                let at_cell = st.bounds_last.is_some_and(|(r, c, x, y, _, h)| {
+                    (r, c) == st.cursor
+                        && (x - (st.view_origin.0 + st.cell.0 * c as f32)).abs() < 1.5
+                        && (y - (st.view_origin.1 + st.cell.1 * r as f32)).abs() < 1.5
+                        && (h - st.cell.1).abs() < 1.5
+                });
+                check("ime_real_ja_candidate_window_at_cursor_cell", st.bounds_calls > 0 && at_cell);
+                // Space asks for candidates: the preedit becomes the first conversion.
                 inject::send_keys(inject::current_hkl(), &[Step::Tap(inject::VK_SPACE)]);
                 self.sub = 83;
                 self.sub_t0 = Instant::now();
             }
             83 => {
-                if !lap(self, 1000) {
+                let st = state(cx);
+                let converted = st.marked.as_deref().is_some_and(|m| m != "\u{306b}\u{307b}\u{3093}\u{3054}" && m.chars().any(|c| (c as u32) >= 0x4e00));
+                if !converted && !timeout(self) {
                     return;
                 }
-                record("ime_real_ja_candidates", snapshot(cx));
+                rec("ime_real_ja_candidates", &st);
+                check("ime_real_ja_conversion_shows_kanji", converted);
                 inject::send_keys(inject::current_hkl(), &[Step::Tap(inject::VK_RETURN)]);
                 self.sub = 84;
                 self.sub_t0 = Instant::now();
             }
             84 => {
-                if !lap(self, 1000) {
+                let st = state(cx);
+                if st.input.is_empty() && !timeout(self) {
                     return;
                 }
-                record("ime_real_ja_committed", snapshot(cx));
-                // Chinese.
+                rec("ime_real_ja_committed", &st);
+                let commits = st.log.iter().filter(|l| l.starts_with("commit:")).count();
+                check("ime_real_ja_commit_sends_cjk_once", non_ascii(&st.input) && commits == 1);
+                check("ime_real_ja_commit_clears_preedit", st.marked.is_none());
                 begin("zh", IME_ZH, cx);
                 self.sub = 85;
                 self.sub_t0 = Instant::now();
             }
             85 => {
-                if !lap(self, 800) || (!on_layout(IME_ZH.0) && !lap(self, 4000)) {
+                if !lap(self, 500) || (!on_layout(IME_ZH.0) && !timeout(self)) {
                     return;
                 }
+                check("ime_real_zh_layout_active", on_layout(IME_ZH.0));
                 let imm = hwnd.map(inject::ime_open_native).unwrap_or_else(|| "no window handle".into());
                 let sent = inject::tap_word(inject::current_hkl(), "zhongwen");
-                record("ime_real_zh_typed", json!({"sent": sent, "on_layout": on_layout(IME_ZH.0), "imm": imm, "hkl": format!("{:x}", inject::current_hkl())}));
+                record("ime_real_zh_typed", json!({"sent": sent, "imm": imm, "hkl": format!("{:x}", inject::current_hkl())}));
                 self.sub = 86;
                 self.sub_t0 = Instant::now();
             }
             86 => {
-                if !lap(self, 1200) {
+                // Pinyin answers more slowly: wait until the preedit has the whole syllable run.
+                let st = state(cx);
+                let full = st.marked.as_deref().is_some_and(|m| m.replace(['\'', ' '], "") == "zhongwen");
+                if !full && !timeout(self) {
                     return;
                 }
-                record("ime_real_zh_composing", snapshot(cx));
+                rec("ime_real_zh_composing", &st);
+                check("ime_real_zh_preedit_in_view", st.marked.is_some() && !st.log.is_empty());
+                check("ime_real_zh_preedit_sends_nothing", st.input.is_empty());
+                check("ime_real_zh_candidate_window_asked", st.bounds_calls > 0);
                 inject::send_keys(inject::current_hkl(), &[Step::Tap(inject::VK_SPACE)]);
                 self.sub = 87;
                 self.sub_t0 = Instant::now();
             }
             _ => {
-                if !lap(self, 1000) {
+                let st = state(cx);
+                if st.input.is_empty() && !timeout(self) {
                     return;
                 }
-                record("ime_real_zh_committed", snapshot(cx));
+                rec("ime_real_zh_committed", &st);
+                let commits = st.log.iter().filter(|l| l.starts_with("commit:")).count();
+                check("ime_real_zh_commit_sends_cjk_once", non_ascii(&st.input) && commits == 1);
                 t.update(cx, |v, _| v.capture_input = None);
                 inject::activate_layout("00000409");
                 self.sub = 20;
@@ -1009,6 +1049,18 @@ impl ShellSmoke {
             }
         }
     }
+}
+
+/// What the view and the IME handler hold at one moment.
+struct ImeState {
+    marked: Option<String>,
+    log: Vec<String>,
+    bounds_calls: u32,
+    bounds_last: Option<(usize, usize, f32, f32, f32, f32)>,
+    cursor: (usize, usize),
+    input: String,
+    view_origin: (f32, f32),
+    cell: (f32, f32),
 }
 
 /// State of the OSC 52 checks.

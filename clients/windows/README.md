@@ -57,10 +57,15 @@ GPUI exposes the Windows IME (TSF/IMM) path through `Window::handle_input` with 
 `replace_and_mark_text_in_range`, `marked_text_range`, `bounds_for_range`, ...). `TerminalView`
 implements it (`view.rs`): the preedit is drawn underlined at the cursor cell, `bounds_for_range`
 anchors the candidate window on that cell, commit sends the text once as typed input, cancel
-sends nothing. The smoke checks all of this at the handler level (`ime_*`). A real Japanese or
-Chinese IME on the hosted runner is probed by the `ime-probe` job (`ci/ime-probe.ps1`,
-artifact `ime-probe`). What it finds is in the task report. The on-screen test with a real IME
-is in `docs/manual-tests.md` (A4).
+sends nothing. The smoke checks this at the handler level (`ime_*`) and with a REAL IME
+(`ime_real_*`): the `windows-latest` image (Server 2025) already has the ja-JP and zh-CN language
+packs, Microsoft IME and Microsoft Pinyin. A workflow step enables them for the user
+(`Set-WinUserLanguageList`), the smoke switches to them (`ActivateKeyboardLayout` plus TSF
+`ActivateProfile`), turns the IME on (`ImmSetOpenStatus`), types `nihongo` / `zhongwen` with
+`SendInput`, and checks what reaches the view: the preedit (にほんご), the conversion (kanji after
+Space), the candidate window anchor at the cursor cell (`bounds_for_range`), and one commit of CJK
+text to the pane. `ci/ime-probe.ps1` (workflow_dispatch only) records what a runner has. What a
+runner cannot show is the candidate window on screen: that is in `docs/manual-tests.md` (A4).
 
 ## Manual tests
 

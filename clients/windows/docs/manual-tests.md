@@ -14,9 +14,10 @@ Build to test: the `forgetty-win-msi` artifact of the latest green `windows-clie
 Window, ConPTY shell, rendering through the WARP software renderer, key encoder, wide characters,
 scrollback, paste sanitizing, selection, pairing dialog logic, reconnect after a server restart,
 letterbox, `size_owner` label, toast requests, the Action Center holding the toast, OSC 52 policy,
-the IME handler (preedit, commit, cancel, candidate window at the cursor cell), MSI install and uninstall.
+the IME handler (preedit, commit, cancel, candidate window anchor at the cursor cell), a real Microsoft IME
+(Japanese) and Microsoft Pinyin driven by injected keys (preedit, conversion, commit, anchor), MSI install and uninstall.
 
-CI cannot check: real GPU rendering, real fonts on your monitors, a real IME on screen, sleep and resume,
+CI cannot check: real GPU rendering, real fonts on your monitors, the IME candidate window on screen, sleep and resume,
 real wifi to tether changes, several monitors, Win-key shell behavior, SmartScreen. Those are below.
 
 ---
@@ -89,7 +90,8 @@ printf '\e]52;c;%s\a' "$(printf 'from osc52' | base64)"
 
 ### A4. IME (Japanese and Chinese)
 
-CI could not run a real IME (see the report of this task). This part is the real test. Settings, Time and language,
+CI drives the real Microsoft IME and Pinyin with injected keys and checks what the pane receives, but a runner shows no
+screen to look at. This part is what only your eyes can check: where the candidate window appears, fonts, and feel. Settings, Time and language,
 Language and region: add Japanese (Microsoft IME) and Chinese Simplified (Microsoft Pinyin). Switch with Win+Space.
 
 Japanese, Microsoft IME in hiragana mode (the key to switch on/off is the tilde key left of 1, or Alt+tilde):
