@@ -122,9 +122,11 @@ async fn round(
             assert!(*d < Duration::from_millis(500), "{label} {n}: pane {i} echo after {d:?}");
         }
     }
-    // The first 6 far-behind resumes of a node and pane spend a token: only
-    // the snapshot build is waited for, not the pacing (1 s and more).
-    if label == "far behind" && n < 6 {
+    // A node and pane have 6 resume tokens and this idle pane gives no live
+    // byte to prove a read, so none comes back. The first attach of the
+    // client spent one: 5 far-behind resumes are left, and they wait for the
+    // snapshot build only, not for the pacing (1 s and more).
+    if label == "far behind" && n < 5 {
         assert!(echo[0] < Duration::from_millis(1000), "{label} {n}: pane A echo after {:?}", echo[0]);
     }
     println!(

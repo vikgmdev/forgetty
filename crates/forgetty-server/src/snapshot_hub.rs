@@ -10,6 +10,9 @@
 //!   builds them one after the other
 //! - the server wide permits go to the waiting nodes in turn (round robin), so
 //!   one node cannot keep another from a build
+//! - a node has at most [`NODE_REQUESTS`] requests in the hub at once, queued
+//!   or running, across all its panes. Its next request waits at the node's
+//!   own gate, so it takes no place in the queue of another node
 //! - a build nobody waits for any more (every stream that asked was replaced or
 //!   closed) is dropped before it starts
 //!
@@ -29,6 +32,9 @@ use tokio::sync::{oneshot, watch};
 pub const REUSE_FOR: Duration = Duration::from_millis(250);
 /// Concurrent builds, server wide.
 pub const MAX_BUILDS: usize = 2;
+/// Snapshot requests one node may have in the hub at once, queued or running,
+/// over all its panes.
+pub const NODE_REQUESTS: usize = 2;
 
 /// Who asks: the 32 bytes of a node id. Builds are limited and shared out per
 /// node. The local socket and the tests use [`LOCAL`].
@@ -136,6 +142,59 @@ impl Scheduler {
     }
 }
 
+/// Per node count of requests in the hub. A node over [`NODE_REQUESTS`] waits
+/// at its own semaphore.
+#[derive(Default)]
+struct NodeGate {
+    /// The semaphore of each node with a request here, and how many requests
+    /// that is (waiting at the semaphore or holding a place).
+    nodes: Mutex<HashMap<NodeKey, (Arc<tokio::sync::Semaphore>, usize)>>,
+}
+
+/// A request of a node in the hub. Counted from `enter` on, so a request that
+/// is dropped while it waits still leaves; the node's entry goes with the last
+/// one.
+struct NodePlace {
+    gate: Arc<NodeGate>,
+    node: NodeKey,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl Drop for NodePlace {
+    fn drop(&mut self) {
+        drop(self.permit.take());
+        let mut nodes = self.gate.nodes.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, users)) = nodes.get_mut(&self.node) {
+            *users -= 1;
+            if *users == 0 {
+                nodes.remove(&self.node);
+            }
+        }
+    }
+}
+
+impl NodeGate {
+    /// Wait for one of the node's [`NODE_REQUESTS`] places.
+    async fn enter(self: &Arc<Self>, node: NodeKey) -> Option<NodePlace> {
+        let sem = {
+            let mut nodes = self.nodes.lock().unwrap_or_else(|e| e.into_inner());
+            let e = nodes
+                .entry(node)
+                .or_insert_with(|| (Arc::new(tokio::sync::Semaphore::new(NODE_REQUESTS)), 0));
+            e.1 += 1;
+            e.0.clone()
+        };
+        let mut place = NodePlace { gate: self.clone(), node, permit: None };
+        place.permit = Some(sem.acquire_owned().await.ok()?);
+        Some(place)
+    }
+
+    #[cfg(test)]
+    fn tracked(&self) -> usize {
+        self.nodes.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+}
+
 /// Counters, for the harness and the logs.
 #[derive(Default)]
 pub struct HubStats {
@@ -195,6 +254,7 @@ impl Drop for Waiter {
 pub struct SnapshotHub {
     map: Mutex<HashMap<PaneId, Slot>>,
     sched: Arc<Scheduler>,
+    gate: Arc<NodeGate>,
     reuse_for: Duration,
     /// Counters.
     pub stats: HubStats,
@@ -215,6 +275,7 @@ impl SnapshotHub {
                 max: max_builds,
                 state: Mutex::new(SchedState::default()),
             }),
+            gate: Arc::new(NodeGate::default()),
             reuse_for,
             stats: HubStats::default(),
         }
@@ -270,6 +331,9 @@ impl SnapshotHub {
         U: Fn(&PaneSnapshot) -> bool,
     {
         let mut build = Some(build);
+        // Kept until the answer is back. The local socket is not a remote
+        // node and has no cap.
+        let _place = if node == LOCAL { None } else { self.gate.enter(node).await };
         loop {
             let (b, mut rx) = {
                 let mut map = self.lock();
@@ -582,6 +646,49 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn one_node_with_fifty_busy_panes_cannot_delay_another_node_by_two_builds() {
+        let build = Duration::from_millis(100);
+        let hub = Arc::new(SnapshotHub::new(2, Duration::from_millis(10)));
+        let mut hostile = Vec::new();
+        for _ in 0..50 {
+            let hub = hub.clone();
+            hostile.push(tokio::spawn(async move {
+                hub.get_for(
+                    node(1),
+                    pane(),
+                    |_| true,
+                    move || {
+                        std::thread::sleep(build);
+                        Some(snap(0))
+                    },
+                )
+                .await
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // The node has at most two requests in the hub: one running, one
+        // queued. The other 48 wait at its own gate.
+        let queued = hub.sched.lock().queues.get(&node(1)).map_or(0, |q| q.len());
+        let running = hub.sched.lock().busy.contains(&node(1)) as usize;
+        assert!(queued + running <= NODE_REQUESTS, "{queued} queued, {running} running");
+        let t0 = Instant::now();
+        let other = hub
+            .get_for(node(2), pane(), |_| true, move || {
+                std::thread::sleep(build);
+                Some(snap(1))
+            })
+            .await;
+        let took = t0.elapsed();
+        assert!(other.is_some());
+        assert!(took < build * 2 + Duration::from_millis(100), "the other node waited {took:?}");
+        for j in hostile {
+            j.abort();
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(hub.gate.tracked(), 0, "idle nodes left entries in the gate");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn permits_go_round_robin_to_the_waiting_nodes() {
         let hub = Arc::new(SnapshotHub::new(1, Duration::from_millis(10)));
         let order = Arc::new(Mutex::new(Vec::<u8>::new()));
@@ -648,10 +755,11 @@ mod tests {
             })
         };
         tokio::time::sleep(Duration::from_millis(20)).await;
-        // Node 1 queues three builds, the last one for `p`. Node 2 then asks
-        // for `p`: it joins that build and does not wait behind the other two.
+        // Node 1 queues two builds (its cap), the last one for `p`. Node 2
+        // then asks for `p`: it joins that build and does not wait behind the
+        // other one.
         let mut joins = Vec::new();
-        for _ in 0..2 {
+        for _ in 0..1 {
             let hub = hub.clone();
             joins.push(tokio::spawn(async move {
                 hub.get_for(

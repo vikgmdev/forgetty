@@ -431,19 +431,29 @@ known gap, section 12).
   `client_id`): a node that asks for many panes gets them one after the other.
   The 2 build permits go to the waiting nodes in turn (round robin), so one
   node cannot keep another from a build. A node that joins a build still
-  waiting in another node's queue can start it on its own turn.
+  waiting in another node's queue can start it on its own turn. A node also
+  has at most 2 snapshot requests in the hub at once, queued or running,
+  across all its panes. Its next request waits at the node's own gate and
+  takes no place in the queue of another node, so one node with 100 busy
+  panes delays the catch-up of another node by 2 build times at most.
 - Pacing, per `(node id, pane)`, kept after the stream and the connection end
   (attaching again does not reset it). A far-behind attach (a resume further
   back than half the ring, or a first attach to a pane with that much
-  history) spends a token of the same bucket as the catch-ups below: 6 free
-  per node and pane, then one more each second. A phone that sat in a pocket
-  while a build printed 10 MB is the normal case, so such an attach waits
-  for nothing but the snapshot build, whatever the last catch-up of that
-  node and pane was. With no token left it waits for the next token and at
-  least the backoff below (1 s, doubling to 10 s), and the waits of attaches
-  that come one after the other add up, so 30 far-behind attaches in a row
-  are served at about a dozen in the first 30 s. A resume with a small gap
-  (less than half the ring) never waits on the pacing.
+  history) spends a resume token: a node and pane have 6, at most. Time earns
+  no resume token. A `Strong` claim (below) earns one, at the moment the peer
+  has read 512 KiB of live bytes at 1 MiB/s or more since its snapshot, or
+  when its catch-up ends with that claim, whichever comes first (once per
+  stream). A phone that sat in a pocket while a build printed 10 MB is the
+  normal case, and it reads what it gets, so it always has a token and waits
+  for nothing but the snapshot build. A token does not lift the floor: two
+  snapshots of one node and pane start at least 100 ms apart. With no token
+  left, the attach waits out the backoff below (2 s, doubling to 10 s, at
+  most 10 s of wait), and the backoff does not start over because the peer
+  waited between attaches: only a `Strong` claim, or 20 s without any
+  attach, ends it. A peer that never reads gets 6 snapshots in all, then the
+  backoff: a peer that attaches again every 2 s for a minute gets at most 8
+  (6 and 2). A resume with a small gap (less than half the ring) never waits
+  on the pacing.
   - A stream whose peer reads (it took live bytes at 1 MiB/s or more since its
     last snapshot, or took a snapshot in under 500 ms that the log outran
     before any live byte) gets a burst of 6 catch-ups at least 100 ms apart,

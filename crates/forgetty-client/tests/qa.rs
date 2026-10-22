@@ -261,6 +261,100 @@ async fn re_attaching_does_not_reset_the_catch_up_backoff() {
     server.shutdown().await;
 }
 
+/// A peer that never reads and attaches again every 2 s for a minute. The
+/// resume tokens are 6 and time earns none, so it gets 6 snapshots, then only
+/// what the doubling backoff lets through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peer_that_never_reads_and_re_attaches_every_two_seconds_gets_six_and_the_backoff() {
+    if !real_only() {
+        return;
+    }
+    let server = TestServer::start(TestServerConfig::default()).await;
+    let pane = server.add_script_pane("exec yes 0123456789abcdef");
+    let (endpoint, conn, mut send) =
+        raw_peer(&server, &["resume", "snapshot_catchup"], Uuid::new_v4()).await;
+    // Let the log grow past half a ring, so every attach starts with a snapshot.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let t0 = Instant::now();
+    let mut id = 1;
+    while t0.elapsed() < Duration::from_secs(60) {
+        attach_raw(&mut send, id, pane).await;
+        id += 1;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    let st = qa_state(&server);
+    let catchups = st["catchups"].as_u64().unwrap();
+    println!("{} re-attaches in 60 s, never reading: {catchups} catch-ups", id - 1);
+    // 6 tokens, then the backoff (2 s, 4 s, then it outlasts the 2 s between
+    // attaches) lets a few more through. The stream's own stall catch-ups
+    // share the same backoff.
+    assert!(catchups <= 6 + 4, "{catchups} snapshot catch-ups in 60 s for a peer that reads nothing");
+    drop(conn);
+    endpoint.close().await;
+    server.shutdown().await;
+}
+
+/// A phone that reads, drops and is far behind again gets each snapshot
+/// without waiting for pacing: its reads (a `Strong` claim each time the
+/// server catches it up) earn the resume tokens back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_honest_far_behind_phone_gets_every_snapshot_in_under_300_ms() {
+    use forgetty_client::proto::{read_output_frame, PaneStreamHeader};
+    if !real_only() {
+        return;
+    }
+    let server = TestServer::start(TestServerConfig::default()).await;
+    // About 10 MB/s, in 1 MiB lumps.
+    let pane = server.add_script_pane(
+        "while :; do head -c 1048576 /dev/zero | tr '\\0' x; sleep 0.1; done",
+    );
+    let (endpoint, conn, mut ctl) =
+        raw_peer(&server, &["resume", "snapshot_catchup"], Uuid::new_v4()).await;
+    // Far behind: the log is past half a ring.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let mut worst = Duration::ZERO;
+    for round in 0..10u64 {
+        let t0 = Instant::now();
+        attach_raw(&mut ctl, round + 1, pane).await;
+        // Streams the server replaced (0x13) before this attach may still be
+        // queued: the answer is the first one that gives a header and its
+        // whole snapshot.
+        let (mut s, h) = 'streams: loop {
+            let mut s = conn.accept_uni().await.unwrap();
+            let Ok(Some(h)) = read_msg::<_, PaneStreamHeader>(&mut s).await else { continue };
+            let mut buf = Vec::new();
+            let mut got = 0usize;
+            while got < h.snapshot_len as usize {
+                match read_output_frame(&mut s, &mut buf).await {
+                    Ok(true) => got += buf.len(),
+                    _ => continue 'streams,
+                }
+            }
+            break (s, h);
+        };
+        let took = t0.elapsed();
+        worst = worst.max(took);
+        assert!(h.snapshot_len > 0, "round {round}: no snapshot, the phone was not far behind");
+        assert!(took < Duration::from_millis(300), "round {round}: snapshot after {took:?}");
+        // It reads at about 4 MiB/s, which is less than the program writes:
+        // the server ends the stream once the phone is 4 MiB behind (the
+        // claim is a strong one: live bytes at a good rate), and the phone
+        // drops.
+        let mut buf = Vec::new();
+        let ended = tokio::time::timeout(Duration::from_secs(10), async {
+            while let Ok(true) = read_output_frame(&mut s, &mut buf).await {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        })
+        .await;
+        assert!(ended.is_ok(), "round {round}: the server never caught the phone up");
+    }
+    println!("honest phone, 10 far-behind attaches: slowest snapshot {worst:?}");
+    drop(conn);
+    endpoint.close().await;
+    server.shutdown().await;
+}
+
 /// A bad frame on the input stream closes the connection (0x02), so the
 /// client redials instead of typing into a dead stream.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
