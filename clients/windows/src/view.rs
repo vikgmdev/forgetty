@@ -1356,7 +1356,9 @@ impl gpui::EntityInputHandler for TerminalView {
         _w: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        // Anchor the candidate window under the cursor cell.
+        // Anchor the candidate window under the cursor cell. The cursor is read from the render
+        // state, which `screen()` brings up to date (output may have arrived since the last frame).
+        let _ = self.term.screen();
         let (r, c) = self.term.cursor();
         let m = &self.metrics;
         Some(Bounds::new(

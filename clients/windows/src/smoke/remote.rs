@@ -1143,6 +1143,7 @@ impl ShellSmoke {
                 self.sub_t0 = Instant::now();
             }
             71 => {
+                let _ = spy.read(cx).term.screen();
                 if spy.read(cx).term.cursor() != (2, 4) {
                     return;
                 }
@@ -1196,6 +1197,7 @@ impl ShellSmoke {
                 self.sub_t0 = Instant::now();
             }
             _ => {
+                let _ = spy.read(cx).term.screen();
                 if spy.read(cx).term.cursor() != (0, 39) {
                     return;
                 }
