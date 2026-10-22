@@ -8,9 +8,18 @@ use std::time::{Duration, Instant};
 
 use forgetty_vt::{Terminal, ANSI_PALETTE_BLACK};
 
-/// Feed size per `vt_write` call. Small, so the deadline is checked often: a
-/// few KiB of `ESC[2J` on a huge pane costs seconds.
-const FEED_CHUNK: usize = 4 * 1024;
+/// Feed size per `vt_write` call for an 80x24 pane. The deadline is checked
+/// between calls, so a call must stay cheap: a few KiB of `ESC[2J` on a huge
+/// pane costs seconds. [`feed_chunk`] scales this to the pane.
+const FEED_CHUNK_80X24: usize = 4 * 1024;
+const FEED_CHUNK_MIN: usize = 64;
+
+/// Bytes per `vt_write` call: [`FEED_CHUNK_80X24`] scaled by the cell count of
+/// the pane against 80x24, so one call costs about 10 ms at worst.
+fn feed_chunk(rows: usize, cols: usize) -> usize {
+    let cells = rows.saturating_mul(cols).max(1);
+    (FEED_CHUNK_80X24 * (80 * 24) / cells).clamp(FEED_CHUNK_MIN, FEED_CHUNK_80X24)
+}
 
 /// How long capture may feed the ring. When it runs out the screen as far as
 /// it got is returned, marked `incomplete`.
@@ -20,7 +29,9 @@ pub const CAPTURE_DEADLINE: Duration = Duration::from_secs(1);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Captured {
     pub text: String,
-    /// The [`CAPTURE_DEADLINE`] ran out before the whole ring was read.
+    /// The [`CAPTURE_DEADLINE`] ran out before the whole ring was read (also
+    /// after the retry from the last clear). The screen may be older than the
+    /// current one.
     pub incomplete: bool,
 }
 
@@ -160,20 +171,27 @@ pub fn capture_with_deadline(
     let rows = rows.max(1) as usize;
     let cols = cols.max(1) as usize;
     let scrollback = scrollback_for(rows, cols, last_lines);
+    let begun = Instant::now();
+    // The first pass gets three quarters of the budget, so there is time left
+    // for the retry.
+    let first_until = begun + deadline.mul_f32(FIRST_PASS_SHARE);
     let start = parse_start(replay, scrollback > 0);
-    let mut term = Terminal::with_scrollback(rows, cols, [ANSI_PALETTE_BLACK; 16], scrollback);
-    let started = Instant::now();
-    let mut incomplete = false;
-    for chunk in replay[start..].chunks(FEED_CHUNK) {
-        if started.elapsed() >= deadline {
-            incomplete = true;
-            break;
+    let (mut term, mut ran_out) = feed(replay, start, rows, cols, scrollback, first_until);
+    if ran_out && scrollback == 0 && Instant::now() < begun + deadline {
+        // Retry once from the last clear in the final quarter of the ring: the
+        // screen is rebuilt from there, which is cheap when the ring is full
+        // of redraws. Not with scrollback: the history before the clear is
+        // what was asked for.
+        if let Some(from) = last_clear_in_final_quarter(replay) {
+            drop(term);
+            let (t, out) = feed(replay, from, rows, cols, 0, begun + deadline);
+            term = t;
+            ran_out = out;
         }
-        term.feed(chunk);
     }
     let mut lines: Vec<String> = Vec::with_capacity(rows);
     if scrollback > 0 {
-        collect_with_history(&mut term, rows, &mut lines);
+        ran_out |= collect_with_history(&mut term, rows, &mut lines, begun + deadline);
     } else {
         collect_viewport(&term, &mut lines);
     }
@@ -189,7 +207,38 @@ pub fn capture_with_deadline(
         let keep_from = lines.len().saturating_sub(n);
         lines.drain(..keep_from);
     }
-    Captured { text: lines.join("\n"), incomplete }
+    Captured { text: lines.join("\n"), incomplete: ran_out }
+}
+
+/// Share of the deadline for the first pass over the ring.
+const FIRST_PASS_SHARE: f32 = 0.75;
+
+/// Feed `replay[start..]` to a new terminal until `until`. True if it ran out.
+fn feed(
+    replay: &[u8],
+    start: usize,
+    rows: usize,
+    cols: usize,
+    scrollback: usize,
+    until: Instant,
+) -> (Terminal, bool) {
+    let mut term = Terminal::with_scrollback(rows, cols, [ANSI_PALETTE_BLACK; 16], scrollback);
+    for chunk in replay[start..].chunks(feed_chunk(rows, cols)) {
+        if Instant::now() >= until {
+            return (term, true);
+        }
+        term.feed(chunk);
+    }
+    (term, false)
+}
+
+/// The last full clear (RIS, home + erase, or erase display) in the final
+/// quarter of the ring.
+fn last_clear_in_final_quarter(replay: &[u8]) -> Option<usize> {
+    let from = replay.len() - replay.len() / 4;
+    let tail = &replay[from..];
+    let last = |pat: &[u8]| tail.windows(pat.len()).rposition(|w| w == pat);
+    [last(RIS), last(HOME_CLEAR), last(b"\x1b[2J")].into_iter().flatten().max().map(|i| from + i)
 }
 
 /// Append the rows now in the viewport.
@@ -206,19 +255,28 @@ fn collect_viewport(term: &Terminal, lines: &mut Vec<String>) {
 
 /// Append every line, scrollback first: the viewport is moved to the top and
 /// down a page at a time.
-fn collect_with_history(term: &mut Terminal, rows: usize, lines: &mut Vec<String>) {
+/// True if `until` passed before every page was read.
+fn collect_with_history(
+    term: &mut Terminal,
+    rows: usize,
+    lines: &mut Vec<String>,
+    until: Instant,
+) -> bool {
     let _ = term.screen(); // refreshes the scrollbar
     let (total, _, _) = term.scrollbar_state();
     let total = total as usize;
     if total <= rows {
         collect_viewport(term, lines);
-        return;
+        return false;
     }
     term.scroll_viewport_delta(isize::MIN / 2);
     let _ = term.screen();
     let mut have = 0usize;
     // A page at a time; the last page overlaps the one before it.
     for _ in 0..=(total / rows + 1) {
+        if Instant::now() >= until {
+            return true;
+        }
         let _ = term.screen();
         let (_, offset, _) = term.scrollbar_state();
         let offset = offset as usize;
@@ -232,6 +290,7 @@ fn collect_with_history(term: &mut Terminal, rows: usize, lines: &mut Vec<String
         }
         term.scroll_viewport_delta(rows as isize);
     }
+    false
 }
 
 #[cfg(test)]
@@ -403,13 +462,36 @@ mod tests {
     }
 
     #[test]
+    fn a_timeout_retries_from_the_last_clear_in_the_final_quarter() {
+        // Redraw spam that cannot be read in time, then a clear and a short
+        // screen at the end. The retry starts at that clear and finishes.
+        let mut ring = b"\x1b[2J".repeat(1_500_000);
+        let marker_at = ring.len();
+        ring.extend_from_slice(b"\x1b[H\x1b[2J");
+        for i in 0..2000 {
+            ring.extend_from_slice(format!("tail line {i}\r\n").as_bytes());
+        }
+        assert!(marker_at >= ring.len() / 4 * 3);
+        let t0 = Instant::now();
+        let got = capture(&ring, 1000, 1000, true, Some(3));
+        assert!(t0.elapsed() < Duration::from_millis(1500), "took {:?}", t0.elapsed());
+        assert!(!got.incomplete, "the retry should finish");
+        assert!(got.text.contains("tail line 1999"), "{:?}", got.text);
+        // No clear in the final quarter: no retry, still incomplete.
+        let mut spam = b"\x1b[2J".repeat(1_500_000);
+        spam.extend_from_slice(&vec![b'x'; 4_000_000]);
+        assert!(capture(&spam, 1000, 1000, true, None).incomplete);
+    }
+
+    #[test]
     fn a_ring_of_clears_on_a_huge_pane_answers_within_the_deadline() {
         let ring = b"\x1b[2J".repeat(1_500_000); // 7.5 MB
         let t0 = Instant::now();
         let got = capture(&ring, 1000, 1000, true, None);
         let took = t0.elapsed();
         assert!(took < Duration::from_millis(1500), "took {took:?}");
-        assert!(got.incomplete, "the deadline should have run out");
+        // The first pass runs out, the retry from the last clear finishes.
+        assert!(!got.incomplete, "the retry should finish");
         assert_eq!(got.text, "");
         // A short ring is complete.
         assert!(!capture(b"hi", 24, 80, true, None).incomplete);

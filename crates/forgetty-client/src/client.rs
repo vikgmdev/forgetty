@@ -256,7 +256,10 @@ struct Ep {
 /// same key and dial with that. Never two at once, so the endpoint id is
 /// registered once at the relay. iroh rebinds its UDP socket only after its own
 /// network probe, which can take 4 to 52 s.
-const NETWORK_FALLBACK: Duration = Duration::from_millis(1000);
+///
+/// Longer than the Pong limit of `network_changed` (1000 ms), so a Pong that
+/// lands right at the limit does not start a needless replace.
+const NETWORK_FALLBACK: Duration = Duration::from_millis(1500);
 
 async fn bind_endpoint(
     opts: &ClientOptions,
@@ -288,6 +291,8 @@ pub(crate) struct Shared {
     /// always (checked by the tests).
     live_eps: AtomicUsize,
     max_live_eps: AtomicUsize,
+    /// The current endpoint was closed and the bind of its replacement failed.
+    endpoint_closed: AtomicBool,
     /// Connections established so far.
     connected_count: AtomicU64,
     /// Test hook: dials on the endpoint of this bind number never connect.
@@ -391,6 +396,7 @@ impl Client {
             next_ep_gen: AtomicU64::new(1),
             live_eps: AtomicUsize::new(1),
             max_live_eps: AtomicUsize::new(1),
+            endpoint_closed: AtomicBool::new(false),
             connected_count: AtomicU64::new(0),
             stuck_gen: AtomicU64::new(u64::MAX),
             server,
@@ -455,27 +461,29 @@ fn spawn_fallback(shared: Arc<Shared>, seen: u64, pong_ok: Arc<AtomicBool>) {
     });
 }
 
+/// Wait before binding again after a failed bind, and after 10 failures.
+const BIND_RETRY: Duration = Duration::from_millis(500);
+const BIND_RETRY_SLOW: Duration = Duration::from_secs(2);
+
 impl Shared {
     /// Close the endpoint and bind a new one with the same key, in that order:
-    /// only one exists at a time. Returns false if the bind failed (the
-    /// caller tries again).
-    async fn replace_endpoint(&self) -> bool {
-        let old = self.ep();
-        let _ = tokio::time::timeout(CLOSE_GRACE, old.ep.close()).await;
-        self.live_eps.fetch_sub(1, Ordering::SeqCst);
-        match bind_endpoint(&self.opts, &self.server, self.identity.clone()).await {
-            Ok(ep) => {
-                let now = self.live_eps.fetch_add(1, Ordering::SeqCst) + 1;
-                self.max_live_eps.fetch_max(now, Ordering::SeqCst);
-                let gen = self.next_ep_gen.fetch_add(1, Ordering::SeqCst);
-                *lock(&self.endpoint) = Ep { ep, gen };
-                true
-            }
-            Err(e) => {
-                warn!("client: fresh endpoint failed to bind: {e}");
-                false
-            }
+    /// only one exists at a time. An `Err` means the bind failed and the
+    /// endpoint stays closed: call again to bind (the old one is not closed
+    /// twice).
+    async fn replace_endpoint(&self) -> Result<(), String> {
+        if !self.endpoint_closed.load(Ordering::SeqCst) {
+            let old = self.ep();
+            let _ = tokio::time::timeout(CLOSE_GRACE, old.ep.close()).await;
+            self.live_eps.fetch_sub(1, Ordering::SeqCst);
+            self.endpoint_closed.store(true, Ordering::SeqCst);
         }
+        let ep = bind_endpoint(&self.opts, &self.server, self.identity.clone()).await?;
+        let now = self.live_eps.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_live_eps.fetch_max(now, Ordering::SeqCst);
+        let gen = self.next_ep_gen.fetch_add(1, Ordering::SeqCst);
+        *lock(&self.endpoint) = Ep { ep, gen };
+        self.endpoint_closed.store(false, Ordering::SeqCst);
+        Ok(())
     }
 }
 
@@ -1000,6 +1008,7 @@ async fn supervise(shared: Arc<Shared>) {
     let mut failures = 0usize;
     let mut final_state = ConnectionState::Closed;
     let mut attempt_no = 0u64;
+    let mut bind_failures = 0u32;
     loop {
         if *shutdown.borrow() {
             break;
@@ -1009,14 +1018,27 @@ async fn supervise(shared: Arc<Shared>) {
         // is closed first. A failed bind is tried again after a short wait.
         let want = shared.replace_for.load(Ordering::SeqCst);
         if want == shared.connected_count.load(Ordering::SeqCst) {
-            if shared.replace_endpoint().await {
-                shared.replace_for.store(u64::MAX, Ordering::SeqCst);
-            } else {
-                tokio::select! {
-                    () = tokio::time::sleep(Duration::from_millis(500)) => {}
-                    _ = shutdown.changed() => {}
+            match shared.replace_endpoint().await {
+                Ok(()) => {
+                    shared.replace_for.store(u64::MAX, Ordering::SeqCst);
+                    bind_failures = 0;
                 }
-                continue;
+                Err(e) => {
+                    bind_failures += 1;
+                    // The first failure, then every 20th: a bind that keeps
+                    // failing must not fill the log.
+                    if bind_failures % 20 == 1 {
+                        warn!(
+                            "client: fresh endpoint failed to bind ({bind_failures} so far): {e}"
+                        );
+                    }
+                    let wait = if bind_failures > 10 { BIND_RETRY_SLOW } else { BIND_RETRY };
+                    tokio::select! {
+                        () = tokio::time::sleep(wait) => {}
+                        _ = shutdown.changed() => {}
+                    }
+                    continue;
+                }
             }
         }
         attempt_no += 1;
