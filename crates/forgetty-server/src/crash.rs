@@ -19,7 +19,7 @@
 //! handler that never returns, for example), the default SIGALRM action kills
 //! the process, so a supervisor such as systemd sees it die and restarts it.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 const SIGNALS: [libc::c_int; 5] =
     [libc::SIGSEGV, libc::SIGABRT, libc::SIGBUS, libc::SIGILL, libc::SIGFPE];
@@ -28,6 +28,10 @@ const SIGNALS: [libc::c_int; 5] =
 static mut OLD: [Option<libc::sigaction>; 32] = [None; 32];
 /// Set while the handler runs. A second fault inside it skips the report.
 static IN_HANDLER: AtomicUsize = AtomicUsize::new(0);
+/// Set once the first thread has written its line. Later threads wait on it (bounded).
+static LINE_DONE: AtomicBool = AtomicBool::new(false);
+/// How long a second faulting thread waits for the first thread's line.
+const SECOND_THREAD_WAIT_MS: u32 = 100;
 
 static INSTALLED: std::sync::Once = std::sync::Once::new();
 static MODULES_BUILT: std::sync::Once = std::sync::Once::new();
@@ -157,8 +161,19 @@ extern "C" fn on_fatal_signal(
 ) {
     if IN_HANDLER.fetch_add(1, Ordering::SeqCst) == 0 {
         // First thing: a deadline. If any step below hangs, SIGALRM (default action) kills us.
-        // SAFETY: alarm is async-signal-safe.
+        // Make sure SIGALRM really has the default action and is not blocked on this thread,
+        // even if other code changed either one.
+        // SAFETY: sigaction, sigemptyset, sigaddset, pthread_sigmask and alarm are
+        // async-signal-safe, and the structs are local and zeroed.
         unsafe {
+            let mut dfl: libc::sigaction = std::mem::zeroed();
+            dfl.sa_sigaction = libc::SIG_DFL;
+            libc::sigemptyset(&mut dfl.sa_mask);
+            libc::sigaction(libc::SIGALRM, &dfl, std::ptr::null_mut());
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, libc::SIGALRM);
+            libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
             libc::alarm(HANDLER_DEADLINE_SECS);
         }
         let mut buf = [0u8; 640];
@@ -186,6 +201,19 @@ extern "C" fn on_fatal_signal(
         // SAFETY: write(2) on fd 2 with a buffer of `n` valid bytes.
         unsafe {
             libc::write(libc::STDERR_FILENO, buf.as_ptr().cast(), n);
+        }
+        LINE_DONE.store(true, Ordering::SeqCst);
+    } else {
+        // A later fault must not re-raise before the first thread's line is written: a
+        // heap-corruption cascade can kill the process within microseconds. Wait, bounded.
+        let ts = libc::timespec { tv_sec: 0, tv_nsec: 1_000_000 };
+        let mut waited = 0;
+        while !LINE_DONE.load(Ordering::SeqCst) && waited < SECOND_THREAD_WAIT_MS {
+            // SAFETY: nanosleep is async-signal-safe and `ts` is valid.
+            unsafe {
+                libc::nanosleep(&ts, std::ptr::null_mut());
+            }
+            waited += 1;
         }
     }
     // SAFETY: OLD is written once at install, before any signal can arrive
@@ -431,6 +459,49 @@ mod tests {
                 install();
                 die_of_sigill();
             }
+            // Some other code ignores SIGALRM and blocks it on this thread. The deadline must hold.
+            "alarm_hostile" => {
+                extern "C" fn stuck(_: libc::c_int, _: *mut libc::siginfo_t, _: *mut libc::c_void) {
+                    loop {
+                        unsafe { libc::pause() };
+                    }
+                }
+                unsafe {
+                    let mut act: libc::sigaction = std::mem::zeroed();
+                    act.sa_sigaction = stuck as *const () as usize;
+                    act.sa_flags = libc::SA_SIGINFO;
+                    libc::sigemptyset(&mut act.sa_mask);
+                    libc::sigaction(libc::SIGILL, &act, std::ptr::null_mut());
+                }
+                install();
+                unsafe {
+                    libc::signal(libc::SIGALRM, libc::SIG_IGN);
+                    let mut set: libc::sigset_t = std::mem::zeroed();
+                    libc::sigemptyset(&mut set);
+                    libc::sigaddset(&mut set, libc::SIGALRM);
+                    libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+                }
+                die_of_sigill();
+            }
+            // A first thread is "in the handler" (a stand-in: the counter is set by hand) and writes
+            // its line 50 ms later. This thread faults meanwhile and must wait for that line.
+            "second_thread_waits" => {
+                install();
+                IN_HANDLER.store(1, Ordering::SeqCst);
+                std::thread::spawn(|| {
+                    std::thread::sleep(Duration::from_millis(50));
+                    let msg = b"first-thread-line\n";
+                    unsafe { libc::write(libc::STDERR_FILENO, msg.as_ptr().cast(), msg.len()) };
+                    LINE_DONE.store(true, Ordering::SeqCst);
+                });
+                die_of_sigill();
+            }
+            // The first thread never finishes: the second one gives up after the bounded wait.
+            "second_thread_gives_up" => {
+                install();
+                IN_HANDLER.store(1, Ordering::SeqCst);
+                die_of_sigill();
+            }
             _ => {}
         }
     }
@@ -508,5 +579,27 @@ mod tests {
         assert!(took >= Duration::from_secs(2), "died too early ({took:?})");
         assert!(err.contains("fatal signal 4 (SIGILL)"), "{err}");
         assert_eq!(status.signal(), Some(libc::SIGALRM));
+    }
+
+    #[test]
+    fn a_hostile_sigalrm_setup_does_not_defeat_the_deadline() {
+        let (err, status, took) = run_child("alarm_hostile", "crash::tests::child_dies");
+        assert!(took < Duration::from_secs(5), "no deadline ({took:?}): {err}");
+        assert!(took >= Duration::from_secs(2), "died too early ({took:?})");
+        assert_eq!(status.signal(), Some(libc::SIGALRM), "{err}");
+    }
+
+    #[test]
+    fn a_second_faulting_thread_waits_for_the_first_line() {
+        let (err, status, _) = run_child("second_thread_waits", "crash::tests::child_dies");
+        assert!(err.contains("first-thread-line"), "the process died before the first line: {err}");
+        assert_eq!(status.signal(), Some(libc::SIGILL), "{err}");
+    }
+
+    #[test]
+    fn a_second_faulting_thread_gives_up_after_the_bounded_wait() {
+        let (err, status, took) = run_child("second_thread_gives_up", "crash::tests::child_dies");
+        // Without the bound the child would hang until `run_child` kills it (SIGKILL).
+        assert_eq!(status.signal(), Some(libc::SIGILL), "waited too long ({took:?}): {err}");
     }
 }
