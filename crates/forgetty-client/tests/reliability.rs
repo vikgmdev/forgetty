@@ -475,8 +475,9 @@ async fn network_changed_aborts_a_hung_dial_and_connects_at_once() {
 /// The socket of the client's endpoint goes away (Android airplane mode): no
 /// dial on it connects, and iroh would take 4 to 52 s to rebind. After
 /// `network_changed` the client must bind a fresh endpoint with the same key
-/// and be Connected within 2.5 s (the 1.5 s fallback delay plus the dial). Input typed before, during and after the
-/// outage reaches the pane once, in order.
+/// and be Connected within 1 s: there is no connection, so nothing waits for
+/// the 1.5 s fallback. Input typed before, during and after the outage reaches
+/// the pane once, in order.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn network_changed_with_a_stuck_socket_connects_on_a_fresh_endpoint() {
     let server =
@@ -489,6 +490,10 @@ async fn network_changed_with_a_stuck_socket_connects_on_a_fresh_endpoint() {
         .await;
 
     h.blackhole_endpoint_for_tests();
+    // The airplane-mode case: the connection is already gone.
+    while h.state().is_connected() {
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
     let handshakes = server.handshakes();
     let t0 = Instant::now();
     h.network_changed().await;
@@ -507,8 +512,7 @@ async fn network_changed_with_a_stuck_socket_connects_on_a_fresh_endpoint() {
     }
     let took = t0.elapsed();
     println!("network_changed with a stuck socket: Connected after {took:?}");
-    assert!(took >= Duration::from_millis(1400), "replaced too early: {took:?}");
-    assert!(took < Duration::from_millis(2500), "Connected after {took:?}");
+    assert!(took < Duration::from_millis(1000), "Connected after {took:?}");
     assert_eq!(h.endpoint_id(), device, "the fresh endpoint keeps the device id");
     // The old endpoint was closed before the new one was bound: never two
     // with the same id, which would split its relay registration.
@@ -799,6 +803,33 @@ async fn a_link_that_lived_long_is_redialed_at_once_with_an_empty_bucket() {
     }
     println!("long link: redialed after {:?}", t.elapsed());
     assert!(t.elapsed() < Duration::from_millis(500));
+    h.close().await;
+    server.shutdown().await;
+}
+
+/// With a connection that is up but silent, the fallback still applies: the
+/// Ping gets no Pong in 1 s, the link is closed, and 1.5 s after the call the
+/// stuck endpoint is replaced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn network_changed_with_a_silent_link_replaces_the_endpoint_after_the_fallback() {
+    if common::real_only() {
+        return; // needs the stuck-endpoint hook
+    }
+    let server =
+        TestServer::start(TestServerConfig { own_runtime: true, ..Default::default() }).await;
+    let h = connect_to(server.addr()).await;
+    h.stick_endpoint_for_tests();
+    server.freeze(Duration::from_millis(2500));
+    let t0 = Instant::now();
+    h.network_changed().await;
+    while !h.state().is_connected() || h.old_endpoint_clones_at_bind_for_tests() == usize::MAX {
+        assert!(t0.elapsed() < Duration::from_secs(8), "state {:?}", h.state());
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    let took = t0.elapsed();
+    println!("silent link: replaced and Connected after {took:?}");
+    assert_eq!(h.old_endpoint_clones_at_bind_for_tests(), 0);
+    assert_eq!(h.live_endpoints_for_tests(), (1, 1));
     h.close().await;
     server.shutdown().await;
 }

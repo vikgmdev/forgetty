@@ -342,6 +342,16 @@ struct Ep {
     /// count of clones is how a replace knows that none is left.
     ep: Arc<Endpoint>,
     gen: u64,
+    /// When this endpoint was bound. The first one counts as old.
+    born: Instant,
+}
+
+/// A replaced endpoint younger than this is not replaced again: its first dial
+/// is still setting up the relay path (a few round trips).
+const EP_MIN_AGE: Duration = Duration::from_secs(3);
+
+fn first_born() -> Instant {
+    Instant::now().checked_sub(EP_MIN_AGE).unwrap_or_else(Instant::now)
 }
 
 /// The tasks that may hold a clone of the endpoint after the dial that made
@@ -520,7 +530,7 @@ impl Client {
         let (events_tx, _) = broadcast::channel(opts.event_buffer.max(16));
         let (shutdown_tx, _) = watch::channel(false);
         let shared = Arc::new(Shared {
-            endpoint: Mutex::new(Some(Ep { ep: Arc::new(endpoint), gen: 0 })),
+            endpoint: Mutex::new(Some(Ep { ep: Arc::new(endpoint), gen: 0, born: first_born() })),
             identity,
             replace_for: AtomicU64::new(u64::MAX),
             next_ep_gen: AtomicU64::new(1),
@@ -587,7 +597,8 @@ fn spawn_fallback(shared: Arc<Shared>, seen: u64, pong_ok: Arc<AtomicBool>) {
         }
         let connected_again = shared.link_tx.borrow().is_some()
             && shared.connected_count.load(Ordering::SeqCst) != seen;
-        if pong_ok.load(Ordering::SeqCst) || connected_again || *shutdown.borrow() {
+        let fresh = shared.ep().is_some_and(|e| e.born.elapsed() < EP_MIN_AGE);
+        if pong_ok.load(Ordering::SeqCst) || connected_again || *shutdown.borrow() || fresh {
             return;
         }
         info!("client: no connection {NETWORK_FALLBACK:?} after a network change, replacing the endpoint");
@@ -654,7 +665,7 @@ impl Shared {
         let now = self.live_eps.fetch_add(1, Ordering::SeqCst) + 1;
         self.max_live_eps.fetch_max(now, Ordering::SeqCst);
         let gen = self.next_ep_gen.fetch_add(1, Ordering::SeqCst);
-        *lock(&self.endpoint) = Some(Ep { ep: Arc::new(ep), gen });
+        *lock(&self.endpoint) = Some(Ep { ep: Arc::new(ep), gen, born: Instant::now() });
         Ok(())
     }
 }
@@ -900,6 +911,9 @@ impl ClientHandle {
     /// Call when the OS reports a network change (Wi-Fi to LTE). Tells iroh to
     /// re-probe paths, sends a `Ping` at once and redials if no `Pong` comes
     /// back within 1 s.
+    /// With no connection (airplane mode, a long outage) it also replaces the
+    /// endpoint at once. With a silent connection the replace comes 1.5 s after
+    /// the call if nothing connected before.
     pub async fn network_changed(&self) {
         let shared = self.shared();
         // Probe first: `network_change` can take long on a dead network, and
@@ -920,15 +934,19 @@ impl ClientHandle {
         // iroh may need many seconds to rebind a socket that went away. If
         // there is no connection after a second, dial with a fresh endpoint.
         let pong_ok = Arc::new(AtomicBool::new(false));
-        spawn_fallback(
-            shared.clone(),
-            shared.connected_count.load(Ordering::SeqCst),
-            pong_ok.clone(),
-        );
+        let seen = shared.connected_count.load(Ordering::SeqCst);
+        spawn_fallback(shared.clone(), seen, pong_ok.clone());
         let Some(link) = link else {
             // No connection: a dial is in flight (it may hang on a dead
             // address) or the supervisor sleeps in a backoff. Abort it, forget
-            // the failures and dial again right away.
+            // the failures and dial again right away. There is no link to
+            // keep and nothing to wait for: the endpoint that has been failing
+            // since the network went away is replaced now, not after the 1.5 s
+            // of the fallback (unless it is itself new).
+            if shared.ep().is_some_and(|e| e.born.elapsed() >= EP_MIN_AGE) {
+                info!("client: network changed with no connection, replacing the endpoint");
+                shared.replace_for.store(seen, Ordering::SeqCst);
+            }
             shared.reset_backoff.store(true, Ordering::SeqCst);
             shared.kick.notify_one();
             return;
@@ -973,6 +991,15 @@ impl ClientHandle {
     #[doc(hidden)]
     pub fn injected_bind_failures_for_tests(&self) -> u32 {
         self.shared().injected_bind_failures.load(Ordering::SeqCst)
+    }
+
+    /// Test hook: no dial on the current endpoint connects (the link stays).
+    #[doc(hidden)]
+    pub fn stick_endpoint_for_tests(&self) {
+        let shared = self.shared();
+        if let Some(ep) = shared.ep() {
+            shared.stuck_gen.store(ep.gen, Ordering::SeqCst);
+        }
     }
 
     /// Test hook: the socket of the current endpoint went away. The current

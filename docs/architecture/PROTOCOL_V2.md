@@ -330,7 +330,11 @@ known gap, section 12).
   retires its attempts like this, never drops one half way through the
   handshake. These attempts are inside one dial
   and do not use up the backoff above. `network_changed()` aborts the dial in
-  flight and dials at once with the backoff reset. A cached direct address and
+  flight and dials at once with the backoff reset. With no connection it also
+  binds a fresh endpoint (same key) at once, because the endpoint that has been
+  failing since the network went away is the likely fault; an endpoint that was
+  itself replaced in the last 3 s is kept. With a silent but open connection the
+  fresh endpoint comes 1.5 s after the call if nothing connected before. A cached direct address and
   the addresses of the pairing payload (relay) are dialed in parallel; the
   direct connect gets 1 s.
 - On `close()` the client waits up to 300 ms for the server to ack the input it
