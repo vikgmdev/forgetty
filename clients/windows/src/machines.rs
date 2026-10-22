@@ -113,6 +113,7 @@ impl AppShell {
     /// system hooks (network change, resume, toasts) start feeding the shell.
     pub fn init_remote(&mut self, remote: RemoteCtx, hooks: Hooks, cx: &mut Context<Self>) {
         let stored = remote.store.machines();
+        self.osc52 = forgetty_shell_core::osc52::Policies::open(remote.store.dir());
         self.remote = Some(remote);
 
         let signals = hooks.signals.clone();
@@ -532,7 +533,39 @@ impl AppShell {
     pub fn open_pair(&mut self, cx: &mut Context<Self>) {
         self.palette = None;
         self.pair = Some(PairDialog { stage: PairStage::Input, raw: String::new() });
+        self.pair_clip_seen = None;
+        // While the dialog is open, a pairing payload that lands on the clipboard (the user
+        // copied the output of `forgetty pair`) is taken without a paste.
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(Duration::from_millis(400)).await;
+            match this.update(cx, |s, cx| s.pair_clipboard_tick(cx)) {
+                Ok(true) => {}
+                _ => break,
+            }
+        })
+        .detach();
         cx.notify();
+    }
+
+    /// One look at the clipboard for the pair dialog. `false` once the dialog is gone. Only a
+    /// text that parses as a pairing payload is taken, and only while the dialog waits for
+    /// text. Nothing is contacted until the user confirms.
+    pub fn pair_clipboard_tick(&mut self, cx: &mut Context<Self>) -> bool {
+        match &self.pair {
+            None => return false,
+            Some(d) if !matches!(d.stage, PairStage::Input) => return true,
+            _ => {}
+        }
+        let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) else { return true };
+        if self.pair_clip_seen.as_deref() == Some(text.as_str()) {
+            return true;
+        }
+        self.pair_clip_seen = Some(text.clone());
+        if store::parse_offer(&text).is_ok() {
+            let t: String = text.chars().take(65536).collect();
+            self.pair_submit_text(&t, cx);
+        }
+        true
     }
 
     /// The pasted text: parse it and ask for confirmation. Nothing is contacted.
@@ -614,7 +647,7 @@ impl AppShell {
                     self.pair = None;
                 } else if paste {
                     if let Some(t) = cx.read_from_clipboard().and_then(|c| c.text()) {
-                        let t: String = t.chars().take(8192).collect();
+                        let t: String = t.chars().take(65536).collect();
                         self.pair_submit_text(&t, cx);
                     }
                 } else if key == "enter" && !d.raw.is_empty() {

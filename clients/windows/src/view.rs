@@ -120,7 +120,26 @@ fn make_term(cfg: &Config, rows: usize, cols: usize) -> Terminal {
     Terminal::with_scrollback(rows, cols, palette, cfg.scrollback_bytes)
 }
 
+/// What a pane tells the shell about.
+#[derive(Clone, Debug)]
+pub enum ViewEvent {
+    /// A program asked for the clipboard (OSC 52). Never sent for replayed output.
+    Clipboard(forgetty_shell_core::osc52::Request),
+}
+
+/// Counts of OSC 52 requests seen live in this pane (the smoke reads them).
+#[derive(Clone, Copy, Default, Debug)]
+pub struct ClipboardSeen {
+    pub writes: u32,
+    pub too_large: u32,
+    pub reads_denied: u32,
+    /// Requests found inside replayed output: dropped.
+    pub replayed: u32,
+}
+
 pub struct TerminalView {
+    pub osc52: forgetty_shell_core::osc52::Scanner,
+    pub clip_seen: ClipboardSeen,
     pub cfg: Config,
     pub term: Terminal,
     pub source: Box<dyn PaneSource>,
@@ -208,6 +227,8 @@ impl Future for YieldNow {
         }
     }
 }
+
+impl gpui::EventEmitter<ViewEvent> for TerminalView {}
 
 impl TerminalView {
     pub fn new(
@@ -317,6 +338,8 @@ impl TerminalView {
             dim: 0.0,
             force_size: false,
             replaying: false,
+            osc52: Default::default(),
+            clip_seen: Default::default(),
             replay_since: None,
             replay_exact: false,
             notice: None,
@@ -363,6 +386,7 @@ impl TerminalView {
         cx: &mut Context<Self>,
     ) {
         if let Some((rows, cols, exact)) = reset {
+            self.osc52 = Default::default();
             self.reset_term(rows, cols);
             self.replaying = true;
             self.replay_exact = exact;
@@ -372,6 +396,20 @@ impl TerminalView {
             let t0 = Instant::now();
             self.term.feed(bytes);
             let dt = t0.elapsed();
+            // libghostty-vt does not surface OSC 52, so this view reads the bytes itself.
+            // Replayed output is history: a program asked for that clipboard write long ago.
+            for req in self.osc52.feed(bytes) {
+                if self.replaying {
+                    self.clip_seen.replayed += 1;
+                    continue;
+                }
+                match &req {
+                    forgetty_shell_core::osc52::Request::Write { .. } => self.clip_seen.writes += 1,
+                    forgetty_shell_core::osc52::Request::TooLarge => self.clip_seen.too_large += 1,
+                    forgetty_shell_core::osc52::Request::ReadDenied => self.clip_seen.reads_denied += 1,
+                }
+                cx.emit(ViewEvent::Clipboard(req));
+            }
             self.fed_bytes += bytes.len() as u64;
             self.feed_time += dt;
             self.max_feed = self.max_feed.max(dt);

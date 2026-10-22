@@ -104,9 +104,11 @@ A green build is not a gate.
 - Spike first, time-boxed to one week: build forgetty-vt for
   `x86_64-windows-gnu`, render one live pane with the chosen UI stack
   (decision 1), measure keystroke-to-pixel latency.
-- MVP: pairing by QR (camera) or paste code, machine list, workspaces, tabs,
-  splits, input with full keyboard protocol, scrollback, clipboard, IME,
-  toast notifications.
+- MVP: pairing by paste (no camera on Windows: the QR is on the laptop's own
+  screen, so the user copies the `forgetty pair` output and the dialog takes
+  it, whole, from the clipboard or Ctrl+V), machine list, workspaces, tabs,
+  splits, input with full keyboard protocol, scrollback, clipboard (OSC 52
+  write only, per-machine policy), IME, toast notifications.
 - **Gate:** Vick daily-drives the Windows client for one week with no blocker bug.
 
 ### P4 — Agent layer

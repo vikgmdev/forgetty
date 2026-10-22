@@ -98,6 +98,12 @@ fn xml_escape(s: &str) -> String {
     o
 }
 
+/// What the Action Center holds for this app: `(launch argument, title)` of each toast.
+/// The smoke uses it to see that a toast really arrived, not only that one was requested.
+pub fn action_center() -> Result<Vec<(String, String)>, String> {
+    imp::history()
+}
+
 /// Toast XML. Text was sanitized by `notify`; it is escaped again here.
 pub fn toast_xml(text: &ToastText, target: &str) -> String {
     let mut x = format!(
@@ -236,6 +242,25 @@ mod imp {
         Ok(toast)
     }
 
+    pub fn history() -> Result<Vec<(String, String)>, String> {
+        let run = || -> windows::core::Result<Vec<(String, String)>> {
+            let list = ToastNotificationManager::History()?.GetHistoryWithId(&HSTRING::from(AUMID))?;
+            let mut out = Vec::new();
+            for t in list {
+                let doc = t.Content()?;
+                let launch = doc.DocumentElement()?.GetAttribute(&HSTRING::from("launch"))?.to_string();
+                let texts = doc.GetElementsByTagName(&HSTRING::from("text"))?;
+                let title = match texts.Item(0) {
+                    Ok(n) => n.InnerText()?.to_string(),
+                    Err(_) => String::new(),
+                };
+                out.push((launch, title));
+            }
+            Ok(out)
+        };
+        run().map_err(|e| e.to_string())
+    }
+
     pub fn toast_thread(
         rx: std::sync::mpsc::Receiver<(ToastText, String)>,
         clicks: async_channel::Sender<String>,
@@ -270,6 +295,10 @@ mod imp {
 #[cfg(not(windows))]
 mod imp {
     use super::*;
+
+    pub fn history() -> Result<Vec<(String, String)>, String> {
+        Err("not Windows".into())
+    }
 
     pub fn register_hooks(_stats: &Arc<Stats>) {}
 

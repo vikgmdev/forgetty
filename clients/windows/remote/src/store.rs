@@ -17,7 +17,8 @@ use uuid::Uuid;
 use crate::acl::{self, write_private};
 
 const MAX_MACHINES: usize = 32;
-const MAX_OFFER_BYTES: usize = 4096;
+/// The whole output of `forgetty pair` (an ASCII QR block, the payload line, status lines) is accepted.
+const MAX_OFFER_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredMachine {
@@ -210,17 +211,34 @@ fn clean(s: &str, max: usize) -> String {
     forgetty_shell_core::notify::sanitize(s, max)
 }
 
+/// The first JSON object in `text` that is a pairing payload. Lines around it (the QR block,
+/// "payload:", "expires in...") may hold braces of their own, so every `{` is tried.
+fn find_payload(text: &str) -> Result<QrPayload, String> {
+    let mut first_err: Option<String> = None;
+    for (i, _) in text.match_indices('{') {
+        let mut it = serde_json::Deserializer::from_str(&text[i..]).into_iter::<serde_json::Value>();
+        let Some(Ok(v)) = it.next() else { continue };
+        if !v.is_object() {
+            continue;
+        }
+        let end = i + it.byte_offset();
+        match QrPayload::parse(&text[i..end]) {
+            Ok(q) => return Ok(q),
+            Err(e) => {
+                first_err.get_or_insert(e.to_string());
+            }
+        }
+    }
+    Err(first_err.unwrap_or_else(|| "No pairing payload found. Paste the text that `forgetty pair` prints.".into()))
+}
+
 /// Parse the text `forgetty pair` prints (the QR payload JSON, possibly with
 /// other lines around it). Nothing is contacted.
 pub fn parse_offer(text: &str) -> Result<PairingOffer, String> {
     if text.len() > MAX_OFFER_BYTES {
         return Err("The pasted text is too long for a pairing payload.".into());
     }
-    let (start, end) = match (text.find('{'), text.rfind('}')) {
-        (Some(s), Some(e)) if e > s => (s, e),
-        _ => return Err("No pairing payload found. Paste the text that `forgetty pair` prints.".into()),
-    };
-    let qr = QrPayload::parse(&text[start..=end]).map_err(|e| e.to_string())?;
+    let qr = find_payload(text)?;
     // Reject a node id or relay that cannot be dialed before showing a dialog.
     qr_to_addr(&qr).map_err(|e| e.to_string())?;
     let machine = clean(&qr.machine, 48);
@@ -313,6 +331,22 @@ mod tests {
         assert_eq!(o.machine, "build-box");
         assert_eq!(o.node_short, n[..8]);
         assert_eq!(o.relay, "https://relay.example.com/");
+    }
+
+    #[test]
+    fn parse_offer_takes_the_whole_pair_output() {
+        let n = node();
+        // An ASCII QR block (3-byte characters, as `qr_to_ascii` prints), a status line with
+        // braces, the payload, then more lines.
+        let block: String = (0..40).map(|_| "\u{2588}\u{2580}\u{2584} ".repeat(30) + "\n").collect();
+        let text = format!(
+            "{block}\nUse {{the camera}} or paste:\npayload: {}\nwaiting for {{pairing}} ...\nexpires in 5 min\n",
+            offer_json(&n, "build-box", "https://relay.example.com/")
+        );
+        assert!(text.len() > 4096);
+        let o = parse_offer(&text).unwrap();
+        assert_eq!(o.machine, "build-box");
+        assert_eq!(o.node_short, n[..8]);
     }
 
     #[test]

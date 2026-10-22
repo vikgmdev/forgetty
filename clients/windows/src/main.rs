@@ -3,6 +3,7 @@
 //! `--smoke` runs the headless CI gate.
 
 mod chrome;
+mod clipboard;
 mod config;
 mod element;
 mod encoder;

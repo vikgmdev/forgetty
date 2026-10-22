@@ -690,6 +690,72 @@ impl AppShell {
 }
 
 impl AppShell {
+    /// A program asks to set the clipboard and the machine's policy is `ask`. The banner does not
+    /// take the keyboard and does not cover the terminal, only its own corner.
+    fn render_clip_prompt(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let p = self.clip_prompt.as_ref()?;
+        let th = self.theme;
+        let name = self.machine_name(p.machine);
+        let chars = p.text.chars().count();
+        let preview: String = p.text.chars().take(60).map(|c| if c.is_control() { ' ' } else { c }).collect();
+        let button = |id: &'static str, label: &'static str, primary: bool| {
+            div()
+                .id(id)
+                .px(px(12.0))
+                .h(px(28.0))
+                .flex()
+                .items_center()
+                .rounded(px(5.0))
+                .cursor_pointer()
+                .text_size(px(12.5))
+                .border_1()
+                .border_color(alpha(th.border, 1.0))
+                .when(primary, |b| b.bg(alpha(th.accent, 0.25)).border_color(hsla(th.accent)))
+                .hover(move |s| s.bg(alpha(th.hover, 1.0)))
+                .child(label)
+        };
+        Some(
+            div()
+                .absolute()
+                .bottom(px(16.0))
+                .right(px(16.0))
+                .w(px(380.0).min(px(self.viewport.0 - 32.0)))
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .p(px(12.0))
+                .rounded(px(8.0))
+                .border_1()
+                .border_color(alpha(th.border, 1.0))
+                .bg(alpha(blend(th.chrome, th.bg, 0.2), 0.98))
+                .shadow_lg()
+                .text_color(hsla(th.fg))
+                .child(
+                    div().text_size(px(13.0)).child(SharedString::from(format!(
+                        "A program on {name} wants to copy {chars} characters to your clipboard."
+                    ))),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .font_family("Cascadia Mono")
+                        .text_color(hsla(th.dim))
+                        .truncate()
+                        .child(SharedString::from(preview)),
+                )
+                .child(div().text_size(px(12.0)).text_color(hsla(th.dim)).child("Your answer is kept for this machine."))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap(px(8.0))
+                        .justify_end()
+                        .child(button("clip-deny", "Deny", false).on_mouse_down(MouseButton::Left, cx.listener(|s, _e, _w, cx| s.clip_answer(false, cx))))
+                        .child(button("clip-allow", "Allow", true).on_mouse_down(MouseButton::Left, cx.listener(|s, _e, _w, cx| s.clip_answer(true, cx)))),
+                ),
+        )
+    }
+
     /// The pairing dialog: paste, confirm (machine, node id, relay), pair.
     fn render_pair(&self, cx: &mut Context<Self>) -> Option<Div> {
         let d = self.pair.as_ref()?;
@@ -741,7 +807,7 @@ impl AppShell {
                             .border_color(alpha(th.border, 1.0))
                             .text_color(hsla(th.dim))
                             .text_size(px(12.5))
-                            .child("Press Ctrl+V to paste"),
+                            .child("Copy the text and it is picked up here, or press Ctrl+V"),
                     )
                     .child(
                         div()
@@ -850,6 +916,7 @@ impl Render for AppShell {
             .child(body)
             .children(self.render_palette())
             .children(self.render_pair(cx))
+            .children(self.render_clip_prompt(cx))
             .child(
                 canvas(
                     |_, _, _| (),

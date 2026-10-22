@@ -12,6 +12,7 @@ pub mod local;
 pub mod notify;
 pub mod update;
 pub mod osc;
+pub mod osc52;
 pub mod source;
 
 pub use backend::*;

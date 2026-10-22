@@ -165,7 +165,13 @@ pub struct AppShell {
     pub remote: Option<RemoteCtx>,
     pub hooks: Option<crate::winsys::Hooks>,
     pub pair: Option<PairDialog>,
+    /// The clipboard text the pair dialog looked at last (so one text is judged once).
+    pub pair_clip_seen: Option<String>,
     pub toast_limiter: ToastLimiter,
+    /// Per-machine OSC 52 (clipboard write) policy and the prompt that waits for an answer.
+    pub osc52: forgetty_shell_core::osc52::Policies,
+    pub clip_prompt: Option<crate::clipboard::ClipPrompt>,
+    pub clip_stats: crate::clipboard::ClipStats,
     pub toast_log: Vec<ToastRecord>,
     /// "Check for updates": idle until the user asks.
     pub update: crate::update::UpdateState,
@@ -258,12 +264,16 @@ impl AppShell {
             hooks: None,
             pair: None,
             toast_limiter: ToastLimiter::default(),
+            osc52: forgetty_shell_core::osc52::Policies::memory(),
+            clip_prompt: None,
+            clip_stats: Default::default(),
             toast_log: Vec::new(),
             update: crate::update::UpdateState::Idle,
             attach_enabled: true,
             win_handle: window.window_handle(),
             net_pokes: 0,
             pair_hint: None,
+            pair_clip_seen: None,
             switch_to: None,
         };
         let mut shell = shell;
@@ -527,6 +537,8 @@ impl AppShell {
             let label = o.label();
             view.update(cx, |v, cx| v.set_size_owner(Some(label), cx));
         }
+        let machine = self.machine.id;
+        cx.subscribe(&view, move |s, _v, ev: &crate::view::ViewEvent, cx| s.on_view_event(machine, ev, cx)).detach();
         self.views.insert(pane, view);
         self.sync_dirty = true;
         cx.notify();
@@ -904,6 +916,9 @@ impl AppShell {
                 }
             }
             Action::CheckUpdates => self.check_for_updates(cx),
+            Action::ClipboardWriteOff => self.set_active_clip_policy(forgetty_shell_core::osc52::Policy::Off, cx),
+            Action::ClipboardWriteAsk => self.set_active_clip_policy(forgetty_shell_core::osc52::Policy::Ask, cx),
+            Action::ClipboardWriteAllow => self.set_active_clip_policy(forgetty_shell_core::osc52::Policy::Allow, cx),
             Action::RenamePane => self.begin_rename_pane(cx),
             Action::RenameWorkspace => self.begin_rename_workspace(self.layout.active_workspace, cx),
             Action::SplitRight => self.split(SplitDir::Horizontal, cx),

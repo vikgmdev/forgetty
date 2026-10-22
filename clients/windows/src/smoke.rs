@@ -274,6 +274,7 @@ pub struct ShellSmoke {
     last_step: Option<Instant>,
     w3: remote::W3,
     w5: remote::W5,
+    w7: remote::W7,
     real: real::Real,
 }
 
@@ -365,6 +366,7 @@ impl ShellSmoke {
             last_step: None,
             w3: remote::W3::default(),
             w5: remote::W5::default(),
+            w7: remote::W7::default(),
             real: real::Real::new(real_distro),
         }
     }

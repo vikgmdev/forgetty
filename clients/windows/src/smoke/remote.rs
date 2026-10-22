@@ -224,6 +224,20 @@ impl ShellSmoke {
                     shell.pair_submit_text("this is not a payload", cx);
                     check("pair_rejects_garbage", matches!(shell.pair.as_ref().map(|d| &d.stage), Some(PairStage::Failed(_))));
 
+                    // The clipboard watch: the whole output of `forgetty pair` (QR block, payload line,
+                    // status lines) is taken from the clipboard while the dialog waits for text.
+                    if let Some(d) = shell.pair.as_mut() {
+                        d.stage = PairStage::Input;
+                    }
+                    let block: String = (0..30).map(|_| "\u{2588}\u{2580}\u{2584} ".repeat(30) + "\n").collect();
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(format!(
+                        "{block}\nUse {{the camera}} or paste:\npayload: {qr}\nwaiting for pairing...\n"
+                    )));
+                    shell.pair_clip_seen = None;
+                    let more = shell.pair_clipboard_tick(cx);
+                    let taken = matches!(shell.pair.as_ref().map(|d| &d.stage), Some(PairStage::Confirm(o)) if o.machine == "ci-remote");
+                    check("pair_clipboard_watch_takes_pair_output", more && taken);
+
                     // The real payload: parse and show the offer. Nothing is paired yet.
                     shell.pair_hint = addr.parse().ok();
                     shell.pair_submit_text(&format!("Scan the QR code or paste this payload:\n{qr}\n"), cx);
@@ -653,6 +667,28 @@ impl ShellSmoke {
                 if self.sub_t0.elapsed() < Duration::from_millis(1500) {
                     return;
                 }
+                // The Action Center: each toast the shell requested is held there. Windows adds a
+                // toast to the history a moment after `Show`, so wait for it.
+                let want: Vec<(String, String)> = shell.toast_log.iter().map(|r| (r.target.clone(), r.text.title.clone())).collect();
+                let hist = crate::winsys::action_center();
+                let missing: Vec<&(String, String)> = match &hist {
+                    Ok(h) => want.iter().filter(|w| !h.contains(w)).collect(),
+                    Err(_) => want.iter().collect(),
+                };
+                if !missing.is_empty() && self.sub_t0.elapsed() < Duration::from_secs(12) {
+                    return;
+                }
+                record(
+                    "action_center",
+                    json!({
+                        "requested": want.len(),
+                        "in_history": hist.as_ref().map(|h| h.len()).unwrap_or(0),
+                        "missing": missing.len(),
+                        "error": hist.as_ref().err().cloned(),
+                        "titles": hist.as_ref().map(|h| h.iter().map(|x| x.1.clone()).collect::<Vec<_>>()).unwrap_or_default(),
+                    }),
+                );
+                check("toast_reaches_action_center", !want.is_empty() && missing.is_empty());
                 if let Some(h) = &shell.hooks {
                     let st = &h.stats;
                     let (shown, failed) = (st.toasts_shown.load(Ordering::SeqCst), st.toasts_failed.load(Ordering::SeqCst));
@@ -849,6 +885,176 @@ impl ShellSmoke {
     }
 }
 
+/// State of the OSC 52 checks.
+pub struct W7 {
+    /// A machine id of its own, so the checks never touch the policy of a real machine.
+    machine: uuid::Uuid,
+    auto_before: usize,
+    denied_sent: u8,
+}
+
+impl Default for W7 {
+    fn default() -> Self {
+        W7 { machine: uuid::Uuid::new_v4(), auto_before: 0, denied_sent: 0 }
+    }
+}
+
+// ---- W7: OSC 52 --------------------------------------------------------------------------
+
+fn osc52_seq(data: &str) -> Vec<u8> {
+    format!("\x1b]52;c;{data}\x07").into_bytes()
+}
+
+fn clip_text(cx: &mut Context<AppShell>) -> Option<String> {
+    cx.read_from_clipboard().and_then(|i| i.text())
+}
+
+impl ShellSmoke {
+    /// OSC 52 through a pane view: the policy per machine (off, ask, allow), the prompt that keeps
+    /// its answer, no answer to a read, the 1 MiB cap, a paste-style clean and no effect from
+    /// replayed output. Steps 50 to 59 of the W5 view phase; the spy view is the pane.
+    fn w7_clipboard(&mut self, shell: &mut AppShell, cx: &mut Context<AppShell>) {
+        use forgetty_shell_core::osc52::{encode_base64, Policies, Policy, MAX_BYTES};
+        let Some(spy) = self.w5.spy.clone() else { fail("osc52 smoke needs the spy view") };
+        let Some(tx) = self.w5.tx.clone() else { fail("osc52 smoke needs the spy channel") };
+        let m = self.w7.machine;
+        let seen = |cx: &mut Context<AppShell>| spy.read(cx).clip_seen;
+        let send = |ev: PaneEvent| {
+            let _ = tx.try_send(ev);
+        };
+        if self.sub_t0.elapsed() > Duration::from_secs(20) {
+            fail(&format!("osc52 checks stuck at step {}", self.sub));
+        }
+        match self.sub {
+            50 => {
+                let id = m;
+                cx.subscribe(&spy, move |s, _v, ev: &crate::view::ViewEvent, cx| s.on_view_event(id, ev, cx)).detach();
+                check("osc52_default_policy_is_ask", shell.osc52.get(&m.to_string()) == Policy::Ask);
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string("SENTINEL".to_string()));
+                self.w7.auto_before = self.w5.log.lock().unwrap().len();
+                send(PaneEvent::Output(osc52_seq(&encode_base64(b"first"))));
+                self.sub = 51;
+                self.sub_t0 = Instant::now();
+            }
+            // ask: a prompt, nothing copied yet. Allow copies and is remembered.
+            51 => {
+                if seen(cx).writes < 1 {
+                    return;
+                }
+                check("osc52_ask_does_not_copy_before_answer", clip_text(cx).as_deref() == Some("SENTINEL"));
+                check("osc52_ask_shows_prompt", shell.clip_prompt.as_ref().is_some_and(|p| p.machine == m && p.text == "first"));
+                shell.clip_answer(true, cx);
+                check("osc52_allow_copies", clip_text(cx).as_deref() == Some("first"));
+                check("osc52_answer_remembered", shell.osc52.get(&m.to_string()) == Policy::Allow && shell.clip_prompt.is_none());
+                let on_disk = shell.remote.as_ref().map(|r| Policies::open(r.store.dir()).get(&m.to_string()));
+                check("osc52_answer_persisted", on_disk == Some(Policy::Allow));
+                send(PaneEvent::Output(osc52_seq(&encode_base64(b"second"))));
+                self.sub = 52;
+                self.sub_t0 = Instant::now();
+            }
+            // allow: no prompt the second time.
+            52 => {
+                if seen(cx).writes < 2 {
+                    return;
+                }
+                check("osc52_allow_needs_no_prompt", shell.clip_prompt.is_none() && clip_text(cx).as_deref() == Some("second"));
+                shell.set_clip_policy(m, Policy::Off, None, cx);
+                send(PaneEvent::Output(osc52_seq(&encode_base64(b"third"))));
+                self.sub = 53;
+                self.sub_t0 = Instant::now();
+            }
+            // off: dropped.
+            53 => {
+                if seen(cx).writes < 3 {
+                    return;
+                }
+                check("osc52_off_drops", clip_text(cx).as_deref() == Some("second") && shell.clip_prompt.is_none());
+                shell.set_clip_policy(m, Policy::Allow, None, cx);
+                // A read is never answered, and even `allow` does not make it a write.
+                send(PaneEvent::Output(b"\x1b]52;c;?\x1b\\".to_vec()));
+                self.sub = 54;
+                self.sub_t0 = Instant::now();
+            }
+            54 => {
+                if seen(cx).reads_denied < 1 {
+                    return;
+                }
+                // Let any (wrong) reply reach the log before looking.
+                if self.sub_t0.elapsed() < Duration::from_millis(400) {
+                    return;
+                }
+                check("osc52_read_never_answered", self.w5.log.lock().unwrap().len() == self.w7.auto_before && clip_text(cx).as_deref() == Some("second"));
+                // More than 1 MiB is dropped, exactly 1 MiB is not.
+                send(PaneEvent::Output(osc52_seq(&encode_base64(&vec![b'a'; MAX_BYTES + 1]))));
+                self.sub = 55;
+                self.sub_t0 = Instant::now();
+            }
+            55 => {
+                if seen(cx).too_large < 1 {
+                    return;
+                }
+                check("osc52_over_1mib_dropped", clip_text(cx).as_deref() == Some("second"));
+                send(PaneEvent::Output(osc52_seq(&encode_base64(&vec![b'b'; MAX_BYTES]))));
+                self.sub = 56;
+                self.sub_t0 = Instant::now();
+            }
+            56 => {
+                if seen(cx).writes < 4 {
+                    return;
+                }
+                check("osc52_exactly_1mib_copied", clip_text(cx).is_some_and(|t| t.len() == MAX_BYTES));
+                // Sanitized like a paste: escapes and bells go, line breaks stay.
+                send(PaneEvent::Output(osc52_seq(&encode_base64(b"ls\x1b[31m\x07 -la\r\nok\x7f"))));
+                self.sub = 57;
+                self.sub_t0 = Instant::now();
+            }
+            57 => {
+                if seen(cx).writes < 5 {
+                    return;
+                }
+                check("osc52_text_sanitized_like_paste", clip_text(cx).as_deref() == Some("ls[31m -la\r\nok"));
+                // A replay (after a reset) re-runs old output: it must not touch the clipboard.
+                send(PaneEvent::Reset { rows: 10, cols: 40, exact_replay: false });
+                send(PaneEvent::Output(osc52_seq(&encode_base64(b"from a replay"))));
+                self.sub = 58;
+                self.sub_t0 = Instant::now();
+            }
+            58 => {
+                if seen(cx).replayed < 1 {
+                    return;
+                }
+                check("osc52_replay_does_not_copy", clip_text(cx).as_deref() == Some("ls[31m -la\r\nok") && seen(cx).writes == 5);
+                // Back to ask. The replay ends when the channel drains: then output is live again.
+                shell.set_clip_policy(m, Policy::Ask, None, cx);
+                self.sub = 59;
+                self.sub_t0 = Instant::now();
+            }
+            _ => {
+                if self.sub_t0.elapsed() < Duration::from_millis(500) {
+                    return;
+                }
+                if self.w7.denied_sent == 0 {
+                    self.w7.denied_sent = 1;
+                    send(PaneEvent::Output(osc52_seq(&encode_base64(b"deny me"))));
+                    return;
+                }
+                if seen(cx).writes < 6 {
+                    return;
+                }
+                check("osc52_ask_prompts_again_after_reset_to_ask", shell.clip_prompt.as_ref().is_some_and(|p| p.text == "deny me"));
+                shell.clip_answer(false, cx);
+                check("osc52_deny_remembered_as_off", shell.osc52.get(&m.to_string()) == Policy::Off && clip_text(cx).as_deref() == Some("ls[31m -la\r\nok"));
+                let st = shell.clip_stats;
+                record("osc52_stats", json!({"copied": st.copied, "dropped_off": st.dropped_off, "prompted": st.prompted, "too_large": st.too_large, "reads_denied": st.reads_denied}));
+                self.w5.spy = None;
+                self.w5.tx = None;
+                self.sub = 9;
+                self.sub_t0 = Instant::now();
+            }
+        }
+    }
+}
+
 // ---- W5: letterbox, AD-025 flags, replay replies, copy with scrollback ---------------------
 
 impl ShellSmoke {
@@ -1040,11 +1246,11 @@ impl ShellSmoke {
                 check("copy_includes_scrollback", lines.len() == 19 && lines[0] == "L03" && lines[18] == "L21");
                 check("copy_restores_viewport", before == after);
                 check("no_input_dropped", view.read(cx).dropped_input() == 0);
-                self.w5.spy = None;
-                self.w5.tx = None;
-                self.sub = 9;
+                self.sub = 50;
                 self.sub_t0 = Instant::now();
             }
+            // ---- OSC 52 (a program sets the clipboard): write only, per machine ----------------
+            50..=59 => self.w7_clipboard(shell, cx),
             // Real keys through SendInput: does the injection reach the pane at all?
             9 => {
                 let Some(pane) = shell.active_pane() else { return };
