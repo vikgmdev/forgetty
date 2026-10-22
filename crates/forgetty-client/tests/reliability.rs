@@ -572,3 +572,39 @@ async fn reconnect_now_every_100_ms_does_not_abort_a_slow_handshake() {
     h.close().await;
     server.shutdown().await;
 }
+
+/// The wait after a failed bind (500 ms) ends on a reconnect request. The
+/// bind fails at least twice, then `reconnect_now` comes in the middle of a
+/// wait: the client must bind and connect well before the wait would end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reconnect_now_ends_the_wait_after_a_failed_bind() {
+    if common::real_only() {
+        return; // the bind failure is a client test hook
+    }
+    let server =
+        TestServer::start(TestServerConfig { own_runtime: true, ..Default::default() }).await;
+    let h = connect_to(server.addr()).await;
+    h.blackhole_endpoint_for_tests();
+    h.fail_binds_for_tests(u32::MAX);
+    h.network_changed().await;
+    // The fallback (1.5 s) starts the replace, which fails and waits 500 ms.
+    let t0 = Instant::now();
+    while h.injected_bind_failures_for_tests() < 2 {
+        assert!(t0.elapsed() < Duration::from_secs(8), "the bind never failed twice");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    // A failure just happened, so the client is at the start of a wait.
+    h.fail_binds_for_tests(0);
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let t1 = Instant::now();
+    h.reconnect_now();
+    while !h.state().is_connected() {
+        assert!(t1.elapsed() < Duration::from_secs(3), "not connected, state {:?}", h.state());
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    let took = t1.elapsed();
+    println!("reconnect_now during the bind wait: Connected after {took:?}");
+    assert!(took < Duration::from_millis(300), "the 500 ms wait was not cut: {took:?}");
+    h.close().await;
+    server.shutdown().await;
+}

@@ -16,7 +16,7 @@
 //! offsets afterwards.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -396,6 +396,9 @@ pub(crate) struct Shared {
     connected_count: AtomicU64,
     /// Test hook: dials on the endpoint of this bind number never connect.
     stuck_gen: AtomicU64,
+    /// Test hook: the next this many binds fail, and how many did.
+    fail_binds: AtomicU32,
+    injected_bind_failures: AtomicU32,
     server: EndpointAddr,
     info: ClientInfo,
     opts: ClientOptions,
@@ -505,6 +508,8 @@ impl Client {
             clones_at_bind: AtomicUsize::new(usize::MAX),
             connected_count: AtomicU64::new(0),
             stuck_gen: AtomicU64::new(u64::MAX),
+            fail_binds: AtomicU32::new(0),
+            injected_bind_failures: AtomicU32::new(0),
             server,
             info,
             opts,
@@ -615,6 +620,11 @@ impl Shared {
                 warn!("client: {left} clones of the old endpoint are still alive, binding anyway");
             }
             self.clones_at_bind.store(left, Ordering::SeqCst);
+        }
+        if self.fail_binds.load(Ordering::SeqCst) > 0 {
+            self.fail_binds.fetch_sub(1, Ordering::SeqCst);
+            self.injected_bind_failures.fetch_add(1, Ordering::SeqCst);
+            return Err("test: bind refused".into());
         }
         let ep = bind_endpoint(&self.opts, &self.server, self.identity.clone()).await?;
         let now = self.live_eps.fetch_add(1, Ordering::SeqCst) + 1;
@@ -929,6 +939,18 @@ impl ClientHandle {
         self.shared().clones_at_bind.load(Ordering::SeqCst)
     }
 
+    /// Test hook: the next `n` endpoint binds fail.
+    #[doc(hidden)]
+    pub fn fail_binds_for_tests(&self, n: u32) {
+        self.shared().fail_binds.store(n, Ordering::SeqCst);
+    }
+
+    /// Test hook: how many binds `fail_binds_for_tests` made fail so far.
+    #[doc(hidden)]
+    pub fn injected_bind_failures_for_tests(&self) -> u32 {
+        self.shared().injected_bind_failures.load(Ordering::SeqCst)
+    }
+
     /// Test hook: the socket of the current endpoint went away. The current
     /// connection ends and no dial on this endpoint connects again.
     #[doc(hidden)]
@@ -1194,6 +1216,15 @@ fn backoff(failures: usize) -> Duration {
     Duration::from_millis(RECONNECT_BACKOFF_MS[failures.min(RECONNECT_BACKOFF_MS.len() - 1)])
 }
 
+/// Take a stored `notify_one` permit, if there is one.
+async fn drain_permit(n: &Notify) {
+    tokio::select! {
+        biased;
+        () = n.notified() => {}
+        () = std::future::ready(()) => {}
+    }
+}
+
 async fn supervise(shared: Arc<Shared>) {
     let mut shutdown = shared.shutdown_tx.subscribe();
     let mut failures = 0usize;
@@ -1228,6 +1259,8 @@ async fn supervise(shared: Arc<Shared>) {
                     tokio::select! {
                         () = tokio::time::sleep(wait) => {}
                         _ = shutdown.changed() => {}
+                        // A reconnect request ends the wait.
+                        _ = shared.wake_backoff.notified() => {}
                     }
                     continue;
                 }
@@ -1263,6 +1296,9 @@ async fn supervise(shared: Arc<Shared>) {
                 let started = Instant::now();
                 shared.connected_count.fetch_add(1, Ordering::SeqCst);
                 shared.replace_for.store(u64::MAX, Ordering::SeqCst);
+                // A `reconnect_now` that came during the dial left a permit:
+                // it must not skip the next backoff.
+                drain_permit(&shared.wake_backoff).await;
                 let (end, resumed) = run_session(&shared, est, &mut shutdown).await;
                 match end {
                     SessionEnd::Shutdown => break,
@@ -2051,6 +2087,18 @@ fn is_superseded(e: &forgetty_proto::FrameError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_stored_wake_permit_is_drained() {
+        let n = Notify::new();
+        n.notify_one();
+        drain_permit(&n).await;
+        let woke = tokio::time::timeout(Duration::from_millis(30), n.notified()).await;
+        assert!(woke.is_err(), "the permit survived the drain");
+        // With no permit the drain returns at once and does not store one.
+        drain_permit(&n).await;
+        assert!(tokio::time::timeout(Duration::from_millis(30), n.notified()).await.is_err());
+    }
 
     #[test]
     fn input_is_cut_only_at_character_and_escape_boundaries() {
