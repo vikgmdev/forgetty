@@ -105,3 +105,19 @@ async fn api_list_describe_and_set_label_over_v2() {
     h.close().await;
     server.shutdown().await;
 }
+
+/// The watchdog and the freeze helper signal a pid only while it is our child,
+/// so a reused pid (the live server's, say) is never hit.
+#[test]
+fn signals_reach_only_children_of_this_process() {
+    let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+    let pid = child.id() as i32;
+    assert!(common::is_my_child(pid));
+    assert!(!common::is_my_child(1), "init is not our child");
+    assert!(!common::is_my_child(std::process::id() as i32), "we are not our own child");
+    assert!(!common::is_my_child(i32::MAX), "no such process");
+    child.kill().unwrap();
+    child.wait().unwrap();
+    // Reaped: the pid is free, and a reused one would not be ours either.
+    assert!(!common::is_my_child(pid));
+}

@@ -2167,12 +2167,18 @@ impl Session {
                                 let job = tokio::task::spawn_blocking(move || {
                                     s2.run_claimed_sync(p.pane_id)
                                 });
-                                if tokio::time::timeout(DETACH_ANSWER_BOUND, job).await.is_err() {
-                                    warn!(
+                                match tokio::time::timeout(DETACH_ANSWER_BOUND, job).await {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(e)) => warn!(
+                                        "rpc2: the size sync of detach_pane {} of client {} \
+                                         failed: {e}",
+                                        p.pane_id, s.client_id
+                                    ),
+                                    Err(_) => warn!(
                                         "rpc2: detach_pane {} of client {} answered before the \
                                          size policy was updated (a lock is busy)",
                                         p.pane_id, s.client_id
-                                    );
+                                    ),
                                 }
                             }
                             to_value(&OkResult { ok: true }).map_err(bad)

@@ -917,22 +917,31 @@ async fn a_hostile_node_does_not_starve_an_honest_nodes_catch_up() {
         (0..8).map(|_| server.add_script_pane("exec yes 0123456789abcdef")).collect();
     let (hostile_panes, honest_panes) = busy.split_at(4);
     let endpoint = raw_endpoint(&server).await;
-    // A fresh attach gets a snapshot only when the pane's log is more than half
-    // the ring ahead of its start. Wait for that on every busy pane, however
-    // slow `yes` runs on a loaded host, instead of assuming that 2 s are enough.
+    // A fresh attach starts at the first offset of the log and gets a snapshot
+    // when the log is more than half the ring ahead of it (the server's
+    // `lag_limit`). The ring is 8 MiB by default (`byte_log_ring_kb` 8192), so
+    // the limit is 4 MiB. The log file is capped at 10 MiB (`byte_log_max_mb`)
+    // and rotates down to 5 MiB, so `total - first` stays between 5 and 10 MiB
+    // once it has grown that far: 4.5 MiB is reached and never lost again.
+    // Wait for it on every busy pane, however slow `yes` runs on a loaded host,
+    // instead of assuming that 2 s are enough.
+    const RING: u64 = 8 * 1024 * 1024;
+    const FILL: u64 = RING / 2 + 512 * 1024;
     let t_fill = Instant::now();
     loop {
-        let short = busy.iter().filter(|p| {
-            let (first, total) = server.log_bounds(**p);
-            total.saturating_sub(first) < 6 * 1024 * 1024
-        });
-        let short = short.count();
+        let short = busy
+            .iter()
+            .filter(|p| {
+                let (first, total) = server.log_bounds(**p);
+                total.saturating_sub(first) < FILL
+            })
+            .count();
         if short == 0 {
             break;
         }
         assert!(
             t_fill.elapsed() < Duration::from_secs(60),
-            "{short} busy panes had under 6 MiB of output after 60 s"
+            "{short} busy panes had under {FILL} bytes of log after 60 s"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }

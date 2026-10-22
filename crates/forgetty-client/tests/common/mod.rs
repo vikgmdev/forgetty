@@ -73,6 +73,26 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// `true` if `pid` is a live child of this process: its parent in
+/// `/proc/<pid>/stat` is us. A pid that was reused by another process is not,
+/// so no signal of this file can reach a process it did not spawn.
+pub fn is_my_child(pid: i32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else { return false };
+    // "pid (comm) S ppid ...": the fields follow the last ')'.
+    let ppid = stat.rsplit(')').next().and_then(|r| r.split_whitespace().nth(1));
+    ppid.and_then(|p| p.parse::<u32>().ok()) == Some(std::process::id())
+}
+
+/// SIGKILL/SIGCONT-style signal to a server child, only if it still is one.
+fn signal_my_child(pid: i32, sig: i32) {
+    if is_my_child(pid) {
+        // SAFETY: plain signal to a process that is our child.
+        unsafe { libc::kill(pid, sig) };
+    } else {
+        raw_stderr(&format!("not signalling {pid}: it is not a child of this process\n"));
+    }
+}
+
 /// Write to fd 2 directly. The test harness captures `eprintln!` of threads
 /// a test spawned, and this message must not be lost.
 fn raw_stderr(msg: &str) {
@@ -158,8 +178,7 @@ fn arm_watchdog() {
                     tail.len(),
                     tail.into_iter().rev().collect::<Vec<_>>().join("\n")
                 ));
-                // SAFETY: plain signal to a child this process spawned.
-                unsafe { libc::kill(*pid, libc::SIGKILL) };
+                signal_my_child(*pid, libc::SIGKILL);
             }
             std::process::exit(124);
         });
@@ -451,8 +470,7 @@ impl Real {
 
     /// SIGTERM, then wait for the process to exit (SIGKILL after 15 s).
     async fn terminate(&self) {
-        // SAFETY: plain signal to a child we spawned.
-        unsafe { libc::kill(self.pid, libc::SIGTERM) };
+        signal_my_child(self.pid, libc::SIGTERM);
         let t0 = std::time::Instant::now();
         loop {
             {
@@ -968,8 +986,7 @@ impl TestServer {
             Inner::Mock { server, .. } => server.freeze(duration),
             Inner::Real(r) => {
                 let pid = r.pid;
-                // SAFETY: plain signals to a child we spawned.
-                unsafe { libc::kill(pid, libc::SIGSTOP) };
+                signal_my_child(pid, libc::SIGSTOP);
                 // `kill` returns when the signal is queued, not when the
                 // process has stopped: on a busy host a Ping can still be
                 // answered meanwhile. Return when every thread is stopped.
@@ -989,14 +1006,15 @@ impl TestServer {
                     if t0.elapsed() > Duration::from_secs(5) {
                         // Do not leave the server stopped, and do not run a
                         // freeze test against a server that never froze.
-                        unsafe { libc::kill(pid, libc::SIGCONT) };
+                        signal_my_child(pid, libc::SIGCONT);
                         panic!("server {pid} did not stop within 5 s of SIGSTOP");
                     }
                     std::thread::sleep(Duration::from_micros(200));
                 }
                 std::thread::spawn(move || {
                     std::thread::sleep(duration);
-                    unsafe { libc::kill(pid, libc::SIGCONT) };
+                    // The server may be gone by now and its pid reused.
+                    signal_my_child(pid, libc::SIGCONT);
                 });
             }
         }

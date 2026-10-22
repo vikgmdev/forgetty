@@ -105,7 +105,8 @@ pub fn isolate_state_for_tests() -> PathBuf {
 const TEST_ROOT_PREFIX: &str = "ft-";
 
 /// File that marks a directory as a test root. Only directories that hold it
-/// are ever removed as stale.
+/// are ever removed as stale. It holds the start time of the owning process
+/// (field 22 of `/proc/<pid>/stat`), so a reused pid is told from the owner.
 const TEST_ROOT_MARKER: &str = ".forgetty-test-root";
 
 fn test_root() -> PathBuf {
@@ -115,10 +116,20 @@ fn test_root() -> PathBuf {
             remove_stale_test_roots(&tmp);
             let root = tmp.join(format!("{TEST_ROOT_PREFIX}{}", std::process::id()));
             let _ = std::fs::create_dir_all(&root);
-            let _ = std::fs::write(root.join(TEST_ROOT_MARKER), b"");
+            let started = process_start_time(std::process::id()).unwrap_or_default();
+            let _ = std::fs::write(root.join(TEST_ROOT_MARKER), started.to_string());
             root
         })
         .clone()
+}
+
+/// Start time of process `pid` in clock ticks since boot (field 22 of
+/// `/proc/<pid>/stat`). `None` when `/proc` has no such process.
+fn process_start_time(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // "pid (comm) state ppid ...": the fields follow the last ')', and field 22
+    // is the 20th of them (the state is field 3).
+    stat.rsplit(')').next()?.split_whitespace().nth(19)?.parse().ok()
 }
 
 /// Resolve symlinks in the longest existing ancestor of `p` and put the rest
@@ -149,6 +160,7 @@ fn live_dirs() -> Vec<PathBuf> {
         dirs::config_dir(),
         dirs::runtime_dir(),
         dirs::data_local_dir(),
+        dirs::cache_dir(),
     ]
     .into_iter()
     .flatten()
@@ -191,9 +203,11 @@ pub fn isolate_if_test_process() {
     }
 }
 
-/// Remove `ft-<pid>` test roots whose process is gone. A directory counts
-/// only if it holds the test-root marker. Where `/proc` does not exist the
-/// pid cannot be checked, so only roots whose mtime is older than 24 hours go.
+/// Remove `ft-<pid>` test roots whose owner is gone. A directory counts only
+/// if it holds the test-root marker. With `/proc`, the owner is gone when the
+/// pid is dead, or alive with another start time than the marker records (the
+/// pid was reused). A marker without a start time keeps a live pid's root.
+/// Without `/proc` only roots whose mtime is older than 24 hours go.
 fn remove_stale_test_roots(tmp: &std::path::Path) {
     let has_proc = std::path::Path::new("/proc/self").exists();
     let Ok(entries) = std::fs::read_dir(tmp) else { return };
@@ -202,11 +216,15 @@ fn remove_stale_test_roots(tmp: &std::path::Path) {
         let Some(pid) = name.to_str().and_then(|n| n.strip_prefix(TEST_ROOT_PREFIX)) else {
             continue;
         };
-        if pid.parse::<u32>().is_err() || !e.path().join(TEST_ROOT_MARKER).exists() {
+        let Ok(pid) = pid.parse::<u32>() else { continue };
+        let Ok(marker) = std::fs::read_to_string(e.path().join(TEST_ROOT_MARKER)) else {
             continue;
-        }
+        };
         let stale = if has_proc {
-            !std::path::Path::new(&format!("/proc/{pid}")).exists()
+            match process_start_time(pid) {
+                None => true,
+                Some(now) => marker.trim().parse::<u64>().is_ok_and(|then| then != now),
+            }
         } else {
             e.metadata()
                 .and_then(|m| m.modified())
@@ -417,21 +435,34 @@ mod tests {
     }
 
     #[test]
-    fn only_a_marked_dead_root_is_removed_as_stale() {
+    fn only_a_root_whose_owner_is_gone_is_removed_as_stale() {
         let tmp = tempfile::tempdir().unwrap();
-        // pid 4294967 is not running; the first has the marker, the second does not.
-        let marked = tmp.path().join(format!("{TEST_ROOT_PREFIX}4294967"));
-        let plain = tmp.path().join(format!("{TEST_ROOT_PREFIX}4294966"));
-        let alive = tmp.path().join(format!("{TEST_ROOT_PREFIX}{}", std::process::id()));
-        for d in [&marked, &plain, &alive] {
-            std::fs::create_dir_all(d).unwrap();
-        }
-        for d in [&marked, &alive] {
-            std::fs::write(d.join(TEST_ROOT_MARKER), b"").unwrap();
-        }
+        let me = std::process::id();
+        let my_start = process_start_time(me).expect("this process has a start time");
+        let root = |pid: u32| tmp.path().join(format!("{TEST_ROOT_PREFIX}{pid}"));
+        let make = |pid: u32, marker: Option<String>| {
+            std::fs::create_dir_all(root(pid)).unwrap();
+            if let Some(m) = marker {
+                std::fs::write(root(pid).join(TEST_ROOT_MARKER), m).unwrap();
+            }
+        };
+        // pid 4294967 is not running.
+        make(4294967, Some("123".into())); // dead owner: removed
+        make(4294966, None); // no marker: never removed
+        make(me, Some(my_start.to_string())); // the live owner: kept
+        // Alive pid with another start time (a reused pid): removed. Use pid 1.
+        make(1, Some((process_start_time(1).unwrap() + 1).to_string()));
         remove_stale_test_roots(tmp.path());
-        assert!(!marked.exists());
-        assert!(plain.exists(), "a directory without the marker is never removed");
-        assert!(alive.exists());
+        assert!(!root(4294967).exists());
+        assert!(root(4294966).exists(), "a directory without the marker is never removed");
+        assert!(root(me).exists(), "the live owner keeps its root");
+        assert!(!root(1).exists(), "a reused pid does not keep the root");
+    }
+
+    #[test]
+    fn the_live_dirs_include_the_cache_dir() {
+        if let Some(cache) = dirs::cache_dir() {
+            assert!(live_dirs().contains(&cache));
+        }
     }
 }
