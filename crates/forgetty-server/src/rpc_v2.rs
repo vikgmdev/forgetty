@@ -415,6 +415,7 @@ impl RpcV2 {
             }
         });
         tokio::spawn(event_pump(rpc.clone()));
+        tokio::spawn(input_watchdog(rpc.sm.clone()));
         let saver = rpc.clone();
         forgetty_socket::add_shutdown_hook(Box::new(move || saver.save_inputs()));
         rpc
@@ -441,11 +442,16 @@ impl RpcV2 {
         // than the limit.
         self.inputs_frozen.store(true, Ordering::SeqCst);
         let undrained = self.sm.close_input_queues_and_drain(INPUT_DRAIN_LIMIT);
-        if undrained > 0 {
+        if !undrained.is_empty() {
             // What stays in those queues was acked and is lost: input never
             // crosses a restart (a client that sees the new `boot_id` drops
             // what it holds), and the programs it was for are gone.
-            warn!("rpc2: {undrained} pane input queue(s) did not drain in {INPUT_DRAIN_LIMIT:?}");
+            let detail: Vec<String> = undrained.iter().map(|r| r.to_string()).collect();
+            warn!(
+                "rpc2: {} pane input queue(s) did not drain in {INPUT_DRAIN_LIMIT:?}: {}",
+                undrained.len(),
+                detail.join("; ")
+            );
         }
         let entries: Vec<serde_json::Value> = lock(&self.inputs)
             .iter()
@@ -2083,6 +2089,29 @@ impl StreamEnd {
 /// starts with a VT snapshot of the screen, then continues live. Without the
 /// capability the old rule stands: bytes come from the ring or the disk file,
 /// and a reader behind everything is reset with `LOG_LOST`.
+/// How often the input watchdog looks at the panes.
+const INPUT_WATCH_TICK: Duration = Duration::from_millis(500);
+
+/// Logs a pane whose input queue stands still (see `forgetty_session::input_watch`).
+async fn input_watchdog(sm: Arc<SessionManager>) {
+    use forgetty_session::input_watch::{InputWatchdog, WatchEvent};
+    let mut dog = InputWatchdog::default();
+    let mut tick = tokio::time::interval(INPUT_WATCH_TICK);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        let reports = sm.input_reports();
+        for event in dog.tick(std::time::Instant::now(), &reports) {
+            match event {
+                WatchEvent::Stalled(r) => warn!("rpc2: pane input stalled: {r}"),
+                WatchEvent::Cleared { pane_id, stalled_for } => {
+                    info!("rpc2: pane input moves again: pane {pane_id} after {stalled_for:?}");
+                }
+            }
+        }
+    }
+}
+
 async fn pane_stream(
     rpc: Arc<RpcV2>,
     conn: Connection,

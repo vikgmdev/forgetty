@@ -62,6 +62,25 @@ fn handle(
                     }))
                 })
                 .collect();
+            let input: Vec<Value> = sm
+                .input_reports()
+                .into_iter()
+                .map(|r| {
+                    json!({
+                        "pane_id": r.pane_id.0.to_string(),
+                        "queued_bytes": r.writer.queued_bytes,
+                        "frames": r.writer.frames,
+                        "in_write_ms": r.writer.in_write.map(|d| d.as_millis() as u64),
+                        "since_progress_ms": r.writer.since_progress.as_millis() as u64,
+                        "writer_exited": r.writer.exited,
+                        "writer_state": r.writer.writer_state(),
+                        "stalled": r.stalled(),
+                        "reader": r.reader.to_string(),
+                        "child_pid": r.child_pid,
+                        "child_alive": r.child_alive,
+                    })
+                })
+                .collect();
             let attaches: Vec<Value> = rpc
                 .qa
                 .attaches
@@ -95,6 +114,7 @@ fn handle(
                 "handshake_failures": sync.handshake_failures(),
                 "attaches": attaches,
                 "panes": panes,
+                "pane_input": input,
             }))
         }
         "qa_drop_connections" => {

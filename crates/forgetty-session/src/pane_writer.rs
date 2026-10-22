@@ -86,13 +86,69 @@ struct Shared {
     generation: AtomicU64,
     /// The writer thread has returned.
     exited: AtomicBool,
+    /// Clock for the two stamps below (milliseconds since this instant).
+    base: Instant,
+    /// When the write under way began, `IDLE` while the thread is not
+    /// inside a job.
+    write_since_ms: AtomicU64,
+    /// Last sign of life: bytes taken by the PTY, a job finished, or the
+    /// queue went from empty to not empty.
+    progress_ms: AtomicU64,
     /// The writer thread, while it runs, so a pane that closes can interrupt a
     /// write that is blocked on a program that never reads.
     #[cfg(unix)]
     thread: Mutex<Option<libc::pthread_t>>,
 }
 
+/// `Shared::write_since_ms` while no write is under way.
+const IDLE: u64 = u64::MAX;
+
+/// What a pane's input queue and writer thread are doing (watchdog, `qa_state`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriterStats {
+    /// Bytes queued, the write under way included.
+    pub queued_bytes: usize,
+    /// Frames queued, the write under way included.
+    pub frames: usize,
+    /// How long the thread has been inside `write()` for the current job.
+    /// `None`: it is not writing.
+    pub in_write: Option<Duration>,
+    /// Time since the PTY last took bytes, a job ended, or the queue got its
+    /// first frame.
+    pub since_progress: Duration,
+    /// The writer thread has returned.
+    pub exited: bool,
+}
+
+impl WriterStats {
+    /// Bytes wait and nothing moved for `limit`.
+    pub fn stalled(&self, limit: Duration) -> bool {
+        self.queued_bytes > 0 && self.since_progress >= limit
+    }
+
+    /// The writer, in words.
+    pub fn writer_state(&self) -> String {
+        if self.exited {
+            "writer thread exited".to_string()
+        } else if let Some(d) = self.in_write {
+            format!("writer blocked in write() for {:.1} s", d.as_secs_f64())
+        } else if self.queued_bytes > 0 {
+            "writer idle with the queue not empty (wakeup bug)".to_string()
+        } else {
+            "writer idle".to_string()
+        }
+    }
+}
+
 impl Shared {
+    fn now_ms(&self) -> u64 {
+        self.base.elapsed().as_millis() as u64
+    }
+
+    fn touch(&self) {
+        self.progress_ms.store(self.now_ms(), Ordering::SeqCst);
+    }
+
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -104,6 +160,9 @@ impl Shared {
         }
         if st.bytes > 0 && st.bytes + job.data.len() > INPUT_QUEUE_BYTES {
             return Err((QueueError::Full, job));
+        }
+        if st.bytes == 0 {
+            self.touch();
         }
         st.bytes += job.data.len();
         st.queue.push_back(job);
@@ -134,6 +193,7 @@ fn write_job(
     abort: &AtomicBool,
     generation: &AtomicU64,
     started_at: u64,
+    progress: &dyn Fn(),
 ) -> Result<(), String> {
     let mut off = 0;
     while off < data.len() {
@@ -144,7 +204,10 @@ fn write_job(
         }
         match out.write(&data[off..]) {
             Ok(0) => return Err("write returned 0".to_string()),
-            Ok(n) => off += n,
+            Ok(n) => {
+                off += n;
+                progress();
+            }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
                 if abort.load(Ordering::SeqCst) {
                     return Err("pane closed".to_string());
@@ -211,6 +274,9 @@ impl PaneWriterOwner {
             abort: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             exited: AtomicBool::new(false),
+            base: Instant::now(),
+            write_since_ms: AtomicU64::new(IDLE),
+            progress_ms: AtomicU64::new(0),
             #[cfg(unix)]
             thread: Mutex::new(None),
         });
@@ -242,7 +308,17 @@ impl PaneWriterOwner {
                 // does not read; nothing else waits on it. A pane that closes
                 // interrupts it (see `PaneWriterOwner::drop`).
                 let started_at = s.generation.load(Ordering::SeqCst);
-                let res = write_job(&mut *out, &job.data, &s.abort, &s.generation, started_at);
+                s.write_since_ms.store(s.now_ms(), Ordering::SeqCst);
+                let res = write_job(
+                    &mut *out,
+                    &job.data,
+                    &s.abort,
+                    &s.generation,
+                    started_at,
+                    &|| s.touch(),
+                );
+                s.write_since_ms.store(IDLE, Ordering::SeqCst);
+                s.touch();
                 let failed = res.is_err();
                 let mut ended = Vec::new();
                 {
@@ -372,6 +448,9 @@ impl PaneWriter {
                 return Err(QueueError::Closed);
             }
             if st.bytes == 0 || st.bytes + job.data.len() <= INPUT_QUEUE_BYTES {
+                if st.bytes == 0 {
+                    self.shared.touch();
+                }
                 st.bytes += job.data.len();
                 st.queue.push_back(job);
                 drop(st);
@@ -475,6 +554,27 @@ impl PaneWriter {
         }
     }
 
+    /// What the queue and the writer thread are doing.
+    pub fn stats(&self) -> WriterStats {
+        let (queued_bytes, frames) = {
+            let st = self.shared.lock();
+            (st.bytes, st.queue.len())
+        };
+        let now = self.shared.now_ms();
+        let since = self.shared.write_since_ms.load(Ordering::SeqCst);
+        let writing = since != IDLE;
+        WriterStats {
+            queued_bytes,
+            // The job in the thread is not in `queue` any more.
+            frames: frames + usize::from(writing),
+            in_write: writing.then(|| Duration::from_millis(now.saturating_sub(since))),
+            since_progress: Duration::from_millis(
+                now.saturating_sub(self.shared.progress_ms.load(Ordering::SeqCst)),
+            ),
+            exited: self.shared.exited.load(Ordering::SeqCst),
+        }
+    }
+
     /// Bytes waiting in the queue (test and QA hook).
     pub fn queued_bytes(&self) -> usize {
         self.shared.lock().bytes
@@ -546,6 +646,31 @@ mod tests {
         assert_eq!(&got[got.len() - 5..], &[4; 5]);
         drop(owner);
         assert_eq!(w.try_queue(vec![0]), Err(QueueError::Closed));
+    }
+
+    #[tokio::test]
+    async fn stats_say_where_the_bytes_wait() {
+        let open = Arc::new(AtomicBool::new(false));
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let owner = PaneWriterOwner::spawn(Box::new(Gate { open: open.clone(), out })).unwrap();
+        let w = owner.handle();
+        let idle = w.stats();
+        assert_eq!((idle.queued_bytes, idle.frames, idle.in_write), (0, 0, None));
+        assert!(!idle.stalled(Duration::ZERO), "an empty queue is never stalled");
+        w.try_queue(vec![1; 10]).unwrap();
+        w.try_queue(vec![2; 20]).unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let blocked = w.stats();
+        assert_eq!((blocked.queued_bytes, blocked.frames), (30, 2));
+        assert!(blocked.in_write.is_some_and(|d| d >= Duration::from_millis(50)), "{blocked:?}");
+        assert!(blocked.since_progress >= Duration::from_millis(50));
+        assert!(blocked.stalled(Duration::from_millis(50)));
+        assert!(blocked.writer_state().contains("blocked in write()"));
+        open.store(true, Ordering::SeqCst);
+        assert!(w.wait_idle(Duration::from_secs(5)));
+        let done = w.stats();
+        assert_eq!((done.queued_bytes, done.frames, done.in_write), (0, 0, None));
+        assert!(!done.stalled(Duration::ZERO));
     }
 
     #[tokio::test]

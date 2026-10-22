@@ -90,6 +90,29 @@ pub struct DiskState {
     pub flushed_to: u64,
 }
 
+/// What a pane's PTY reader task is doing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReaderState {
+    /// Reading the PTY (or waiting for the program to write).
+    Reading,
+    /// Stopped in `wait_room` for this long: the disk appender is behind.
+    WaitingForRoom(std::time::Duration),
+    /// The task has ended.
+    Exited,
+}
+
+impl std::fmt::Display for ReaderState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReaderState::Reading => write!(f, "reading"),
+            ReaderState::WaitingForRoom(d) => {
+                write!(f, "waiting in wait_room for {:.1} s", d.as_secs_f64())
+            }
+            ReaderState::Exited => write!(f, "exited"),
+        }
+    }
+}
+
 /// State shared between the log, its disk appender and the stream readers.
 pub struct LogShared {
     /// Path of the log file.
@@ -105,6 +128,13 @@ pub struct LogShared {
     queued: AtomicU64,
     /// Woken when the appender took a chunk off the queue.
     room: Notify,
+    /// Clock for `room_wait_since_ms`.
+    reader_base: std::time::Instant,
+    /// When the PTY reader began waiting in `wait_room`, `u64::MAX` while it
+    /// does not wait.
+    room_wait_since_ms: AtomicU64,
+    /// The PTY reader task has ended.
+    reader_exited: AtomicBool,
     /// Set when the `ByteLog` is dropped (the pane is gone).
     closed: AtomicBool,
     /// Set when the server is stopping: a disk write that keeps failing is
@@ -161,9 +191,36 @@ impl LogShared {
                 || !self.disk_enabled
                 || self.queued.load(Ordering::Acquire) < DISK_HIGH_WATER
             {
+                self.room_wait_since_ms.store(u64::MAX, Ordering::SeqCst);
                 return;
             }
+            if self.room_wait_since_ms.load(Ordering::SeqCst) == u64::MAX {
+                let now = self.reader_base.elapsed().as_millis() as u64;
+                self.room_wait_since_ms.store(now, Ordering::SeqCst);
+            }
             room.await;
+        }
+    }
+
+    /// The PTY reader task has ended (EOF, pane gone).
+    pub fn mark_reader_exited(&self) {
+        self.reader_exited.store(true, Ordering::SeqCst);
+        self.room_wait_since_ms.store(u64::MAX, Ordering::SeqCst);
+    }
+
+    /// What the PTY reader task is doing.
+    pub fn reader_state(&self) -> ReaderState {
+        if self.reader_exited.load(Ordering::SeqCst) {
+            return ReaderState::Exited;
+        }
+        match self.room_wait_since_ms.load(Ordering::SeqCst) {
+            u64::MAX => ReaderState::Reading,
+            since => {
+                let now = self.reader_base.elapsed().as_millis() as u64;
+                ReaderState::WaitingForRoom(std::time::Duration::from_millis(
+                    now.saturating_sub(since),
+                ))
+            }
         }
     }
 
@@ -386,6 +443,9 @@ impl ByteLog {
             disk_progress: Notify::new(),
             queued: AtomicU64::new(0),
             room: Notify::new(),
+            reader_base: std::time::Instant::now(),
+            room_wait_since_ms: AtomicU64::new(u64::MAX),
+            reader_exited: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
             total: AtomicU64::new(total_bytes_written),

@@ -1913,26 +1913,54 @@ impl SessionManager {
         self.pane_writer(id).map(|w| w.queued_bytes())
     }
 
+    /// What every pane's input queue, writer thread, PTY reader and child
+    /// are doing. Panes with an empty queue are included.
+    pub fn input_reports(&self) -> Vec<crate::input_watch::InputReport> {
+        let mut out = Vec::new();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let inner = &mut *inner;
+        for (id, pane) in inner.panes.iter_mut() {
+            let reader = inner
+                .byte_logs
+                .get(id)
+                .map_or(crate::byte_log::ReaderState::Reading, |l| l.shared().reader_state());
+            out.push(crate::input_watch::InputReport {
+                pane_id: *id,
+                writer: pane.pty_bridge.writer.handle().stats(),
+                reader,
+                child_pid: pane.pty_bridge.pty.pid(),
+                child_alive: pane.pty_bridge.pty.is_alive(),
+            });
+        }
+        out
+    }
+
     /// Close every pane's input queue and wait up to `timeout` in all for what
-    /// is queued to be written (graceful stop, AD-024). Returns the number of
-    /// panes whose queue did not drain.
-    pub fn close_input_queues_and_drain(&self, timeout: std::time::Duration) -> usize {
+    /// is queued to be written (graceful stop, AD-024). Returns a report for
+    /// each pane whose queue did not drain.
+    pub fn close_input_queues_and_drain(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Vec<crate::input_watch::InputReport> {
         let writers: Vec<_> = {
             let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            inner.panes.values().map(|p| p.pty_bridge.writer.handle()).collect()
+            inner.panes.iter().map(|(id, p)| (*id, p.pty_bridge.writer.handle())).collect()
         };
         let deadline = std::time::Instant::now() + timeout;
-        let mut left = 0;
+        let mut left = Vec::new();
         // Close all first, so none takes new input while the others drain.
-        for w in &writers {
+        for (_, w) in &writers {
             w.close();
         }
-        for w in &writers {
+        for (id, w) in &writers {
             if !w.close_and_drain(deadline) {
-                left += 1;
+                left.push(*id);
             }
         }
-        left
+        if left.is_empty() {
+            return Vec::new();
+        }
+        self.input_reports().into_iter().filter(|r| left.contains(&r.pane_id)).collect()
     }
 
     /// Resize a pane's PTY to new dimensions.
@@ -2193,10 +2221,16 @@ impl SessionManager {
                     let Some(bytes) = rx.recv().await else { break };
                     if let Ok(result) = sm.process_pane_bytes(pane_id, &bytes) {
                         if result.pty_exited {
+                            if let Some(shared) = &shared {
+                                shared.mark_reader_exited();
+                            }
                             sm.finish_pane(pane_id).await;
                             return;
                         }
                     }
+                }
+                if let Some(shared) = &shared {
+                    shared.mark_reader_exited();
                 }
                 sm.finish_pane(pane_id).await;
             });

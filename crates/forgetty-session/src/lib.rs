@@ -27,6 +27,7 @@ pub mod capture;
 pub mod clients;
 pub mod drain_result;
 pub mod events;
+pub mod input_watch;
 pub mod layout;
 pub mod manager;
 pub mod osc;
@@ -40,7 +41,7 @@ pub mod vt_gate;
 pub mod workspace;
 
 // Convenient top-level re-exports for downstream crates.
-pub use byte_log::{read_disk, ByteLog, DiskState, LogPlan, LogShared};
+pub use byte_log::{read_disk, ByteLog, DiskState, LogPlan, LogShared, ReaderState};
 pub use clients::{ClientGuard, ClientInfo, ClientRegistry};
 pub use drain_result::DrainResult;
 pub use events::{LabelTarget, SessionEvent};
@@ -50,7 +51,7 @@ pub use manager::{
     MAX_LABEL_CHARS, MAX_PANE_DIM,
 };
 pub use pane::{DuplicatedTab, NotificationInfo, PaneInfo, PaneOsc, PaneState};
-pub use pane_writer::{OnEnd, PaneWriter, QueueError, INPUT_QUEUE_BYTES};
+pub use pane_writer::{OnEnd, PaneWriter, QueueError, WriterStats, INPUT_QUEUE_BYTES};
 pub use pty_bridge::PtyBridge;
 pub use sizes::{SizeGovernor, SizeOwner};
 pub use status::{PaneStatus, StatusSnapshot};
