@@ -461,6 +461,10 @@ fn spawn_fallback(shared: Arc<Shared>, seen: u64, pong_ok: Arc<AtomicBool>) {
     });
 }
 
+/// How long replacing the endpoint waits for the old one to drain. Short: the
+/// reason for the replace is that its socket does not work.
+const REPLACE_CLOSE_GRACE: Duration = Duration::from_millis(250);
+
 /// Wait before binding again after a failed bind, and after 10 failures.
 const BIND_RETRY: Duration = Duration::from_millis(500);
 const BIND_RETRY_SLOW: Duration = Duration::from_secs(2);
@@ -473,7 +477,8 @@ impl Shared {
     async fn replace_endpoint(&self) -> Result<(), String> {
         if !self.endpoint_closed.load(Ordering::SeqCst) {
             let old = self.ep();
-            let _ = tokio::time::timeout(CLOSE_GRACE, old.ep.close()).await;
+            // The socket may be dead, so the peers will not ack: wait briefly.
+            let _ = tokio::time::timeout(REPLACE_CLOSE_GRACE, old.ep.close()).await;
             self.live_eps.fetch_sub(1, Ordering::SeqCst);
             self.endpoint_closed.store(true, Ordering::SeqCst);
         }
