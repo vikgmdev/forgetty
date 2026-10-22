@@ -22,9 +22,11 @@
 # OBJDUMP=<path> overrides the disassembler.
 set -euo pipefail
 
-# Names of functions that pick their CPU at run time. `libunwind::` is Zig's bundled unwinder:
-# on aarch64 it executes `stg` (MTE) only for frames whose CIE marks them as MTE tagged.
-DISPATCH='haswell|icelake|westmere|skylake|N_AVX|N_SSE|N_SSSE3|N_SVE|N_NEON|avx2|avx512|AVX|libunwind::'
+# Names of functions that pick their CPU at run time.
+DISPATCH='haswell|icelake|westmere|skylake|N_AVX|N_SSE|N_SSSE3|N_SVE|N_NEON|avx2|avx512|AVX'
+# aarch64 only: `libunwind::` is Zig's bundled unwinder. It executes `stg` (MTE) only for frames
+# whose CIE marks them as MTE tagged, so those MTE instructions (and only those) are allowed
+# there. Any other flagged instruction in `libunwind::`, and any use on x86, still counts.
 
 # ---- x86-64 --------------------------------------------------------------------------------
 X86_AWK='
@@ -92,6 +94,7 @@ A64_AWK='
   if (kind == "") next
   total++
   if (allowed) next
+  if (kind == "ext" && fn ~ /libunwind::/ && m ~ /^(stg|st2g|stzg|stz2g|ldg|irg|gmi|addg|subg)$/) next
   ordinary++
   if (kind == "sve") sve++
   if (shown < 6 && !(fn in seen)) { seen[fn] = 1; shown++; example[shown] = m " (" kind ") in " fn }
