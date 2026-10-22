@@ -247,8 +247,30 @@ impl InputQueue {
 /// above the endpoint, so a new endpoint loses none of it.
 #[derive(Clone)]
 struct Ep {
-    ep: Endpoint,
+    /// Shared by the dials, the connect attempts and the network probe. The
+    /// count of clones is how a replace knows that none is left.
+    ep: Arc<Endpoint>,
     gen: u64,
+}
+
+/// The tasks that may hold a clone of the endpoint after the dial that made
+/// them is gone: retired connect attempts and the network probe. A replace
+/// aborts them all before it closes the endpoint.
+#[derive(Default)]
+struct HolderBin(Mutex<Vec<tokio::task::AbortHandle>>);
+
+impl HolderBin {
+    fn add(&self, h: tokio::task::AbortHandle) {
+        let mut v = lock(&self.0);
+        v.retain(|h| !h.is_finished());
+        v.push(h);
+    }
+
+    fn abort_all(&self) {
+        for h in lock(&self.0).drain(..) {
+            h.abort();
+        }
+    }
 }
 
 /// A network change that leaves no connection this long afterwards makes the
@@ -279,7 +301,7 @@ async fn bind_endpoint(
 
 pub(crate) struct Shared {
     /// The endpoint dials use now. Swapped when a fresh one wins the race.
-    endpoint: Mutex<Ep>,
+    endpoint: Mutex<Option<Ep>>,
     /// The key every endpoint of this client is bound with.
     identity: SecretKey,
     /// Set by the network-change fallback to the value of `connected_count` it
@@ -291,8 +313,13 @@ pub(crate) struct Shared {
     /// always (checked by the tests).
     live_eps: AtomicUsize,
     max_live_eps: AtomicUsize,
-    /// The current endpoint was closed and the bind of its replacement failed.
-    endpoint_closed: AtomicBool,
+    /// Tasks that hold clones of the endpoint (see [`HolderBin`]).
+    holders: Arc<HolderBin>,
+    /// The id of the endpoint: the same for every endpoint of this client.
+    endpoint_id: iroh::EndpointId,
+    /// Test hook: clones of the old endpoint still alive when the new one was
+    /// bound (`usize::MAX` before any replace). Must be 0.
+    clones_at_bind: AtomicUsize,
     /// Connections established so far.
     connected_count: AtomicU64,
     /// Test hook: dials on the endpoint of this bind number never connect.
@@ -385,18 +412,21 @@ impl Client {
         let endpoint =
             bind_endpoint(&opts, &server, identity.clone()).await.map_err(ClientError::Setup)?;
 
+        let endpoint_id = endpoint.id();
         let (state_tx, _) = watch::channel(ConnectionState::Reconnecting { since: Instant::now() });
         let (link_tx, _) = watch::channel(None);
         let (events_tx, _) = broadcast::channel(opts.event_buffer.max(16));
         let (shutdown_tx, _) = watch::channel(false);
         let shared = Arc::new(Shared {
-            endpoint: Mutex::new(Ep { ep: endpoint, gen: 0 }),
+            endpoint: Mutex::new(Some(Ep { ep: Arc::new(endpoint), gen: 0 })),
             identity,
             replace_for: AtomicU64::new(u64::MAX),
             next_ep_gen: AtomicU64::new(1),
             live_eps: AtomicUsize::new(1),
             max_live_eps: AtomicUsize::new(1),
-            endpoint_closed: AtomicBool::new(false),
+            holders: Arc::new(HolderBin::default()),
+            endpoint_id,
+            clones_at_bind: AtomicUsize::new(usize::MAX),
             connected_count: AtomicU64::new(0),
             stuck_gen: AtomicU64::new(u64::MAX),
             server,
@@ -434,7 +464,8 @@ impl Client {
 }
 
 impl Shared {
-    fn ep(&self) -> Ep {
+    /// The endpoint dials use. `None` only while it is being replaced.
+    fn ep(&self) -> Option<Ep> {
         lock(&self.endpoint).clone()
     }
 }
@@ -465,6 +496,9 @@ fn spawn_fallback(shared: Arc<Shared>, seen: u64, pong_ok: Arc<AtomicBool>) {
 /// reason for the replace is that its socket does not work.
 const REPLACE_CLOSE_GRACE: Duration = Duration::from_millis(250);
 
+/// How long a replace waits for the clones of the old endpoint to go.
+const CLONES_WAIT: Duration = Duration::from_secs(2);
+
 /// Wait before binding again after a failed bind, and after 10 failures.
 const BIND_RETRY: Duration = Duration::from_millis(500);
 const BIND_RETRY_SLOW: Duration = Duration::from_secs(2);
@@ -475,19 +509,33 @@ impl Shared {
     /// endpoint stays closed: call again to bind (the old one is not closed
     /// twice).
     async fn replace_endpoint(&self) -> Result<(), String> {
-        if !self.endpoint_closed.load(Ordering::SeqCst) {
-            let old = self.ep();
+        let old = lock(&self.endpoint).take();
+        if let Some(old) = old {
+            // Retired connect attempts and the network probe hold clones of the
+            // endpoint, some for seconds. End them first.
+            self.holders.abort_all();
+            let weak = Arc::downgrade(&old.ep);
             // The socket may be dead, so the peers will not ack: wait briefly.
             let _ = tokio::time::timeout(REPLACE_CLOSE_GRACE, old.ep.close()).await;
             self.live_eps.fetch_sub(1, Ordering::SeqCst);
-            self.endpoint_closed.store(true, Ordering::SeqCst);
+            drop(old);
+            // Bind only when every clone is gone. The aborted tasks drop theirs
+            // as soon as the runtime runs them.
+            let waited = Instant::now();
+            while weak.strong_count() > 0 && waited.elapsed() < CLONES_WAIT {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let left = weak.strong_count();
+            if left > 0 {
+                warn!("client: {left} clones of the old endpoint are still alive, binding anyway");
+            }
+            self.clones_at_bind.store(left, Ordering::SeqCst);
         }
         let ep = bind_endpoint(&self.opts, &self.server, self.identity.clone()).await?;
         let now = self.live_eps.fetch_add(1, Ordering::SeqCst) + 1;
         self.max_live_eps.fetch_max(now, Ordering::SeqCst);
         let gen = self.next_ep_gen.fetch_add(1, Ordering::SeqCst);
-        *lock(&self.endpoint) = Ep { ep, gen };
-        self.endpoint_closed.store(false, Ordering::SeqCst);
+        *lock(&self.endpoint) = Some(Ep { ep: Arc::new(ep), gen });
         Ok(())
     }
 }
@@ -543,7 +591,7 @@ impl ClientHandle {
 
     /// The local iroh endpoint id (the device id the server registers).
     pub fn endpoint_id(&self) -> iroh::EndpointId {
-        lock(&self.shared().endpoint).ep.id()
+        self.shared().endpoint_id
     }
 
     /// Call a method and wait for the result, with the default timeout. Waits
@@ -714,8 +762,10 @@ impl ClientHandle {
         // Probe first: `network_change` can take long on a dead network, and
         // must not delay the Ping.
         let link = shared.link_tx.borrow().clone();
-        let endpoint = shared.ep().ep;
-        tokio::spawn(async move { endpoint.network_change().await });
+        if let Some(ep) = shared.ep() {
+            let probe = tokio::spawn(async move { ep.ep.network_change().await });
+            shared.holders.add(probe.abort_handle());
+        }
         // iroh may need many seconds to rebind a socket that went away. If
         // there is no connection after a second, dial with a fresh endpoint.
         let pong_ok = Arc::new(AtomicBool::new(false));
@@ -755,12 +805,21 @@ impl ClientHandle {
         (s.live_eps.load(Ordering::SeqCst), s.max_live_eps.load(Ordering::SeqCst))
     }
 
+    /// Test hook: clones of the old endpoint alive when the last replacement
+    /// was bound (`usize::MAX` if there was none).
+    #[doc(hidden)]
+    pub fn old_endpoint_clones_at_bind_for_tests(&self) -> usize {
+        self.shared().clones_at_bind.load(Ordering::SeqCst)
+    }
+
     /// Test hook: the socket of the current endpoint went away. The current
     /// connection ends and no dial on this endpoint connects again.
     #[doc(hidden)]
     pub fn blackhole_endpoint_for_tests(&self) {
         let shared = self.shared();
-        shared.stuck_gen.store(shared.ep().gen, Ordering::SeqCst);
+        if let Some(ep) = shared.ep() {
+            shared.stuck_gen.store(ep.gen, Ordering::SeqCst);
+        }
         if let Some(link) = shared.link_tx.borrow().clone() {
             link.conn.close(close_code::OK.into(), b"test blackhole");
         }
@@ -1054,7 +1113,11 @@ async fn supervise(shared: Arc<Shared>) {
         if shared.reset_backoff.swap(false, Ordering::SeqCst) {
             failures = 0;
         }
-        let attempt = tokio::time::timeout(shared.opts.dial_timeout, dial(&shared, shared.ep()));
+        let Some(ep) = shared.ep() else {
+            // Replaced just now and the bind failed: the loop above retries.
+            continue;
+        };
+        let attempt = tokio::time::timeout(shared.opts.dial_timeout, dial(&shared, ep));
         let result = tokio::select! {
             r = attempt => r,
             _ = shutdown.changed() => continue,
@@ -1142,8 +1205,14 @@ async fn supervise(shared: Arc<Shared>) {
     // that is the peers' acks, and connections that were retired (or lost
     // across an outage) can take seconds to drain: an app that quits must not
     // wait for them.
-    let _ = tokio::time::timeout(CLOSE_GRACE, shared.ep().ep.close()).await;
-    shared.live_eps.fetch_sub(1, Ordering::SeqCst);
+    shared.holders.abort_all();
+    // Only an endpoint that exists is closed: after a failed bind there is none
+    // and the live count was already lowered.
+    let last = lock(&shared.endpoint).take();
+    if let Some(ep) = last {
+        let _ = tokio::time::timeout(CLOSE_GRACE, ep.ep.close()).await;
+        shared.live_eps.fetch_sub(1, Ordering::SeqCst);
+    }
     shared.state_tx.send_replace(final_state);
 }
 
@@ -1174,16 +1243,19 @@ const RETIRE_GRACE: Duration = Duration::from_secs(2);
 /// Dropped half way through the handshake an attempt leaves a half-open
 /// connection on the server, which holds up its shutdown for seconds. Each one
 /// gets [`RETIRE_GRACE`] to finish and is then closed.
-struct Attempts(Option<tokio::task::JoinSet<Result<Connection, String>>>);
+struct Attempts {
+    set: Option<tokio::task::JoinSet<Result<Connection, String>>>,
+    holders: Arc<HolderBin>,
+}
 
 impl Drop for Attempts {
     fn drop(&mut self) {
-        let Some(mut set) = self.0.take() else { return };
+        let Some(mut set) = self.set.take() else { return };
         if set.is_empty() {
             return;
         }
         let Ok(rt) = tokio::runtime::Handle::try_current() else { return };
-        rt.spawn(async move {
+        let retire = rt.spawn(async move {
             let grace = tokio::time::sleep(RETIRE_GRACE);
             tokio::pin!(grace);
             loop {
@@ -1197,6 +1269,8 @@ impl Drop for Attempts {
                 }
             }
         });
+        // The attempts hold clones of the endpoint: a replace aborts them.
+        self.holders.add(retire.abort_handle());
     }
 }
 
@@ -1208,13 +1282,14 @@ async fn connect_probing(
     ep: &Ep,
     target: EndpointAddr,
 ) -> Result<Connection, String> {
-    let mut attempts = Attempts(Some(tokio::task::JoinSet::new()));
+    let mut attempts =
+        Attempts { set: Some(tokio::task::JoinSet::new()), holders: shared.holders.clone() };
     let mut n = 0usize;
     loop {
         let endpoint = ep.ep.clone();
         let to = target.clone();
         let stuck = shared.stuck_gen.load(Ordering::SeqCst) == ep.gen;
-        let set = attempts.0.as_mut().expect("set is taken only on drop");
+        let set = attempts.set.as_mut().expect("set is taken only on drop");
         set.spawn(async move {
             if stuck {
                 // Test hook: the socket of this endpoint is gone.
@@ -1224,7 +1299,7 @@ async fn connect_probing(
         });
         let gap = Duration::from_millis(CONNECT_PROBES_MS[n.min(CONNECT_PROBES_MS.len() - 1)]);
         n += 1;
-        let set = attempts.0.as_mut().expect("set is taken only on drop");
+        let set = attempts.set.as_mut().expect("set is taken only on drop");
         tokio::select! {
             Some(done) = set.join_next() => {
                 return match done {

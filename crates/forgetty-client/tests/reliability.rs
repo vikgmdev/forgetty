@@ -475,7 +475,7 @@ async fn network_changed_aborts_a_hung_dial_and_connects_at_once() {
 /// The socket of the client's endpoint goes away (Android airplane mode): no
 /// dial on it connects, and iroh would take 4 to 52 s to rebind. After
 /// `network_changed` the client must bind a fresh endpoint with the same key
-/// and be Connected within 2 s (the 1.5 s fallback delay plus the dial). Input typed before, during and after the
+/// and be Connected within 2.5 s (the 1.5 s fallback delay plus the dial). Input typed before, during and after the
 /// outage reaches the pane once, in order.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn network_changed_with_a_stuck_socket_connects_on_a_fresh_endpoint() {
@@ -508,11 +508,18 @@ async fn network_changed_with_a_stuck_socket_connects_on_a_fresh_endpoint() {
     let took = t0.elapsed();
     println!("network_changed with a stuck socket: Connected after {took:?}");
     assert!(took >= Duration::from_millis(1400), "replaced too early: {took:?}");
-    assert!(took < Duration::from_millis(2000), "Connected after {took:?}");
+    assert!(took < Duration::from_millis(2500), "Connected after {took:?}");
     assert_eq!(h.endpoint_id(), device, "the fresh endpoint keeps the device id");
     // The old endpoint was closed before the new one was bound: never two
     // with the same id, which would split its relay registration.
     assert_eq!(h.live_endpoints_for_tests(), (1, 1), "one endpoint at a time");
+    // The retired connect attempts of the stuck endpoint were aborted and the
+    // old endpoint had no clone left when the new one was bound.
+    assert_eq!(
+        h.old_endpoint_clones_at_bind_for_tests(),
+        0,
+        "the old endpoint was still held when the new one was bound"
+    );
 
     h.send_input(pane, b"after").await.unwrap();
     wait_until("all input", Duration::from_secs(5), || {

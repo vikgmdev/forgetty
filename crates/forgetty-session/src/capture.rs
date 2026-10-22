@@ -12,7 +12,9 @@ use forgetty_vt::{Terminal, ANSI_PALETTE_BLACK};
 /// between calls, so a call must stay cheap: a few KiB of `ESC[2J` on a huge
 /// pane costs seconds. [`feed_chunk`] scales this to the pane.
 const FEED_CHUNK_80X24: usize = 4 * 1024;
-const FEED_CHUNK_MIN: usize = 64;
+/// Floor of the chunk. DECALN (`ESC # 8`, 3 bytes) fills the whole screen, so a
+/// chunk of 8 bytes is at most two fills.
+const FEED_CHUNK_MIN: usize = 8;
 
 /// Bytes per `vt_write` call: [`FEED_CHUNK_80X24`] scaled by the cell count of
 /// the pane against 80x24, so one call costs about 10 ms at worst.
@@ -64,16 +66,16 @@ fn scrollback_for(rows: usize, cols: usize, last_lines: Option<usize>) -> usize 
     }
 }
 
-/// Does `buf` change state that a clear does not reset and that changes how
-/// later text lands: a scroll region (DECSTBM), a charset designation or shift,
-/// or auto-wrap (DECAWM)?
-fn changes_persistent_modes(buf: &[u8]) -> bool {
+/// Where `buf` first changes state that a clear does not reset and that
+/// changes how later text lands: a scroll region (DECSTBM), a charset
+/// designation or shift, or auto-wrap (DECAWM).
+fn first_persistent_change(buf: &[u8]) -> Option<usize> {
     let mut i = 0;
     while i < buf.len() {
         match buf[i] {
-            0x0e | 0x0f => return true,
+            0x0e | 0x0f => return Some(i),
             0x1b => match buf.get(i + 1) {
-                Some(b'(' | b')' | b'*' | b'+') => return true,
+                Some(b'(' | b')' | b'*' | b'+') => return Some(i),
                 Some(b'[') => {
                     let mut j = i + 2;
                     let private = buf.get(j) == Some(&b'?');
@@ -86,13 +88,13 @@ fn changes_persistent_modes(buf: &[u8]) -> bool {
                     }
                     if let Some(&fin) = buf.get(j) {
                         if !private && fin == b'r' {
-                            return true;
+                            return Some(i);
                         }
                         if private
                             && (fin == b'h' || fin == b'l')
                             && buf[params_at..j].split(|&b| b == b';').any(|p| p == b"7")
                         {
-                            return true;
+                            return Some(i);
                         }
                     }
                     i = j.max(i + 1);
@@ -104,31 +106,48 @@ fn changes_persistent_modes(buf: &[u8]) -> bool {
         }
         i += 1;
     }
-    false
+    None
+}
+
+/// The cut rules, shared by the first pass and the retry. The last RIS (it
+/// resets every mode, so nothing before it matters) or the last `ESC[H ESC[2J`
+/// at or after `min_pos`. The `ESC[H ESC[2J` counts only when no scroll region,
+/// charset or auto-wrap change comes before it in the ring (a clear does not
+/// reset those, so text after it would land differently). Neither counts when
+/// an alternate screen switch follows it: leaving the alternate screen shows
+/// the older primary screen. A bare `ESC[2J` is never a cut. `None` if no cut
+/// is valid.
+fn find_cut(
+    replay: &[u8],
+    min_pos: usize,
+    first_change: &std::cell::OnceCell<Option<usize>>,
+) -> Option<usize> {
+    let tail = &replay[min_pos.min(replay.len())..];
+    let last = |pat: &[u8]| tail.windows(pat.len()).rposition(|w| w == pat).map(|i| i + min_pos);
+    let ris = last(RIS);
+    // The scan of the whole ring is done once, for both passes.
+    let clear = last(HOME_CLEAR).filter(|&m| {
+        let first = *first_change.get_or_init(|| first_persistent_change(replay));
+        first.is_none_or(|c| c >= m)
+    });
+    let mark = ris.max(clear)?;
+    let after = &replay[mark..];
+    let switched = ALT_SCREEN_PREFIXES.iter().any(|p| after.windows(p.len()).any(|w| w == *p));
+    (!switched).then_some(mark)
 }
 
 /// Where parsing starts. The whole ring when scrollback is wanted (history
-/// before a clear is part of it). Otherwise the last RIS (it resets every
-/// mode, so nothing before it matters), or the last `ESC[H ESC[2J` when no
-/// scroll region, charset or auto-wrap change comes before it in the ring (a
-/// clear does not reset those, so text after it would land differently). A cut
-/// is not made when an alternate screen switch follows it: leaving the
-/// alternate screen shows the older primary screen. The ring start otherwise.
-fn parse_start(replay: &[u8], want_scrollback: bool) -> usize {
+/// before a clear is part of it). Otherwise the last valid cut ([`find_cut`]),
+/// or the ring start.
+fn parse_start(
+    replay: &[u8],
+    want_scrollback: bool,
+    first_change: &std::cell::OnceCell<Option<usize>>,
+) -> usize {
     if want_scrollback {
         return 0;
     }
-    let last = |pat: &[u8]| replay.windows(pat.len()).rposition(|w| w == pat);
-    let ris = last(RIS);
-    let clear = last(HOME_CLEAR).filter(|&m| !changes_persistent_modes(&replay[..m]));
-    let Some(mark) = ris.max(clear) else { return 0 };
-    let after = &replay[mark..];
-    let switched = ALT_SCREEN_PREFIXES.iter().any(|p| after.windows(p.len()).any(|w| w == *p));
-    if switched {
-        0
-    } else {
-        mark
-    }
+    find_cut(replay, 0, first_change).unwrap_or(0)
 }
 
 /// Render `replay` (raw PTY bytes) on a `rows` x `cols` screen and return its
@@ -172,25 +191,30 @@ pub fn capture_with_deadline(
     let cols = cols.max(1) as usize;
     let scrollback = scrollback_for(rows, cols, last_lines);
     let begun = Instant::now();
-    // The deadline is for the whole call. Feeding stops at 80% of it, which
-    // leaves time to read a big screen (a 1000x1000 grid takes 100 ms or more
-    // in a slow build). The first pass gets three quarters of the feed time, so
-    // there is time left for the retry.
-    let feed_budget = deadline.mul_f32(FEED_SHARE);
-    let first_until = begun + feed_budget.mul_f32(FIRST_PASS_SHARE);
-    let start = parse_start(replay, scrollback > 0);
-    let (mut term, mut ran_out) =
-        feed(replay, start, rows, cols, scrollback, first_until, Duration::ZERO);
-    if ran_out && scrollback == 0 && Instant::now() < begun + deadline {
-        // Retry once from the last clear in the final quarter of the ring: the
-        // screen is rebuilt from there, which is cheap when the ring is full
-        // of redraws. Not with scrollback: the history before the clear is
-        // what was asked for.
-        if let Some(from) = last_clear_in_final_quarter(replay) {
-            drop(term);
-            let (t, out) = feed(replay, from, rows, cols, 0, begun + feed_budget, RETRY_MIN_FEED);
-            term = t;
-            ran_out = out;
+    // The deadline is for the whole call. Feeding stops early enough to read
+    // the screen and free the terminal: that work grows with the cell count
+    // ([`read_reserve`]). The first pass gets three quarters of the feed time,
+    // so the retry has time left.
+    let feed_end = begun + deadline.saturating_sub(read_reserve(rows, cols));
+    let first_until = begun + (feed_end - begun).mul_f32(FIRST_PASS_SHARE);
+    let first_change = std::cell::OnceCell::new();
+    let start = parse_start(replay, scrollback > 0, &first_change);
+    let (mut term, mut ran_out) = feed(replay, start, rows, cols, scrollback, first_until);
+    if ran_out && scrollback == 0 {
+        // Retry once from a valid cut ([`find_cut`]) in the final quarter of
+        // the ring, with what is left of the budget: the screen is rebuilt
+        // from there, which is cheap when the ring is full of redraws. No cut,
+        // or no time left to build another terminal: the first pass stays and
+        // the result is incomplete. Not with scrollback: the history before the
+        // clear is what was asked for.
+        let from = replay.len() - replay.len() / 4;
+        if let Some(cut) = find_cut(replay, from, &first_change) {
+            if Instant::now() + terminal_cost(rows, cols) < feed_end {
+                drop(term);
+                let (t, out) = feed(replay, cut, rows, cols, 0, feed_end);
+                term = t;
+                ran_out = out;
+            }
         }
     }
     let mut lines: Vec<String> = Vec::with_capacity(rows);
@@ -214,19 +238,26 @@ pub fn capture_with_deadline(
     Captured { text: lines.join("\n"), incomplete: ran_out }
 }
 
-/// Share of the deadline for feeding the ring (the rest is for reading the
-/// screen).
-const FEED_SHARE: f32 = 0.8;
-
 /// Share of the feed time for the first pass over the ring.
 const FIRST_PASS_SHARE: f32 = 0.75;
 
-/// The retry feeds for at least this long, counted from when its terminal is
-/// ready: allocating a huge pane takes a while on a busy machine.
-const RETRY_MIN_FEED: Duration = Duration::from_millis(150);
+/// Time kept back from the deadline for reading the screen and dropping the
+/// terminal, which grow with the cell count (about 0.1 ms per 1000 cells in a
+/// release build, more in a debug build), and for the last chunk fed.
+fn read_reserve(rows: usize, cols: usize) -> Duration {
+    Duration::from_nanos((rows.saturating_mul(cols) as u64).saturating_mul(READ_NS_PER_CELL))
+        + Duration::from_millis(5)
+}
 
-/// Feed `replay[start..]` to a new terminal until `until`, or until `at_least`
-/// after the terminal is ready if that is later. True if it ran out.
+/// What building a terminal of this size costs, about.
+fn terminal_cost(rows: usize, cols: usize) -> Duration {
+    Duration::from_nanos((rows.saturating_mul(cols) as u64).saturating_mul(NEW_NS_PER_CELL))
+}
+
+const READ_NS_PER_CELL: u64 = 250;
+const NEW_NS_PER_CELL: u64 = 100;
+
+/// Feed `replay[start..]` to a new terminal until `until`. True if it ran out.
 fn feed(
     replay: &[u8],
     start: usize,
@@ -234,10 +265,8 @@ fn feed(
     cols: usize,
     scrollback: usize,
     until: Instant,
-    at_least: Duration,
 ) -> (Terminal, bool) {
     let mut term = Terminal::with_scrollback(rows, cols, [ANSI_PALETTE_BLACK; 16], scrollback);
-    let until = until.max(Instant::now() + at_least);
     for chunk in replay[start..].chunks(feed_chunk(rows, cols)) {
         if Instant::now() >= until {
             return (term, true);
@@ -245,15 +274,6 @@ fn feed(
         term.feed(chunk);
     }
     (term, false)
-}
-
-/// The last full clear (RIS, home + erase, or erase display) in the final
-/// quarter of the ring.
-fn last_clear_in_final_quarter(replay: &[u8]) -> Option<usize> {
-    let from = replay.len() - replay.len() / 4;
-    let tail = &replay[from..];
-    let last = |pat: &[u8]| tail.windows(pat.len()).rposition(|w| w == pat);
-    [last(RIS), last(HOME_CLEAR), last(b"\x1b[2J")].into_iter().flatten().max().map(|i| from + i)
 }
 
 /// Append the rows now in the viewport.
@@ -322,6 +342,20 @@ mod tests {
     }
 
     /// For tests of what the screen shows, not of the deadline.
+    fn start_of(replay: &[u8], want_scrollback: bool) -> usize {
+        parse_start(replay, want_scrollback, &std::cell::OnceCell::new())
+    }
+
+    /// Bound on a whole capture. Generous by default, the deadline plus 150 ms
+    /// with `FORGETTY_STRICT_TIMING=1` (run alone, on a quiet machine).
+    fn bound() -> Duration {
+        if std::env::var_os("FORGETTY_STRICT_TIMING").is_some() {
+            CAPTURE_DEADLINE + Duration::from_millis(150)
+        } else {
+            Duration::from_millis(1500)
+        }
+    }
+
     fn no_deadline() -> Duration {
         Duration::from_secs(60)
     }
@@ -444,19 +478,19 @@ mod tests {
         let mut ring = vec![b'x'; 5000];
         // A bare erase display is no mark.
         ring.extend_from_slice(b"\x1b[2Jtext");
-        assert_eq!(parse_start(&ring, false), 0);
+        assert_eq!(start_of(&ring, false), 0);
         // Home + erase is, when nothing before it changes persistent modes.
         ring.extend_from_slice(b"\x1b[H\x1b[2Jmore");
         let mark = ring.len() - "\x1b[H\x1b[2Jmore".len();
-        assert_eq!(parse_start(&ring, false), mark);
-        assert_eq!(parse_start(&ring, true), 0);
+        assert_eq!(start_of(&ring, false), mark);
+        assert_eq!(start_of(&ring, true), 0);
         // RIS is.
         ring.extend_from_slice(b"\x1bcafter");
-        assert_eq!(parse_start(&ring, false), ring.len() - "\x1bcafter".len());
+        assert_eq!(start_of(&ring, false), ring.len() - "\x1bcafter".len());
         // An alternate screen switch after the mark: no cut.
         ring.extend_from_slice(b"\x1b[?1049l");
-        assert_eq!(parse_start(&ring, false), 0);
-        assert_eq!(parse_start(b"plain", false), 0);
+        assert_eq!(start_of(&ring, false), 0);
+        assert_eq!(start_of(b"plain", false), 0);
     }
 
     #[test]
@@ -472,11 +506,11 @@ mod tests {
         ] {
             let mut ring = before.to_vec();
             ring.extend_from_slice(b"text\x1b[H\x1b[2Jnew");
-            assert_eq!(parse_start(&ring, false), 0, "{before:?}");
+            assert_eq!(start_of(&ring, false), 0, "{before:?}");
         }
         // Other CSI sequences do not count.
         let ring = b"\x1b[31m\x1b[?25l\x1b[10;5Htext\x1b[H\x1b[2Jnew".to_vec();
-        assert_eq!(parse_start(&ring, false), ring.len() - "\x1b[H\x1b[2Jnew".len());
+        assert_eq!(start_of(&ring, false), ring.len() - "\x1b[H\x1b[2Jnew".len());
     }
 
     /// apt: a scroll region keeps the last row for a status line. A clear does
@@ -507,7 +541,7 @@ mod tests {
         assert!(marker_at >= ring.len() / 4 * 3);
         let t0 = Instant::now();
         let got = capture(&ring, 1000, 1000, true, Some(3));
-        assert!(t0.elapsed() < Duration::from_millis(1500), "took {:?}", t0.elapsed());
+        assert!(t0.elapsed() < bound(), "took {:?}", t0.elapsed());
         assert!(!got.incomplete, "the retry should finish");
         assert!(got.text.contains("tail line 1999"), "{:?}", got.text);
         // No clear in the final quarter: no retry, still incomplete.
@@ -517,18 +551,65 @@ mod tests {
     }
 
     #[test]
-    fn a_ring_of_clears_on_a_huge_pane_answers_within_the_deadline() {
+    fn a_ring_of_bare_clears_on_a_huge_pane_answers_in_time_and_says_incomplete() {
         let _heavy = heavy();
+        // A bare `ESC[2J` is no cut: the screen cannot be rebuilt from there.
         let ring = b"\x1b[2J".repeat(1_500_000); // 7.5 MB
         let t0 = Instant::now();
         let got = capture(&ring, 1000, 1000, true, None);
         let took = t0.elapsed();
-        assert!(took < Duration::from_millis(1500), "took {took:?}");
-        // The first pass runs out, the retry from the last clear finishes.
-        assert!(!got.incomplete, "the retry should finish");
-        assert_eq!(got.text, "");
+        assert!(took < bound(), "took {took:?}");
+        assert!(got.incomplete);
         // A short ring is complete.
         assert!(!capture(b"hi", 24, 80, true, None).incomplete);
+    }
+
+    #[test]
+    fn a_decaln_flood_on_a_huge_pane_answers_in_time() {
+        let _heavy = heavy();
+        // `ESC # 8` fills the whole screen with E.
+        let ring = b"\x1b#8".repeat(2_500_000);
+        let t0 = Instant::now();
+        let got = capture(&ring, 1000, 1000, true, None);
+        let took = t0.elapsed();
+        assert!(took < bound(), "took {took:?}");
+        assert!(got.incomplete);
+    }
+
+    /// htop or vim redraws past the first pass, then the user quits. The
+    /// screen is the shell's, which the redraws do not show: no retry from a
+    /// clear inside the alternate screen.
+    #[test]
+    fn the_retry_does_not_cut_inside_an_alternate_screen_that_was_left() {
+        let _heavy = heavy();
+        let mut ring = b"$ before vim\r\n\x1b[?1049h".to_vec();
+        ring.extend_from_slice(&b"\x1b[H\x1b[2Jredraw".repeat(900_000));
+        ring.extend_from_slice(b"\x1b[?1049l$ ");
+        let t0 = Instant::now();
+        let got = capture(&ring, 1000, 1000, true, None);
+        let took = t0.elapsed();
+        assert!(took < bound(), "took {took:?}");
+        assert!(got.incomplete, "a blank retry screen must not pass for complete");
+        assert!(find_cut(&ring, ring.len() - ring.len() / 4, &Default::default()).is_none());
+    }
+
+    /// apt: a scroll region set before the redraws. A clear does not reset it,
+    /// so a retry from the clear would lay the text out differently.
+    #[test]
+    fn the_retry_does_not_cut_after_a_scroll_region_change() {
+        let _heavy = heavy();
+        let mut ring = b"\x1b[1;999r".to_vec();
+        ring.extend_from_slice(&b"\x1b[H\x1b[2Jredraw".repeat(900_000));
+        ring.extend_from_slice(b"tail");
+        let t0 = Instant::now();
+        let got = capture(&ring, 1000, 1000, true, None);
+        let took = t0.elapsed();
+        assert!(took < bound(), "took {took:?}");
+        assert!(got.incomplete);
+        assert!(find_cut(&ring, ring.len() - ring.len() / 4, &Default::default()).is_none());
+        // RIS resets the region: a cut at it is fine.
+        ring.extend_from_slice(b"\x1bcfresh");
+        assert!(find_cut(&ring, ring.len() - ring.len() / 4, &Default::default()).is_some());
     }
 
     #[test]

@@ -88,6 +88,9 @@ if want 2; then
   cargo test -p forgetty-server --lib snapshot_hub >>"$LOGS/u-server.log" 2>&1 || ok=0
   cargo test -p forgetty-server --lib limiter >>"$LOGS/u-server.log" 2>&1 || ok=0
   cargo test -p forgetty-proto >"$LOGS/u-proto.log" 2>&1 || ok=0
+  # Capture timing: strict bounds (deadline + 150 ms), the tests alone and in turn.
+  FORGETTY_STRICT_TIMING=1 cargo test --release -p forgetty-session --lib capture:: \
+    -- --test-threads=1 >"$LOGS/u-capture-strict.log" 2>&1 || ok=0
   [ $ok = 1 ] && { pass "unit tests"; SUMMARY+=("unit tests: pass"); } || { fail "unit tests"; tail -20 "$LOGS"/u-*.log; }
 fi
 
