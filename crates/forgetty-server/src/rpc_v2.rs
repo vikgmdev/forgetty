@@ -1648,9 +1648,19 @@ impl Drop for AttachTicket {
 /// blocking thread per pane, not one per request.
 #[derive(Default)]
 struct SyncSlots {
-    /// Panes with a sync running, and whether it must go again.
-    running: Mutex<HashMap<Uuid, bool>>,
+    /// Panes with a sync running (or orphaned), and what each needs.
+    running: Mutex<HashMap<Uuid, Slot>>,
     done: Condvar,
+}
+
+/// State of one pane's sync slot.
+#[derive(Default, Clone, Copy)]
+struct Slot {
+    /// A request came in while the sync ran: it must go again.
+    dirty: bool,
+    /// The runner panicked with `dirty` set, so the final state was never
+    /// applied. The next claimer or waiter takes the slot over and runs it.
+    orphaned: bool,
 }
 
 impl SyncSlots {
@@ -1658,12 +1668,17 @@ impl SyncSlots {
     fn claim(&self, pane: Uuid) -> bool {
         let mut running = lock(&self.running);
         match running.get_mut(&pane) {
-            Some(dirty) => {
-                *dirty = true;
+            Some(slot) if slot.orphaned => {
+                // A runner died with work left: this caller takes it over.
+                *slot = Slot::default();
+                true
+            }
+            Some(slot) => {
+                slot.dirty = true;
                 false
             }
             None => {
-                running.insert(pane, false);
+                running.insert(pane, Slot::default());
                 true
             }
         }
@@ -1673,8 +1688,8 @@ impl SyncSlots {
     fn pass_done(&self, pane: Uuid) -> bool {
         let mut running = lock(&self.running);
         match running.get_mut(&pane) {
-            Some(dirty) if *dirty => {
-                *dirty = false;
+            Some(slot) if slot.dirty => {
+                slot.dirty = false;
                 true
             }
             _ => {
@@ -1685,18 +1700,38 @@ impl SyncSlots {
         }
     }
 
-    /// The runner of `pane` ended without [`SyncSlots::pass_done`] (a panic):
-    /// free the slot so later syncs and `wait_idle` do not wait for ever.
+    /// The runner of `pane` ended without [`SyncSlots::pass_done`] (a panic).
+    /// With nothing marked dirty the slot is freed. With a dirty mark the
+    /// final state was never applied, so the slot stays as orphaned for the
+    /// next claimer, and a waiter takes it over.
     fn abandon(&self, pane: Uuid) {
-        lock(&self.running).remove(&pane);
+        let mut running = lock(&self.running);
+        match running.get_mut(&pane) {
+            Some(slot) if slot.dirty => {
+                slot.orphaned = true;
+            }
+            _ => {
+                running.remove(&pane);
+            }
+        }
         self.done.notify_all();
     }
 
-    /// Block until no sync runs for `pane`.
-    fn wait_idle(&self, pane: Uuid) {
+    /// Block until no sync runs for `pane`. `true`: the last runner died with
+    /// work left, and the caller now owns the slot and must run the sync.
+    fn wait_idle(&self, pane: Uuid) -> bool {
         let mut running = lock(&self.running);
-        while running.contains_key(&pane) {
-            running = self.done.wait(running).unwrap_or_else(|e| e.into_inner());
+        loop {
+            match running.get_mut(&pane) {
+                None => return false,
+                Some(slot) if slot.orphaned => {
+                    *slot = Slot::default();
+                    return true;
+                }
+                Some(_) => {
+                    running = self.done.wait(running).unwrap_or_else(|e| e.into_inner());
+                }
+            }
         }
     }
 }
@@ -2366,7 +2401,10 @@ impl Session {
             // One runs and goes again after us, so the state we changed is
             // applied before it ends. Wait for that: the answer of an attach
             // promises the size policy knows about the stream.
-            self.syncs.wait_idle(pane);
+            if self.syncs.wait_idle(pane) {
+                // The runner panicked with work left: this call owns it now.
+                self.run_claimed_sync(pane);
+            }
         }
     }
 
@@ -3536,19 +3574,49 @@ mod owner_tests {
 mod sync_slot_tests {
     use super::*;
 
+    fn crash(slots: &SyncSlots, pane: Uuid) {
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _slot = SyncSlotGuard { slots, pane, ended: false };
+            panic!("a pass panics");
+        }));
+        assert!(crashed.is_err());
+    }
+
     #[test]
     fn a_panicking_runner_frees_its_slot() {
         let slots = SyncSlots::default();
         let pane = Uuid::new_v4();
         assert!(slots.claim(pane));
-        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _slot = SyncSlotGuard { slots: &slots, pane, ended: false };
-            panic!("a pass panics");
-        }));
-        assert!(crashed.is_err());
+        crash(&slots, pane);
         // No one waits for ever, and the next request claims the slot.
-        slots.wait_idle(pane);
+        assert!(!slots.wait_idle(pane));
         assert!(slots.claim(pane));
+    }
+
+    #[test]
+    fn a_panicking_runner_with_a_dirty_mark_hands_the_final_sync_on() {
+        let slots = SyncSlots::default();
+        let pane = Uuid::new_v4();
+        assert!(slots.claim(pane));
+        assert!(!slots.claim(pane)); // a request marks it dirty
+        crash(&slots, pane);
+        // A waiter does not return as synced: it owns the sync now.
+        assert!(slots.wait_idle(pane), "the waiter must run the lost sync");
+        // Taken over once: the slot is its, and others mark it dirty again.
+        assert!(!slots.claim(pane));
+        assert!(slots.pass_done(pane));
+        assert!(!slots.pass_done(pane));
+        assert!(slots.claim(pane));
+    }
+
+    #[test]
+    fn the_next_claimer_takes_an_orphaned_slot() {
+        let slots = SyncSlots::default();
+        let pane = Uuid::new_v4();
+        assert!(slots.claim(pane));
+        assert!(!slots.claim(pane));
+        crash(&slots, pane);
+        assert!(slots.claim(pane), "a detach after the crash runs the sync");
     }
 
     #[test]

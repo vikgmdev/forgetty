@@ -100,16 +100,87 @@ pub fn isolate_state_for_tests() -> PathBuf {
     test_root()
 }
 
+/// Name prefix of a test root: short, because a socket path must fit in the
+/// 104 bytes of `sun_path` on macOS (`<root>/run/forgetty/forgetty.sock`).
+const TEST_ROOT_PREFIX: &str = "ft-";
+
+/// File that marks a directory as a test root. Only directories that hold it
+/// are ever removed as stale.
+const TEST_ROOT_MARKER: &str = ".forgetty-test-root";
+
 fn test_root() -> PathBuf {
     TEST_ROOT
         .get_or_init(|| {
-            let tmp = std::env::temp_dir();
+            let tmp = trusted_tmp();
             remove_stale_test_roots(&tmp);
-            let root = tmp.join(format!("forgetty-test-{}", std::process::id()));
+            let root = tmp.join(format!("{TEST_ROOT_PREFIX}{}", std::process::id()));
             let _ = std::fs::create_dir_all(&root);
+            let _ = std::fs::write(root.join(TEST_ROOT_MARKER), b"");
             root
         })
         .clone()
+}
+
+/// Resolve symlinks in the longest existing ancestor of `p` and put the rest
+/// back, so `/var` and `/private/var` agree on macOS.
+fn resolve_path(p: &std::path::Path) -> PathBuf {
+    let mut rest = Vec::new();
+    let mut cur = p;
+    loop {
+        if let Ok(real) = std::fs::canonicalize(cur) {
+            return rest.iter().rev().fold(real, |acc, c| acc.join(c));
+        }
+        match (cur.parent(), cur.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_owned());
+                cur = parent;
+            }
+            _ => return p.to_path_buf(),
+        }
+    }
+}
+
+/// The directories a live install uses, from the platform and from the
+/// `XDG_*` variables, plus the home directory.
+fn live_dirs() -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = [
+        dirs::home_dir(),
+        dirs::data_dir(),
+        dirs::config_dir(),
+        dirs::runtime_dir(),
+        dirs::data_local_dir(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    for key in ["XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_RUNTIME_DIR"] {
+        if let Some(d) = std::env::var_os(key).filter(|d| !d.is_empty()) {
+            v.push(PathBuf::from(d));
+        }
+    }
+    v
+}
+
+/// `temp` if it can be trusted as a place for throwaway state, else a fixed
+/// one. A temporary directory that is `/`, the home directory or an ancestor
+/// of any live directory would make the live state count as temporary, so it
+/// is untrusted. The fixed place is `/tmp` on unix. Elsewhere there is none,
+/// and `temp` stays.
+fn trusted_tmp_for(temp: &std::path::Path, live: &[PathBuf]) -> PathBuf {
+    let t = resolve_path(temp);
+    let swallows_live = t.parent().is_none()
+        || t.as_os_str().is_empty()
+        || live.iter().any(|d| resolve_path(d).starts_with(&t));
+    if swallows_live && cfg!(unix) {
+        PathBuf::from("/tmp")
+    } else {
+        temp.to_path_buf()
+    }
+}
+
+/// The temporary directory this process trusts for test state.
+fn trusted_tmp() -> PathBuf {
+    trusted_tmp_for(&std::env::temp_dir(), &live_dirs())
 }
 
 /// [`isolate_state_for_tests`] in a test process, nothing elsewhere. Call it
@@ -120,18 +191,18 @@ pub fn isolate_if_test_process() {
     }
 }
 
-/// Remove `forgetty-test-<pid>` directories whose process is gone. Where
-/// `/proc` does not exist the pid cannot be checked, so only roots whose
-/// mtime is older than 24 hours go.
+/// Remove `ft-<pid>` test roots whose process is gone. A directory counts
+/// only if it holds the test-root marker. Where `/proc` does not exist the
+/// pid cannot be checked, so only roots whose mtime is older than 24 hours go.
 fn remove_stale_test_roots(tmp: &std::path::Path) {
     let has_proc = std::path::Path::new("/proc/self").exists();
     let Ok(entries) = std::fs::read_dir(tmp) else { return };
     for e in entries.flatten() {
         let name = e.file_name();
-        let Some(pid) = name.to_str().and_then(|n| n.strip_prefix("forgetty-test-")) else {
+        let Some(pid) = name.to_str().and_then(|n| n.strip_prefix(TEST_ROOT_PREFIX)) else {
             continue;
         };
-        if pid.parse::<u32>().is_err() {
+        if pid.parse::<u32>().is_err() || !e.path().join(TEST_ROOT_MARKER).exists() {
             continue;
         }
         let stale = if has_proc {
@@ -149,36 +220,21 @@ fn remove_stale_test_roots(tmp: &std::path::Path) {
     }
 }
 
-/// `true` if `path` lies under the temporary directory. A path with a `..`
-/// component never counts. Symlinks in the existing part of both paths are
-/// resolved, so `/var` and `/private/var` agree on macOS.
+/// `true` if `path` lies under the trusted temporary directory or under the
+/// test root. A path with a `..` component never counts. Symlinks in the
+/// existing part of both paths are resolved.
 fn under_temp_dir(path: &std::path::Path) -> bool {
     use std::path::Component;
     if path.components().any(|c| matches!(c, Component::ParentDir)) {
         return false;
     }
-    let tmp = std::env::temp_dir();
+    let tmp = trusted_tmp();
     if path.starts_with(&tmp) {
         return true;
     }
-    // Resolve the longest existing ancestor and put the rest back.
-    let resolve = |p: &std::path::Path| -> PathBuf {
-        let mut rest = Vec::new();
-        let mut cur = p;
-        loop {
-            if let Ok(real) = std::fs::canonicalize(cur) {
-                return rest.iter().rev().fold(real, |acc, c| acc.join(c));
-            }
-            match (cur.parent(), cur.file_name()) {
-                (Some(parent), Some(name)) => {
-                    rest.push(name.to_owned());
-                    cur = parent;
-                }
-                _ => return p.to_path_buf(),
-            }
-        }
-    };
-    resolve(path).starts_with(resolve(&tmp))
+    let real = resolve_path(path);
+    real.starts_with(resolve_path(&tmp))
+        || TEST_ROOT.get().is_some_and(|root| real.starts_with(resolve_path(root)))
 }
 
 /// The directory for `kind` in a test process. A directory under the
@@ -207,7 +263,7 @@ fn test_checked(kind: &str, resolved: PathBuf) -> PathBuf {
             eprintln!(
                 "forgetty: a test process asked for the {kind} directory {}, which is not under {}; using {} instead",
                 resolved.display(),
-                std::env::temp_dir().display(),
+                trusted_tmp().display(),
                 root.display()
             );
         });
@@ -317,7 +373,7 @@ mod tests {
     fn a_temp_xdg_data_home_is_the_tests_own_choice() {
         isolate_state_for_tests();
         let _lock = ENV.lock().unwrap_or_else(|e| e.into_inner());
-        let own = std::env::temp_dir().join("forgetty-guard-own-choice");
+        let own = trusted_tmp().join("forgetty-guard-own-choice");
         let prior = set_env("XDG_DATA_HOME", Some(own.as_os_str()));
         let got = data_dir();
         set_env("XDG_DATA_HOME", prior.as_deref());
@@ -326,7 +382,56 @@ mod tests {
 
     #[test]
     fn a_path_that_climbs_out_of_temp_is_not_temp() {
-        let climb = std::env::temp_dir().join("x/../../forgetty-guard-test");
+        let climb = trusted_tmp().join("x/../../forgetty-guard-test");
         assert!(!under_temp_dir(&climb));
+    }
+
+    #[test]
+    fn a_temp_dir_that_holds_the_live_dirs_is_not_trusted() {
+        let live = vec![
+            PathBuf::from("/home/u"),
+            PathBuf::from("/home/u/.local/share"),
+            PathBuf::from("/run/user/1000"),
+        ];
+        let fixed = PathBuf::from("/tmp");
+        if cfg!(unix) {
+            // TMPDIR is $HOME, an ancestor of $HOME, a live dir, or /.
+            for bad in ["/home/u", "/home", "/", "/home/u/.local/share", "/run/user/1000", "/run"] {
+                assert_eq!(trusted_tmp_for(std::path::Path::new(bad), &live), fixed, "{bad}");
+            }
+        }
+        // A directory next to the live ones is fine.
+        let ok = PathBuf::from("/var/tmp/forgetty-guard-trusted-check");
+        assert_eq!(trusted_tmp_for(&ok, &live), ok);
+        // A temp dir inside HOME is fine too: it does not hold HOME.
+        let inside = PathBuf::from("/home/u/tmp");
+        assert_eq!(trusted_tmp_for(&inside, &live), inside);
+    }
+
+    #[test]
+    fn the_test_root_keeps_a_socket_path_under_the_macos_limit() {
+        let root = isolate_state_for_tests();
+        let sock = root.join("run").join("forgetty").join("forgetty.sock");
+        let len = sock.as_os_str().len();
+        assert!(len < 100, "{} is {len} bytes; sun_path holds 103 on macOS", sock.display());
+    }
+
+    #[test]
+    fn only_a_marked_dead_root_is_removed_as_stale() {
+        let tmp = tempfile::tempdir().unwrap();
+        // pid 4294967 is not running; the first has the marker, the second does not.
+        let marked = tmp.path().join(format!("{TEST_ROOT_PREFIX}4294967"));
+        let plain = tmp.path().join(format!("{TEST_ROOT_PREFIX}4294966"));
+        let alive = tmp.path().join(format!("{TEST_ROOT_PREFIX}{}", std::process::id()));
+        for d in [&marked, &plain, &alive] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        for d in [&marked, &alive] {
+            std::fs::write(d.join(TEST_ROOT_MARKER), b"").unwrap();
+        }
+        remove_stale_test_roots(tmp.path());
+        assert!(!marked.exists());
+        assert!(plain.exists(), "a directory without the marker is never removed");
+        assert!(alive.exists());
     }
 }

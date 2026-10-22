@@ -891,6 +891,21 @@ async fn input_without_the_flags_capability_is_user_input() {
 /// turns: the timing limit of the catch-up test does not hold next to them.
 static HEAVY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Wait for the snapshot item of `s`. The limit is for the whole wait, not per
+/// item: a busy pane sends output items all the time, so a per-item timeout
+/// never fires while no snapshot comes. (This once hung a gate for 30 minutes.)
+async fn wait_for_snapshot(s: &mut forgetty_client::PaneStream, limit: Duration, who: &str) {
+    let t0 = Instant::now();
+    loop {
+        let left = limit.saturating_sub(t0.elapsed());
+        match tokio::time::timeout(left, s.next()).await {
+            Ok(Some(PaneItem::Snapshot { .. })) => return,
+            Ok(Some(_)) => continue,
+            other => panic!("no snapshot for {who} after {:?}: {other:?}", t0.elapsed()),
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_hostile_node_does_not_starve_an_honest_nodes_catch_up() {
     if !real_only() {
@@ -902,20 +917,36 @@ async fn a_hostile_node_does_not_starve_an_honest_nodes_catch_up() {
         (0..8).map(|_| server.add_script_pane("exec yes 0123456789abcdef")).collect();
     let (hostile_panes, honest_panes) = busy.split_at(4);
     let endpoint = raw_endpoint(&server).await;
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // A fresh attach gets a snapshot only when the pane's log is more than half
+    // the ring ahead of its start. Wait for that on every busy pane, however
+    // slow `yes` runs on a loaded host, instead of assuming that 2 s are enough.
+    let t_fill = Instant::now();
+    loop {
+        let short = busy.iter().filter(|p| {
+            let (first, total) = server.log_bounds(**p);
+            total.saturating_sub(first) < 6 * 1024 * 1024
+        });
+        let short = short.count();
+        if short == 0 {
+            break;
+        }
+        assert!(
+            t_fill.elapsed() < Duration::from_secs(60),
+            "{short} busy panes had under 6 MiB of output after 60 s"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 
     // One snapshot on this host right now, from a node nobody competes with:
     // the bound for the contended ones is relative to it.
+    let me = common::test_name();
+    common::progress_for(&me, "test", "probe connect");
     let probe = connect(&server, "probe").await;
+    common::progress_for(&me, "test", "probe attach_pane");
     let t0 = Instant::now();
     let mut s = probe.attach_pane(honest_panes[3]).await.unwrap();
-    loop {
-        match tokio::time::timeout(Duration::from_secs(10), s.next()).await {
-            Ok(Some(PaneItem::Snapshot { .. })) => break,
-            Ok(Some(_)) => continue,
-            other => panic!("no snapshot for the probe: {other:?}"),
-        }
-    }
+    common::progress_for(&me, "test", "probe waits for its snapshot");
+    wait_for_snapshot(&mut s, Duration::from_secs(20), "the probe").await;
     let one_build = t0.elapsed();
     drop(s);
     probe.close().await;
@@ -925,12 +956,17 @@ async fn a_hostile_node_does_not_starve_an_honest_nodes_catch_up() {
         let (stop, panes) = (stop.clone(), hostile_panes.to_vec());
         let endpoint = endpoint.clone();
         let addr = server.addr();
+        let me = me.clone();
         tokio::spawn(async move {
             let mut conns = Vec::new();
+            let mut round = 0u32;
             while !stop.load(Ordering::SeqCst) {
+                round += 1;
+                common::progress_for(&me, "hostile", &format!("round {round}: connect"));
                 // Same node, fresh client id each time, never reads a pane.
                 let conn = endpoint.connect(addr.clone(), forgetty_client::proto::ALPN_RPC).await;
                 let Ok(conn) = conn else { break };
+                common::progress_for(&me, "hostile", &format!("round {round}: open_bi"));
                 let Ok((mut send, mut recv)) = conn.open_bi().await else { break };
                 let hello = Hello::new(
                     Uuid::new_v4(),
@@ -940,11 +976,14 @@ async fn a_hostile_node_does_not_starve_an_honest_nodes_catch_up() {
                     "0.0.0",
                     vec!["resume".into(), "snapshot_catchup".into()],
                 );
+                common::progress_for(&me, "hostile", &format!("round {round}: hello"));
                 write_msg(&mut send, &hello).await.unwrap();
+                common::progress_for(&me, "hostile", &format!("round {round}: handshake reply"));
                 let _ = read_msg::<_, HandshakeReply>(&mut recv).await;
                 tokio::spawn(async move {
                     while let Ok(Some(_)) = read_msg::<_, ControlMsg>(&mut recv).await {}
                 });
+                common::progress_for(&me, "hostile", &format!("round {round}: attaches"));
                 for (i, pane) in panes.iter().enumerate() {
                     attach_raw(&mut send, i as u64 + 1, *pane).await;
                 }
@@ -958,24 +997,22 @@ async fn a_hostile_node_does_not_starve_an_honest_nodes_catch_up() {
     };
     tokio::time::sleep(Duration::from_secs(3)).await;
 
+    common::progress_for(&me, "test", "honest connect");
     let honest = connect(&server, "honest").await;
     let mut worst = Duration::ZERO;
     for pane in honest_panes.iter().take(3) {
+        common::progress_for(&me, "test", &format!("honest attach {pane}"));
         let t0 = Instant::now();
         let mut s = honest.attach_pane(*pane).await.unwrap();
-        loop {
-            match tokio::time::timeout(Duration::from_secs(10), s.next()).await {
-                Ok(Some(PaneItem::Snapshot { .. })) => break,
-                Ok(Some(_)) => continue,
-                other => panic!("no snapshot for the honest node: {other:?}"),
-            }
-        }
+        wait_for_snapshot(&mut s, Duration::from_secs(20), "the honest node").await;
         let took = t0.elapsed();
         println!("honest node catch-up while a hostile node asks: {took:?}");
         worst = worst.max(took);
     }
     stop.store(true, Ordering::SeqCst);
+    common::progress_for(&me, "test", "waiting for the hostile task to stop");
     let _ = hostile.await;
+    common::progress_for(&me, "test", "reading qa_state");
     let st = qa_state(&server);
     println!(
         "worst {worst:?}, builds {}, max running {}, last build {} us",

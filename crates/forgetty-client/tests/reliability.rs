@@ -771,7 +771,8 @@ async fn a_server_that_refuses_the_session_is_not_redialed_in_a_loop() {
 /// + 15 (sleeps) = 25 dials, against thousands for a tight loop. Dials are
 /// counted where the client starts them (`dial_starts_for_tests`), not by the
 /// server's handshakes, which a loaded host can miss or merge. Without the
-/// "no refill during the sleep" rule the count goes past 30.
+/// "no refill during the sleep" rule the count is 34. Normal is 25; the bound
+/// is 29 (between the two, with room for a loaded host).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_server_that_answers_once_and_closes_is_redialed_at_a_bounded_rate() {
     if common::real_only() {
@@ -797,7 +798,7 @@ async fn a_server_that_answers_once_and_closes_is_redialed_at_a_bounded_rate() {
     let longest_gap = at.windows(2).map(|w| w[1] - w[0]).max().unwrap_or_default();
     println!("answers once: {seen} dials started, longest gap {longest_gap:?}");
     assert!(seen >= 10, "the burst did not happen: {at:?}");
-    assert!(seen <= 27, "{seen} dials in 30 s");
+    assert!(seen <= 29, "{seen} dials in 30 s");
     assert!(longest_gap >= Duration::from_millis(1800), "gap {longest_gap:?}");
     h.close().await;
     server.shutdown().await;

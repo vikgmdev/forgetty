@@ -25,6 +25,150 @@ use forgetty_client::{EndpointAddr, EndpointId, SecretKey};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+// ---------------------------------------------------------------------------
+// Per-test watchdog
+// ---------------------------------------------------------------------------
+//
+// A test that hangs must fail with its name, not stall a gate until an outer
+// limit kills the run. `TestServer::start` arms a watchdog for the calling
+// test thread. If the test is still running after `FORGETTY_TEST_TIMEOUT_SECS`
+// (default 300), the watchdog prints the test name, kills the real servers of
+// this process and exits with status 124.
+
+/// Pids and state dirs of the real servers this process spawned and has not
+/// dropped.
+static REAL_PIDS: Mutex<Vec<(i32, PathBuf)>> = Mutex::new(Vec::new());
+
+/// Where a test is, by test name and label, for the watchdog to print.
+static PROGRESS: Mutex<Vec<(String, String, String)>> = Mutex::new(Vec::new());
+
+/// Name of the calling test thread. Take it before spawning tasks, then pass
+/// it to [`progress_for`] from them.
+pub fn test_name() -> String {
+    std::thread::current().name().unwrap_or("<unnamed thread>").to_string()
+}
+
+/// Record that part `label` of test `test` is now at `what`. The watchdog
+/// prints these when the test times out.
+pub fn progress_for(test: &str, label: &str, what: &str) {
+    if let Ok(mut p) = PROGRESS.lock() {
+        match p.iter_mut().find(|(t, l, _)| t == test && l == label) {
+            Some(e) => e.2 = what.to_string(),
+            None => p.push((test.to_string(), label.to_string(), what.to_string())),
+        }
+    }
+}
+
+struct WatchdogDone(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for WatchdogDone {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+thread_local! {
+    /// Set once per test thread. Dropped when the thread (the test) ends.
+    static WATCHDOG: std::cell::RefCell<Option<WatchdogDone>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Write to fd 2 directly. The test harness captures `eprintln!` of threads
+/// a test spawned, and this message must not be lost.
+fn raw_stderr(msg: &str) {
+    // SAFETY: a plain write of a valid buffer to fd 2.
+    unsafe { libc::write(2, msg.as_ptr().cast(), msg.len()) };
+}
+
+/// Ask a real server `method` on its local socket, with 5 s limits. For the
+/// watchdog report: it shows whether the server as a whole still answers.
+fn probe_socket(dir: &Path, method: &str) -> String {
+    let sock = Real::socket(dir);
+    let run = || -> std::io::Result<String> {
+        let mut stream = UnixStream::connect(&sock)?;
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+        let req = format!("{{\"jsonrpc\":\"2.0\",\"method\":\"{method}\",\"params\":{{}},\"id\":1}}\n");
+        stream.write_all(req.as_bytes())?;
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line)?;
+        Ok(line)
+    };
+    match run() {
+        Ok(l) => l.chars().take(1500).collect(),
+        Err(e) => format!("no answer: {e}"),
+    }
+}
+
+fn test_timeout() -> Duration {
+    let secs = std::env::var("FORGETTY_TEST_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(300);
+    Duration::from_secs(secs)
+}
+
+/// Arm the watchdog for the current test thread (once).
+fn arm_watchdog() {
+    WATCHDOG.with(|w| {
+        if w.borrow().is_some() {
+            return;
+        }
+        let name = std::thread::current().name().unwrap_or("<unnamed thread>").to_string();
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        *w.borrow_mut() = Some(WatchdogDone(done.clone()));
+        let limit = test_timeout();
+        let spawned = std::thread::Builder::new().name(format!("watchdog:{name}")).spawn(move || {
+            let t0 = std::time::Instant::now();
+            while t0.elapsed() < limit {
+                if done.load(Ordering::SeqCst) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            if done.load(Ordering::SeqCst) {
+                return;
+            }
+            raw_stderr(&format!(
+                "\nTEST TIMEOUT: `{name}` ran for more than {} s and is stuck \
+                 (FORGETTY_TEST_TIMEOUT_SECS sets the limit)\n",
+                limit.as_secs()
+            ));
+            if let Ok(p) = PROGRESS.lock() {
+                for (_, label, what) in p.iter().filter(|(t, _, _)| *t == name) {
+                    raw_stderr(&format!("  {label}: {what}\n"));
+                }
+            }
+            let pids = REAL_PIDS.lock().map(|p| p.clone()).unwrap_or_default();
+            for (pid, dir) in &pids {
+                let status = std::fs::read_to_string(format!("/proc/{pid}/status"))
+                    .unwrap_or_default()
+                    .lines()
+                    .filter(|l| l.starts_with("State:") || l.starts_with("Threads:"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                raw_stderr(&format!("real server {pid}: {status}\n"));
+                // `dir` is the server's temp dir (state, config and log in it).
+                raw_stderr(&format!("qa_state: {}\n", probe_socket(dir, "qa_state")));
+                raw_stderr(&format!("list_tabs: {}\n", probe_socket(dir, "list_tabs")));
+                let log = std::fs::read_to_string(dir.join("server.log")).unwrap_or_default();
+                let tail: Vec<&str> = log.lines().rev().take(40).collect();
+                raw_stderr(&format!(
+                    "--- last {} lines of server.log ---\n{}\n---\n",
+                    tail.len(),
+                    tail.into_iter().rev().collect::<Vec<_>>().join("\n")
+                ));
+                // SAFETY: plain signal to a child this process spawned.
+                unsafe { libc::kill(*pid, libc::SIGKILL) };
+            }
+            std::process::exit(124);
+        });
+        if let Err(e) = spawned {
+            eprintln!("could not start the watchdog: {e}");
+        }
+    });
+}
+
 /// Is the real server under test?
 pub fn is_real() -> bool {
     std::env::var_os("FORGETTY_REAL_SERVER").is_some()
@@ -75,6 +219,9 @@ struct Rpc {
     tx: mpsc::Sender<Op>,
 }
 
+/// How long `Rpc::call` waits for an answer.
+const RPC_LIMIT: Duration = Duration::from_secs(120);
+
 impl Rpc {
     fn connect(path: &Path) -> std::io::Result<Rpc> {
         let stream = UnixStream::connect(path)?;
@@ -115,7 +262,15 @@ impl Rpc {
         self.tx
             .send(Op { method: method.into(), params, reply: Some(tx) })
             .map_err(|_| "worker gone".to_string())?;
-        rx.recv().map_err(|_| "worker gone".to_string())?
+        // A call that never gets its answer fails with its name instead of
+        // blocking the test for ever.
+        match rx.recv_timeout(RPC_LIMIT) {
+            Ok(r) => r,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                Err(format!("{method}: no answer from the server in {} s", RPC_LIMIT.as_secs()))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err("worker gone".to_string()),
+        }
     }
 
     fn call_timeout(&self, method: &str, params: Value, limit: Duration) -> Option<Value> {
@@ -211,6 +366,9 @@ impl Real {
     ) -> Real {
         let mut child = Self::spawn(&dir, port, log_mb);
         let pid = child.id() as i32;
+        if let Ok(mut pids) = REAL_PIDS.lock() {
+            pids.push((pid, dir.path().to_path_buf()));
+        }
         let sock = Self::socket(dir.path());
         let t0 = std::time::Instant::now();
         let mut last;
@@ -322,6 +480,9 @@ impl Real {
 
 impl Drop for Real {
     fn drop(&mut self) {
+        if let Ok(mut pids) = REAL_PIDS.lock() {
+            pids.retain(|(p, _)| *p != self.pid);
+        }
         if let Some(mut child) = self.child.lock().unwrap().take() {
             let _ = child.kill();
             let _ = child.wait();
@@ -356,6 +517,7 @@ impl TestServer {
 
     /// Like `start`, with the real server's byte log cap set to `log_mb` MiB.
     pub async fn start_with(cfg: TestServerConfig, log_mb: Option<u32>) -> TestServer {
+        arm_watchdog();
         if !is_real() {
             let mut cfg = cfg;
             let key =
@@ -383,6 +545,7 @@ impl TestServer {
 
     /// A new server process on `port` with the state of a stopped one.
     pub async fn start_again(saved: Saved, port: u16) -> TestServer {
+        arm_watchdog();
         match saved {
             Saved::Mock { key, panes } => {
                 let cfg = TestServerConfig {
