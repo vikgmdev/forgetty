@@ -398,6 +398,13 @@ mod tests {
         (reader.join().unwrap(), status, t0.elapsed())
     }
 
+    fn monotonic_ns() -> u64 {
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        // SAFETY: clock_gettime with a valid out pointer.
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+        ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+    }
+
     fn die_of_sigill() {
         // No core file: a crash handler such as apport would add seconds to the test.
         // SAFETY: setrlimit with a valid struct.
@@ -513,6 +520,9 @@ mod tests {
             "second_thread_gives_up" => {
                 install();
                 IN_HANDLER.store(1, Ordering::SeqCst);
+                // Tell the parent when the fault starts, on the clock both processes share, so the
+                // test times the wait itself and not the process start-up under load.
+                eprintln!("fault-at-ns {}", monotonic_ns());
                 die_of_sigill();
             }
             _ => {}
@@ -618,7 +628,15 @@ mod tests {
     fn a_second_faulting_thread_gives_up_after_the_bounded_wait() {
         let _serial = serial();
         let (err, status, took) = run_child("second_thread_gives_up", "crash::tests::child_dies");
+        let ended = monotonic_ns();
         // Without the bound the child would hang until `run_child` kills it (SIGKILL).
         assert_eq!(status.signal(), Some(libc::SIGILL), "waited too long ({took:?}): {err}");
+        let start: u64 = err
+            .lines()
+            .find_map(|l| l.strip_prefix("fault-at-ns "))
+            .and_then(|n| n.trim().parse().ok())
+            .unwrap_or_else(|| panic!("no fault time in: {err}"));
+        let waited = Duration::from_nanos(ended.saturating_sub(start));
+        assert!(waited < Duration::from_secs(5), "the wait is not bounded to 100 ms ({waited:?}): {err}");
     }
 }
