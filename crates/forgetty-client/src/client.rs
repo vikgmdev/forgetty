@@ -57,7 +57,8 @@ const INPUT_CHUNK: usize = 16 * 1024;
 /// - While a token is left, a link the server answered (`heard`, or resumed)
 ///   is redialed at once and a silent one climbs the backoff ladder.
 /// - With no token, the client sleeps the ladder step for the current streak
-///   of short sessions, heard or not.
+///   of short sessions, heard or not. The bucket does not refill during that
+///   sleep.
 ///
 /// `reconnect_now` and `network_changed` can cut a sleep but never add a
 /// token. So a server that answers once and closes cannot make the client
@@ -1368,7 +1369,7 @@ async fn supervise(shared: Arc<Shared>) {
                 } else {
                     let now = Instant::now();
                     tokens = (tokens
-                        + now.duration_since(refilled).as_secs_f64() / REDIAL_REFILL.as_secs_f64())
+                        + now.saturating_duration_since(refilled).as_secs_f64() / REDIAL_REFILL.as_secs_f64())
                     .min(REDIAL_BURST);
                     refilled = now;
                     let step = backoff(streak);
@@ -1384,6 +1385,9 @@ async fn supervise(shared: Arc<Shared>) {
                         if resumed { None } else { Some(backoff(failures - 1)) }
                     } else {
                         info!("client: redial bucket empty, sleeping {step:?}");
+                        // The sleep earns no tokens: a broken server settles at
+                        // the ladder cap instead of drawing on the refill.
+                        refilled = now + step;
                         Some(step)
                     }
                 }

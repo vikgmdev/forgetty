@@ -314,9 +314,9 @@ known gap, section 12).
   to a `session_init` request) or that finished `session_init` is redialed at
   once, and a silent link climbs the ladder above. With no token the client
   sleeps the ladder step for the current streak of short sessions, heard or
-  not. `reconnect_now()` and `network_changed()` can cut a sleep and never add
+  not, and the bucket does not refill during that sleep. `reconnect_now()` and `network_changed()` can cut a sleep and never add
   a token. So a server that answers once and closes gets about 10 dials, then
-  one every 2 s plus the refill (about 35 in 30 s), not a tight loop.
+  one every 2 s (about 25 in 30 s), not a tight loop.
 - **Redial speed.** Once the server is reachable again the client is connected
   within 1 s. A QUIC connect that gets no answer repeats its first packet only
   after a timeout that starts near 1 s and doubles, so one long attempt would
