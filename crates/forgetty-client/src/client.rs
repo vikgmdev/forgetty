@@ -1278,6 +1278,10 @@ async fn supervise(shared: Arc<Shared>) {
             // Replaced just now and the bind failed: the loop above retries.
             continue;
         };
+        // A `reconnect_now` from before this dial wanted this dial, so it is
+        // spent. One that comes during or after it stays stored: if the link
+        // dies at once, it cuts the backoff that follows.
+        drain_permit(&shared.wake_backoff).await;
         let attempt = tokio::time::timeout(shared.opts.dial_timeout, dial(&shared, ep));
         let result = tokio::select! {
             r = attempt => r,
@@ -1296,9 +1300,6 @@ async fn supervise(shared: Arc<Shared>) {
                 let started = Instant::now();
                 shared.connected_count.fetch_add(1, Ordering::SeqCst);
                 shared.replace_for.store(u64::MAX, Ordering::SeqCst);
-                // A `reconnect_now` that came during the dial left a permit:
-                // it must not skip the next backoff.
-                drain_permit(&shared.wake_backoff).await;
                 let (end, resumed) = run_session(&shared, est, &mut shutdown).await;
                 match end {
                     SessionEnd::Shutdown => break,

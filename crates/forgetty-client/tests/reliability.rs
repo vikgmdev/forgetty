@@ -608,3 +608,63 @@ async fn reconnect_now_ends_the_wait_after_a_failed_bind() {
     h.close().await;
     server.shutdown().await;
 }
+
+/// A `reconnect_now` during a dial must still count if the new link dies at
+/// once: the backoff after it (2 s by then) is cut, not waited out. Every
+/// link is closed 30 ms after it is up (before it resumed), so the backoff climbs to 2 s. The
+/// call comes in the middle of the sixth dial (it takes 400 ms).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reconnect_request_during_a_dial_cuts_the_backoff_after_a_link_that_dies_at_once() {
+    if common::real_only() {
+        return; // the delay is a mock server option
+    }
+    let server = TestServer::start(TestServerConfig {
+        handshake_delay: Duration::from_millis(400),
+        die_at_once: true,
+        ..Default::default()
+    })
+    .await;
+    let key = SecretKey::generate(&mut rand::rng());
+    let info = ClientInfo::new(Uuid::new_v4(), ClientKind::Cli, "dies-at-once", "0");
+    let h = Client::spawn(server.addr(), key, info, ClientOptions::default()).await.unwrap();
+    // The session subscribes to events first, and the server never answers: the
+    // link dies before it has resumed, so the redial backs off.
+    let _events = h.events().await.unwrap();
+    let t0 = Instant::now();
+    // One dial can show as two handshakes (the client races its paths): count a
+    // dial when the number grows 100 ms or more after the last one.
+    let mut at: Vec<Duration> = Vec::new();
+    let mut seen = 0u64;
+    let mut wait_dial = |at: &mut Vec<Duration>, limit: Duration| {
+        let start = Instant::now();
+        let want = at.len() + 1;
+        while at.len() < want {
+            let n = server.handshakes();
+            let now = t0.elapsed();
+            if n > seen {
+                seen = n;
+                if at.last().is_none_or(|l| now - *l >= Duration::from_millis(100)) {
+                    at.push(now);
+                }
+            }
+            assert!(start.elapsed() < limit, "dial {want} did not come, dials at {at:?}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
+    // Dials 1 to 5: each link dies before it resumes, the backoff after the fifth is 2 s.
+    for _ in 0..5 {
+        wait_dial(&mut at, Duration::from_secs(10));
+    }
+    // The sixth dial starts when that backoff ends and takes 400 ms.
+    tokio::time::sleep(Duration::from_millis(2000 + 200)).await;
+    h.reconnect_now();
+    wait_dial(&mut at, Duration::from_secs(5));
+    let sixth = Instant::now();
+    // The link dies 30 ms later. The seventh dial must follow at once (a dial
+    // takes 400 ms), not after the 2 s backoff.
+    wait_dial(&mut at, Duration::from_millis(1200));
+    let seventh = sixth.elapsed();
+    println!("dials at {at:?}, the seventh {seventh:?} after the sixth");
+    h.close().await;
+    server.shutdown().await;
+}

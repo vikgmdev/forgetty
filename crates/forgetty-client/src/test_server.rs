@@ -60,6 +60,9 @@ pub struct TestServerConfig {
     pub own_runtime: bool,
     /// Wait this long between reading `Hello` and answering `Welcome`.
     pub handshake_delay: Duration,
+    /// Answer no request: close the connection 30 ms after the `Welcome`.
+    /// The client's dial succeeds and the link dies before it resumes.
+    pub die_at_once: bool,
 }
 
 impl Default for TestServerConfig {
@@ -82,6 +85,7 @@ impl Default for TestServerConfig {
             panes: Vec::new(),
             own_runtime: false,
             handshake_delay: Duration::ZERO,
+            die_at_once: false,
         }
     }
 }
@@ -663,6 +667,11 @@ async fn handle_rpc(conn: Connection, state: Arc<State>) {
         return;
     }
     state.handshakes.fetch_add(1, Ordering::SeqCst);
+    if state.cfg.die_at_once {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        conn.close(TEST_DROP_CODE.into(), b"test die at once");
+        return;
+    }
     lock(&state.conns).push(conn.clone());
     let entry = ClientEntry {
         client_id: hello.client_id,
