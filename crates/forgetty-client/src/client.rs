@@ -699,7 +699,14 @@ impl Shared {
             self.holders.abort_all();
             let weak = Arc::downgrade(&old.ep);
             // The socket may be dead, so the peers will not ack: wait briefly.
-            let _ = tokio::time::timeout(REPLACE_CLOSE_GRACE, old.ep.close()).await;
+            let closing = Instant::now();
+            let closed = tokio::time::timeout(REPLACE_CLOSE_GRACE, old.ep.close()).await.is_ok();
+            info!(
+                "client: old endpoint {} after {:?} (grace {REPLACE_CLOSE_GRACE:?}, closing started: {})",
+                if closed { "closed" } else { "still closing" },
+                closing.elapsed(),
+                old.ep.is_closed()
+            );
             self.live_eps.fetch_sub(1, Ordering::SeqCst);
             drop(old);
             // Bind only when every clone is gone. The aborted tasks drop theirs

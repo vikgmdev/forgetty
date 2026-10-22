@@ -43,10 +43,7 @@ pub fn load_or_generate_at(path: &std::path::Path) -> anyhow::Result<SecretKey> 
 
 /// Returns the canonical path for the identity key file.
 pub fn identity_path() -> PathBuf {
-    dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("~/.local/share"))
-        .join("forgetty")
-        .join("identity.key")
+    forgetty_core::platform::data_dir().join("identity.key")
 }
 
 #[cfg(test)]

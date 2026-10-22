@@ -732,6 +732,8 @@ pub fn delete_vt_snapshot(pane_id: uuid::Uuid) {
 ///
 /// Typically `~/.local/share/forgetty/logs/`.
 pub fn logs_dir() -> PathBuf {
+    // A test process must not write pane logs into the real data directory.
+    forgetty_core::platform::isolate_if_test_process();
     data_dir().join("logs")
 }
 

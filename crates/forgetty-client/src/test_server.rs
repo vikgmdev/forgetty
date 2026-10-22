@@ -251,6 +251,8 @@ struct State {
     input_seq: Mutex<HashMap<(Uuid, Uuid), u64>>,
     dedup_drops: AtomicU64,
     hold_acks: AtomicBool,
+    /// While set and in the future, no `Pong` goes out (see [`TestServer::freeze`]).
+    frozen_until: Mutex<Option<std::time::Instant>>,
     server_id: Uuid,
     /// New for each start of the server, like the real one's.
     boot_id: Uuid,
@@ -326,6 +328,7 @@ impl TestServer {
             input_seq: Mutex::new(HashMap::new()),
             dedup_drops: AtomicU64::new(0),
             hold_acks: AtomicBool::new(false),
+            frozen_until: Mutex::new(None),
             server_id: Uuid::new_v4(),
             boot_id: Uuid::new_v4(),
             panes: Mutex::new(HashMap::new()),
@@ -581,6 +584,8 @@ impl TestServer {
     /// counts on the silence (a Ping with no Pong) is wrong.
     pub fn freeze(&self, duration: Duration) {
         let rt = self.rt.as_ref().expect("freeze needs TestServerConfig::own_runtime");
+        // Set before anything else: from here no Pong goes out until it ends.
+        *lock(&self.state.frozen_until) = Some(std::time::Instant::now() + duration);
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         for _ in 0..2 {
             let started = started_tx.clone();
@@ -798,7 +803,22 @@ async fn handle_rpc(conn: Connection, state: Arc<State>) {
                             .copied()
                             .unwrap_or(0)
                     };
-                    let _ = out_tx.send(ControlMsg::Pong { nonce, input_acked });
+                    // A frozen server answers nothing, and a Ping that gets
+                    // through a thread the freeze did not hold waits for the thaw.
+                    let thaw = (*lock(&state.frozen_until))
+                        .filter(|t| *t > std::time::Instant::now());
+                    match thaw {
+                        Some(t) => {
+                            let tx = out_tx.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep_until(t.into()).await;
+                                let _ = tx.send(ControlMsg::Pong { nonce, input_acked });
+                            });
+                        }
+                        None => {
+                            let _ = out_tx.send(ControlMsg::Pong { nonce, input_acked });
+                        }
+                    }
                     continue;
                 }
                 let ControlMsg::Request { id, method: m, params } = msg else { continue };

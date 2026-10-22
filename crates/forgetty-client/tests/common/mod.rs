@@ -807,6 +807,24 @@ impl TestServer {
                 let pid = r.pid;
                 // SAFETY: plain signals to a child we spawned.
                 unsafe { libc::kill(pid, libc::SIGSTOP) };
+                // `kill` returns when the signal is queued, not when the
+                // process has stopped: on a busy host a Ping can still be
+                // answered meanwhile. Return when every thread is stopped.
+                let t0 = std::time::Instant::now();
+                loop {
+                    let stopped = std::fs::read_dir(format!("/proc/{pid}/task")).is_ok_and(|d| {
+                        d.flatten().all(|e| {
+                            let stat = std::fs::read_to_string(e.path().join("stat"))
+                                .unwrap_or_default();
+                            // "pid (comm) S ...": the state follows the last ')'.
+                            stat.rsplit(')').next().is_some_and(|r| r.trim_start().starts_with('T'))
+                        })
+                    });
+                    if stopped || t0.elapsed() > Duration::from_secs(5) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_micros(200));
+                }
                 std::thread::spawn(move || {
                     std::thread::sleep(duration);
                     unsafe { libc::kill(pid, libc::SIGCONT) };

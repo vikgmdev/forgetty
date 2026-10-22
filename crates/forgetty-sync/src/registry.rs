@@ -382,10 +382,7 @@ impl DeviceRegistry {
 
 /// Returns the canonical path for the authorized-devices file.
 pub fn registry_path() -> PathBuf {
-    dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("~/.local/share"))
-        .join("forgetty")
-        .join("authorized_devices.json")
+    forgetty_core::platform::data_dir().join("authorized_devices.json")
 }
 
 /// Returns the current UTC time as an ISO 8601 string.

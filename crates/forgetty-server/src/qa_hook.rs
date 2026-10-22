@@ -107,6 +107,7 @@ fn handle(
                 "input_drops": rpc.qa.input_drops.load(Ordering::SeqCst),
                 "auto_drops": rpc.qa.auto_drops.load(Ordering::SeqCst),
                 "too_many_closes": rpc.qa.too_many_closes.load(Ordering::SeqCst),
+                "sync_jobs": rpc.qa.sync_jobs.load(Ordering::SeqCst),
                 "stall_closes": rpc.qa.stall_closes.load(Ordering::SeqCst),
                 "alive_tasks": tokio::runtime::Handle::current().metrics().num_alive_tasks(),
                 "connections": rpc.connection_count(),

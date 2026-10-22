@@ -20,7 +20,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use crate::control_queue::ControlQueue;
@@ -91,8 +91,12 @@ const MAX_INFLIGHT: usize = 64;
 const DETACH_ANSWER_BOUND: Duration = Duration::from_millis(250);
 
 /// Marks of detached panes one connection keeps before it drops the old ones,
-/// and how many requests old a mark must be to go: no attach that can still be
-/// running is that old (at most [`MAX_INFLIGHT`] requests run at once).
+/// and how many requests old a mark must be to go. A mark of a pane that has
+/// an attach in flight is never dropped, however old: that attach may be
+/// stuck on a lock, and the mark is what stops it from starting a stream the
+/// client has stopped. Marks of other panes are bookkeeping for requests that
+/// finished, and a peer cannot grow them past [`MARKS_KEPT`] plus the panes
+/// with an attach in flight (at most [`MAX_INFLIGHT`]).
 const MARKS_KEPT: usize = 256;
 const MARK_AGE: u64 = 128;
 /// A connection whose Control queue stays (half) full this long without
@@ -343,6 +347,8 @@ pub struct Qa {
     pub auto_drops: AtomicU64,
     /// Connections closed for [`MAX_INFLIGHT`].
     pub too_many_closes: AtomicU64,
+    /// Size-policy syncs started by `detach_pane` (one per pane at a time).
+    pub sync_jobs: AtomicU64,
     /// Connections closed for [`STALL_LIMIT`].
     pub stall_closes: AtomicU64,
     /// Test only: `(pane, n)`. Each change makes the streams of `pane` take a
@@ -425,6 +431,7 @@ impl RpcV2 {
                 input_drops: AtomicU64::new(0),
                 auto_drops: AtomicU64::new(0),
                 too_many_closes: AtomicU64::new(0),
+                sync_jobs: AtomicU64::new(0),
                 stall_closes: AtomicU64::new(0),
                 force_catchup,
                 #[cfg(feature = "qa-tools")]
@@ -1584,6 +1591,8 @@ struct Session {
     req_n: AtomicU64,
     /// The pane streams of this connection, by the request that made them.
     ops: Mutex<PaneOps>,
+    /// The size-policy syncs that run now, one per pane.
+    syncs: SyncSlots,
     /// A `subscribe_events` was taken. The receiver goes to the control loop
     /// through `events_tx`.
     subscribed: AtomicBool,
@@ -1602,6 +1611,87 @@ struct PaneOps {
     /// The connection is ending: no stream starts any more.
     closed: bool,
     map: HashMap<Uuid, (u64, Option<AbortHandle>)>,
+    /// Attaches read from the control stream and not finished, by pane.
+    attaching: HashMap<Uuid, usize>,
+}
+
+/// An attach in flight for a pane. While one exists, the mark a detach left
+/// for that pane stays (see [`MARK_AGE`]).
+struct AttachTicket {
+    session: Arc<Session>,
+    pane: Uuid,
+}
+
+impl AttachTicket {
+    fn new(session: &Arc<Session>, pane: Uuid) -> Self {
+        *lock(&session.ops).attaching.entry(pane).or_insert(0) += 1;
+        AttachTicket { session: session.clone(), pane }
+    }
+}
+
+impl Drop for AttachTicket {
+    fn drop(&mut self) {
+        let mut ops = lock(&self.session.ops);
+        if let Some(n) = ops.attaching.get_mut(&self.pane) {
+            *n -= 1;
+            if *n == 0 {
+                ops.attaching.remove(&self.pane);
+            }
+        }
+    }
+}
+
+/// The size-policy syncs of one connection. A sync re-reads the final stream
+/// state of its pane, so one running sync per pane is enough: a request that
+/// finds one running marks it dirty and the sync goes again. A peer that
+/// sends detaches while the policy lock is busy then holds at most one
+/// blocking thread per pane, not one per request.
+#[derive(Default)]
+struct SyncSlots {
+    /// Panes with a sync running, and whether it must go again.
+    running: Mutex<HashMap<Uuid, bool>>,
+    done: Condvar,
+}
+
+impl SyncSlots {
+    /// `true`: the caller runs the sync. `false`: one runs, and goes again.
+    fn claim(&self, pane: Uuid) -> bool {
+        let mut running = lock(&self.running);
+        match running.get_mut(&pane) {
+            Some(dirty) => {
+                *dirty = true;
+                false
+            }
+            None => {
+                running.insert(pane, false);
+                true
+            }
+        }
+    }
+
+    /// A pass ended. `true`: it was marked dirty, go again.
+    fn pass_done(&self, pane: Uuid) -> bool {
+        let mut running = lock(&self.running);
+        match running.get_mut(&pane) {
+            Some(dirty) if *dirty => {
+                *dirty = false;
+                true
+            }
+            _ => {
+                running.remove(&pane);
+                self.done.notify_all();
+                false
+            }
+        }
+    }
+
+    /// Block until no sync runs for `pane`.
+    fn wait_idle(&self, pane: Uuid) {
+        let mut running = lock(&self.running);
+        while running.contains_key(&pane) {
+            running = self.done.wait(running).unwrap_or_else(|e| e.into_inner());
+        }
+    }
 }
 
 impl Session {
@@ -1623,6 +1713,7 @@ impl Session {
             caps,
             req_n: AtomicU64::new(0),
             ops: Mutex::new(PaneOps::default()),
+            syncs: SyncSlots::default(),
             subscribed: AtomicBool::new(false),
             events_tx,
             events_rx: Mutex::new(Some(events_rx)),
@@ -1976,13 +2067,16 @@ impl Session {
                 let Some(guard) = self.begin_task(inflight, out, 0) else { return false };
                 let (s, out) = (self.clone(), out.clone());
                 let n = self.req_n.fetch_add(1, Ordering::SeqCst);
+                // Counted here, in the order of the control stream, so a detach
+                // that follows keeps its mark for as long as this attach runs.
+                let parsed = from_value::<AttachPaneParams>(params).map_err(bad);
+                let ticket = parsed.as_ref().ok().map(|p| AttachTicket::new(self, p.pane_id));
                 work.spawn(async move {
                     let t = std::time::Instant::now();
                     let s2 = s.clone();
                     let r = tokio::task::spawn_blocking(move || {
-                        from_value::<AttachPaneParams>(params)
-                            .map_err(bad)
-                            .and_then(|p| s2.attach(n, p, guard))
+                        let _ticket = ticket;
+                        parsed.and_then(|p| s2.attach(n, p, guard))
                     })
                     .await
                     .unwrap_or_else(|e| Err((error_code::INTERNAL, format!("handler failed: {e}"))));
@@ -2008,14 +2102,20 @@ impl Session {
                             // only for DETACH_ANSWER_BOUND: a lock a busy pane
                             // holds must not keep a detach unanswered.
                             s.detach_stream(n, p.pane_id);
-                            let s2 = s.clone();
-                            let job = tokio::task::spawn_blocking(move || s2.sync_attached(p.pane_id));
-                            if tokio::time::timeout(DETACH_ANSWER_BOUND, job).await.is_err() {
-                                warn!(
-                                    "rpc2: detach_pane {} of client {} answered before the size \
-                                     policy was updated (a lock is busy)",
-                                    p.pane_id, s.client_id
-                                );
+                            // One sync per pane runs at a time. When one runs
+                            // already it goes again and sees this detach.
+                            if s.syncs.claim(p.pane_id) {
+                                let s2 = s.clone();
+                                let job = tokio::task::spawn_blocking(move || {
+                                    s2.run_claimed_sync(p.pane_id)
+                                });
+                                if tokio::time::timeout(DETACH_ANSWER_BOUND, job).await.is_err() {
+                                    warn!(
+                                        "rpc2: detach_pane {} of client {} answered before the \
+                                         size policy was updated (a lock is busy)",
+                                        p.pane_id, s.client_id
+                                    );
+                                }
                             }
                             to_value(&OkResult { ok: true }).map_err(bad)
                         }
@@ -2222,7 +2322,10 @@ impl Session {
         // still be running are dropped, so a peer cannot grow the map.
         ops.map.insert(pane, (n, None));
         if ops.map.len() > MARKS_KEPT {
-            ops.map.retain(|_, (seq, h)| h.is_some() || *seq + MARK_AGE > n);
+            let PaneOps { map, attaching, .. } = &mut *ops;
+            map.retain(|pane, (seq, h)| {
+                h.is_some() || *seq + MARK_AGE > n || attaching.contains_key(pane)
+            });
         }
     }
 
@@ -2234,6 +2337,29 @@ impl Session {
     /// applies the final state, and a client that closed in between is left
     /// as no one's.
     fn sync_attached(&self, pane: Uuid) {
+        if self.syncs.claim(pane) {
+            self.run_claimed_sync(pane);
+        } else {
+            // One runs and goes again after us, so the state we changed is
+            // applied before it ends. Wait for that: the answer of an attach
+            // promises the size policy knows about the stream.
+            self.syncs.wait_idle(pane);
+        }
+    }
+
+    /// Run the sync for `pane`, which the caller claimed with
+    /// [`SyncSlots::claim`]. Goes again while others marked it dirty.
+    fn run_claimed_sync(&self, pane: Uuid) {
+        self.rpc.qa.sync_jobs.fetch_add(1, Ordering::SeqCst);
+        loop {
+            self.sync_pass(pane);
+            if !self.syncs.pass_done(pane) {
+                return;
+            }
+        }
+    }
+
+    fn sync_pass(&self, pane: Uuid) {
         loop {
             let want = {
                 let ops = lock(&self.ops);

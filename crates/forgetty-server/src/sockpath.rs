@@ -28,7 +28,10 @@ pub fn current_uid() -> u32 {
 /// Private directory that holds the socket.
 pub fn socket_dir() -> PathBuf {
     match std::env::var_os("XDG_RUNTIME_DIR") {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir).join("forgetty"),
+        // `platform::runtime_dir` is the same path, and a test process never gets
+        // the real one from it.
+        Some(dir) if !dir.is_empty() => forgetty_core::platform::runtime_dir()
+            .unwrap_or_else(|| PathBuf::from(dir).join("forgetty")),
         _ => PathBuf::from(format!("/tmp/forgetty-{}", current_uid())),
     }
 }

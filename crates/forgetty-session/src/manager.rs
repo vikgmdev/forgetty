@@ -195,6 +195,9 @@ pub fn clamp_pane_dim(n: u16) -> u16 {
 impl SessionManager {
     /// Create a new, empty session manager.
     pub fn new() -> Self {
+        // Tests, benches and test servers build managers that spawn panes and
+        // write logs. In a test process those go to a temporary directory.
+        forgetty_core::platform::isolate_if_test_process();
         let event_tx = EventBus::new();
         Self {
             clients: crate::clients::ClientRegistry::new(),

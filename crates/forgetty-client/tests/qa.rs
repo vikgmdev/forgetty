@@ -2301,3 +2301,140 @@ async fn every_detach_is_answered_within_a_second_while_attaches_churn_and_the_l
     endpoint.close().await;
     server.shutdown().await;
 }
+
+/// A raw peer that records the ids of the answers it gets.
+async fn raw_control(
+    endpoint: &iroh::Endpoint,
+    server: &TestServer,
+) -> (
+    iroh::endpoint::Connection,
+    iroh::endpoint::SendStream,
+    Arc<std::sync::Mutex<std::collections::HashSet<u64>>>,
+) {
+    let conn = endpoint.connect(server.addr(), ALPN_RPC).await.unwrap();
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    let hello = Hello::new(
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        ClientKind::Cli,
+        "raw",
+        "0.0.0",
+        vec!["resume".to_string()],
+    );
+    write_msg(&mut send, &hello).await.unwrap();
+    match read_msg::<_, HandshakeReply>(&mut recv).await.unwrap() {
+        Some(HandshakeReply::Welcome(_)) => {}
+        other => panic!("handshake: {other:?}"),
+    }
+    let answered: Arc<std::sync::Mutex<std::collections::HashSet<u64>>> = Arc::default();
+    let seen = answered.clone();
+    tokio::spawn(async move {
+        while let Ok(Some(msg)) = read_msg::<_, ControlMsg>(&mut recv).await {
+            if let ControlMsg::Response { id, .. } | ControlMsg::Failure { id, .. } = msg {
+                seen.lock().unwrap().insert(id);
+            }
+        }
+    });
+    (conn, send, answered)
+}
+
+async fn detach_raw(send: &mut iroh::endpoint::SendStream, id: u64, pane: Uuid) {
+    let msg = ControlMsg::Request {
+        id,
+        method: "detach_pane".into(),
+        params: to_value(&json!({"pane_id": pane.to_string()})).unwrap(),
+    };
+    write_msg(send, &msg).await.unwrap();
+}
+
+/// Wait (up to `limit`) until `want` ids are answered.
+async fn answered_count(
+    answered: &Arc<std::sync::Mutex<std::collections::HashSet<u64>>>,
+    want: usize,
+    limit: Duration,
+) {
+    let t0 = Instant::now();
+    while answered.lock().unwrap().len() < want {
+        assert!(
+            t0.elapsed() < limit,
+            "{} of {want} requests answered",
+            answered.lock().unwrap().len()
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// With the size policy lock held for 3 s, 500 detaches of 2 panes start at
+/// most one size-policy sync per pane. Each one would hold a blocking thread.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn detaches_start_at_most_one_size_sync_per_pane() {
+    if !real_only() {
+        return;
+    }
+    let server = TestServer::start(TestServerConfig::default()).await;
+    let panes = [
+        server.add_script_pane("stty raw -echo; exec cat"),
+        server.add_script_pane("stty raw -echo; exec cat"),
+    ];
+    let endpoint = raw_endpoint(&server).await;
+    let (conn, mut send, answered) = raw_control(&endpoint, &server).await;
+    let jobs = |s: &TestServer| qa_state(s)["sync_jobs"].as_u64().unwrap();
+    let before = jobs(&server);
+    server.socket_call("qa_hold_sizes", json!({"ms": 3000})).unwrap();
+    let mut sent = 0usize;
+    for batch in 0..10u64 {
+        for i in 0..50u64 {
+            detach_raw(&mut send, batch * 50 + i + 1, panes[(i % 2) as usize]).await;
+            sent += 1;
+        }
+        // 50 in flight at most; the first of each pane waits its 250 ms.
+        answered_count(&answered, sent, Duration::from_secs(5)).await;
+    }
+    let started = jobs(&server) - before;
+    println!("500 detaches under a held size policy lock: {started} syncs started");
+    assert!(started <= 2, "{started} syncs started for 500 detaches of 2 panes");
+    // The lock is let go: nothing is left attached or pending.
+    wait_for("the size policy to be clean", || {
+        qa_state(&server)["attached_clients"].as_u64().unwrap() == 0
+    })
+    .await;
+    conn.close(0u32.into(), b"done");
+    endpoint.close().await;
+    server.shutdown().await;
+}
+
+/// An attach stuck on a lock, then a detach of its pane and 300 detaches of
+/// panes that do not exist: the mark of the real pane stays, so the late
+/// attach starts no stream the client had stopped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_attach_does_not_start_a_stream_after_its_detach_and_a_flood_of_marks() {
+    if !real_only() {
+        return;
+    }
+    let server = TestServer::start(TestServerConfig::default()).await;
+    let pane = server.add_script_pane("stty raw -echo; exec cat");
+    let endpoint = raw_endpoint(&server).await;
+    let (conn, mut send, answered) = raw_control(&endpoint, &server).await;
+    server.socket_call("qa_attach_delay", json!({"ms": 2500})).unwrap();
+    attach_raw(&mut send, 1, pane).await;
+    // The attach is read and counted before the detaches follow.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    server.socket_call("qa_attach_delay", json!({"ms": 0})).unwrap();
+    detach_raw(&mut send, 2, pane).await;
+    let mut sent = 1usize;
+    for batch in 0..8u64 {
+        for i in 0..40u64 {
+            detach_raw(&mut send, 3 + batch * 40 + i, Uuid::new_v4()).await;
+            sent += 1;
+        }
+        answered_count(&answered, sent, Duration::from_secs(5)).await;
+    }
+    // The stuck attach answers last.
+    answered_count(&answered, sent + 1, Duration::from_secs(10)).await;
+    let stream = tokio::time::timeout(Duration::from_millis(700), conn.accept_uni()).await;
+    assert!(stream.is_err(), "the late attach started a stream the client had stopped");
+    assert_eq!(qa_state(&server)["attached_clients"].as_u64().unwrap(), 0);
+    conn.close(0u32.into(), b"done");
+    endpoint.close().await;
+    server.shutdown().await;
+}
