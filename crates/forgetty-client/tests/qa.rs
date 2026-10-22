@@ -1332,6 +1332,7 @@ async fn capture_right_after_a_full_ring_answers() {
             .unwrap_or_else(|e| panic!("capture {i} failed: {e}"));
         let text = r["text"].as_str().expect("text");
         assert!(text.contains("DONE_MARKER"), "capture {i}: {text:?}");
+        assert_eq!(r["incomplete"], json!(false), "capture {i} ran out of time");
     }
     server.shutdown().await;
 }

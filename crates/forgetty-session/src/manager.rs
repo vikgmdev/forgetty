@@ -2340,7 +2340,7 @@ impl SessionManager {
         id: PaneId,
         trim: bool,
         last_lines: Option<usize>,
-    ) -> Option<String> {
+    ) -> Option<crate::capture::Captured> {
         let (rows, cols, replay) = {
             let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             let inner = &mut *guard;
@@ -2351,8 +2351,8 @@ impl SessionManager {
             (rows, cols, replay)
         };
         // Only two VT builds run at once, capture and snapshot together.
-        let _permit = crate::vt_gate::vt_gate().acquire();
-        Some(crate::capture::capture_text(&replay, rows, cols, trim, last_lines))
+        let _permit = crate::vt_gate::vt_gate().acquire_capture();
+        Some(crate::capture::capture(&replay, rows, cols, trim, last_lines))
     }
 
     /// Snapshot catch-up (AD-023): the pane's current screen as VT bytes, built
@@ -2369,7 +2369,7 @@ impl SessionManager {
             let (replay, offset) = inner.byte_logs.get(&id)?.ring_copy();
             (pane.rows, pane.cols, replay, offset)
         };
-        let _permit = crate::vt_gate::vt_gate().acquire();
+        let _permit = crate::vt_gate::vt_gate().acquire_snapshot();
         let bytes = crate::snapshot::build_snapshot(&replay, rows, cols);
         Some(PaneSnapshot { offset, rows, cols, bytes })
     }
@@ -5321,12 +5321,13 @@ mod tests {
         assert!(
             wait_for(|| sm
                 .capture_pane(pane, true, None)
-                .is_some_and(|t| t.contains("captured-line")))
+                .is_some_and(|t| t.text.contains("captured-line")))
             .await,
             "capture shows the line"
         );
         let text = sm.capture_pane(pane, true, Some(1)).unwrap();
-        assert_eq!(text.lines().count(), 1);
+        assert_eq!(text.text.lines().count(), 1);
+        assert!(!text.incomplete);
         assert!(sm.capture_pane(PaneId::new(), true, None).is_none());
         sm.close_pane(pane).unwrap();
     }

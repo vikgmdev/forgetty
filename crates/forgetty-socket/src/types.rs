@@ -406,6 +406,9 @@ pub struct CaptureParams {
 pub struct CaptureResult {
     /// Visible screen as text, one line per row.
     pub text: String,
+    /// `true` when the 1 s work limit ran out before the whole byte log was
+    /// read: `text` is the screen as far as it got. Always present.
+    pub incomplete: bool,
 }
 
 // ---------------------------------------------------------------------------

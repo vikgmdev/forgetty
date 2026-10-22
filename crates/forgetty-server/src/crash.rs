@@ -17,10 +17,16 @@ static mut OLD: [Option<libc::sigaction>; 32] = [None; 32];
 /// Set while the handler runs. A second fault inside it skips the report.
 static IN_HANDLER: AtomicUsize = AtomicUsize::new(0);
 
-/// Install the panic hook and the fatal signal handlers.
+static INSTALLED: std::sync::Once = std::sync::Once::new();
+
+/// Install the panic hook and the fatal signal handlers, once. A second call
+/// does nothing: it would save our own handler as the "old" one and call it
+/// again from inside the handler.
 pub fn install() {
-    install_panic_hook();
-    install_signal_handlers();
+    INSTALLED.call_once(|| {
+        install_panic_hook();
+        install_signal_handlers();
+    });
 }
 
 fn install_panic_hook() {
@@ -84,13 +90,16 @@ extern "C" fn on_fatal_signal(
     // raising the signal again, so the process still dies of it.
     unsafe {
         if let Some(o) = old {
-            if o.sa_sigaction != libc::SIG_DFL
-                && o.sa_sigaction != libc::SIG_IGN
-                && o.sa_flags & libc::SA_SIGINFO != 0
-            {
-                let f: extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void) =
-                    std::mem::transmute(o.sa_sigaction);
-                f(sig, info, ctx);
+            if o.sa_sigaction != libc::SIG_DFL && o.sa_sigaction != libc::SIG_IGN {
+                if o.sa_flags & libc::SA_SIGINFO != 0 {
+                    let f: extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void) =
+                        std::mem::transmute(o.sa_sigaction);
+                    f(sig, info, ctx);
+                } else {
+                    // A plain `sa_handler`: it takes the signal number only.
+                    let f: extern "C" fn(libc::c_int) = std::mem::transmute(o.sa_sigaction);
+                    f(sig);
+                }
             }
         }
         let mut dfl: libc::sigaction = std::mem::zeroed();

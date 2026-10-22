@@ -509,6 +509,9 @@ async fn network_changed_with_a_stuck_socket_connects_on_a_fresh_endpoint() {
     println!("network_changed with a stuck socket: Connected after {took:?}");
     assert!(took < Duration::from_millis(1500), "Connected after {took:?}");
     assert_eq!(h.endpoint_id(), device, "the fresh endpoint keeps the device id");
+    // The old endpoint was closed before the new one was bound: never two
+    // with the same id, which would split its relay registration.
+    assert_eq!(h.live_endpoints_for_tests(), (1, 1), "one endpoint at a time");
 
     h.send_input(pane, b"after").await.unwrap();
     wait_until("all input", Duration::from_secs(5), || {
@@ -522,6 +525,7 @@ async fn network_changed_with_a_stuck_socket_connects_on_a_fresh_endpoint() {
         server.handshakes() > before && h.state().is_connected()
     })
     .await;
+    assert_eq!(h.live_endpoints_for_tests(), (1, 1));
     h.close().await;
     server.shutdown().await;
 }

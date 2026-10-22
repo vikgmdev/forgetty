@@ -16,7 +16,7 @@
 //! offsets afterwards.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -252,36 +252,11 @@ struct Ep {
 }
 
 /// A network change that leaves no connection this long afterwards makes the
-/// client bind a fresh endpoint and dial with it as well. iroh rebinds its UDP
-/// socket only after its own network probe, which can take 4 to 52 s.
+/// client replace its endpoint: close the old one, bind a fresh one with the
+/// same key and dial with that. Never two at once, so the endpoint id is
+/// registered once at the relay. iroh rebinds its UDP socket only after its own
+/// network probe, which can take 4 to 52 s.
 const NETWORK_FALLBACK: Duration = Duration::from_millis(1000);
-
-/// Close `ep` in the background, waiting at most [`CLOSE_GRACE`] for the peers.
-fn retire_endpoint(ep: Endpoint) {
-    if let Ok(rt) = tokio::runtime::Handle::try_current() {
-        rt.spawn(async move {
-            let _ = tokio::time::timeout(CLOSE_GRACE, ep.close()).await;
-        });
-    }
-}
-
-/// A spare endpoint that was bound for the race. Closed on drop unless it was
-/// taken for good with [`SpareGuard::keep`].
-struct SpareGuard(Option<Ep>);
-
-impl SpareGuard {
-    fn keep(mut self) -> Ep {
-        self.0.take().expect("kept once")
-    }
-}
-
-impl Drop for SpareGuard {
-    fn drop(&mut self) {
-        if let Some(e) = self.0.take() {
-            retire_endpoint(e.ep);
-        }
-    }
-}
 
 async fn bind_endpoint(
     opts: &ClientOptions,
@@ -304,12 +279,15 @@ pub(crate) struct Shared {
     endpoint: Mutex<Ep>,
     /// The key every endpoint of this client is bound with.
     identity: SecretKey,
-    /// A fresh endpoint bound after a network change, for the supervisor to
-    /// race against `endpoint`.
-    spare: Mutex<Option<Ep>>,
-    spare_ready: Notify,
-    rebuilding: AtomicBool,
+    /// Set by the network-change fallback to the value of `connected_count` it
+    /// saw (`u64::MAX` when nothing is asked): the supervisor replaces the
+    /// endpoint before its next dial, if no connection was made since.
+    replace_for: AtomicU64,
     next_ep_gen: AtomicU64,
+    /// Endpoints bound and not yet closed, and the most there ever were. One,
+    /// always (checked by the tests).
+    live_eps: AtomicUsize,
+    max_live_eps: AtomicUsize,
     /// Connections established so far.
     connected_count: AtomicU64,
     /// Test hook: dials on the endpoint of this bind number never connect.
@@ -409,10 +387,10 @@ impl Client {
         let shared = Arc::new(Shared {
             endpoint: Mutex::new(Ep { ep: endpoint, gen: 0 }),
             identity,
-            spare: Mutex::new(None),
-            spare_ready: Notify::new(),
-            rebuilding: AtomicBool::new(false),
+            replace_for: AtomicU64::new(u64::MAX),
             next_ep_gen: AtomicU64::new(1),
+            live_eps: AtomicUsize::new(1),
+            max_live_eps: AtomicUsize::new(1),
             connected_count: AtomicU64::new(0),
             stuck_gen: AtomicU64::new(u64::MAX),
             server,
@@ -456,8 +434,7 @@ impl Shared {
 }
 
 /// After [`NETWORK_FALLBACK`], and unless the network change was answered or a
-/// connection came up since, bind a fresh endpoint with the same key and hand
-/// it to the supervisor to race against the old one.
+/// connection came up since, ask the supervisor to replace the endpoint.
 fn spawn_fallback(shared: Arc<Shared>, seen: u64, pong_ok: Arc<AtomicBool>) {
     tokio::spawn(async move {
         let mut shutdown = shared.shutdown_tx.subscribe();
@@ -465,34 +442,41 @@ fn spawn_fallback(shared: Arc<Shared>, seen: u64, pong_ok: Arc<AtomicBool>) {
             () = tokio::time::sleep(NETWORK_FALLBACK) => {}
             _ = shutdown.changed() => return,
         }
-        let connected_again = |shared: &Shared| {
-            shared.link_tx.borrow().is_some()
-                && shared.connected_count.load(Ordering::SeqCst) != seen
-        };
-        if pong_ok.load(Ordering::SeqCst) || connected_again(&shared) || *shutdown.borrow() {
+        let connected_again = shared.link_tx.borrow().is_some()
+            && shared.connected_count.load(Ordering::SeqCst) != seen;
+        if pong_ok.load(Ordering::SeqCst) || connected_again || *shutdown.borrow() {
             return;
         }
-        if shared.rebuilding.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        info!("client: no connection {NETWORK_FALLBACK:?} after a network change, binding a fresh endpoint");
-        match bind_endpoint(&shared.opts, &shared.server, shared.identity.clone()).await {
-            Ok(ep) => {
-                let gen = shared.next_ep_gen.fetch_add(1, Ordering::SeqCst);
-                if connected_again(&shared) || *shutdown.borrow() {
-                    retire_endpoint(ep);
-                } else {
-                    let old = lock(&shared.spare).replace(Ep { ep, gen });
-                    if let Some(old) = old {
-                        retire_endpoint(old.ep);
-                    }
-                    shared.spare_ready.notify_one();
-                }
-            }
-            Err(e) => warn!("client: fresh endpoint failed to bind: {e}"),
-        }
-        shared.rebuilding.store(false, Ordering::SeqCst);
+        info!("client: no connection {NETWORK_FALLBACK:?} after a network change, replacing the endpoint");
+        shared.replace_for.store(seen, Ordering::SeqCst);
+        // Ends the dial in flight (it is on the endpoint that is going) or the
+        // backoff sleep. A live but silent link is closed by `network_changed`.
+        shared.kick.notify_one();
     });
+}
+
+impl Shared {
+    /// Close the endpoint and bind a new one with the same key, in that order:
+    /// only one exists at a time. Returns false if the bind failed (the
+    /// caller tries again).
+    async fn replace_endpoint(&self) -> bool {
+        let old = self.ep();
+        let _ = tokio::time::timeout(CLOSE_GRACE, old.ep.close()).await;
+        self.live_eps.fetch_sub(1, Ordering::SeqCst);
+        match bind_endpoint(&self.opts, &self.server, self.identity.clone()).await {
+            Ok(ep) => {
+                let now = self.live_eps.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_live_eps.fetch_max(now, Ordering::SeqCst);
+                let gen = self.next_ep_gen.fetch_add(1, Ordering::SeqCst);
+                *lock(&self.endpoint) = Ep { ep, gen };
+                true
+            }
+            Err(e) => {
+                warn!("client: fresh endpoint failed to bind: {e}");
+                false
+            }
+        }
+    }
 }
 
 struct HandleInner {
@@ -749,6 +733,13 @@ impl ClientHandle {
             shared.reset_backoff.store(true, Ordering::SeqCst);
             link.conn.close(close_code::OK.into(), b"network changed");
         }
+    }
+
+    /// Test hook: endpoints bound and not closed now, and the most at once.
+    #[doc(hidden)]
+    pub fn live_endpoints_for_tests(&self) -> (usize, usize) {
+        let s = self.shared();
+        (s.live_eps.load(Ordering::SeqCst), s.max_live_eps.load(Ordering::SeqCst))
     }
 
     /// Test hook: the socket of the current endpoint went away. The current
@@ -1013,6 +1004,21 @@ async fn supervise(shared: Arc<Shared>) {
         if *shutdown.borrow() {
             break;
         }
+        // A network change left no connection: replace the endpoint before
+        // dialing again. Only if nothing connected since, and the old endpoint
+        // is closed first. A failed bind is tried again after a short wait.
+        let want = shared.replace_for.load(Ordering::SeqCst);
+        if want == shared.connected_count.load(Ordering::SeqCst) {
+            if shared.replace_endpoint().await {
+                shared.replace_for.store(u64::MAX, Ordering::SeqCst);
+            } else {
+                tokio::select! {
+                    () = tokio::time::sleep(Duration::from_millis(500)) => {}
+                    _ = shutdown.changed() => {}
+                }
+                continue;
+            }
+        }
         attempt_no += 1;
         let attempt_started = Instant::now();
         debug!("client: dial #{attempt_no} starts (failures so far {failures})");
@@ -1021,7 +1027,7 @@ async fn supervise(shared: Arc<Shared>) {
         if shared.reset_backoff.swap(false, Ordering::SeqCst) {
             failures = 0;
         }
-        let attempt = tokio::time::timeout(shared.opts.dial_timeout, dial_racing(&shared));
+        let attempt = tokio::time::timeout(shared.opts.dial_timeout, dial(&shared, shared.ep()));
         let result = tokio::select! {
             r = attempt => r,
             _ = shutdown.changed() => continue,
@@ -1038,6 +1044,7 @@ async fn supervise(shared: Arc<Shared>) {
                 );
                 let started = Instant::now();
                 shared.connected_count.fetch_add(1, Ordering::SeqCst);
+                shared.replace_for.store(u64::MAX, Ordering::SeqCst);
                 let (end, resumed) = run_session(&shared, est, &mut shutdown).await;
                 match end {
                     SessionEnd::Shutdown => break,
@@ -1108,10 +1115,8 @@ async fn supervise(shared: Arc<Shared>) {
     // that is the peers' acks, and connections that were retired (or lost
     // across an outage) can take seconds to drain: an app that quits must not
     // wait for them.
-    if let Some(spare) = lock(&shared.spare).take() {
-        retire_endpoint(spare.ep);
-    }
     let _ = tokio::time::timeout(CLOSE_GRACE, shared.ep().ep.close()).await;
+    shared.live_eps.fetch_sub(1, Ordering::SeqCst);
     shared.state_tx.send_replace(final_state);
 }
 
@@ -1271,65 +1276,6 @@ async fn dial(shared: &Shared, ep: Ep) -> Result<Established, DialError> {
         }
     }
     Err(last)
-}
-
-/// [`dial`] on the current endpoint, and, once a network change has bound a
-/// fresh one, on that too. The first handshake wins. The winner's endpoint
-/// becomes the current one and the other is closed (bounded). A dial that lost
-/// is dropped: its connect attempts are retired, see [`Attempts`].
-async fn dial_racing(shared: &Shared) -> Result<Established, DialError> {
-    let old = shared.ep();
-    let a = dial(shared, old.clone());
-    tokio::pin!(a);
-    let mut spare = SpareGuard(None);
-    let mut b: Option<std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send + '_>>> = None;
-    let (mut a_done, mut b_done) = (false, false);
-    let mut last = DialError::Transient("no address".into());
-    loop {
-        if b.is_none() && !b_done {
-            if let Some(e) = lock(&shared.spare).take() {
-                debug!("client: racing a fresh endpoint (bind {})", e.gen);
-                b = Some(Box::pin(dial(shared, e.clone())));
-                spare = SpareGuard(Some(e));
-            }
-        }
-        if a_done && b.is_none() {
-            // The old endpoint failed. If a fresh one is being bound, wait for
-            // it. Otherwise this dial failed.
-            if b_done || !shared.rebuilding.load(Ordering::SeqCst) {
-                return Err(last);
-            }
-            shared.spare_ready.notified().await;
-            continue;
-        }
-        if a_done && b_done {
-            return Err(last);
-        }
-        let (r, from_spare) = tokio::select! {
-            r = &mut a, if !a_done => { a_done = true; (r, false) }
-            r = async { b.as_mut().expect("guarded").await }, if b.is_some() && !b_done => {
-                b_done = true;
-                (r, true)
-            }
-            () = shared.spare_ready.notified(), if b.is_none() && !b_done => continue,
-        };
-        match r {
-            Ok(est) => {
-                if from_spare {
-                    // The fresh endpoint carries the session from now on.
-                    let won = spare.keep();
-                    let previous = std::mem::replace(&mut *lock(&shared.endpoint), won);
-                    retire_endpoint(previous.ep);
-                }
-                return Ok(est);
-            }
-            Err(e @ DialError::Fatal(_)) => return Err(e),
-            Err(DialError::Transient(m)) => {
-                debug!("client: a dial failed: {m}");
-                last = DialError::Transient(m);
-            }
-        }
-    }
 }
 
 /// Did the peer close the connection with `not_authorized`?

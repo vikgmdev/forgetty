@@ -4,10 +4,25 @@
 //! and dropped. Nothing is kept between calls, and nothing runs on the PTY
 //! drain path.
 
+use std::time::{Duration, Instant};
+
 use forgetty_vt::{Terminal, ANSI_PALETTE_BLACK};
 
-/// Feed size per `vt_write` call.
-const FEED_CHUNK: usize = 64 * 1024;
+/// Feed size per `vt_write` call. Small, so the deadline is checked often: a
+/// few KiB of `ESC[2J` on a huge pane costs seconds.
+const FEED_CHUNK: usize = 4 * 1024;
+
+/// How long capture may feed the ring. When it runs out the screen as far as
+/// it got is returned, marked `incomplete`.
+pub const CAPTURE_DEADLINE: Duration = Duration::from_secs(1);
+
+/// A captured screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Captured {
+    pub text: String,
+    /// The [`CAPTURE_DEADLINE`] ran out before the whole ring was read.
+    pub incomplete: bool,
+}
 
 /// Most bytes of scrollback the capture terminal gets, for `last_lines` beyond
 /// the screen height. libghostty counts scrollback in bytes of page memory.
@@ -17,8 +32,11 @@ const MAX_SCRATCH_SCROLLBACK: usize = 2 * 1024 * 1024;
 /// page granularity (see `Terminal::with_scrollback`).
 const SCROLLBACK_BYTES_PER_CELL: usize = 24;
 
-/// Sequences that clear the whole screen: reset (RIS) and erase display.
-const RESET_MARKERS: [&[u8]; 2] = [b"\x1bc", b"\x1b[2J"];
+/// RIS: resets the screen and every mode.
+const RIS: &[u8] = b"\x1bc";
+
+/// Cursor home, then erase display.
+const HOME_CLEAR: &[u8] = b"\x1b[H\x1b[2J";
 
 /// Alternate screen mode switches (1049, 1047 and 47, set or reset).
 const ALT_SCREEN_PREFIXES: [&[u8]; 3] = [b"\x1b[?1049", b"\x1b[?1047", b"\x1b[?47"];
@@ -35,17 +53,64 @@ fn scrollback_for(rows: usize, cols: usize, last_lines: Option<usize>) -> usize 
     }
 }
 
+/// Does `buf` change state that a clear does not reset and that changes how
+/// later text lands: a scroll region (DECSTBM), a charset designation or shift,
+/// or auto-wrap (DECAWM)?
+fn changes_persistent_modes(buf: &[u8]) -> bool {
+    let mut i = 0;
+    while i < buf.len() {
+        match buf[i] {
+            0x0e | 0x0f => return true,
+            0x1b => match buf.get(i + 1) {
+                Some(b'(' | b')' | b'*' | b'+') => return true,
+                Some(b'[') => {
+                    let mut j = i + 2;
+                    let private = buf.get(j) == Some(&b'?');
+                    if private {
+                        j += 1;
+                    }
+                    let params_at = j;
+                    while j < buf.len() && (buf[j].is_ascii_digit() || buf[j] == b';') {
+                        j += 1;
+                    }
+                    if let Some(&fin) = buf.get(j) {
+                        if !private && fin == b'r' {
+                            return true;
+                        }
+                        if private
+                            && (fin == b'h' || fin == b'l')
+                            && buf[params_at..j].split(|&b| b == b';').any(|p| p == b"7")
+                        {
+                            return true;
+                        }
+                    }
+                    i = j.max(i + 1);
+                    continue;
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
 /// Where parsing starts. The whole ring when scrollback is wanted (history
-/// before a clear is part of it). Otherwise the last full-screen clear, since
-/// nothing before it shows on the screen, unless an alternate screen switch
-/// follows it (leaving the alternate screen shows the older primary screen).
-/// The ring start when there is no clear.
+/// before a clear is part of it). Otherwise the last RIS (it resets every
+/// mode, so nothing before it matters), or the last `ESC[H ESC[2J` when no
+/// scroll region, charset or auto-wrap change comes before it in the ring (a
+/// clear does not reset those, so text after it would land differently). A cut
+/// is not made when an alternate screen switch follows it: leaving the
+/// alternate screen shows the older primary screen. The ring start otherwise.
 fn parse_start(replay: &[u8], want_scrollback: bool) -> usize {
     if want_scrollback {
         return 0;
     }
     let last = |pat: &[u8]| replay.windows(pat.len()).rposition(|w| w == pat);
-    let Some(mark) = RESET_MARKERS.iter().filter_map(|m| last(m)).max() else { return 0 };
+    let ris = last(RIS);
+    let clear = last(HOME_CLEAR).filter(|&m| !changes_persistent_modes(&replay[..m]));
+    let Some(mark) = ris.max(clear) else { return 0 };
     let after = &replay[mark..];
     let switched = ALT_SCREEN_PREFIXES.iter().any(|p| after.windows(p.len()).any(|w| w == *p));
     if switched {
@@ -70,12 +135,40 @@ pub fn capture_text(
     trim: bool,
     last_lines: Option<usize>,
 ) -> String {
+    capture(replay, rows, cols, trim, last_lines).text
+}
+
+/// [`capture_text`] with the [`CAPTURE_DEADLINE`]: says whether it ran out.
+pub fn capture(
+    replay: &[u8],
+    rows: u16,
+    cols: u16,
+    trim: bool,
+    last_lines: Option<usize>,
+) -> Captured {
+    capture_with_deadline(replay, rows, cols, trim, last_lines, CAPTURE_DEADLINE)
+}
+
+pub fn capture_with_deadline(
+    replay: &[u8],
+    rows: u16,
+    cols: u16,
+    trim: bool,
+    last_lines: Option<usize>,
+    deadline: Duration,
+) -> Captured {
     let rows = rows.max(1) as usize;
     let cols = cols.max(1) as usize;
     let scrollback = scrollback_for(rows, cols, last_lines);
     let start = parse_start(replay, scrollback > 0);
     let mut term = Terminal::with_scrollback(rows, cols, [ANSI_PALETTE_BLACK; 16], scrollback);
+    let started = Instant::now();
+    let mut incomplete = false;
     for chunk in replay[start..].chunks(FEED_CHUNK) {
+        if started.elapsed() >= deadline {
+            incomplete = true;
+            break;
+        }
         term.feed(chunk);
     }
     let mut lines: Vec<String> = Vec::with_capacity(rows);
@@ -96,7 +189,7 @@ pub fn capture_text(
         let keep_from = lines.len().saturating_sub(n);
         lines.drain(..keep_from);
     }
-    lines.join("\n")
+    Captured { text: lines.join("\n"), incomplete }
 }
 
 /// Append the rows now in the viewport.
@@ -256,14 +349,70 @@ mod tests {
     }
 
     #[test]
-    fn a_clear_cuts_the_parse_unless_the_alternate_screen_switches_after_it() {
+    fn only_ris_or_home_clear_cut_the_parse() {
         let mut ring = vec![b'x'; 5000];
+        // A bare erase display is no mark.
         ring.extend_from_slice(b"\x1b[2Jtext");
-        assert_eq!(parse_start(&ring, false), 5000);
+        assert_eq!(parse_start(&ring, false), 0);
+        // Home + erase is, when nothing before it changes persistent modes.
+        ring.extend_from_slice(b"\x1b[H\x1b[2Jmore");
+        let mark = ring.len() - "\x1b[H\x1b[2Jmore".len();
+        assert_eq!(parse_start(&ring, false), mark);
         assert_eq!(parse_start(&ring, true), 0);
+        // RIS is.
+        ring.extend_from_slice(b"\x1bcafter");
+        assert_eq!(parse_start(&ring, false), ring.len() - "\x1bcafter".len());
+        // An alternate screen switch after the mark: no cut.
         ring.extend_from_slice(b"\x1b[?1049l");
         assert_eq!(parse_start(&ring, false), 0);
         assert_eq!(parse_start(b"plain", false), 0);
+    }
+
+    #[test]
+    fn a_persistent_mode_before_the_clear_means_no_cut() {
+        for before in [
+            &b"\x1b[1;23r"[..],
+            b"\x1b[r",
+            b"\x1b(0",
+            b"\x1b)B",
+            b"\x0e",
+            b"\x1b[?7l",
+            b"\x1b[?25;7h",
+        ] {
+            let mut ring = before.to_vec();
+            ring.extend_from_slice(b"text\x1b[H\x1b[2Jnew");
+            assert_eq!(parse_start(&ring, false), 0, "{before:?}");
+        }
+        // Other CSI sequences do not count.
+        let ring = b"\x1b[31m\x1b[?25l\x1b[10;5Htext\x1b[H\x1b[2Jnew".to_vec();
+        assert_eq!(parse_start(&ring, false), ring.len() - "\x1b[H\x1b[2Jnew".len());
+    }
+
+    /// apt: a scroll region keeps the last row for a status line. A clear does
+    /// not reset the region, so the text after it must scroll inside it.
+    #[test]
+    fn an_apt_style_scroll_region_and_status_line_survive_a_clear() {
+        let mut ring = Vec::new();
+        ring.extend_from_slice(b"\x1b[1;23r\x1b[24;1Hstatus A\x1b[23;1Hold\r\n");
+        ring.extend_from_slice(b"\x1b[H\x1b[2J");
+        ring.extend_from_slice(b"\x1b[24;1HProgress: 50%\x1b[23;1Hl1\r\nl2\r\nl3");
+        let out = capture_text(&ring, 24, 40, true, None);
+        let lines: Vec<&str> = out.split('\n').collect();
+        assert_eq!(lines.len(), 24);
+        assert_eq!(&lines[20..], ["l1", "l2", "l3", "Progress: 50%"]);
+    }
+
+    #[test]
+    fn a_ring_of_clears_on_a_huge_pane_answers_within_the_deadline() {
+        let ring = b"\x1b[2J".repeat(1_500_000); // 7.5 MB
+        let t0 = Instant::now();
+        let got = capture(&ring, 1000, 1000, true, None);
+        let took = t0.elapsed();
+        assert!(took < Duration::from_millis(1500), "took {took:?}");
+        assert!(got.incomplete, "the deadline should have run out");
+        assert_eq!(got.text, "");
+        // A short ring is complete.
+        assert!(!capture(b"hi", 24, 80, true, None).incomplete);
     }
 
     #[test]

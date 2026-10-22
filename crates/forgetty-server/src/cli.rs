@@ -785,8 +785,12 @@ pub fn capture(target: &str, trim: bool, lines: Option<u32>, json_out: bool) -> 
     }
     let result = client.call("capture", params)?;
     let text = result.get("text").and_then(Value::as_str).unwrap_or("");
+    let incomplete = result.get("incomplete").and_then(Value::as_bool).unwrap_or(false);
+    if incomplete {
+        eprintln!("warning: capture ran out of time, the screen below is incomplete");
+    }
     if json_out {
-        println!("{}", json!({ "pane_id": pane, "text": text }));
+        println!("{}", json!({ "pane_id": pane, "text": text, "incomplete": incomplete }));
     } else if !text.is_empty() {
         println!("{text}");
     }

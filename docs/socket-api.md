@@ -714,7 +714,7 @@ Kind: call. Protocol v2: yes.
 
 Read the visible screen of a pane as text.
 
-The server builds the screen from the pane's byte log on request. It needs no attached client. `trim` removes trailing spaces and blank lines. `last_lines` keeps the last N lines.
+The server builds the screen from the pane's byte log on request. It needs no attached client. `trim` removes trailing spaces and blank lines. `last_lines` keeps the last N lines (past the screen height they come from history). The work has a 1 s limit: if it runs out, `incomplete` is true and `text` is the screen as far as it got.
 
 Kind: call. Protocol v2: yes.
 
@@ -730,13 +730,14 @@ Kind: call. Protocol v2: yes.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
+| `incomplete` | boolean | yes | `true` when the 1 s work limit ran out before the whole byte log was read: `text` is the screen as far as it got. Always present. |
 | `text` | string | yes | Visible screen as text, one line per row. |
 
 **Example**
 
 ```json
 {"jsonrpc":"2.0","method":"capture","params":{"pane_id":"6f1c2a40-5b7e-4d3a-9c21-8e0d4b7a1f35","trim":true,"last_lines":20},"id":1}
-{"jsonrpc":"2.0","result":{"text":"$ echo hi\nhi\n$"},"id":1}
+{"jsonrpc":"2.0","result":{"text":"$ echo hi\nhi\n$","incomplete":false},"id":1}
 ```
 
 ### `pane_exit_status`

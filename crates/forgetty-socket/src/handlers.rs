@@ -937,7 +937,10 @@ pub(crate) fn handle_capture(request: &Request, sm: &SessionManager) -> Response
         },
     };
     match sm.capture_pane(id, trim, last_lines) {
-        Some(text) => Response::success(request.id.clone(), serde_json::json!({ "text": text })),
+        Some(got) => Response::success(
+            request.id.clone(),
+            serde_json::json!({ "text": got.text, "incomplete": got.incomplete }),
+        ),
         None => Response::error(
             request.id.clone(),
             protocol::INVALID_PARAMS,

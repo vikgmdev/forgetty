@@ -341,11 +341,13 @@ static METHODS: &[MethodSpec] = &[
         "Read the visible screen of a pane as text.",
         "The server builds the screen from the pane's byte log on request. It needs no \
          attached client. `trim` removes trailing spaces and blank lines. `last_lines` \
-         keeps the last N lines.",
+         keeps the last N lines (past the screen height they come from history). The work \
+         has a 1 s limit: if it runs out, `incomplete` is true and `text` is the screen as \
+         far as it got.",
         t::CaptureParams,
         t::CaptureResult,
         concat!(r#"{"pane_id":""#, pane!(), r#"","trim":true,"last_lines":20}"#),
-        r#"{"text":"$ echo hi\nhi\n$"}"#,
+        r#"{"text":"$ echo hi\nhi\n$","incomplete":false}"#,
         Some(|r, c| h::handle_capture(r, &c.sm))
     ),
     spec!(
