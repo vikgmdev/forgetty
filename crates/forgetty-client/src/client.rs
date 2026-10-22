@@ -396,6 +396,10 @@ pub(crate) struct Shared {
     connected_count: AtomicU64,
     /// Test hook: dials on the endpoint of this bind number never connect.
     stuck_gen: AtomicU64,
+    /// The generation of the last link the server answered or sent data on.
+    /// A link that was heard counts as healthy even if `session_init` was cut
+    /// off before it finished (it ends a moment after the data arrived).
+    heard_gen: AtomicU64,
     /// Test hook: the next this many binds fail, and how many did.
     fail_binds: AtomicU32,
     injected_bind_failures: AtomicU32,
@@ -508,6 +512,7 @@ impl Client {
             clones_at_bind: AtomicUsize::new(usize::MAX),
             connected_count: AtomicU64::new(0),
             stuck_gen: AtomicU64::new(u64::MAX),
+            heard_gen: AtomicU64::new(0),
             fail_binds: AtomicU32::new(0),
             injected_bind_failures: AtomicU32::new(0),
             server,
@@ -1694,7 +1699,10 @@ async fn run_session(
     link.fail_all(ClientError::ConnectionLost);
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
-    let resumed = link.resumed.load(Ordering::SeqCst);
+    // Resumed, or at least heard: the server answered a request or sent data on
+    // this link. A server that accepts and then says nothing before the link
+    // dies is not healthy.
+    let resumed = link.resumed.load(Ordering::SeqCst) || shared.heard_gen.load(Ordering::SeqCst) == gen;
     let not_authorized = matches!(
         conn.close_reason(),
         Some(ConnectionError::ApplicationClosed(c))
@@ -1758,11 +1766,16 @@ async fn control_reader(link: Arc<Link>, shared: Arc<Shared>, mut recv: RecvStre
     loop {
         match read_frame_into(&mut recv, &mut buf).await {
             Ok(true) => match decode_msg::<ControlMsg>(&buf) {
-                Ok(ControlMsg::Response { id, result }) => link.complete(id, Ok(result)),
+                Ok(ControlMsg::Response { id, result }) => {
+                    shared.heard_gen.store(link.gen, Ordering::SeqCst);
+                    link.complete(id, Ok(result))
+                }
                 Ok(ControlMsg::Failure { id, code, message }) => {
+                    shared.heard_gen.store(link.gen, Ordering::SeqCst);
                     link.complete(id, Err(ClientError::Server { code, message }))
                 }
                 Ok(ControlMsg::Event { seq, event }) => {
+                    shared.heard_gen.store(link.gen, Ordering::SeqCst);
                     let _ = shared.events_tx.send(EventItem::Server { seq, event });
                 }
                 Ok(ControlMsg::Pong { nonce, input_acked }) => {
@@ -2018,6 +2031,7 @@ async fn pane_reader(shared: Arc<Shared>, gen: u64, mut recv: RecvStream) -> Tas
     loop {
         match read_output_frame(&mut recv, &mut buf).await {
             Ok(true) => {
+                shared.heard_gen.store(gen, Ordering::SeqCst);
                 let Ok(permit) = pane.tx.reserve().await else {
                     return TaskEnd::Done;
                 };
