@@ -20,9 +20,12 @@ use uuid::Uuid;
 use crate::acl::{self, write_private};
 
 const MAX_MACHINES: usize = 32;
-/// Version of `machines.json`. 1: no pinned addresses (a direct address was only in the address
-/// cache). 2: `pinned_addrs` and `relays_disabled`.
+/// Version of `machines.json` written. 1: no pinned addresses (a direct address was only in the
+/// address cache). 2: `pinned_addrs` and `relays_disabled`. Both read the same way.
 const MACHINES_VERSION: u32 = 2;
+/// Retries (and the wait between them) when `machines.json` cannot be read before a write.
+const READ_RETRIES: u32 = 3;
+const READ_RETRY_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
 /// Most direct addresses kept from one pairing payload.
 const MAX_PINNED: usize = 8;
 /// The whole output of `forgetty pair` (an ASCII QR block, the payload line, status lines) is accepted.
@@ -155,8 +158,13 @@ impl MachineStore {
     }
 
     /// Paired machines. A missing or unreadable file is an empty list. An entry that does not
-    /// parse is skipped and logged, the rest load. A version 1 file is migrated once (see
-    /// `migrate_v1`).
+    /// parse is skipped and logged, the rest load.
+    ///
+    /// A version 1 file loads as it is: no machine gets a pinned address from the old address
+    /// cache. A direct address given at pairing before version 2 stays in the cache, where the
+    /// network and eviction rules apply. Pins are never audited, so a pinned LAN address that
+    /// DHCP hands to someone else would fail the identity check for good. A machine that moves to
+    /// a WireGuard-only server is paired again. The file becomes version 2 with its next write.
     pub fn machines(&self) -> Vec<StoredMachine> {
         let bytes = match std::fs::read(self.machines_path()) {
             Ok(b) => b,
@@ -170,34 +178,7 @@ impl MachineStore {
             eprintln!("forgetty-win: machines.json is not a machine list, ignoring it (a copy is kept before the next write)");
             return Vec::new();
         };
-        if file.version >= MACHINES_VERSION {
-            return file.machines;
-        }
-        self.migrate_v1(file.machines)
-    }
-
-    /// Before version 2 a direct address given at pairing (`direct_hint`: LAN, tests) was only
-    /// stored in the address cache, where it follows the network and eviction rules. Every
-    /// version 1 payload carried the default relay, so a machine whose only relay is that one
-    /// (or none) has its private cached addresses (LAN, WireGuard, loopback) moved to its pinned
-    /// list, once. Whether the server runs without a relay is unknowable here:
-    /// `relays_disabled` stays false (a server moved to `--no-relay` is paired again). The cache
-    /// is left as it is, so a downgrade followed by an upgrade migrates again. A machine with a
-    /// relay of its own is left alone: what its cache holds was learned, and pinning a learned
-    /// address would keep a stale one for good.
-    fn migrate_v1(&self, mut machines: Vec<StoredMachine>) -> Vec<StoredMachine> {
-        let cache = self.addr_cache();
-        for m in &mut machines {
-            if !m.pinned_addrs.is_empty() || !only_default_relay(&m.relays) {
-                continue;
-            }
-            let Ok(id) = m.node_id.parse::<EndpointId>() else { continue };
-            m.pinned_addrs = cache.get_everywhere(id).into_iter().filter(is_private_addr).collect();
-        }
-        if let Err(e) = self.save_machines(&machines) {
-            eprintln!("forgetty-win: machines.json migration: {e}");
-        }
-        machines
+        file.machines
     }
 
     /// Add a machine, or replace the entry with the same node id (keeping its
@@ -235,10 +216,26 @@ impl MachineStore {
     /// first. The new list is shorter than what was there, and the copy is the only way back.
     /// When the copy fails the write does not happen.
     fn keep_unreadable_copy(&self) -> io::Result<()> {
-        let bytes = match std::fs::read(self.machines_path()) {
-            Ok(b) => b,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(e),
+        let path = self.machines_path();
+        // An antivirus scan or the indexer can hold the file for a moment: 3 retries over 300 ms.
+        let mut attempt = 0;
+        let bytes = loop {
+            match std::fs::read(&path) {
+                Ok(b) => break b,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(e) if attempt < READ_RETRIES => {
+                    let _ = e;
+                    attempt += 1;
+                    std::thread::sleep(READ_RETRY_WAIT);
+                }
+                // The file is there and cannot be read: it is not replaced, and the caller sees why.
+                Err(e) => {
+                    return Err(io::Error::new(
+                        e.kind(),
+                        format!("cannot read {} before replacing it, so it was left alone: {e}", path.display()),
+                    ));
+                }
+            }
         };
         if parse_machines(&bytes, false).is_some_and(|f| f.skipped == 0) {
             return Ok(());
@@ -301,28 +298,6 @@ fn parse_machines(bytes: &[u8], log: bool) -> Option<LoadedMachines> {
         }
     }
     Some(LoadedMachines { version, machines, skipped })
-}
-
-/// The relay every version 1 pairing payload carried (`forgetty_sync::qr::DEFAULT_RELAY`).
-const DEFAULT_RELAY: &str = "https://euw1-1.relay.iroh.network/";
-
-/// No relay, or only the default one.
-fn only_default_relay(relays: &[String]) -> bool {
-    relays.iter().all(|r| r.trim_end_matches('/') == DEFAULT_RELAY.trim_end_matches('/'))
-}
-
-/// An address that only some networks have: private, link-local, CGNAT, ULA, loopback.
-fn is_private_addr(a: &SocketAddr) -> bool {
-    match a.ip() {
-        std::net::IpAddr::V4(v) => {
-            let o = v.octets();
-            v.is_private() || v.is_loopback() || v.is_link_local() || (o[0] == 100 && (o[1] & 0xc0) == 64)
-        }
-        std::net::IpAddr::V6(v) => {
-            let s = v.segments();
-            v.is_loopback() || (s[0] & 0xfe00) == 0xfc00 || (s[0] & 0xffc0) == 0xfe80
-        }
-    }
 }
 
 // ---- pairing ---------------------------------------------------------------
@@ -724,58 +699,6 @@ mod tests {
     }
 
     #[test]
-    fn a_version_1_machine_with_the_default_relay_pins_its_private_cached_address_once() {
-        let (default_relay, own_relay, no_cache) = (node(), node(), node());
-        let dir = tempfile::tempdir().unwrap();
-        let s = MachineStore::open(dir.path());
-        let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
-        // Every version 1 payload carried the default relay.
-        v1_file(
-            &s,
-            serde_json::json!([
-                {"id": a, "name": "lan", "node_id": default_relay, "relay": DEFAULT_RELAY},
-                {"id": b, "name": "relayed", "node_id": own_relay, "relay": "https://a.example.com/"},
-                {"id": c, "name": "plain", "node_id": no_cache, "relay": DEFAULT_RELAY},
-            ]),
-        );
-        let cache = AddrCache::new();
-        let (lan, wg, public, learned): (SocketAddr, SocketAddr, SocketAddr, SocketAddr) =
-            ("192.168.1.20:47297".parse().unwrap(), "10.230.1.14:47297".parse().unwrap(), "203.0.113.7:4000".parse().unwrap(), "192.168.9.9:1".parse().unwrap());
-        let (id_a, id_b): (EndpointId, EndpointId) = (default_relay.parse().unwrap(), own_relay.parse().unwrap());
-        cache.insert(id_a, public, local_network());
-        cache.add(id_a, wg, local_network());
-        cache.add(id_a, lan, local_network());
-        cache.insert(id_b, learned, local_network());
-        s.save_addr_cache(&cache).unwrap();
-
-        let list = s.machines();
-        let mut pinned = list[0].pinned_addrs.clone();
-        pinned.sort();
-        let mut want = vec![lan, wg];
-        want.sort();
-        assert_eq!(pinned, want, "private addresses only: the public one was learned");
-        assert!(!list[0].relays_disabled, "unknowable, so false");
-        assert_eq!(list[0].relays, vec![DEFAULT_RELAY.to_string()]);
-        assert!(list[1].pinned_addrs.is_empty(), "a relay of its own: what the cache holds was learned");
-        assert!(list[2].pinned_addrs.is_empty(), "nothing cached");
-        assert!(std::fs::read_to_string(s.machines_path()).unwrap().contains("\"version\": 2"));
-        // The cache is untouched.
-        let after = s.addr_cache();
-        assert_eq!(after.get_everywhere(id_a).len(), 3);
-        assert_eq!(after.get_everywhere(id_b), vec![learned]);
-
-        // Once: a later load does not pin what the client learns afterwards.
-        after.add(id_a, "172.16.0.5:1".parse().unwrap(), local_network());
-        s.save_addr_cache(&after).unwrap();
-        assert_eq!(s.machines()[0].pinned_addrs.len(), 2);
-
-        // A downgrade writes a version 1 file again; the next upgrade migrates again.
-        v1_file(&s, serde_json::json!([{"id": a, "name": "lan", "node_id": default_relay, "relay": DEFAULT_RELAY}]));
-        assert_eq!(s.machines()[0].pinned_addrs.len(), 3, "the cache still held the address");
-        assert!(bad_copies(&s).is_empty());
-    }
-
-    #[test]
     fn a_corrupt_entry_is_skipped_and_the_rest_load() {
         let (good, other) = (node(), node());
         let dir = tempfile::tempdir().unwrap();
@@ -825,16 +748,58 @@ mod tests {
     }
 
     #[test]
-    fn a_v1_file_with_a_bad_entry_is_copied_before_the_migration_rewrites_it() {
+    fn a_version_1_file_loads_as_it_is_and_pins_nothing() {
+        let (a, b) = (node(), node());
         let dir = tempfile::tempdir().unwrap();
         let s = MachineStore::open(dir.path());
-        let n = node();
-        v1_file(&s, serde_json::json!([{"id": Uuid::new_v4(), "name": "ok", "node_id": n}, {"id": 5}]));
+        v1_file(&s, serde_json::json!([{"id": Uuid::new_v4(), "name": "lan", "node_id": a, "relay": "https://euw1-1.relay.iroh.network/"}, {"id": 5}]));
+        // The hint given at pairing sits in the cache; it stays there.
+        let cache = AddrCache::new();
+        let id: EndpointId = a.parse().unwrap();
+        cache.insert(id, "192.168.1.20:47297".parse().unwrap(), local_network());
+        s.save_addr_cache(&cache).unwrap();
         let before = std::fs::read_to_string(s.machines_path()).unwrap();
-        assert_eq!(s.machines().len(), 1);
+
+        let list = s.machines();
+        assert_eq!(list.len(), 1);
+        assert!(list[0].pinned_addrs.is_empty() && !list[0].relays_disabled);
+        assert_eq!(s.addr_cache().get_everywhere(id).len(), 1);
+        assert_eq!(std::fs::read_to_string(s.machines_path()).unwrap(), before, "loading writes nothing");
+        assert!(bad_copies(&s).is_empty());
+
+        // The next write keeps a copy of the file with the bad entry, then writes version 2.
+        s.add(StoredMachine { id: Uuid::new_v4(), name: "new".into(), node_id: b, relays: Vec::new(), relays_disabled: false, pinned_addrs: Vec::new() }).unwrap();
         let copies = bad_copies(&s);
         assert_eq!(copies.len(), 1);
         assert_eq!(std::fs::read_to_string(&copies[0]).unwrap(), before);
+        assert!(std::fs::read_to_string(s.machines_path()).unwrap().contains("\"version\": 2"));
+        assert_eq!(s.machines().len(), 2);
+        assert_eq!(s.addr_cache().get_everywhere(id).len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_that_cannot_be_read_is_not_replaced_and_the_error_names_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let s = MachineStore::open(dir.path());
+        let m = StoredMachine { id: Uuid::new_v4(), name: "m".into(), node_id: node(), relays: Vec::new(), relays_disabled: false, pinned_addrs: Vec::new() };
+        s.add(m.clone()).unwrap();
+        let before = std::fs::read(s.machines_path()).unwrap();
+        std::fs::set_permissions(s.machines_path(), std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(s.machines_path()).is_ok() {
+            // Running as root: mode 000 does not stop the read, so the case cannot be made here.
+            std::fs::set_permissions(s.machines_path(), std::fs::Permissions::from_mode(0o600)).unwrap();
+            return;
+        }
+        let t0 = std::time::Instant::now();
+        let err = s.add(StoredMachine { id: Uuid::new_v4(), name: "n".into(), node_id: node(), ..m }).unwrap_err();
+        let took = t0.elapsed();
+        assert!(err.to_string().contains("machines.json"), "{err}");
+        assert!(took >= std::time::Duration::from_millis(300), "three retries over 300 ms ({took:?})");
+        std::fs::set_permissions(s.machines_path(), std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(std::fs::read(s.machines_path()).unwrap(), before, "the file was not replaced");
+        assert!(bad_copies(&s).is_empty());
     }
 
     #[test]

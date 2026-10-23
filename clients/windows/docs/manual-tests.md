@@ -195,11 +195,10 @@ port for this. Start a second one with its own `--state-dir` and port.
 - [ ] G6 Turn the tunnel off and on three times in a row, quickly. Expected: it ends "connected", no duplicated characters.
 - [ ] G7 Sleep the PC with the tunnel on, wake it. Expected: "connected" again within a few seconds of the tunnel being up.
 - [ ] G8 Switch the PC from wifi to tether with the tunnel on. Expected: as N1 (the tunnel follows the network).
-- [ ] G9 An upgrade from an older build: a machine paired on that build (it carries the default relay) keeps working.
-  If its server was reached on a LAN or WireGuard address, that address is now pinned and the sidebar still goes to
-  "connected". Note: the old file cannot say whether the server runs with `--no-relay`, so the machine is NOT marked
-  relayless. A server that is moved to `--no-relay` (WireGuard only) needs a re-pair on this PC: remove the machine
-  and pair again with the new `forgetty pair` output.
+- [ ] G9 An upgrade from an older build: a machine paired on that build keeps working. Nothing is pinned for it:
+  a direct address it was reached on stays in the address cache and follows the network. A server that is moved to
+  `--no-relay` (WireGuard only) needs a re-pair on this PC: remove the machine and pair again with the new
+  `forgetty pair` output.
 - [ ] G10 Break `machines.json` on purpose (put `{` in one entry, or cut the file in half) and start the app. Expected: the
   good machines still load (a half file loads none). Pair or remove a machine, then look in
   `%APPDATA%\forgetty\`: a `machines.json.bad-<seconds>` file holds the broken original. Nothing is lost silently.
