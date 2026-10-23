@@ -64,6 +64,47 @@ pub struct RunArgs {
     /// payload plus the cached direct address.
     #[arg(long)]
     pub n0_discovery: bool,
+
+    /// Bind the iroh endpoint to this IP address only, on the fixed port.
+    /// Repeat for several. Replaces `bind_addrs` in the config file. Without
+    /// either, every address is bound (the default). The pairing QR carries
+    /// these addresses.
+    #[arg(long = "bind", value_name = "IP")]
+    pub bind: Vec<String>,
+
+    /// Use no relay and publish nothing to n0: the server never contacts a
+    /// relay or n0 DNS. For a server that clients reach over WireGuard only.
+    /// Same as `relay = "none"` in the config file.
+    #[arg(long)]
+    pub no_relay: bool,
+}
+
+/// Parse the IP addresses of `--bind` or the config file.
+pub fn parse_bind_addrs(addrs: &[String]) -> anyhow::Result<Vec<std::net::IpAddr>> {
+    let mut out: Vec<std::net::IpAddr> = Vec::new();
+    for a in addrs {
+        let ip: std::net::IpAddr = a
+            .trim()
+            .trim_matches(|c| c == '[' || c == ']')
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid bind address {a:?}: {e} (an IP, no port)"))?;
+        if !out.contains(&ip) {
+            out.push(ip);
+        }
+    }
+    Ok(out)
+}
+
+/// Is the relay switched off, by `--no-relay` or `relay = "none"`? Any other
+/// value of `relay` is an error: a typo must not turn the relays on silently.
+pub fn relays_disabled(no_relay_flag: bool, relay_setting: Option<&str>) -> anyhow::Result<bool> {
+    match relay_setting.map(str::trim) {
+        None | Some("") => Ok(no_relay_flag),
+        Some(v) if v.eq_ignore_ascii_case("none") => Ok(true),
+        Some(v) => anyhow::bail!(
+            "invalid relay setting {v:?}: the only value is \"none\" (use relay_urls for relays)"
+        ),
+    }
 }
 
 /// Parse relay URLs from `--relay-url` or the config file.
@@ -697,10 +738,23 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
     // Relays: --relay-url replaces the config file list. None: iroh defaults.
     let relay_source = if args.relay_url.is_empty() { &config.relay_urls } else { &args.relay_url };
     let relay_urls = parse_relay_urls(relay_source)?;
+    let no_relay = relays_disabled(args.no_relay, config.relay.as_deref())?;
+    if no_relay && !relay_urls.is_empty() {
+        anyhow::bail!("relays are switched off (--no-relay / relay = \"none\") but relay URLs are set");
+    }
     // Own relays: no n0 discovery unless asked for (--n0-discovery).
-    let n0_discovery = relay_urls.is_empty() || args.n0_discovery;
+    let n0_discovery = !no_relay && (relay_urls.is_empty() || args.n0_discovery);
+    let bind_source = if args.bind.is_empty() { &config.bind_addrs } else { &args.bind };
+    let bind_addrs = parse_bind_addrs(bind_source)?;
+    if bind_addrs.is_empty() {
+        info!("bind: every address");
+    } else {
+        info!("bind: {}", bind_addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", "));
+    }
     info!("n0 discovery: {}", if n0_discovery { "on" } else { "off" });
-    if relay_urls.is_empty() {
+    if no_relay {
+        info!("relays: none (the server never contacts a relay or n0)");
+    } else if relay_urls.is_empty() {
         info!("relays: iroh defaults");
     } else {
         info!(
@@ -712,6 +766,8 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
         .bind_port(port)
         .relay_urls(relay_urls)
         .n0_discovery(n0_discovery)
+        .relays_disabled(no_relay)
+        .bind_addrs(bind_addrs)
         .transport_config(quic_config())
         .register_alpn(forgetty_proto::ALPN_RPC, rpc_v2.alpn_handler())
         .register_alpn(
@@ -936,6 +992,25 @@ mod tests {
         assert_eq!(parsed[0].to_string(), "https://relay.example.org/");
         assert_eq!(parsed[1].to_string(), "http://127.0.0.1:3340/");
         assert!(parse_relay_urls(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn bind_addresses_parse_and_dedupe() {
+        let got = parse_bind_addrs(&["10.230.1.14".into(), " 10.230.1.14 ".into(), "[::1]".into()])
+            .unwrap();
+        assert_eq!(got.len(), 2);
+        assert!(parse_bind_addrs(&[]).unwrap().is_empty());
+        assert!(parse_bind_addrs(&["10.0.0.1:47297".into()]).is_err());
+        assert!(parse_bind_addrs(&["not an ip".into()]).is_err());
+    }
+
+    #[test]
+    fn relay_none_and_the_flag_switch_relays_off_and_a_typo_is_an_error() {
+        assert!(!relays_disabled(false, None).unwrap());
+        assert!(relays_disabled(true, None).unwrap());
+        assert!(relays_disabled(false, Some("none")).unwrap());
+        assert!(relays_disabled(false, Some("NONE")).unwrap());
+        assert!(relays_disabled(false, Some("nope")).is_err());
     }
 
     #[test]

@@ -105,6 +105,19 @@ pub struct RevokeOutcome {
     pub durable: bool,
 }
 
+/// What an endpoint reaches out to besides its peers (see
+/// [`SyncEndpoint::outside_services`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutsideServices {
+    /// The relay the endpoint is homed on (none: it has no relay actor).
+    pub relay_urls: Vec<String>,
+    /// Address lookup services: n0 DNS publishing and resolving.
+    pub address_lookups: usize,
+    /// Packets sent or received through a relay, relay home changes and relay
+    /// paths opened, so far.
+    pub relay_activity: u64,
+}
+
 /// Builder for [`SyncEndpoint`].
 ///
 /// Construct via [`SyncEndpoint::builder`], chain zero or more
@@ -119,6 +132,8 @@ pub struct SyncEndpointBuilder {
     transport: Option<iroh::endpoint::QuicTransportConfig>,
     relay_urls: Vec<iroh::RelayUrl>,
     n0_discovery: bool,
+    relays_disabled: bool,
+    bind_addrs: Vec<std::net::IpAddr>,
 }
 
 impl SyncEndpointBuilder {
@@ -128,6 +143,25 @@ impl SyncEndpointBuilder {
     /// the pairing payload and the address cache, so nothing needs to be public.
     pub fn n0_discovery(mut self, on: bool) -> Self {
         self.n0_discovery = on;
+        self
+    }
+
+    /// No relay, no n0: the endpoint is built without iroh's N0 preset, with
+    /// `RelayMode::Disabled` and no address lookup service, so it never
+    /// contacts a relay or n0 DNS and publishes nothing. For a server that is
+    /// reached over a VPN (WireGuard) only. Overrides `relay_urls` and
+    /// `n0_discovery`.
+    pub fn relays_disabled(mut self, off: bool) -> Self {
+        self.relays_disabled = off;
+        self
+    }
+
+    /// Bind only these IP addresses, on the port of
+    /// [`bind_port`](Self::bind_port) (a random one without it). Empty (the
+    /// default) binds every address. A failed bind is an error: there is no
+    /// IPv4-only fallback for addresses the operator chose.
+    pub fn bind_addrs(mut self, addrs: Vec<std::net::IpAddr>) -> Self {
+        self.bind_addrs = addrs;
         self
     }
 
@@ -177,19 +211,33 @@ impl SyncEndpointBuilder {
         alpn_list.extend(self.extra_alpns.keys().cloned());
 
         let make = |dual: bool| -> Result<iroh::endpoint::Builder, SyncError> {
-            let mut builder = Endpoint::builder(presets::N0)
-                .secret_key(self.secret_key.clone())
-                .alpns(alpn_list.clone());
-            if !self.relay_urls.is_empty() {
+            let mut builder = if self.relays_disabled {
+                // Nothing of the N0 preset: no relays, no DNS publishing.
+                Endpoint::empty_builder().relay_mode(iroh::RelayMode::Disabled)
+            } else {
+                Endpoint::builder(presets::N0)
+            }
+            .secret_key(self.secret_key.clone())
+            .alpns(alpn_list.clone());
+            if !self.relays_disabled && !self.relay_urls.is_empty() {
                 builder = builder.relay_mode(iroh::RelayMode::custom(self.relay_urls.clone()));
             }
-            if !self.n0_discovery {
+            if !self.relays_disabled && !self.n0_discovery {
                 builder = builder.clear_address_lookup();
             }
             if let Some(t) = &self.transport {
                 builder = builder.transport_config(t.clone());
             }
-            if let Some(port) = self.bind_port {
+            if !self.bind_addrs.is_empty() {
+                builder = builder.clear_ip_transports();
+                let port = self.bind_port.unwrap_or(0);
+                for ip in &self.bind_addrs {
+                    let sa = std::net::SocketAddr::new(*ip, port);
+                    builder = builder
+                        .bind_addr(sa.to_string().as_str())
+                        .map_err(|e| SyncError::Bind(format!("{sa}: {e}")))?;
+                }
+            } else if let Some(port) = self.bind_port {
                 builder = builder
                     .clear_ip_transports()
                     .bind_addr(format!("0.0.0.0:{port}").as_str())
@@ -202,10 +250,12 @@ impl SyncEndpointBuilder {
             }
             Ok(builder)
         };
-        // IPv6 on the same port. A host without IPv6 binds IPv4 only.
+        // IPv6 on the same port. A host without IPv6 binds IPv4 only. Addresses
+        // the operator chose are bound as they are or not at all.
+        let chose_addrs = !self.bind_addrs.is_empty();
         let endpoint = match make(self.bind_port.is_some())?.bind().await {
             Ok(ep) => ep,
-            Err(e) if self.bind_port.is_some() => {
+            Err(e) if self.bind_port.is_some() && !chose_addrs => {
                 warn!(
                     "totem-sync: dual-stack bind on port {:?} failed ({e}), using IPv4 only",
                     self.bind_port
@@ -243,7 +293,9 @@ impl SyncEndpointBuilder {
             pairing: Arc::new(Mutex::new(PairingState::new())),
             extra_alpns: Arc::new(self.extra_alpns),
             relay_urls: self.relay_urls.iter().map(|u| u.to_string()).collect(),
-            n0_discovery: self.n0_discovery,
+            n0_discovery: self.n0_discovery && !self.relays_disabled,
+            relays_disabled: self.relays_disabled,
+            bind_addrs: self.bind_addrs.clone(),
             live: crate::connections::LiveConnections::new(),
             quic_open: Arc::new(AtomicUsize::new(0)),
             handshake_failures: Arc::new(AtomicUsize::new(0)),
@@ -272,6 +324,10 @@ pub struct SyncEndpoint {
     relay_urls: Vec<String>,
     /// Whether the n0 DNS discovery service is in use.
     n0_discovery: bool,
+    /// No relay and no n0 at all (see `SyncEndpointBuilder::relays_disabled`).
+    relays_disabled: bool,
+    /// The addresses the endpoint was told to bind (empty: every address).
+    bind_addrs: Vec<std::net::IpAddr>,
     /// Broadcast channel for pairing/connection events. Receivers are vended to
     /// socket RPC handlers via `subscribe()`.
     pub event_tx: broadcast::Sender<SyncEvent>,
@@ -299,6 +355,8 @@ impl SyncEndpoint {
             transport: None,
             relay_urls: Vec::new(),
             n0_discovery: true,
+            relays_disabled: false,
+            bind_addrs: Vec::new(),
         }
     }
 
@@ -316,6 +374,54 @@ impl SyncEndpoint {
     /// Whether the endpoint publishes to and resolves from n0 DNS discovery.
     pub fn n0_discovery(&self) -> bool {
         self.n0_discovery
+    }
+
+    /// `true` when the endpoint uses no relay and no n0 at all.
+    pub fn relays_disabled(&self) -> bool {
+        self.relays_disabled
+    }
+
+    /// The direct addresses clients can dial, when the endpoint was told which
+    /// addresses to bind: those, with the port it really listens on. Empty
+    /// when it listens on every address.
+    pub fn direct_addrs(&self) -> Vec<std::net::SocketAddr> {
+        if self.bind_addrs.is_empty() {
+            return Vec::new();
+        }
+        self.endpoint
+            .bound_sockets()
+            .into_iter()
+            .filter(|s| self.bind_addrs.contains(&s.ip()) && !s.ip().is_unspecified())
+            .collect()
+    }
+
+    /// What the endpoint reaches out to besides its peers. All of it is
+    /// empty or zero when relays are disabled.
+    pub fn outside_services(&self) -> OutsideServices {
+        let m = self.endpoint.metrics();
+        let s = &m.socket;
+        OutsideServices {
+            relay_urls: self.endpoint.addr().relay_urls().map(ToString::to_string).collect(),
+            address_lookups: self.endpoint.address_lookup().map_or(0, |l| l.len()),
+            relay_activity: s.send_relay.get()
+                + s.recv_data_relay.get()
+                + s.relay_home_change.get()
+                + s.transport_relay_paths_added.get(),
+        }
+    }
+
+    /// The pairing payload for this endpoint and a pairing `secret`: its
+    /// relays, or the flag that it has none and the direct addresses it is
+    /// bound to.
+    pub fn qr_payload(&self, secret: String) -> crate::qr::QrPayload {
+        let node_id = self.node_id().to_string();
+        if self.relays_disabled {
+            crate::qr::QrPayload::without_relays(node_id, secret, &self.direct_addrs())
+        } else {
+            let mut p = crate::qr::QrPayload::with_relays(node_id, secret, &self.relay_urls);
+            p.direct = self.direct_addrs().iter().map(ToString::to_string).collect();
+            p
+        }
     }
 
     /// The local UDP sockets the endpoint listens on.

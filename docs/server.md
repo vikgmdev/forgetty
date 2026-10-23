@@ -297,3 +297,32 @@ or set `relay_urls = ["https://relay.example.org"]` in
 `~/.config/forgetty/config.toml`. The pairing QR then carries the relay and the
 apps use it. How to run `iroh-relay` as a user service, with HTTPS and the
 firewall ports: `relay.md`.
+
+## WireGuard-only server
+
+A server that only the WireGuard tunnel reaches needs no relay and no outside
+service. Start it with a bind address and no relay:
+
+```sh
+forgetty server run --port 47297 --bind 10.230.1.14 --no-relay
+```
+
+or put the same in `~/.config/forgetty/config.toml`:
+
+```toml
+bind_addrs = ["10.230.1.14"]   # the WireGuard address of this machine
+relay = "none"
+```
+
+- `--bind IP` (repeatable) binds the iroh endpoint to these addresses only, on
+  the fixed `--port`. Without it the server binds every address.
+- `--no-relay` (or `relay = "none"`) turns relays off. The server never
+  contacts a relay or n0: no relay connection, no address publishing, no
+  discovery. It cannot be combined with `--relay-url`.
+- The pairing QR then carries no relay, a `relays_disabled` flag and the bound
+  addresses as `direct`. A client of an older version ignores the flag.
+- A paired client uses no relay either. It dials those addresses on every
+  network. When nothing answers it reports `unreachable_direct_only` so the
+  app can say "Can't reach the server. Is WireGuard on?".
+
+An example unit: `dist/systemd/forgetty-server-wireguard.service`.

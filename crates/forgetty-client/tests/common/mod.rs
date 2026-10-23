@@ -348,7 +348,7 @@ impl Real {
         PathBuf::from(std::env::var_os("FORGETTY_REAL_SERVER").expect("FORGETTY_REAL_SERVER"))
     }
 
-    fn spawn(dir: &Arc<tempfile::TempDir>, port: u16, log_mb: Option<u32>) -> Child {
+    fn spawn(dir: &Arc<tempfile::TempDir>, port: u16, log_mb: Option<u32>, extra: &[String]) -> Child {
         let root = dir.path();
         let wrapper = wrapper_path(root);
         if !wrapper.exists() {
@@ -359,6 +359,7 @@ impl Real {
         let mut cmd = Command::new(Self::binary());
         cmd.arg("--state-dir").arg(root.join("state"));
         cmd.args(["server", "run", "--port", &port.to_string()]);
+        cmd.args(extra);
         if let Some(mb) = log_mb {
             let cfg = root.join("config.toml");
             std::fs::write(
@@ -394,8 +395,9 @@ impl Real {
         own_runtime: bool,
         log_mb: Option<u32>,
         open_access_override: Option<bool>,
+        extra: &[String],
     ) -> Real {
-        let mut child = Self::spawn(&dir, port, log_mb);
+        let mut child = Self::spawn(&dir, port, log_mb, extra);
         let pid = child.id() as i32;
         if let Ok(mut pids) = REAL_PIDS.lock() {
             pids.push((pid, dir.path().to_path_buf()));
@@ -568,8 +570,20 @@ impl TestServer {
             cfg.own_runtime,
             log_mb,
             None,
+            &[],
         )
         .await;
+        TestServer { inner: Inner::Real(Box::new(real)) }
+    }
+
+    /// A real server started with extra `server run` arguments (`--bind`,
+    /// `--no-relay`). Real server only: the mock has no such options.
+    pub async fn start_real_with_args(extra: &[&str]) -> TestServer {
+        arm_watchdog();
+        assert!(is_real(), "start_real_with_args needs FORGETTY_REAL_SERVER");
+        let dir = Arc::new(tempfile::tempdir().expect("temp dir"));
+        let extra: Vec<String> = extra.iter().map(ToString::to_string).collect();
+        let real = Real::start(dir, 0, &[vec![]], None, false, None, None, &extra).await;
         TestServer { inner: Inner::Real(Box::new(real)) }
     }
 
@@ -587,7 +601,7 @@ impl TestServer {
                 Self::start(cfg).await
             }
             Saved::Real { dir, open_access } => {
-                let real = Real::start(dir, port, &[], None, false, None, Some(open_access)).await;
+                let real = Real::start(dir, port, &[], None, false, None, Some(open_access), &[]).await;
                 TestServer { inner: Inner::Real(Box::new(real)) }
             }
         }

@@ -52,6 +52,8 @@ fn qr_payload_becomes_a_server_address() {
         machine: "ovh".into(),
         relay: "https://relay.example.com/".into(),
         relays: Vec::new(),
+        relays_disabled: false,
+        direct: Vec::new(),
         secret: "ABC".into(),
     };
     let addr = qr_to_addr(&qr).unwrap();

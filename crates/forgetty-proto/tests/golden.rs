@@ -325,6 +325,8 @@ fn golden_qr_payload() {
         machine: "ovh".into(),
         relay: "https://r/".into(),
         relays: Vec::new(),
+        relays_disabled: false,
+        direct: Vec::new(),
         secret: "S".into(),
     };
     assert_eq!(
@@ -336,6 +338,42 @@ fn golden_qr_payload() {
         QrPayload::parse(r#"{"v":1,"node_id":"a","machine":"m","relay":"r","secret":"s"}"#),
         Err(QrError::Version(1))
     ));
+}
+
+#[test]
+fn golden_qr_payload_without_relays() {
+    let q = QrPayload {
+        v: 2,
+        node_id: "abc".into(),
+        machine: "ovh".into(),
+        relay: String::new(),
+        relays: Vec::new(),
+        relays_disabled: true,
+        direct: vec!["10.230.1.14:47297".into()],
+        secret: "S".into(),
+    };
+    assert_eq!(
+        q.to_json(),
+        r#"{"v":2,"node_id":"abc","machine":"ovh","relay":"","relays_disabled":true,"direct":["10.230.1.14:47297"],"secret":"S"}"#
+    );
+    let back = QrPayload::parse(&q.to_json()).unwrap();
+    assert_eq!(back, q);
+    assert_eq!(back.direct_addrs(), vec!["10.230.1.14:47297".parse().unwrap()]);
+    assert!(back.relay_urls().is_empty());
+    // An older client has no such fields and ignores them.
+    #[derive(serde::Deserialize)]
+    struct Old {
+        v: u32,
+        node_id: String,
+        machine: String,
+        relay: String,
+        #[serde(default)]
+        relays: Vec<String>,
+        secret: String,
+    }
+    let old: Old = serde_json::from_str(&q.to_json()).unwrap();
+    assert_eq!((old.v, old.node_id.as_str(), old.machine.as_str()), (2, "abc", "ovh"));
+    assert!(old.relay.is_empty() && old.relays.is_empty() && old.secret == "S");
 }
 
 #[test]

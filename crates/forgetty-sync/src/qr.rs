@@ -26,6 +26,15 @@ pub struct QrPayload {
     /// when empty, so a server without own relays writes the v2 payload as before.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub relays: Vec<String>,
+    /// The server uses no relay and publishes nothing to n0. `relay` is then
+    /// empty. Left out of the JSON when `false`, so an older client reads the
+    /// payload as before.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub relays_disabled: bool,
+    /// Direct addresses (`ip:port`) the server is bound to, when it was told
+    /// which ones to bind. Left out of the JSON when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub direct: Vec<String>,
     /// One-time pairing secret, 16 random bytes in base32 (AD-021).
     pub secret: String,
 }
@@ -43,6 +52,8 @@ impl QrPayload {
             machine,
             relay: DEFAULT_RELAY.to_string(),
             relays: Vec::new(),
+            relays_disabled: false,
+            direct: Vec::new(),
             secret,
         }
     }
@@ -57,6 +68,20 @@ impl QrPayload {
                 p.relays = relays.to_vec();
             }
         }
+        p
+    }
+
+    /// A payload for a server that uses no relay (WireGuard-only): no relay
+    /// URL, `relays_disabled` set, and the direct addresses it is bound to.
+    pub fn without_relays(
+        node_id_str: String,
+        secret: String,
+        direct: &[std::net::SocketAddr],
+    ) -> Self {
+        let mut p = Self::new(node_id_str, secret);
+        p.relay = String::new();
+        p.relays_disabled = true;
+        p.direct = direct.iter().map(ToString::to_string).collect();
         p
     }
 
@@ -129,6 +154,22 @@ pub fn qr_to_png(payload: &QrPayload, module_size: u32) -> Result<Vec<u8>, QrErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_payload_without_relays_carries_the_flag_and_the_direct_addresses() {
+        let direct: Vec<std::net::SocketAddr> = vec!["10.230.1.14:47297".parse().unwrap()];
+        let p = QrPayload::without_relays("n".into(), "S".into(), &direct);
+        assert!(p.relay.is_empty() && p.relays_disabled);
+        let json = p.to_json().unwrap();
+        assert!(json.contains("\"relays_disabled\":true"), "{json}");
+        assert!(json.contains("10.230.1.14:47297"), "{json}");
+    }
+
+    #[test]
+    fn a_payload_with_relays_writes_neither_new_field() {
+        let json = QrPayload::with_relays("n".into(), "S".into(), &[]).to_json().unwrap();
+        assert!(!json.contains("relays_disabled") && !json.contains("direct"), "{json}");
+    }
 
     #[test]
     fn default_payload_is_unchanged() {

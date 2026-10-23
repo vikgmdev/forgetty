@@ -469,6 +469,16 @@ pub struct QrPayload {
     /// payloads from servers with one relay and in older payloads.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub relays: Vec<String>,
+    /// The server uses no relay and publishes nothing to n0 (a WireGuard-only
+    /// server). `relay` is then empty and the client dials `direct` only.
+    /// Absent in payloads of servers that use relays, and in older payloads;
+    /// an older client ignores it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub relays_disabled: bool,
+    /// The direct addresses (`ip:port`) the server is bound to, when it was
+    /// told which ones to bind. Absent when it listens on every address.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub direct: Vec<String>,
     /// One-time secret, 16 random bytes as base32.
     pub secret: String,
 }
@@ -500,6 +510,19 @@ impl QrPayload {
         for r in std::iter::once(&self.relay).chain(self.relays.iter()) {
             if !r.is_empty() && !out.contains(r) {
                 out.push(r.clone());
+            }
+        }
+        out
+    }
+
+    /// The direct addresses of the payload that parse as `ip:port`.
+    pub fn direct_addrs(&self) -> Vec<std::net::SocketAddr> {
+        let mut out: Vec<std::net::SocketAddr> = Vec::new();
+        for d in &self.direct {
+            if let Ok(a) = d.trim().parse::<std::net::SocketAddr>() {
+                if !out.contains(&a) {
+                    out.push(a);
+                }
             }
         }
         out

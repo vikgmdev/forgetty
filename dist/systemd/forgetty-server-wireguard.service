@@ -1,0 +1,34 @@
+# Forgetty server reachable over WireGuard only.
+#
+# Binds the tunnel address (change 10.230.1.14 to this machine's WireGuard
+# address) on a fixed port and uses no relay: no connection to a relay or n0,
+# nothing published. Pair a device with `forgetty pair` while the tunnel is up;
+# the QR carries the tunnel address. Open UDP 47297 on the WireGuard interface
+# only.
+#
+# Install: copy to ~/.config/systemd/user/forgetty-server.service (replacing
+# the standard unit), then `systemctl --user daemon-reload` and
+# `systemctl --user enable --now forgetty-server`.
+[Unit]
+Description=Forgetty durable terminal server (WireGuard only)
+Documentation=https://forgetty.dev
+# The tunnel address must exist before the server binds it.
+After=default.target network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/forgetty server run --port 47297 --bind 10.230.1.14 --no-relay
+Restart=on-failure
+RestartSec=5s
+
+StandardOutput=journal
+StandardError=journal
+
+# Same stop behaviour as the standard unit: SIGTERM to the server only, time to
+# flush the byte logs and save the layout, no restart loop on exit 75.
+KillMode=mixed
+TimeoutStopSec=10
+RestartPreventExitStatus=75
+
+[Install]
+WantedBy=default.target

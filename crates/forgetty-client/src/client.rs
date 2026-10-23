@@ -404,7 +404,7 @@ async fn bind_endpoint(
     // relay URLs of the pairing payload and the cached direct address.
     opts.shape(Endpoint::empty_builder())
         .secret_key(identity)
-        .relay_mode(opts.relay.mode(server))
+        .relay_mode(opts.relay_mode(server))
         .transport_config(transport_config())
         .bind()
         .await
@@ -581,7 +581,8 @@ impl Client {
                 ConnectionState::Connected => return Ok(handle),
                 ConnectionState::Failed(reason) => return Err(ClientError::Failed(reason)),
                 ConnectionState::Closed => return Err(ClientError::Closed),
-                ConnectionState::Reconnecting { .. } => {}
+                ConnectionState::Reconnecting { .. }
+                | ConnectionState::UnreachableDirectOnly { .. } => {}
             }
             if rx.changed().await.is_err() {
                 return Err(ClientError::Closed);
@@ -1727,6 +1728,7 @@ async fn supervise(shared: Arc<Shared>) {
                 );
                 let d = backoff(failures);
                 failures += 1;
+                mark_unreachable(&shared, failures);
                 why = "dial failed: ladder";
                 Some(d)
             }
@@ -1737,6 +1739,7 @@ async fn supervise(shared: Arc<Shared>) {
                 );
                 let d = backoff(failures);
                 failures += 1;
+                mark_unreachable(&shared, failures);
                 why = "dial timed out: ladder";
                 Some(d)
             }
@@ -1810,6 +1813,27 @@ async fn supervise(shared: Arc<Shared>) {
         shared.live_eps.fetch_sub(1, Ordering::SeqCst);
     }
     shared.state_tx.send_replace(final_state);
+}
+
+/// A client of a server that has no relay says "unreachable" once nothing has
+/// answered for this long.
+const UNREACHABLE_AFTER: Duration = Duration::from_secs(3);
+
+/// A server reached on its direct addresses only did not answer: tell the app
+/// (`ConnectionState::UnreachableDirectOnly`), once a dial failed and the
+/// connection has been down for [`UNREACHABLE_AFTER`]. The redials go on as
+/// before.
+fn mark_unreachable(shared: &Shared, failures: usize) {
+    if !shared.opts.relays_disabled || failures == 0 {
+        return;
+    }
+    let ConnectionState::Reconnecting { since } = shared.state_tx.borrow().clone() else {
+        return;
+    };
+    if since.elapsed() >= UNREACHABLE_AFTER {
+        info!("client: the server does not answer on its direct addresses (no relay to try)");
+        shared.state_tx.send_replace(ConnectionState::UnreachableDirectOnly { since });
+    }
 }
 
 /// Gap before each further QUIC connect attempt, in milliseconds. The last
@@ -2006,8 +2030,13 @@ async fn dial_legs(
     let net = shared.current_net();
     let server = shared.server_target();
     // Pinned addresses are in `server`; a cache that holds one (an app that
-    // seeded it) must not dial it twice.
-    let mut known = shared.opts.addr_cache.get_all(shared.server.id, net);
+    // seeded it) must not dial it twice. A server without relays is dialed on
+    // its pinned addresses only.
+    let mut known = if shared.opts.relays_disabled {
+        Vec::new()
+    } else {
+        shared.opts.addr_cache.get_all(shared.server.id, net)
+    };
     known.retain(|a| !shared.opts.pinned_addrs.contains(a));
     if known.is_empty() {
         return dial_to(shared, ep, server, None, Some(shared.book_dirty.clone())).await;
@@ -2905,6 +2934,9 @@ async fn liveness(shared: Arc<Shared>, link: Arc<Link>) -> TaskEnd {
 /// something on this network is stored with its fingerprint. Link-local
 /// addresses are skipped: they mean nothing on the next network.
 fn note_direct_addr(shared: &Shared, conn: &Connection) {
+    if shared.opts.relays_disabled {
+        return; // only the pinned addresses are dialed: nothing to learn
+    }
     let mut net = None;
     for p in conn.to_info().paths() {
         let iroh::TransportAddr::Ip(addr) = p.remote_addr() else { continue };

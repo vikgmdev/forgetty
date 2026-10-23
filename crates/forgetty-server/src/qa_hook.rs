@@ -120,6 +120,17 @@ fn handle(
                 "pane_input": input,
             }))
         }
+        "qa_net_services" => {
+            let o = sync.outside_services();
+            ok(json!({
+                "relays_disabled": sync.relays_disabled(),
+                "relay_urls": o.relay_urls,
+                "address_lookups": o.address_lookups,
+                "relay_activity": o.relay_activity,
+                "bound_sockets": sync.bound_sockets().iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+                "direct_addrs": sync.direct_addrs().iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+            }))
+        }
         "qa_drop_connections" => {
             rpc.drop_connections();
             ok(json!({ "ok": true }))

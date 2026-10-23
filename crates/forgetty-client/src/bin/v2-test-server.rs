@@ -69,6 +69,8 @@ async fn main() {
         machine,
         relay,
         relays: Vec::new(),
+        relays_disabled: false,
+        direct: Vec::new(),
         secret,
     };
     println!("NODE_ID={node_id}");

@@ -173,6 +173,20 @@ bell_mode = "visual"         # visual | audio | both | none
 
 Or use the appearance sidebar (`Ctrl+,`) to change theme, font, and size with live preview.
 
+### WireGuard-only server
+
+To reach a server only over WireGuard, bind it to the tunnel address and turn
+relays off. The server then never contacts a relay or n0, and the pairing QR
+carries the tunnel address:
+
+```sh
+forgetty server run --port 47297 --bind 10.230.1.14 --no-relay
+```
+
+The same as config: `bind_addrs = ["10.230.1.14"]` and `relay = "none"`. A
+systemd example is in `dist/systemd/forgetty-server-wireguard.service`, and the
+details are in `docs/server.md`.
+
 ## Building from Source
 
 ### Prerequisites

@@ -171,6 +171,17 @@ pub struct Config {
     /// relays. The pairing QR carries these URLs. `--relay-url` on the command
     /// line replaces this list.
     pub relay_urls: Vec<String>,
+
+    /// `"none"`: the iroh endpoint uses no relay and publishes nothing to n0
+    /// (a server reached over WireGuard only). Anything else, or unset: relays
+    /// as `relay_urls` says. `--no-relay` on the command line has the same
+    /// effect.
+    pub relay: Option<String>,
+
+    /// IP addresses the iroh endpoint binds, for example `["10.230.1.14"]`, on
+    /// the fixed port. Empty (default) binds every address. `--bind` on the
+    /// command line replaces this list.
+    pub bind_addrs: Vec<String>,
 }
 
 impl Default for Config {
@@ -262,6 +273,12 @@ impl Serialize for Config {
         if !self.relay_urls.is_empty() {
             map.serialize_entry("relay_urls", &self.relay_urls)?;
         }
+        if let Some(relay) = &self.relay {
+            map.serialize_entry("relay", relay)?;
+        }
+        if !self.bind_addrs.is_empty() {
+            map.serialize_entry("bind_addrs", &self.bind_addrs)?;
+        }
 
         map.end()
     }
@@ -337,6 +354,12 @@ impl<'de> Deserialize<'de> for Config {
 
             #[serde(default)]
             relay_urls: Vec<String>,
+
+            #[serde(default)]
+            relay: Option<String>,
+
+            #[serde(default)]
+            bind_addrs: Vec<String>,
         }
 
         let raw = RawConfig::deserialize(deserializer)?;
@@ -413,6 +436,8 @@ impl<'de> Deserialize<'de> for Config {
             byte_log_ring_kb: raw.byte_log_ring_kb,
             byte_log_max_mb: raw.byte_log_max_mb,
             relay_urls: raw.relay_urls,
+            relay: raw.relay,
+            bind_addrs: raw.bind_addrs,
         })
     }
 }
@@ -459,6 +484,19 @@ mod relay_urls_tests {
         assert!(c.relay_urls.is_empty());
         let text = toml::to_string(&c).unwrap();
         assert!(!text.contains("relay_urls"));
+    }
+
+    #[test]
+    fn relay_none_and_bind_addrs_round_trip_and_default_to_nothing() {
+        let c: Config = toml::from_str("").unwrap();
+        assert!(c.relay.is_none() && c.bind_addrs.is_empty());
+        let text = toml::to_string(&c).unwrap();
+        assert!(!text.contains("relay =") && !text.contains("bind_addrs"));
+        let c: Config =
+            toml::from_str("relay = \"none\"\nbind_addrs = [\"10.230.1.14\"]\n").unwrap();
+        assert_eq!(c.relay.as_deref(), Some("none"));
+        let again: Config = toml::from_str(&toml::to_string(&c).unwrap()).unwrap();
+        assert_eq!((again.relay, again.bind_addrs), (c.relay, c.bind_addrs));
     }
 
     #[test]

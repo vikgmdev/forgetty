@@ -20,6 +20,25 @@ pub struct PairedServer {
     /// Relay URLs from the QR payload, in order. Store them per machine; build
     /// the address again with [`server_addr`].
     pub relays: Vec<String>,
+    /// The server uses no relay (a WireGuard-only server). Store it with the
+    /// machine and set `ClientOptions::relays_disabled` from it.
+    pub relays_disabled: bool,
+    /// The direct addresses from the QR payload. They are pinned: store them
+    /// with the machine and give them back as `ClientOptions::pinned_addrs`
+    /// (or use [`PairedServer::options`]).
+    pub pinned_addrs: Vec<std::net::SocketAddr>,
+}
+
+impl PairedServer {
+    /// Client options for this machine: `relays_disabled` and `pinned_addrs`
+    /// as paired.
+    pub fn options(&self) -> ClientOptions {
+        ClientOptions {
+            relays_disabled: self.relays_disabled,
+            pinned_addrs: self.pinned_addrs.clone(),
+            ..Default::default()
+        }
+    }
 }
 
 /// Build the server address from a node id and relay URLs.
@@ -27,6 +46,17 @@ pub struct PairedServer {
 /// An app stores `node_id` and the relay URLs of a paired machine
 /// ([`PairedServer::relays`]) and calls this on every start.
 pub fn server_addr(node_id: &str, relays: &[String]) -> Result<EndpointAddr, ClientError> {
+    server_addr_direct(node_id, relays, &[])
+}
+
+/// [`server_addr`] with direct addresses too: the ones from the pairing
+/// payload. They are pinned: the client dials them on every network and never
+/// forgets them.
+pub fn server_addr_direct(
+    node_id: &str,
+    relays: &[String],
+    direct: &[std::net::SocketAddr],
+) -> Result<EndpointAddr, ClientError> {
     let id: EndpointId = node_id
         .parse()
         .map_err(|e| ClientError::Invalid(format!("bad node_id in QR payload: {e}")))?;
@@ -37,12 +67,17 @@ pub fn server_addr(node_id: &str, relays: &[String]) -> Result<EndpointAddr, Cli
             .map_err(|e| ClientError::Invalid(format!("bad relay in QR payload: {e}")))?;
         addr = addr.with_relay_url(relay);
     }
+    for d in direct {
+        addr = addr.with_ip_addr(*d);
+    }
     Ok(addr)
 }
 
 /// Build the server address from a QR payload (node id plus all relay URLs).
 pub fn qr_to_addr(qr: &QrPayload) -> Result<EndpointAddr, ClientError> {
-    server_addr(&qr.node_id, &qr.relay_urls())
+    // A server without relays has none to dial, whatever `relay` says.
+    let relays = if qr.relays_disabled { Vec::new() } else { qr.relay_urls() };
+    server_addr_direct(&qr.node_id, &relays, &qr.direct_addrs())
 }
 
 /// Pair this device with the server in a QR payload.
@@ -62,10 +97,20 @@ pub async fn pair(
         identity,
         device_name,
         client_kind,
-        &ClientOptions::default(),
+        &ClientOptions {
+            relays_disabled: qr.relays_disabled,
+            pinned_addrs: qr.direct_addrs(),
+            ..Default::default()
+        },
     )
     .await?;
-    Ok(PairedServer { addr, machine: qr.machine.clone(), relays: qr.relay_urls() })
+    Ok(PairedServer {
+        addr,
+        machine: qr.machine.clone(),
+        relays: if qr.relays_disabled { Vec::new() } else { qr.relay_urls() },
+        relays_disabled: qr.relays_disabled,
+        pinned_addrs: qr.direct_addrs(),
+    })
 }
 
 /// Pair with an explicit address and secret (tests, manual entry).
@@ -80,7 +125,7 @@ pub async fn pair_with_addr(
     let endpoint = opts
         .shape(Endpoint::empty_builder())
         .secret_key(identity)
-        .relay_mode(opts.relay.mode(&addr))
+        .relay_mode(opts.relay_mode(&addr))
         .transport_config(transport_config())
         .bind()
         .await

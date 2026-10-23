@@ -65,6 +65,15 @@ pub enum RelayChoice {
 }
 
 impl ClientOptions {
+    /// The relay mode of an endpoint that dials `server`.
+    pub(crate) fn relay_mode(&self, server: &EndpointAddr) -> RelayMode {
+        if self.relays_disabled {
+            RelayMode::Disabled
+        } else {
+            self.relay.mode(server)
+        }
+    }
+
     /// Apply `relay_only` to an endpoint builder.
     pub(crate) fn shape(&self, builder: iroh::endpoint::Builder) -> iroh::endpoint::Builder {
         if self.relay_only {
@@ -120,6 +129,13 @@ pub struct ClientOptions {
     /// itself follow the network and eviction rules. Seeding such an address
     /// into the cache instead loses it on the next network.
     pub pinned_addrs: Vec<std::net::SocketAddr>,
+    /// The pairing payload said the server uses no relay and publishes
+    /// nothing to n0 (`PairedServer::relays_disabled`: a WireGuard-only
+    /// server). The client then binds with `RelayMode::Disabled`, dials only
+    /// the pinned direct addresses of the server address (no learned ones),
+    /// and reports `ConnectionState::UnreachableDirectOnly` when nothing
+    /// answers.
+    pub relays_disabled: bool,
     /// Bind no IP socket: every packet goes through a relay, direct paths are
     /// impossible. For tests of a relay and for networks where UDP is blocked.
     pub relay_only: bool,
@@ -136,6 +152,7 @@ impl Default for ClientOptions {
             addr_cache: AddrCache::default(),
             paired_servers: None,
             pinned_addrs: Vec::new(),
+            relays_disabled: false,
             relay_only: false,
         }
     }
@@ -150,4 +167,20 @@ pub fn transport_config() -> QuicTransportConfig {
             IdleTimeout::try_from(Duration::from_secs(IDLE_TIMEOUT_SECS)).expect("30 s fits"),
         ))
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relays_disabled_binds_without_a_relay_whatever_the_address_says() {
+        let relay: iroh::RelayUrl = "https://relay.example.com/".parse().unwrap();
+        let id = iroh::SecretKey::generate(&mut rand::rng()).public();
+        let addr = EndpointAddr::new(id).with_relay_url(relay);
+        let off = ClientOptions { relays_disabled: true, ..Default::default() };
+        assert!(matches!(off.relay_mode(&addr), RelayMode::Disabled));
+        let on = ClientOptions::default();
+        assert!(!matches!(on.relay_mode(&addr), RelayMode::Disabled));
+    }
 }
