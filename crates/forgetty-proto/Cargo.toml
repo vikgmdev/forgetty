@@ -9,6 +9,7 @@ description = "Forgetty protocol v2 wire types, MessagePack codec and frame I/O 
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 uuid = { workspace = true }
 rmp-serde = "1"
 rmpv = { version = "1", features = ["with-serde"] }

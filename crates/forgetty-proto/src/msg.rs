@@ -515,17 +515,19 @@ impl QrPayload {
         out
     }
 
-    /// The direct addresses of the payload that parse as `ip:port`.
+    /// The usable direct addresses of the payload: those that parse as
+    /// `ip:port` and pass [`usable_pinned_addrs`] (not unspecified, broadcast,
+    /// multicast or port 0; no duplicates; at most [`MAX_PINNED_ADDRS`]).
+    /// What is dropped is logged at WARN.
     pub fn direct_addrs(&self) -> Vec<std::net::SocketAddr> {
-        let mut out: Vec<std::net::SocketAddr> = Vec::new();
+        let mut parsed = Vec::new();
         for d in &self.direct {
-            if let Ok(a) = d.trim().parse::<std::net::SocketAddr>() {
-                if !out.contains(&a) {
-                    out.push(a);
-                }
+            match d.trim().parse::<std::net::SocketAddr>() {
+                Ok(a) => parsed.push(a),
+                Err(_) => tracing::warn!("pinned address {d:?} dropped: not an ip:port"),
             }
         }
-        out
+        usable_pinned_addrs(parsed)
     }
 
     /// Parse and check the version.
@@ -661,5 +663,101 @@ mod tests {
         let msg = Value::Map(vec![(Value::from("Event"), ev)]);
         let got: ControlMsg = from_value(msg).unwrap();
         assert_eq!(got, ControlMsg::Event { seq: 3, event: ServerEvent::Unknown });
+    }
+}
+
+/// Most pinned (pairing payload or typed-in) addresses of one server.
+pub const MAX_PINNED_ADDRS: usize = 8;
+
+/// Why `addr` cannot be a pinned server address, if it cannot.
+pub fn pinned_addr_problem(addr: &std::net::SocketAddr) -> Option<&'static str> {
+    let ip = addr.ip();
+    if addr.port() == 0 {
+        Some("port 0")
+    } else if ip.is_unspecified() {
+        Some("unspecified address")
+    } else if ip.is_multicast() {
+        Some("multicast address")
+    } else if ip == std::net::IpAddr::V4(std::net::Ipv4Addr::BROADCAST) {
+        Some("broadcast address")
+    } else {
+        None
+    }
+}
+
+/// The addresses a client may pin, from what a payload or an app gave it:
+/// unspecified, broadcast, multicast and port-0 addresses and duplicates are
+/// dropped, and at most [`MAX_PINNED_ADDRS`] are kept, in order. Every address
+/// that is dropped is logged at WARN. One rule for every app.
+pub fn usable_pinned_addrs<I>(addrs: I) -> Vec<std::net::SocketAddr>
+where
+    I: IntoIterator<Item = std::net::SocketAddr>,
+{
+    let mut out: Vec<std::net::SocketAddr> = Vec::new();
+    for a in addrs {
+        if let Some(why) = pinned_addr_problem(&a) {
+            tracing::warn!("pinned address {a} dropped: {why}");
+        } else if out.contains(&a) {
+            tracing::warn!("pinned address {a} dropped: duplicate");
+        } else if out.len() >= MAX_PINNED_ADDRS {
+            tracing::warn!("pinned address {a} dropped: more than {MAX_PINNED_ADDRS} addresses");
+        } else {
+            out.push(a);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod pinned_tests {
+    use super::*;
+
+    fn sa(s: &str) -> std::net::SocketAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn unusable_pinned_addresses_are_dropped() {
+        let got = usable_pinned_addrs([
+            sa("0.0.0.0:47297"),
+            sa("[::]:47297"),
+            sa("255.255.255.255:47297"),
+            sa("224.0.0.1:47297"),
+            sa("[ff02::1]:47297"),
+            sa("10.230.1.14:0"),
+            sa("10.230.1.14:47297"),
+            sa("10.230.1.14:47297"),
+            sa("[fd00::1]:47297"),
+        ]);
+        assert_eq!(got, vec![sa("10.230.1.14:47297"), sa("[fd00::1]:47297")]);
+    }
+
+    #[test]
+    fn at_most_eight_pinned_addresses_are_kept_in_order() {
+        let many: Vec<_> = (1..=12).map(|i| sa(&format!("10.0.0.{i}:47297"))).collect();
+        let got = usable_pinned_addrs(many.clone());
+        assert_eq!(got.len(), MAX_PINNED_ADDRS);
+        assert_eq!(got, many[..MAX_PINNED_ADDRS]);
+    }
+
+    #[test]
+    fn a_payload_filters_its_direct_addresses() {
+        let p = QrPayload {
+            v: QrPayload::VERSION,
+            node_id: "n".into(),
+            machine: "m".into(),
+            relay: String::new(),
+            relays: Vec::new(),
+            relays_disabled: true,
+            direct: vec![
+                "10.230.1.14:47297".into(),
+                "0.0.0.0:47297".into(),
+                "garbage".into(),
+                " 10.230.1.14:47297 ".into(),
+                "[::1]:0".into(),
+            ],
+            secret: "S".into(),
+        };
+        assert_eq!(p.direct_addrs(), vec![sa("10.230.1.14:47297")]);
     }
 }

@@ -322,14 +322,20 @@ relay = "none"
   it does not talk to the router either. It cannot be combined with
   `--relay-url`.
 - `--no-relay` needs `--bind`. Without a bind address the server refuses to
-  start, prints the reason and exits with code 75. The unit has
-  `RestartPreventExitStatus=75`, so systemd does not restart-loop on it.
+  start, prints the reason and exits with code 78 (`EX_CONFIG`, a setting that
+  a restart cannot fix). `forgetty server start` prints that error at once. The
+  unit has `RestartPreventExitStatus=75 78`, so systemd does not restart-loop on
+  it.
 - The pairing QR then carries no relay, a `relays_disabled` flag and the bound
   addresses as `direct`. A client of an older version ignores the flag.
 - A paired client uses no relay either, and no port mapping. It dials those
   addresses on every network. When nothing answers it reports
   `unreachable_direct_only` so the app can say "Can't reach the server. Is
   WireGuard on?".
+- A `config.toml` that exists but does not parse stops the server with exit 78
+  and an error that names the file and the line. It never falls back to the
+  defaults, so a typo cannot turn the relays back on. A missing file means the
+  defaults.
 - Devices paired before this change have no `relays_disabled` flag and no
   direct address. They must pair again.
 - The network watcher of the client (`link-watch`) does nothing for a client
@@ -348,6 +354,12 @@ the panes stay up, and the server retries the bind in the background (after 1
 s, then 2, 4, 8 and every 10 s) and logs a WARN once a minute. When the
 address appears the endpoint comes up on its own and `forgetty pair` works.
 Until then `forgetty pair` and the other sync commands answer "unavailable".
+The WARN says "remote access is off until <address> is available".
+
+The retry applies when `--bind` (or `bind_addrs`) is set, and with the default
+bind only when the error is "address not available". A busy port with the
+default bind still ends the process with a non-zero status, so the service
+manager restarts it.
 
 A systemd user unit cannot be ordered after `wg-quick@wg0` (that is a system
 unit), so the unit has no `After=` for the tunnel. The retry covers it.

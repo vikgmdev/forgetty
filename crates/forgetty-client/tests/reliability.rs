@@ -1550,11 +1550,12 @@ async fn the_audit_has_its_own_key_and_stops_on_close() {
     a.shutdown().await;
 }
 
-/// A probe that gets no answer gives no verdict, so the rate limit does not
-/// record it: the next audit probes the address again. (The slot used to be
-/// taken when the probe started, which silenced a dead address for 10 min.)
+/// A probe that gets no answer is not a verdict, but it is not repeated on
+/// every connect either: the next audit, a reconnect later, leaves the dead
+/// address alone (it is due again after 60 s, see the unit test of
+/// `audit_is_due`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_audit_probe_without_an_answer_is_tried_again_by_the_next_audit() {
+async fn an_audit_probe_without_an_answer_is_not_repeated_on_the_next_connect() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_test_writer()
@@ -1570,7 +1571,7 @@ async fn an_audit_probe_without_an_answer_is_tried_again_by_the_next_audit() {
             others: vec![CachedOther { addr: "192.0.2.1:9".parse().unwrap(), net: None }],
         }],
     });
-    let info = ClientInfo::new(Uuid::new_v4(), ClientKind::Cli, "audit-again", "0");
+    let info = ClientInfo::new(Uuid::new_v4(), ClientKind::Cli, "audit-silent", "0");
     let opts = ClientOptions { addr_cache: cache, ..Default::default() };
     let h = Client::connect_with(a.addr(), key, info, opts).await.expect("connect");
     let dead: std::net::SocketAddr = "192.0.2.1:9".parse().unwrap();
@@ -1580,14 +1581,16 @@ async fn an_audit_probe_without_an_answer_is_tried_again_by_the_next_audit() {
         h.audits_for_tests().1 == 0
     })
     .await;
+    // Reconnect, let the next audit run (500 ms delay) and finish.
+    let before = a.handshakes();
     h.reconnect_now();
-    wait_until("the second probe of the same address", Duration::from_secs(10), || {
-        probes_of_dead() == 2
+    wait_until("the reconnect", Duration::from_secs(10), || {
+        a.handshakes() > before && h.state().is_connected()
     })
     .await;
-    // Let the probes end before the stop: a probe cancelled in its handshake
-    // leaves the mock server a half-open connection until its idle timeout.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
     wait_until("the audits to end", Duration::from_secs(5), || h.audits_for_tests().1 == 0).await;
+    assert_eq!(probes_of_dead(), 1, "the silent address was probed again at once");
     h.close().await;
     a.shutdown().await;
 }

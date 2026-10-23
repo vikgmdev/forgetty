@@ -91,6 +91,7 @@ pub async fn pair(
     client_kind: ClientKind,
 ) -> Result<PairedServer, ClientError> {
     let addr = qr_to_addr(qr)?;
+    let direct = qr.direct_addrs();
     pair_with_addr(
         addr.clone(),
         &qr.secret,
@@ -99,7 +100,7 @@ pub async fn pair(
         client_kind,
         &ClientOptions {
             relays_disabled: qr.relays_disabled,
-            pinned_addrs: qr.direct_addrs(),
+            pinned_addrs: direct.clone(),
             ..Default::default()
         },
     )
@@ -109,7 +110,7 @@ pub async fn pair(
         machine: qr.machine.clone(),
         relays: if qr.relays_disabled { Vec::new() } else { qr.relay_urls() },
         relays_disabled: qr.relays_disabled,
-        pinned_addrs: qr.direct_addrs(),
+        pinned_addrs: direct,
     })
 }
 
@@ -126,7 +127,7 @@ pub async fn pair_with_addr(
         .shape(Endpoint::empty_builder())
         .secret_key(identity)
         .relay_mode(opts.relay_mode(&addr))
-        .portmapper_config(opts.portmapper_config())
+        .portmapper_config(opts.portmapper_config(&addr))
         .transport_config(transport_config())
         .bind()
         .await

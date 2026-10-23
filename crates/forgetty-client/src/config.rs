@@ -74,10 +74,11 @@ impl ClientOptions {
         }
     }
 
-    /// A server without relays is reached on its direct addresses only: the
-    /// endpoint must not talk to the router either (UPnP, NAT-PMP, PCP).
-    pub(crate) fn portmapper_config(&self) -> iroh::endpoint::PortmapperConfig {
-        if self.relays_disabled {
+    /// An endpoint without relays reaches its server on direct addresses
+    /// only: it must not talk to the router either (UPnP, NAT-PMP, PCP). Keyed
+    /// on the effective relay mode, so every way of getting no relay counts.
+    pub(crate) fn portmapper_config(&self, server: &EndpointAddr) -> iroh::endpoint::PortmapperConfig {
+        if matches!(self.relay_mode(server), RelayMode::Disabled) {
             iroh::endpoint::PortmapperConfig::Disabled
         } else {
             iroh::endpoint::PortmapperConfig::default()
@@ -182,6 +183,25 @@ pub fn transport_config() -> QuicTransportConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_portmapper_follows_the_effective_relay_mode() {
+        use iroh::endpoint::PortmapperConfig as P;
+        let id = iroh::SecretKey::generate(&mut rand::rng()).public();
+        let relay: iroh::RelayUrl = "https://relay.example.com/".parse().unwrap();
+        let with_relay = EndpointAddr::new(id).with_relay_url(relay);
+        let without = EndpointAddr::new(id);
+        // A relay in the address: the default client uses it, port mapping on.
+        let default = ClientOptions::default();
+        assert!(matches!(default.portmapper_config(&with_relay), P::Enabled { .. }));
+        // Every way to no relay switches it off: the flag, the choice, or an
+        // address that has none.
+        let flag = ClientOptions { relays_disabled: true, ..Default::default() };
+        assert!(matches!(flag.portmapper_config(&with_relay), P::Disabled));
+        let choice = ClientOptions { relay: RelayChoice::Disabled, ..Default::default() };
+        assert!(matches!(choice.portmapper_config(&with_relay), P::Disabled));
+        assert!(matches!(default.portmapper_config(&without), P::Disabled));
+    }
 
     #[test]
     fn relays_disabled_binds_without_a_relay_whatever_the_address_says() {

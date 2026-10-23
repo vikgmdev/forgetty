@@ -405,7 +405,7 @@ async fn bind_endpoint(
     opts.shape(Endpoint::empty_builder())
         .secret_key(identity)
         .relay_mode(opts.relay_mode(server))
-        .portmapper_config(opts.portmapper_config())
+        .portmapper_config(opts.portmapper_config(server))
         .transport_config(transport_config())
         .bind()
         .await
@@ -597,8 +597,11 @@ impl Client {
         server: EndpointAddr,
         identity: SecretKey,
         info: ClientInfo,
-        opts: ClientOptions,
+        mut opts: ClientOptions,
     ) -> Result<ClientHandle, ClientError> {
+        // One rule for every app: no unspecified, broadcast, multicast or
+        // port-0 address, no duplicates, at most 8.
+        opts.pinned_addrs = forgetty_proto::usable_pinned_addrs(std::mem::take(&mut opts.pinned_addrs));
         if let Some(paired) = &opts.paired_servers {
             let mut keep = paired.clone();
             keep.push(server.id);
@@ -2107,11 +2110,23 @@ const AUDIT_DELAY: Duration = Duration::from_millis(500);
 const AUDIT_LIMIT: Duration = Duration::from_millis(1500);
 const AUDIT_INLINE: Duration = Duration::from_millis(600);
 const AUDIT_REPEAT: Duration = Duration::from_secs(600);
+/// A probe that got no answer is not a verdict, but it is not tried on every
+/// connect either.
+const AUDIT_REPEAT_SILENT: Duration = Duration::from_secs(60);
+
+/// Is the address due for a probe: no entry, or its time has passed.
+fn audit_is_due(
+    audited: &HashMap<(SocketAddr, u64), Instant>,
+    key: &(SocketAddr, u64),
+    now: Instant,
+) -> bool {
+    audited.get(key).is_none_or(|until| now >= *until)
+}
 
 /// What the audits of one client remember.
 #[derive(Default)]
 struct AuditState {
-    /// When each address was last audited, per network.
+    /// Per address and network: the time before which it is not probed again.
     audited: Mutex<HashMap<(SocketAddr, u64), Instant>>,
     /// The ids of the audit endpoints bound so far (tests check they are not
     /// the device key).
@@ -2175,8 +2190,8 @@ impl Drop for AuditEndpoint {
 /// leaves the cache for this network, and the address book is marked stale.
 /// One that does not answer is harmless and stays. Pinned addresses are never
 /// audited, and an address is audited once per network per
-/// [`AUDIT_REPEAT`] (when a probe gave a verdict: the right peer, or another
-/// one). With `budget` the call returns when it is spent and the
+/// [`AUDIT_REPEAT`] when a probe gave a verdict (the right peer, or another
+/// one) and every [`AUDIT_REPEAT_SILENT`] when it got no answer. With `budget` the call returns when it is spent and the
 /// probes still open are dropped (their candidates stay). Returns the
 /// addresses forgotten.
 async fn audit(
@@ -2191,9 +2206,7 @@ async fn audit(
             .filter(|a| !ctx.pinned.contains(a))
             .filter(|a| {
                 let key = (*a, ctx.net);
-                // Only a verdict is recorded (below): a probe that got no
-                // answer is tried again by the next audit.
-                !audited.get(&key).is_some_and(|t| t.elapsed() < AUDIT_REPEAT)
+                audit_is_due(&audited, &key, Instant::now())
             })
             .collect()
     };
@@ -2230,9 +2243,10 @@ async fn audit(
                 let guard = AuditEndpoint { ep: Some(Arc::new(ep)), state: ctx.state.clone() };
                 let ep = guard.ep.clone().expect("set above");
                 let target = EndpointAddr::new(ctx.server).with_ip_addr(addr);
-                let verdict = || {
-                    lock(&ctx.state.audited).insert((addr, ctx.net), Instant::now());
+                let record = |repeat: Duration| {
+                    lock(&ctx.state.audited).insert((addr, ctx.net), Instant::now() + repeat);
                 };
+                let verdict = || record(AUDIT_REPEAT);
                 match tokio::time::timeout(AUDIT_LIMIT, ep.connect(target, ALPN_RPC)).await {
                     Ok(Ok(c)) => {
                         verdict();
@@ -2244,7 +2258,9 @@ async fn audit(
                         ctx.dirty.store(true, Ordering::SeqCst);
                         lock(&gone).push(addr);
                     }
-                    _ => {}
+                    // No answer, or an error that says nothing about who is
+                    // there: not a verdict, tried again after a short while.
+                    _ => record(AUDIT_REPEAT_SILENT),
                 }
             });
         }
@@ -3146,6 +3162,19 @@ fn is_superseded(e: &forgetty_proto::FrameError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_audit_is_due_when_it_has_no_entry_or_its_time_has_passed() {
+        let key: (SocketAddr, u64) = ("192.0.2.1:9".parse().unwrap(), 1);
+        let mut audited = HashMap::new();
+        let t0 = Instant::now();
+        assert!(audit_is_due(&audited, &key, t0));
+        audited.insert(key, t0 + AUDIT_REPEAT_SILENT);
+        assert!(!audit_is_due(&audited, &key, t0 + AUDIT_REPEAT_SILENT - Duration::from_secs(1)));
+        assert!(audit_is_due(&audited, &key, t0 + AUDIT_REPEAT_SILENT));
+        audited.insert(key, t0 + AUDIT_REPEAT);
+        assert!(!audit_is_due(&audited, &key, t0 + AUDIT_REPEAT_SILENT));
+    }
 
     #[tokio::test]
     async fn a_stored_wake_permit_is_drained() {

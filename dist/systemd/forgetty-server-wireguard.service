@@ -27,12 +27,13 @@ StandardOutput=journal
 StandardError=journal
 
 # Same stop behaviour as the standard unit: SIGTERM to the server only, time to
-# flush the byte logs and save the layout. Exit 75 is a setting the server
-# refuses (for example --no-relay without --bind) or another server holding the
-# lock: do not restart-loop on it.
+# flush the byte logs and save the layout. Exit 78 is a setting the server
+# refuses (for example --no-relay without --bind, or a config.toml that does
+# not parse) and 75 another server holding the lock: do not restart-loop on
+# either.
 KillMode=mixed
 TimeoutStopSec=10
-RestartPreventExitStatus=75
+RestartPreventExitStatus=75 78
 
 [Install]
 WantedBy=default.target

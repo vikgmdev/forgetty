@@ -143,16 +143,59 @@ fn quic_config() -> iroh::endpoint::QuicTransportConfig {
 /// `server start` uses it to tell "someone else is starting" from a real failure.
 pub const EXIT_ALREADY_RUNNING: i32 = 75; // keep in step with cli.rs
 
+/// `server run` exit code for a configuration error (sysexits `EX_CONFIG`): a
+/// bad or missing setting that a restart cannot fix. `server start` prints the
+/// error at once; the systemd units do not restart on it.
+pub const EXIT_CONFIG: i32 = 78; // keep in step with cli.rs
+
+/// A config file that exists but cannot be read or parsed. `server run` exits
+/// with [`EXIT_CONFIG`] (no restart loop): falling back to defaults would hide the
+/// mistake, and a typo in `relay = "none"` would turn the relays back on.
+#[derive(Debug)]
+pub struct ConfigInvalid(pub String);
+
+impl std::fmt::Display for ConfigInvalid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "config file is invalid, not starting: {}", self.0)
+    }
+}
+
+impl std::error::Error for ConfigInvalid {}
+
+/// Load the config. A missing file (the default location, or a `--config-file`
+/// that does not exist) means the defaults. A file that exists and fails to
+/// read or parse is an error that names the file and the line.
+pub fn load_server_config(path: Option<&std::path::Path>) -> anyhow::Result<Config> {
+    if let Some(p) = path {
+        if !p.exists() {
+            warn!("config file {} not found, using defaults", p.display());
+            return Ok(Config::default());
+        }
+    }
+    load_config(path).map_err(|e| ConfigInvalid(e.to_string()).into())
+}
+
 /// Backoff of the background iroh bind (address not there yet): from 1 s up to
 /// 10 s, a WARN at most once a minute.
 const BIND_RETRY_MIN: Duration = Duration::from_secs(1);
 const BIND_RETRY_MAX: Duration = Duration::from_secs(10);
 const BIND_WARN_EVERY: Duration = Duration::from_secs(60);
 
+/// Does a failed iroh bind wait for the address, or end the process? The
+/// operator chose the addresses (`--bind`): wait, the tunnel may come up. With
+/// the default bind only "address not available" (EADDRNOTAVAIL) waits; any
+/// other error (a busy port) ends the process with a non-zero status, and the
+/// service manager restarts it.
+pub fn bind_is_retryable(chose_addrs: bool, error: &str) -> bool {
+    chose_addrs
+        || error.contains("os error 99")
+        || error.contains("Cannot assign requested address")
+        || error.contains("AddrNotAvailable")
+}
+
 /// `--no-relay` / `relay = "none"` without `--bind` / `bind_addrs`. A config
-/// error that a restart cannot fix: `server run` exits with
-/// [`EXIT_ALREADY_RUNNING`]'s code 75 so the systemd unit (`RestartPreventExitStatus=75`)
-/// does not loop on it.
+/// error that a restart cannot fix: `server run` exits with [`EXIT_CONFIG`]
+/// so the systemd unit (`RestartPreventExitStatus=75 78`) does not loop on it.
 #[derive(Debug)]
 pub struct NeedsBind;
 
@@ -328,13 +371,7 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
         })
     });
 
-    let config: Config = match load_config(config_path.as_deref()) {
-        Ok(c) => c,
-        Err(e) => {
-            warn!("Failed to load config, using defaults: {e}");
-            Config::default()
-        }
-    };
+    let config: Config = load_server_config(config_path.as_deref())?;
 
     // Relays: --relay-url replaces the config file list. None: iroh defaults.
     let relay_source = if args.relay_url.is_empty() { &config.relay_urls } else { &args.relay_url };
@@ -799,6 +836,12 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
     let sync_slot: forgetty_socket::SyncSlot = Default::default();
     #[cfg(feature = "qa-tools")]
     forgetty_server::qa_hook::install(Arc::clone(&rpc_v2), Arc::clone(&sync_slot));
+    let chose_addrs = !bind_addrs.is_empty();
+    let bind_label = if chose_addrs {
+        bind_addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ")
+    } else {
+        "the bind address".to_string()
+    };
     let make_endpoint = {
         let (rpc_v2, relay_urls, bind_addrs) = (Arc::clone(&rpc_v2), relay_urls, bind_addrs);
         move || {
@@ -842,10 +885,13 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
     };
     match make_endpoint().await {
         Ok(ep) => bring_up(ep),
-        Err(forgetty_sync::SyncError::Bind(e)) => {
+        Err(forgetty_sync::SyncError::Bind(e)) if bind_is_retryable(chose_addrs, &e) => {
             // Not fatal: the process keeps the panes and the local socket and
             // tries again until the address is there.
-            warn!("iroh endpoint: cannot bind yet ({e}); retrying in the background");
+            warn!(
+                "iroh endpoint: cannot bind {bind_label} ({e}); remote access is off until \
+                 {bind_label} is available; retrying in the background"
+            );
             tokio::spawn(async move {
                 let mut wait = BIND_RETRY_MIN;
                 let mut last_warn = std::time::Instant::now();
@@ -858,7 +904,10 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
                         }
                         Err(forgetty_sync::SyncError::Bind(e)) => {
                             if last_warn.elapsed() >= BIND_WARN_EVERY {
-                                warn!("iroh endpoint: still cannot bind ({e}); retrying");
+                                warn!(
+                                    "iroh endpoint: still cannot bind {bind_label} ({e}); remote \
+                                     access is off until {bind_label} is available"
+                                );
                                 last_warn = std::time::Instant::now();
                             } else {
                                 debug!("iroh endpoint: bind failed again ({e})");
@@ -1063,6 +1112,35 @@ mod tests {
         assert_eq!(parsed[0].to_string(), "https://relay.example.org/");
         assert_eq!(parsed[1].to_string(), "http://127.0.0.1:3340/");
         assert!(parse_relay_urls(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_config_that_does_not_parse_is_an_error_and_a_missing_one_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        // Missing: defaults.
+        let missing = dir.path().join("none.toml");
+        assert!(load_server_config(Some(&missing)).unwrap().relay.is_none());
+        // Valid.
+        let ok = dir.path().join("ok.toml");
+        std::fs::write(&ok, "relay = \"none\"\n").unwrap();
+        assert_eq!(load_server_config(Some(&ok)).unwrap().relay.as_deref(), Some("none"));
+        // A typo: an error that names the file and the line, not the defaults.
+        let bad = dir.path().join("bad.toml");
+        std::fs::write(&bad, "font_size = 13.0\nrelay = \"none\n").unwrap();
+        let err = load_server_config(Some(&bad)).unwrap_err();
+        assert!(err.downcast_ref::<ConfigInvalid>().is_some(), "{err}");
+        let text = err.to_string();
+        assert!(text.contains("bad.toml"), "{text}");
+        assert!(text.contains("line 2"), "{text}");
+    }
+
+    #[test]
+    fn a_failed_bind_waits_only_for_a_chosen_or_missing_address() {
+        // --bind set: always wait.
+        assert!(bind_is_retryable(true, "10.230.1.14:47297: Address already in use"));
+        // Default bind: a missing address waits, a busy port ends the process.
+        assert!(bind_is_retryable(false, "Cannot assign requested address (os error 99)"));
+        assert!(!bind_is_retryable(false, "Address already in use (os error 98)"));
     }
 
     #[test]

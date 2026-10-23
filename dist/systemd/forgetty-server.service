@@ -23,8 +23,9 @@ StandardError=journal
 KillMode=mixed
 # Time for the flush and save above before systemd gives up and sends SIGKILL.
 TimeoutStopSec=10
-# Exit 75 means another server already holds the lock. Do not restart-loop on it.
-RestartPreventExitStatus=75
+# Exit 75 means another server already holds the lock, 78 a setting the server
+# refuses (config error). Do not restart-loop on either.
+RestartPreventExitStatus=75 78
 
 [Install]
 WantedBy=default.target

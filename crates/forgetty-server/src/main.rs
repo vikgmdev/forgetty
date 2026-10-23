@@ -337,10 +337,12 @@ fn main() {
                 Ok(()) => 0,
                 Err(e) => {
                     eprintln!("forgetty server: {e}");
-                    if e.downcast_ref::<server::AlreadyRunning>().is_some()
-                        || e.downcast_ref::<server::NeedsBind>().is_some()
-                    {
+                    if e.downcast_ref::<server::AlreadyRunning>().is_some() {
                         server::EXIT_ALREADY_RUNNING
+                    } else if e.downcast_ref::<server::NeedsBind>().is_some()
+                        || e.downcast_ref::<server::ConfigInvalid>().is_some()
+                    {
+                        server::EXIT_CONFIG
                     } else {
                         cli::EXIT_FAILED
                     }

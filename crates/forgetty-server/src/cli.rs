@@ -372,6 +372,19 @@ fn layout_cands(client: &mut Client) -> Result<(Vec<Cand>, Vec<Cand>)> {
 
 /// `forgetty server run` exit code when another server already runs (EX_TEMPFAIL).
 const EXIT_ALREADY_RUNNING: i32 = 75;
+const EXIT_CONFIG: i32 = 78; // keep in step with server.rs
+
+/// The `forgetty server: ...` error the server wrote to the log after byte
+/// `from`, or a pointer to the log.
+fn config_error_from_log(log_path: &std::path::Path, from: u64) -> String {
+    let text = std::fs::read(log_path)
+        .map(|b| String::from_utf8_lossy(b.get(from as usize..).unwrap_or(&[])).into_owned())
+        .unwrap_or_default();
+    match text.find("forgetty server: ") {
+        Some(i) => text[i + "forgetty server: ".len()..].trim_end().to_string(),
+        None => format!("server stopped on a configuration error. See {}", log_path.display()),
+    }
+}
 
 pub fn server_start() -> Result<()> {
     match Client::connect() {
@@ -409,6 +422,8 @@ pub fn server_start() -> Result<()> {
             });
         }
     }
+    // Where this run's output starts, to read its error back on a config exit.
+    let log_start = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
     let mut child = cmd.spawn().map_err(|e| CliError::Failed(format!("spawn server: {e}")))?;
 
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -432,6 +447,10 @@ pub fn server_start() -> Result<()> {
                 }
                 std::thread::sleep(Duration::from_millis(100));
                 continue;
+            }
+            if status.code() == Some(EXIT_CONFIG) {
+                // A setting the server refuses: say which, not "see the log".
+                return Err(CliError::Failed(config_error_from_log(&log_path, log_start)));
             }
             return Err(CliError::Failed(format!(
                 "server exited at startup ({status}). See {}",

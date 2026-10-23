@@ -186,10 +186,10 @@ async fn a_relayless_client_connects_on_its_pinned_address_and_reports_a_hung_se
 }
 
 /// `--no-relay` without `--bind`: a config error. The server exits at once
-/// with code 75 (the unit's `RestartPreventExitStatus`), before it makes any
+/// with code 78 (the unit's `RestartPreventExitStatus`), before it makes any
 /// socket or pane.
 #[test]
-fn no_relay_without_a_bind_address_is_refused_with_exit_75() {
+fn no_relay_without_a_bind_address_is_refused_with_exit_78() {
     if !real_only() {
         return;
     }
@@ -203,7 +203,7 @@ fn no_relay_without_a_bind_address_is_refused_with_exit_75() {
         .output()
         .expect("run forgetty");
     let err = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(75), "exit status; stderr: {err}");
+    assert_eq!(out.status.code(), Some(78), "exit status; stderr: {err}");
     assert!(err.contains("no bind address"), "stderr: {err}");
 }
 
@@ -260,6 +260,93 @@ async fn the_endpoint_binds_in_the_background_when_the_address_becomes_usable() 
     assert_eq!(n["portmapper_activity"], 0, "{n}");
     // And it serves: pair, connect, use the pane that was made before.
     let (h, _paired) = paired_client(&server, Duration::from_secs(5)).await;
+    assert!(h.state().is_connected());
+    h.close().await;
+    server.shutdown().await;
+}
+
+/// A config file that exists but does not parse stops the server with exit
+/// 78 and an error that names the file and the line. It never falls back to
+/// the defaults: a typo in `relay = "none"` would turn the relays back on.
+#[test]
+fn a_config_file_that_does_not_parse_stops_the_server_with_exit_78() {
+    if !real_only() {
+        return;
+    }
+    let bin = std::env::var_os("FORGETTY_REAL_SERVER").expect("FORGETTY_REAL_SERVER");
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("config.toml");
+    std::fs::write(&cfg, "bind_addrs = [\"127.0.0.1\"]\nrelay = \"none\n").unwrap();
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(dir.path().join("state"))
+        .args(["server", "run", "--port", "0", "--config-file"])
+        .arg(&cfg)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run forgetty");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(78), "exit status; stderr: {err}");
+    assert!(err.contains("config.toml") && err.contains("line 2"), "stderr: {err}");
+}
+
+/// `forgetty server start` reads the exit status 78 of the server it spawned
+/// and prints the real error at once (file and line), where it used to read
+/// 75 as "another start is under way" and wait 20 s. The config sits at the
+/// default location of a throwaway `--state-dir`.
+#[test]
+fn server_start_prints_a_config_error_at_once() {
+    if !real_only() {
+        return;
+    }
+    let bin = std::env::var_os("FORGETTY_REAL_SERVER").expect("FORGETTY_REAL_SERVER");
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let cfg_dir = state.join("config/forgetty");
+    std::fs::create_dir_all(&cfg_dir).unwrap();
+    std::fs::write(cfg_dir.join("config.toml"), "bind_addrs = [\"127.0.0.1\"]\nrelay = \"none\n")
+        .unwrap();
+    let t0 = Instant::now();
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["server", "start"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run forgetty");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "server start succeeded; stderr: {err}");
+    assert!(t0.elapsed() < Duration::from_secs(10), "took {:?}", t0.elapsed());
+    assert!(err.contains("config.toml") && err.contains("line 2"), "stderr: {err}");
+}
+
+/// Unusable pinned addresses (unspecified, multicast, port 0) given through
+/// `ClientOptions::pinned_addrs` are dropped by the library: the client
+/// connects on the good one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unusable_pinned_addresses_do_not_get_in_the_way() {
+    init_tracing();
+    let server = TestServer::start(common::TestServerConfig::default()).await;
+    let key = SecretKey::generate(&mut rand::rng());
+    server.authorize(key.public());
+    let opts = forgetty_client::ClientOptions {
+        relays_disabled: true,
+        pinned_addrs: vec![
+            "0.0.0.0:47297".parse().unwrap(),
+            "224.0.0.1:47297".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+            server.udp_addr(),
+        ],
+        ..Default::default()
+    };
+    let info = ClientInfo::new(Uuid::new_v4(), ClientKind::Cli, "pins", "0.0.0");
+    let h = tokio::time::timeout(
+        Duration::from_secs(10),
+        Client::connect_with(forgetty_client::EndpointAddr::new(server.node_id()), key, info, opts),
+    )
+    .await
+    .expect("connect timed out")
+    .expect("connect failed");
     assert!(h.state().is_connected());
     h.close().await;
     server.shutdown().await;
