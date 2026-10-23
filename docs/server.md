@@ -351,7 +351,10 @@ relay = "none"
   (`forgetty_config::validate_remote_settings`, with no command-line options)
   on the new text, and writes it only when the server would start with it. So
   it refuses `rellay = "none"`, a bad `relay`, bad URLs or addresses, and
-  `relay = "none"` without a pairable `bind_addrs`. It does not look at the file
+  a `bind_addrs` list with no pairable address. `relay = "none"` with no
+  `bind_addrs` at all is saved with the warning "relay = none needs --bind or
+  bind_addrs where the server runs", because `--bind` can come from the
+  command line. It does not look at the file
   on disk, so it can repair a file that does not load. Values are trimmed and
   not case sensitive: `Relay = "None"` and `relay = " NONE"` are the same
   as `"none"`. Every other configuration error (a bad `relay` value, a bad

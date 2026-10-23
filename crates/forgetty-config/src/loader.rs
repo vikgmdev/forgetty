@@ -180,34 +180,63 @@ pub fn load_config_as_text() -> String {
     std::fs::read_to_string(config_file_path()).unwrap_or_default()
 }
 
-/// Parse a TOML string as `Config`, save it to the default config file, and
-/// return the parsed value. See [`parse_and_save_config_at`].
+/// The result of a settings-editor save: the parsed config and warnings to
+/// show (the save went through).
+#[derive(Debug, Clone)]
+pub struct SavedConfig {
+    pub config: Config,
+    pub warnings: Vec<String>,
+}
+
+/// Parse a TOML string as `Config`, save it to the config file of this process,
+/// and return the parsed value. See [`parse_and_save_config_checked_at`].
 pub fn parse_and_save_config(toml_text: &str) -> Result<Config> {
     parse_and_save_config_at(toml_text, None)
 }
 
-/// Parse a TOML string as `Config` and write it to `path` (`None`: the default
-/// config file), then return the parsed value.
+/// [`parse_and_save_config_checked_at`] without the warnings (they are logged).
+pub fn parse_and_save_config_at(toml_text: &str, path: Option<&Path>) -> Result<Config> {
+    let saved = parse_and_save_config_checked_at(toml_text, path)?;
+    for w in &saved.warnings {
+        tracing::warn!("{w}");
+    }
+    Ok(saved.config)
+}
+
+/// Parse a TOML string as `Config` and write it to `path` (`None`: the config
+/// file of this process), then return the parsed value and any warnings.
 ///
 /// The new text is validated as `load_config` would: it must parse, and it
 /// must pass the unknown-key check (a misspelt `relay` is an error) and the
 /// server's check of the remote settings (`validate_remote_settings`). A text
 /// that passes is written even when the file on disk does not load: this is
 /// how a broken config is repaired in the text editor.
-pub fn parse_and_save_config_at(toml_text: &str, path: Option<&Path>) -> Result<Config> {
+///
+/// One check is skipped: `relay = "none"` without `bind_addrs` passes with a
+/// warning, because the server may get `--bind` on its command line.
+pub fn parse_and_save_config_checked_at(
+    toml_text: &str,
+    path: Option<&Path>,
+) -> Result<SavedConfig> {
     let config_path = target_path(path);
     let mut config: Config = toml::from_str(toml_text).map_err(|e| {
         forgetty_core::ForgettyError::Config(format!("Failed to parse config: {}", e))
     })?;
     check_unknown_keys(&config, toml_text, &config_path)?;
     // The server refuses a config whose remote settings are invalid (exit 78):
-    // do not write one. No command-line overrides here: the file must stand
-    // on its own.
-    remote::validate_remote_settings(&config, &remote::RemoteOverrides::default())
-        .map_err(|e| forgetty_core::ForgettyError::Config(e.to_string()))?;
+    // do not write one. No command-line overrides here.
+    let settings = remote::validate_remote_settings(
+        &config,
+        &remote::RemoteOverrides { bind_may_come_later: true, ..Default::default() },
+    )
+    .map_err(|e| forgetty_core::ForgettyError::Config(e.to_string()))?;
+    let mut warnings = Vec::new();
+    if settings.no_relay && settings.bind_addrs.is_empty() {
+        warnings.push("relay = none needs --bind or bind_addrs where the server runs".to_string());
+    }
     config.source = Some(config_path.clone());
     write_config(&config, &config_path)?;
-    Ok(config)
+    Ok(SavedConfig { config, warnings })
 }
 
 /// `path`, or the default config file.

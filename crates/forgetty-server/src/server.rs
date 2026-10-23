@@ -328,6 +328,7 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
             no_relay: args.no_relay,
             relay_urls: args.relay_url.clone(),
             bind: args.bind.clone(),
+            bind_may_come_later: false,
         },
     )
     .map_err(|e| ConfigInvalid(e.to_string()))?;

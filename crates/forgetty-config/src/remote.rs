@@ -29,6 +29,11 @@ pub struct RemoteOverrides {
     pub no_relay: bool,
     pub relay_urls: Vec<String>,
     pub bind: Vec<String>,
+    /// The bind address may come from `--bind` where the server runs, so a
+    /// config with `relay = "none"` and no `bind_addrs` is not an error here
+    /// (the settings editor sets this). A bind list that is present is still
+    /// checked.
+    pub bind_may_come_later: bool,
 }
 
 /// The checked remote settings.
@@ -151,6 +156,9 @@ pub fn validate_remote_settings(
     if no_relay {
         // Without relays the server is reached on its direct addresses only,
         // and a server that binds every address would put them all in the QR.
+        if bind_addrs.is_empty() && overrides.bind_may_come_later {
+            return Ok(RemoteSettings { no_relay, relay_urls, bind_addrs });
+        }
         if bind_addrs.is_empty() {
             return Err(ConfigError(
                 "relays are switched off (--no-relay / relay = \"none\") but no bind address \
@@ -258,9 +266,33 @@ mod tests {
         assert!(validate_remote_settings(&c, &over).unwrap().no_relay);
     }
 
+    #[test]
+    fn the_editor_allows_no_relay_without_a_bind_but_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let saved =
+            crate::parse_and_save_config_checked_at("relay = \"none\"\n", Some(&path)).unwrap();
+        assert_eq!(saved.warnings.len(), 1, "{:?}", saved.warnings);
+        assert!(
+            saved.warnings[0].contains("relay = none needs --bind or bind_addrs"),
+            "{:?}",
+            saved.warnings
+        );
+        assert!(path.exists());
+        // A bind list that is there is still checked, and a good one needs no warning.
+        let bad = "relay = \"none\"\nbind_addrs = [\"0.0.0.0\"]\n";
+        assert!(crate::parse_and_save_config_checked_at(bad, Some(&path)).is_err());
+        let good = "relay = \"none\"\nbind_addrs = [\"10.0.0.1\"]\n";
+        let saved = crate::parse_and_save_config_checked_at(good, Some(&path)).unwrap();
+        assert!(saved.warnings.is_empty());
+        // The server itself still refuses it with no --bind.
+        let c = config("relay = \"none\"\n");
+        assert!(validate_remote_settings(&c, &RemoteOverrides::default()).is_err());
+    }
+
     /// The cases of `every_configuration_error_exits_78` in forgetty-client
     /// (`tests/wireguard_only.rs`), as config text. The settings editor must
-    /// refuse each one the server refuses.
+    /// refuse each one the server refuses (it skips only the missing bind).
     #[test]
     fn every_server_configuration_error_is_refused_by_the_editor_too() {
         let cases = [
@@ -284,7 +316,6 @@ mod tests {
                 "relay = \"none\"\nbind_addrs = [\"127.0.0.1\"]\nrelay_urls = [\"https://r.example.org\"]\n",
                 "relay URLs are set",
             ),
-            ("relay = \"none\"\n", "no bind address is set"),
             // Case and spaces do not slip past the near-key guard.
             ("Relay = \"None\"\n", "did you mean `relay`"),
             ("rellay = \" NONE\"\n", "did you mean `relay`"),

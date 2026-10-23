@@ -12,7 +12,8 @@ pub mod theme;
 
 pub use loader::{
     config_file_path, load_config, load_config_as_text, parse_and_save_config,
-    parse_and_save_config_at, save_config, set_config_path,
+    parse_and_save_config_at, parse_and_save_config_checked_at, save_config, set_config_path,
+    SavedConfig,
 };
 pub use remote::{validate_remote_settings, ConfigError, RemoteOverrides, RemoteSettings};
 pub use schema::{BellMode, Config, CursorStyle, NotificationMode, OnLaunch, ProfileConfig};
