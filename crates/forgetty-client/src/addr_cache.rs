@@ -60,13 +60,59 @@ pub struct CachedAddr {
     /// The address the last connection used.
     pub addr: SocketAddr,
     /// The network `addr` is valid on (see [`CachedOther::net`]). A snapshot
-    /// of an older version has none: a private address in it is dropped on
-    /// load, because nobody knows which network it belongs to.
+    /// of an older version has none: a private address in it is kept as an
+    /// address valid on every network, until the audit proves it wrong or a
+    /// newer entry for the same address (with its network) replaces it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub net: Option<u64>,
     /// The other addresses the server is known by, newest first.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "lenient_others")]
     pub others: Vec<CachedOther>,
+}
+
+/// An `others` item as an older version wrote it: a bare address, or the
+/// address with its network. Anything else is skipped, not fatal.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum OtherRepr {
+    Scoped {
+        addr: SocketAddr,
+        #[serde(default)]
+        net: Option<u64>,
+    },
+    Bare(SocketAddr),
+    Junk(serde::de::IgnoredAny),
+}
+
+fn lenient_others<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<CachedOther>, D::Error> {
+    let items = Vec::<OtherRepr>::deserialize(d)?;
+    Ok(items
+        .into_iter()
+        .filter_map(|i| match i {
+            OtherRepr::Scoped { addr, net } => Some(CachedOther { addr, net }),
+            OtherRepr::Bare(addr) => Some(CachedOther { addr, net: None }),
+            OtherRepr::Junk(_) => None,
+        })
+        .collect())
+}
+
+/// An entry of the snapshot, or something a version this one does not know
+/// wrote there: that is skipped, the rest of the snapshot loads.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum EntryRepr {
+    Entry(CachedAddr),
+    Junk(serde::de::IgnoredAny),
+}
+
+fn lenient_entries<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<CachedAddr>, D::Error> {
+    Ok(Vec::<EntryRepr>::deserialize(d)?
+        .into_iter()
+        .filter_map(|e| match e {
+            EntryRepr::Entry(e) => Some(e),
+            EntryRepr::Junk(_) => None,
+        })
+        .collect())
 }
 
 impl CachedAddr {
@@ -80,6 +126,7 @@ impl CachedAddr {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AddrCacheSnapshot {
     /// Entries, sorted by node id.
+    #[serde(deserialize_with = "lenient_entries")]
     pub entries: Vec<CachedAddr>,
 }
 
@@ -187,7 +234,8 @@ impl AddrCache {
     }
 
     /// Restore from a snapshot. Entries with an unparsable node id are
-    /// skipped, and so is a private address with no network to belong to.
+    /// skipped. A private address with no network (an older snapshot) is kept
+    /// as valid everywhere, until an audit or a newer entry replaces it.
     pub fn from_snapshot(snapshot: &AddrCacheSnapshot) -> Self {
         let cache = Self::new();
         for e in &snapshot.entries {
@@ -196,9 +244,6 @@ impl AddrCache {
             let all = std::iter::once(CachedOther { addr: e.addr, net: e.net }).chain(e.others.iter().copied());
             for o in all {
                 let net = if network_independent(&o.addr) { None } else { o.net };
-                if !network_independent(&o.addr) && net.is_none() {
-                    continue;
-                }
                 let slot = Slot { addr: o.addr, net };
                 if !slots.contains(&slot) {
                     slots.push(slot);
@@ -260,7 +305,9 @@ impl AddrCache {
         let slot = Slot { addr, net: scope(&addr, net) };
         let mut map = self.lock();
         let v = map.entry(id).or_default();
-        v.retain(|s| *s != slot);
+        // A newer entry replaces the address an older snapshot kept for every
+        // network.
+        v.retain(|s| *s != slot && !(slot.net.is_some() && s.addr == addr && s.net.is_none()));
         v.insert(0, slot);
         v.truncate(MAX_ADDRS_PER_SERVER);
     }
@@ -274,6 +321,9 @@ impl AddrCache {
         let v = map.entry(id).or_default();
         if v.contains(&slot) {
             return;
+        }
+        if slot.net.is_some() {
+            v.retain(|s| !(s.addr == addr && s.net.is_none()));
         }
         if v.len() >= MAX_ADDRS_PER_SERVER {
             v.pop();
@@ -469,14 +519,45 @@ mod tests {
     }
 
     #[test]
-    fn an_old_snapshot_keeps_its_global_address_and_drops_the_private_one() {
+    fn an_old_snapshot_keeps_its_private_address_for_every_network() {
         let n = id();
         let old = format!(r#"{{"entries":[{{"node_id":"{n}","addr":"192.168.1.9:7"}}]}}"#);
         let snap: AddrCacheSnapshot = serde_json::from_str(&old).unwrap();
-        assert!(AddrCache::from_snapshot(&snap).get_all(n, HOME).is_empty());
+        let c = AddrCache::from_snapshot(&snap);
+        assert_eq!(c.get_all(n, HOME), vec![a("192.168.1.9:7")]);
+        assert_eq!(c.get_all(n, OFFICE), vec![a("192.168.1.9:7")]);
+        // A newer entry for the same address (with its network) replaces it.
+        c.insert(n, a("192.168.1.9:7"), HOME);
+        assert_eq!(c.get_all(n, HOME), vec![a("192.168.1.9:7")]);
+        assert!(c.get_all(n, OFFICE).is_empty());
+        // An audit that proves it wrong removes it.
+        let c = AddrCache::from_snapshot(&snap);
+        assert_eq!(c.evict(n, &[a("192.168.1.9:7")], HOME), 1);
+        assert!(c.get_all(n, OFFICE).is_empty());
         let old = format!(r#"{{"entries":[{{"node_id":"{n}","addr":"203.0.113.9:7"}}]}}"#);
         let snap: AddrCacheSnapshot = serde_json::from_str(&old).unwrap();
         assert_eq!(AddrCache::from_snapshot(&snap).get_all(n, HOME), vec![a("203.0.113.9:7")]);
+    }
+
+    #[test]
+    fn an_others_item_of_the_previous_format_or_junk_is_skipped_not_fatal() {
+        let n = id();
+        // 75075d8 wrote `others` as bare addresses; a future version may write
+        // anything. The entry and the rest of the snapshot load.
+        let text = format!(
+            r#"{{"entries":[
+                {{"node_id":"{n}","addr":"203.0.113.1:7","others":["203.0.113.2:7",{{"addr":"203.0.113.3:7","net":5}},"not an address",42]}},
+                "junk",
+                {{"node_id":"{n}x","addr":"nope"}}
+            ]}}"#
+        );
+        let snap: AddrCacheSnapshot = serde_json::from_str(&text).unwrap();
+        assert_eq!(snap.entries.len(), 1);
+        let c = AddrCache::from_snapshot(&snap);
+        assert_eq!(
+            c.get_all(n, HOME),
+            vec![a("203.0.113.1:7"), a("203.0.113.2:7"), a("203.0.113.3:7")]
+        );
     }
 
     #[test]
