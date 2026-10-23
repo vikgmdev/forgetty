@@ -2,8 +2,9 @@
 //! callbacks. Everything here reports back through channels and counters; the
 //! shell decides what to do (`machines.rs`).
 //!
-//! - Network: `NotifyIpInterfaceChange` (iphlpapi). The callback runs on a
-//!   system thread and only sends a signal.
+//! - Network: `NotifyIpInterfaceChange` and `NotifyUnicastIpAddressChange` (iphlpapi). A
+//!   WireGuard tunnel going up or down (its adapter appears or goes, then its address is added
+//!   or removed) is one of these. The callbacks run on a system thread and only send a signal.
 //! - Resume: `PowerRegisterSuspendResumeNotification` with a callback. It
 //!   delivers the same `PBT_APM*` events a window gets in `WM_POWERBROADCAST`,
 //!   without subclassing the GPUI window.
@@ -135,7 +136,8 @@ mod imp {
     use windows::UI::Notifications::{ToastActivatedEventArgs, ToastNotification, ToastNotificationManager};
     use windows::Win32::Foundation::{ERROR_SUCCESS, HANDLE};
     use windows::Win32::NetworkManagement::IpHelper::{
-        MibInitialNotification, NotifyIpInterfaceChange, MIB_IPINTERFACE_ROW, MIB_NOTIFICATION_TYPE,
+        MibInitialNotification, NotifyIpInterfaceChange, NotifyUnicastIpAddressChange, MIB_IPINTERFACE_ROW, MIB_NOTIFICATION_TYPE,
+        MIB_UNICASTIPADDRESS_ROW,
     };
     use windows::Win32::Networking::WinSock::AF_UNSPEC;
     use windows::Win32::System::Power::{
@@ -153,6 +155,21 @@ mod imp {
             s.net_callbacks.fetch_add(1, Ordering::Relaxed);
         }
         // The initial notification only proves the callback works.
+        if kind != MibInitialNotification {
+            signal(Signal::Network);
+        }
+    }
+
+    /// An address was added, removed or changed on some interface: the tunnel address of a
+    /// WireGuard adapter arrives after the adapter itself.
+    unsafe extern "system" fn on_address_change(
+        _ctx: *const c_void,
+        _row: *const MIB_UNICASTIPADDRESS_ROW,
+        kind: MIB_NOTIFICATION_TYPE,
+    ) {
+        if let Some(s) = STATS.get() {
+            s.net_callbacks.fetch_add(1, Ordering::Relaxed);
+        }
         if kind != MibInitialNotification {
             signal(Signal::Network);
         }
@@ -176,6 +193,11 @@ mod imp {
                 stats.net_registered.store(true, Ordering::SeqCst);
             } else {
                 stats.error(&format!("NotifyIpInterfaceChange: {}", rc.0));
+            }
+            let mut addr_handle = HANDLE::default();
+            let rc = NotifyUnicastIpAddressChange(AF_UNSPEC, Some(on_address_change), None, true, &mut addr_handle);
+            if rc != ERROR_SUCCESS {
+                stats.error(&format!("NotifyUnicastIpAddressChange: {}", rc.0));
             }
 
             // The registration keeps pointers to this struct only while the call runs.

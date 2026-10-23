@@ -170,7 +170,39 @@ Needs a paired remote machine with a pane running `ping` or `while sleep 1; do d
   gap and no repeated block.
 - [ ] N6 Type something, pull the network cable/disable wifi, and restart the server. After reconnect a notice
   "Server restarted, N bytes of input not sent" shows in the pane. The typed bytes are NOT replayed into the new session.
-- [ ] N7 A VPN (WireGuard) up and down while connected: reconnects, no duplicated characters.
+- [ ] N7 A VPN (WireGuard) up and down while connected: reconnects, no duplicated characters. For a WireGuard-only
+  server see the next section.
+
+---
+
+## WireGuard-only server (no relay)
+
+Needs a server started with `--bind <its WireGuard IP> --no-relay` (see `docs/server.md`, section "WireGuard-only
+server") and a WireGuard tunnel on this PC that reaches it. Do not use the server that is already running on the default
+port for this. Start a second one with its own `--state-dir` and port.
+
+- [ ] G1 With the tunnel UP, run `forgetty pair` on the server. The output has a `direct` list with the WireGuard address.
+  Pair as in A2. Expected: the confirm step shows "Relay: none (WireGuard only)" and an "Address" row with the
+  WireGuard IP and port. After Confirm the machine goes to "connected" and a pane works.
+- [ ] G2 Close the client and open it again. Expected: it connects without the QR (the address is stored with the machine).
+- [ ] G3 Turn the tunnel OFF in the WireGuard app. Expected: within a few seconds the sidebar shows "reconnecting", and
+  after the dial has failed for a while the pane overlay says "Can't reach the server. Is WireGuard on?" with a Retry
+  button. The sidebar says "unreachable". Typing is buffered, nothing crashes.
+- [ ] G4 With the tunnel still off, press Retry. Expected: nothing visible changes except that the app dials again
+  (the message stays). No error dialog.
+- [ ] G5 Turn the tunnel ON. Expected: the message goes away on its own within a few seconds, the sidebar goes to
+  "connected", and the buffered keystrokes arrive in order. You do not press Retry.
+- [ ] G6 Turn the tunnel off and on three times in a row, quickly. Expected: it ends "connected", no duplicated characters.
+- [ ] G7 Sleep the PC with the tunnel on, wake it. Expected: "connected" again within a few seconds of the tunnel being up.
+- [ ] G8 Switch the PC from wifi to tether with the tunnel on. Expected: as N1 (the tunnel follows the network).
+- [ ] G9 An upgrade from an older build: a machine paired on that build (it carries the default relay) keeps working.
+  If its server was reached on a LAN or WireGuard address, that address is now pinned and the sidebar still goes to
+  "connected". Note: the old file cannot say whether the server runs with `--no-relay`, so the machine is NOT marked
+  relayless. A server that is moved to `--no-relay` (WireGuard only) needs a re-pair on this PC: remove the machine
+  and pair again with the new `forgetty pair` output.
+- [ ] G10 Break `machines.json` on purpose (put `{` in one entry, or cut the file in half) and start the app. Expected: the
+  good machines still load (a half file loads none). Pair or remove a machine, then look in
+  `%APPDATA%\forgetty\`: a `machines.json.bad-<seconds>` file holds the broken original. Nothing is lost silently.
 
 ---
 
