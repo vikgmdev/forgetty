@@ -72,6 +72,7 @@ async fn the_server_binds_only_its_address_and_reaches_nobody_outside() {
     assert_eq!(n["relays_disabled"], true, "{n}");
     assert_eq!(n["relay_urls"].as_array().unwrap().len(), 0, "relay urls: {n}");
     assert_eq!(n["address_lookups"], 0, "address lookups (n0 DNS / pkarr): {n}");
+    assert_eq!(n["portmapper_activity"], 0, "portmapper (UPnP, NAT-PMP, PCP): {n}");
     assert_eq!(n["relay_activity"], 0, "relay activity: {n}");
     let sockets: Vec<String> =
         n["bound_sockets"].as_array().unwrap().iter().map(|s| s.as_str().unwrap().into()).collect();
@@ -94,6 +95,7 @@ async fn the_server_binds_only_its_address_and_reaches_nobody_outside() {
     h.request("get_layout", forgetty_client::proto::Value::Nil).await.expect("get_layout");
     let n = net(&server);
     assert_eq!(n["relay_activity"], 0, "relay activity after a client: {n}");
+    assert_eq!(n["portmapper_activity"], 0, "portmapper after a client: {n}");
     assert_eq!(n["address_lookups"], 0, "{n}");
     assert_eq!(n["relay_urls"].as_array().unwrap().len(), 0, "{n}");
     h.close().await;
@@ -179,6 +181,86 @@ async fn a_relayless_client_connects_on_its_pinned_address_and_reports_a_hung_se
         let _ = tokio::time::timeout(Duration::from_millis(100), rx.changed()).await;
     }
     wait_for("the reconnect", Duration::from_secs(40), || h.state().is_connected()).await;
+    h.close().await;
+    server.shutdown().await;
+}
+
+/// `--no-relay` without `--bind`: a config error. The server exits at once
+/// with code 75 (the unit's `RestartPreventExitStatus`), before it makes any
+/// socket or pane.
+#[test]
+fn no_relay_without_a_bind_address_is_refused_with_exit_75() {
+    if !real_only() {
+        return;
+    }
+    let bin = std::env::var_os("FORGETTY_REAL_SERVER").expect("FORGETTY_REAL_SERVER");
+    let dir = tempfile::tempdir().unwrap();
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(dir.path().join("state"))
+        .args(["server", "run", "--port", "0", "--no-relay"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run forgetty");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(75), "exit status; stderr: {err}");
+    assert!(err.contains("no bind address"), "stderr: {err}");
+}
+
+/// An address that is not on this machine (TEST-NET-1): the bind fails, and
+/// the process stays up with its local socket and panes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bind_address_that_is_not_there_does_not_end_the_server() {
+    if !real_only() {
+        return;
+    }
+    let server =
+        TestServer::start_real_on(0, &["--bind", "192.0.2.1", "--no-relay"], false).await;
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let pid = server.pid().expect("pid");
+    assert!(std::path::Path::new(&format!("/proc/{pid}")).exists(), "the server exited");
+    // The local socket and the panes work, the iroh side says it is not up.
+    let pane = server.add_pane();
+    assert!(!pane.is_nil());
+    let st = server.qa_state();
+    assert!(st["udp_port"].is_null(), "udp_port: {}", st["udp_port"]);
+    let err = server.socket_call("pair_open", serde_json::json!({})).unwrap_err();
+    assert!(err.contains("unavailable") || err.contains("not"), "pair_open error: {err}");
+    // A stop still works without an endpoint.
+    server.shutdown().await;
+}
+
+/// The address appears later (here: the port is held by another socket at
+/// first). The server retries in the background and comes up by itself, and a
+/// client can pair with it. A real tunnel address needs root to add, so the
+/// "address appears" case is the same code path with a busy port.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_endpoint_binds_in_the_background_when_the_address_becomes_usable() {
+    if !real_only() {
+        return;
+    }
+    let holder = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = holder.local_addr().unwrap().port();
+    let server =
+        TestServer::start_real_on(port, &["--bind", "127.0.0.1", "--no-relay"], false).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(server.qa_state()["udp_port"].is_null(), "bound while the port was taken");
+    let pane = server.add_pane();
+    assert!(!pane.is_nil());
+
+    drop(holder);
+    // Backoff is 1, 2, 4, 8, 10 s: up within the first 10 s tick.
+    wait_for("the endpoint to come up", Duration::from_secs(25), || {
+        !server.qa_state()["udp_port"].is_null()
+    })
+    .await;
+    assert_eq!(server.qa_state()["udp_port"], port);
+    let n = net(&server);
+    assert_eq!(n["relay_activity"], 0, "{n}");
+    assert_eq!(n["portmapper_activity"], 0, "{n}");
+    // And it serves: pair, connect, use the pane that was made before.
+    let (h, _paired) = paired_client(&server, Duration::from_secs(5)).await;
+    assert!(h.state().is_connected());
     h.close().await;
     server.shutdown().await;
 }

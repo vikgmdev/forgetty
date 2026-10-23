@@ -143,6 +143,31 @@ fn quic_config() -> iroh::endpoint::QuicTransportConfig {
 /// `server start` uses it to tell "someone else is starting" from a real failure.
 pub const EXIT_ALREADY_RUNNING: i32 = 75; // keep in step with cli.rs
 
+/// Backoff of the background iroh bind (address not there yet): from 1 s up to
+/// 10 s, a WARN at most once a minute.
+const BIND_RETRY_MIN: Duration = Duration::from_secs(1);
+const BIND_RETRY_MAX: Duration = Duration::from_secs(10);
+const BIND_WARN_EVERY: Duration = Duration::from_secs(60);
+
+/// `--no-relay` / `relay = "none"` without `--bind` / `bind_addrs`. A config
+/// error that a restart cannot fix: `server run` exits with
+/// [`EXIT_ALREADY_RUNNING`]'s code 75 so the systemd unit (`RestartPreventExitStatus=75`)
+/// does not loop on it.
+#[derive(Debug)]
+pub struct NeedsBind;
+
+impl std::fmt::Display for NeedsBind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "relays are switched off (--no-relay / relay = \"none\") but no bind address is set: \
+             add --bind IP (or bind_addrs in the config file), for example the WireGuard address"
+        )
+    }
+}
+
+impl std::error::Error for NeedsBind {}
+
 /// Another server holds the instance lock.
 #[derive(Debug)]
 pub struct AlreadyRunning(pub PathBuf);
@@ -310,6 +335,28 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
             Config::default()
         }
     };
+
+    // Relays: --relay-url replaces the config file list. None: iroh defaults.
+    let relay_source = if args.relay_url.is_empty() { &config.relay_urls } else { &args.relay_url };
+    let relay_urls = parse_relay_urls(relay_source)?;
+    let no_relay = relays_disabled(args.no_relay, config.relay.as_deref())?;
+    if no_relay && !relay_urls.is_empty() {
+        anyhow::bail!("relays are switched off (--no-relay / relay = \"none\") but relay URLs are set");
+    }
+    // Own relays: no n0 discovery unless asked for (--n0-discovery).
+    let n0_discovery = !no_relay && (relay_urls.is_empty() || args.n0_discovery);
+    let bind_source = if args.bind.is_empty() { &config.bind_addrs } else { &args.bind };
+    let bind_addrs = parse_bind_addrs(bind_source)?;
+    if bind_addrs.is_empty() {
+        info!("bind: every address");
+    } else {
+        info!("bind: {}", bind_addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", "));
+    }
+    if no_relay && bind_addrs.is_empty() {
+        // Without relays the server is reached on its direct addresses only,
+        // and a server that binds every address would put them all in the QR.
+        return Err(NeedsBind.into());
+    }
 
     info!("session_id: {session_id}");
 
@@ -735,22 +782,6 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
         .port
         .or_else(|| std::env::var("FORGETTY_PORT").ok().and_then(|v| v.parse().ok()))
         .unwrap_or(DEFAULT_PORT);
-    // Relays: --relay-url replaces the config file list. None: iroh defaults.
-    let relay_source = if args.relay_url.is_empty() { &config.relay_urls } else { &args.relay_url };
-    let relay_urls = parse_relay_urls(relay_source)?;
-    let no_relay = relays_disabled(args.no_relay, config.relay.as_deref())?;
-    if no_relay && !relay_urls.is_empty() {
-        anyhow::bail!("relays are switched off (--no-relay / relay = \"none\") but relay URLs are set");
-    }
-    // Own relays: no n0 discovery unless asked for (--n0-discovery).
-    let n0_discovery = !no_relay && (relay_urls.is_empty() || args.n0_discovery);
-    let bind_source = if args.bind.is_empty() { &config.bind_addrs } else { &args.bind };
-    let bind_addrs = parse_bind_addrs(bind_source)?;
-    if bind_addrs.is_empty() {
-        info!("bind: every address");
-    } else {
-        info!("bind: {}", bind_addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", "));
-    }
     info!("n0 discovery: {}", if n0_discovery { "on" } else { "off" });
     if no_relay {
         info!("relays: none (the server never contacts a relay or n0)");
@@ -762,58 +793,98 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
             relay_urls.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(", ")
         );
     }
-    let sync_endpoint = match SyncEndpoint::builder(secret_key)
-        .bind_port(port)
-        .relay_urls(relay_urls)
-        .n0_discovery(n0_discovery)
-        .relays_disabled(no_relay)
-        .bind_addrs(bind_addrs)
-        .transport_config(quic_config())
-        .register_alpn(forgetty_proto::ALPN_RPC, rpc_v2.alpn_handler())
-        .register_alpn(
-            FORGETTY_STREAM_ALPN,
-            Arc::new(move |conn, registry| {
-                let sm = Arc::clone(&sm_for_alpn);
-                Box::pin(async move {
-                    handle_terminal_stream(conn, sm, registry).await;
-                })
-            }),
-        )
-        .build()
-        .await
-    {
-        Ok(ep) => {
+    // The iroh endpoint can come up late: a WireGuard-only server started
+    // before its tunnel is up has no address to bind yet. The local socket
+    // server and the panes do not wait for it.
+    let sync_slot: forgetty_socket::SyncSlot = Default::default();
+    #[cfg(feature = "qa-tools")]
+    forgetty_server::qa_hook::install(Arc::clone(&rpc_v2), Arc::clone(&sync_slot));
+    let make_endpoint = {
+        let (rpc_v2, relay_urls, bind_addrs) = (Arc::clone(&rpc_v2), relay_urls, bind_addrs);
+        move || {
+            let sm_for_alpn = Arc::clone(&sm_for_alpn);
+            SyncEndpoint::builder(secret_key.clone())
+                .bind_port(port)
+                .relay_urls(relay_urls.clone())
+                .n0_discovery(n0_discovery)
+                .relays_disabled(no_relay)
+                .bind_addrs(bind_addrs.clone())
+                .transport_config(quic_config())
+                .register_alpn(forgetty_proto::ALPN_RPC, rpc_v2.alpn_handler())
+                .register_alpn(
+                    FORGETTY_STREAM_ALPN,
+                    Arc::new(move |conn, registry| {
+                        let sm = Arc::clone(&sm_for_alpn);
+                        Box::pin(async move {
+                            handle_terminal_stream(conn, sm, registry).await;
+                        })
+                    }),
+                )
+                .build()
+        }
+    };
+    let bring_up = {
+        let (rpc_v2, slot) = (Arc::clone(&rpc_v2), Arc::clone(&sync_slot));
+        move |ep: SyncEndpoint| {
             info!(
                 "iroh endpoint bound, node_id={}, udp={:?}, alpns=[forgetty/rpc/2, forgetty/pair/2, forgetty/pair/1 (refuses), forgetty/stream/1]",
                 ep.node_id(),
                 ep.bound_sockets()
             );
-            Arc::new(ep)
+            let ep = Arc::new(ep);
+            rpc_v2.set_sync(Arc::clone(&ep));
+            let _ = slot.set(Arc::clone(&ep));
+            // Spawn iroh accept loop.
+            tokio::spawn(async move {
+                ep.accept_loop().await;
+            });
+        }
+    };
+    match make_endpoint().await {
+        Ok(ep) => bring_up(ep),
+        Err(forgetty_sync::SyncError::Bind(e)) => {
+            // Not fatal: the process keeps the panes and the local socket and
+            // tries again until the address is there.
+            warn!("iroh endpoint: cannot bind yet ({e}); retrying in the background");
+            tokio::spawn(async move {
+                let mut wait = BIND_RETRY_MIN;
+                let mut last_warn = std::time::Instant::now();
+                loop {
+                    tokio::time::sleep(wait).await;
+                    match make_endpoint().await {
+                        Ok(ep) => {
+                            bring_up(ep);
+                            return;
+                        }
+                        Err(forgetty_sync::SyncError::Bind(e)) => {
+                            if last_warn.elapsed() >= BIND_WARN_EVERY {
+                                warn!("iroh endpoint: still cannot bind ({e}); retrying");
+                                last_warn = std::time::Instant::now();
+                            } else {
+                                debug!("iroh endpoint: bind failed again ({e})");
+                            }
+                        }
+                        Err(e) => {
+                            error!("iroh endpoint: {e}; giving up on the network side");
+                            return;
+                        }
+                    }
+                    wait = (wait * 2).min(BIND_RETRY_MAX);
+                }
+            });
         }
         Err(e) => {
             warn!("totem-sync: failed to bind iroh endpoint: {e}");
             return Err(anyhow::anyhow!("iroh bind failed: {e}"));
         }
-    };
-
-    rpc_v2.set_sync(Arc::clone(&sync_endpoint));
-    #[cfg(feature = "qa-tools")]
-    forgetty_server::qa_hook::install(Arc::clone(&rpc_v2), Arc::clone(&sync_endpoint));
-
-    // Spawn iroh accept loop.
-    {
-        let ep = Arc::clone(&sync_endpoint);
-        tokio::spawn(async move {
-            ep.accept_loop().await;
-        });
     }
 
     // Spawn the socket server with full SessionManager + SyncEndpoint integration.
     let _socket_task = {
         let sm = Arc::clone(&session_manager);
-        let se = Arc::clone(&sync_endpoint);
+        let slot = Arc::clone(&sync_slot);
         tokio::spawn(async move {
-            if let Err(e) = socket_server.run_with_streaming(sm, Some(se)).await {
+            if let Err(e) = socket_server.run_with_slot(sm, slot).await {
                 error!("Socket server error: {e}");
             }
         })
@@ -834,7 +905,7 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
     info!("forgetty-server shutting down");
     forgetty_socket::graceful_exit(
         &session_manager,
-        Some(&sync_endpoint),
+        sync_slot.get().map(|e| &**e),
         Some(session_id),
         &socket_path,
     )

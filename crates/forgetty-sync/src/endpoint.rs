@@ -116,6 +116,9 @@ pub struct OutsideServices {
     /// Packets sent or received through a relay, relay home changes and relay
     /// paths opened, so far.
     pub relay_activity: u64,
+    /// Portmapper work (UPnP, NAT-PMP, PCP probes and mapping attempts) so
+    /// far. It talks to the router, so it is zero when relays are disabled.
+    pub portmapper_activity: u64,
 }
 
 /// Builder for [`SyncEndpoint`].
@@ -213,7 +216,11 @@ impl SyncEndpointBuilder {
         let make = |dual: bool| -> Result<iroh::endpoint::Builder, SyncError> {
             let mut builder = if self.relays_disabled {
                 // Nothing of the N0 preset: no relays, no DNS publishing.
-                Endpoint::empty_builder().relay_mode(iroh::RelayMode::Disabled)
+                // The portmapper (UPnP, NAT-PMP, PCP) is on by default and
+                // asks the router: off too.
+                Endpoint::empty_builder()
+                    .relay_mode(iroh::RelayMode::Disabled)
+                    .portmapper_config(iroh::endpoint::PortmapperConfig::Disabled)
             } else {
                 Endpoint::builder(presets::N0)
             }
@@ -403,6 +410,11 @@ impl SyncEndpoint {
         OutsideServices {
             relay_urls: self.endpoint.addr().relay_urls().map(ToString::to_string).collect(),
             address_lookups: self.endpoint.address_lookup().map_or(0, |l| l.len()),
+            portmapper_activity: {
+                let p = &m.portmapper;
+                p.probes_started.get() + p.mapping_attempts.get() + p.local_port_updates.get()
+                    + p.upnp_probes.get()
+            },
             relay_activity: s.send_relay.get()
                 + s.recv_data_relay.get()
                 + s.relay_home_change.get()

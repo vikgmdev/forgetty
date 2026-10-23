@@ -24,7 +24,7 @@ use crate::rpc_v2::RpcV2;
 const READ_CAP: usize = 16 * 1024 * 1024;
 
 /// Register the `qa_*` methods with the socket dispatch table.
-pub fn install(rpc: Arc<RpcV2>, sync: Arc<SyncEndpoint>) {
+pub fn install(rpc: Arc<RpcV2>, sync: forgetty_socket::SyncSlot) {
     forgetty_socket::qa::set_hook(Arc::new(move |req, sm| handle(&rpc, &sync, req, sm)));
 }
 
@@ -43,10 +43,19 @@ fn pane_param(req: &Request) -> Result<Uuid, Response> {
 
 fn handle(
     rpc: &Arc<RpcV2>,
-    sync: &Arc<SyncEndpoint>,
+    slot: &forgetty_socket::SyncSlot,
     req: &Request,
     sm: &Arc<SessionManager>,
 ) -> Option<Response> {
+    // The endpoint of a server whose address is not up yet is not there.
+    let sync: Option<&Arc<SyncEndpoint>> = slot.get();
+    let needs_sync = || {
+        Some(Response::error(
+            req.id.clone(),
+            INTERNAL_ERROR,
+            "the iroh endpoint is not bound yet".to_string(),
+        ))
+    };
     let ok = |v: Value| Some(Response::success(req.id.clone(), v));
     match req.method.as_str() {
         "qa_state" => {
@@ -90,9 +99,11 @@ fn handle(
                 .iter()
                 .map(|(p, o)| json!([p.to_string(), o]))
                 .collect();
-            let port = sync.bound_sockets().into_iter().find(|s| s.is_ipv4()).map(|s| s.port());
+            let port = sync.and_then(|s| {
+                s.bound_sockets().into_iter().find(|s| s.is_ipv4()).map(|s| s.port())
+            });
             ok(json!({
-                "node_id": sync.node_id().to_string(),
+                "node_id": sync.map(|s| s.node_id().to_string()),
                 "udp_port": port,
                 "dedup_drops": rpc.qa.dedup_drops.load(Ordering::SeqCst),
                 "handshakes": rpc.qa.handshakes.load(Ordering::SeqCst),
@@ -113,20 +124,22 @@ fn handle(
                 "alive_tasks": tokio::runtime::Handle::current().metrics().num_alive_tasks(),
                 "connections": rpc.connection_count(),
                 "attached_clients": rpc.attached_total(),
-                "quic_open": sync.quic_open(),
-                "handshake_failures": sync.handshake_failures(),
+                "quic_open": sync.map_or(0, |s| s.quic_open()),
+                "handshake_failures": sync.map_or(0, |s| s.handshake_failures()),
                 "attaches": attaches,
                 "panes": panes,
                 "pane_input": input,
             }))
         }
         "qa_net_services" => {
+            let Some(sync) = sync else { return needs_sync() };
             let o = sync.outside_services();
             ok(json!({
                 "relays_disabled": sync.relays_disabled(),
                 "relay_urls": o.relay_urls,
                 "address_lookups": o.address_lookups,
                 "relay_activity": o.relay_activity,
+                "portmapper_activity": o.portmapper_activity,
                 "bound_sockets": sync.bound_sockets().iter().map(|a| a.to_string()).collect::<Vec<_>>(),
                 "direct_addrs": sync.direct_addrs().iter().map(|a| a.to_string()).collect::<Vec<_>>(),
             }))
@@ -179,6 +192,7 @@ fn handle(
                 paired_at: iso8601_now(),
                 last_seen: None,
             };
+            let Some(sync) = sync else { return needs_sync() };
             let res = sync.registry().lock().unwrap_or_else(|e| e.into_inner()).add(entry);
             match res {
                 Ok(()) => ok(json!({ "ok": true })),

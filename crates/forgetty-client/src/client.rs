@@ -405,6 +405,7 @@ async fn bind_endpoint(
     opts.shape(Endpoint::empty_builder())
         .secret_key(identity)
         .relay_mode(opts.relay_mode(server))
+        .portmapper_config(opts.portmapper_config())
         .transport_config(transport_config())
         .bind()
         .await
@@ -1167,6 +1168,12 @@ impl ClientHandle {
     pub fn audits_for_tests(&self) -> (Vec<iroh::EndpointId>, usize) {
         let a = &self.shared().audit;
         (lock(&a.keys).clone(), a.running.load(Ordering::SeqCst))
+    }
+
+    /// Test hook: the address of every audit probe so far, in order.
+    #[doc(hidden)]
+    pub fn audit_probes_for_tests(&self) -> Vec<SocketAddr> {
+        lock(&self.shared().audit.probed).clone()
     }
 
     /// Test hook: the id of the device key.
@@ -2109,6 +2116,8 @@ struct AuditState {
     /// The ids of the audit endpoints bound so far (tests check they are not
     /// the device key).
     keys: Mutex<Vec<iroh::EndpointId>>,
+    /// The address each probe was sent to, in order (tests).
+    probed: Mutex<Vec<SocketAddr>>,
     /// Audit endpoints alive now.
     running: AtomicUsize,
 }
@@ -2166,7 +2175,8 @@ impl Drop for AuditEndpoint {
 /// leaves the cache for this network, and the address book is marked stale.
 /// One that does not answer is harmless and stays. Pinned addresses are never
 /// audited, and an address is audited once per network per
-/// [`AUDIT_REPEAT`]. With `budget` the call returns when it is spent and the
+/// [`AUDIT_REPEAT`] (when a probe gave a verdict: the right peer, or another
+/// one). With `budget` the call returns when it is spent and the
 /// probes still open are dropped (their candidates stay). Returns the
 /// addresses forgotten.
 async fn audit(
@@ -2175,21 +2185,20 @@ async fn audit(
     budget: Option<Duration>,
 ) -> Vec<SocketAddr> {
     let due: Vec<SocketAddr> = {
-        let mut audited = lock(&ctx.state.audited);
+        let audited = lock(&ctx.state.audited);
         candidates
             .into_iter()
             .filter(|a| !ctx.pinned.contains(a))
             .filter(|a| {
                 let key = (*a, ctx.net);
-                if audited.get(&key).is_some_and(|t| t.elapsed() < AUDIT_REPEAT) {
-                    return false;
-                }
-                audited.insert(key, Instant::now());
-                true
+                // Only a verdict is recorded (below): a probe that got no
+                // answer is tried again by the next audit.
+                !audited.get(&key).is_some_and(|t| t.elapsed() < AUDIT_REPEAT)
             })
             .collect()
     };
     if due.is_empty() {
+        debug!("client: audit has nothing due");
         return Vec::new();
     }
     let gone = Arc::new(Mutex::new(Vec::new()));
@@ -2203,9 +2212,12 @@ async fn audit(
                 // second candidate would make the first one look wrong (or
                 // right).
                 let key = SecretKey::generate(&mut rand::rng());
+                // No relay, and no port mapping either: a probe must not ask
+                // the router (UPnP, NAT-PMP, PCP) for anything.
                 let Ok(ep) = Endpoint::empty_builder()
                     .secret_key(key)
                     .relay_mode(iroh::RelayMode::Disabled)
+                    .portmapper_config(iroh::endpoint::PortmapperConfig::Disabled)
                     .transport_config(transport_config())
                     .bind()
                     .await
@@ -2213,13 +2225,21 @@ async fn audit(
                     return;
                 };
                 lock(&ctx.state.keys).push(ep.id());
+                lock(&ctx.state.probed).push(addr);
                 ctx.state.running.fetch_add(1, Ordering::SeqCst);
                 let guard = AuditEndpoint { ep: Some(Arc::new(ep)), state: ctx.state.clone() };
                 let ep = guard.ep.clone().expect("set above");
                 let target = EndpointAddr::new(ctx.server).with_ip_addr(addr);
+                let verdict = || {
+                    lock(&ctx.state.audited).insert((addr, ctx.net), Instant::now());
+                };
                 match tokio::time::timeout(AUDIT_LIMIT, ep.connect(target, ALPN_RPC)).await {
-                    Ok(Ok(c)) => c.close(0u32.into(), b"audit"),
+                    Ok(Ok(c)) => {
+                        verdict();
+                        c.close(0u32.into(), b"audit");
+                    }
                     Ok(Err(e)) if is_identity_failure(&e.to_string()) => {
+                        verdict();
                         ctx.cache.evict(ctx.server, &[addr], ctx.net);
                         ctx.dirty.store(true, Ordering::SeqCst);
                         lock(&gone).push(addr);
@@ -2259,6 +2279,7 @@ fn spawn_audit(shared: &Shared, conn: iroh::endpoint::ConnectionInfo, ctx: Audit
             .collect();
         let unproven: Vec<SocketAddr> =
             ctx.tried.iter().filter(|a| !on_path.contains(a)).copied().collect();
+        debug!("client: audit of {unproven:?} (cached {:?}, on a path {on_path:?})", ctx.tried);
         if unproven.is_empty() {
             return;
         }

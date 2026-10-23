@@ -74,6 +74,16 @@ impl ClientOptions {
         }
     }
 
+    /// A server without relays is reached on its direct addresses only: the
+    /// endpoint must not talk to the router either (UPnP, NAT-PMP, PCP).
+    pub(crate) fn portmapper_config(&self) -> iroh::endpoint::PortmapperConfig {
+        if self.relays_disabled {
+            iroh::endpoint::PortmapperConfig::Disabled
+        } else {
+            iroh::endpoint::PortmapperConfig::default()
+        }
+    }
+
     /// Apply `relay_only` to an endpoint builder.
     pub(crate) fn shape(&self, builder: iroh::endpoint::Builder) -> iroh::endpoint::Builder {
         if self.relay_only {

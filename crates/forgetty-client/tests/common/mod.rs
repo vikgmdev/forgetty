@@ -387,6 +387,7 @@ impl Real {
         dir.join("state/run/forgetty/forgetty.sock")
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn start(
         dir: Arc<tempfile::TempDir>,
         port: u16,
@@ -396,6 +397,7 @@ impl Real {
         log_mb: Option<u32>,
         open_access_override: Option<bool>,
         extra: &[String],
+        need_net: bool,
     ) -> Real {
         let mut child = Self::spawn(&dir, port, log_mb, extra);
         let pid = child.id() as i32;
@@ -408,7 +410,9 @@ impl Real {
         let (rpc, state) = loop {
             match Rpc::connect(&sock) {
                 Ok(rpc) => match rpc.call("qa_state", json!({})) {
-                    Ok(state) if state.get("udp_port").is_some_and(|p| !p.is_null()) => {
+                    Ok(state)
+                        if !need_net || state.get("udp_port").is_some_and(|p| !p.is_null()) =>
+                    {
                         break (rpc, state)
                     }
                     Ok(state) => last = format!("qa_state without a UDP port: {state}"),
@@ -433,8 +437,12 @@ impl Real {
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         };
-        let node_id: EndpointId = state["node_id"].as_str().unwrap().parse().expect("node id");
-        let port = state["udp_port"].as_u64().unwrap() as u16;
+        // A server whose iroh endpoint is not bound yet has neither.
+        let node_id: EndpointId = match state["node_id"].as_str() {
+            Some(id) => id.parse().expect("node id"),
+            None => SecretKey::generate(&mut rand::rng()).public(),
+        };
+        let port = state["udp_port"].as_u64().unwrap_or(0) as u16;
         let open_access = open_access_override.unwrap_or(authorized.is_none());
         rpc.call("qa_open_access", json!({"on": open_access})).unwrap();
         if let Some(set) = authorized {
@@ -571,6 +579,7 @@ impl TestServer {
             log_mb,
             None,
             &[],
+            true,
         )
         .await;
         TestServer { inner: Inner::Real(Box::new(real)) }
@@ -579,12 +588,29 @@ impl TestServer {
     /// A real server started with extra `server run` arguments (`--bind`,
     /// `--no-relay`). Real server only: the mock has no such options.
     pub async fn start_real_with_args(extra: &[&str]) -> TestServer {
+        Self::start_real_on(0, extra, true).await
+    }
+
+    /// Like [`start_real_with_args`](Self::start_real_with_args) on `port`.
+    /// With `need_net` false it returns as soon as the local socket answers,
+    /// without waiting for the iroh endpoint (a server whose bind address is
+    /// not up yet).
+    pub async fn start_real_on(port: u16, extra: &[&str], need_net: bool) -> TestServer {
         arm_watchdog();
-        assert!(is_real(), "start_real_with_args needs FORGETTY_REAL_SERVER");
+        assert!(is_real(), "start_real_on needs FORGETTY_REAL_SERVER");
         let dir = Arc::new(tempfile::tempdir().expect("temp dir"));
         let extra: Vec<String> = extra.iter().map(ToString::to_string).collect();
-        let real = Real::start(dir, 0, &[vec![]], None, false, None, None, &extra).await;
+        let panes = if need_net { vec![vec![]] } else { Vec::new() };
+        let real = Real::start(dir, port, &panes, None, false, None, None, &extra, need_net).await;
         TestServer { inner: Inner::Real(Box::new(real)) }
+    }
+
+    /// The `qa_state` of the real server.
+    pub fn qa_state(&self) -> Value {
+        match &self.inner {
+            Inner::Real(r) => r.state(),
+            Inner::Mock { .. } => panic!("mock server has no qa_state"),
+        }
     }
 
     /// A new server process on `port` with the state of a stopped one.
@@ -601,7 +627,7 @@ impl TestServer {
                 Self::start(cfg).await
             }
             Saved::Real { dir, open_access } => {
-                let real = Real::start(dir, port, &[], None, false, None, Some(open_access), &[]).await;
+                let real = Real::start(dir, port, &[], None, false, None, Some(open_access), &[], true).await;
                 TestServer { inner: Inner::Real(Box::new(real)) }
             }
         }

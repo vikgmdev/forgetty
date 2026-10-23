@@ -183,7 +183,8 @@ carries the tunnel address:
 forgetty server run --port 47297 --bind 10.230.1.14 --no-relay
 ```
 
-The same as config: `bind_addrs = ["10.230.1.14"]` and `relay = "none"`. A
+The same as config: `bind_addrs = ["10.230.1.14"]` and `relay = "none"`.
+`--no-relay` needs `--bind`: without it the server exits with code 75. A
 systemd example is in `dist/systemd/forgetty-server-wireguard.service`, and the
 details are in `docs/server.md`.
 

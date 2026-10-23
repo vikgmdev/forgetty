@@ -14,6 +14,10 @@ use tracing::{debug, error, info, warn};
 
 use forgetty_session::{SessionEvent, SessionManager};
 use forgetty_sync::SyncEndpoint;
+
+/// The sync endpoint of a server that may bind it late (see
+/// [`SocketServer::run_with_slot`]).
+pub type SyncSlot = Arc<std::sync::OnceLock<Arc<SyncEndpoint>>>;
 use forgetty_workspace;
 
 use crate::framing::write_frame;
@@ -172,6 +176,22 @@ impl SocketServer {
         sm: Arc<SessionManager>,
         sync_endpoint: Option<Arc<SyncEndpoint>>,
     ) -> std::io::Result<()> {
+        let slot = SyncSlot::default();
+        if let Some(se) = sync_endpoint {
+            let _ = slot.set(se);
+        }
+        self.run_with_slot(sm, slot).await
+    }
+
+    /// [`run_with_streaming`](Self::run_with_streaming) with a slot that is
+    /// filled later: the iroh endpoint of a server whose address is not up
+    /// yet comes after the socket. Until it is set the sync methods answer
+    /// "unavailable".
+    pub async fn run_with_slot(
+        &self,
+        sm: Arc<SessionManager>,
+        sync_slot: SyncSlot,
+    ) -> std::io::Result<()> {
         let listener = UnixListener::bind(&self.socket_path)?;
         restrict_socket(&self.socket_path)?;
         info!("Socket server listening on {:?}", self.socket_path);
@@ -193,7 +213,7 @@ impl SocketServer {
                     }
                     debug!("Accepted socket connection");
                     let sm = Arc::clone(&sm);
-                    let se = sync_endpoint.as_ref().map(Arc::clone);
+                    let se = Arc::clone(&sync_slot);
                     let counter = Arc::clone(&conn_counter);
                     let socket_path = socket_path.clone();
                     tokio::spawn(async move {
@@ -312,7 +332,7 @@ fn client_identity(
 async fn handle_streaming_connection(
     stream: tokio::net::UnixStream,
     sm: Arc<SessionManager>,
-    sync_endpoint: Option<Arc<SyncEndpoint>>,
+    sync_slot: SyncSlot,
     session_id: Option<uuid::Uuid>,
     conn_counter: Arc<AtomicUsize>,
     socket_path: PathBuf,
@@ -945,7 +965,7 @@ async fn handle_streaming_connection(
             let resp = Response::success(request.id, serde_json::json!({ "ok": true }));
             write_response(&mut writer, &resp).await?;
             info!("Received shutdown RPC, stopping server");
-            graceful_exit(&sm, sync_endpoint.as_deref(), session_id, &socket_path).await;
+            graceful_exit(&sm, sync_slot.get().map(|e| &**e), session_id, &socket_path).await;
         }
 
         if request.method == methods::IS_ATTACHED {
@@ -983,7 +1003,7 @@ async fn handle_streaming_connection(
             let (req, sm2, se, sid) = (
                 request.clone(),
                 Arc::clone(&sm),
-                sync_endpoint.as_ref().map(Arc::clone),
+                sync_slot.get().cloned(),
                 session_id,
             );
             let method = request.method.clone();
@@ -1002,7 +1022,7 @@ async fn handle_streaming_connection(
             guarded_dispatch(
                 &request,
                 Arc::clone(&sm),
-                sync_endpoint.as_ref().map(Arc::clone),
+                sync_slot.get().cloned(),
                 session_id,
             )
         };

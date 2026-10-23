@@ -318,11 +318,48 @@ relay = "none"
   the fixed `--port`. Without it the server binds every address.
 - `--no-relay` (or `relay = "none"`) turns relays off. The server never
   contacts a relay or n0: no relay connection, no address publishing, no
-  discovery. It cannot be combined with `--relay-url`.
+  discovery. It also switches off iroh's port mapping (UPnP, NAT-PMP, PCP), so
+  it does not talk to the router either. It cannot be combined with
+  `--relay-url`.
+- `--no-relay` needs `--bind`. Without a bind address the server refuses to
+  start, prints the reason and exits with code 75. The unit has
+  `RestartPreventExitStatus=75`, so systemd does not restart-loop on it.
 - The pairing QR then carries no relay, a `relays_disabled` flag and the bound
   addresses as `direct`. A client of an older version ignores the flag.
-- A paired client uses no relay either. It dials those addresses on every
-  network. When nothing answers it reports `unreachable_direct_only` so the
-  app can say "Can't reach the server. Is WireGuard on?".
+- A paired client uses no relay either, and no port mapping. It dials those
+  addresses on every network. When nothing answers it reports
+  `unreachable_direct_only` so the app can say "Can't reach the server. Is
+  WireGuard on?".
+- Devices paired before this change have no `relays_disabled` flag and no
+  direct address. They must pair again.
+- The network watcher of the client (`link-watch`) does nothing for a client
+  without relays: iroh runs no network report when it has no relay. Only the
+  app's `network_changed` call wakes such a client after a network change, so
+  an app must call it (Android: the connectivity callback; Windows: the
+  network-change notification).
 
 An example unit: `dist/systemd/forgetty-server-wireguard.service`.
+
+### The tunnel is down at boot
+
+If the bind address is not on the machine yet (the tunnel starts after the
+server), the iroh bind fails. The server does not exit. The local socket and
+the panes stay up, and the server retries the bind in the background (after 1
+s, then 2, 4, 8 and every 10 s) and logs a WARN once a minute. When the
+address appears the endpoint comes up on its own and `forgetty pair` works.
+Until then `forgetty pair` and the other sync commands answer "unavailable".
+
+A systemd user unit cannot be ordered after `wg-quick@wg0` (that is a system
+unit), so the unit has no `After=` for the tunnel. The retry covers it.
+
+### Manual checks (need root, not in the test suite)
+
+- Tunnel up after the server: stop the tunnel, start the server, then run
+  `sudo wg-quick up wg0`. Within 10 s the log shows `iroh endpoint bound` and a
+  client connects. (The test suite covers the same retry with a busy port,
+  because adding an address needs root.)
+- Tunnel restart while the server runs: run
+  `sudo wg-quick down wg0 && sudo wg-quick up wg0` and confirm a connected
+  client is back within 5 s. The server's socket is bound to the address, so
+  check in the log that it keeps answering after the interface returns. If it
+  does not, restart the server and report it.

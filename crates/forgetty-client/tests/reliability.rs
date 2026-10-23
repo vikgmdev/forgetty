@@ -1549,3 +1549,45 @@ async fn the_audit_has_its_own_key_and_stops_on_close() {
     println!("audit stopped {:?} after close", t0.elapsed());
     a.shutdown().await;
 }
+
+/// A probe that gets no answer gives no verdict, so the rate limit does not
+/// record it: the next audit probes the address again. (The slot used to be
+/// taken when the probe started, which silenced a dead address for 10 min.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_audit_probe_without_an_answer_is_tried_again_by_the_next_audit() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
+    let a = TestServer::start(TestServerConfig::default()).await;
+    let key = SecretKey::generate(&mut rand::rng());
+    a.authorize(key.public());
+    let cache = AddrCache::from_snapshot(&AddrCacheSnapshot {
+        entries: vec![CachedAddr {
+            node_id: a.node_id().to_string(),
+            addr: a.udp_addr(),
+            net: None,
+            others: vec![CachedOther { addr: "192.0.2.1:9".parse().unwrap(), net: None }],
+        }],
+    });
+    let info = ClientInfo::new(Uuid::new_v4(), ClientKind::Cli, "audit-again", "0");
+    let opts = ClientOptions { addr_cache: cache, ..Default::default() };
+    let h = Client::connect_with(a.addr(), key, info, opts).await.expect("connect");
+    let dead: std::net::SocketAddr = "192.0.2.1:9".parse().unwrap();
+    let probes_of_dead = || h.audit_probes_for_tests().iter().filter(|p| **p == dead).count();
+    wait_until("the first probe", Duration::from_secs(5), || probes_of_dead() == 1).await;
+    wait_until("it ends without an answer", Duration::from_secs(5), || {
+        h.audits_for_tests().1 == 0
+    })
+    .await;
+    h.reconnect_now();
+    wait_until("the second probe of the same address", Duration::from_secs(10), || {
+        probes_of_dead() == 2
+    })
+    .await;
+    // Let the probes end before the stop: a probe cancelled in its handshake
+    // leaves the mock server a half-open connection until its idle timeout.
+    wait_until("the audits to end", Duration::from_secs(5), || h.audits_for_tests().1 == 0).await;
+    h.close().await;
+    a.shutdown().await;
+}

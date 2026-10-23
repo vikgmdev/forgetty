@@ -12,8 +12,10 @@
 [Unit]
 Description=Forgetty durable terminal server (WireGuard only)
 Documentation=https://forgetty.dev
-# The tunnel address must exist before the server binds it.
-After=default.target network-online.target
+# A user unit cannot order itself after wg-quick@wg0 (a system unit). If the
+# tunnel address is not there yet, the server stays up and retries the bind
+# every few seconds until it is.
+After=default.target
 
 [Service]
 Type=simple
@@ -25,7 +27,9 @@ StandardOutput=journal
 StandardError=journal
 
 # Same stop behaviour as the standard unit: SIGTERM to the server only, time to
-# flush the byte logs and save the layout, no restart loop on exit 75.
+# flush the byte logs and save the layout. Exit 75 is a setting the server
+# refuses (for example --no-relay without --bind) or another server holding the
+# lock: do not restart-loop on it.
 KillMode=mixed
 TimeoutStopSec=10
 RestartPreventExitStatus=75

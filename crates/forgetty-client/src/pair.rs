@@ -126,6 +126,7 @@ pub async fn pair_with_addr(
         .shape(Endpoint::empty_builder())
         .secret_key(identity)
         .relay_mode(opts.relay_mode(&addr))
+        .portmapper_config(opts.portmapper_config())
         .transport_config(transport_config())
         .bind()
         .await
