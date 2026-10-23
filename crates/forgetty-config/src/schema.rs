@@ -188,6 +188,11 @@ pub struct Config {
     /// warns about each of them and refuses one that looks like a typo of
     /// `relay` or `bind_addrs` (see `loader::check_unknown_keys`).
     pub extra: toml::Table,
+
+    /// The file this config was loaded from (`load_config`), so a save goes
+    /// back to the same file (`--config-file`). Not a setting: never read from
+    /// or written to the file. `None`: the default location.
+    pub source: Option<std::path::PathBuf>,
 }
 
 impl Default for Config {
@@ -454,6 +459,7 @@ impl<'de> Deserialize<'de> for Config {
             relay: raw.relay,
             bind_addrs: raw.bind_addrs,
             extra: raw.extra,
+            source: None,
         })
     }
 }

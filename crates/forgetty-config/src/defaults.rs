@@ -38,5 +38,6 @@ pub fn default_config() -> Config {
         relay: None,
         bind_addrs: Vec::new(),
         extra: toml::Table::new(),
+        source: None,
     }
 }

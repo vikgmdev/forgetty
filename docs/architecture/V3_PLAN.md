@@ -187,3 +187,7 @@ Fallback if GPUI blocks a gate: winit + wgpu with the same client crates.
 
 Phone push channel when the app is closed: decide at P4 with data from the
 foreground service.
+
+Desktop backlog (GTK client, paused): show a banner in settings when
+`config.toml` failed to load and the app runs on defaults. Today the app only
+logs the error at startup (`src/main.rs`).

@@ -36,7 +36,7 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
     }
 
     let contents = std::fs::read_to_string(&config_path)?;
-    let config: Config = toml::from_str(&contents).map_err(|e| {
+    let mut config: Config = toml::from_str(&contents).map_err(|e| {
         forgetty_core::ForgettyError::Config(format!(
             "Failed to parse {}: {}",
             config_path.display(),
@@ -45,35 +45,47 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
     })?;
 
     check_unknown_keys(&config, &contents, &config_path)?;
+    config.source = Some(config_path.clone());
 
     tracing::info!("Loaded config from {}", config_path.display());
     Ok(config)
 }
 
 /// The settings that decide where a server listens and which relays it uses,
-/// or none, with the value shape each one has.
-const GUARDED_KEYS: [(&str, Shape); 3] = [
-    ("relay", Shape::Str),
-    ("relay_urls", Shape::StrList),
-    ("bind_addrs", Shape::StrList),
-];
+/// or none, with the kind of value each one takes.
+const GUARDED_KEYS: [(&str, Kind); 3] =
+    [("relay", Kind::Relay), ("relay_urls", Kind::RelayUrls), ("bind_addrs", Kind::BindAddrs)];
 
 #[derive(Clone, Copy)]
-enum Shape {
-    /// A string.
-    Str,
-    /// An array of strings (a single string is accepted too: `bind_addr =
-    /// "10.0.0.1"` is a plausible slip for the plural key).
-    StrList,
+enum Kind {
+    /// `"none"` or a relay URL.
+    Relay,
+    /// Relay URLs.
+    RelayUrls,
+    /// IP address literals.
+    BindAddrs,
 }
 
-impl Shape {
+fn is_url(s: &str) -> bool {
+    let rest = s.strip_prefix("https://").or_else(|| s.strip_prefix("http://"));
+    rest.is_some_and(|r| !r.is_empty() && !r.contains(char::is_whitespace))
+}
+
+impl Kind {
+    /// Would `v` be a valid value of the setting? A string is accepted for the
+    /// list settings too: `bind_addr = "10.0.0.1"` is a plausible slip.
     fn fits(self, v: &toml::Value) -> bool {
+        let one = |s: &str| match self {
+            Kind::Relay => s == "none" || is_url(s),
+            Kind::RelayUrls => is_url(s),
+            Kind::BindAddrs => {
+                s.trim().trim_matches(['[', ']']).parse::<std::net::IpAddr>().is_ok()
+            }
+        };
         match (self, v) {
-            (Shape::Str, toml::Value::String(_)) => true,
-            (Shape::StrList, toml::Value::String(_)) => true,
-            (Shape::StrList, toml::Value::Array(a)) => {
-                a.iter().all(|x| matches!(x, toml::Value::String(_)))
+            (_, toml::Value::String(s)) => one(s),
+            (Kind::RelayUrls | Kind::BindAddrs, toml::Value::Array(a)) => {
+                !a.is_empty() && a.iter().all(|x| matches!(x, toml::Value::String(s) if one(s)))
             }
             _ => false,
         }
@@ -82,9 +94,9 @@ impl Shape {
 
 /// Warn about every top-level key this version does not know. A key within
 /// edit distance 2 of `relay`, `relay_urls` or `bind_addrs` (`rellay`,
-/// `bind_addr`) whose value has the shape of that setting (a string for
-/// `relay`, an array of strings for the other two) is an error: the setting
-/// would be ignored, and `relay = "none"` is what keeps a WireGuard-only
+/// `bind_addr`) whose value would be valid for that setting (`"none"` or a URL
+/// for `relay`, URLs for `relay_urls`, IP literals for `bind_addrs`) is an
+/// error: the setting would be ignored, and `relay = "none"` is what keeps a WireGuard-only
 /// server off the relays. Every other unknown key only warns, so a newer build
 /// that adds `retry = 3` does not stop an older server. The message names the
 /// file and line.
@@ -94,18 +106,16 @@ fn check_unknown_keys(config: &Config, text: &str, path: &Path) -> Result<()> {
             .lines()
             .position(|l| {
                 let l = l.trim_start().trim_start_matches('[');
-                l.strip_prefix(key.as_str()).is_some_and(|rest| {
-                    rest.trim_start().starts_with(['=', ']', '.'])
-                })
+                l.strip_prefix(key.as_str())
+                    .is_some_and(|rest| rest.trim_start().starts_with(['=', ']', '.']))
             })
             .map(|i| i + 1);
         let at = match line {
             Some(n) => format!("{}:{n}", path.display()),
             None => path.display().to_string(),
         };
-        let near = GUARDED_KEYS
-            .iter()
-            .find(|(g, shape)| edit_distance(key, g) <= 2 && shape.fits(value));
+        let near =
+            GUARDED_KEYS.iter().find(|(g, kind)| edit_distance(key, g) <= 2 && kind.fits(value));
         if let Some((near, _)) = near {
             return Err(forgetty_core::ForgettyError::Config(format!(
                 "{at}: unknown key `{key}`, did you mean `{near}`? Not starting: the setting \
@@ -153,27 +163,47 @@ pub fn load_config_as_text() -> String {
     std::fs::read_to_string(config_path).unwrap_or_default()
 }
 
-/// Parse a TOML string as `Config`, save it to disk, and return the parsed value.
-///
-/// Returns an error if the text is not valid TOML or does not conform to the
-/// `Config` schema. On success the config is atomically written to the default
-/// config path.
+/// Parse a TOML string as `Config`, save it to the default config file, and
+/// return the parsed value. See [`parse_and_save_config_at`].
 pub fn parse_and_save_config(toml_text: &str) -> Result<Config> {
-    let config: Config = toml::from_str(toml_text).map_err(|e| {
+    parse_and_save_config_at(toml_text, None)
+}
+
+/// Parse a TOML string as `Config` and write it to `path` (`None`: the default
+/// config file), then return the parsed value.
+///
+/// The new text is validated as `load_config` would: it must parse, and it
+/// must pass the unknown-key check (a misspelt `relay` is an error). A text
+/// that passes is written even when the file on disk does not load: this is
+/// how a broken config is repaired in the text editor.
+pub fn parse_and_save_config_at(toml_text: &str, path: Option<&Path>) -> Result<Config> {
+    let config_path = target_path(path);
+    let mut config: Config = toml::from_str(toml_text).map_err(|e| {
         forgetty_core::ForgettyError::Config(format!("Failed to parse config: {}", e))
     })?;
-    save_config(&config)?;
+    check_unknown_keys(&config, toml_text, &config_path)?;
+    config.source = Some(config_path.clone());
+    write_config(&config, &config_path)?;
     Ok(config)
 }
 
-/// Saves the configuration to `~/.config/forgetty/config.toml`.
+/// `path`, or the default config file.
+fn target_path(path: Option<&Path>) -> std::path::PathBuf {
+    match path {
+        Some(p) => p.to_path_buf(),
+        None => forgetty_core::platform::config_dir().join("config.toml"),
+    }
+}
+
+/// Saves the configuration to the file it was loaded from (`config.source`,
+/// set by `load_config`, for example from `--config-file`), or to
+/// `~/.config/forgetty/config.toml`.
 ///
 /// Creates the config directory if it does not exist. Uses an atomic
 /// write pattern (write to temp file, then rename) to prevent partial
 /// writes from confusing the `ConfigWatcher`.
 pub fn save_config(config: &Config) -> Result<()> {
-    let config_dir = forgetty_core::platform::config_dir();
-    let config_path = config_dir.join("config.toml");
+    let config_path = target_path(config.source.as_deref());
 
     // A config.toml that does not load made the app run on defaults. Saving
     // those over it would delete the user's settings (a relay = "none" among
@@ -185,10 +215,16 @@ pub fn save_config(config: &Config) -> Result<()> {
             config_path.display()
         )));
     }
+    write_config(config, &config_path)
+}
+
+/// Write `config` to `config_path` atomically.
+fn write_config(config: &Config, config_path: &Path) -> Result<()> {
+    let config_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
 
     // Ensure the config directory exists.
     if !config_dir.exists() {
-        std::fs::create_dir_all(&config_dir)?;
+        std::fs::create_dir_all(config_dir)?;
     }
 
     let toml_string = toml::to_string_pretty(config).map_err(|e| {
@@ -196,9 +232,9 @@ pub fn save_config(config: &Config) -> Result<()> {
     })?;
 
     // Atomic write: write to a temp file in the same directory, then rename.
-    let tmp_path = config_dir.join("config.toml.tmp");
+    let tmp_path = config_path.with_extension("toml.tmp");
     std::fs::write(&tmp_path, &toml_string)?;
-    std::fs::rename(&tmp_path, &config_path)?;
+    std::fs::rename(&tmp_path, config_path)?;
 
     tracing::info!("Saved config to {}", config_path.display());
     Ok(())
@@ -229,7 +265,7 @@ mod tests {
             ("font_size = 12.0\nrellay = \"none\"\n", "rellay"),
             ("bind_addr = [\"10.0.0.1\"]\n", "bind_addr"),
             ("relays = \"none\"\n", "relays"),
-            ("relay_url = \"x\"\n", "relay_url"),
+            ("relay_url = \"https://r.example.org\"\n", "relay_url"),
             ("relay_url = [\"https://r.example.org\"]\n", "relay_url"),
         ] {
             let err = load_text(text).unwrap_err().to_string();
@@ -245,6 +281,11 @@ mod tests {
         // Different value shapes: not a misspelling of the guarded setting.
         for text in [
             "retry = 3\n",
+            "delay = \"500ms\"\n",
+            "retry = \"always\"\n",
+            "reply = \"hi\"\n",
+            "bind_addr = [\"not an ip\"]\n",
+            "relays = \"foo\"\n",
             "delay = 1.5\n",
             "replay = true\n",
             "ready = [1, 2]\n",
@@ -259,8 +300,7 @@ mod tests {
 
     #[test]
     fn other_unknown_keys_load_and_survive_a_serialize_round_trip() {
-        let c = load_text("font_size = 13.0\nfuture_flag = true\n[future_table]\nx = 1\n")
-            .unwrap();
+        let c = load_text("font_size = 13.0\nfuture_flag = true\n[future_table]\nx = 1\n").unwrap();
         assert_eq!(c.extra.len(), 2);
         let text = toml::to_string_pretty(&c).unwrap();
         let again: Config = toml::from_str(&text).unwrap();
@@ -284,9 +324,48 @@ mod tests {
     }
 
     #[test]
+    fn the_text_editor_repairs_a_config_that_does_not_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        std::fs::write(&p, "relay = \"none\n").unwrap(); // does not parse
+        assert!(load_config(Some(&p)).is_err());
+        // The settings save is refused ...
+        let c = Config { source: Some(p.clone()), ..Config::default() };
+        assert!(save_config(&c).is_err());
+        // ... a text that is still bad is refused too, and writes nothing ...
+        assert!(parse_and_save_config_at("rellay = \"none\"\n", Some(&p)).is_err());
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "relay = \"none\n");
+        // ... and a valid text repairs the file.
+        let fixed = parse_and_save_config_at("relay = \"none\"\n", Some(&p)).unwrap();
+        assert_eq!(fixed.relay.as_deref(), Some("none"));
+        assert_eq!(load_config(Some(&p)).unwrap().relay.as_deref(), Some("none"));
+        // Now ordinary saves work again, to the same file.
+        let loaded = load_config(Some(&p)).unwrap();
+        assert_eq!(loaded.source.as_deref(), Some(p.as_path()));
+        save_config(&loaded).unwrap();
+        assert_eq!(load_config(Some(&p)).unwrap().relay.as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn a_save_goes_back_to_the_file_the_config_was_loaded_from() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("custom.toml");
+        std::fs::write(&p, "font_size = 14.0\nrelay = \"none\"\n").unwrap();
+        let mut c = load_config(Some(&p)).unwrap();
+        c.font_size = 15.0;
+        save_config(&c).unwrap();
+        let again = load_config(Some(&p)).unwrap();
+        assert_eq!(again.font_size, 15.0);
+        assert_eq!(again.relay.as_deref(), Some("none"));
+        // A broken --config-file blocks the save to that file.
+        std::fs::write(&p, "font_size = \n").unwrap();
+        assert!(save_config(&c).is_err());
+    }
+
+    #[test]
     fn known_keys_are_never_unknown() {
-        let c = load_text("relay = \"none\"\nbind_addrs = [\"10.0.0.1\"]\nrelay_urls = []\n")
-            .unwrap();
+        let c =
+            load_text("relay = \"none\"\nbind_addrs = [\"10.0.0.1\"]\nrelay_urls = []\n").unwrap();
         assert!(c.extra.is_empty());
     }
 }

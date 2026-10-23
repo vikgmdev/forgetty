@@ -326,6 +326,9 @@ relay = "none"
   a restart cannot fix). `forgetty server start` prints that error at once. The
   unit has `RestartPreventExitStatus=75 78`, so systemd does not restart-loop on
   it.
+- A loopback-only bind (`--bind 127.0.0.1`) with `--no-relay` is allowed, because
+  the tests need it. No remote device can reach such a server, so it logs a WARN
+  at startup: "bound to loopback only: no remote device can pair".
 - The pairing QR then carries no relay, a `relays_disabled` flag and the bound
   addresses as `direct`. A client of an older version ignores the flag.
 - A paired client uses no relay either, and no port mapping. It dials those
@@ -338,8 +341,14 @@ relay = "none"
   defaults.
 - Unknown keys in `config.toml` are warned about and kept when the file is saved.
   A key within edit distance 2 of `relay`, `relay_urls` or `bind_addrs` (for
-  example `rellay` or `bind_addr`) stops the server with exit 78: the setting
-  would be ignored. Every other configuration error (a bad `relay` value, a bad
+  example `rellay` or `bind_addr`) stops the server with exit 78 when its value
+  would be valid for that setting (`"none"` or a URL for `relay`, URLs for
+  `relay_urls`, IP literals for `bind_addrs`): the setting would be ignored. A
+  near key with another value (`delay = "500ms"`, `retry = "always"`) only warns.
+  The settings save writes to the file the config was loaded from
+  (`--config-file`) and refuses to overwrite a file that does not load. The
+  settings text editor checks the new text the same way as a load, and then
+  writes it, so it can repair a broken file. Every other configuration error (a bad `relay` value, a bad
   `--bind` address, a bad relay URL, `--no-relay` with relay URLs) also exits 78.
 - Devices paired before this change have no `relays_disabled` flag and no
   direct address. They must pair again.

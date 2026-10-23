@@ -183,6 +183,12 @@ pub fn check_pairable_bind(addrs: &[std::net::IpAddr]) -> anyhow::Result<()> {
     )
 }
 
+/// Do all the addresses stay on this machine? Then no remote device can pair.
+/// Allowed (the tests bind `127.0.0.1`), but worth a warning at startup.
+pub fn loopback_only(addrs: &[std::net::IpAddr]) -> bool {
+    !addrs.is_empty() && addrs.iter().all(std::net::IpAddr::is_loopback)
+}
+
 /// Wrap a setting error so `server run` exits with [`EXIT_CONFIG`].
 fn config_invalid(e: anyhow::Error) -> anyhow::Error {
     ConfigInvalid(e.to_string()).into()
@@ -409,8 +415,7 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
         relays_disabled(args.no_relay, config.relay.as_deref()).map_err(config_invalid)?;
     if no_relay && !relay_urls.is_empty() {
         return Err(ConfigInvalid(
-            "relays are switched off (--no-relay / relay = \"none\") but relay URLs are set"
-                .into(),
+            "relays are switched off (--no-relay / relay = \"none\") but relay URLs are set".into(),
         )
         .into());
     }
@@ -430,6 +435,9 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
     }
     if no_relay {
         check_pairable_bind(&bind_addrs).map_err(config_invalid)?;
+        if loopback_only(&bind_addrs) {
+            warn!("bound to loopback only: no remote device can pair");
+        }
     }
 
     info!("session_id: {session_id}");
@@ -1214,6 +1222,17 @@ mod tests {
         }
         // One good address among bad ones is enough.
         assert!(check_pairable_bind(&[ip("0.0.0.0"), ip("10.0.0.2")]).is_ok());
+    }
+
+    #[test]
+    fn loopback_only_binds_are_flagged() {
+        let ips =
+            |v: &[&str]| v.iter().map(|s| s.parse().unwrap()).collect::<Vec<std::net::IpAddr>>();
+        assert!(loopback_only(&ips(&["127.0.0.1"])));
+        assert!(loopback_only(&ips(&["127.0.0.1", "::1"])));
+        assert!(!loopback_only(&ips(&["127.0.0.1", "10.0.0.2"])));
+        assert!(!loopback_only(&ips(&["10.230.1.14"])));
+        assert!(!loopback_only(&[]));
     }
 
     #[test]

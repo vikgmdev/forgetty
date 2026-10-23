@@ -9,7 +9,9 @@ pub mod loader;
 pub mod schema;
 pub mod theme;
 
-pub use loader::{load_config, load_config_as_text, parse_and_save_config, save_config};
+pub use loader::{
+    load_config, load_config_as_text, parse_and_save_config, parse_and_save_config_at, save_config,
+};
 pub use schema::{BellMode, Config, CursorStyle, NotificationMode, OnLaunch, ProfileConfig};
 pub use theme::{
     load_theme_by_name, load_theme_catalog, parse_theme_file, PreviewColors, Theme,
