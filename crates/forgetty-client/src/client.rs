@@ -527,9 +527,8 @@ pub(crate) struct Shared {
     srtt_us: AtomicU64,
     /// Until when the link is watched fast (see [`FAST_WINDOW`]).
     fast_until: Mutex<Option<Instant>>,
-    /// The next dial leaves the address cache alone (set by an identity
-    /// failure: the cache held an address of someone else).
-    skip_cache: AtomicBool,
+    /// State of the audit of cached addresses (see [`audit`]).
+    audit: Arc<AuditState>,
     /// An identity failure left a wrong address in iroh's address book: the
     /// supervisor replaces the endpoint before its next dial.
     book_dirty: Arc<AtomicBool>,
@@ -665,7 +664,7 @@ impl Client {
             last_dial_start: Mutex::new(None),
             srtt_us: AtomicU64::new(0),
             fast_until: Mutex::new(None),
-            skip_cache: AtomicBool::new(false),
+            audit: Arc::new(AuditState::default()),
             book_dirty: Arc::new(AtomicBool::new(false)),
             epoch: Instant::now(),
             rx_at: AtomicU64::new(0),
@@ -703,12 +702,19 @@ impl Shared {
         Duration::from_millis(ms.saturating_sub(self.rx_at.load(Ordering::Relaxed)))
     }
 
-    /// The pairing payload address. Its addresses are pinned: never scoped to
-    /// a network, never evicted, always dialed (a WireGuard address is private
-    /// but valid on every network while the tunnel is up). Only addresses the
-    /// client learned itself follow the network and eviction rules.
+    /// The address every dial uses: the server address plus the pinned
+    /// addresses (`ClientOptions::pinned_addrs`: from the pairing QR or typed
+    /// in). Pinned addresses are dialed on every network. They never enter the
+    /// cache, are never scoped to a network and never evicted (a WireGuard
+    /// address is private but valid wherever the tunnel is up). Only the
+    /// addresses the client learned itself follow the network and eviction
+    /// rules.
     fn server_target(&self) -> EndpointAddr {
-        self.server.clone()
+        let mut target = self.server.clone();
+        for p in &self.opts.pinned_addrs {
+            target = target.with_ip_addr(*p);
+        }
+        target
     }
 }
 
@@ -1154,6 +1160,20 @@ impl ClientHandle {
         link_report(self.shared(), print);
     }
 
+    /// Test hook: the ids of the endpoints the audits bound, and how many are
+    /// alive now.
+    #[doc(hidden)]
+    pub fn audits_for_tests(&self) -> (Vec<iroh::EndpointId>, usize) {
+        let a = &self.shared().audit;
+        (lock(&a.keys).clone(), a.running.load(Ordering::SeqCst))
+    }
+
+    /// Test hook: the id of the device key.
+    #[doc(hidden)]
+    pub fn device_id_for_tests(&self) -> iroh::EndpointId {
+        self.shared().identity.public()
+    }
+
     /// Test hook: dials the supervisor started so far.
     #[doc(hidden)]
     pub fn dial_starts_for_tests(&self) -> u64 {
@@ -1540,9 +1560,14 @@ async fn supervise(shared: Arc<Shared>) {
         // dialing again. Only if nothing connected since, and the old endpoint
         // is closed first. A failed bind is tried again after a short wait.
         let want = shared.replace_for.load(Ordering::SeqCst);
-        if want == shared.connected_count.load(Ordering::SeqCst)
-            || shared.book_dirty.swap(false, Ordering::SeqCst)
-        {
+        // A wrong address left in iroh's address book is cleaned by a new
+        // endpoint, but never sooner than `EP_MIN_AGE` after the last bind.
+        let dirty = shared.book_dirty.load(Ordering::SeqCst)
+            && shared.ep().is_some_and(|e| e.born.elapsed() >= EP_MIN_AGE);
+        if want == shared.connected_count.load(Ordering::SeqCst) || dirty {
+            if dirty {
+                shared.book_dirty.store(false, Ordering::SeqCst);
+            }
             match shared.replace_endpoint().await {
                 Ok(()) => {
                     shared.replace_for.store(u64::MAX, Ordering::SeqCst);
@@ -1680,13 +1705,12 @@ async fn supervise(shared: Arc<Shared>) {
             Ok(Err(DialError::Identity(reason))) => {
                 identity_streak += 1;
                 if identity_streak == 1 {
-                    // The cache held an address of someone else and iroh's
-                    // address book now holds it too: a clean endpoint and a
-                    // dial that leaves the cache alone, at once.
-                    info!("client: dial #{attempt_no} reached the wrong peer ({reason}), redialing clean");
-                    shared.skip_cache.store(true, Ordering::SeqCst);
-                    shared.book_dirty.store(true, Ordering::SeqCst);
-                    why = "wrong peer: clean endpoint, no cache";
+                    // A path answered as someone else. The dial audited the
+                    // cached addresses it tried and forgot the wrong ones, and
+                    // iroh's address book is cleaned at the next replace:
+                    // redial at once.
+                    info!("client: dial #{attempt_no} reached the wrong peer ({reason}), redialing");
+                    why = "wrong peer: audited, redial";
                     None
                 } else {
                     debug!("client: dial #{attempt_no} reached the wrong peer again: {reason}");
@@ -1818,31 +1842,8 @@ const RETIRE_GRACE: Duration = Duration::from_secs(2);
 struct Attempts {
     set: Option<tokio::task::JoinSet<Result<Connection, String>>>,
     holders: Arc<HolderBin>,
-    watch: Option<IdentityWatch>,
-}
-
-/// What a direct leg tried, so that an attempt that fails after the dial was
-/// won by the other leg still gets its identity failure acted on.
-#[derive(Clone)]
-struct IdentityWatch {
-    cache: AddrCache,
-    server: iroh::EndpointId,
-    tried: Vec<SocketAddr>,
-    net: u64,
-    dirty: Arc<AtomicBool>,
-}
-
-impl IdentityWatch {
-    /// The peer at one of the tried addresses is not the server: forget them.
-    fn failed(&self, why: &str) {
-        let gone = self.cache.evict(self.server, &self.tried, self.net);
-        warn!(
-            "client: a path answered as someone else ({why}); {gone} cached address(es) \
-             forgotten, tried {:?}",
-            self.tried
-        );
-        self.dirty.store(true, Ordering::SeqCst);
-    }
+    /// Set when an attempt that outlived the dial reports a wrong peer.
+    dirty: Option<Arc<AtomicBool>>,
 }
 
 impl Drop for Attempts {
@@ -1852,7 +1853,7 @@ impl Drop for Attempts {
             return;
         }
         let Ok(rt) = tokio::runtime::Handle::try_current() else { return };
-        let watch = self.watch.take();
+        let dirty = self.dirty.take();
         let retire = rt.spawn(async move {
             let grace = tokio::time::sleep(RETIRE_GRACE);
             tokio::pin!(grace);
@@ -1861,8 +1862,8 @@ impl Drop for Attempts {
                     done = set.join_next() => match done {
                         Some(Ok(Ok(conn))) => conn.close(0u32.into(), b"redundant dial"),
                         Some(Ok(Err(why))) => {
-                            if let Some(w) = watch.as_ref().filter(|_| is_identity_failure(&why)) {
-                                w.failed(&why);
+                            if let Some(d) = dirty.as_ref().filter(|_| is_identity_failure(&why)) {
+                                d.store(true, Ordering::SeqCst);
                             }
                         }
                         Some(_) => {}
@@ -1884,12 +1885,12 @@ async fn connect_probing(
     shared: &Shared,
     ep: &Ep,
     target: EndpointAddr,
-    watch: Option<IdentityWatch>,
+    dirty: Option<Arc<AtomicBool>>,
 ) -> Result<Connection, String> {
     let mut attempts = Attempts {
         set: Some(tokio::task::JoinSet::new()),
         holders: shared.holders.clone(),
-        watch,
+        dirty,
     };
     let mut n = 0usize;
     loop {
@@ -1930,9 +1931,9 @@ async fn dial_to(
     ep: &Ep,
     target: EndpointAddr,
     connect_limit: Option<Duration>,
-    watch: Option<IdentityWatch>,
+    dirty: Option<Arc<AtomicBool>>,
 ) -> Result<Established, DialError> {
-    let probing = connect_probing(shared, ep, target, watch);
+    let probing = connect_probing(shared, ep, target, dirty);
     let conn = match connect_limit {
         Some(limit) => match tokio::time::timeout(limit, probing).await {
             Ok(r) => r,
@@ -1956,48 +1957,60 @@ async fn dial_to(
     }
 }
 
-/// The cached direct addresses and the addresses of the pairing payload (relay
-/// URLs, direct addresses) are dialed in parallel, not one after the other
-/// (happy eyeballs). The direct connect gets 1 s: a dead cached address (the
-/// network changed) must not hold up the relay. The 1 s covers the QUIC
-/// connect, not the handshake after it. The first handshake wins and
-/// the other dial is dropped. A fatal error ends the race at once.
+/// The cached direct addresses and the server address (the pairing payload's
+/// relay URLs and direct addresses, and the pinned addresses) are dialed in
+/// parallel, not one after the other (happy eyeballs). The direct connect
+/// gets 1 s: a dead cached address (the network changed) must not hold up the
+/// relay. The 1 s covers the QUIC connect, not the handshake after it. The
+/// first handshake wins and the other dial is dropped. A fatal error ends the
+/// race at once.
 ///
 /// The cached addresses are the ones valid on this network (see
-/// [`AddrCache::get_all`]) that the system has a route to. If a path answers
-/// as someone else, the addresses this dial tried leave the cache, iroh's
-/// address book is stale (both legs share it) and the endpoint is replaced
-/// before the next dial, which skips the cache ([`DialError::Identity`]).
+/// [`AddrCache::get_all`]) that the system has a route to. The dial itself
+/// forgets nothing. If a path answers as someone else, it cannot say which
+/// address that was: iroh's address book is marked stale (the endpoint is
+/// replaced before the next dial, not sooner than `EP_MIN_AGE` after its
+/// bind) and the cached addresses the dial tried are audited one by one
+/// ([`audit`]); the wrong ones leave the cache and the dial is retried
+/// ([`DialError::Identity`]).
 async fn dial(shared: &Shared, ep: Ep) -> Result<Established, DialError> {
-    let mut audit = None;
-    let result = dial_legs(shared, ep, &mut audit).await;
-    if let (Ok(est), Some(watch)) = (&result, audit) {
-        spawn_audit(shared, est.conn.to_info(), watch);
+    let mut tried = None;
+    let result = dial_legs(shared, ep, &mut tried).await;
+    match (&result, tried) {
+        (Ok(est), Some(ctx)) => {
+            // A dial won by one leg proves nothing about the other leg's
+            // addresses: audit the ones that did not become a path.
+            spawn_audit(shared, est.conn.to_info(), ctx);
+        }
+        (Err(DialError::Identity(m)), tried) => {
+            shared.book_dirty.store(true, Ordering::SeqCst);
+            if let Some(ctx) = tried {
+                let candidates = ctx.tried.clone();
+                let gone = audit(ctx, candidates, Some(AUDIT_INLINE)).await;
+                warn!("client: a path answered as someone else ({m}); audit forgot {gone:?}");
+            }
+        }
+        _ => {}
     }
     result
 }
 
-/// The legs of [`dial`]. `audit` gets the cached addresses the direct leg
-/// tried, if it ran.
+/// The legs of [`dial`]. `tried` gets the audit context of the cached
+/// addresses the direct leg dialed, if it ran.
 async fn dial_legs(
     shared: &Shared,
     ep: Ep,
-    audit: &mut Option<IdentityWatch>,
+    tried: &mut Option<AuditCtx>,
 ) -> Result<Established, DialError> {
     let ep = &ep;
     let net = shared.current_net();
     let server = shared.server_target();
-    let skip = shared.skip_cache.swap(false, Ordering::SeqCst);
-    let known = if skip {
-        debug!("client: dialing without the address cache");
-        Vec::new()
-    } else {
-        shared.opts.addr_cache.get_all(shared.server.id, net)
-    };
+    // Pinned addresses are in `server`; a cache that holds one (an app that
+    // seeded it) must not dial it twice.
+    let mut known = shared.opts.addr_cache.get_all(shared.server.id, net);
+    known.retain(|a| !shared.opts.pinned_addrs.contains(a));
     if known.is_empty() {
-        return dial_to(shared, ep, server, None, None).await.map_err(|e| {
-            identity_failed(shared, net, &[], e)
-        });
+        return dial_to(shared, ep, server, None, Some(shared.book_dirty.clone())).await;
     }
     // Only the addresses the local network has a route to: one without (an
     // IPv6 address on a device with no IPv6) would cost the whole direct
@@ -2008,10 +2021,8 @@ async fn dial_legs(
         debug!("client: {} of {} cached addresses have no route here", known.len() - ips.len(), known.len());
     }
     if ips.is_empty() {
-        if !shared.server.is_empty() {
-            return dial_to(shared, ep, server, None, None).await.map_err(|e| {
-                identity_failed(shared, net, &[], e)
-            });
+        if !server.is_empty() {
+            return dial_to(shared, ep, server, None, Some(shared.book_dirty.clone())).await;
         }
         ips = known;
     }
@@ -2019,22 +2030,14 @@ async fn dial_legs(
     for ip in &ips {
         direct = direct.with_ip_addr(*ip);
     }
-    let watch = IdentityWatch {
-        cache: shared.opts.addr_cache.clone(),
-        server: shared.server.id,
-        tried: ips.clone(),
-        net,
-        dirty: shared.book_dirty.clone(),
-    };
-    *audit = Some(watch.clone());
-    if shared.server.is_empty() {
+    *tried = Some(AuditCtx::new(shared, net, ips));
+    let dirty = Some(shared.book_dirty.clone());
+    if server.is_empty() {
         // Nothing to fall back to: the direct dial has the whole dial timeout.
-        return dial_to(shared, ep, direct, None, Some(watch))
-            .await
-            .map_err(|e| identity_failed(shared, net, &ips, e));
+        return dial_to(shared, ep, direct, None, dirty).await;
     }
-    let a = dial_to(shared, ep, direct, Some(DIRECT_DIAL_TIMEOUT), Some(watch));
-    let b = dial_to(shared, ep, server, None, None);
+    let a = dial_to(shared, ep, direct, Some(DIRECT_DIAL_TIMEOUT), dirty.clone());
+    let b = dial_to(shared, ep, server, None, dirty);
     tokio::pin!(a, b);
     let (mut a_done, mut b_done) = (false, false);
     let mut last = DialError::Transient("no address".into());
@@ -2047,12 +2050,9 @@ async fn dial_legs(
         match r {
             Ok(est) => return Ok(est),
             Err(e @ DialError::Fatal(_)) => return Err(e),
-            Err(e @ DialError::Identity(_)) => {
-                // The other leg may still connect; the stale address book is
-                // cleaned at the next replace either way.
-                if let DialError::Identity(m) = identity_failed(shared, net, &ips, e) {
-                    identity = Some(m);
-                }
+            Err(DialError::Identity(m)) => {
+                // The other leg may still connect.
+                identity = Some(m);
             }
             Err(DialError::Transient(m)) => {
                 debug!("client: a dial leg failed: {m}");
@@ -2064,22 +2064,161 @@ async fn dial_legs(
 }
 
 /// How long after a connect the cached addresses that gave no path are
-/// checked, and how long each check may take.
+/// audited, how long each probe may take, how long a dial that failed on a
+/// wrong peer waits for the verdicts, and how often an address is audited on
+/// one network.
 const AUDIT_DELAY: Duration = Duration::from_millis(500);
 const AUDIT_LIMIT: Duration = Duration::from_millis(1500);
+const AUDIT_INLINE: Duration = Duration::from_millis(600);
+const AUDIT_REPEAT: Duration = Duration::from_secs(600);
+
+/// What the audits of one client remember.
+#[derive(Default)]
+struct AuditState {
+    /// When each address was last audited, per network.
+    audited: Mutex<HashMap<(SocketAddr, u64), Instant>>,
+    /// The ids of the audit endpoints bound so far (tests check they are not
+    /// the device key).
+    keys: Mutex<Vec<iroh::EndpointId>>,
+    /// Audit endpoints alive now.
+    running: AtomicUsize,
+}
+
+/// What an audit needs from the client.
+#[derive(Clone)]
+struct AuditCtx {
+    cache: AddrCache,
+    server: iroh::EndpointId,
+    net: u64,
+    /// The cached addresses the dial tried.
+    tried: Vec<SocketAddr>,
+    pinned: Vec<SocketAddr>,
+    dirty: Arc<AtomicBool>,
+    state: Arc<AuditState>,
+}
+
+impl AuditCtx {
+    fn new(shared: &Shared, net: u64, tried: Vec<SocketAddr>) -> Self {
+        AuditCtx {
+            cache: shared.opts.addr_cache.clone(),
+            server: shared.server.id,
+            net,
+            tried,
+            pinned: shared.opts.pinned_addrs.clone(),
+            dirty: shared.book_dirty.clone(),
+            state: shared.audit.clone(),
+        }
+    }
+}
+
+/// An audit endpoint. Dropped on any path (a cancelled audit included) it
+/// closes itself in the background, so iroh does not log an ungraceful drop.
+struct AuditEndpoint {
+    ep: Option<Arc<Endpoint>>,
+    state: Arc<AuditState>,
+}
+
+impl Drop for AuditEndpoint {
+    fn drop(&mut self) {
+        self.state.running.fetch_sub(1, Ordering::SeqCst);
+        if let (Some(ep), Ok(rt)) = (self.ep.take(), tokio::runtime::Handle::try_current()) {
+            rt.spawn(async move {
+                let _ = tokio::time::timeout(Duration::from_millis(500), ep.close()).await;
+            });
+        }
+    }
+}
+
+/// Try `candidates` each alone, on an endpoint of its own with a fresh random
+/// key (never the device key: one endpoint per key). On the
+/// client's endpoint the address book of the server already holds its good
+/// addresses and an attempt would connect through them, which hides a wrong
+/// peer. A candidate that answers as someone else (not the expected node id)
+/// leaves the cache for this network, and the address book is marked stale.
+/// One that does not answer is harmless and stays. Pinned addresses are never
+/// audited, and an address is audited once per network per
+/// [`AUDIT_REPEAT`]. With `budget` the call returns when it is spent and the
+/// probes still open are dropped (their candidates stay). Returns the
+/// addresses forgotten.
+async fn audit(
+    ctx: AuditCtx,
+    candidates: Vec<SocketAddr>,
+    budget: Option<Duration>,
+) -> Vec<SocketAddr> {
+    let due: Vec<SocketAddr> = {
+        let mut audited = lock(&ctx.state.audited);
+        candidates
+            .into_iter()
+            .filter(|a| !ctx.pinned.contains(a))
+            .filter(|a| {
+                let key = (*a, ctx.net);
+                if audited.get(&key).is_some_and(|t| t.elapsed() < AUDIT_REPEAT) {
+                    return false;
+                }
+                audited.insert(key, Instant::now());
+                true
+            })
+            .collect()
+    };
+    if due.is_empty() {
+        return Vec::new();
+    }
+    let gone = Arc::new(Mutex::new(Vec::new()));
+    let probes = async {
+        let mut set = tokio::task::JoinSet::new();
+        for addr in due {
+            let (ctx, gone) = (ctx.clone(), gone.clone());
+            set.spawn(async move {
+                // One endpoint per candidate: the address book of an endpoint
+                // keeps every address it was given for the server, and a
+                // second candidate would make the first one look wrong (or
+                // right).
+                let key = SecretKey::generate(&mut rand::rng());
+                let Ok(ep) = Endpoint::empty_builder()
+                    .secret_key(key)
+                    .relay_mode(iroh::RelayMode::Disabled)
+                    .transport_config(transport_config())
+                    .bind()
+                    .await
+                else {
+                    return;
+                };
+                lock(&ctx.state.keys).push(ep.id());
+                ctx.state.running.fetch_add(1, Ordering::SeqCst);
+                let guard = AuditEndpoint { ep: Some(Arc::new(ep)), state: ctx.state.clone() };
+                let ep = guard.ep.clone().expect("set above");
+                let target = EndpointAddr::new(ctx.server).with_ip_addr(addr);
+                match tokio::time::timeout(AUDIT_LIMIT, ep.connect(target, ALPN_RPC)).await {
+                    Ok(Ok(c)) => c.close(0u32.into(), b"audit"),
+                    Ok(Err(e)) if is_identity_failure(&e.to_string()) => {
+                        ctx.cache.evict(ctx.server, &[addr], ctx.net);
+                        ctx.dirty.store(true, Ordering::SeqCst);
+                        lock(&gone).push(addr);
+                    }
+                    _ => {}
+                }
+            });
+        }
+        while set.join_next().await.is_some() {}
+    };
+    match budget {
+        Some(b) => {
+            let _ = tokio::time::timeout(b, probes).await;
+        }
+        None => probes.await,
+    }
+    let out = lock(&gone).clone();
+    out
+}
 
 /// A dial won by one leg proves nothing about the cached addresses of the
 /// other: a wrong peer that answers after the right one is ignored by QUIC,
-/// and stays in the cache to win a race later. So the cached addresses that
-/// did not become a path of the connection are tried alone, in the
-/// background, on an endpoint of their own: on the client's endpoint the
-/// address book of the server already holds its good addresses, and the
-/// attempt would connect through them. One that answers as someone else is
-/// forgotten (and the endpoint is replaced before its next dial). One that
-/// does not answer is harmless and stays: it may be right on another day.
-fn spawn_audit(shared: &Shared, conn: iroh::endpoint::ConnectionInfo, watch: IdentityWatch) {
-    let identity = shared.identity.clone();
-    tokio::spawn(async move {
+/// and stays in the cache to win a race later. So, after the connect, the
+/// cached addresses that did not become a path of the connection are audited
+/// in the background. The task is a holder: a replace of the endpoint or a
+/// shutdown cancels it, and so does the end of the connection it audits.
+fn spawn_audit(shared: &Shared, conn: iroh::endpoint::ConnectionInfo, ctx: AuditCtx) {
+    let task = tokio::spawn(async move {
         tokio::time::sleep(AUDIT_DELAY).await;
         let on_path: Vec<SocketAddr> = conn
             .paths()
@@ -2090,60 +2229,20 @@ fn spawn_audit(shared: &Shared, conn: iroh::endpoint::ConnectionInfo, watch: Ide
             })
             .collect();
         let unproven: Vec<SocketAddr> =
-            watch.tried.iter().filter(|a| !on_path.contains(a)).copied().collect();
+            ctx.tried.iter().filter(|a| !on_path.contains(a)).copied().collect();
         if unproven.is_empty() {
             return;
         }
-        let Ok(ep) = Endpoint::empty_builder()
-            .secret_key(identity)
-            .relay_mode(iroh::RelayMode::Disabled)
-            .transport_config(transport_config())
-            .bind()
-            .await
-        else {
-            return;
-        };
-        let ep = Arc::new(ep);
-        let probes: Vec<_> = unproven
-            .into_iter()
-            .map(|addr| {
-                let (ep, watch) = (ep.clone(), watch.clone());
-                tokio::spawn(async move {
-                    let target = EndpointAddr::new(watch.server).with_ip_addr(addr);
-                    match tokio::time::timeout(AUDIT_LIMIT, ep.connect(target, ALPN_RPC)).await {
-                        Ok(Ok(c)) => c.close(0u32.into(), b"audit"),
-                        Ok(Err(e)) if is_identity_failure(&e.to_string()) => {
-                            IdentityWatch { tried: vec![addr], ..watch }.failed(&e.to_string());
-                        }
-                        _ => {}
-                    }
-                })
-            })
-            .collect();
-        for p in probes {
-            let _ = p.await;
+        tokio::select! {
+            gone = audit(ctx, unproven, None) => {
+                if !gone.is_empty() {
+                    warn!("client: audit forgot cached addresses of another peer: {gone:?}");
+                }
+            }
+            _ = conn.closed() => {}
         }
-        let _ = tokio::time::timeout(Duration::from_millis(500), ep.close()).await;
     });
-}
-
-/// A dial leg failed. When it says the peer is not the server, forget the
-/// cached (learned) addresses the dial tried and remember that iroh's address
-/// book holds them. The addresses of the pairing payload are pinned and stay.
-/// Returns the error to go on with.
-fn identity_failed(
-    shared: &Shared,
-    net: u64,
-    tried: &[SocketAddr],
-    e: DialError,
-) -> DialError {
-    let DialError::Identity(m) = &e else { return e };
-    let gone = shared.opts.addr_cache.evict(shared.server.id, tried, net);
-    warn!(
-        "client: a path answered as someone else ({m}); {gone} cached address(es) forgotten,          tried {tried:?}"
-    );
-    shared.book_dirty.store(true, Ordering::SeqCst);
-    e
+    shared.holders.add(task.abort_handle());
 }
 
 /// Did the peer close the connection with `not_authorized`?
@@ -2813,7 +2912,7 @@ fn note_direct_addr(shared: &Shared, conn: &Connection) {
             std::net::IpAddr::V4(a) => a.is_link_local(),
             std::net::IpAddr::V6(a) => (a.segments()[0] & 0xffc0) == 0xfe80,
         };
-        if local_only {
+        if local_only || shared.opts.pinned_addrs.contains(addr) {
             continue;
         }
         let net = *net.get_or_insert_with(|| shared.current_net());

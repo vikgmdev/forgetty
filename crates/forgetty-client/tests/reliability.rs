@@ -1400,3 +1400,152 @@ async fn an_unpaired_server_is_dropped_from_the_cache_at_connect() {
     h.close().await;
     a.shutdown().await;
 }
+
+// ---- Round 21c: pinned addresses, audit ---------------------------------
+
+/// A pinned address is in the server address of every dial. After the network
+/// changed (a different local fingerprint) with nothing in the cache, the
+/// client still connects, and the pinned address never reaches the cache.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pinned_address_connects_on_any_network_and_is_never_cached() {
+    let a = TestServer::start(TestServerConfig::default()).await;
+    let key = SecretKey::generate(&mut rand::rng());
+    a.authorize(key.public());
+    let pinned = a.udp_addr();
+    let cache = AddrCache::new();
+    let info = ClientInfo::new(Uuid::new_v4(), ClientKind::Cli, "pinned", "0");
+    let opts = ClientOptions {
+        addr_cache: cache.clone(),
+        pinned_addrs: vec![pinned],
+        ..Default::default()
+    };
+    // The address of the server is its node id alone: only the pin leads there.
+    let h = tokio::time::timeout(
+        Duration::from_secs(10),
+        Client::connect_with(EndpointAddr::new(a.node_id()), key, info, opts),
+    )
+    .await
+    .expect("connect timed out")
+    .expect("connect failed");
+
+    // Another network: a different fingerprint, a redial.
+    let before = a.handshakes();
+    h.set_network_for_tests(Some(0x5eed));
+    h.reconnect_now();
+    wait_until("the redial on the other network", Duration::from_secs(10), || {
+        a.handshakes() > before && h.state().is_connected()
+    })
+    .await;
+    // And once more, on a third one.
+    let before = a.handshakes();
+    h.set_network_for_tests(Some(0xbeef));
+    h.reconnect_now();
+    wait_until("the redial on a third network", Duration::from_secs(10), || {
+        a.handshakes() > before && h.state().is_connected()
+    })
+    .await;
+    assert!(
+        !cache.get_everywhere(a.node_id()).contains(&pinned),
+        "the pinned address was cached: {:?}",
+        cache.get_everywhere(a.node_id())
+    );
+    h.close().await;
+    a.shutdown().await;
+}
+
+/// The cache holds the good address and the address of another node, and the
+/// client has nothing else to dial (no relay, no direct address in the server
+/// address). The audit names the wrong one, only that one leaves the cache,
+/// and the client connects.
+async fn good_and_wrong_node_case(a_frozen_for: Duration) {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
+    let a = TestServer::start(TestServerConfig { own_runtime: true, ..Default::default() }).await;
+    let b = TestServer::start(TestServerConfig::default()).await;
+    let key = SecretKey::generate(&mut rand::rng());
+    a.authorize(key.public());
+    let (good, bad) = (a.udp_addr(), b.udp_addr());
+    let cache = AddrCache::from_snapshot(&AddrCacheSnapshot {
+        entries: vec![CachedAddr {
+            node_id: a.node_id().to_string(),
+            addr: good,
+            net: None,
+            others: vec![CachedOther { addr: bad, net: None }],
+        }],
+    });
+    let info = ClientInfo::new(Uuid::new_v4(), ClientKind::Cli, "good-and-wrong", "0");
+    let opts = ClientOptions { addr_cache: cache.clone(), ..Default::default() };
+    if !a_frozen_for.is_zero() {
+        a.freeze(a_frozen_for); // B answers first
+    }
+    let t0 = Instant::now();
+    let h = tokio::time::timeout(
+        Duration::from_secs(15),
+        Client::connect_with(EndpointAddr::new(a.node_id()), key, info, opts),
+    )
+    .await
+    .expect("connect timed out")
+    .expect("connect failed");
+    println!("connect with a good and a wrong node in the cache: {:?}", t0.elapsed());
+    wait_until("the wrong node leaves the cache", Duration::from_secs(5), || {
+        !cache.get_everywhere(a.node_id()).contains(&bad)
+    })
+    .await;
+    assert!(
+        cache.get_everywhere(a.node_id()).contains(&good),
+        "the good address left the cache: {:?}",
+        cache.get_everywhere(a.node_id())
+    );
+    h.close().await;
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_good_and_a_wrong_cached_node_the_audit_evicts_only_the_wrong_one() {
+    good_and_wrong_node_case(Duration::ZERO).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_good_and_a_wrong_cached_node_after_one_identity_failure_only_the_wrong_one_goes() {
+    good_and_wrong_node_case(Duration::from_millis(600)).await;
+}
+
+/// The audit binds its own endpoint with a fresh random key, never the device
+/// key, and it stops when the client closes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_audit_has_its_own_key_and_stops_on_close() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
+    let a = TestServer::start(TestServerConfig::default()).await;
+    let key = SecretKey::generate(&mut rand::rng());
+    a.authorize(key.public());
+    // The second address leads nowhere: its audit probe waits for its limit.
+    let cache = AddrCache::from_snapshot(&AddrCacheSnapshot {
+        entries: vec![CachedAddr {
+            node_id: a.node_id().to_string(),
+            addr: a.udp_addr(),
+            net: None,
+            others: vec![CachedOther { addr: "192.0.2.1:9".parse().unwrap(), net: None }],
+        }],
+    });
+    let info = ClientInfo::new(Uuid::new_v4(), ClientKind::Cli, "audit-key", "0");
+    let opts = ClientOptions { addr_cache: cache, ..Default::default() };
+    let h = Client::connect_with(a.addr(), key, info, opts).await.expect("connect");
+    wait_until("the audit endpoint", Duration::from_secs(5), || h.audits_for_tests().1 == 1).await;
+    let (keys, _) = h.audits_for_tests();
+    assert!(!keys.is_empty());
+    assert!(
+        !keys.contains(&h.device_id_for_tests()),
+        "an audit endpoint used the device key"
+    );
+    let t0 = Instant::now();
+    h.close().await;
+    wait_until("the audit to stop", Duration::from_secs(2), || h.audits_for_tests().1 == 0).await;
+    println!("audit stopped {:?} after close", t0.elapsed());
+    a.shutdown().await;
+}

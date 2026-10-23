@@ -112,6 +112,14 @@ pub struct ClientOptions {
     /// addresses of every other server (one that was unpaired leaves nothing
     /// behind). `None`: the cache is left as it is.
     pub paired_servers: Option<Vec<iroh::EndpointId>>,
+    /// Direct addresses of the server from the pairing QR (`ip:port`) or typed
+    /// in by the user. They go into the server address of every dial, on every
+    /// network. They are never stored in the cache, never scoped to a network
+    /// and never evicted: a WireGuard address (`10.230.1.14`) is private but
+    /// valid wherever the tunnel is up. Only addresses the client learned
+    /// itself follow the network and eviction rules. Seeding such an address
+    /// into the cache instead loses it on the next network.
+    pub pinned_addrs: Vec<std::net::SocketAddr>,
     /// Bind no IP socket: every packet goes through a relay, direct paths are
     /// impossible. For tests of a relay and for networks where UDP is blocked.
     pub relay_only: bool,
@@ -127,6 +135,7 @@ impl Default for ClientOptions {
             event_buffer: 1024,
             addr_cache: AddrCache::default(),
             paired_servers: None,
+            pinned_addrs: Vec::new(),
             relay_only: false,
         }
     }
