@@ -116,8 +116,11 @@ fn test_root() -> PathBuf {
             remove_stale_test_roots(&tmp);
             let root = tmp.join(format!("{TEST_ROOT_PREFIX}{}", std::process::id()));
             let _ = std::fs::create_dir_all(&root);
-            let started = process_start_time(std::process::id()).unwrap_or_default();
-            let _ = std::fs::write(root.join(TEST_ROOT_MARKER), started.to_string());
+            // An empty marker when the start time is unknown: it keeps the root
+            // of a live pid and still lets a dead pid's root go.
+            let started =
+                process_start_time(std::process::id()).map(|t| t.to_string()).unwrap_or_default();
+            let _ = std::fs::write(root.join(TEST_ROOT_MARKER), started);
             root
         })
         .clone()

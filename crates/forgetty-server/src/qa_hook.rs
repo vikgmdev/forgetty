@@ -56,9 +56,10 @@ fn handle(
                 .filter_map(|id| {
                     let info = sm.pane_info(id)?;
                     let (first, total) = sm.log_bounds(id).unwrap_or((0, 0));
+                    let ring = sm.log_shared(id).map_or(0, |l| l.ring_capacity());
                     Some(json!({
                         "pane_id": id.0.to_string(), "rows": info.rows, "cols": info.cols,
-                        "first": first, "total": total,
+                        "first": first, "total": total, "ring_capacity": ring,
                     }))
                 })
                 .collect();

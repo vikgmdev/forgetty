@@ -919,21 +919,30 @@ async fn a_hostile_node_does_not_starve_an_honest_nodes_catch_up() {
     let endpoint = raw_endpoint(&server).await;
     // A fresh attach starts at the first offset of the log and gets a snapshot
     // when the log is more than half the ring ahead of it (the server's
-    // `lag_limit`). The ring is 8 MiB by default (`byte_log_ring_kb` 8192), so
-    // the limit is 4 MiB. The log file is capped at 10 MiB (`byte_log_max_mb`)
-    // and rotates down to 5 MiB, so `total - first` stays between 5 and 10 MiB
-    // once it has grown that far: 4.5 MiB is reached and never lost again.
-    // Wait for it on every busy pane, however slow `yes` runs on a loaded host,
-    // instead of assuming that 2 s are enough.
-    const RING: u64 = 8 * 1024 * 1024;
-    const FILL: u64 = RING / 2 + 512 * 1024;
+    // `lag_limit`). The ring size comes from the server (`qa_state`). The log
+    // file is capped at 10 MiB (`byte_log_max_mb`) and rotates down to 5 MiB,
+    // so `total - first` stays between 5 and 10 MiB once it has grown that
+    // far; the ring (8 MiB by default) leaves a limit of 4 MiB below that.
+    // Wait for the fill on every busy pane, however slow `yes` runs on a loaded
+    // host, instead of assuming that 2 s are enough.
+    let ring = qa_state(&server)["panes"]
+        .as_array()
+        .and_then(|p| p.iter().find(|p| p["pane_id"] == busy[0].to_string()))
+        .and_then(|p| p["ring_capacity"].as_u64())
+        .expect("qa_state reports the ring size");
+    assert!(ring > 0, "the pane has no byte log");
+    let fill: u64 = ring / 2 + 512 * 1024;
+    assert!(
+        fill < 5 * 1024 * 1024,
+        "a ring of {ring} bytes needs {fill} bytes of log, but the file keeps only 5 MiB after a rotation"
+    );
     let t_fill = Instant::now();
     loop {
         let short = busy
             .iter()
             .filter(|p| {
                 let (first, total) = server.log_bounds(**p);
-                total.saturating_sub(first) < FILL
+                total.saturating_sub(first) < fill
             })
             .count();
         if short == 0 {
@@ -941,7 +950,7 @@ async fn a_hostile_node_does_not_starve_an_honest_nodes_catch_up() {
         }
         assert!(
             t_fill.elapsed() < Duration::from_secs(60),
-            "{short} busy panes had under {FILL} bytes of log after 60 s"
+            "{short} busy panes had under {fill} bytes of log after 60 s"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -2482,5 +2491,91 @@ async fn a_late_attach_does_not_start_a_stream_after_its_detach_and_a_flood_of_m
     assert_eq!(qa_state(&server)["attached_clients"].as_u64().unwrap(), 0);
     conn.close(0u32.into(), b"done");
     endpoint.close().await;
+    server.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Input buffer after a reconnect
+// ---------------------------------------------------------------------------
+
+/// The user (or the app) filled the input buffer (64 KiB, `INPUT_BUFFER_CAP`)
+/// while the link was down. After the reconnect the backlog goes out, and the
+/// server acks it at once, but the client used to free the space only at its
+/// next once-a-second `Ping`: the keys typed right after `Connected` were
+/// refused or held for 600 to 700 ms. The client now asks for the ack as soon
+/// as the backlog is on the wire. Local, so one round trip is a few ms.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn input_is_accepted_at_once_after_a_reconnect_with_a_full_buffer() {
+    if !real_only() {
+        return;
+    }
+    let server = TestServer::start(TestServerConfig::default()).await;
+    let pane = server.add_script_pane("stty raw -echo; exec cat");
+    let c = connect(&server, "typist").await;
+    // Warm up: the pane works, and the session is past its first Pong.
+    c.send_input(pane, b"a").await.unwrap();
+    wait_for("the first key to be acked", || c.unacked_input_bytes() == 0).await;
+
+    // A loaded host can stall one attempt for a few hundred ms. The bug costs a
+    // full second (the next liveness Ping) in every attempt, so the best of
+    // three attempts tells them apart.
+    let mut best = Duration::MAX;
+    for attempt in 1..=3 {
+        // The server hangs for 5 s, longer than the 3 s without a Pong.
+        let handshakes = server.handshakes();
+        server.freeze(Duration::from_secs(5));
+        let t_wait = Instant::now();
+        while c.state().is_connected() {
+            assert!(t_wait.elapsed() < Duration::from_secs(15), "the client never noticed the freeze");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Fill the buffer while the link is down.
+        let kb = [b'k'; 1024];
+        let mut accepted = 0usize;
+        loop {
+            match c.send_input(pane, &kb).await {
+                Ok(()) => accepted += kb.len(),
+                Err(forgetty_client::ClientError::InputBufferFull) => break,
+                Err(e) => panic!("send_input while disconnected: {e}"),
+            }
+            assert!(accepted <= 128 * 1024, "the buffer has no cap");
+        }
+        assert!(c.unacked_input_bytes() >= 60 * 1024, "the buffer is not full: {}", c.unacked_input_bytes());
+
+        // Reconnect. Do not call `send_input` yet: a blocked call asks for an ack
+        // itself. An app that checks the buffer (`unacked_input_bytes`, or a
+        // status call that refuses at once) must see the space come back on its
+        // own, within one round trip of the backlog going out.
+        let t_wait = Instant::now();
+        while !(c.state().is_connected() && server.handshakes() > handshakes) {
+            assert!(t_wait.elapsed() < Duration::from_secs(30), "the client never reconnected");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let t0 = Instant::now();
+        while c.unacked_input_bytes() > 0 {
+            assert!(
+                t0.elapsed() < Duration::from_secs(3),
+                "the backlog was never acked: {} bytes",
+                c.unacked_input_bytes()
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let freed = t0.elapsed();
+        println!("the buffer was free {freed:?} after Connected");
+        // And a key typed now goes in at once.
+        let t1 = Instant::now();
+        c.send_input(pane, b"z").await.expect("send_input after the ack");
+        assert!(t1.elapsed() < Duration::from_millis(50), "send_input took {:?}", t1.elapsed());
+        best = best.min(freed);
+        println!("attempt {attempt}: free after {freed:?}");
+        if best < Duration::from_millis(100) {
+            break;
+        }
+    }
+    assert!(
+        best < Duration::from_millis(100),
+        "the buffer stayed full for {best:?} after Connected in every attempt (the next liveness Ping?)"
+    );
+    c.close().await;
     server.shutdown().await;
 }

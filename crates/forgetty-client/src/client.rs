@@ -1941,6 +1941,7 @@ async fn run_session(
 
     let (stream_tx, mut stream_rx) = mpsc::unbounded_channel::<RecvStream>();
     let (resumed_tx, resumed_rx) = oneshot::channel();
+    let (backlog_tx, backlog_rx) = oneshot::channel();
     let mut tasks: JoinSet<TaskEnd> = JoinSet::new();
     tasks.spawn(control_writer(send, control_rx));
     tasks.spawn(control_reader(link.clone(), shared.clone(), recv));
@@ -1948,8 +1949,10 @@ async fn run_session(
         shared.clone(),
         input_send,
         resumed_rx,
+        backlog_tx,
         link.has_cap(cap::INPUT_FLAGS),
     ));
+    tasks.spawn(ack_backlog(shared.clone(), link.clone(), backlog_rx));
     tasks.spawn(accept_streams(conn.clone(), stream_tx));
     tasks.spawn(session_init(shared.clone(), link.clone(), resumed_tx));
     tasks.spawn(liveness(shared.clone(), link.clone()));
@@ -2014,27 +2017,63 @@ const INPUT_DRAIN: Duration = Duration::from_millis(300);
 /// then is dropped with the connection, as before.
 async fn drain_input(shared: &Arc<Shared>, link: &Arc<Link>) {
     let deadline = tokio::time::Instant::now() + INPUT_DRAIN;
-    while !lock(&shared.input.state).frames.is_empty() {
+    if !ack_until(shared, link, deadline, |st| st.frames.is_empty()).await {
+        debug!(
+            "client: closing with {} bytes of input not acked",
+            lock(&shared.input.state).bytes
+        );
+    }
+}
+
+/// Ask the server for acks with a `Ping` until `done` holds for the input
+/// queue or `deadline` passes. A `Pong` can overtake input frames the server
+/// has not read yet, so it asks again 10 ms later while the queue is not done.
+/// `true`: `done` held.
+async fn ack_until(
+    shared: &Arc<Shared>,
+    link: &Arc<Link>,
+    deadline: tokio::time::Instant,
+    done: impl Fn(&InputState) -> bool,
+) -> bool {
+    while !done(&lock(&shared.input.state)) {
         let now = tokio::time::Instant::now();
         if now >= deadline {
-            debug!(
-                "client: closing with {} bytes of input not acked",
-                lock(&shared.input.state).bytes
-            );
-            return;
+            return false;
         }
         let nonce = shared.next_nonce.fetch_add(1, Ordering::Relaxed);
         let mut pong = link.pong_tx.subscribe();
         if send_ping(link, nonce).is_err() {
-            return;
+            return false;
         }
         let _ = tokio::time::timeout(deadline - now, pong.wait_for(|n| *n >= nonce)).await;
         // Frames the writer had not sent when the Ping went out are still
         // open: ask again shortly.
-        if !lock(&shared.input.state).frames.is_empty() {
+        if !done(&lock(&shared.input.state)) {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
+    true
+}
+
+/// How long [`ack_backlog`] keeps asking.
+const ACK_BACKLOG_LIMIT: Duration = Duration::from_secs(2);
+
+/// After a resume the backlog (input buffered while the link was down) goes
+/// out, and the server acks it as it queues it. Without this the client would
+/// see the ack only at its next once-a-second liveness `Ping`, and a full
+/// buffer (64 KiB) would refuse the user's keys for up to a second after
+/// `Connected`. So it pings as soon as the backlog is on the wire. `sent`
+/// carries the highest `seq` of the backlog; it is dropped when there is none.
+async fn ack_backlog(
+    shared: Arc<Shared>,
+    link: Arc<Link>,
+    sent: oneshot::Receiver<u64>,
+) -> TaskEnd {
+    let Ok(last) = sent.await else { return TaskEnd::Done };
+    let deadline = tokio::time::Instant::now() + ACK_BACKLOG_LIMIT;
+    ack_until(&shared, &link, deadline, |st| st.frames.front().is_none_or(|f| f.seq > last)).await;
+    shared.input.space.notify_waiters();
+    TaskEnd::Done
 }
 
 // ---------------------------------------------------------------------------
@@ -2250,6 +2289,7 @@ async fn input_writer(
     shared: Arc<Shared>,
     mut send: SendStream,
     resumed: oneshot::Receiver<()>,
+    backlog_sent: oneshot::Sender<u64>,
     flags: bool,
 ) -> TaskEnd {
     if resumed.await.is_err() {
@@ -2257,6 +2297,12 @@ async fn input_writer(
     }
     let q = &shared.input;
     let mut sent = 0u64;
+    // What is buffered now is the backlog. Once it is on the wire, tell
+    // `ack_backlog`, so the ack does not wait for the next liveness Ping.
+    let mut backlog = {
+        let st = lock(&q.state);
+        st.frames.back().map(|f| (f.seq, backlog_sent))
+    };
     loop {
         let ready = q.ready.notified();
         tokio::pin!(ready);
@@ -2274,6 +2320,11 @@ async fn input_writer(
             return TaskEnd::Lost(format!("input write: {e}"));
         }
         sent = seq;
+        if backlog.as_ref().is_some_and(|(last, _)| sent >= *last) {
+            if let Some((last, tx)) = backlog.take() {
+                let _ = tx.send(last);
+            }
+        }
     }
 }
 
