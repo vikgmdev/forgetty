@@ -271,7 +271,6 @@ impl MachineStore {
 
 /// What a `machines.json` held.
 struct LoadedMachines {
-    version: u32,
     machines: Vec<StoredMachine>,
     /// Entries that did not parse.
     skipped: usize,
@@ -282,7 +281,6 @@ struct LoadedMachines {
 fn parse_machines(bytes: &[u8], log: bool) -> Option<LoadedMachines> {
     let v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
     let obj = v.as_object()?;
-    let version = obj.get("version").and_then(serde_json::Value::as_u64).map_or(1, |n| n.min(u64::from(u32::MAX)) as u32);
     let entries = obj.get("machines")?.as_array()?;
     let mut machines = Vec::new();
     let mut skipped = 0;
@@ -297,7 +295,7 @@ fn parse_machines(bytes: &[u8], log: bool) -> Option<LoadedMachines> {
             }
         }
     }
-    Some(LoadedMachines { version, machines, skipped })
+    Some(LoadedMachines { machines, skipped })
 }
 
 // ---- pairing ---------------------------------------------------------------
