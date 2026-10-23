@@ -7,8 +7,9 @@ use std::io;
 use std::path::Path;
 
 /// Write `bytes` to `path` so that only the current user can read the file at
-/// any time after it exists: write a temporary file, restrict it, then rename
-/// it over `path` (the DACL travels with the file).
+/// any time after it exists: write a temporary file, restrict it, flush it to disk, then
+/// rename it over `path` (the DACL travels with the file) and flush the rename too. A power
+/// cut leaves the old file or the new one, never an empty one.
 pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -18,12 +19,34 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let tmp = std::path::PathBuf::from(tmp);
     // Fresh temporary every time: a stale one may carry another DACL.
     let _ = std::fs::remove_file(&tmp);
-    std::fs::write(&tmp, bytes)?;
-    if let Err(e) = restrict_to_user(&tmp) {
+    let written = (|| {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        // The data must be on disk before the rename makes it the file.
+        f.sync_all()
+    })();
+    if let Err(e) = written.and_then(|()| restrict_to_user(&tmp)) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
-    std::fs::rename(&tmp, path)
+    replace_file(&tmp, path)?;
+    match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => sync_dir(dir),
+        _ => Ok(()),
+    }
+}
+
+/// Rename `tmp` over `to`.
+#[cfg(unix)]
+fn replace_file(tmp: &Path, to: &Path) -> io::Result<()> {
+    std::fs::rename(tmp, to)
+}
+
+/// Flush a directory, so a rename in it survives a power cut.
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
 }
 
 /// Create `path` new (it must not exist: `AlreadyExists` otherwise) with `bytes`, readable by
@@ -60,7 +83,7 @@ pub fn is_user_only(path: &Path) -> io::Result<bool> {
 }
 
 #[cfg(windows)]
-pub use win::{create_private_new, current_user_sid, describe, is_user_only, restrict_to_user};
+pub use win::{create_private_new, current_user_sid, describe, is_user_only, replace_file, restrict_to_user, sync_dir};
 
 #[cfg(windows)]
 mod win {
@@ -93,6 +116,21 @@ mod win {
 
     fn err(e: windows::core::Error) -> io::Error {
         io::Error::other(e.to_string())
+    }
+
+    /// Rename `tmp` over `to` and wait until the move is on disk (`MOVEFILE_WRITE_THROUGH`).
+    pub fn replace_file(tmp: &Path, to: &Path) -> io::Result<()> {
+        use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH};
+        let (from, to) = (wide(tmp.as_os_str()), wide(to.as_os_str()));
+        // SAFETY: both buffers are NUL-terminated and live for the call.
+        unsafe {
+            MoveFileExW(PCWSTR(from.as_ptr()), PCWSTR(to.as_ptr()), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH).map_err(err)
+        }
+    }
+
+    /// Windows cannot flush a directory handle; `replace_file` already waited for the move.
+    pub fn sync_dir(_dir: &Path) -> io::Result<()> {
+        Ok(())
     }
 
     /// The current user's SID in string form (`S-1-5-21-...`).

@@ -67,6 +67,7 @@ pub fn map_conn(s: &ConnectionState) -> ConnState {
     match s {
         ConnectionState::Connected => ConnState::Connected,
         ConnectionState::Reconnecting { since } => ConnState::Reconnecting { since: *since },
+        ConnectionState::UnreachableDirectOnly { since } => ConnState::UnreachableDirectOnly { since: *since },
         ConnectionState::Failed(r) => ConnState::Failed(r.clone()),
         ConnectionState::Closed => ConnState::Closed,
     }
@@ -125,7 +126,7 @@ impl RemoteBackend {
                 if let Some(n) = nudger.take() {
                     n.abort();
                 }
-                if let ConnectionState::Reconnecting { since } = st {
+                if let ConnectionState::Reconnecting { since } | ConnectionState::UnreachableDirectOnly { since } = st {
                     // The contract backoff grows to 2 s, so a server that comes back
                     // can wait that long for the next dial. For the first minute of an
                     // outage, cut each wait short; after that the plain backoff applies.
@@ -283,6 +284,10 @@ impl SessionBackend for RemoteBackend {
     fn network_changed(&self) {
         let client = self.inner.client.clone();
         self.inner.rt.spawn(async move { client.network_changed().await });
+    }
+
+    fn reconnect_now(&self) {
+        self.inner.client.reconnect_now();
     }
 
     fn get_layout(&self) -> BackendFuture<Layout> {

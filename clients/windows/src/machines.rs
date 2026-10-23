@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use forgetty_client::proto::ClientKind;
-use forgetty_client::{AddrCache, ClientInfo, ClientOptions};
+use forgetty_client::{AddrCache, ClientInfo};
 use forgetty_remote::store::{self, MachineStore, PairingOffer, StoredMachine};
 use forgetty_remote::{RemoteBackend, RemoteParams};
 use forgetty_shell_core::notify::{self, ToastText, Visibility};
@@ -20,6 +20,14 @@ use gpui::{AppContext as _, Context, Entity, Keystroke, Window};
 use crate::shell::{AppShell, Drag, PaneMeta, Rename};
 use crate::view::TerminalView;
 use crate::winsys::{Hooks, Signal};
+
+/// Quiet time that ends a burst of network events.
+const NETWORK_QUIET: Duration = Duration::from_millis(400);
+/// A burst never delays the poke longer than this.
+const NETWORK_QUIET_CAP: Duration = Duration::from_secs(3);
+
+/// The overlay of a machine that is reached on pinned addresses only and does not answer.
+pub const UNREACHABLE_TEXT: &str = "Can't reach the server. Is WireGuard on?";
 
 /// Everything the shell needs to reach remote machines.
 pub struct RemoteCtx {
@@ -125,16 +133,19 @@ impl AppShell {
 
         cx.spawn(async move |this, cx| {
             while let Ok(first) = signals.recv().await {
-                // A change comes as a burst of interface events: wait for quiet.
+                // A change comes as a burst of interface events: wait for quiet, but never
+                // longer than `NETWORK_QUIET_CAP`, so an address that keeps flapping still
+                // pokes at least once in that time.
                 let mut resume = first == Signal::Resume;
+                let started = Instant::now();
                 loop {
-                    cx.background_executor().timer(Duration::from_millis(400)).await;
+                    cx.background_executor().timer(NETWORK_QUIET).await;
                     let mut more = false;
                     while let Ok(s) = signals.try_recv() {
                         more = true;
                         resume |= s == Signal::Resume;
                     }
-                    if !more {
+                    if !more || started.elapsed() >= NETWORK_QUIET_CAP {
                         break;
                     }
                 }
@@ -164,7 +175,7 @@ impl AppShell {
             cx.background_executor().timer(Duration::from_millis(250)).await;
             let alive = this
                 .update(cx, |s, cx| {
-                    if s.machines.iter().any(|m| matches!(m.conn, ConnState::Reconnecting { .. })) {
+                    if s.machines.iter().any(|m| matches!(m.conn, ConnState::Reconnecting { .. } | ConnState::UnreachableDirectOnly { .. })) {
                         cx.notify();
                     }
                 })
@@ -222,7 +233,7 @@ impl AppShell {
                     device,
                     env!("CARGO_PKG_VERSION"),
                 ),
-                opts: ClientOptions { dial_timeout: store::dial_timeout_for(&cache, &m), addr_cache: cache, ..Default::default() },
+                opts: store::machine_options(&cache, &m),
             };
             RemoteBackend::start(params).await.map_err(|e| e.to_string())
         });
@@ -458,8 +469,23 @@ impl AppShell {
         }
         Some(match conn {
             ConnState::Failed(why) => format!("Cannot connect to {}: {}", self.machine.name, why),
+            ConnState::UnreachableDirectOnly { .. } => UNREACHABLE_TEXT.to_string(),
             _ => format!("Reconnecting to {}...", self.machine.name),
         })
+    }
+
+    /// The overlay offers a Retry button: the machine is reached on its pinned addresses only
+    /// and none answered.
+    pub fn overlay_retry(&self) -> bool {
+        matches!(self.active_conn(), Some(ConnState::UnreachableDirectOnly { .. }))
+    }
+
+    /// The Retry button: dial the machine on screen now.
+    pub fn retry_connection(&mut self, cx: &mut Context<Self>) {
+        if let Some(m) = self.machines.iter().find(|m| m.id == self.machine.id) {
+            m.backend.reconnect_now();
+        }
+        cx.notify();
     }
 
     // ---- network and power ------------------------------------------------------
@@ -630,15 +656,6 @@ impl AppShell {
         match res {
             Ok(m) => {
                 self.pair = None;
-                if let Some(r) = &self.remote {
-                    // `pair` may have added a direct address to the cache file.
-                    let fresh = r.store.addr_cache();
-                    for e in fresh.snapshot().entries {
-                        if let (Ok(id), addr) = (e.node_id.parse(), e.addr) {
-                            r.addr_cache.insert(id, addr);
-                        }
-                    }
-                }
                 self.connect_stored(m, true, cx);
             }
             Err(e) => {

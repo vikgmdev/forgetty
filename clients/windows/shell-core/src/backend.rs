@@ -113,6 +113,10 @@ pub enum ConnState {
     Connected,
     /// No connection. `since` is when it was lost (or when the client started).
     Reconnecting { since: std::time::Instant },
+    /// A machine that is reached on its pinned addresses only (a WireGuard-only server, no
+    /// relay) did not answer for a while. The client goes on redialing; the UI says "Can't
+    /// reach the server. Is WireGuard on?" with a Retry (`SessionBackend::reconnect_now`).
+    UnreachableDirectOnly { since: std::time::Instant },
     /// The link stopped for good (`proto_mismatch`, `not_authorized`).
     Failed(String),
     Closed,
@@ -129,7 +133,9 @@ impl ConnState {
 
     pub fn show_overlay(&self, now: std::time::Instant) -> bool {
         match self {
-            ConnState::Reconnecting { since } => now.saturating_duration_since(*since) >= Self::OVERLAY_DELAY,
+            ConnState::Reconnecting { since } | ConnState::UnreachableDirectOnly { since } => {
+                now.saturating_duration_since(*since) >= Self::OVERLAY_DELAY
+            }
             ConnState::Failed(_) => true,
             _ => false,
         }
@@ -309,6 +315,9 @@ pub trait SessionBackend: Send + Sync {
     /// backend probes its connection and redials when it is dead.
     fn network_changed(&self) {}
 
+    /// Dial now, without waiting for the backoff (the Retry button). A local backend has no link.
+    fn reconnect_now(&self) {}
+
     fn get_layout(&self) -> BackendFuture<Layout>;
     fn new_tab(&self, req: NewTab) -> BackendFuture<NewTabReply>;
     fn close_tab(&self, tab_id: Uuid) -> BackendFuture<()>;
@@ -355,5 +364,16 @@ mod owner_tests {
         // A kind from a newer server, and a name with bidi and control characters.
         assert_eq!(owner("unknown", "x\u{202e}y\u{7}").label(), "Size set by xy (another client)");
         assert_eq!(owner("hologram", "").label(), "Size set by another client");
+    }
+
+    #[test]
+    fn an_unreachable_machine_shows_the_overlay_after_one_second_and_a_connected_one_never() {
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let down = ConnState::UnreachableDirectOnly { since: start };
+        assert!(!down.show_overlay(start + Duration::from_millis(900)));
+        assert!(down.show_overlay(start + Duration::from_secs(1)));
+        assert!(!down.is_connected());
+        assert!(!ConnState::Connected.show_overlay(start + Duration::from_secs(60)));
     }
 }

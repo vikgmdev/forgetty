@@ -283,6 +283,7 @@ impl AppShell {
                 (_, c @ forgetty_shell_core::ConnState::Reconnecting { .. }) => {
                     (WARN, if c.show_overlay(now) { "reconnecting" } else { "connecting" })
                 }
+                (_, forgetty_shell_core::ConnState::UnreachableDirectOnly { .. }) => (WARN, "unreachable"),
                 (_, forgetty_shell_core::ConnState::Failed(_)) => (BAD, "offline"),
                 (_, forgetty_shell_core::ConnState::Closed) => (BAD, "closed"),
             };
@@ -472,7 +473,8 @@ impl AppShell {
         let multi = self.active_tab().is_some_and(|t| t.pane_tree.pane_count() > 1);
         let zoomed = self.zoomed.contains_key(&tab_id);
         let overlay = self.overlay_text(std::time::Instant::now());
-        for (pane, r) in &geo.panes {
+        let retry = overlay.is_some() && self.overlay_retry();
+        for (n, (pane, r)) in geo.panes.iter().enumerate() {
             let pane = *pane;
             let focused = Some(pane) == active;
             let mut d = div()
@@ -509,10 +511,33 @@ impl AppShell {
                         .flex()
                         .items_center()
                         .justify_center()
+                        .flex_col()
+                        .gap(px(10.0))
                         .bg(alpha(th.bg, 0.72))
                         .text_color(hsla(th.fg))
                         .text_size(px(13.0))
-                        .child(SharedString::from(text.clone())),
+                        .child(SharedString::from(text.clone()))
+                        .when(retry, |o| {
+                            o.child(
+                                div()
+                                    .id(("retry", n))
+                                    .px(px(14.0))
+                                    .h(px(30.0))
+                                    .flex()
+                                    .items_center()
+                                    .rounded(px(5.0))
+                                    .cursor_pointer()
+                                    .border_1()
+                                    .border_color(hsla(th.accent))
+                                    .bg(alpha(th.accent, 0.25))
+                                    .hover(move |s| s.bg(alpha(th.hover, 1.0)))
+                                    .child("Retry")
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|s, _e, _w, cx| {
+                                        cx.stop_propagation();
+                                        s.retry_connection(cx);
+                                    })),
+                            )
+                        }),
                 );
             }
             if zoomed {
@@ -874,7 +899,10 @@ impl AppShell {
                             ),
                     )
                     .child(line("Compare the Node ID with `forgetty pair` on the server. If it differs, cancel.".into(), true))
-                    .child(row("Relay", if o.relay.is_empty() { "none".to_string() } else { o.relay.clone() }))
+                    .child(row("Relay", if o.relay.is_empty() { if o.relays_disabled { "none (WireGuard only)".to_string() } else { "none".to_string() } } else { o.relay.clone() }))
+                    .when(!o.direct.is_empty(), |b| {
+                        b.child(row("Address", o.direct.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")))
+                    })
                     .child(line("Pairing gives this PC full access to the sessions on that machine.".into(), false))
                     .child(
                         div()

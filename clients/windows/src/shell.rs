@@ -184,7 +184,7 @@ pub struct AppShell {
     pub win_handle: gpui::AnyWindowHandle,
     /// Times a network change or a resume poked the remote backends.
     pub net_pokes: u64,
-    /// Extra direct address for the next pairing (CI smoke, LAN).
+    /// Extra direct address for the next pairing (CI smoke, LAN). It is stored as a pinned address.
     pub pair_hint: Option<std::net::SocketAddr>,
     pub(crate) switch_to: Option<Uuid>,
 }
