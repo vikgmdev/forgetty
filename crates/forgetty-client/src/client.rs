@@ -29,13 +29,13 @@ use forgetty_proto::{
     RECONNECT_BACKOFF_MS,
 };
 use iroh::endpoint::{Connection, ConnectionError, RecvStream, SendStream};
-use iroh::{Endpoint, EndpointAddr, SecretKey};
+use iroh::{Endpoint, EndpointAddr, SecretKey, Watcher as _};
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Notify};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::addr_cache::AddrCache;
+use crate::addr_cache::{has_route, usable, AddrCache};
 use crate::config::{transport_config, ClientInfo, ClientOptions};
 use crate::error::ClientError;
 use crate::state::ConnectionState;
@@ -174,6 +174,8 @@ pub(crate) struct Link {
     last_pong: Mutex<Instant>,
     /// Highest `Ping` nonce answered so far.
     pong_tx: watch::Sender<u64>,
+    /// When the latest `Ping`s went out, by nonce, to time their `Pong`s.
+    ping_times: Mutex<VecDeque<(u64, Instant)>>,
 }
 
 impl Link {
@@ -522,6 +524,15 @@ pub(crate) struct Shared {
     redial_note: Mutex<String>,
     /// Wakes the liveness task for an immediate `Ping`.
     ping_now: Notify,
+    /// When `network_changed` last ran (the app's call, or a link change iroh
+    /// reported), and when the supervisor last started a dial. A connection
+    /// that comes up around a network change gets the fast liveness window.
+    net_change_at: Mutex<Option<Instant>>,
+    last_dial_start: Mutex<Option<Instant>>,
+    /// Smoothed round trip time of `Ping`s in microseconds (0: not measured).
+    srtt_us: AtomicU64,
+    /// Until when the link is watched fast (see [`FAST_WINDOW`]).
+    fast_until: Mutex<Option<Instant>>,
     next_nonce: AtomicU64,
     /// Random per `spawn`: the `Hello.input_epoch`.
     input_epoch: Uuid,
@@ -635,6 +646,10 @@ impl Client {
             immediate: Mutex::new(ImmediateDial::default()),
             redial_note: Mutex::new(String::new()),
             ping_now: Notify::new(),
+            net_change_at: Mutex::new(None),
+            last_dial_start: Mutex::new(None),
+            srtt_us: AtomicU64::new(0),
+            fast_until: Mutex::new(None),
             next_nonce: AtomicU64::new(1),
             input_epoch: Uuid::new_v4(),
         });
@@ -740,6 +755,79 @@ impl Shared {
         let gen = self.next_ep_gen.fetch_add(1, Ordering::SeqCst);
         *lock(&self.endpoint) = Some(Ep { ep: Arc::new(ep), gen, born: Instant::now() });
         Ok(())
+    }
+}
+
+async fn network_changed_shared(shared: &Arc<Shared>) {
+    *lock(&shared.net_change_at) = Some(Instant::now());
+    // A real change of the network earns one immediate dial, with no
+    // token, at most once per `EP_MIN_AGE`. A repeat of the same event
+    // earns nothing, and does not use up the one a real change may need.
+    let fp = lock(&shared.net_fp_test).unwrap_or_else(net_fingerprint);
+    let real = std::mem::replace(&mut *lock(&shared.net_fp), fp) != fp;
+    let granted = real && {
+        let mut im = lock(&shared.immediate);
+        let ok = im.last_grant.is_none_or(|t| t.elapsed() >= EP_MIN_AGE);
+        if ok {
+            im.granted = Some(Instant::now());
+            im.last_grant = im.granted;
+        }
+        ok
+    };
+    tl!(
+        shared,
+        "network_changed: real {real}, immediate dial {granted}, link {}, {}",
+        shared.link_tx.borrow().is_some(),
+        lock(&shared.redial_note)
+    );
+    // Probe first: `network_change` can take long on a dead network, and
+    // must not delay the Ping.
+    let link = shared.link_tx.borrow().clone();
+    {
+        // The probe holds a clone of the endpoint. Register it under the
+        // endpoint lock: a replace takes the endpoint under the same lock
+        // and aborts the holders after, so either the probe is registered
+        // before the take (and aborted) or there is no endpoint and no
+        // probe. No holder appears after the abort.
+        let slot = lock(&shared.endpoint);
+        if let Some(ep) = slot.clone() {
+            let probe = tokio::spawn(async move { ep.ep.network_change().await });
+            shared.holders.add(probe.abort_handle());
+        }
+    }
+    // iroh may need many seconds to rebind a socket that went away. If
+    // there is no connection after a second, dial with a fresh endpoint.
+    let pong_ok = Arc::new(AtomicBool::new(false));
+    let seen = shared.connected_count.load(Ordering::SeqCst);
+    spawn_fallback(shared.clone(), seen, pong_ok.clone());
+    let Some(link) = link else {
+        // No connection: a dial is in flight (it may hang on a dead
+        // address) or the supervisor sleeps in a backoff. Abort it, forget
+        // the failures and dial again right away. There is no link to
+        // keep and nothing to wait for: the endpoint that has been failing
+        // since the network went away is replaced now, not after the 1.5 s
+        // of the fallback (unless it is itself new).
+        if shared.ep().is_some_and(|e| e.born.elapsed() >= EP_MIN_AGE) {
+            info!("client: network changed with no connection, replacing the endpoint");
+            shared.replace_for.store(seen, Ordering::SeqCst);
+        }
+        shared.reset_backoff.store(true, Ordering::SeqCst);
+        shared.kick.notify_one();
+        return;
+    };
+    let nonce = shared.next_nonce.fetch_add(1, Ordering::Relaxed);
+    let mut pong_rx = link.pong_tx.subscribe();
+    if send_ping(&link, nonce).is_err() {
+        return;
+    }
+    let wait = pong_rx.wait_for(|n| *n >= nonce);
+    let limit = Duration::from_millis(NETWORK_CHANGE_PONG_MS);
+    if matches!(tokio::time::timeout(limit, wait).await, Ok(Ok(_))) {
+        pong_ok.store(true, Ordering::SeqCst);
+    } else {
+        info!("client: no Pong after network change, redialing");
+        shared.reset_backoff.store(true, Ordering::SeqCst);
+        link.conn.close(close_code::OK.into(), b"network changed");
     }
 }
 
@@ -1002,76 +1090,7 @@ impl ClientHandle {
     /// endpoint at once. With a silent connection the replace comes 1.5 s after
     /// the call if nothing connected before.
     pub async fn network_changed(&self) {
-        let shared = self.shared();
-        // A real change of the network earns one immediate dial, with no
-        // token, at most once per `EP_MIN_AGE`. A repeat of the same event
-        // earns nothing, and does not use up the one a real change may need.
-        let fp = lock(&shared.net_fp_test).unwrap_or_else(net_fingerprint);
-        let real = std::mem::replace(&mut *lock(&shared.net_fp), fp) != fp;
-        let granted = real && {
-            let mut im = lock(&shared.immediate);
-            let ok = im.last_grant.is_none_or(|t| t.elapsed() >= EP_MIN_AGE);
-            if ok {
-                im.granted = Some(Instant::now());
-                im.last_grant = im.granted;
-            }
-            ok
-        };
-        tl!(
-            shared,
-            "network_changed: real {real}, immediate dial {granted}, link {}, {}",
-            shared.link_tx.borrow().is_some(),
-            lock(&shared.redial_note)
-        );
-        // Probe first: `network_change` can take long on a dead network, and
-        // must not delay the Ping.
-        let link = shared.link_tx.borrow().clone();
-        {
-            // The probe holds a clone of the endpoint. Register it under the
-            // endpoint lock: a replace takes the endpoint under the same lock
-            // and aborts the holders after, so either the probe is registered
-            // before the take (and aborted) or there is no endpoint and no
-            // probe. No holder appears after the abort.
-            let slot = lock(&shared.endpoint);
-            if let Some(ep) = slot.clone() {
-                let probe = tokio::spawn(async move { ep.ep.network_change().await });
-                shared.holders.add(probe.abort_handle());
-            }
-        }
-        // iroh may need many seconds to rebind a socket that went away. If
-        // there is no connection after a second, dial with a fresh endpoint.
-        let pong_ok = Arc::new(AtomicBool::new(false));
-        let seen = shared.connected_count.load(Ordering::SeqCst);
-        spawn_fallback(shared.clone(), seen, pong_ok.clone());
-        let Some(link) = link else {
-            // No connection: a dial is in flight (it may hang on a dead
-            // address) or the supervisor sleeps in a backoff. Abort it, forget
-            // the failures and dial again right away. There is no link to
-            // keep and nothing to wait for: the endpoint that has been failing
-            // since the network went away is replaced now, not after the 1.5 s
-            // of the fallback (unless it is itself new).
-            if shared.ep().is_some_and(|e| e.born.elapsed() >= EP_MIN_AGE) {
-                info!("client: network changed with no connection, replacing the endpoint");
-                shared.replace_for.store(seen, Ordering::SeqCst);
-            }
-            shared.reset_backoff.store(true, Ordering::SeqCst);
-            shared.kick.notify_one();
-            return;
-        };
-        let nonce = shared.next_nonce.fetch_add(1, Ordering::Relaxed);
-        let mut pong_rx = link.pong_tx.subscribe();
-        if send_ping(&link, nonce).is_err() {
-            return;
-        }
-        let wait = pong_rx.wait_for(|n| *n >= nonce);
-        let limit = Duration::from_millis(NETWORK_CHANGE_PONG_MS);
-        if matches!(tokio::time::timeout(limit, wait).await, Ok(Ok(_))) {
-            pong_ok.store(true, Ordering::SeqCst);
-        } else {
-            info!("client: no Pong after network change, redialing");
-            shared.reset_backoff.store(true, Ordering::SeqCst);
-            link.conn.close(close_code::OK.into(), b"network changed");
-        }
+        network_changed_shared(self.shared()).await;
     }
 
     /// Test hook: how long the supervisor has slept before its next dial, or
@@ -1434,6 +1453,7 @@ async fn supervise(shared: Arc<Shared>) {
     let mut final_state = ConnectionState::Closed;
     let mut attempt_no = 0u64;
     let mut bind_failures = 0u32;
+    let mut watched_gen: Option<u64> = None;
     // Redial bucket and the streak of short sessions (see MIN_HEALTHY_SESSION).
     let mut tokens = REDIAL_BURST;
     let mut refilled = Instant::now();
@@ -1477,6 +1497,8 @@ async fn supervise(shared: Arc<Shared>) {
         }
         attempt_no += 1;
         shared.dial_starts.store(attempt_no, Ordering::SeqCst);
+        *lock(&shared.last_dial_start) = Some(Instant::now());
+        watch_link_changes(&shared, &mut watched_gen);
         let attempt_started = Instant::now();
         debug!("client: dial #{attempt_no} starts (failures so far {failures})");
         tl!(
@@ -1806,10 +1828,28 @@ async fn dial_to(
 /// the other dial is dropped. A fatal error ends the race at once.
 async fn dial(shared: &Shared, ep: Ep) -> Result<Established, DialError> {
     let ep = &ep;
-    let Some(ip) = shared.opts.addr_cache.get(shared.server.id) else {
+    let known = shared.opts.addr_cache.get_all(shared.server.id);
+    if known.is_empty() {
         return dial_to(shared, ep, shared.server.clone(), None).await;
-    };
-    let direct = EndpointAddr::new(shared.server.id).with_ip_addr(ip);
+    }
+    // Only the addresses the local network has a route to: one without (an
+    // IPv6 address on a device with no IPv6) would cost the whole direct
+    // timeout. All of them go in one address, so iroh races them. With
+    // nothing to fall back to and no usable address, try them all anyway.
+    let mut ips = usable(&known, has_route);
+    if ips.len() < known.len() {
+        debug!("client: {} of {} cached addresses have no route here", known.len() - ips.len(), known.len());
+    }
+    if ips.is_empty() {
+        if !shared.server.is_empty() {
+            return dial_to(shared, ep, shared.server.clone(), None).await;
+        }
+        ips = known;
+    }
+    let mut direct = EndpointAddr::new(shared.server.id);
+    for ip in ips {
+        direct = direct.with_ip_addr(ip);
+    }
     if shared.server.is_empty() {
         // Nothing to fall back to: the direct dial has the whole dial timeout.
         return dial_to(shared, ep, direct, None).await;
@@ -1906,6 +1946,10 @@ async fn run_session(
     let Established { conn, send, recv, welcome } = est;
     *lock(&shared.link_born) = Instant::now();
     tl!(shared, "welcome received, session starts");
+    if follows_network_change(shared) {
+        info!("client: connected around a network change, watching the link fast for {FAST_WINDOW:?}");
+        *lock(&shared.fast_until) = Some(Instant::now() + FAST_WINDOW);
+    }
     let gen = shared.next_gen.fetch_add(1, Ordering::SeqCst) + 1;
     note_boot(shared, welcome.boot_id);
 
@@ -1926,6 +1970,7 @@ async fn run_session(
         init_ids: Mutex::new(HashSet::new()),
         last_pong: Mutex::new(Instant::now()),
         pong_tx: watch::channel(0).0,
+        ping_times: Mutex::new(VecDeque::new()),
     });
 
     let input_send = match conn.open_uni().await {
@@ -2111,6 +2156,7 @@ async fn control_reader(link: Arc<Link>, shared: Arc<Shared>, mut recv: RecvStre
                 }
                 Ok(ControlMsg::Pong { nonce, input_acked }) => {
                     *lock(&link.last_pong) = Instant::now();
+                    note_rtt(&shared, &link, nonce);
                     link.pong_tx.send_modify(|n| *n = (*n).max(nonce));
                     shared.input.ack(input_acked);
                 }
@@ -2328,12 +2374,110 @@ async fn input_writer(
     }
 }
 
+/// What iroh's network report says about the link: which UDP families work
+/// and the public addresses. iroh has no public link change event, but its
+/// report changes when the OS moved the default route or an address.
+type LinkPrint = (bool, bool, Option<std::net::IpAddr>, Option<std::net::IpAddr>);
+
+fn link_print(r: &iroh::NetReport) -> LinkPrint {
+    (
+        r.udp_v4,
+        r.udp_v6,
+        r.global_v4.map(|a| std::net::IpAddr::V4(*a.ip())),
+        r.global_v6.map(|a| std::net::IpAddr::V6(*a.ip())),
+    )
+}
+
+/// Treat a change of the endpoint's network report as `network_changed`,
+/// once per endpoint. The first report is the baseline.
+fn watch_link_changes(shared: &Arc<Shared>, watched_gen: &mut Option<u64>) {
+    let Some(ep) = shared.ep() else { return };
+    if *watched_gen == Some(ep.gen) {
+        return;
+    }
+    *watched_gen = Some(ep.gen);
+    let mut watcher = ep.ep.net_report();
+    let weak = Arc::downgrade(shared);
+    let task = tokio::spawn(async move {
+        let mut last: Option<LinkPrint> = None;
+        loop {
+            let Ok(value) = watcher.updated().await else { return };
+            let Some(report) = value else { continue };
+            let print = link_print(&report);
+            let changed = last.is_some_and(|l| l != print);
+            last = Some(print);
+            if changed {
+                let Some(shared) = weak.upgrade() else { return };
+                info!("client: the network report changed, treating it as a network change");
+                network_changed_shared(&shared).await;
+            }
+        }
+    });
+    shared.holders.add(task.abort_handle());
+}
+
+/// After a connection that follows a network change, the link is watched
+/// fast for this long: a Ping every [`FAST_PING_MS`], and dead after
+/// max([`FAST_DEAD_MIN_MS`], 4 x the smoothed round trip time) without a
+/// `Pong`. The OS often finishes configuring the interface after the first
+/// dial succeeded, and the link then dies silently.
+const FAST_WINDOW: Duration = Duration::from_secs(3);
+const FAST_PING_MS: u64 = 250;
+const FAST_DEAD_MIN_MS: u64 = 1000;
+
+/// A dial that started up to this long after a network change belongs to it.
+const NET_CHANGE_DIAL_SLACK: Duration = Duration::from_secs(2);
+
+/// Does the connection that comes up now follow a network change? True when
+/// `network_changed` ran during the dial that made it, or up to
+/// [`NET_CHANGE_DIAL_SLACK`] before the dial started.
+fn follows_network_change(shared: &Shared) -> bool {
+    let (Some(change), Some(dial)) =
+        (*lock(&shared.net_change_at), *lock(&shared.last_dial_start))
+    else {
+        return false;
+    };
+    change + NET_CHANGE_DIAL_SLACK >= dial
+}
+
+/// Time a `Pong` against its `Ping` and fold it into the smoothed RTT (the
+/// usual 7/8 old + 1/8 new).
+fn note_rtt(shared: &Shared, link: &Link, nonce: u64) {
+    let sent = {
+        let mut times = lock(&link.ping_times);
+        let mut sent = None;
+        while times.front().is_some_and(|(n, _)| *n <= nonce) {
+            if let Some((n, t)) = times.pop_front() {
+                if n == nonce {
+                    sent = Some(t);
+                }
+            }
+        }
+        sent
+    };
+    let Some(sent) = sent else { return };
+    let sample = u64::try_from(sent.elapsed().as_micros()).unwrap_or(u64::MAX);
+    let old = shared.srtt_us.load(Ordering::Relaxed);
+    let new = if old == 0 { sample } else { (old * 7 + sample) / 8 };
+    shared.srtt_us.store(new.max(1), Ordering::Relaxed);
+}
+
 /// Ping every second; declare the connection dead after 3 s without a Pong.
+/// In the fast window (see [`FAST_WINDOW`]): every 250 ms, and dead after
+/// max(1 s, 4 x smoothed RTT).
 async fn liveness(shared: Arc<Shared>, link: Arc<Link>) -> TaskEnd {
-    let interval = Duration::from_millis(PING_INTERVAL_MS);
-    let dead_after = Duration::from_millis(PONG_DEAD_AFTER_MS);
     let mut last_ping: Option<Instant> = None;
     loop {
+        let fast = lock(&shared.fast_until).is_some_and(|t| Instant::now() < t);
+        let (interval, dead_after) = if fast {
+            let rtt = Duration::from_micros(shared.srtt_us.load(Ordering::Relaxed));
+            (
+                Duration::from_millis(FAST_PING_MS),
+                Duration::from_millis(FAST_DEAD_MIN_MS).max(rtt * 4),
+            )
+        } else {
+            (Duration::from_millis(PING_INTERVAL_MS), Duration::from_millis(PONG_DEAD_AFTER_MS))
+        };
         let due = last_ping.is_none_or(|t| t.elapsed() >= interval);
         if due {
             let nonce = shared.next_nonce.fetch_add(1, Ordering::Relaxed);
@@ -2344,28 +2488,51 @@ async fn liveness(shared: Arc<Shared>, link: Arc<Link>) -> TaskEnd {
             note_direct_addr(&shared, &link.conn);
         }
         if lock(&link.last_pong).elapsed() > dead_after {
-            return TaskEnd::Lost("no Pong in 3 s".into());
+            return TaskEnd::Lost(if fast {
+                format!("no Pong in {dead_after:?} (fast window)")
+            } else {
+                "no Pong in 3 s".into()
+            });
         }
+        let tick = if fast { 50 } else { 100 };
         tokio::select! {
-            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+            _ = tokio::time::sleep(Duration::from_millis(tick)) => {}
             _ = shared.ping_now.notified() => { last_ping = None; }
         }
     }
 }
 
-/// Remember the direct address of the selected path, for the next dial.
+/// Remember the direct addresses of the paths of this connection, for the
+/// next dial: the selected one as the address the connection really uses, the
+/// others as addresses the server is known by. Link-local addresses are
+/// skipped: they mean nothing on the next network.
 fn note_direct_addr(shared: &Shared, conn: &Connection) {
-    let direct = conn.to_info().paths().into_iter().find_map(|p| match p.remote_addr() {
-        iroh::TransportAddr::Ip(addr) if p.is_selected() => Some(*addr),
-        _ => None,
-    });
-    if let Some(addr) = direct {
-        shared.opts.addr_cache.insert(shared.server.id, addr);
+    for p in conn.to_info().paths() {
+        let iroh::TransportAddr::Ip(addr) = p.remote_addr() else { continue };
+        let local_only = match addr.ip() {
+            std::net::IpAddr::V4(a) => a.is_link_local(),
+            std::net::IpAddr::V6(a) => (a.segments()[0] & 0xffc0) == 0xfe80,
+        };
+        if local_only {
+            continue;
+        }
+        if p.is_selected() {
+            shared.opts.addr_cache.insert(shared.server.id, *addr);
+        } else {
+            shared.opts.addr_cache.add(shared.server.id, *addr);
+        }
     }
 }
 
 fn send_ping(link: &Link, nonce: u64) -> Result<(), ClientError> {
     let frame = encode_msg(&ControlMsg::Ping { nonce })?;
+    {
+        let mut times = lock(&link.ping_times);
+        if times.len() >= 32 {
+            times.pop_front();
+        }
+        times.push_back((nonce, Instant::now()));
+    }
     link.control_tx.send(frame).map_err(|_| ClientError::ConnectionLost)
 }
 

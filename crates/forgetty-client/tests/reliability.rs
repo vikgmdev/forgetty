@@ -291,7 +291,7 @@ fn addr_cache_snapshot_round_trips_through_serde() {
     let back: AddrCacheSnapshot = serde_json::from_str(&json).unwrap();
     assert_eq!(AddrCache::from_snapshot(&back).get(key.public()), Some(addr));
     // A bad entry is skipped, not fatal.
-    let junk = AddrCacheSnapshot { entries: vec![CachedAddr { node_id: "garbage".into(), addr }] };
+    let junk = AddrCacheSnapshot { entries: vec![CachedAddr { node_id: "garbage".into(), addr, others: vec![] }] };
     assert!(AddrCache::from_snapshot(&junk).snapshot().entries.is_empty());
 }
 
@@ -316,7 +316,7 @@ async fn server_restart_on_the_cached_port_reconnects_every_time() {
 
     // What the app would have persisted from an earlier run.
     let cache = AddrCache::from_snapshot(&AddrCacheSnapshot {
-        entries: vec![CachedAddr { node_id: node_id.to_string(), addr: first.udp_addr() }],
+        entries: vec![CachedAddr { node_id: node_id.to_string(), addr: first.udp_addr(), others: vec![] }],
     });
     let opts = ClientOptions { addr_cache: cache, ..Default::default() };
     let info = ClientInfo::new(Uuid::new_v4(), ClientKind::Cli, "restart", "0");
@@ -445,7 +445,7 @@ async fn network_changed_aborts_a_hung_dial_and_connects_at_once() {
     let saved: Saved = first.stop_for_restart().await;
 
     let cache = AddrCache::from_snapshot(&AddrCacheSnapshot {
-        entries: vec![CachedAddr { node_id: node_id.to_string(), addr }],
+        entries: vec![CachedAddr { node_id: node_id.to_string(), addr, others: vec![] }],
     });
     let opts = ClientOptions { addr_cache: cache, ..Default::default() };
     let info = ClientInfo::new(Uuid::new_v4(), ClientKind::Cli, "net-change", "0");
@@ -1103,4 +1103,105 @@ async fn a_network_that_changes_every_200_ms_still_has_a_bounded_dial_rate() {
     assert!(d.at.len() <= 37, "{} dials in 30 s", d.at.len());
     h.close().await;
     server.shutdown().await;
+}
+
+// ---- Round 21: reconnect after a network change -------------------------
+
+/// A client that is connected just after a `network_changed`: the fast window
+/// of the liveness check is open from its `Connected`. The reconnect is forced
+/// with `reconnect_now`, so the new dial starts right after the change.
+async fn connect_after_network_change(
+    server: &TestServer,
+    h: &ClientHandle,
+) {
+    let before = server.handshakes();
+    h.network_changed().await;
+    h.reconnect_now();
+    wait_until("the reconnect after the network change", Duration::from_secs(10), || {
+        server.handshakes() > before && h.state().is_connected()
+    })
+    .await;
+}
+
+/// The address cache holds addresses of a family the machine has no route to
+/// (an IPv6 address on a device with no IPv6) and one that leads nowhere
+/// (TEST-NET), in front of the one that works. The dial must not pay for them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cached_address_list_with_an_unreachable_family_dials_fast() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
+    let server = TestServer::start(TestServerConfig::default()).await;
+    let node_id = server.node_id();
+    let good = server.udp_addr();
+    let v6: std::net::SocketAddr = "[2001:db8::1]:9".parse().unwrap();
+    let blackhole: std::net::SocketAddr = "192.0.2.1:9".parse().unwrap();
+    // The two dead addresses come first; the used one is last.
+    let cache = AddrCache::from_snapshot(&AddrCacheSnapshot {
+        entries: vec![CachedAddr {
+            node_id: node_id.to_string(),
+            addr: v6,
+            others: vec![blackhole, good],
+        }],
+    });
+    let key = SecretKey::generate(&mut rand::rng());
+    server.authorize(key.public());
+    let info = ClientInfo::new(Uuid::new_v4(), ClientKind::Cli, "addr-list", "0");
+    let opts = ClientOptions { addr_cache: cache, ..Default::default() };
+    let t0 = Instant::now();
+    let h = Client::connect_with(EndpointAddr::new(node_id), key, info, opts)
+        .await
+        .expect("connect through the cached list");
+    let took = t0.elapsed();
+    println!("dial with a dead family and a black hole in the cache: {took:?}");
+    assert!(took < Duration::from_millis(200), "dial took {took:?}");
+    h.close().await;
+    server.shutdown().await;
+}
+
+/// A link that dies right after the `Connected` that follows a network
+/// change: the OS finished configuring the interface late. Found within 1.5 s,
+/// not after the 3 s of the normal liveness check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_link_that_dies_right_after_a_post_change_connect_is_found_within_1500_ms() {
+    let a = TestServer::start(TestServerConfig { own_runtime: true, ..Default::default() }).await;
+    let h = connect_to(a.addr()).await;
+    connect_after_network_change(&a, &h).await;
+
+    let dials = h.dial_starts_for_tests();
+    a.freeze(Duration::from_secs(5));
+    let t0 = Instant::now();
+    while h.dial_starts_for_tests() == dials {
+        assert!(t0.elapsed() < Duration::from_secs(6), "the dead link was not found");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let found = t0.elapsed();
+    println!("dead link found after {found:?}");
+    assert!(found < Duration::from_millis(1500), "found after {found:?}");
+    h.close().await;
+    a.shutdown().await;
+}
+
+/// The same fast window on a healthy link with 300 ms added to every Pong
+/// (mock delay: netem needs root, so no real netem here): no redial.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_fast_window_does_not_redial_a_healthy_link_with_300_ms_delay() {
+    let a = TestServer::start(TestServerConfig {
+        own_runtime: true,
+        pong_delay: Duration::from_millis(300),
+        ..Default::default()
+    })
+    .await;
+    let h = connect_to(a.addr()).await;
+    connect_after_network_change(&a, &h).await;
+
+    let (dials, shakes) = (h.dial_starts_for_tests(), a.handshakes());
+    // The window is 3 s: watch past its end.
+    tokio::time::sleep(Duration::from_millis(4500)).await;
+    assert!(h.state().is_connected());
+    assert_eq!(h.dial_starts_for_tests(), dials, "the fast window redialed a healthy link");
+    assert_eq!(a.handshakes(), shakes);
+    h.close().await;
+    a.shutdown().await;
 }

@@ -67,6 +67,9 @@ pub struct TestServerConfig {
     pub own_runtime: bool,
     /// Wait this long between reading `Hello` and answering `Welcome`.
     pub handshake_delay: Duration,
+    /// Wait this long before each `Pong` (a link with a long round trip, in
+    /// place of netem, which needs root).
+    pub pong_delay: Duration,
     /// What a connection does after the `Welcome` (see [`DIE_SILENT`] and
     /// [`DIE_AFTER_EVENT`]); [`TestServer::set_die_mode`] changes it while
     /// the server runs. 0 serves normally.
@@ -93,6 +96,7 @@ impl Default for TestServerConfig {
             panes: Vec::new(),
             own_runtime: false,
             handshake_delay: Duration::ZERO,
+            pong_delay: Duration::ZERO,
             die_mode: 0,
         }
     }
@@ -812,6 +816,14 @@ async fn handle_rpc(conn: Connection, state: Arc<State>) {
                             let tx = out_tx.clone();
                             tokio::spawn(async move {
                                 tokio::time::sleep_until(t.into()).await;
+                                let _ = tx.send(ControlMsg::Pong { nonce, input_acked });
+                            });
+                        }
+                        None if !state.cfg.pong_delay.is_zero() => {
+                            let tx = out_tx.clone();
+                            let delay = state.cfg.pong_delay;
+                            tokio::spawn(async move {
+                                tokio::time::sleep(delay).await;
                                 let _ = tx.send(ControlMsg::Pong { nonce, input_acked });
                             });
                         }
