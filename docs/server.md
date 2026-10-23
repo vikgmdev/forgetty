@@ -320,7 +320,13 @@ relay = "none"
   contacts a relay or n0: no relay connection, no address publishing, no
   discovery. It also switches off iroh's port mapping (UPnP, NAT-PMP, PCP), so
   it does not talk to the router either. It cannot be combined with
-  `--relay-url`.
+  `--relay-url`, and `relay = "none"` cannot be combined with `relay_urls` in
+  the file.
+- A command-line flag wins over the file. With `--no-relay` the `relay` and
+  `relay_urls` of `config.toml` are ignored (not even parsed), with `--relay-url`
+  its `relay`, and with `--bind` its `bind_addrs`. The server logs a WARN for
+  each, for example "config relay settings ignored: --no-relay given", and
+  starts. Exit 78 stays for a conflict inside one source.
 - `--no-relay` needs `--bind`. Without a bind address the server refuses to
   start, prints the reason and exits with code 78 (`EX_CONFIG`, a setting that
   a restart cannot fix). `forgetty server start` prints that error at once. The
@@ -358,7 +364,7 @@ relay = "none"
   on disk, so it can repair a file that does not load. Values are trimmed and
   not case sensitive: `Relay = "None"` and `relay = " NONE"` are the same
   as `"none"`. Every other configuration error (a bad `relay` value, a bad
-  `--bind` address, a bad relay URL, `--no-relay` with relay URLs) also exits 78.
+  `--bind` address, a bad relay URL, `--no-relay` with `--relay-url`) also exits 78.
 - Devices paired before this change have no `relays_disabled` flag and no
   direct address. They must pair again.
 - The network watcher of the client (`link-watch`) does nothing for a client

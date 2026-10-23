@@ -45,6 +45,9 @@ pub struct RemoteSettings {
     pub relay_urls: Vec<Url>,
     /// Addresses to bind, without duplicates. Empty: every address.
     pub bind_addrs: Vec<IpAddr>,
+    /// Settings of the file that a command-line flag overrode. The caller logs
+    /// them at WARN.
+    pub warnings: Vec<String>,
 }
 
 /// Is `value` the relay setting that switches relays off? Trimmed, any case.
@@ -137,27 +140,59 @@ pub fn check_pairable_bind(addrs: &[IpAddr]) -> Result<(), ConfigError> {
 /// Check the remote settings of `config` with the command-line `overrides`.
 /// The server calls this at startup and exits 78 on an error; the settings
 /// editor calls it with no overrides before it writes a file.
+///
+/// A command-line flag wins over the file: with `--no-relay` the file's `relay`
+/// and `relay_urls` are ignored (not even parsed), with `--relay-url` the file's
+/// `relay`, and with `--bind` the file's `bind_addrs`. Each ignored setting is
+/// reported in [`RemoteSettings::warnings`]. A conflict inside one source is an
+/// error: `--no-relay` with `--relay-url`, or `relay = "none"` with
+/// `relay_urls` in the file.
 pub fn validate_remote_settings(
     config: &crate::Config,
     overrides: &RemoteOverrides,
 ) -> Result<RemoteSettings, ConfigError> {
-    // --relay-url replaces the config file list. None: iroh defaults.
-    let relay_source =
-        if overrides.relay_urls.is_empty() { &config.relay_urls } else { &overrides.relay_urls };
-    let relay_urls = parse_relay_urls(relay_source)?;
-    let no_relay = relays_disabled(overrides.no_relay, config.relay.as_deref())?;
-    if no_relay && !relay_urls.is_empty() {
-        return Err(ConfigError(
-            "relays are switched off (--no-relay / relay = \"none\") but relay URLs are set".into(),
-        ));
-    }
-    let bind_source = if overrides.bind.is_empty() { &config.bind_addrs } else { &overrides.bind };
-    let bind_addrs = parse_bind_addrs(bind_source)?;
+    let mut warnings = Vec::new();
+    let file_relay = config.relay.as_deref().map(str::trim).filter(|v| !v.is_empty());
+    let (no_relay, relay_urls) = if overrides.no_relay {
+        if !overrides.relay_urls.is_empty() {
+            return Err(ConfigError(
+                "relays are switched off (--no-relay) but relay URLs are set (--relay-url)".into(),
+            ));
+        }
+        if !config.relay_urls.is_empty() || file_relay.is_some_and(|v| !is_relay_none(v)) {
+            warnings.push("config relay settings ignored: --no-relay given".to_string());
+        }
+        (true, Vec::new())
+    } else if !overrides.relay_urls.is_empty() {
+        if file_relay.is_some() {
+            warnings.push("config relay settings ignored: --relay-url given".to_string());
+        }
+        (false, parse_relay_urls(&overrides.relay_urls)?)
+    } else {
+        let relay_urls = parse_relay_urls(&config.relay_urls)?;
+        let no_relay = relays_disabled(false, config.relay.as_deref())?;
+        if no_relay && !relay_urls.is_empty() {
+            return Err(ConfigError(
+                "relays are switched off (relay = \"none\") but relay URLs are set \
+                 (relay_urls)"
+                    .into(),
+            ));
+        }
+        (no_relay, relay_urls)
+    };
+    let bind_addrs = if overrides.bind.is_empty() {
+        parse_bind_addrs(&config.bind_addrs)?
+    } else {
+        if !config.bind_addrs.is_empty() {
+            warnings.push("config bind_addrs ignored: --bind given".to_string());
+        }
+        parse_bind_addrs(&overrides.bind)?
+    };
     if no_relay {
         // Without relays the server is reached on its direct addresses only,
         // and a server that binds every address would put them all in the QR.
         if bind_addrs.is_empty() && overrides.bind_may_come_later {
-            return Ok(RemoteSettings { no_relay, relay_urls, bind_addrs });
+            return Ok(RemoteSettings { no_relay, relay_urls, bind_addrs, warnings });
         }
         if bind_addrs.is_empty() {
             return Err(ConfigError(
@@ -169,7 +204,7 @@ pub fn validate_remote_settings(
         }
         check_pairable_bind(&bind_addrs)?;
     }
-    Ok(RemoteSettings { no_relay, relay_urls, bind_addrs })
+    Ok(RemoteSettings { no_relay, relay_urls, bind_addrs, warnings })
 }
 
 #[cfg(test)]
@@ -255,6 +290,71 @@ mod tests {
         assert_eq!(s.bind_addrs, vec![ip("10.0.0.2")]);
         assert_eq!(s.relay_urls[0].as_str(), "https://b.example.org/");
         assert!(!s.no_relay);
+    }
+
+    #[test]
+    fn a_command_line_flag_wins_over_the_file() {
+        let flag = |no_relay: bool, urls: &[&str], bind: &[&str]| RemoteOverrides {
+            no_relay,
+            relay_urls: urls.iter().map(|s| s.to_string()).collect(),
+            bind: bind.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        // --no-relay: the file's relay settings are ignored, even bad ones.
+        for file in [
+            "relay_urls = [\"https://r.example.org\"]\n",
+            "relay_urls = [\"ftp://bad\"]\n",
+            "relay = \"nne\"\n",
+            "relay = \"none\"\nrelay_urls = [\"https://r.example.org\"]\n",
+        ] {
+            let s = validate_remote_settings(&config(file), &flag(true, &[], &["10.0.0.1"]))
+                .unwrap_or_else(|e| panic!("{file:?}: {e}"));
+            assert!(s.no_relay && s.relay_urls.is_empty(), "{file:?}");
+            assert_eq!(
+                s.warnings,
+                vec!["config relay settings ignored: --no-relay given".to_string()],
+                "{file:?}"
+            );
+        }
+        // relay = "none" alone in the file is the same as the flag: no warning.
+        let s = validate_remote_settings(
+            &config("relay = \"none\"\n"),
+            &flag(true, &[], &["10.0.0.1"]),
+        )
+        .unwrap();
+        assert!(s.warnings.is_empty());
+        // --relay-url: the file's relay = "none" is ignored.
+        let s = validate_remote_settings(
+            &config("relay = \"none\"\n"),
+            &flag(false, &["https://r.example.org"], &[]),
+        )
+        .unwrap();
+        assert!(!s.no_relay && s.relay_urls.len() == 1);
+        assert_eq!(
+            s.warnings,
+            vec!["config relay settings ignored: --relay-url given".to_string()]
+        );
+        // --bind: the file's bind_addrs is ignored, even a bad one.
+        let s = validate_remote_settings(
+            &config("bind_addrs = [\"not an ip\"]\n"),
+            &flag(false, &[], &["10.0.0.2"]),
+        )
+        .unwrap();
+        assert_eq!(s.bind_addrs, vec![ip("10.0.0.2")]);
+        assert_eq!(s.warnings, vec!["config bind_addrs ignored: --bind given".to_string()]);
+        // A conflict inside one source is still an error.
+        let e = validate_remote_settings(
+            &config(""),
+            &flag(true, &["https://r.example.org"], &["10.0.0.1"]),
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("relay URLs are set"), "{e}");
+        let e = validate_remote_settings(
+            &config("relay = \"none\"\nrelay_urls = [\"https://r.example.org\"]\n"),
+            &flag(false, &[], &["10.0.0.1"]),
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("relay URLs are set"), "{e}");
     }
 
     #[test]

@@ -17,6 +17,10 @@ static CONFIG_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
 /// Record the config file this process uses (`--config-file`), so that every
 /// load and save that names no path (the settings view, a reload) uses the same
 /// file and never another one. `None`: the default location.
+///
+/// This is process state. A test must not rely on it: pass an explicit path
+/// (`load_config(Some(..))`, `parse_and_save_config_at`) and leave this alone.
+/// The one test that sets it restores it with a guard.
 pub fn set_config_path(path: Option<PathBuf>) {
     *CONFIG_PATH.lock().unwrap_or_else(|e| e.into_inner()) = path;
 }
@@ -422,6 +426,14 @@ mod tests {
     fn a_config_path_set_for_the_process_is_the_one_every_call_uses() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("elsewhere.toml");
+        /// Puts the process-wide path back, also when an assert fails.
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                set_config_path(None);
+            }
+        }
+        let _reset = Reset;
         set_config_path(Some(p.clone()));
         assert_eq!(config_file_path(), p);
         // No file yet: defaults, whose save goes to that file.
@@ -438,7 +450,6 @@ mod tests {
         let fallback = Config { source: Some(config_file_path()), ..Config::default() };
         assert!(save_config(&fallback).is_err());
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "font_size = \n");
-        set_config_path(None);
     }
 
     #[test]

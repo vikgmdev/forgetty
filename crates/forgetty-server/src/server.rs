@@ -332,6 +332,9 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
         },
     )
     .map_err(|e| ConfigInvalid(e.to_string()))?;
+    for w in &remote.warnings {
+        warn!("{w}");
+    }
     let no_relay = remote.no_relay;
     let relay_urls: Vec<iroh::RelayUrl> =
         remote.relay_urls.into_iter().map(iroh::RelayUrl::from).collect();
