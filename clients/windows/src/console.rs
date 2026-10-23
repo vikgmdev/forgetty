@@ -1,7 +1,9 @@
 //! The console of a GUI-subsystem build. The release exe has no console of its own. When a
 //! shell started it, `attach_parent` joins that shell's console, so `--smoke` output and
 //! `eprintln!` still reach it. Without a parent console (Start menu) it does nothing and
-//! stderr stays closed, which also drops libghostty-vt's Zig log output.
+//! stderr stays closed, which also drops libghostty-vt's Zig log output. Only the CLI modes
+//! (`--smoke`) attach: a normal launch from a terminal must not join its console, or Ctrl+C
+//! and closing the tab would kill the app and its shells.
 
 #[cfg(windows)]
 mod imp {
@@ -31,6 +33,20 @@ mod imp {
         ) -> isize;
     }
 
+    #[link(name = "user32")]
+    extern "system" {
+        fn MessageBoxW(window: isize, text: *const u16, caption: *const u16, kind: u32) -> i32;
+    }
+
+    const MB_OK_ICONERROR: u32 = 0x10;
+
+    /// An error box. A GUI-subsystem exe has no stderr to show an error on.
+    pub fn error_box(text: &str) {
+        let wide = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+        // SAFETY: both strings are NUL-terminated and outlive the call.
+        unsafe { MessageBoxW(0, wide(text).as_ptr(), wide("Forgetty").as_ptr(), MB_OK_ICONERROR) };
+    }
+
     pub fn attach_parent() -> bool {
         // SAFETY: plain Win32 calls with valid arguments.
         unsafe {
@@ -57,15 +73,23 @@ mod imp {
     /// Process ids attached to this process's console. Empty when it has none.
     pub fn process_ids() -> Vec<u32> {
         let mut ids = vec![0u32; 64];
-        // SAFETY: `ids` holds `len` u32.
-        let n = unsafe { GetConsoleProcessList(ids.as_mut_ptr(), ids.len() as u32) } as usize;
-        ids.truncate(n.min(ids.len()));
-        ids
+        loop {
+            // SAFETY: `ids` holds `len` u32.
+            let n = unsafe { GetConsoleProcessList(ids.as_mut_ptr(), ids.len() as u32) } as usize;
+            // More processes than room: the return value is the size needed.
+            if n > ids.len() {
+                ids.resize(n + 16, 0);
+                continue;
+            }
+            ids.truncate(n);
+            return ids;
+        }
     }
 }
 
 #[cfg(not(windows))]
 mod imp {
+    pub fn error_box(_text: &str) {}
     pub fn attach_parent() -> bool {
         false
     }
@@ -74,4 +98,4 @@ mod imp {
     }
 }
 
-pub use imp::{attach_parent, process_ids};
+pub use imp::{attach_parent, error_box, process_ids};

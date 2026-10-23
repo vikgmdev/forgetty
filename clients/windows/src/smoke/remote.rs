@@ -31,12 +31,15 @@ pub struct ServerProc {
 
 impl ServerProc {
     fn start(exe: &Path, args: &[String]) -> std::io::Result<Self> {
-        let mut child = Command::new(exe)
-            .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?;
+        let mut cmd = Command::new(exe);
+        cmd.args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+        // The app is GUI-subsystem: without this flag the server opens a console window.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        let mut child = cmd.spawn()?;
         super::SERVER_PID.store(child.id(), std::sync::atomic::Ordering::SeqCst);
         let lines = Arc::new(Mutex::new(Vec::new()));
         let out = child.stdout.take().expect("piped stdout");

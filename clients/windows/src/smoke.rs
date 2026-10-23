@@ -102,7 +102,11 @@ pub fn hard_exit(code: i32) -> ! {
     {
         let pid = SERVER_PID.load(std::sync::atomic::Ordering::SeqCst);
         if pid != 0 {
-            let _ = std::process::Command::new("taskkill").args(["/F", "/T", "/PID", &pid.to_string()]).output();
+            use std::os::windows::process::CommandExt;
+            let _ = std::process::Command::new("taskkill")
+                .args(["/F", "/T", "/PID", &pid.to_string()])
+                .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+                .output();
         }
     }
     if let Some(d) = real::distro() {
@@ -536,8 +540,9 @@ impl ShellSmoke {
                         // that started this exe, and no log line may reach the pane.
                         let console = crate::console::process_ids();
                         let shell_pid = self.p1.and_then(|p| self.local.pty(p)).and_then(|p| p.pid());
-                        record("console_attached", json!(!console.is_empty()));
-                        check("shell_not_on_app_console", shell_pid.is_some_and(|pid| !console.contains(&pid)));
+                        // The gate runs from a console. Without one, the check below proves nothing.
+                        check("console_attached", !console.is_empty());
+                        check("shell_not_on_app_console", !console.is_empty() && shell_pid.is_some_and(|pid| !console.contains(&pid)));
                         check("pane_has_no_log_lines", !rows.iter().any(|r| r.contains("unimplemented mode") || r.contains("warning(")));
                         self.start_probe(v, cr, cc);
                         self.goto(Phase::Keys);

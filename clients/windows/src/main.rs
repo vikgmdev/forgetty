@@ -4,7 +4,7 @@
 
 // Release builds are GUI-subsystem: no console of their own, so Windows (and a default
 // terminal such as Windows Terminal) opens no extra window. `console::attach_parent` gives
-// stdout and stderr back when a console started us. Debug builds keep the console.
+// stdout and stderr back to `--smoke` when a console started us. Debug builds keep the console.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod chrome;
@@ -33,9 +33,12 @@ use config::{Backdrop, Config};
 use shell::AppShell;
 
 fn main() {
-    console::attach_parent();
     let start = Instant::now();
     let smoke = std::env::args().any(|a| a == "--smoke");
+    if smoke {
+        // The only mode that prints. A normal launch must not join the terminal's console.
+        console::attach_parent();
+    }
 
     if smoke {
         // Watchdog: independent of the GPUI loop so a hung window still exits 1.
@@ -72,6 +75,7 @@ fn main() {
     }
     if let Some(e) = cfg_err {
         eprintln!("forgetty-win: config error, using defaults: {e}");
+        console::error_box(&format!("Config error, using defaults:\n\n{e}"));
     }
 
     application().run(move |cx: &mut App| {
@@ -156,6 +160,7 @@ fn fatal(smoke: bool, msg: &str) -> ! {
         smoke::fail(msg)
     }
     eprintln!("forgetty-win: {msg}");
+    console::error_box(msg);
     std::process::exit(1);
 }
 
