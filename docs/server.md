@@ -346,9 +346,15 @@ relay = "none"
   `relay_urls`, IP literals for `bind_addrs`): the setting would be ignored. A
   near key with another value (`delay = "500ms"`, `retry = "always"`) only warns.
   The settings save writes to the file the config was loaded from
-  (`--config-file`) and refuses to overwrite a file that does not load. The
-  settings text editor checks the new text the same way as a load, and then
-  writes it, so it can repair a broken file. Every other configuration error (a bad `relay` value, a bad
+  (`--config-file`, also when the load failed) and refuses to overwrite a file
+  that does not load. The settings text editor runs the server's own check
+  (`forgetty_config::validate_remote_settings`, with no command-line options)
+  on the new text, and writes it only when the server would start with it. So
+  it refuses `rellay = "none"`, a bad `relay`, bad URLs or addresses, and
+  `relay = "none"` without a pairable `bind_addrs`. It does not look at the file
+  on disk, so it can repair a file that does not load. Values are trimmed and
+  not case sensitive: `Relay = "None"` and `relay = " NONE"` are the same
+  as `"none"`. Every other configuration error (a bad `relay` value, a bad
   `--bind` address, a bad relay URL, `--no-relay` with relay URLs) also exits 78.
 - Devices paired before this change have no `relays_disabled` flag and no
   direct address. They must pair again.

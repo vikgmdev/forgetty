@@ -17,7 +17,7 @@ use tokio::signal::unix::{signal, SignalKind};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use forgetty_config::{load_config, Config};
+use forgetty_config::{load_config, validate_remote_settings, Config, RemoteOverrides};
 use forgetty_core::PaneId;
 use forgetty_pty::PtySize;
 use forgetty_session::{SessionEvent, SessionManager};
@@ -79,51 +79,6 @@ pub struct RunArgs {
     pub no_relay: bool,
 }
 
-/// Parse the IP addresses of `--bind` or the config file.
-pub fn parse_bind_addrs(addrs: &[String]) -> anyhow::Result<Vec<std::net::IpAddr>> {
-    let mut out: Vec<std::net::IpAddr> = Vec::new();
-    for a in addrs {
-        let ip: std::net::IpAddr = a
-            .trim()
-            .trim_matches(|c| c == '[' || c == ']')
-            .parse()
-            .map_err(|e| anyhow::anyhow!("invalid bind address {a:?}: {e} (an IP, no port)"))?;
-        if !out.contains(&ip) {
-            out.push(ip);
-        }
-    }
-    Ok(out)
-}
-
-/// Is the relay switched off, by `--no-relay` or `relay = "none"`? Any other
-/// value of `relay` is an error: a typo must not turn the relays on silently.
-pub fn relays_disabled(no_relay_flag: bool, relay_setting: Option<&str>) -> anyhow::Result<bool> {
-    match relay_setting.map(str::trim) {
-        None | Some("") => Ok(no_relay_flag),
-        Some(v) if v.eq_ignore_ascii_case("none") => Ok(true),
-        Some(v) => anyhow::bail!(
-            "invalid relay setting {v:?}: the only value is \"none\" (use relay_urls for relays)"
-        ),
-    }
-}
-
-/// Parse relay URLs from `--relay-url` or the config file.
-pub fn parse_relay_urls(urls: &[String]) -> anyhow::Result<Vec<iroh::RelayUrl>> {
-    let mut out: Vec<iroh::RelayUrl> = Vec::new();
-    for u in urls {
-        let parsed: iroh::RelayUrl =
-            u.trim().parse().map_err(|e| anyhow::anyhow!("invalid relay URL {u:?}: {e}"))?;
-        let scheme = parsed.scheme();
-        if scheme != "http" && scheme != "https" {
-            anyhow::bail!("invalid relay URL {u:?}: scheme must be http or https");
-        }
-        if !out.contains(&parsed) {
-            out.push(parsed);
-        }
-    }
-    Ok(out)
-}
-
 /// Default UDP port of the iroh endpoint (PROTOCOL_V2 section 1).
 pub const DEFAULT_PORT: u16 = 47297;
 
@@ -163,35 +118,10 @@ impl std::fmt::Display for ConfigInvalid {
 
 impl std::error::Error for ConfigInvalid {}
 
-/// With no relay a device reaches the server on its bind addresses and nothing
-/// else, so at least one must be an address a device can pair with: not
-/// `0.0.0.0` or `::`, not link-local, not multicast or broadcast (the same rule
-/// as `forgetty_proto::pinned_addr_problem`, which the client applies to the
-/// QR).
-pub fn check_pairable_bind(addrs: &[std::net::IpAddr]) -> anyhow::Result<()> {
-    // Any non-zero port: the rule is about the IP here.
-    let pairable = |ip: &std::net::IpAddr| {
-        forgetty_proto::pinned_addr_problem(&std::net::SocketAddr::new(*ip, 1)).is_none()
-    };
-    if addrs.iter().any(pairable) {
-        return Ok(());
-    }
-    let list = addrs.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
-    anyhow::bail!(
-        "no address a device can pair with: --no-relay needs a bind address that is not \
-         0.0.0.0, ::, link-local, multicast or broadcast (bound: {list})"
-    )
-}
-
 /// Do all the addresses stay on this machine? Then no remote device can pair.
 /// Allowed (the tests bind `127.0.0.1`), but worth a warning at startup.
 pub fn loopback_only(addrs: &[std::net::IpAddr]) -> bool {
     !addrs.is_empty() && addrs.iter().all(std::net::IpAddr::is_loopback)
-}
-
-/// Wrap a setting error so `server run` exits with [`EXIT_CONFIG`].
-fn config_invalid(e: anyhow::Error) -> anyhow::Error {
-    ConfigInvalid(e.to_string()).into()
 }
 
 /// Load the config. A missing file (the default location, or a `--config-file`
@@ -201,7 +131,7 @@ pub fn load_server_config(path: Option<&std::path::Path>) -> anyhow::Result<Conf
     if let Some(p) = path {
         if !p.exists() {
             warn!("config file {} not found, using defaults", p.display());
-            return Ok(Config::default());
+            return Ok(Config { source: Some(p.to_path_buf()), ..Config::default() });
         }
     }
     load_config(path).map_err(|e| ConfigInvalid(e.to_string()).into())
@@ -227,24 +157,6 @@ pub fn bind_is_retryable(chose_addrs: bool, error: &forgetty_sync::SyncError) ->
         _ => false,
     }
 }
-
-/// `--no-relay` / `relay = "none"` without `--bind` / `bind_addrs`. A config
-/// error that a restart cannot fix: `server run` exits with [`EXIT_CONFIG`]
-/// so the systemd unit (`RestartPreventExitStatus=75 78`) does not loop on it.
-#[derive(Debug)]
-pub struct NeedsBind;
-
-impl std::fmt::Display for NeedsBind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "relays are switched off (--no-relay / relay = \"none\") but no bind address is set: \
-             add --bind IP (or bind_addrs in the config file), for example the WireGuard address"
-        )
-    }
-}
-
-impl std::error::Error for NeedsBind {}
 
 /// Another server holds the instance lock.
 #[derive(Debug)]
@@ -408,36 +320,30 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
 
     let config: Config = load_server_config(config_path.as_deref())?;
 
-    // Relays: --relay-url replaces the config file list. None: iroh defaults.
-    let relay_source = if args.relay_url.is_empty() { &config.relay_urls } else { &args.relay_url };
-    let relay_urls = parse_relay_urls(relay_source).map_err(config_invalid)?;
-    let no_relay =
-        relays_disabled(args.no_relay, config.relay.as_deref()).map_err(config_invalid)?;
-    if no_relay && !relay_urls.is_empty() {
-        return Err(ConfigInvalid(
-            "relays are switched off (--no-relay / relay = \"none\") but relay URLs are set".into(),
-        )
-        .into());
-    }
+    // One check of the remote settings, shared with the settings editor: a
+    // setting the server refuses (exit 78) is a setting the editor refuses.
+    let remote = validate_remote_settings(
+        &config,
+        &RemoteOverrides {
+            no_relay: args.no_relay,
+            relay_urls: args.relay_url.clone(),
+            bind: args.bind.clone(),
+        },
+    )
+    .map_err(|e| ConfigInvalid(e.to_string()))?;
+    let no_relay = remote.no_relay;
+    let relay_urls: Vec<iroh::RelayUrl> =
+        remote.relay_urls.into_iter().map(iroh::RelayUrl::from).collect();
+    let bind_addrs = remote.bind_addrs;
     // Own relays: no n0 discovery unless asked for (--n0-discovery).
     let n0_discovery = !no_relay && (relay_urls.is_empty() || args.n0_discovery);
-    let bind_source = if args.bind.is_empty() { &config.bind_addrs } else { &args.bind };
-    let bind_addrs = parse_bind_addrs(bind_source).map_err(config_invalid)?;
     if bind_addrs.is_empty() {
         info!("bind: every address");
     } else {
         info!("bind: {}", bind_addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", "));
     }
-    if no_relay && bind_addrs.is_empty() {
-        // Without relays the server is reached on its direct addresses only,
-        // and a server that binds every address would put them all in the QR.
-        return Err(NeedsBind.into());
-    }
-    if no_relay {
-        check_pairable_bind(&bind_addrs).map_err(config_invalid)?;
-        if loopback_only(&bind_addrs) {
-            warn!("bound to loopback only: no remote device can pair");
-        }
+    if no_relay && loopback_only(&bind_addrs) {
+        warn!("bound to loopback only: no remote device can pair");
     }
 
     info!("session_id: {session_id}");
@@ -1144,20 +1050,7 @@ fn restore_subtree(
 
 #[cfg(test)]
 mod tests {
-
-    #[test]
-    fn relay_urls_parse_and_dedupe() {
-        let urls = vec![
-            "https://relay.example.org".to_string(),
-            "https://relay.example.org/".to_string(),
-            " http://127.0.0.1:3340 ".to_string(),
-        ];
-        let parsed = parse_relay_urls(&urls).unwrap();
-        assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0].to_string(), "https://relay.example.org/");
-        assert_eq!(parsed[1].to_string(), "http://127.0.0.1:3340/");
-        assert!(parse_relay_urls(&[]).unwrap().is_empty());
-    }
+    use super::*;
 
     #[test]
     fn a_config_that_does_not_parse_is_an_error_and_a_missing_one_is_not() {
@@ -1212,19 +1105,6 @@ mod tests {
     }
 
     #[test]
-    fn no_relay_needs_a_bind_address_a_device_can_pair_with() {
-        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
-        assert!(check_pairable_bind(&[ip("10.230.1.14")]).is_ok());
-        assert!(check_pairable_bind(&[ip("0.0.0.0"), ip("127.0.0.1")]).is_ok());
-        for bad in ["0.0.0.0", "::", "169.254.1.1", "fe80::1", "224.0.0.1", "ff02::1"] {
-            let err = check_pairable_bind(&[ip(bad)]).unwrap_err().to_string();
-            assert!(err.contains("no address a device can pair with"), "{bad}: {err}");
-        }
-        // One good address among bad ones is enough.
-        assert!(check_pairable_bind(&[ip("0.0.0.0"), ip("10.0.0.2")]).is_ok());
-    }
-
-    #[test]
     fn loopback_only_binds_are_flagged() {
         let ips =
             |v: &[&str]| v.iter().map(|s| s.parse().unwrap()).collect::<Vec<std::net::IpAddr>>();
@@ -1235,34 +1115,6 @@ mod tests {
         assert!(!loopback_only(&[]));
     }
 
-    #[test]
-    fn bind_addresses_parse_and_dedupe() {
-        let got = parse_bind_addrs(&["10.230.1.14".into(), " 10.230.1.14 ".into(), "[::1]".into()])
-            .unwrap();
-        assert_eq!(got.len(), 2);
-        assert!(parse_bind_addrs(&[]).unwrap().is_empty());
-        assert!(parse_bind_addrs(&["10.0.0.1:47297".into()]).is_err());
-        assert!(parse_bind_addrs(&["not an ip".into()]).is_err());
-    }
-
-    #[test]
-    fn relay_none_and_the_flag_switch_relays_off_and_a_typo_is_an_error() {
-        assert!(!relays_disabled(false, None).unwrap());
-        assert!(relays_disabled(true, None).unwrap());
-        assert!(relays_disabled(false, Some("none")).unwrap());
-        assert!(relays_disabled(false, Some("NONE")).unwrap());
-        assert!(relays_disabled(false, Some("nope")).is_err());
-    }
-
-    #[test]
-    fn bad_relay_urls_are_refused() {
-        assert!(parse_relay_urls(&["not a url".to_string()]).is_err());
-        let e = parse_relay_urls(&["ftp://relay.example.org".to_string()]).unwrap_err();
-        assert!(e.to_string().contains("http or https"), "{e}");
-    }
-    use super::*;
-
-    /// One test mutates XDG_DATA_HOME; keep the mutations in a single test.
     #[test]
     fn server_id_is_stable_and_lock_is_exclusive() {
         let tmp = tempfile::tempdir().unwrap();

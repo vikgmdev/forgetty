@@ -4,10 +4,32 @@
 //! deserializing it into a `Config` struct, and writing updated
 //! configuration back to disk.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
+use crate::remote;
 use crate::schema::Config;
 use forgetty_core::Result;
+
+/// The `--config-file` of this process, if any (see [`set_config_path`]).
+static CONFIG_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// Record the config file this process uses (`--config-file`), so that every
+/// load and save that names no path (the settings view, a reload) uses the same
+/// file and never another one. `None`: the default location.
+pub fn set_config_path(path: Option<PathBuf>) {
+    *CONFIG_PATH.lock().unwrap_or_else(|e| e.into_inner()) = path;
+}
+
+/// The config file of this process: the one given to [`set_config_path`], or
+/// `~/.config/forgetty/config.toml`.
+pub fn config_file_path() -> PathBuf {
+    CONFIG_PATH
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .unwrap_or_else(|| forgetty_core::platform::config_dir().join("config.toml"))
+}
 
 /// Loads the configuration from the given path, or from the default location.
 ///
@@ -19,10 +41,10 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
     let config_path = match path {
         Some(p) => p.to_path_buf(),
         None => {
-            let default_path = forgetty_core::platform::config_dir().join("config.toml");
+            let default_path = config_file_path();
             if !default_path.exists() {
                 tracing::info!("No config file found, using defaults");
-                return Ok(Config::default());
+                return Ok(Config { source: Some(default_path), ..Config::default() });
             }
             default_path
         }
@@ -66,21 +88,15 @@ enum Kind {
     BindAddrs,
 }
 
-fn is_url(s: &str) -> bool {
-    let rest = s.strip_prefix("https://").or_else(|| s.strip_prefix("http://"));
-    rest.is_some_and(|r| !r.is_empty() && !r.contains(char::is_whitespace))
-}
-
 impl Kind {
     /// Would `v` be a valid value of the setting? A string is accepted for the
-    /// list settings too: `bind_addr = "10.0.0.1"` is a plausible slip.
+    /// list settings too: `bind_addr = "10.0.0.1"` is a plausible slip. The
+    /// value parsers are the server's (`crate::remote`): trimmed, any case.
     fn fits(self, v: &toml::Value) -> bool {
         let one = |s: &str| match self {
-            Kind::Relay => s == "none" || is_url(s),
-            Kind::RelayUrls => is_url(s),
-            Kind::BindAddrs => {
-                s.trim().trim_matches(['[', ']']).parse::<std::net::IpAddr>().is_ok()
-            }
+            Kind::Relay => remote::is_relay_none(s) || remote::parse_relay_url(s).is_ok(),
+            Kind::RelayUrls => remote::parse_relay_url(s).is_ok(),
+            Kind::BindAddrs => remote::parse_bind_addr(s).is_ok(),
         };
         match (self, v) {
             (_, toml::Value::String(s)) => one(s),
@@ -114,8 +130,9 @@ fn check_unknown_keys(config: &Config, text: &str, path: &Path) -> Result<()> {
             Some(n) => format!("{}:{n}", path.display()),
             None => path.display().to_string(),
         };
-        let near =
-            GUARDED_KEYS.iter().find(|(g, kind)| edit_distance(key, g) <= 2 && kind.fits(value));
+        let near = GUARDED_KEYS
+            .iter()
+            .find(|(g, kind)| edit_distance(&key.to_ascii_lowercase(), g) <= 2 && kind.fits(value));
         if let Some((near, _)) = near {
             return Err(forgetty_core::ForgettyError::Config(format!(
                 "{at}: unknown key `{key}`, did you mean `{near}`? Not starting: the setting \
@@ -155,12 +172,12 @@ fn unloadable_on_disk(path: &Path) -> Option<String> {
     }
 }
 
-/// Returns the current `config.toml` contents as a raw string.
+/// Returns the current contents of the config file ([`config_file_path`]) as a
+/// raw string.
 ///
 /// Returns an empty string if the file does not exist yet.
 pub fn load_config_as_text() -> String {
-    let config_path = forgetty_core::platform::config_dir().join("config.toml");
-    std::fs::read_to_string(config_path).unwrap_or_default()
+    std::fs::read_to_string(config_file_path()).unwrap_or_default()
 }
 
 /// Parse a TOML string as `Config`, save it to the default config file, and
@@ -173,7 +190,8 @@ pub fn parse_and_save_config(toml_text: &str) -> Result<Config> {
 /// config file), then return the parsed value.
 ///
 /// The new text is validated as `load_config` would: it must parse, and it
-/// must pass the unknown-key check (a misspelt `relay` is an error). A text
+/// must pass the unknown-key check (a misspelt `relay` is an error) and the
+/// server's check of the remote settings (`validate_remote_settings`). A text
 /// that passes is written even when the file on disk does not load: this is
 /// how a broken config is repaired in the text editor.
 pub fn parse_and_save_config_at(toml_text: &str, path: Option<&Path>) -> Result<Config> {
@@ -182,6 +200,11 @@ pub fn parse_and_save_config_at(toml_text: &str, path: Option<&Path>) -> Result<
         forgetty_core::ForgettyError::Config(format!("Failed to parse config: {}", e))
     })?;
     check_unknown_keys(&config, toml_text, &config_path)?;
+    // The server refuses a config whose remote settings are invalid (exit 78):
+    // do not write one. No command-line overrides here: the file must stand
+    // on its own.
+    remote::validate_remote_settings(&config, &remote::RemoteOverrides::default())
+        .map_err(|e| forgetty_core::ForgettyError::Config(e.to_string()))?;
     config.source = Some(config_path.clone());
     write_config(&config, &config_path)?;
     Ok(config)
@@ -191,7 +214,7 @@ pub fn parse_and_save_config_at(toml_text: &str, path: Option<&Path>) -> Result<
 fn target_path(path: Option<&Path>) -> std::path::PathBuf {
     match path {
         Some(p) => p.to_path_buf(),
-        None => forgetty_core::platform::config_dir().join("config.toml"),
+        None => config_file_path(),
     }
 }
 
@@ -334,9 +357,12 @@ mod tests {
         assert!(save_config(&c).is_err());
         // ... a text that is still bad is refused too, and writes nothing ...
         assert!(parse_and_save_config_at("rellay = \"none\"\n", Some(&p)).is_err());
+        assert!(parse_and_save_config_at("relay = \"nne\"\n", Some(&p)).is_err());
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "relay = \"none\n");
         // ... and a valid text repairs the file.
-        let fixed = parse_and_save_config_at("relay = \"none\"\n", Some(&p)).unwrap();
+        let fixed =
+            parse_and_save_config_at("relay = \"none\"\nbind_addrs = [\"10.0.0.1\"]\n", Some(&p))
+                .unwrap();
         assert_eq!(fixed.relay.as_deref(), Some("none"));
         assert_eq!(load_config(Some(&p)).unwrap().relay.as_deref(), Some("none"));
         // Now ordinary saves work again, to the same file.
@@ -360,6 +386,30 @@ mod tests {
         // A broken --config-file blocks the save to that file.
         std::fs::write(&p, "font_size = \n").unwrap();
         assert!(save_config(&c).is_err());
+    }
+
+    /// The only test that sets the process-wide config path.
+    #[test]
+    fn a_config_path_set_for_the_process_is_the_one_every_call_uses() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("elsewhere.toml");
+        set_config_path(Some(p.clone()));
+        assert_eq!(config_file_path(), p);
+        // No file yet: defaults, whose save goes to that file.
+        let c = load_config(None).unwrap();
+        assert_eq!(c.source.as_deref(), Some(p.as_path()));
+        assert_eq!(load_config_as_text(), "");
+        parse_and_save_config("font_size = 17.0\n").unwrap();
+        assert!(load_config_as_text().contains("font_size = 17"));
+        assert_eq!(load_config(None).unwrap().font_size, 17.0);
+        // A load that fails leaves a default config whose save still names the
+        // same file (what the apps do), and the guard refuses it.
+        std::fs::write(&p, "font_size = \n").unwrap();
+        assert!(load_config(None).is_err());
+        let fallback = Config { source: Some(config_file_path()), ..Config::default() };
+        assert!(save_config(&fallback).is_err());
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "font_size = \n");
+        set_config_path(None);
     }
 
     #[test]

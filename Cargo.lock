@@ -1194,10 +1194,12 @@ version = "0.1.0-beta"
 dependencies = [
  "dirs",
  "forgetty-core",
+ "forgetty-proto",
  "serde",
  "tempfile",
  "toml 0.8.2",
  "tracing",
+ "url",
 ]
 
 [[package]]

@@ -373,6 +373,9 @@ fn run_server_once(args: &[&str], config: Option<&str>) -> (Option<i32>, String)
 /// `--no-relay` plus relay URL conflict.
 #[test]
 fn every_configuration_error_exits_78() {
+    // The settings editor refuses the same cases as config text: see
+    // `every_server_configuration_error_is_refused_by_the_editor_too` in
+    // crates/forgetty-config/src/remote.rs. Keep the two lists in step.
     if !real_only() {
         return;
     }

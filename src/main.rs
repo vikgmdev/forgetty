@@ -91,6 +91,9 @@ fn main() {
         })
     });
 
+    // Every load and save without a path (the settings view) uses this file.
+    forgetty_config::set_config_path(config_path.clone());
+
     let config = match load_config(config_path.as_deref()) {
         Ok(c) => c,
         Err(e) => {
@@ -102,7 +105,11 @@ fn main() {
                 "Failed to load config, using defaults. config.toml is not overwritten \
                  until it loads: {e}"
             );
-            forgetty_config::Config::default()
+            // `source` keeps a save on this file, never on another one.
+            forgetty_config::Config {
+                source: Some(forgetty_config::config_file_path()),
+                ..forgetty_config::Config::default()
+            }
         }
     };
 
