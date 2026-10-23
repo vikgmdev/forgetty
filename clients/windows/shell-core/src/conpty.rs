@@ -82,6 +82,11 @@ impl LocalConPty {
                     match reader.read(&mut buf) {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
+                            let kept = strip_win32_input_mode(&mut buf[..n]);
+                            if kept == 0 {
+                                continue;
+                            }
+                            let n = kept;
                             // A bad sequence must never kill the reader: log and drop.
                             let chunk = &buf[..n];
                             if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| on_output(chunk))).is_err() {
@@ -163,6 +168,11 @@ impl LocalConPty {
         self.exited.load(Ordering::SeqCst)
     }
 
+    /// Process id of the shell, `None` once it is gone.
+    pub fn pid(&self) -> Option<u32> {
+        self.child.lock().ok().and_then(|c| c.process_id())
+    }
+
     /// Poll the child directly. Used by tests to confirm a kill took effect.
     pub fn try_exited(&self) -> bool {
         if self.has_exited() {
@@ -172,5 +182,44 @@ impl LocalConPty {
             Ok(mut c) => matches!(c.try_wait(), Ok(Some(_))),
             Err(_) => true,
         }
+    }
+}
+
+/// ConPTY starts its output with `CSI ? 9001 h` (win32-input-mode). The terminal never sends
+/// win32 key records, and libghostty-vt logs "unimplemented mode: 9001" for it, so the
+/// sequence is cut from the stream here. It arrives whole in the first read; one split
+/// across reads is not held back (holding a lone ESC could stall real output). Returns the
+/// new length of `buf`.
+fn strip_win32_input_mode(buf: &mut [u8]) -> usize {
+    const SEQ: [&[u8]; 2] = [b"\x1b[?9001h", b"\x1b[?9001l"];
+    let (mut r, mut w) = (0, 0);
+    while r < buf.len() {
+        if buf[r] == 0x1b && SEQ.iter().any(|s| buf[r..].starts_with(s)) {
+            r += SEQ[0].len();
+        } else {
+            buf[w] = buf[r];
+            w += 1;
+            r += 1;
+        }
+    }
+    w
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_win32_input_mode;
+
+    fn strip(input: &[u8]) -> Vec<u8> {
+        let mut v = input.to_vec();
+        let n = strip_win32_input_mode(&mut v);
+        v.truncate(n);
+        v
+    }
+
+    #[test]
+    fn cuts_mode_9001_only() {
+        assert_eq!(strip(b"\x1b[?9001h\x1b[?25lhi\x1b[?9001l!"), b"\x1b[?25lhi!");
+        assert_eq!(strip(b"\x1b[?9001h\x1b[?9001h"), b"");
+        assert_eq!(strip(b"\x1b[?90010h plain \x1b[?9001"), b"\x1b[?90010h plain \x1b[?9001");
     }
 }

@@ -2,9 +2,15 @@
 //! palette) over a `SessionBackend`, terminal panes on libghostty-vt.
 //! `--smoke` runs the headless CI gate.
 
+// Release builds are GUI-subsystem: no console of their own, so Windows (and a default
+// terminal such as Windows Terminal) opens no extra window. `console::attach_parent` gives
+// stdout and stderr back when a console started us. Debug builds keep the console.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod chrome;
 mod clipboard;
 mod config;
+mod console;
 mod element;
 mod encoder;
 mod lineedit;
@@ -27,6 +33,7 @@ use config::{Backdrop, Config};
 use shell::AppShell;
 
 fn main() {
+    console::attach_parent();
     let start = Instant::now();
     let smoke = std::env::args().any(|a| a == "--smoke");
 

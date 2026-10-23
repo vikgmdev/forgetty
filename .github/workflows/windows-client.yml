@@ -58,7 +58,7 @@ jobs:
         working-directory: clients/windows
         run: |
           # The ConPTY tests in shell-core's local module are covered by the smoke.
-          cargo test --release -p forgetty-shell-core --lib -- notify:: layout:: keys:: osc:: osc52:: fuzzy:: update::
+          cargo test --release -p forgetty-shell-core --lib -- conpty:: notify:: layout:: keys:: osc:: osc52:: fuzzy:: update::
           cargo test --release -p forgetty-remote
 
       - name: Turn on the Japanese and Chinese input methods for the smoke
@@ -77,8 +77,11 @@ jobs:
         working-directory: clients/windows/target/release
         run: |
           Get-ChildItem *.exe, *.dll | Format-Table Name, Length
-          .\forgetty-win.exe --smoke | Tee-Object -FilePath smoke.json
-          $code = $LASTEXITCODE
+          # The release exe is GUI-subsystem: wait for it explicitly. It attaches to this console.
+          $p = Start-Process .\forgetty-win.exe -ArgumentList '--smoke' -Wait -PassThru -RedirectStandardOutput smoke.json -RedirectStandardError smoke.err
+          Get-Content smoke.json
+          Get-Content smoke.err
+          $code = $p.ExitCode
           Write-Host "forgetty-win --smoke exit code: $code"
           exit $code
 
@@ -101,6 +104,7 @@ jobs:
             clients/windows/target/release/*.dll
             clients/windows/target/release/v2-test-server.exe
             clients/windows/target/release/smoke.json
+            clients/windows/target/release/smoke.err
 
   # The real Linux server, built here, for the WSL end-to-end test below.
   linux-server:
@@ -198,8 +202,10 @@ jobs:
         working-directory: win
         run: |
           $env:FORGETTY_REAL_WSL_DISTRO = "Ubuntu-24.04"
-          .\forgetty-win.exe --smoke | Tee-Object -FilePath real-smoke.json
-          $code = $LASTEXITCODE
+          $p = Start-Process .\forgetty-win.exe -ArgumentList '--smoke' -Wait -PassThru -RedirectStandardOutput real-smoke.json -RedirectStandardError real-smoke.err
+          Get-Content real-smoke.json
+          Get-Content real-smoke.err
+          $code = $p.ExitCode
           Write-Host "forgetty-win real smoke exit code: $code"
           exit $code
 

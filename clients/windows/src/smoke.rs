@@ -532,6 +532,13 @@ impl ShellSmoke {
                         record("found", json!("spike-ok"));
                         record("time_to_echo_found_ms", json!(ms(now - self.start)));
                         check("echo_found", true);
+                        // The shell lives on the pane's ConPTY: it must not share the console
+                        // that started this exe, and no log line may reach the pane.
+                        let console = crate::console::process_ids();
+                        let shell_pid = self.p1.and_then(|p| self.local.pty(p)).and_then(|p| p.pid());
+                        record("console_attached", json!(!console.is_empty()));
+                        check("shell_not_on_app_console", shell_pid.is_some_and(|pid| !console.contains(&pid)));
+                        check("pane_has_no_log_lines", !rows.iter().any(|r| r.contains("unimplemented mode") || r.contains("warning(")));
                         self.start_probe(v, cr, cc);
                         self.goto(Phase::Keys);
                     }
