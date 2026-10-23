@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use common::{Saved, TestServer, TestServerConfig};
 use forgetty_client::proto::ClientKind;
 use forgetty_client::{
-    AddrCache, AddrCacheSnapshot, CachedAddr, Client, ClientHandle, ClientInfo, ClientOptions,
+    AddrCache, AddrCacheSnapshot, CachedAddr, CachedOther, Client, ClientHandle, ClientInfo, ClientOptions,
     EndpointAddr, PaneItem, PaneStream, SecretKey,
 };
 use uuid::Uuid;
@@ -286,12 +286,12 @@ fn addr_cache_snapshot_round_trips_through_serde() {
     let key = SecretKey::generate(&mut rand::rng());
     let addr: std::net::SocketAddr = "203.0.113.7:47297".parse().unwrap();
     let cache = AddrCache::new();
-    cache.insert(key.public(), addr);
+    cache.insert(key.public(), addr, 1);
     let json = serde_json::to_string(&cache.snapshot()).unwrap();
     let back: AddrCacheSnapshot = serde_json::from_str(&json).unwrap();
-    assert_eq!(AddrCache::from_snapshot(&back).get(key.public()), Some(addr));
+    assert_eq!(AddrCache::from_snapshot(&back).get(key.public(), 1), Some(addr));
     // A bad entry is skipped, not fatal.
-    let junk = AddrCacheSnapshot { entries: vec![CachedAddr { node_id: "garbage".into(), addr, others: vec![] }] };
+    let junk = AddrCacheSnapshot { entries: vec![CachedAddr::global("garbage", addr)] };
     assert!(AddrCache::from_snapshot(&junk).snapshot().entries.is_empty());
 }
 
@@ -316,7 +316,7 @@ async fn server_restart_on_the_cached_port_reconnects_every_time() {
 
     // What the app would have persisted from an earlier run.
     let cache = AddrCache::from_snapshot(&AddrCacheSnapshot {
-        entries: vec![CachedAddr { node_id: node_id.to_string(), addr: first.udp_addr(), others: vec![] }],
+        entries: vec![CachedAddr::global(node_id.to_string(), first.udp_addr())],
     });
     let opts = ClientOptions { addr_cache: cache, ..Default::default() };
     let info = ClientInfo::new(Uuid::new_v4(), ClientKind::Cli, "restart", "0");
@@ -445,7 +445,7 @@ async fn network_changed_aborts_a_hung_dial_and_connects_at_once() {
     let saved: Saved = first.stop_for_restart().await;
 
     let cache = AddrCache::from_snapshot(&AddrCacheSnapshot {
-        entries: vec![CachedAddr { node_id: node_id.to_string(), addr, others: vec![] }],
+        entries: vec![CachedAddr::global(node_id.to_string(), addr)],
     });
     let opts = ClientOptions { addr_cache: cache, ..Default::default() };
     let info = ClientInfo::new(Uuid::new_v4(), ClientKind::Cli, "net-change", "0");
@@ -1142,7 +1142,11 @@ async fn a_cached_address_list_with_an_unreachable_family_dials_fast() {
         entries: vec![CachedAddr {
             node_id: node_id.to_string(),
             addr: v6,
-            others: vec![blackhole, good],
+            net: None,
+            others: vec![
+                CachedOther { addr: blackhole, net: None },
+                CachedOther { addr: good, net: None },
+            ],
         }],
     });
     let key = SecretKey::generate(&mut rand::rng());
@@ -1202,6 +1206,197 @@ async fn the_fast_window_does_not_redial_a_healthy_link_with_300_ms_delay() {
     assert!(h.state().is_connected());
     assert_eq!(h.dial_starts_for_tests(), dials, "the fast window redialed a healthy link");
     assert_eq!(a.handshakes(), shakes);
+    h.close().await;
+    a.shutdown().await;
+}
+
+// ---- Round 21b: wrong cached address, busy link, flapping reports -------
+
+/// The cache of server A holds the address of server B (a private address of
+/// another network that is now somebody else's, or a public one that was
+/// reassigned). Both legs of the dial share iroh's address book, and the
+/// certificate of B fails the handshake. A must still connect, soon, and B's
+/// address must be gone from the cache.
+async fn wrong_cached_address_case(a_frozen_for: Duration) {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
+    let a = TestServer::start(TestServerConfig { own_runtime: true, ..Default::default() }).await;
+    let b = TestServer::start(TestServerConfig::default()).await;
+    let key = SecretKey::generate(&mut rand::rng());
+    a.authorize(key.public());
+    let bad = b.udp_addr();
+    let cache = AddrCache::from_snapshot(&AddrCacheSnapshot {
+        entries: vec![CachedAddr::global(a.node_id().to_string(), bad)],
+    });
+    assert_eq!(cache.get_everywhere(a.node_id()), vec![bad]);
+    let info = ClientInfo::new(Uuid::new_v4(), ClientKind::Cli, "wrong-addr", "0");
+    let opts = ClientOptions { addr_cache: cache.clone(), ..Default::default() };
+    if !a_frozen_for.is_zero() {
+        // A hangs, so the wrong server B is the first to answer.
+        a.freeze(a_frozen_for);
+    }
+    let t0 = Instant::now();
+    let h = tokio::time::timeout(
+        Duration::from_secs(10),
+        Client::connect_with(a.addr(), key, info, opts),
+    )
+    .await
+    .expect("connect timed out")
+    .expect("connect failed");
+    let took = t0.elapsed();
+    println!("connect with the address of another server in the cache: {took:?}");
+    assert!(took < Duration::from_millis(3000), "connect took {took:?}");
+    assert!(h.state().is_connected());
+    wait_until("the other server's address leaves the cache", Duration::from_secs(3), || {
+        !cache.get_everywhere(a.node_id()).contains(&bad)
+    })
+    .await;
+    // The connection taught the cache the addresses of A: the port is A's
+    // (iroh may select an interface address in place of the loopback one).
+    let port = a.udp_addr().port();
+    wait_until("an address of A in the cache", Duration::from_secs(3), || {
+        cache.get_everywhere(a.node_id()).iter().any(|x| x.port() == port)
+    })
+    .await;
+    assert!(
+        !cache.get_everywhere(a.node_id()).contains(&bad),
+        "the address of the other server came back: {:?}",
+        cache.get_everywhere(a.node_id())
+    );
+    h.close().await;
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+/// The wrong address answers after the right one connected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cached_address_of_another_server_is_evicted_when_the_right_path_wins() {
+    wrong_cached_address_case(Duration::ZERO).await;
+}
+
+/// The wrong address answers first: the failed leg ends the dial attempt
+/// (the endpoint is replaced and the redial leaves the cache alone) or the
+/// slow right leg wins; either way the server connects soon.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cached_address_of_another_server_is_evicted_when_the_wrong_path_answers_first() {
+    wrong_cached_address_case(Duration::from_millis(600)).await;
+}
+
+/// A resume with four busy panes on a link that holds its Pongs behind the
+/// data (and 300 ms of delay): in the fast window the data it receives shows
+/// that the link lives, so there is no redial.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_fast_window_does_not_kill_a_busy_resume_that_holds_its_pongs() {
+    if !common::mock_only() {
+        return;
+    }
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
+    let a = TestServer::start(TestServerConfig {
+        own_runtime: true,
+        pong_delay: Duration::from_millis(300),
+        chunk: 4096,
+        ..Default::default()
+    })
+    .await;
+    let panes: Vec<Uuid> = (0..4).map(|_| a.add_pane()).collect();
+    let h = connect_to(a.addr()).await;
+    let mut streams = Vec::new();
+    for p in &panes {
+        streams.push(h.attach_pane(*p).await.expect("attach"));
+    }
+    // Let the old link measure a round trip of 300 ms.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+
+    // The network changes. The new link holds its Pongs for 2.5 s, and the
+    // panes have 3 MB each waiting.
+    let before = a.handshakes();
+    h.network_changed().await;
+    a.set_pong_hold(Duration::from_millis(2500));
+    for p in &panes {
+        a.append(*p, &vec![b'x'; 3 * 1024 * 1024]);
+    }
+    h.reconnect_now();
+    wait_until("the resume", Duration::from_secs(10), || {
+        a.handshakes() > before && h.state().is_connected()
+    })
+    .await;
+    let (dials, shakes) = (h.dial_starts_for_tests(), a.handshakes());
+
+    // Four slow consumers: 4 KiB per 5 ms each.
+    let readers: Vec<_> = streams
+        .into_iter()
+        .map(|mut s| {
+            tokio::spawn(async move {
+                let mut got = 0usize;
+                while got < 3 * 1024 * 1024 {
+                    match s.next().await.expect("stream ended") {
+                        PaneItem::Data { bytes, .. } => got += bytes.len(),
+                        PaneItem::Reset { .. } => {}
+                        other => panic!("unexpected item {other:?}"),
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                got
+            })
+        })
+        .collect();
+    for r in readers {
+        let got = tokio::time::timeout(Duration::from_secs(30), r).await.expect("reader timed out");
+        assert!(got.unwrap() >= 3 * 1024 * 1024);
+    }
+    assert_eq!(h.dial_starts_for_tests(), dials, "the fast window redialed a busy link");
+    assert_eq!(a.handshakes(), shakes);
+    assert!(h.state().is_connected());
+    h.close().await;
+    a.shutdown().await;
+}
+
+/// Reports of the network that flap (a probe that failed once) cause no
+/// redial, and neither does a change that holds: it only asks for a Ping.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn flapping_network_reports_cause_no_redial() {
+    let a = TestServer::start(TestServerConfig { own_runtime: true, ..Default::default() }).await;
+    let h = connect_to(a.addr()).await;
+    let (dials, shakes) = (h.dial_starts_for_tests(), a.handshakes());
+    h.feed_link_report_for_tests(true, 1); // the baseline
+    for i in 0..60 {
+        h.feed_link_report_for_tests(i % 2 == 0, 1);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // A change that holds for two reports.
+    h.feed_link_report_for_tests(false, 9);
+    h.feed_link_report_for_tests(false, 9);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(h.state().is_connected());
+    assert_eq!(h.dial_starts_for_tests(), dials, "a report caused a dial");
+    assert_eq!(a.handshakes(), shakes);
+    h.close().await;
+    a.shutdown().await;
+}
+
+/// The options prune the cache: a server that is not paired any more leaves
+/// nothing behind.
+#[tokio::test]
+async fn an_unpaired_server_is_dropped_from_the_cache_at_connect() {
+    let a = TestServer::start(TestServerConfig::default()).await;
+    let gone = SecretKey::generate(&mut rand::rng()).public();
+    let cache = AddrCache::new();
+    cache.insert(gone, "203.0.113.5:47297".parse().unwrap(), 1);
+    let key = SecretKey::generate(&mut rand::rng());
+    a.authorize(key.public());
+    let info = ClientInfo::new(Uuid::new_v4(), ClientKind::Cli, "prune", "0");
+    let opts = ClientOptions {
+        addr_cache: cache.clone(),
+        paired_servers: Some(vec![a.node_id()]),
+        ..Default::default()
+    };
+    let h = Client::connect_with(a.addr(), key, info, opts).await.expect("connect");
+    assert!(cache.get_everywhere(gone).is_empty());
     h.close().await;
     a.shutdown().await;
 }

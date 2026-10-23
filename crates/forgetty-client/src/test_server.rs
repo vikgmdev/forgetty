@@ -257,6 +257,9 @@ struct State {
     hold_acks: AtomicBool,
     /// While set and in the future, no `Pong` goes out (see [`TestServer::freeze`]).
     frozen_until: Mutex<Option<std::time::Instant>>,
+    /// Every `Pong` waits until this long after the `Hello` of its
+    /// connection (zero: no wait). See [`TestServer::set_pong_hold`].
+    pong_hold: Mutex<Duration>,
     server_id: Uuid,
     /// New for each start of the server, like the real one's.
     boot_id: Uuid,
@@ -333,6 +336,7 @@ impl TestServer {
             dedup_drops: AtomicU64::new(0),
             hold_acks: AtomicBool::new(false),
             frozen_until: Mutex::new(None),
+            pong_hold: Mutex::new(Duration::ZERO),
             server_id: Uuid::new_v4(),
             boot_id: Uuid::new_v4(),
             panes: Mutex::new(HashMap::new()),
@@ -578,6 +582,13 @@ impl TestServer {
         }
     }
 
+    /// Hold every `Pong` until `hold` after the `Hello` of its connection (a
+    /// `Pong` that waits behind a resume's data on a busy link). Applies to
+    /// connections that start after the call and to the live ones.
+    pub fn set_pong_hold(&self, hold: Duration) {
+        *lock(&self.state.pong_hold) = hold;
+    }
+
     /// Stop the server for `duration` without closing anything: it neither
     /// reads nor writes a packet, like a dead network or a hung process. Needs
     /// `own_runtime`. Queued packets are handled when it thaws.
@@ -791,6 +802,7 @@ async fn handle_rpc(conn: Connection, state: Arc<State>) {
     }
 
     // Control request loop, in this task.
+    let hello_at = std::time::Instant::now();
     let mut streams: HashMap<Uuid, tokio::task::AbortHandle> = HashMap::new();
     let mut events_subscribed = false;
     let mut event_rx = state.events.subscribe();
@@ -809,8 +821,12 @@ async fn handle_rpc(conn: Connection, state: Arc<State>) {
                     };
                     // A frozen server answers nothing, and a Ping that gets
                     // through a thread the freeze did not hold waits for the thaw.
+                    let hold = *lock(&state.pong_hold);
                     let thaw = (*lock(&state.frozen_until))
-                        .filter(|t| *t > std::time::Instant::now());
+                        .into_iter()
+                        .chain((!hold.is_zero()).then(|| hello_at + hold))
+                        .filter(|t| *t > std::time::Instant::now())
+                        .max();
                     match thaw {
                         Some(t) => {
                             let tx = out_tx.clone();

@@ -6,7 +6,13 @@ license.workspace = true
 description = "Forgetty protocol v2 client: connect, resume, reconnect, pairing (no UI)"
 
 [features]
-default = []
+default = ["link-watch"]
+# Treat a change of iroh's network report (UDP families, public addresses) as
+# a hint that the link changed: it wakes the liveness check and cuts a backoff
+# sleep. iroh has no public link-change event; this reads the doc-hidden
+# `Endpoint::net_report`, which can move between iroh releases (hence the
+# exact pin of iroh in the workspace). Off: only the app's `network_changed`.
+link-watch = []
 # In-process protocol v2 test server (`forgetty_client::test_server`).
 test-util = []
 

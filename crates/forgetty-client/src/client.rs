@@ -16,6 +16,7 @@
 //! offsets afterwards.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -29,13 +30,16 @@ use forgetty_proto::{
     RECONNECT_BACKOFF_MS,
 };
 use iroh::endpoint::{Connection, ConnectionError, RecvStream, SendStream};
-use iroh::{Endpoint, EndpointAddr, SecretKey, Watcher as _};
+use iroh::{Endpoint, EndpointAddr, SecretKey};
+#[cfg(feature = "link-watch")]
+use iroh::Watcher as _;
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Notify};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::addr_cache::{has_route, usable, AddrCache};
+use crate::addr_cache::{has_route, local_network, usable, AddrCache};
+use crate::link_watch::{Debounce, LinkPrint};
 use crate::config::{transport_config, ClientInfo, ClientOptions};
 use crate::error::ClientError;
 use crate::state::ConnectionState;
@@ -425,17 +429,7 @@ macro_rules! tl {
 /// IPv6. No packet is sent. A device with no network gives the same number
 /// every time.
 fn net_fingerprint() -> u64 {
-    use std::hash::{Hash, Hasher};
-    let local = |bind: &str, to: &str| -> Option<std::net::IpAddr> {
-        let sock = std::net::UdpSocket::bind(bind).ok()?;
-        sock.connect(to).ok()?;
-        sock.local_addr().ok().map(|a| a.ip())
-    };
-    let v4 = local("0.0.0.0:0", "192.0.2.1:9");
-    let v6 = local("[::]:0", "[2001:db8::1]:9");
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    (v4, v6).hash(&mut h);
-    h.finish()
+    local_network()
 }
 
 /// See `Shared::immediate`.
@@ -533,6 +527,22 @@ pub(crate) struct Shared {
     srtt_us: AtomicU64,
     /// Until when the link is watched fast (see [`FAST_WINDOW`]).
     fast_until: Mutex<Option<Instant>>,
+    /// The next dial leaves the address cache alone (set by an identity
+    /// failure: the cache held an address of someone else).
+    skip_cache: AtomicBool,
+    /// An identity failure left a wrong address in iroh's address book: the
+    /// supervisor replaces the endpoint before its next dial.
+    book_dirty: Arc<AtomicBool>,
+    /// The direct addresses of the pairing payload answered with another
+    /// identity: dial its relays only.
+    server_ips_bad: AtomicBool,
+    /// Base of `rx_at`.
+    epoch: Instant,
+    /// When the last frame or stream byte from the server arrived, in ms
+    /// since `epoch`.
+    rx_at: AtomicU64,
+    /// Debounce of the network reports (see [`crate::link_watch`]).
+    link_debounce: Mutex<Debounce>,
     next_nonce: AtomicU64,
     /// Random per `spawn`: the `Hello.input_epoch`.
     input_epoch: Uuid,
@@ -591,6 +601,14 @@ impl Client {
         info: ClientInfo,
         opts: ClientOptions,
     ) -> Result<ClientHandle, ClientError> {
+        if let Some(paired) = &opts.paired_servers {
+            let mut keep = paired.clone();
+            keep.push(server.id);
+            let gone = opts.addr_cache.retain_servers(&keep);
+            if gone > 0 {
+                debug!("client: {gone} unpaired server(s) dropped from the address cache");
+            }
+        }
         let endpoint =
             bind_endpoint(&opts, &server, identity.clone()).await.map_err(ClientError::Setup)?;
 
@@ -650,6 +668,12 @@ impl Client {
             last_dial_start: Mutex::new(None),
             srtt_us: AtomicU64::new(0),
             fast_until: Mutex::new(None),
+            skip_cache: AtomicBool::new(false),
+            book_dirty: Arc::new(AtomicBool::new(false)),
+            server_ips_bad: AtomicBool::new(false),
+            epoch: Instant::now(),
+            rx_at: AtomicU64::new(0),
+            link_debounce: Mutex::new(Debounce::default()),
             next_nonce: AtomicU64::new(1),
             input_epoch: Uuid::new_v4(),
         });
@@ -664,6 +688,36 @@ impl Shared {
     /// The endpoint dials use. `None` only while it is being replaced.
     fn ep(&self) -> Option<Ep> {
         lock(&self.endpoint).clone()
+    }
+
+    /// The fingerprint of the network we are on (a test can set one).
+    fn current_net(&self) -> u64 {
+        lock(&self.net_fp_test).unwrap_or_else(local_network)
+    }
+
+    /// Something arrived from the server: a control frame, a pane frame.
+    fn touch_rx(&self) {
+        let ms = u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.rx_at.store(ms, Ordering::Relaxed);
+    }
+
+    /// How long nothing arrived from the server.
+    fn rx_idle(&self) -> Duration {
+        let ms = u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
+        Duration::from_millis(ms.saturating_sub(self.rx_at.load(Ordering::Relaxed)))
+    }
+
+    /// The pairing payload address. When its direct addresses turned out to
+    /// belong to someone else, only its relays are left.
+    fn server_target(&self) -> EndpointAddr {
+        if self.server_ips_bad.load(Ordering::SeqCst) && self.server.relay_urls().next().is_some() {
+            let mut t = EndpointAddr::new(self.server.id);
+            for r in self.server.relay_urls() {
+                t = t.with_relay_url(r.clone());
+            }
+            return t;
+        }
+        self.server.clone()
     }
 }
 
@@ -1100,6 +1154,15 @@ impl ClientHandle {
         lock(&self.shared().sleeping_since).map(|t| t.elapsed())
     }
 
+    /// Test hook: feed the debounce the way the network report watcher does.
+    /// `udp_v6` and the last byte of a public IPv4 address make the print.
+    #[doc(hidden)]
+    pub fn feed_link_report_for_tests(&self, udp_v6: bool, ip_last: u8) {
+        let print: LinkPrint =
+            (true, udp_v6, Some(std::net::IpAddr::from([203, 0, 113, ip_last])), None);
+        link_report(self.shared(), print);
+    }
+
     /// Test hook: dials the supervisor started so far.
     #[doc(hidden)]
     pub fn dial_starts_for_tests(&self) -> u64 {
@@ -1406,6 +1469,21 @@ fn attach_params(link: &Link, pane: &PaneShared) -> Result<Value, ClientError> {
 enum DialError {
     Transient(String),
     Fatal(String),
+    /// The peer at an address is not the server (wrong node id, certificate
+    /// mismatch): the address belongs to someone else.
+    Identity(String),
+}
+
+/// Does a connect error say the peer is not the one asked for? The text is
+/// all iroh 0.97 gives on this path: a TLS `invalid peer certificate` alert
+/// (the key in the certificate is not the node id), or a wrong remote id.
+fn is_identity_failure(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("peer certificate")
+        || m.contains("unknownissuer")
+        || m.contains("bad certificate")
+        || m.contains("remote endpoint id")
+        || m.contains("remote id")
 }
 
 struct Established {
@@ -1454,6 +1532,9 @@ async fn supervise(shared: Arc<Shared>) {
     let mut attempt_no = 0u64;
     let mut bind_failures = 0u32;
     let mut watched_gen: Option<u64> = None;
+    // Identity failures in a row: the first earns a clean endpoint and an
+    // immediate redial without the cache, the next ones the normal ladder.
+    let mut identity_streak = 0u32;
     // Redial bucket and the streak of short sessions (see MIN_HEALTHY_SESSION).
     let mut tokens = REDIAL_BURST;
     let mut refilled = Instant::now();
@@ -1468,7 +1549,9 @@ async fn supervise(shared: Arc<Shared>) {
         // dialing again. Only if nothing connected since, and the old endpoint
         // is closed first. A failed bind is tried again after a short wait.
         let want = shared.replace_for.load(Ordering::SeqCst);
-        if want == shared.connected_count.load(Ordering::SeqCst) {
+        if want == shared.connected_count.load(Ordering::SeqCst)
+            || shared.book_dirty.swap(false, Ordering::SeqCst)
+        {
             match shared.replace_endpoint().await {
                 Ok(()) => {
                     shared.replace_for.store(u64::MAX, Ordering::SeqCst);
@@ -1541,6 +1624,7 @@ async fn supervise(shared: Arc<Shared>) {
                 let started = Instant::now();
                 shared.connected_count.fetch_add(1, Ordering::SeqCst);
                 shared.replace_for.store(u64::MAX, Ordering::SeqCst);
+                identity_streak = 0;
                 let (end, resumed) = run_session(&shared, est, &mut shutdown).await;
                 match end {
                     SessionEnd::Shutdown => break,
@@ -1601,6 +1685,25 @@ async fn supervise(shared: Arc<Shared>) {
                 warn!("client: dial failed for good: {reason}");
                 final_state = ConnectionState::Failed(reason);
                 break;
+            }
+            Ok(Err(DialError::Identity(reason))) => {
+                identity_streak += 1;
+                if identity_streak == 1 {
+                    // The cache held an address of someone else and iroh's
+                    // address book now holds it too: a clean endpoint and a
+                    // dial that leaves the cache alone, at once.
+                    info!("client: dial #{attempt_no} reached the wrong peer ({reason}), redialing clean");
+                    shared.skip_cache.store(true, Ordering::SeqCst);
+                    shared.book_dirty.store(true, Ordering::SeqCst);
+                    why = "wrong peer: clean endpoint, no cache";
+                    None
+                } else {
+                    debug!("client: dial #{attempt_no} reached the wrong peer again: {reason}");
+                    let d = backoff(failures);
+                    failures += 1;
+                    why = "wrong peer again: ladder";
+                    Some(d)
+                }
             }
             Ok(Err(DialError::Transient(reason))) => {
                 debug!(
@@ -1724,6 +1827,31 @@ const RETIRE_GRACE: Duration = Duration::from_secs(2);
 struct Attempts {
     set: Option<tokio::task::JoinSet<Result<Connection, String>>>,
     holders: Arc<HolderBin>,
+    watch: Option<IdentityWatch>,
+}
+
+/// What a direct leg tried, so that an attempt that fails after the dial was
+/// won by the other leg still gets its identity failure acted on.
+#[derive(Clone)]
+struct IdentityWatch {
+    cache: AddrCache,
+    server: iroh::EndpointId,
+    tried: Vec<SocketAddr>,
+    net: u64,
+    dirty: Arc<AtomicBool>,
+}
+
+impl IdentityWatch {
+    /// The peer at one of the tried addresses is not the server: forget them.
+    fn failed(&self, why: &str) {
+        let gone = self.cache.evict(self.server, &self.tried, self.net);
+        warn!(
+            "client: a path answered as someone else ({why}); {gone} cached address(es) \
+             forgotten, tried {:?}",
+            self.tried
+        );
+        self.dirty.store(true, Ordering::SeqCst);
+    }
 }
 
 impl Drop for Attempts {
@@ -1733,6 +1861,7 @@ impl Drop for Attempts {
             return;
         }
         let Ok(rt) = tokio::runtime::Handle::try_current() else { return };
+        let watch = self.watch.take();
         let retire = rt.spawn(async move {
             let grace = tokio::time::sleep(RETIRE_GRACE);
             tokio::pin!(grace);
@@ -1740,6 +1869,11 @@ impl Drop for Attempts {
                 tokio::select! {
                     done = set.join_next() => match done {
                         Some(Ok(Ok(conn))) => conn.close(0u32.into(), b"redundant dial"),
+                        Some(Ok(Err(why))) => {
+                            if let Some(w) = watch.as_ref().filter(|_| is_identity_failure(&why)) {
+                                w.failed(&why);
+                            }
+                        }
                         Some(_) => {}
                         None => return,
                     },
@@ -1759,9 +1893,13 @@ async fn connect_probing(
     shared: &Shared,
     ep: &Ep,
     target: EndpointAddr,
+    watch: Option<IdentityWatch>,
 ) -> Result<Connection, String> {
-    let mut attempts =
-        Attempts { set: Some(tokio::task::JoinSet::new()), holders: shared.holders.clone() };
+    let mut attempts = Attempts {
+        set: Some(tokio::task::JoinSet::new()),
+        holders: shared.holders.clone(),
+        watch,
+    };
     let mut n = 0usize;
     loop {
         let endpoint = ep.ep.clone();
@@ -1801,8 +1939,9 @@ async fn dial_to(
     ep: &Ep,
     target: EndpointAddr,
     connect_limit: Option<Duration>,
+    watch: Option<IdentityWatch>,
 ) -> Result<Established, DialError> {
-    let probing = connect_probing(shared, ep, target);
+    let probing = connect_probing(shared, ep, target, watch);
     let conn = match connect_limit {
         Some(limit) => match tokio::time::timeout(limit, probing).await {
             Ok(r) => r,
@@ -1810,7 +1949,13 @@ async fn dial_to(
         },
         None => probing.await,
     }
-    .map_err(DialError::Transient)?;
+    .map_err(|m| {
+        if is_identity_failure(&m) {
+            DialError::Identity(m)
+        } else {
+            DialError::Transient(m)
+        }
+    })?;
     match handshake(shared, &conn).await {
         Ok((send, recv, welcome)) => Ok(Established { conn, send, recv, welcome }),
         Err(e) => {
@@ -1820,17 +1965,48 @@ async fn dial_to(
     }
 }
 
-/// The cached direct address and the addresses of the pairing payload (relay
+/// The cached direct addresses and the addresses of the pairing payload (relay
 /// URLs, direct addresses) are dialed in parallel, not one after the other
 /// (happy eyeballs). The direct connect gets 1 s: a dead cached address (the
 /// network changed) must not hold up the relay. The 1 s covers the QUIC
 /// connect, not the handshake after it. The first handshake wins and
 /// the other dial is dropped. A fatal error ends the race at once.
+///
+/// The cached addresses are the ones valid on this network (see
+/// [`AddrCache::get_all`]) that the system has a route to. If a path answers
+/// as someone else, the addresses this dial tried leave the cache, iroh's
+/// address book is stale (both legs share it) and the endpoint is replaced
+/// before the next dial, which skips the cache ([`DialError::Identity`]).
 async fn dial(shared: &Shared, ep: Ep) -> Result<Established, DialError> {
+    let mut audit = None;
+    let result = dial_legs(shared, ep, &mut audit).await;
+    if let (Ok(est), Some(watch)) = (&result, audit) {
+        spawn_audit(shared, est.conn.to_info(), watch);
+    }
+    result
+}
+
+/// The legs of [`dial`]. `audit` gets the cached addresses the direct leg
+/// tried, if it ran.
+async fn dial_legs(
+    shared: &Shared,
+    ep: Ep,
+    audit: &mut Option<IdentityWatch>,
+) -> Result<Established, DialError> {
     let ep = &ep;
-    let known = shared.opts.addr_cache.get_all(shared.server.id);
+    let net = shared.current_net();
+    let server = shared.server_target();
+    let skip = shared.skip_cache.swap(false, Ordering::SeqCst);
+    let known = if skip {
+        debug!("client: dialing without the address cache");
+        Vec::new()
+    } else {
+        shared.opts.addr_cache.get_all(shared.server.id, net)
+    };
     if known.is_empty() {
-        return dial_to(shared, ep, shared.server.clone(), None).await;
+        return dial_to(shared, ep, server, None, None).await.map_err(|e| {
+            identity_failed(shared, net, &[], e, !shared.server.is_empty())
+        });
     }
     // Only the addresses the local network has a route to: one without (an
     // IPv6 address on a device with no IPv6) would cost the whole direct
@@ -1842,38 +2018,145 @@ async fn dial(shared: &Shared, ep: Ep) -> Result<Established, DialError> {
     }
     if ips.is_empty() {
         if !shared.server.is_empty() {
-            return dial_to(shared, ep, shared.server.clone(), None).await;
+            return dial_to(shared, ep, server, None, None).await.map_err(|e| {
+                identity_failed(shared, net, &[], e, true)
+            });
         }
         ips = known;
     }
     let mut direct = EndpointAddr::new(shared.server.id);
-    for ip in ips {
-        direct = direct.with_ip_addr(ip);
+    for ip in &ips {
+        direct = direct.with_ip_addr(*ip);
     }
+    let watch = IdentityWatch {
+        cache: shared.opts.addr_cache.clone(),
+        server: shared.server.id,
+        tried: ips.clone(),
+        net,
+        dirty: shared.book_dirty.clone(),
+    };
+    *audit = Some(watch.clone());
     if shared.server.is_empty() {
         // Nothing to fall back to: the direct dial has the whole dial timeout.
-        return dial_to(shared, ep, direct, None).await;
+        return dial_to(shared, ep, direct, None, Some(watch))
+            .await
+            .map_err(|e| identity_failed(shared, net, &ips, e, false));
     }
-    let a = dial_to(shared, ep, direct, Some(DIRECT_DIAL_TIMEOUT));
-    let b = dial_to(shared, ep, shared.server.clone(), None);
+    let a = dial_to(shared, ep, direct, Some(DIRECT_DIAL_TIMEOUT), Some(watch));
+    let b = dial_to(shared, ep, server, None, None);
     tokio::pin!(a, b);
     let (mut a_done, mut b_done) = (false, false);
     let mut last = DialError::Transient("no address".into());
+    let mut identity: Option<String> = None;
     while !(a_done && b_done) {
-        let r = tokio::select! {
-            r = &mut a, if !a_done => { a_done = true; r }
-            r = &mut b, if !b_done => { b_done = true; r }
+        let (r, server_leg) = tokio::select! {
+            r = &mut a, if !a_done => { a_done = true; (r, false) }
+            r = &mut b, if !b_done => { b_done = true; (r, true) }
         };
         match r {
             Ok(est) => return Ok(est),
             Err(e @ DialError::Fatal(_)) => return Err(e),
+            Err(e @ DialError::Identity(_)) => {
+                // The other leg may still connect; the stale address book is
+                // cleaned at the next replace either way.
+                if let DialError::Identity(m) = identity_failed(shared, net, &ips, e, server_leg) {
+                    identity = Some(m);
+                }
+            }
             Err(DialError::Transient(m)) => {
                 debug!("client: a dial leg failed: {m}");
                 last = DialError::Transient(m);
             }
         }
     }
-    Err(last)
+    Err(identity.map_or(last, DialError::Identity))
+}
+
+/// How long after a connect the cached addresses that gave no path are
+/// checked, and how long each check may take.
+const AUDIT_DELAY: Duration = Duration::from_millis(500);
+const AUDIT_LIMIT: Duration = Duration::from_millis(1500);
+
+/// A dial won by one leg proves nothing about the cached addresses of the
+/// other: a wrong peer that answers after the right one is ignored by QUIC,
+/// and stays in the cache to win a race later. So the cached addresses that
+/// did not become a path of the connection are tried alone, in the
+/// background, on an endpoint of their own: on the client's endpoint the
+/// address book of the server already holds its good addresses, and the
+/// attempt would connect through them. One that answers as someone else is
+/// forgotten (and the endpoint is replaced before its next dial). One that
+/// does not answer is harmless and stays: it may be right on another day.
+fn spawn_audit(shared: &Shared, conn: iroh::endpoint::ConnectionInfo, watch: IdentityWatch) {
+    let identity = shared.identity.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(AUDIT_DELAY).await;
+        let on_path: Vec<SocketAddr> = conn
+            .paths()
+            .into_iter()
+            .filter_map(|p| match p.remote_addr() {
+                iroh::TransportAddr::Ip(a) => Some(*a),
+                _ => None,
+            })
+            .collect();
+        let unproven: Vec<SocketAddr> =
+            watch.tried.iter().filter(|a| !on_path.contains(a)).copied().collect();
+        if unproven.is_empty() {
+            return;
+        }
+        let Ok(ep) = Endpoint::empty_builder()
+            .secret_key(identity)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .transport_config(transport_config())
+            .bind()
+            .await
+        else {
+            return;
+        };
+        let ep = Arc::new(ep);
+        let probes: Vec<_> = unproven
+            .into_iter()
+            .map(|addr| {
+                let (ep, watch) = (ep.clone(), watch.clone());
+                tokio::spawn(async move {
+                    let target = EndpointAddr::new(watch.server).with_ip_addr(addr);
+                    match tokio::time::timeout(AUDIT_LIMIT, ep.connect(target, ALPN_RPC)).await {
+                        Ok(Ok(c)) => c.close(0u32.into(), b"audit"),
+                        Ok(Err(e)) if is_identity_failure(&e.to_string()) => {
+                            IdentityWatch { tried: vec![addr], ..watch }.failed(&e.to_string());
+                        }
+                        _ => {}
+                    }
+                })
+            })
+            .collect();
+        for p in probes {
+            let _ = p.await;
+        }
+        let _ = tokio::time::timeout(Duration::from_millis(500), ep.close()).await;
+    });
+}
+
+/// A dial leg failed. When it says the peer is not the server, forget the
+/// cached addresses the dial tried, remember that iroh's address book holds
+/// them, and (for the server leg) that the pairing payload's direct
+/// addresses are no good. Returns the error to go on with.
+fn identity_failed(
+    shared: &Shared,
+    net: u64,
+    tried: &[SocketAddr],
+    e: DialError,
+    server_leg: bool,
+) -> DialError {
+    let DialError::Identity(m) = &e else { return e };
+    let gone = shared.opts.addr_cache.evict(shared.server.id, tried, net);
+    warn!(
+        "client: a path answered as someone else ({m}); {gone} cached address(es) forgotten,          tried {tried:?}"
+    );
+    shared.book_dirty.store(true, Ordering::SeqCst);
+    if server_leg && shared.server.ip_addrs().next().is_some() {
+        shared.server_ips_bad.store(true, Ordering::SeqCst);
+    }
+    e
 }
 
 /// Did the peer close the connection with `not_authorized`?
@@ -1946,6 +2229,9 @@ async fn run_session(
     let Established { conn, send, recv, welcome } = est;
     *lock(&shared.link_born) = Instant::now();
     tl!(shared, "welcome received, session starts");
+    // What the last link measured says nothing about this one.
+    shared.srtt_us.store(0, Ordering::Relaxed);
+    shared.touch_rx();
     if follows_network_change(shared) {
         info!("client: connected around a network change, watching the link fast for {FAST_WINDOW:?}");
         *lock(&shared.fast_until) = Some(Instant::now() + FAST_WINDOW);
@@ -2138,7 +2424,9 @@ async fn control_reader(link: Arc<Link>, shared: Arc<Shared>, mut recv: RecvStre
     let mut buf = Vec::new();
     loop {
         match read_frame_into(&mut recv, &mut buf).await {
-            Ok(true) => match decode_msg::<ControlMsg>(&buf) {
+            Ok(true) => {
+                shared.touch_rx();
+                match decode_msg::<ControlMsg>(&buf) {
                 Ok(ControlMsg::Response { id, result }) => {
                     shared.heard_gen.store(link.gen, Ordering::SeqCst);
                     link.complete(id, Ok(result))
@@ -2166,7 +2454,8 @@ async fn control_reader(link: Arc<Link>, shared: Arc<Shared>, mut recv: RecvStre
                 // An event type this version does not know. The frame is
                 // length delimited, so skipping it is safe.
                 Err(e) => warn!("client: undecodable control frame skipped: {e}"),
-            },
+                }
+            }
             Ok(false) => return TaskEnd::Lost("control stream closed".into()),
             Err(e) => return TaskEnd::Lost(format!("control read: {e}")),
         }
@@ -2374,52 +2663,66 @@ async fn input_writer(
     }
 }
 
-/// What iroh's network report says about the link: which UDP families work
-/// and the public addresses. iroh has no public link change event, but its
-/// report changes when the OS moved the default route or an address.
-type LinkPrint = (bool, bool, Option<std::net::IpAddr>, Option<std::net::IpAddr>);
-
-fn link_print(r: &iroh::NetReport) -> LinkPrint {
-    (
-        r.udp_v4,
-        r.udp_v6,
-        r.global_v4.map(|a| std::net::IpAddr::V4(*a.ip())),
-        r.global_v6.map(|a| std::net::IpAddr::V6(*a.ip())),
-    )
-}
-
-/// Treat a change of the endpoint's network report as `network_changed`,
-/// once per endpoint. The first report is the baseline.
+/// Follow iroh's network report (`link-watch` feature): the report is what
+/// changes when the OS moved the route or an address. One watcher per
+/// endpoint; it starts with a clean debounce.
+#[cfg(feature = "link-watch")]
 fn watch_link_changes(shared: &Arc<Shared>, watched_gen: &mut Option<u64>) {
     let Some(ep) = shared.ep() else { return };
     if *watched_gen == Some(ep.gen) {
         return;
     }
     *watched_gen = Some(ep.gen);
+    lock(&shared.link_debounce).reset();
     let mut watcher = ep.ep.net_report();
     let weak = Arc::downgrade(shared);
+    let gen = ep.gen;
     let task = tokio::spawn(async move {
-        let mut last: Option<LinkPrint> = None;
         loop {
             let Ok(value) = watcher.updated().await else { return };
             let Some(report) = value else { continue };
-            let print = link_print(&report);
-            let changed = last.is_some_and(|l| l != print);
-            last = Some(print);
-            if changed {
-                let Some(shared) = weak.upgrade() else { return };
-                info!("client: the network report changed, treating it as a network change");
-                network_changed_shared(&shared).await;
+            let Some(shared) = weak.upgrade() else { return };
+            // A report of an endpoint that was replaced since says nothing.
+            if shared.ep().is_none_or(|e| e.gen != gen) {
+                return;
             }
+            link_report(&shared, crate::link_watch::print_of(&report));
         }
     });
     shared.holders.add(task.abort_handle());
 }
 
+#[cfg(not(feature = "link-watch"))]
+fn watch_link_changes(_shared: &Arc<Shared>, _watched_gen: &mut Option<u64>) {}
+
+/// One report from the network. A change counts once two reports in a row
+/// carry it.
+fn link_report(shared: &Shared, print: LinkPrint) {
+    if lock(&shared.link_debounce).feed(print) {
+        link_event(shared);
+    }
+}
+
+/// The believed link change. It is only a hint, and it can be wrong, so it is
+/// cheap: it never calls `network_change` on the endpoint, never aborts a
+/// dial in flight and never opens the fast window (the report is a result of
+/// the endpoint's own probing, which a network change of ours causes). With a
+/// link it asks for one `Ping`, judged by the normal limit. Without one it
+/// cuts a backoff sleep.
+fn link_event(shared: &Shared) {
+    info!("client: the network report changed twice in a row, checking the link");
+    if shared.link_tx.borrow().is_some() {
+        shared.ping_now.notify_one();
+    } else {
+        shared.wake_backoff.notify_one();
+    }
+}
+
 /// After a connection that follows a network change, the link is watched
 /// fast for this long: a Ping every [`FAST_PING_MS`], and dead after
 /// max([`FAST_DEAD_MIN_MS`], 4 x the smoothed round trip time) without a
-/// `Pong`. The OS often finishes configuring the interface after the first
+/// `Pong` or any other frame from the server. The smoothed round trip time
+/// is measured on this link only. The OS often finishes configuring the interface after the first
 /// dial succeeded, and the link then dies silently.
 const FAST_WINDOW: Duration = Duration::from_secs(3);
 const FAST_PING_MS: u64 = 250;
@@ -2487,7 +2790,15 @@ async fn liveness(shared: Arc<Shared>, link: Arc<Link>) -> TaskEnd {
             last_ping = Some(Instant::now());
             note_direct_addr(&shared, &link.conn);
         }
-        if lock(&link.last_pong).elapsed() > dead_after {
+        // Normally only a `Pong` counts. In the fast window a link that is
+        // busy with a catch-up may hold the `Pong` behind its data: any frame
+        // or stream byte from the server shows that it lives.
+        let silent = if fast {
+            lock(&link.last_pong).elapsed().min(shared.rx_idle())
+        } else {
+            lock(&link.last_pong).elapsed()
+        };
+        if silent > dead_after {
             return TaskEnd::Lost(if fast {
                 format!("no Pong in {dead_after:?} (fast window)")
             } else {
@@ -2504,9 +2815,11 @@ async fn liveness(shared: Arc<Shared>, link: Arc<Link>) -> TaskEnd {
 
 /// Remember the direct addresses of the paths of this connection, for the
 /// next dial: the selected one as the address the connection really uses, the
-/// others as addresses the server is known by. Link-local addresses are
-/// skipped: they mean nothing on the next network.
+/// others as addresses the server is known by. An address that only means
+/// something on this network is stored with its fingerprint. Link-local
+/// addresses are skipped: they mean nothing on the next network.
 fn note_direct_addr(shared: &Shared, conn: &Connection) {
+    let mut net = None;
     for p in conn.to_info().paths() {
         let iroh::TransportAddr::Ip(addr) = p.remote_addr() else { continue };
         let local_only = match addr.ip() {
@@ -2516,10 +2829,11 @@ fn note_direct_addr(shared: &Shared, conn: &Connection) {
         if local_only {
             continue;
         }
+        let net = *net.get_or_insert_with(|| shared.current_net());
         if p.is_selected() {
-            shared.opts.addr_cache.insert(shared.server.id, *addr);
+            shared.opts.addr_cache.insert(shared.server.id, *addr, net);
         } else {
-            shared.opts.addr_cache.add(shared.server.id, *addr);
+            shared.opts.addr_cache.add(shared.server.id, *addr, net);
         }
     }
 }
@@ -2606,7 +2920,8 @@ async fn pane_reader(shared: Arc<Shared>, gen: u64, mut recv: RecvStream) -> Tas
         match read_output_frame(&mut recv, &mut buf).await {
             Ok(true) => {
                 shared.heard_gen.store(gen, Ordering::SeqCst);
-                let Ok(permit) = pane.tx.reserve().await else {
+                shared.touch_rx();
+                let Some(permit) = reserve_alive(&shared, &pane.tx).await else {
                     return TaskEnd::Done;
                 };
                 let mut st = lock(&pane.state);
@@ -2658,6 +2973,22 @@ async fn pane_reader(shared: Arc<Shared>, gen: u64, mut recv: RecvStream) -> Tas
                 }
                 return TaskEnd::Lost(format!("pane {} read: {e}", pane.id));
             }
+        }
+    }
+}
+
+/// Wait for room in a pane channel. While the consumer is slow the link is
+/// not at fault, and the server's data is waiting for us: this counts as
+/// hearing from it (see [`liveness`]).
+async fn reserve_alive<'a, T>(
+    shared: &Shared,
+    tx: &'a mpsc::Sender<T>,
+) -> Option<mpsc::Permit<'a, T>> {
+    loop {
+        match tokio::time::timeout(Duration::from_millis(100), tx.reserve()).await {
+            Ok(Ok(permit)) => return Some(permit),
+            Ok(Err(_)) => return None,
+            Err(_) => shared.touch_rx(),
         }
     }
 }

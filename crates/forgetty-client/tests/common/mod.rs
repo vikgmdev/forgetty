@@ -214,6 +214,18 @@ pub fn real_only() -> bool {
     false
 }
 
+/// First line of a test that needs the mock server (a delay or a hold it
+/// puts on the `Pong`s: the real server has none). With the real server it
+/// prints `SKIPPED (mock only)` and returns `false`.
+#[allow(dead_code)]
+pub fn mock_only() -> bool {
+    if !is_real() {
+        return true;
+    }
+    println!("SKIPPED (mock only)");
+    false
+}
+
 fn b64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
@@ -901,6 +913,14 @@ impl TestServer {
             Inner::Real(r) => {
                 r.rpc.call("qa_hold_acks", json!({"hold": hold})).unwrap();
             }
+        }
+    }
+
+    /// Mock only: hold every `Pong` until this long after the `Hello`.
+    pub fn set_pong_hold(&self, hold: Duration) {
+        match &self.inner {
+            Inner::Mock { server, .. } => server.set_pong_hold(hold),
+            Inner::Real(_) => panic!("set_pong_hold needs the mock server"),
         }
     }
 

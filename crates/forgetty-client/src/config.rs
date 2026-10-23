@@ -108,6 +108,10 @@ pub struct ClientOptions {
     pub event_buffer: usize,
     /// Last direct address per server. Dialed first on every connect.
     pub addr_cache: AddrCache,
+    /// The servers the app has paired. When set, the connect drops the cached
+    /// addresses of every other server (one that was unpaired leaves nothing
+    /// behind). `None`: the cache is left as it is.
+    pub paired_servers: Option<Vec<iroh::EndpointId>>,
     /// Bind no IP socket: every packet goes through a relay, direct paths are
     /// impossible. For tests of a relay and for networks where UDP is blocked.
     pub relay_only: bool,
@@ -122,6 +126,7 @@ impl Default for ClientOptions {
             pane_buffer: 64,
             event_buffer: 1024,
             addr_cache: AddrCache::default(),
+            paired_servers: None,
             relay_only: false,
         }
     }

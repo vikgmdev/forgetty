@@ -73,7 +73,7 @@ async fn run(args: &[String]) -> Result<(), String> {
         None => None,
     };
     if let Some(a) = direct {
-        cache.insert(addr.id, a);
+        cache.insert(addr.id, a, forgetty_client::local_network());
     }
     let server_id = addr.id;
     if !no_pair {
@@ -104,7 +104,7 @@ async fn run(args: &[String]) -> Result<(), String> {
     // (iroh learns it in the handshake). Put the seeded one back, so the replace
     // dials it (a delaying test proxy then shows the cost of the direct path).
     if let Some(a) = direct {
-        cache.insert(server_id, a);
+        cache.insert(server_id, a, forgetty_client::local_network());
     }
     let gate = arg(args, "--gate").map(PathBuf::from);
     let usable_after: Option<u64> = arg(args, "--usable-after-ms").and_then(|v| v.parse().ok());

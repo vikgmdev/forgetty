@@ -15,13 +15,14 @@ mod addr_cache;
 mod client;
 mod config;
 mod error;
+mod link_watch;
 pub mod identity;
 mod pair;
 mod state;
 #[cfg(feature = "test-util")]
 pub mod test_server;
 
-pub use addr_cache::{AddrCache, AddrCacheSnapshot, CachedAddr};
+pub use addr_cache::{local_network, AddrCache, AddrCacheSnapshot, CachedAddr, CachedOther};
 pub use client::{Client, ClientHandle, EventItem, EventStream, PaneItem, PaneStream};
 pub use config::{transport_config, ClientInfo, ClientOptions, RelayChoice};
 pub use error::ClientError;
