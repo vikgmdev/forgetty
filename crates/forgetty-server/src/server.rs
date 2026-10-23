@@ -163,6 +163,26 @@ impl std::fmt::Display for ConfigInvalid {
 
 impl std::error::Error for ConfigInvalid {}
 
+/// With no relay a device reaches the server on its bind addresses and nothing
+/// else, so at least one must be an address a device can pair with: not
+/// `0.0.0.0` or `::`, not link-local, not multicast or broadcast (the same rule
+/// as `forgetty_proto::pinned_addr_problem`, which the client applies to the
+/// QR).
+pub fn check_pairable_bind(addrs: &[std::net::IpAddr]) -> anyhow::Result<()> {
+    // Any non-zero port: the rule is about the IP here.
+    let pairable = |ip: &std::net::IpAddr| {
+        forgetty_proto::pinned_addr_problem(&std::net::SocketAddr::new(*ip, 1)).is_none()
+    };
+    if addrs.iter().any(pairable) {
+        return Ok(());
+    }
+    let list = addrs.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
+    anyhow::bail!(
+        "no address a device can pair with: --no-relay needs a bind address that is not \
+         0.0.0.0, ::, link-local, multicast or broadcast (bound: {list})"
+    )
+}
+
 /// Wrap a setting error so `server run` exits with [`EXIT_CONFIG`].
 fn config_invalid(e: anyhow::Error) -> anyhow::Error {
     ConfigInvalid(e.to_string()).into()
@@ -407,6 +427,9 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
         // Without relays the server is reached on its direct addresses only,
         // and a server that binds every address would put them all in the QR.
         return Err(NeedsBind.into());
+    }
+    if no_relay {
+        check_pairable_bind(&bind_addrs).map_err(config_invalid)?;
     }
 
     info!("session_id: {session_id}");
@@ -1178,6 +1201,19 @@ mod tests {
         assert!(matches!(busy, SyncError::Bind(_)), "{busy:?}");
         assert!(bind_is_retryable(true, &busy));
         assert!(!bind_is_retryable(false, &busy));
+    }
+
+    #[test]
+    fn no_relay_needs_a_bind_address_a_device_can_pair_with() {
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        assert!(check_pairable_bind(&[ip("10.230.1.14")]).is_ok());
+        assert!(check_pairable_bind(&[ip("0.0.0.0"), ip("127.0.0.1")]).is_ok());
+        for bad in ["0.0.0.0", "::", "169.254.1.1", "fe80::1", "224.0.0.1", "ff02::1"] {
+            let err = check_pairable_bind(&[ip(bad)]).unwrap_err().to_string();
+            assert!(err.contains("no address a device can pair with"), "{bad}: {err}");
+        }
+        // One good address among bad ones is enough.
+        assert!(check_pairable_bind(&[ip("0.0.0.0"), ip("10.0.0.2")]).is_ok());
     }
 
     #[test]

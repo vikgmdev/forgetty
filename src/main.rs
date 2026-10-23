@@ -94,7 +94,14 @@ fn main() {
     let config = match load_config(config_path.as_deref()) {
         Ok(c) => c,
         Err(e) => {
-            tracing::warn!("Failed to load config, using defaults: {e}");
+            // The app runs on defaults, but config.toml is left alone:
+            // `save_config` refuses to write over a file that does not load,
+            // so a settings change cannot delete the user's settings. Fix the
+            // file (the text editor in settings can) and restart.
+            tracing::error!(
+                "Failed to load config, using defaults. config.toml is not overwritten \
+                 until it loads: {e}"
+            );
             forgetty_config::Config::default()
         }
     };

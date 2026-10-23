@@ -380,6 +380,8 @@ fn every_configuration_error_exits_78() {
         (&["--bind", "127.0.0.1"], Some("rellay = \"none\"\n"), "did you mean `relay`"),
         (&["--bind", "127.0.0.1"], Some("bind_addr = [\"127.0.0.1\"]\n"), "bind_addrs"),
         (&["--bind", "127.0.0.1"], Some("relay = \"nne\"\n"), "invalid relay setting"),
+        (&["--no-relay", "--bind", "0.0.0.0"], None, "no address a device can pair with"),
+        (&["--no-relay", "--bind", "169.254.1.1"], None, "no address a device can pair with"),
         (&["--no-relay", "--bind", "127.0.0.1:47297"], None, "invalid bind address"),
         (&["--bind", "127.0.0.1", "--relay-url", "ftp://x.example.org"], None, "relay URL"),
         (
