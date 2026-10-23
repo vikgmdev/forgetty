@@ -602,6 +602,7 @@ impl Client {
         // One rule for every app: no unspecified, broadcast, multicast or
         // port-0 address, no duplicates, at most 8.
         opts.pinned_addrs = forgetty_proto::usable_pinned_addrs(std::mem::take(&mut opts.pinned_addrs));
+        let server = crate::pair::clean_direct(server);
         if let Some(paired) = &opts.paired_servers {
             let mut keep = paired.clone();
             keep.push(server.id);

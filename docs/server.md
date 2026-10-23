@@ -336,6 +336,11 @@ relay = "none"
   and an error that names the file and the line. It never falls back to the
   defaults, so a typo cannot turn the relays back on. A missing file means the
   defaults.
+- Unknown keys in `config.toml` are warned about and kept when the file is saved.
+  A key within edit distance 2 of `relay`, `relay_urls` or `bind_addrs` (for
+  example `rellay` or `bind_addr`) stops the server with exit 78: the setting
+  would be ignored. Every other configuration error (a bad `relay` value, a bad
+  `--bind` address, a bad relay URL, `--no-relay` with relay URLs) also exits 78.
 - Devices paired before this change have no `relays_disabled` flag and no
   direct address. They must pair again.
 - The network watcher of the client (`link-watch`) does nothing for a client

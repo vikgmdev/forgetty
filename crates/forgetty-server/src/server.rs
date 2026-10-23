@@ -148,19 +148,25 @@ pub const EXIT_ALREADY_RUNNING: i32 = 75; // keep in step with cli.rs
 /// error at once; the systemd units do not restart on it.
 pub const EXIT_CONFIG: i32 = 78; // keep in step with cli.rs
 
-/// A config file that exists but cannot be read or parsed. `server run` exits
-/// with [`EXIT_CONFIG`] (no restart loop): falling back to defaults would hide the
+/// A configuration the server refuses: a config file that exists but cannot be
+/// read or parsed, or a bad setting (`relay`, `--bind`, a relay URL, a
+/// conflict). `server run` exits with [`EXIT_CONFIG`] (no restart loop): falling back to defaults would hide the
 /// mistake, and a typo in `relay = "none"` would turn the relays back on.
 #[derive(Debug)]
 pub struct ConfigInvalid(pub String);
 
 impl std::fmt::Display for ConfigInvalid {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "config file is invalid, not starting: {}", self.0)
+        write!(f, "invalid configuration, not starting: {}", self.0)
     }
 }
 
 impl std::error::Error for ConfigInvalid {}
+
+/// Wrap a setting error so `server run` exits with [`EXIT_CONFIG`].
+fn config_invalid(e: anyhow::Error) -> anyhow::Error {
+    ConfigInvalid(e.to_string()).into()
+}
 
 /// Load the config. A missing file (the default location, or a `--config-file`
 /// that does not exist) means the defaults. A file that exists and fails to
@@ -183,14 +189,17 @@ const BIND_WARN_EVERY: Duration = Duration::from_secs(60);
 
 /// Does a failed iroh bind wait for the address, or end the process? The
 /// operator chose the addresses (`--bind`): wait, the tunnel may come up. With
-/// the default bind only "address not available" (EADDRNOTAVAIL) waits; any
-/// other error (a busy port) ends the process with a non-zero status, and the
-/// service manager restarts it.
-pub fn bind_is_retryable(chose_addrs: bool, error: &str) -> bool {
-    chose_addrs
-        || error.contains("os error 99")
-        || error.contains("Cannot assign requested address")
-        || error.contains("AddrNotAvailable")
+/// the default bind only "address not available" (`io::ErrorKind::
+/// AddrNotAvailable`, found in the error chain) waits; any other error (a busy
+/// port) ends the process with a non-zero status, and the service manager
+/// restarts it.
+pub fn bind_is_retryable(chose_addrs: bool, error: &forgetty_sync::SyncError) -> bool {
+    use forgetty_sync::SyncError;
+    match error {
+        SyncError::BindAddrNotAvailable(_) => true,
+        SyncError::Bind(_) => chose_addrs,
+        _ => false,
+    }
 }
 
 /// `--no-relay` / `relay = "none"` without `--bind` / `bind_addrs`. A config
@@ -375,15 +384,20 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
 
     // Relays: --relay-url replaces the config file list. None: iroh defaults.
     let relay_source = if args.relay_url.is_empty() { &config.relay_urls } else { &args.relay_url };
-    let relay_urls = parse_relay_urls(relay_source)?;
-    let no_relay = relays_disabled(args.no_relay, config.relay.as_deref())?;
+    let relay_urls = parse_relay_urls(relay_source).map_err(config_invalid)?;
+    let no_relay =
+        relays_disabled(args.no_relay, config.relay.as_deref()).map_err(config_invalid)?;
     if no_relay && !relay_urls.is_empty() {
-        anyhow::bail!("relays are switched off (--no-relay / relay = \"none\") but relay URLs are set");
+        return Err(ConfigInvalid(
+            "relays are switched off (--no-relay / relay = \"none\") but relay URLs are set"
+                .into(),
+        )
+        .into());
     }
     // Own relays: no n0 discovery unless asked for (--n0-discovery).
     let n0_discovery = !no_relay && (relay_urls.is_empty() || args.n0_discovery);
     let bind_source = if args.bind.is_empty() { &config.bind_addrs } else { &args.bind };
-    let bind_addrs = parse_bind_addrs(bind_source)?;
+    let bind_addrs = parse_bind_addrs(bind_source).map_err(config_invalid)?;
     if bind_addrs.is_empty() {
         info!("bind: every address");
     } else {
@@ -885,7 +899,7 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
     };
     match make_endpoint().await {
         Ok(ep) => bring_up(ep),
-        Err(forgetty_sync::SyncError::Bind(e)) if bind_is_retryable(chose_addrs, &e) => {
+        Err(e) if bind_is_retryable(chose_addrs, &e) => {
             // Not fatal: the process keeps the panes and the local socket and
             // tries again until the address is there.
             warn!(
@@ -902,7 +916,7 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
                             bring_up(ep);
                             return;
                         }
-                        Err(forgetty_sync::SyncError::Bind(e)) => {
+                        Err(e) if bind_is_retryable(chose_addrs, &e) => {
                             if last_warn.elapsed() >= BIND_WARN_EVERY {
                                 warn!(
                                     "iroh endpoint: still cannot bind {bind_label} ({e}); remote \
@@ -1134,13 +1148,36 @@ mod tests {
         assert!(text.contains("line 2"), "{text}");
     }
 
-    #[test]
-    fn a_failed_bind_waits_only_for_a_chosen_or_missing_address() {
-        // --bind set: always wait.
-        assert!(bind_is_retryable(true, "10.230.1.14:47297: Address already in use"));
-        // Default bind: a missing address waits, a busy port ends the process.
-        assert!(bind_is_retryable(false, "Cannot assign requested address (os error 99)"));
-        assert!(!bind_is_retryable(false, "Address already in use (os error 98)"));
+    /// Bind with `--bind addr` on `port` and return the real error.
+    async fn bind_error(addr: &str, port: u16) -> forgetty_sync::SyncError {
+        let key = iroh::SecretKey::generate(&mut rand::rng());
+        match SyncEndpoint::builder(key)
+            .bind_port(port)
+            .relays_disabled(true)
+            .bind_addrs(vec![addr.parse().unwrap()])
+            .build()
+            .await
+        {
+            Ok(_) => panic!("bind on {addr}:{port} worked"),
+            Err(e) => e,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_bind_waits_only_for_a_chosen_or_missing_address() {
+        use forgetty_sync::SyncError;
+        // An address that is not on this machine: EADDRNOTAVAIL, found by its
+        // io kind in the error chain. It waits, with or without --bind.
+        let missing = bind_error("192.0.2.1", 0).await;
+        assert!(matches!(missing, SyncError::BindAddrNotAvailable(_)), "{missing:?}");
+        assert!(bind_is_retryable(true, &missing));
+        assert!(bind_is_retryable(false, &missing));
+        // A busy port: waits with --bind, ends the process without.
+        let holder = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let busy = bind_error("127.0.0.1", holder.local_addr().unwrap().port()).await;
+        assert!(matches!(busy, SyncError::Bind(_)), "{busy:?}");
+        assert!(bind_is_retryable(true, &busy));
+        assert!(!bind_is_retryable(false, &busy));
     }
 
     #[test]

@@ -44,8 +44,59 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
         ))
     })?;
 
+    check_unknown_keys(&config, &contents, &config_path)?;
+
     tracing::info!("Loaded config from {}", config_path.display());
     Ok(config)
+}
+
+/// The settings that decide where a server listens and which relays it uses, or
+/// none. A misspelling of one of them must stop the load, not be ignored.
+const GUARDED_KEYS: [&str; 3] = ["relay", "relay_urls", "bind_addrs"];
+
+/// Warn about every top-level key this version does not know. A key within edit
+/// distance 2 of `relay`, `relay_urls` or `bind_addrs` (`rellay`, `bind_addr`) is an error:
+/// the setting would be ignored, and `relay = "none"` is what keeps a
+/// WireGuard-only server off the relays. The message names the file and line.
+fn check_unknown_keys(config: &Config, text: &str, path: &Path) -> Result<()> {
+    for key in config.extra.keys() {
+        let line = text
+            .lines()
+            .position(|l| {
+                let l = l.trim_start().trim_start_matches('[');
+                l.strip_prefix(key.as_str()).is_some_and(|rest| {
+                    rest.trim_start().starts_with(['=', ']', '.'])
+                })
+            })
+            .map(|i| i + 1);
+        let at = match line {
+            Some(n) => format!("{}:{n}", path.display()),
+            None => path.display().to_string(),
+        };
+        if let Some(near) = GUARDED_KEYS.iter().find(|g| edit_distance(key, g) <= 2) {
+            return Err(forgetty_core::ForgettyError::Config(format!(
+                "{at}: unknown key `{key}`, did you mean `{near}`? Not starting: the setting \
+                 would be ignored"
+            )));
+        }
+        tracing::warn!("{at}: unknown config key `{key}` (ignored, kept on save)");
+    }
+    Ok(())
+}
+
+/// Levenshtein distance of two short strings.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut cur = vec![i + 1];
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != *cb);
+            cur.push((prev[j] + cost).min(prev[j + 1] + 1).min(cur[j] + 1));
+        }
+        prev = cur;
+    }
+    prev[b.len()]
 }
 
 /// Returns the current `config.toml` contents as a raw string.
@@ -94,4 +145,58 @@ pub fn save_config(config: &Config) -> Result<()> {
 
     tracing::info!("Saved config to {}", config_path.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn load_text(text: &str) -> Result<Config> {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        std::fs::write(&p, text).unwrap();
+        load_config(Some(&p))
+    }
+
+    #[test]
+    fn edit_distance_counts_edits() {
+        assert_eq!(edit_distance("relay", "relay"), 0);
+        assert_eq!(edit_distance("rellay", "relay"), 1);
+        assert_eq!(edit_distance("bind_addr", "bind_addrs"), 1);
+        assert_eq!(edit_distance("font_size", "relay"), 9);
+    }
+
+    #[test]
+    fn a_typo_of_relay_or_bind_addrs_is_refused_with_file_and_line() {
+        for (text, key) in [
+            ("font_size = 12.0\nrellay = \"none\"\n", "rellay"),
+            ("bind_addr = [\"10.0.0.1\"]\n", "bind_addr"),
+            ("relays = \"none\"\n", "relays"),
+            ("relay_url = \"x\"\n", "relay_url"),
+        ] {
+            let err = load_text(text).unwrap_err().to_string();
+            assert!(err.contains("config.toml:"), "{err}");
+            assert!(err.contains(key) && err.contains("did you mean"), "{err}");
+        }
+        let err = load_text("font_size = 12.0\nrellay = \"none\"\n").unwrap_err().to_string();
+        assert!(err.contains("config.toml:2"), "{err}");
+    }
+
+    #[test]
+    fn other_unknown_keys_load_and_survive_a_serialize_round_trip() {
+        let c = load_text("font_size = 13.0\nfuture_flag = true\n[future_table]\nx = 1\n")
+            .unwrap();
+        assert_eq!(c.extra.len(), 2);
+        let text = toml::to_string_pretty(&c).unwrap();
+        let again: Config = toml::from_str(&text).unwrap();
+        assert_eq!(again.extra, c.extra, "{text}");
+        assert_eq!(again.font_size, 13.0);
+    }
+
+    #[test]
+    fn known_keys_are_never_unknown() {
+        let c = load_text("relay = \"none\"\nbind_addrs = [\"10.0.0.1\"]\nrelay_urls = []\n")
+            .unwrap();
+        assert!(c.extra.is_empty());
+    }
 }

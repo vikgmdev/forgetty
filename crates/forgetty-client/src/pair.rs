@@ -67,10 +67,24 @@ pub fn server_addr_direct(
             .map_err(|e| ClientError::Invalid(format!("bad relay in QR payload: {e}")))?;
         addr = addr.with_relay_url(relay);
     }
-    for d in direct {
-        addr = addr.with_ip_addr(*d);
+    for d in forgetty_proto::usable_pinned_addrs(direct.iter().copied()) {
+        addr = addr.with_ip_addr(d);
     }
     Ok(addr)
+}
+
+/// The same address with only its usable direct addresses (see
+/// [`forgetty_proto::usable_pinned_addrs`]): relays and the id are kept. Every
+/// path from an app or a payload into a server address goes through it.
+pub(crate) fn clean_direct(addr: EndpointAddr) -> EndpointAddr {
+    let ips: Vec<std::net::SocketAddr> = addr.ip_addrs().copied().collect();
+    let usable = forgetty_proto::usable_pinned_addrs(ips.iter().copied());
+    if usable == ips {
+        return addr;
+    }
+    let others = addr.addrs.iter().filter(|a| !matches!(a, iroh::TransportAddr::Ip(_))).cloned();
+    EndpointAddr::from_parts(addr.id, others)
+        .with_addrs(usable.into_iter().map(iroh::TransportAddr::Ip))
 }
 
 /// Build the server address from a QR payload (node id plus all relay URLs).
@@ -123,6 +137,7 @@ pub async fn pair_with_addr(
     client_kind: ClientKind,
     opts: &ClientOptions,
 ) -> Result<(), ClientError> {
+    let addr = clean_direct(addr);
     let endpoint = opts
         .shape(Endpoint::empty_builder())
         .secret_key(identity)
@@ -170,5 +185,49 @@ async fn pair_exchange(
         Ok(())
     } else {
         Err(ClientError::PairRejected(result.reason.unwrap_or_else(|| "unknown".into())))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id() -> EndpointId {
+        SecretKey::generate(&mut rand::rng()).public()
+    }
+
+    #[test]
+    fn server_addr_direct_drops_unusable_pins() {
+        let node = id().to_string();
+        let direct: Vec<std::net::SocketAddr> = [
+            "0.0.0.0:47297",
+            "[::ffff:224.0.0.1]:47297",
+            "169.254.3.3:47297",
+            "10.230.1.14:0",
+            "10.230.1.14:47297",
+        ]
+        .iter()
+        .map(|s| s.parse().unwrap())
+        .collect();
+        let addr = server_addr_direct(&node, &[], &direct).unwrap();
+        let got: Vec<_> = addr.ip_addrs().copied().collect();
+        assert_eq!(got, vec!["10.230.1.14:47297".parse().unwrap()]);
+    }
+
+    #[test]
+    fn clean_direct_keeps_relays_and_good_addresses() {
+        let relay: RelayUrl = "https://relay.example.com/".parse().unwrap();
+        let addr = EndpointAddr::new(id())
+            .with_relay_url(relay.clone())
+            .with_ip_addr("0.0.0.0:1".parse().unwrap())
+            .with_ip_addr("[::ffff:255.255.255.255]:1".parse().unwrap())
+            .with_ip_addr("127.0.0.1:47297".parse().unwrap());
+        let cleaned = clean_direct(addr.clone());
+        assert_eq!(cleaned.id, addr.id);
+        assert_eq!(cleaned.relay_urls().cloned().collect::<Vec<_>>(), vec![relay]);
+        assert_eq!(
+            cleaned.ip_addrs().copied().collect::<Vec<_>>(),
+            vec!["127.0.0.1:47297".parse().unwrap()]
+        );
     }
 }

@@ -85,8 +85,34 @@ pub enum SyncEvent {
 pub enum SyncError {
     #[error("Failed to bind iroh endpoint: {0}")]
     Bind(String),
+    /// The bind failed because the address is not on this machine
+    /// (`io::ErrorKind::AddrNotAvailable`): a tunnel that is not up yet.
+    #[error("Failed to bind iroh endpoint: {0}")]
+    BindAddrNotAvailable(String),
     #[error("Registry error: {0}")]
     Registry(#[from] crate::registry::RegistryError),
+}
+
+/// Turn a failed iroh bind into a [`SyncError`], keeping the message of the
+/// whole error chain and telling "address not available" apart by the kind of
+/// the `io::Error` in the chain, not by its text.
+fn bind_error(e: &(dyn std::error::Error + 'static)) -> SyncError {
+    let mut msg = e.to_string();
+    let mut not_available = false;
+    let mut cur = e.source();
+    while let Some(err) = cur {
+        msg.push_str(": ");
+        msg.push_str(&err.to_string());
+        if let Some(io) = err.downcast_ref::<std::io::Error>() {
+            not_available |= io.kind() == std::io::ErrorKind::AddrNotAvailable;
+        }
+        cur = err.source();
+    }
+    if not_available {
+        SyncError::BindAddrNotAvailable(msg)
+    } else {
+        SyncError::Bind(msg)
+    }
 }
 
 /// What [`SyncEndpoint::revoke_device`] did.
@@ -269,7 +295,7 @@ impl SyncEndpointBuilder {
                 );
                 // The failed dual-stack attempt can still hold the IPv4 port for a moment
                 // (WSL1 releases it late), so the IPv4-only bind retries briefly.
-                let mut last = None;
+                let mut last: Option<SyncError> = None;
                 let mut bound = None;
                 for attempt in 0..8u32 {
                     if attempt > 0 {
@@ -280,15 +306,15 @@ impl SyncEndpointBuilder {
                             bound = Some(ep);
                             break;
                         }
-                        Err(e) => last = Some(e.to_string()),
+                        Err(e) => last = Some(bind_error(&e)),
                     }
                 }
                 match bound {
                     Some(ep) => ep,
-                    None => return Err(SyncError::Bind(last.unwrap_or_default())),
+                    None => return Err(last.unwrap_or_else(|| SyncError::Bind(String::new()))),
                 }
             }
-            Err(e) => return Err(SyncError::Bind(e.to_string())),
+            Err(e) => return Err(bind_error(&e)),
         };
 
         let registry = Arc::new(Mutex::new(DeviceRegistry::load().map_err(SyncError::Registry)?));

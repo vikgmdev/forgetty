@@ -182,6 +182,12 @@ pub struct Config {
     /// the fixed port. Empty (default) binds every address. `--bind` on the
     /// command line replaces this list.
     pub bind_addrs: Vec<String>,
+
+    /// Top-level keys this version does not know, kept as they were so a save
+    /// (`save_config`, the settings editor) does not delete them. The loader
+    /// warns about each of them and refuses one that looks like a typo of
+    /// `relay` or `bind_addrs` (see `loader::check_unknown_keys`).
+    pub extra: toml::Table,
 }
 
 impl Default for Config {
@@ -221,7 +227,7 @@ impl Serialize for Config {
             len += 1;
         }
 
-        let mut map = serializer.serialize_map(Some(len))?;
+        let mut map = serializer.serialize_map(Some(len + self.extra.len() + 3))?;
 
         map.serialize_entry("font_family", &self.font_family)?;
         map.serialize_entry("font_size", &self.font_size)?;
@@ -278,6 +284,11 @@ impl Serialize for Config {
         }
         if !self.bind_addrs.is_empty() {
             map.serialize_entry("bind_addrs", &self.bind_addrs)?;
+        }
+
+        // Keys of a newer version (or a typo): kept, last.
+        for (key, value) in &self.extra {
+            map.serialize_entry(key, value)?;
         }
 
         map.end()
@@ -360,6 +371,10 @@ impl<'de> Deserialize<'de> for Config {
 
             #[serde(default)]
             bind_addrs: Vec<String>,
+
+            /// Every key above does not claim.
+            #[serde(flatten)]
+            extra: toml::Table,
         }
 
         let raw = RawConfig::deserialize(deserializer)?;
@@ -438,6 +453,7 @@ impl<'de> Deserialize<'de> for Config {
             relay_urls: raw.relay_urls,
             relay: raw.relay,
             bind_addrs: raw.bind_addrs,
+            extra: raw.extra,
         })
     }
 }

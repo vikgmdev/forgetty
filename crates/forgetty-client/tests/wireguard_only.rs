@@ -351,3 +351,46 @@ async fn unusable_pinned_addresses_do_not_get_in_the_way() {
     h.close().await;
     server.shutdown().await;
 }
+
+/// Run `forgetty server run` with `args` (and an optional config file) and
+/// return its exit code and stderr.
+fn run_server_once(args: &[&str], config: Option<&str>) -> (Option<i32>, String) {
+    let bin = std::env::var_os("FORGETTY_REAL_SERVER").expect("FORGETTY_REAL_SERVER");
+    let dir = tempfile::tempdir().unwrap();
+    let mut cmd = std::process::Command::new(bin);
+    cmd.arg("--state-dir").arg(dir.path().join("state")).args(["server", "run", "--port", "0"]);
+    if let Some(text) = config {
+        let cfg = dir.path().join("config.toml");
+        std::fs::write(&cfg, text).unwrap();
+        cmd.arg("--config-file").arg(cfg);
+    }
+    let out = cmd.args(args).stdin(std::process::Stdio::null()).output().expect("run forgetty");
+    (out.status.code(), String::from_utf8_lossy(&out.stderr).into_owned())
+}
+
+/// Every configuration error is exit 78: a typo of a guarded key, a bad
+/// `relay` value, a port with `--bind`, a bad relay URL, and the
+/// `--no-relay` plus relay URL conflict.
+#[test]
+fn every_configuration_error_exits_78() {
+    if !real_only() {
+        return;
+    }
+    let cases: Vec<(&[&str], Option<&str>, &str)> = vec![
+        (&["--bind", "127.0.0.1"], Some("rellay = \"none\"\n"), "did you mean `relay`"),
+        (&["--bind", "127.0.0.1"], Some("bind_addr = [\"127.0.0.1\"]\n"), "bind_addrs"),
+        (&["--bind", "127.0.0.1"], Some("relay = \"nne\"\n"), "invalid relay setting"),
+        (&["--no-relay", "--bind", "127.0.0.1:47297"], None, "invalid bind address"),
+        (&["--bind", "127.0.0.1", "--relay-url", "ftp://x.example.org"], None, "relay URL"),
+        (
+            &["--no-relay", "--bind", "127.0.0.1", "--relay-url", "https://r.example.org"],
+            None,
+            "relay URLs are set",
+        ),
+    ];
+    for (args, config, needle) in cases {
+        let (code, err) = run_server_once(args, config);
+        assert_eq!(code, Some(78), "args {args:?} config {config:?}; stderr: {err}");
+        assert!(err.contains(needle), "args {args:?}: wanted {needle:?} in: {err}");
+    }
+}

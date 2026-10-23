@@ -669,9 +669,14 @@ mod tests {
 /// Most pinned (pairing payload or typed-in) addresses of one server.
 pub const MAX_PINNED_ADDRS: usize = 8;
 
-/// Why `addr` cannot be a pinned server address, if it cannot.
+/// Why `addr` cannot be a pinned server address, if it cannot. An IPv4
+/// address in IPv6 form (`::ffff:0.0.0.0`) is judged as the IPv4 address.
 pub fn pinned_addr_problem(addr: &std::net::SocketAddr) -> Option<&'static str> {
-    let ip = addr.ip();
+    let ip = addr.ip().to_canonical();
+    let link_local = match ip {
+        std::net::IpAddr::V4(a) => a.is_link_local(),
+        std::net::IpAddr::V6(a) => (a.segments()[0] & 0xffc0) == 0xfe80,
+    };
     if addr.port() == 0 {
         Some("port 0")
     } else if ip.is_unspecified() {
@@ -680,6 +685,8 @@ pub fn pinned_addr_problem(addr: &std::net::SocketAddr) -> Option<&'static str> 
         Some("multicast address")
     } else if ip == std::net::IpAddr::V4(std::net::Ipv4Addr::BROADCAST) {
         Some("broadcast address")
+    } else if link_local {
+        Some("link-local address (means nothing on another network)")
     } else {
         None
     }
@@ -695,6 +702,8 @@ where
 {
     let mut out: Vec<std::net::SocketAddr> = Vec::new();
     for a in addrs {
+        // `::ffff:10.0.0.1` and `10.0.0.1` are one address: keep the IPv4 form.
+        let a = std::net::SocketAddr::new(a.ip().to_canonical(), a.port());
         if let Some(why) = pinned_addr_problem(&a) {
             tracing::warn!("pinned address {a} dropped: {why}");
         } else if out.contains(&a) {
@@ -730,6 +739,32 @@ mod pinned_tests {
             sa("[fd00::1]:47297"),
         ]);
         assert_eq!(got, vec![sa("10.230.1.14:47297"), sa("[fd00::1]:47297")]);
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_addresses_are_judged_as_ipv4() {
+        let got = usable_pinned_addrs([
+            sa("[::ffff:0.0.0.0]:47297"),
+            sa("[::ffff:255.255.255.255]:47297"),
+            sa("[::ffff:224.0.0.1]:47297"),
+            sa("[::ffff:169.254.1.1]:47297"),
+            sa("[::ffff:10.230.1.14]:47297"),
+            sa("10.230.1.14:47297"),
+        ]);
+        // The mapped good address is the same as the plain one: kept once, in
+        // IPv4 form.
+        assert_eq!(got, vec![sa("10.230.1.14:47297")]);
+    }
+
+    #[test]
+    fn link_local_addresses_are_dropped() {
+        let got = usable_pinned_addrs([
+            sa("169.254.10.1:47297"),
+            sa("[fe80::1]:47297"),
+            sa("[febf::1]:47297"),
+            sa("127.0.0.1:47297"),
+        ]);
+        assert_eq!(got, vec![sa("127.0.0.1:47297")]);
     }
 
     #[test]
