@@ -533,9 +533,6 @@ pub(crate) struct Shared {
     /// An identity failure left a wrong address in iroh's address book: the
     /// supervisor replaces the endpoint before its next dial.
     book_dirty: Arc<AtomicBool>,
-    /// The direct addresses of the pairing payload answered with another
-    /// identity: dial its relays only.
-    server_ips_bad: AtomicBool,
     /// Base of `rx_at`.
     epoch: Instant,
     /// When the last frame or stream byte from the server arrived, in ms
@@ -670,7 +667,6 @@ impl Client {
             fast_until: Mutex::new(None),
             skip_cache: AtomicBool::new(false),
             book_dirty: Arc::new(AtomicBool::new(false)),
-            server_ips_bad: AtomicBool::new(false),
             epoch: Instant::now(),
             rx_at: AtomicU64::new(0),
             link_debounce: Mutex::new(Debounce::default()),
@@ -707,16 +703,11 @@ impl Shared {
         Duration::from_millis(ms.saturating_sub(self.rx_at.load(Ordering::Relaxed)))
     }
 
-    /// The pairing payload address. When its direct addresses turned out to
-    /// belong to someone else, only its relays are left.
+    /// The pairing payload address. Its addresses are pinned: never scoped to
+    /// a network, never evicted, always dialed (a WireGuard address is private
+    /// but valid on every network while the tunnel is up). Only addresses the
+    /// client learned itself follow the network and eviction rules.
     fn server_target(&self) -> EndpointAddr {
-        if self.server_ips_bad.load(Ordering::SeqCst) && self.server.relay_urls().next().is_some() {
-            let mut t = EndpointAddr::new(self.server.id);
-            for r in self.server.relay_urls() {
-                t = t.with_relay_url(r.clone());
-            }
-            return t;
-        }
         self.server.clone()
     }
 }
@@ -2005,7 +1996,7 @@ async fn dial_legs(
     };
     if known.is_empty() {
         return dial_to(shared, ep, server, None, None).await.map_err(|e| {
-            identity_failed(shared, net, &[], e, !shared.server.is_empty())
+            identity_failed(shared, net, &[], e)
         });
     }
     // Only the addresses the local network has a route to: one without (an
@@ -2019,7 +2010,7 @@ async fn dial_legs(
     if ips.is_empty() {
         if !shared.server.is_empty() {
             return dial_to(shared, ep, server, None, None).await.map_err(|e| {
-                identity_failed(shared, net, &[], e, true)
+                identity_failed(shared, net, &[], e)
             });
         }
         ips = known;
@@ -2040,7 +2031,7 @@ async fn dial_legs(
         // Nothing to fall back to: the direct dial has the whole dial timeout.
         return dial_to(shared, ep, direct, None, Some(watch))
             .await
-            .map_err(|e| identity_failed(shared, net, &ips, e, false));
+            .map_err(|e| identity_failed(shared, net, &ips, e));
     }
     let a = dial_to(shared, ep, direct, Some(DIRECT_DIAL_TIMEOUT), Some(watch));
     let b = dial_to(shared, ep, server, None, None);
@@ -2049,9 +2040,9 @@ async fn dial_legs(
     let mut last = DialError::Transient("no address".into());
     let mut identity: Option<String> = None;
     while !(a_done && b_done) {
-        let (r, server_leg) = tokio::select! {
-            r = &mut a, if !a_done => { a_done = true; (r, false) }
-            r = &mut b, if !b_done => { b_done = true; (r, true) }
+        let r = tokio::select! {
+            r = &mut a, if !a_done => { a_done = true; r }
+            r = &mut b, if !b_done => { b_done = true; r }
         };
         match r {
             Ok(est) => return Ok(est),
@@ -2059,7 +2050,7 @@ async fn dial_legs(
             Err(e @ DialError::Identity(_)) => {
                 // The other leg may still connect; the stale address book is
                 // cleaned at the next replace either way.
-                if let DialError::Identity(m) = identity_failed(shared, net, &ips, e, server_leg) {
+                if let DialError::Identity(m) = identity_failed(shared, net, &ips, e) {
                     identity = Some(m);
                 }
             }
@@ -2137,15 +2128,14 @@ fn spawn_audit(shared: &Shared, conn: iroh::endpoint::ConnectionInfo, watch: Ide
 }
 
 /// A dial leg failed. When it says the peer is not the server, forget the
-/// cached addresses the dial tried, remember that iroh's address book holds
-/// them, and (for the server leg) that the pairing payload's direct
-/// addresses are no good. Returns the error to go on with.
+/// cached (learned) addresses the dial tried and remember that iroh's address
+/// book holds them. The addresses of the pairing payload are pinned and stay.
+/// Returns the error to go on with.
 fn identity_failed(
     shared: &Shared,
     net: u64,
     tried: &[SocketAddr],
     e: DialError,
-    server_leg: bool,
 ) -> DialError {
     let DialError::Identity(m) = &e else { return e };
     let gone = shared.opts.addr_cache.evict(shared.server.id, tried, net);
@@ -2153,9 +2143,6 @@ fn identity_failed(
         "client: a path answered as someone else ({m}); {gone} cached address(es) forgotten,          tried {tried:?}"
     );
     shared.book_dirty.store(true, Ordering::SeqCst);
-    if server_leg && shared.server.ip_addrs().next().is_some() {
-        shared.server_ips_bad.store(true, Ordering::SeqCst);
-    }
     e
 }
 
