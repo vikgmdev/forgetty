@@ -471,7 +471,7 @@ impl ShellSmoke {
             25 => {
                 until!(shell.layout.tab_count() == self.wp3.tabs0);
                 check("wp3_tabs_closed", true);
-                self.goto(super::Phase::RSetup);
+                self.goto(super::Phase::Wp3d);
             }
             _ => {}
         }
