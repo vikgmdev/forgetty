@@ -490,7 +490,7 @@ static METHODS: &[MethodSpec] = &[
         Call,
         true,
         "Set or clear the accent colour of a workspace.",
-        "The server stores the string as given. `workspace_id` names the workspace by id.",
+        "`color` is `#rrggbb` or null (clears it); any other value is INVALID_PARAMS. `workspace_id` names the workspace by id.",
         t::SetWorkspaceColorParams,
         t::OkResult,
         r##"{"workspace_idx":0,"color":"#3b82f6"}"##,

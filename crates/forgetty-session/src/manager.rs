@@ -192,6 +192,45 @@ pub fn clamp_pane_dim(n: u16) -> u16 {
     n.clamp(1, MAX_PANE_DIM)
 }
 
+/// How a request names a workspace: by position, or by id. An id names one workspace for
+/// good, a position can point at another workspace after a reorder or a delete by another
+/// client. A method that takes a `WsRef` resolves it under the same lock it acts under, so
+/// nothing can move between the lookup and the change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WsRef {
+    Idx(usize),
+    Id(Uuid),
+}
+
+impl From<usize> for WsRef {
+    fn from(i: usize) -> Self {
+        WsRef::Idx(i)
+    }
+}
+
+impl From<Uuid> for WsRef {
+    fn from(id: Uuid) -> Self {
+        WsRef::Id(id)
+    }
+}
+
+/// Start of the error text for an id that names no workspace. The socket layer maps it to
+/// `INVALID_PARAMS`.
+pub const WORKSPACE_NOT_FOUND: &str = "workspace not found";
+
+impl WsRef {
+    /// The position in `workspaces`. A position is returned as it is (each method keeps its
+    /// own bounds check and message); an id that is not there is an error.
+    fn resolve(self, workspaces: &[crate::layout::SessionWorkspace]) -> Result<usize> {
+        match self {
+            WsRef::Idx(i) => Ok(i),
+            WsRef::Id(id) => workspaces.iter().position(|w| w.id == id).ok_or_else(|| {
+                forgetty_core::ForgettyError::Pty(format!("{WORKSPACE_NOT_FOUND}: {id}"))
+            }),
+        }
+    }
+}
+
 impl SessionManager {
     /// Create a new, empty session manager.
     pub fn new() -> Self {
@@ -613,8 +652,9 @@ impl SessionManager {
     /// responsible for producing valid `#RRGGBB` strings. Malformed hex
     /// on the wire will simply fail to parse client-side and render as
     /// "no colour" (graceful degradation).
-    pub fn set_workspace_color(&self, workspace_idx: usize, color: Option<&str>) -> Result<()> {
+    pub fn set_workspace_color(&self, workspace: impl Into<WsRef>, color: Option<&str>) -> Result<()> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let workspace_idx = workspace.into().resolve(&inner.layout.workspaces)?;
 
         if workspace_idx >= inner.layout.workspaces.len() {
             return Err(forgetty_core::ForgettyError::Pty(format!(
@@ -661,8 +701,11 @@ impl SessionManager {
     /// `active_index` follow-logic already present in
     /// `move_workspace_up`/`move_workspace_down` so the active pointer
     /// remains attached to the moved workspace.
-    pub fn move_workspace(&self, from_idx: usize, to_idx: usize) -> Result<()> {
+    pub fn move_workspace(&self, from: impl Into<WsRef>, to: impl Into<WsRef>) -> Result<()> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        // Both are resolved under this one lock, so a swap of two ids is a swap of those two.
+        let from_idx = from.into().resolve(&inner.layout.workspaces)?;
+        let to_idx = to.into().resolve(&inner.layout.workspaces)?;
 
         let len = inner.layout.workspaces.len();
         if from_idx >= len {
@@ -731,8 +774,9 @@ impl SessionManager {
     /// the single `WorkspaceDeleted` event, so `subscribe_output` consumers
     /// see panes disappear first and `subscribe_layout` consumers see the
     /// workspace row disappear afterwards.
-    pub fn delete_workspace(&self, workspace_idx: usize) -> Result<()> {
+    pub fn delete_workspace(&self, workspace: impl Into<WsRef>) -> Result<()> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let workspace_idx = workspace.into().resolve(&inner.layout.workspaces)?;
 
         if workspace_idx >= inner.layout.workspaces.len() {
             return Err(forgetty_core::ForgettyError::Pty(format!(
@@ -852,10 +896,11 @@ impl SessionManager {
     /// `duplicated_tabs.len()` equals the source's tab count.
     pub fn duplicate_workspace(
         &self,
-        source_workspace_idx: usize,
+        source_workspace: impl Into<WsRef>,
         new_name: Option<&str>,
         default_size: PtySize,
     ) -> Result<(Uuid, usize, Vec<DuplicatedTab>)> {
+        let source_workspace = source_workspace.into();
         // Phase 1 — snapshot from the source under the lock, then RELEASE it
         // before the long-running PTY spawns in Phase 2. This is NOT a single
         // critical section; Phase 3 re-acquires the lock and defensively
@@ -863,8 +908,9 @@ impl SessionManager {
         // mutator may have shrunk the layout in between). The snapshot of
         // source name / CWDs is accepted as stale-tolerant per AD-007 —
         // the daemon-side identity of the duplicate is fixed at Phase 1.
-        let (dup_name, insert_at, cwds): (String, usize, Vec<Option<PathBuf>>) = {
+        let (dup_name, insert_at, cwds, source_id): (String, usize, Vec<Option<PathBuf>>, Uuid) = {
             let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let source_workspace_idx = source_workspace.resolve(&inner.layout.workspaces)?;
 
             if source_workspace_idx >= inner.layout.workspaces.len() {
                 return Err(forgetty_core::ForgettyError::Pty(format!(
@@ -890,7 +936,7 @@ impl SessionManager {
                 })
                 .collect();
 
-            (dup_name, source_workspace_idx + 1, cwds)
+            (dup_name, source_workspace_idx + 1, cwds, source.id)
         };
 
         // Phase 2 — spawn PTYs OUTSIDE the mutex. PtyBridge::spawn may
@@ -938,6 +984,13 @@ impl SessionManager {
             // than error — the source still exists (guard below) and pushing
             // past the end is safer than failing a user-visible action.
             // NOTE: `Vec::insert` requires `idx <= len` — clamp defensively.
+            // The copy goes right after its source, where the source is now.
+            let insert_at = inner
+                .layout
+                .workspaces
+                .iter()
+                .position(|w| w.id == source_id)
+                .map_or(insert_at, |i| i + 1);
             let clamped_insert = insert_at.min(inner.layout.workspaces.len());
 
             let mut new_tabs: Vec<SessionTab> = Vec::with_capacity(spawned.len());
@@ -1008,7 +1061,7 @@ impl SessionManager {
             }
 
             tracing::info!(
-                source_workspace_idx,
+                %source_id,
                 workspace_idx = clamped_insert,
                 %new_ws_id,
                 name = %dup_name,
@@ -3992,6 +4045,55 @@ mod tests {
     }
 
     /// FIX-006 bounds: out-of-range from_idx or to_idx returns Err and does
+    /// An id is resolved under the same lock the change runs under: while other threads
+    /// keep reordering the workspaces, every move, color and delete by id lands on the
+    /// workspace it named, never on whatever sat at its old position.
+    #[test]
+    fn test_workspace_calls_by_id_survive_concurrent_reorders() {
+        let session = std::sync::Arc::new(SessionManager::new());
+        let (a, _) = session.create_workspace("A");
+        let (b, _) = session.create_workspace("B");
+        let (c, _) = session.create_workspace("C");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shuffler = {
+            let (s, stop) = (session.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut i = 0usize;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = s.move_workspace(i % 4, (i + 1) % 4);
+                    i += 1;
+                }
+            })
+        };
+        for n in 0..300 {
+            let color = format!("#{:06x}", n);
+            session.set_workspace_color(b, Some(&color)).unwrap();
+            // The color of B is on B, wherever B is, and on nobody else.
+            let l = session.layout();
+            for w in &l.workspaces {
+                if w.id == b {
+                    assert_eq!(w.color.as_deref(), Some(color.as_str()));
+                } else {
+                    assert!(w.color.is_none(), "color leaked to {}", w.name);
+                }
+            }
+            session.move_workspace(a, c).unwrap();
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        shuffler.join().unwrap();
+        // A delete by id removes that workspace only.
+        session.delete_workspace(b).unwrap();
+        let names: Vec<_> = session.layout().workspaces.iter().map(|w| w.name.clone()).collect();
+        assert_eq!(names.len(), 3);
+        assert!(!names.contains(&"B".to_string()), "{names:?}");
+        // The id is gone: an error that says so, and nothing else goes.
+        let err = session.delete_workspace(b).unwrap_err().to_string();
+        assert!(err.contains(WORKSPACE_NOT_FOUND), "{err}");
+        assert!(session.set_workspace_color(b, None).is_err());
+        assert!(session.move_workspace(a, b).is_err());
+        assert_eq!(session.layout().workspaces.len(), 3);
+    }
+
     /// not mutate state.
     #[test]
     fn test_move_workspace_out_of_bounds_errors() {

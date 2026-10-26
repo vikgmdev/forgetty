@@ -48,7 +48,7 @@ pub use events::{LabelTarget, SessionEvent};
 pub use layout::{SessionLayout, SessionTab, SessionWorkspace};
 pub use manager::{
     clamp_pane_dim, InputOutcome, LabelError, LocalOutputGuard, PaneSnapshot, SessionManager,
-    MAX_LABEL_CHARS, MAX_PANE_DIM,
+    WsRef, MAX_LABEL_CHARS, MAX_PANE_DIM, WORKSPACE_NOT_FOUND,
 };
 pub use pane::{DuplicatedTab, NotificationInfo, PaneInfo, PaneOsc, PaneState};
 pub use pane_writer::{OnEnd, PaneWriter, QueueError, WriterStats, INPUT_QUEUE_BYTES};

@@ -1024,7 +1024,7 @@ Kind: call. Protocol v2: yes.
 
 Set or clear the accent colour of a workspace.
 
-The server stores the string as given. `workspace_id` names the workspace by id.
+`color` is `#rrggbb` or null (clears it); any other value is INVALID_PARAMS. `workspace_id` names the workspace by id.
 
 Kind: call. Protocol v2: yes.
 
