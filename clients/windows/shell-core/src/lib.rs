@@ -4,7 +4,10 @@
 //! `forgetty-client` (`clients/windows/remote`) plug into these types.
 
 pub mod backend;
+pub mod bell;
+pub mod codeblock;
 pub mod conpty;
+pub mod copytext;
 pub mod fuzzy;
 pub mod keys;
 pub mod layout;
@@ -14,7 +17,10 @@ pub mod notify;
 pub mod update;
 pub mod osc;
 pub mod osc52;
+pub mod paste;
+pub mod scrollbar;
 pub mod search;
+pub mod selection;
 pub mod source;
 
 pub use backend::*;
