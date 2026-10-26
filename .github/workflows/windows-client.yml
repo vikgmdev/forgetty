@@ -46,11 +46,11 @@ jobs:
 
       - name: Build (release)
         working-directory: clients/windows
-        run: cargo build --release
+        run: cargo build --release --locked
 
       - name: Build the protocol v2 test server (separate process for the W3 smoke)
         run: |
-          cargo build --release -p forgetty-client --features test-util --bin v2-test-server
+          cargo build --release --locked -p forgetty-client --features test-util --bin v2-test-server
           Copy-Item target/release/v2-test-server.exe clients/windows/target/release/
         shell: pwsh
 
@@ -58,8 +58,8 @@ jobs:
         working-directory: clients/windows
         run: |
           # The ConPTY tests in shell-core's local module are covered by the smoke.
-          cargo test --release -p forgetty-shell-core --lib -- conpty:: notify:: layout:: keys:: osc:: osc52:: fuzzy:: update:: search:: links:: copytext:: paste:: selection:: scrollbar:: bell:: codeblock:: colors:: menu:: ops:: fingerprint::
-          cargo test --release -p forgetty-remote
+          cargo test --release --locked -p forgetty-shell-core --lib -- conpty:: notify:: layout:: keys:: osc:: osc52:: fuzzy:: update:: search:: links:: copytext:: paste:: selection:: scrollbar:: bell:: codeblock:: colors:: menu:: ops:: fingerprint:: config:: argv:: confwatch::
+          cargo test --release --locked -p forgetty-remote
 
       - name: Turn on the Japanese and Chinese input methods for the smoke
         # The runner image already has the language packs and Microsoft IME / Pinyin. They only

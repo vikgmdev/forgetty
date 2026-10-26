@@ -20,8 +20,11 @@ const QUIET: Duration = Duration::from_millis(150);
 /// The outcome of one read.
 #[derive(Debug)]
 pub enum Reload {
-    /// The file parsed (or does not exist: then it is the defaults, as at start).
+    /// The file parsed.
     Loaded(Loaded),
+    /// There is no file (it was deleted, or never made). The caller keeps what it has: at start
+    /// that is the defaults, while running it is the last good config.
+    Missing,
     /// The file could not be read or parsed. The text says why and names the file.
     Failed(String),
 }
@@ -44,16 +47,14 @@ impl ConfWatch {
     }
 }
 
-/// Read and parse `path`. A missing file is the defaults.
+/// Read and parse `path`.
 pub fn read(path: &Path) -> Reload {
     match std::fs::read_to_string(path) {
         Ok(text) => match Config::parse(&text) {
             Ok(l) => Reload::Loaded(l),
             Err(e) => Reload::Failed(format!("{}: {e}", path.display())),
         },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Reload::Loaded(Loaded { config: Config::default(), warnings: Vec::new() })
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Reload::Missing,
         Err(e) => Reload::Failed(format!("{}: {e}", path.display())),
     }
 }
@@ -131,13 +132,10 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_file_is_the_defaults_and_a_bad_one_is_a_failure() {
+    fn a_missing_file_is_reported_as_missing_and_a_bad_one_is_a_failure() {
         let d = temp_dir("read");
         let p = d.join("config.toml");
-        match read(&p) {
-            Reload::Loaded(l) => assert_eq!(l.config, Config::default()),
-            other => panic!("{other:?}"),
-        }
+        assert!(matches!(read(&p), Reload::Missing));
         std::fs::write(&p, "bell_mode = \"loud\"").unwrap();
         match read(&p) {
             Reload::Failed(e) => assert!(e.contains("config.toml") && e.contains("loud"), "{e}"),
@@ -189,9 +187,13 @@ mod tests {
         std::fs::write(d.join("machines.json"), "{}").unwrap();
         assert!(next(&w, 1).is_none());
 
+        // The file is deleted: the caller is told, and keeps what it has.
+        std::fs::remove_file(&p).unwrap();
+        assert!(matches!(next(&w, 10), Some(Reload::Missing)));
+
         // The user asks.
         w.reload_now();
-        assert!(matches!(next(&w, 10), Some(Reload::Loaded(_))));
+        assert!(matches!(next(&w, 10), Some(Reload::Missing)));
 
         drop(w);
         let _ = std::fs::remove_dir_all(d);
