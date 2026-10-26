@@ -239,6 +239,16 @@ impl SyncEndpointBuilder {
         alpn_list.push(FORGETTY_PAIRING_ALPN_V1.to_vec());
         alpn_list.extend(self.extra_alpns.keys().cloned());
 
+        // Several addresses on port 0 must share one port: find a port that is
+        // free on every one of them first (the endpoint binds it right after).
+        let bind_port = {
+            let port = self.bind_port.unwrap_or(0);
+            if port == 0 && self.bind_addrs.len() > 1 {
+                common_free_port(&self.bind_addrs)
+            } else {
+                port
+            }
+        };
         let make = |dual: bool| -> Result<iroh::endpoint::Builder, SyncError> {
             let mut builder = if self.relays_disabled {
                 // Nothing of the N0 preset: no relays, no DNS publishing.
@@ -263,12 +273,32 @@ impl SyncEndpointBuilder {
             }
             if !self.bind_addrs.is_empty() {
                 builder = builder.clear_ip_transports();
-                let port = self.bind_port.unwrap_or(0);
-                for ip in &self.bind_addrs {
-                    let sa = std::net::SocketAddr::new(*ip, port);
-                    builder = builder
-                        .bind_addr(sa.to_string().as_str())
-                        .map_err(|e| SyncError::Bind(format!("{sa}: {e}")))?;
+                // iroh 0.97 takes one default socket per IP family
+                // (`bind_addr`), and its duplicate check looks at the sockets
+                // added so far: a default socket may not follow another
+                // user-defined default. Further addresses of a family are
+                // therefore added first, as extra sockets (full-length prefix,
+                // no default route: each one serves its own address only, so
+                // the routing stays defined), and the last address of the
+                // family goes in as the default. Every address gets its own
+                // socket on the same port.
+                for v4 in [true, false] {
+                    let family: Vec<&std::net::IpAddr> =
+                        self.bind_addrs.iter().filter(|ip| ip.is_ipv4() == v4).collect();
+                    for (i, ip) in family.iter().enumerate() {
+                        let sa = std::net::SocketAddr::new(**ip, bind_port);
+                        let result = if i + 1 < family.len() {
+                            builder.bind_addr_with_opts(
+                                sa,
+                                iroh::endpoint::BindOpts::default()
+                                    .set_prefix_len(if v4 { 32 } else { 128 })
+                                    .set_is_default_route(false),
+                            )
+                        } else {
+                            builder.bind_addr(sa.to_string().as_str())
+                        };
+                        builder = result.map_err(|e| SyncError::Bind(format!("{sa}: {e}")))?;
+                    }
                 }
             } else if let Some(port) = self.bind_port {
                 builder = builder
@@ -335,6 +365,20 @@ impl SyncEndpointBuilder {
             event_tx,
         })
     }
+}
+
+/// A UDP port that is free on every one of `addrs` (a few tries), or `0` when
+/// none is found: then each address gets a port of its own.
+fn common_free_port(addrs: &[std::net::IpAddr]) -> u16 {
+    for _ in 0..16 {
+        let Ok(first) = std::net::UdpSocket::bind((addrs[0], 0)) else { return 0 };
+        let Ok(port) = first.local_addr().map(|a| a.port()) else { return 0 };
+        let rest_free = addrs[1..].iter().all(|ip| std::net::UdpSocket::bind((*ip, port)).is_ok());
+        if rest_free {
+            return port;
+        }
+    }
+    0
 }
 
 /// Wrapper around an iroh `Endpoint` that manages the pairing accept loop,

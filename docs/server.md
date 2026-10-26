@@ -315,7 +315,11 @@ relay = "none"
 ```
 
 - `--bind IP` (repeatable) binds the iroh endpoint to these addresses only, on
-  the fixed `--port`. Without it the server binds every address.
+  the fixed `--port`. Without it the server binds every address. Several
+  addresses, also of one IP family (`--bind 10.230.1.14 --bind 10.240.1.112`),
+  each get their own socket on the same port, and the pairing payload lists
+  every one as a direct address. With `--port 0` the server picks one free
+  port for all of them.
 - `--no-relay` (or `relay = "none"`) turns relays off. The server never
   contacts a relay or n0: no relay connection, no address publishing, no
   discovery. It also switches off iroh's port mapping (UPnP, NAT-PMP, PCP), so
