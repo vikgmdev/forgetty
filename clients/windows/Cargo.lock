@@ -1916,6 +1916,7 @@ dependencies = [
  "anyhow",
  "async-channel",
  "forgetty-core",
+ "forgetty-vt",
  "portable-pty",
  "serde",
  "serde_json",

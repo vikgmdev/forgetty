@@ -8,11 +8,13 @@ pub mod conpty;
 pub mod fuzzy;
 pub mod keys;
 pub mod layout;
+pub mod links;
 pub mod local;
 pub mod notify;
 pub mod update;
 pub mod osc;
 pub mod osc52;
+pub mod search;
 pub mod source;
 
 pub use backend::*;
