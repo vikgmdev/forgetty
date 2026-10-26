@@ -110,3 +110,38 @@ fn scan_speed_of_a_big_scrollback() {
     eprintln!("scanned {total} rows x 120 cols in {:?} ({hits} hits)", t0.elapsed());
     assert!(hits > 40_000);
 }
+
+#[test]
+fn rows_stay_inside_the_real_width_after_a_resize() {
+    let mut t = term(6, 40);
+    t.feed(b"first line of text\r\nsecond\r\n");
+    let mut rt = RowText::default();
+    for (rows, cols) in [(6, 80), (8, 20), (3, 7), (6, 200), (6, 40)] {
+        assert!(t.resize(rows, cols));
+        for r in 0..t.scrollbar_state().0 as usize {
+            assert!(t.row_text(r, &mut rt));
+            assert_eq!(*rt.cols.last().unwrap() as usize, cols, "width after resize to {cols}");
+            assert!(rt.cols[..rt.cols.len() - 1].iter().all(|&c| (c as usize) < cols));
+        }
+    }
+}
+
+/// DECCOLM (mode 3, allowed by mode 40) changes the width inside libghostty without a call to
+/// `Terminal::resize`: `row_text` must follow the real width, not the one Rust last set.
+#[test]
+fn rows_stay_inside_the_real_width_after_deccolm() {
+    let mut t = term(5, 80);
+    t.feed(b"\x1b[?40h\x1b[?3hhello");
+    let mut rt = RowText::default();
+    let mut widths = Vec::new();
+    for r in 0..t.scrollbar_state().0 as usize {
+        assert!(t.row_text(r, &mut rt));
+        widths.push(*rt.cols.last().unwrap() as usize);
+        assert!(rt.cols[..rt.cols.len() - 1].iter().all(|&c| (c as usize) < widths[0]));
+    }
+    assert!(widths.iter().all(|&w| w == widths[0]));
+    assert_eq!(widths[0], 132, "libghostty switched to 132 columns");
+    t.feed(b"\x1b[?3l");
+    assert!(t.row_text(t.scrollbar_state().1 as usize, &mut rt));
+    assert_eq!(*rt.cols.last().unwrap(), 80);
+}

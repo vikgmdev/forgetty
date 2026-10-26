@@ -387,25 +387,31 @@ impl Terminal {
         Some((rgb.r, rgb.g, rgb.b))
     }
 
-    /// Resize the terminal to new dimensions.
-    pub fn resize(&mut self, rows: usize, cols: usize) {
-        self.rows = rows;
-        self.cols = cols;
-        // Keep callback state in sync for the SIZE callback.
-        self.callback_state.cols = cols as u16;
-        self.callback_state.rows = rows as u16;
-        unsafe {
+    /// Resize the terminal to new dimensions. Returns false, and changes nothing, when
+    /// libghostty refuses the new size.
+    pub fn resize(&mut self, rows: usize, cols: usize) -> bool {
+        let rc = unsafe {
             ffi::ghostty_terminal_resize(
                 self.handle,
                 cols as u16,
                 rows as u16,
                 self.callback_state.cell_width,
                 self.callback_state.cell_height,
-            );
+            )
+        };
+        if rc != ffi::GHOSTTY_SUCCESS {
+            tracing::warn!("ghostty_terminal_resize({rows}x{cols}) failed: {rc}");
+            return false;
         }
+        self.rows = rows;
+        self.cols = cols;
+        // Keep callback state in sync for the SIZE callback.
+        self.callback_state.cols = cols as u16;
+        self.callback_state.rows = rows as u16;
         let cache = self.cache.get_mut();
         cache.screen.resize(rows, cols);
         cache.screen_dirty = true;
+        true
     }
 
     /// Get the terminal title (set via OSC).
@@ -630,8 +636,15 @@ impl Terminal {
             unsafe { ffi::ghostty_row_get(row, ffi::GHOSTTY_ROW_DATA_WRAP, &mut wrap as *mut bool as *mut c_void) };
             out.wrapped = wrap;
         }
+        // libghostty does not bounds-check `x` in the grid ref calls. The width comes from
+        // libghostty for every call, never from `self.cols`: DECCOLM, or a resize that failed,
+        // can make the two differ.
+        let cols = self.real_cols();
+        if cols == 0 {
+            return false;
+        }
         let mut cps = [0u32; 16];
-        for x in 0..self.cols {
+        for x in 0..cols {
             // The ref names a row of one page; moving `x` stays in that row.
             r.x = x as u16;
             let mut cell: ffi::GhosttyCell = 0;
@@ -679,8 +692,21 @@ impl Terminal {
                 out.cols.push(x as u16);
             }
         }
-        out.cols.push(self.cols as u16);
+        out.cols.push(cols as u16);
         true
+    }
+
+    /// The width of the active screen as libghostty has it now.
+    fn real_cols(&self) -> usize {
+        let mut cols: u16 = 0;
+        let rc = unsafe {
+            ffi::ghostty_terminal_get(self.handle, ffi::GHOSTTY_TERMINAL_DATA_COLS, &mut cols as *mut u16 as *mut c_void)
+        };
+        if rc == ffi::GHOSTTY_SUCCESS {
+            cols as usize
+        } else {
+            0
+        }
     }
 
     /// Total lines: scrollback + visible rows.
