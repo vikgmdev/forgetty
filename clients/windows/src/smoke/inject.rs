@@ -8,9 +8,10 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, POINT};
 use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ActivateKeyboardLayout, GetKeyboardLayout, LoadKeyboardLayoutW, MapVirtualKeyExW, SendInput, HKL, INPUT, INPUT_0,
-    INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KLF_ACTIVATE,
-    MAPVK_VK_TO_VSC, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEINPUT, VIRTUAL_KEY,
+    ActivateKeyboardLayout, GetKeyboardLayout, LoadKeyboardLayoutW, MapVirtualKeyExW, SendInput,
+    HKL, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
+    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KLF_ACTIVATE, MAPVK_VK_TO_VSC, MOUSEEVENTF_LEFTDOWN,
+    MOUSEEVENTF_LEFTUP, MOUSEINPUT, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::SetCursorPos;
 
@@ -53,7 +54,9 @@ pub fn activate_layout(klid: &str) -> Option<isize> {
 }
 
 fn key_event(vk: u16, up: bool, extended: bool, hkl: isize) -> INPUT {
-    let scan = unsafe { MapVirtualKeyExW(vk as u32, MAPVK_VK_TO_VSC, Some(HKL(hkl as *mut c_void))) } as u16;
+    let scan =
+        unsafe { MapVirtualKeyExW(vk as u32, MAPVK_VK_TO_VSC, Some(HKL(hkl as *mut c_void))) }
+            as u16;
     let mut flags = KEYBD_EVENT_FLAGS(0);
     if up {
         flags |= KEYEVENTF_KEYUP;
@@ -63,7 +66,15 @@ fn key_event(vk: u16, up: bool, extended: bool, hkl: isize) -> INPUT {
     }
     INPUT {
         r#type: INPUT_KEYBOARD,
-        Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: VIRTUAL_KEY(vk), wScan: scan, dwFlags: flags, time: 0, dwExtraInfo: 0 } },
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(vk),
+                wScan: scan,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
     }
 }
 
@@ -100,7 +111,9 @@ pub fn move_cursor(x: i32, y: i32) -> bool {
 fn mouse(flags: windows::Win32::UI::Input::KeyboardAndMouse::MOUSE_EVENT_FLAGS) -> INPUT {
     INPUT {
         r#type: INPUT_MOUSE,
-        Anonymous: INPUT_0 { mi: MOUSEINPUT { dx: 0, dy: 0, mouseData: 0, dwFlags: flags, time: 0, dwExtraInfo: 0 } },
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT { dx: 0, dy: 0, mouseData: 0, dwFlags: flags, time: 0, dwExtraInfo: 0 },
+        },
     }
 }
 
@@ -116,7 +129,11 @@ pub const VK_RETURN: u16 = 0x0D;
 
 /// Tap the letters of `word` (a-z).
 pub fn tap_word(hkl: isize, word: &str) -> bool {
-    let steps: Vec<Step> = word.bytes().filter(u8::is_ascii_lowercase).map(|b| Step::Tap(u16::from(b.to_ascii_uppercase()))).collect();
+    let steps: Vec<Step> = word
+        .bytes()
+        .filter(u8::is_ascii_lowercase)
+        .map(|b| Step::Tap(u16::from(b.to_ascii_uppercase())))
+        .collect();
     send_keys(hkl, &steps)
 }
 
@@ -130,14 +147,15 @@ pub fn activate_text_service(langid: u16, clsid: &str, profile: &str) -> Result<
     use windows::core::GUID;
     use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
     use windows::Win32::UI::TextServices::{
-        CLSID_TF_InputProcessorProfiles, ITfInputProcessorProfileMgr, TF_IPPMF_DONTCARECURRENTINPUTLANGUAGE, TF_IPPMF_FORPROCESS,
-        TF_PROFILETYPE_INPUTPROCESSOR,
+        CLSID_TF_InputProcessorProfiles, ITfInputProcessorProfileMgr,
+        TF_IPPMF_DONTCARECURRENTINPUTLANGUAGE, TF_IPPMF_FORPROCESS, TF_PROFILETYPE_INPUTPROCESSOR,
     };
     let clsid = GUID::try_from(clsid).map_err(|e| e.to_string())?;
     let profile = GUID::try_from(profile).map_err(|e| e.to_string())?;
     unsafe {
         let mgr: ITfInputProcessorProfileMgr =
-            CoCreateInstance(&CLSID_TF_InputProcessorProfiles, None, CLSCTX_INPROC_SERVER).map_err(|e| format!("CoCreateInstance: {e}"))?;
+            CoCreateInstance(&CLSID_TF_InputProcessorProfiles, None, CLSCTX_INPROC_SERVER)
+                .map_err(|e| format!("CoCreateInstance: {e}"))?;
         mgr.ActivateProfile(
             TF_PROFILETYPE_INPUTPROCESSOR,
             langid,
@@ -154,8 +172,8 @@ pub fn activate_text_service(langid: u16, clsid: &str, profile: &str) -> Result<
 /// a line saying what Windows reported.
 pub fn ime_open_native(hwnd: HWND) -> String {
     use windows::Win32::UI::Input::Ime::{
-        ImmGetContext, ImmGetOpenStatus, ImmReleaseContext, ImmSetConversionStatus, ImmSetOpenStatus, IME_CMODE_FULLSHAPE,
-        IME_CMODE_NATIVE, IME_SMODE_PHRASEPREDICT,
+        ImmGetContext, ImmGetOpenStatus, ImmReleaseContext, ImmSetConversionStatus,
+        ImmSetOpenStatus, IME_CMODE_FULLSHAPE, IME_CMODE_NATIVE, IME_SMODE_PHRASEPREDICT,
     };
     unsafe {
         let himc = ImmGetContext(hwnd);
@@ -163,7 +181,12 @@ pub fn ime_open_native(hwnd: HWND) -> String {
             return "no input context".into();
         }
         let set = ImmSetOpenStatus(himc, true).as_bool();
-        let mode = ImmSetConversionStatus(himc, IME_CMODE_NATIVE | IME_CMODE_FULLSHAPE, IME_SMODE_PHRASEPREDICT).as_bool();
+        let mode = ImmSetConversionStatus(
+            himc,
+            IME_CMODE_NATIVE | IME_CMODE_FULLSHAPE,
+            IME_SMODE_PHRASEPREDICT,
+        )
+        .as_bool();
         let open = ImmGetOpenStatus(himc).as_bool();
         let _ = ImmReleaseContext(hwnd, himc);
         format!("set_open={set} set_mode={mode} open={open}")

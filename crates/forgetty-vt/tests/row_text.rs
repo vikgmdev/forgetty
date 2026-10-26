@@ -145,3 +145,20 @@ fn rows_stay_inside_the_real_width_after_deccolm() {
     assert!(t.row_text(t.scrollbar_state().1 as usize, &mut rt));
     assert_eq!(*rt.cols.last().unwrap(), 80);
 }
+
+/// A refused resize changes nothing, and `grid_size` says what libghostty really has.
+#[test]
+fn a_refused_resize_leaves_the_grid_as_it_was() {
+    let mut t = term(6, 40);
+    assert_eq!(t.grid_size(), (6, 40));
+    assert!(t.resize(9, 55));
+    assert_eq!(t.grid_size(), (9, 55));
+    // Zero columns and a width past u16 are not grids.
+    assert!(!t.resize(9, 0));
+    assert_eq!(t.grid_size(), (9, 55));
+    assert!(!t.resize(0, 55));
+    assert_eq!(t.grid_size(), (9, 55));
+    // DECCOLM changes the width inside libghostty: grid_size follows it.
+    t.feed(b"\x1b[?40h\x1b[?3h");
+    assert_eq!(t.grid_size().1, 132);
+}

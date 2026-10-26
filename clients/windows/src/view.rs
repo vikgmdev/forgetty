@@ -18,7 +18,8 @@ use forgetty_shell_core::links::{self, Link, LogicalLine};
 use forgetty_shell_core::scrollbar;
 use forgetty_shell_core::search::{self, SearchJob};
 use forgetty_shell_core::selection::{self, AUTOSCROLL_TICK};
-use forgetty_shell_core::{copytext, paste as paste_rules, PaneEvent, PaneId, PaneSource};
+use forgetty_shell_core::copytext::CopyJob;
+use forgetty_shell_core::{paste as paste_rules, PaneEvent, PaneId, PaneSource};
 use forgetty_vt::ffi;
 use forgetty_vt::screen::{CellAttributes, Color};
 use forgetty_vt::{RowText, Screen, Terminal, TerminalEvent};
@@ -205,6 +206,11 @@ pub struct TerminalView {
     pub dim: f32,
     /// Set after a VT reset: the next resize is sent even if the size is unchanged.
     pub force_size: bool,
+    /// libghostty refused this size: do not try it again until the target changes.
+    pub(crate) resize_refused: Option<(usize, usize)>,
+    /// A copy over many rows, read in slices: the job and whether to smart-copy.
+    copy_task: Option<(CopyJob, bool)>,
+    copy_driver: bool,
     /// True from a reset until the replay has drained (or `REPLAY_MAX` passed).
     pub replaying: bool,
     replay_since: Option<Instant>,
@@ -252,6 +258,10 @@ pub struct SearchState {
     /// The scan just finished for a new query: scroll to the current match.
     scroll_now: bool,
     scratch: RowText,
+    /// Scans started from the top (a new query, or a buffer that shrank) and scans that went on
+    /// over new output. The smoke reads them.
+    pub restarts: u32,
+    pub extends: u32,
 }
 
 /// A paste waiting for the user's confirmation (Enter pastes, Esc cancels).
@@ -409,6 +419,9 @@ impl TerminalView {
             layout_changed: false,
             dim: 0.0,
             force_size: false,
+            resize_refused: None,
+            copy_task: None,
+            copy_driver: false,
             replaying: false,
             osc52: Default::default(),
             clip_seen: Default::default(),
@@ -610,20 +623,37 @@ impl TerminalView {
             }
             return;
         }
-        self.rows = rows;
-        self.cols = cols;
+        if self.resize_refused == Some((rows, cols)) {
+            return;
+        }
+        if !self.resize_vt(rows, cols) {
+            return;
+        }
         self.resizes += 1;
-        self.term.resize(rows, cols);
         if std::mem::take(&mut self.force_size) {
             self.source.reassert_size(rows as u16, cols as u16);
         } else {
             self.source.resize(rows as u16, cols as u16);
         }
-        self.row_hash = vec![0; rows];
-        self.rows_shaped = vec![None; rows];
-        self.last_gen = 0;
         self.sel = None;
-        self.layout_changed = true;
+    }
+
+    /// Resize the VT. When libghostty refuses, the view keeps the grid the terminal really has
+    /// (and the PTY keeps the size it had: nothing is sent), and the same target is not tried
+    /// again until the window size changes.
+    fn resize_vt(&mut self, rows: usize, cols: usize) -> bool {
+        let ok = self.term.resize(rows, cols);
+        let (r, c) = if ok { (rows, cols) } else { self.term.grid_size() };
+        self.resize_refused = if ok { None } else { Some((rows, cols)) };
+        if (r, c) != (self.rows, self.cols) || self.row_hash.len() != r {
+            self.rows = r;
+            self.cols = c;
+            self.row_hash = vec![0; r];
+            self.rows_shaped = vec![None; r];
+            self.last_gen = 0;
+            self.layout_changed = true;
+        }
+        ok
     }
 
     /// The server reported a new PTY size for this pane (`PaneResized`). A letterboxed view
@@ -636,15 +666,13 @@ impl TerminalView {
         if rows == self.rows && cols == self.cols {
             return;
         }
-        self.rows = rows;
-        self.cols = cols;
-        self.resizes += 1;
-        self.term.resize(rows, cols);
-        self.row_hash = vec![0; rows];
-        self.rows_shaped = vec![None; rows];
-        self.last_gen = 0;
-        self.sel = None;
-        self.layout_changed = true;
+        if self.resize_refused == Some((rows, cols)) {
+            return;
+        }
+        if self.resize_vt(rows, cols) {
+            self.resizes += 1;
+            self.sel = None;
+        }
         cx.notify();
     }
 
@@ -954,6 +982,8 @@ impl TerminalView {
             driver: false,
             scroll_now: false,
             scratch: RowText::default(),
+            restarts: 0,
+            extends: 0,
         });
         cx.notify();
     }
@@ -1033,6 +1063,7 @@ impl TerminalView {
         let total = self.term.scrollbar_state().0 as usize;
         let Some(st) = self.search.as_mut() else { return };
         st.job = SearchJob::new(&st.edit.text, total);
+        st.restarts += 1;
         st.current = 0;
         st.jump = true;
         st.keep = None;
@@ -1079,11 +1110,25 @@ impl TerminalView {
         let st = self.search.as_mut()?;
         if st.stale && st.started.elapsed() >= SEARCH_RESTART_GAP {
             st.stale = false;
+            st.started = Instant::now();
             if !st.jump {
                 st.keep = st.job.as_ref().and_then(|j| j.matches.get(st.current)).map(|m| (m.row, m.col));
             }
-            st.job = SearchJob::new(&st.edit.text, total);
-            st.started = Instant::now();
+            // New output: the running (or finished) scan goes on over the rows added since it
+            // started, plus the old screen, which changes in place. It is never thrown away
+            // while output keeps coming, so a long scan always completes. A buffer that
+            // shrank (clear, reset) starts a new scan.
+            let screen = self.rows;
+            let extended = st.job.as_mut().is_some_and(|j| {
+                let old_total = j.progress().1;
+                j.extend(total, old_total.saturating_sub(screen))
+            });
+            if extended {
+                st.extends += 1;
+            } else {
+                st.job = SearchJob::new(&st.edit.text, total);
+                st.restarts += 1;
+            }
         }
         let Some(job) = st.job.as_mut() else {
             st.driver = false;
@@ -1582,11 +1627,62 @@ impl TerminalView {
     /// Copy the selection. `smart` strips box-drawing characters as well (trailing spaces and
     /// line endings are always cleaned).
     pub fn copy_selection_as(&mut self, smart: bool, cx: &mut Context<Self>) {
-        if let Some(text) = self.selection_text_as(smart) {
-            if !text.is_empty() {
-                cx.write_to_clipboard(ClipboardItem::new_string(text));
-            }
+        let Some(((r0, c0), (r1, c1))) = self.sel.as_ref().map(|s| s.range()) else { return };
+        let total = self.term.scrollbar_state().0 as usize;
+        let r1 = r1.min(total.saturating_sub(1));
+        if r0 > r1 {
+            return;
         }
+        let mut job = CopyJob::new(r0, c0, r1, c1);
+        // A screen's worth is read in one go. A selection over the scrollback is read in slices
+        // (about 100 ms for 100 000 rows in one go), and goes to the clipboard when it is done.
+        if job.total_rows() <= COPY_INLINE_ROWS {
+            let mut rt = RowText::default();
+            job.step(&mut copy_reader(&self.term, &mut rt), Duration::from_secs(5));
+            write_copy(&job, smart, cx);
+            return;
+        }
+        self.copy_task = Some((job, smart));
+        self.copy_drive(cx);
+    }
+
+    /// The timer task that reads a big copy in slices, if it is not running.
+    fn copy_drive(&mut self, cx: &mut Context<Self>) {
+        if self.copy_driver {
+            return;
+        }
+        self.copy_driver = true;
+        cx.spawn(async move |this, cx| loop {
+            let again = this.update(cx, |v, cx| v.copy_tick(cx));
+            match again {
+                Ok(true) => cx.background_executor().timer(Duration::from_millis(1)).await,
+                _ => break,
+            }
+        })
+        .detach();
+    }
+
+    /// One slice of a big copy. True while more is to come.
+    fn copy_tick(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some((job, smart)) = self.copy_task.as_mut() else {
+            self.copy_driver = false;
+            return false;
+        };
+        let mut rt = RowText::default();
+        if !job.step(&mut copy_reader(&self.term, &mut rt), COPY_SLICE) {
+            return true;
+        }
+        let smart = *smart;
+        if let Some((job, _)) = self.copy_task.take() {
+            write_copy(&job, smart, cx);
+        }
+        self.copy_driver = false;
+        false
+    }
+
+    /// A copy in slices is still running.
+    pub fn copy_pending(&self) -> bool {
+        self.copy_task.is_some()
     }
 
     /// Select what is on screen now (GTK's "Select All" does the same: not the scrollback).
@@ -1923,18 +2019,10 @@ impl TerminalView {
         if r0 > r1 {
             return None;
         }
+        let mut job = CopyJob::new(r0, c0, r1, c1);
         let mut rt = RowText::default();
-        let mut rows: Vec<(String, bool)> = Vec::with_capacity(r1 - r0 + 1);
-        for ar in r0..=r1 {
-            if !self.term.row_text(ar, &mut rt) {
-                continue; // the row is gone (scrollback was trimmed)
-            }
-            let first = if ar == r0 { c0 } else { 0 };
-            let last = if ar == r1 { c1 } else { usize::MAX };
-            rows.push((copytext::slice_cols(&rt.text, &rt.cols, first, last), rt.wrapped));
-        }
-        let joined = copytext::join_rows(&rows);
-        Some(if smart { copytext::smart_copy(&joined) } else { copytext::raw_copy(&joined) })
+        job.step(&mut copy_reader(&self.term, &mut rt), Duration::from_secs(3600));
+        Some(job.finish(smart))
     }
 
     // ---- after paint ---------------------------------------------------------------
@@ -1959,6 +2047,33 @@ impl TerminalView {
             .as_ref()
             .map(|m| m.chars().map(|c| if (c as u32) >= 0x1100 { 2 } else { 1 }).sum())
             .unwrap_or(0)
+    }
+}
+
+/// A selection of this many rows or fewer is copied on the spot.
+const COPY_INLINE_ROWS: usize = 2_000;
+/// Time budget of one slice of a big copy.
+const COPY_SLICE: Duration = Duration::from_millis(4);
+
+/// Reads rows of the terminal for a `CopyJob`: the row's text and columns, and whether it wraps.
+fn copy_reader<'a>(
+    term: &'a Terminal,
+    rt: &'a mut RowText,
+) -> impl FnMut(usize, &mut String, &mut Vec<u16>) -> Option<bool> + 'a {
+    move |ar, text, cols| {
+        if !term.row_text(ar, rt) {
+            return None; // the row is gone (scrollback was trimmed)
+        }
+        std::mem::swap(text, &mut rt.text);
+        std::mem::swap(cols, &mut rt.cols);
+        Some(rt.wrapped)
+    }
+}
+
+fn write_copy(job: &CopyJob, smart: bool, cx: &mut Context<TerminalView>) {
+    let text = job.finish(smart);
+    if !text.is_empty() {
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
     }
 }
 

@@ -38,9 +38,12 @@ fn wsl(distro: &str, args: &[&str]) -> Command {
 
 /// Lines a child prints, kept for the report.
 fn collect(child: &mut Child, sink: &Arc<Mutex<Vec<String>>>) {
-    for stream in [child.stdout.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>), child.stderr.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>)]
-        .into_iter()
-        .flatten()
+    for stream in [
+        child.stdout.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+        child.stderr.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+    ]
+    .into_iter()
+    .flatten()
     {
         let sink = sink.clone();
         std::thread::spawn(move || {
@@ -94,7 +97,11 @@ pub fn stop_server(distro: &str) {
     let _ = wsl(distro, &["pkill", "-TERM", "-f", "forgetty server run"]).output();
     let t0 = Instant::now();
     while t0.elapsed() < Duration::from_secs(6) {
-        let gone = wsl(distro, &["pgrep", "-f", "forgetty server run"]).stdin(Stdio::null()).output().map(|o| !o.status.success()).unwrap_or(true);
+        let gone = wsl(distro, &["pgrep", "-f", "forgetty server run"])
+            .stdin(Stdio::null())
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true);
         if gone {
             return;
         }
@@ -142,7 +149,13 @@ impl ShellSmoke {
     }
 
     /// True once no byte reached `pane` for `quiet`.
-    fn real_quiet(&mut self, shell: &AppShell, cx: &gpui::App, pane: PaneId, quiet: Duration) -> bool {
+    fn real_quiet(
+        &mut self,
+        shell: &AppShell,
+        cx: &gpui::App,
+        pane: PaneId,
+        quiet: Duration,
+    ) -> bool {
         let fed = shell.views.get(&pane).map(|v| v.read(cx).fed_bytes).unwrap_or(0);
         if fed != self.real.fed_last || self.real.fed_t.is_none() {
             self.real.fed_last = fed;
@@ -157,8 +170,13 @@ impl ShellSmoke {
         if self.real.distro.is_empty() {
             return String::new();
         }
-        let mut o = format!("server log: {:?}\n", self.real.server_log.lock().unwrap().iter().rev().take(30).collect::<Vec<_>>());
-        let st = wsl(&self.real.distro, &[BIN, "server", "status", "--json"]).stdin(Stdio::null()).output();
+        let mut o = format!(
+            "server log: {:?}\n",
+            self.real.server_log.lock().unwrap().iter().rev().take(30).collect::<Vec<_>>()
+        );
+        let st = wsl(&self.real.distro, &[BIN, "server", "status", "--json"])
+            .stdin(Stdio::null())
+            .output();
         match st {
             Ok(out) => o.push_str(&format!(
                 "status: {:?} out={} err={}\n",
@@ -194,11 +212,20 @@ impl ShellSmoke {
                 }
             }
         }
-        o.push_str(&format!("server log: {:?}\n", self.real.server_log.lock().unwrap().iter().rev().take(12).collect::<Vec<_>>()));
+        o.push_str(&format!(
+            "server log: {:?}\n",
+            self.real.server_log.lock().unwrap().iter().rev().take(12).collect::<Vec<_>>()
+        ));
         *SCREEN_DUMP.lock().unwrap() = o;
     }
 
-    pub(super) fn real_step(&mut self, shell: &mut AppShell, _window: &mut Window, cx: &mut Context<AppShell>, now_t: Instant) {
+    pub(super) fn real_step(
+        &mut self,
+        shell: &mut AppShell,
+        _window: &mut Window,
+        cx: &mut Context<AppShell>,
+        now_t: Instant,
+    ) {
         // A burst of frames while a phase waits for the network: show why it stuck.
         if self.phase_t0.elapsed() > Duration::from_secs(200) {
             self.real_dump(shell, cx);
@@ -218,7 +245,11 @@ impl ShellSmoke {
                     self.real.last_probe = Some(Instant::now());
                     // The runner can hold the port back (Windows reserves port ranges): the
                     // server exits at once, so try the next port.
-                    let exited = self.real.server.as_mut().is_some_and(|c| c.try_wait().map(|s| s.is_some()).unwrap_or(false));
+                    let exited = self
+                        .real
+                        .server
+                        .as_mut()
+                        .is_some_and(|c| c.try_wait().map(|s| s.is_some()).unwrap_or(false));
                     if exited && self.real.restarts < 8 {
                         self.real.restarts += 1;
                         self.real.port += 13;
@@ -244,7 +275,13 @@ impl ShellSmoke {
                     self.sub = 2;
                 }
                 _ => {
-                    let payload = self.real.pair_log.lock().unwrap().iter().find_map(|l| l.strip_prefix("payload: ").map(str::to_string));
+                    let payload = self
+                        .real
+                        .pair_log
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find_map(|l| l.strip_prefix("payload: ").map(str::to_string));
                     let Some(payload) = payload else { return };
                     self.real.t_pair = Some(Instant::now());
                     shell.pair_hint = format!("127.0.0.1:{}", self.real.port).parse().ok();
@@ -275,10 +312,22 @@ impl ShellSmoke {
                 if !up {
                     return;
                 }
-                record("real_pair_to_panes_ms", json!(ms(self.real.t_pair.map(|t| t.elapsed()).unwrap_or_default())));
-                self.real.panes = shell.layout.workspaces.iter().flat_map(|w| w.tabs.iter().map(|t| t.pane_tree.first_leaf())).take(2).collect();
+                record(
+                    "real_pair_to_panes_ms",
+                    json!(ms(self.real.t_pair.map(|t| t.elapsed()).unwrap_or_default())),
+                );
+                self.real.panes = shell
+                    .layout
+                    .workspaces
+                    .iter()
+                    .flat_map(|w| w.tabs.iter().map(|t| t.pane_tree.first_leaf()))
+                    .take(2)
+                    .collect();
                 check("real_paired_and_two_panes", self.real.panes.len() == 2);
-                check("real_sidebar_lists_machines", shell.machines.len() == 2 && shell.machines[1].kind == MachineKind::Remote);
+                check(
+                    "real_sidebar_lists_machines",
+                    shell.machines.len() == 2 && shell.machines[1].kind == MachineKind::Remote,
+                );
                 self.goto(Phase::RealEcho);
             }
             // ---- type into both panes ---------------------------------------------------------
@@ -287,7 +336,9 @@ impl ShellSmoke {
                 if i >= 2 {
                     let mut isolated = true;
                     for n in 0..2 {
-                        let Some(s) = snap(shell, cx, self.real.panes[n]) else { fail("real pane view vanished") };
+                        let Some(s) = snap(shell, cx, self.real.panes[n]) else {
+                            fail("real pane view vanished")
+                        };
                         for m in 0..2 {
                             let has = s.find_exact(&format!("W4-ECHO-{m}")).is_some();
                             if has != (m == n) {
@@ -297,7 +348,11 @@ impl ShellSmoke {
                     }
                     check("real_echo_2_panes", true);
                     check("real_echo_isolated", isolated);
-                    let resets = self.real.panes.iter().all(|p| shell.views.get(p).is_some_and(|v| v.read(cx).resets >= 1));
+                    let resets = self
+                        .real
+                        .panes
+                        .iter()
+                        .all(|p| shell.views.get(p).is_some_and(|v| v.read(cx).resets >= 1));
                     check("real_vt_reset_on_attach", resets);
                     self.goto(Phase::RealSize);
                     return;
@@ -312,7 +367,9 @@ impl ShellSmoke {
                     view.update(cx, |v, _| v.send_bytes(format!("echo W4-ECHO-{i}\r").as_bytes()));
                     self.sub += 1;
                     self.sub_t0 = Instant::now();
-                } else if snap(shell, cx, p).is_some_and(|s| s.find_exact(&format!("W4-ECHO-{i}")).is_some()) {
+                } else if snap(shell, cx, p)
+                    .is_some_and(|s| s.find_exact(&format!("W4-ECHO-{i}")).is_some())
+                {
                     self.sub += 1;
                     self.real.fed_t = None;
                 }
@@ -337,19 +394,31 @@ impl ShellSmoke {
                     _ => {
                         let got = *self.real.size_probe.lock().unwrap();
                         match got {
-                            Some(sz) if sz == grid || self.sub_t0.elapsed() > Duration::from_secs(10) => {
-                                record("real_size_before_restart", json!({"server": [sz.0, sz.1], "client": [grid.0, grid.1], "visible": visible}));
+                            Some(sz)
+                                if sz == grid
+                                    || self.sub_t0.elapsed() > Duration::from_secs(10) =>
+                            {
+                                record(
+                                    "real_size_before_restart",
+                                    json!({"server": [sz.0, sz.1], "client": [grid.0, grid.1], "visible": visible}),
+                                );
                                 check("real_server_size_equals_client_grid", sz == grid);
                                 self.goto(Phase::RealKeys);
                             }
                             Some(_) => {
                                 // Not equal yet: ask again, five times a second at most.
-                                if self.real.last_probe.map_or(true, |t| t.elapsed() > Duration::from_millis(200)) {
+                                if self
+                                    .real
+                                    .last_probe
+                                    .map_or(true, |t| t.elapsed() > Duration::from_millis(200))
+                                {
                                     self.real.last_probe = Some(Instant::now());
                                     self.probe_size(shell, p0, cx);
                                 }
                             }
-                            None if self.sub_t0.elapsed() > Duration::from_secs(10) => fail("real: get_pane_info never answered"),
+                            None if self.sub_t0.elapsed() > Duration::from_secs(10) => {
+                                fail("real: get_pane_info never answered")
+                            }
                             None => {}
                         }
                     }
@@ -378,7 +447,10 @@ impl ShellSmoke {
                         let Some(pr) = &self.probe else { return };
                         let (done, reshaped) = {
                             let v = view.read(cx);
-                            (v.term.screen().cell(pr.row, pr.col).grapheme.starts_with(pr.ch), v.rows_reshaped_last)
+                            (
+                                v.term.screen().cell(pr.row, pr.col).grapheme.starts_with(pr.ch),
+                                v.rows_reshaped_last,
+                            )
                         };
                         if done {
                             let pr = self.probe.take().unwrap();
@@ -396,7 +468,11 @@ impl ShellSmoke {
                         let cur = view.read(cx).term.cursor();
                         if cur == self.real.cursor {
                             if self.lat_ms.len() >= PROBES {
-                                let (p50, _) = summarize_keys(&self.lat_ms, self.max_reshaped_per_key, "_real");
+                                let (p50, _) = summarize_keys(
+                                    &self.lat_ms,
+                                    self.max_reshaped_per_key,
+                                    "_real",
+                                );
                                 check("real_key_p50_le_30ms", p50 <= 30.0);
                                 self.goto(Phase::RealKill);
                             } else {
@@ -431,7 +507,10 @@ impl ShellSmoke {
                             }
                             return;
                         }
-                        record("real_link_loss_detected_ms", json!(ms(self.real.t_kill.map(|t| t.elapsed()).unwrap_or_default())));
+                        record(
+                            "real_link_loss_detected_ms",
+                            json!(ms(self.real.t_kill.map(|t| t.elapsed()).unwrap_or_default())),
+                        );
                         view.update(cx, |v, _| v.send_bytes(b"OFFLINE-OK"));
                         self.sub = 2;
                         self.sub_t0 = Instant::now();
@@ -453,12 +532,18 @@ impl ShellSmoke {
                 match self.sub {
                     0 => {
                         if self.real.t_ready.is_none() {
-                            if self.real.last_probe.is_some_and(|t| t.elapsed() < Duration::from_millis(300)) {
+                            if self
+                                .real
+                                .last_probe
+                                .is_some_and(|t| t.elapsed() < Duration::from_millis(300))
+                            {
                                 return;
                             }
                             self.real.last_probe = Some(Instant::now());
                             // A server that exited (the port was not free yet) is started again.
-                            let exited = self.real.server.as_mut().is_some_and(|c| c.try_wait().map(|s| s.is_some()).unwrap_or(false));
+                            let exited = self.real.server.as_mut().is_some_and(|c| {
+                                c.try_wait().map(|s| s.is_some()).unwrap_or(false)
+                            });
                             if exited && self.real.restarts < 5 {
                                 self.real.restarts += 1;
                                 self.real_start_server();
@@ -466,7 +551,10 @@ impl ShellSmoke {
                             }
                             if self.real_server_up() {
                                 self.real.t_ready = Some(Instant::now());
-                                record("real_server_restart_ms", json!(ms(self.phase_t0.elapsed())));
+                                record(
+                                    "real_server_restart_ms",
+                                    json!(ms(self.phase_t0.elapsed())),
+                                );
                             }
                             return;
                         }
@@ -485,16 +573,22 @@ impl ShellSmoke {
                         if super::input_lost_bytes(notice.as_deref()).is_some_and(|n| n >= 10) {
                             record("real_input_lost_notice", json!(notice));
                             check("real_input_lost_notice_after_restart", true);
-                            let typed = snap(shell, cx, self.real.panes[0]).is_some_and(|s| s.rows.iter().any(|r| r.contains("OFFLINE-OK")));
+                            let typed = snap(shell, cx, self.real.panes[0])
+                                .is_some_and(|s| s.rows.iter().any(|r| r.contains("OFFLINE-OK")));
                             check("real_typing_during_restart_not_replayed", !typed);
                             // The restarted server reopens the saved byte log under the same pane id, so the
                             // client resumes from its offset and no reset is needed. Record what happened.
-                            record("real_resets_after_restart", json!(view.read(cx).resets - self.real.resets_before));
+                            record(
+                                "real_resets_after_restart",
+                                json!(view.read(cx).resets - self.real.resets_before),
+                            );
                             // Clear the line, then the burst.
                             self.real.fed_t = None;
                             self.goto(Phase::RealBurst);
                         } else if self.sub_t0.elapsed() > Duration::from_secs(30) {
-                            fail(&format!("real: no input-lost notice after the restart (notice: {notice:?})"));
+                            fail(&format!(
+                                "real: no input-lost notice after the restart (notice: {notice:?})"
+                            ));
                         }
                     }
                 }
@@ -511,7 +605,12 @@ impl ShellSmoke {
                         self.real.burst_fed0 = view.read(cx).fed_bytes;
                         self.real.burst_t0 = Some(Instant::now());
                         self.real.burst_last = None;
-                        view.update(cx, |v, _| v.send_bytes(format!("\x15seq 1 {BURST_LINES}; echo BURST-DONE-$((40+2))\r").as_bytes()));
+                        view.update(cx, |v, _| {
+                            v.send_bytes(
+                                format!("\x15seq 1 {BURST_LINES}; echo BURST-DONE-$((40+2))\r")
+                                    .as_bytes(),
+                            )
+                        });
                         self.sub = 1;
                     }
                     _ => {
@@ -522,11 +621,20 @@ impl ShellSmoke {
                             }
                         }
                         self.real.burst_last = Some(now_t);
-                        if snap(shell, cx, p0).is_some_and(|s| s.find_exact("BURST-DONE-42").is_some()) {
-                            let secs = self.real.burst_t0.map(|t| t.elapsed().as_secs_f64()).unwrap_or(1.0);
+                        if snap(shell, cx, p0)
+                            .is_some_and(|s| s.find_exact("BURST-DONE-42").is_some())
+                        {
+                            let secs = self
+                                .real
+                                .burst_t0
+                                .map(|t| t.elapsed().as_secs_f64())
+                                .unwrap_or(1.0);
                             let fed = view.read(cx).fed_bytes - self.real.burst_fed0;
                             record("real_burst_s", json!(secs));
-                            record("real_burst_mb_per_s", json!((fed as f64 / 1e6 / secs * 10.0).round() / 10.0));
+                            record(
+                                "real_burst_mb_per_s",
+                                json!((fed as f64 / 1e6 / secs * 10.0).round() / 10.0),
+                            );
                             record("real_burst_fed_mb", json!(fed as f64 / 1e6));
                             record("real_burst_max_frame_gap_ms", json!(self.real.burst_max_gap));
                             check("real_burst_complete", fed as f64 >= BURST_BYTES * 0.99);
@@ -549,13 +657,21 @@ impl ShellSmoke {
                     return;
                 }
                 // After a restart and a resume the server pane must have the client's grid again.
-                let grid = shell.views.get(&p0).map(|v| (v.read(cx).win_grid.0 as u16, v.read(cx).win_grid.1 as u16)).unwrap_or((0, 0));
+                let grid = shell
+                    .views
+                    .get(&p0)
+                    .map(|v| (v.read(cx).win_grid.0 as u16, v.read(cx).win_grid.1 as u16))
+                    .unwrap_or((0, 0));
                 let got = *self.real.size_probe.lock().unwrap();
                 match got {
                     Some(sz) if sz == grid => {}
                     _ if self.sub_t0.elapsed() > Duration::from_secs(10) => {}
                     Some(_) => {
-                        if self.real.last_probe.map_or(true, |t| t.elapsed() > Duration::from_millis(200)) {
+                        if self
+                            .real
+                            .last_probe
+                            .map_or(true, |t| t.elapsed() > Duration::from_millis(200))
+                        {
                             self.real.last_probe = Some(Instant::now());
                             self.probe_size(shell, p0, cx);
                         }
@@ -563,13 +679,18 @@ impl ShellSmoke {
                     }
                     None => return,
                 }
-                record("real_size_after_restart", json!({"server": got.map(|g| [g.0, g.1]), "client": [grid.0, grid.1]}));
+                record(
+                    "real_size_after_restart",
+                    json!({"server": got.map(|g| [g.0, g.1]), "client": [grid.0, grid.1]}),
+                );
                 check("real_server_size_equals_client_grid_after_restart", got == Some(grid));
                 // The client renders at the PTY size the server reports (letterbox), so both agree.
-                let vt = shell.views.get(&p0).map(|v| (v.read(cx).rows as u16, v.read(cx).cols as u16));
+                let vt =
+                    shell.views.get(&p0).map(|v| (v.read(cx).rows as u16, v.read(cx).cols as u16));
                 check("real_client_vt_is_pty_size", vt == got);
                 let Some(s) = snap(shell, cx, p0) else { fail("real pane view vanished") };
-                let mut mine: Vec<String> = s.rows.iter().map(|r| r.trim_end().to_string()).collect();
+                let mut mine: Vec<String> =
+                    s.rows.iter().map(|r| r.trim_end().to_string()).collect();
                 while mine.last().is_some_and(|r| r.is_empty()) {
                     mine.pop();
                 }
@@ -577,7 +698,9 @@ impl ShellSmoke {
                 // The capture CLI can lose its socket right after the burst on WSL1, so retry a few times and
                 // keep every attempt's error for the report.
                 let mut errs: Vec<String> = Vec::new();
-                let mut out = wsl(&self.real.distro, &[BIN, "capture", "-p", &id, "--trim"]).stdin(Stdio::null()).output();
+                let mut out = wsl(&self.real.distro, &[BIN, "capture", "-p", &id, "--trim"])
+                    .stdin(Stdio::null())
+                    .output();
                 for _ in 0..3 {
                     match &out {
                         Ok(o) if o.status.success() => break,
@@ -585,13 +708,16 @@ impl ShellSmoke {
                         Err(e) => errs.push(e.to_string()),
                     }
                     std::thread::sleep(Duration::from_secs(2));
-                    out = wsl(&self.real.distro, &[BIN, "capture", "-p", &id, "--trim"]).stdin(Stdio::null()).output();
+                    out = wsl(&self.real.distro, &[BIN, "capture", "-p", &id, "--trim"])
+                        .stdin(Stdio::null())
+                        .output();
                 }
                 record("real_capture_attempt_errors", json!(errs));
                 match out {
                     Ok(o) if o.status.success() => {
                         let text = String::from_utf8_lossy(&o.stdout).to_string();
-                        let mut theirs: Vec<String> = text.lines().map(|l| l.trim_end().to_string()).collect();
+                        let mut theirs: Vec<String> =
+                            text.lines().map(|l| l.trim_end().to_string()).collect();
                         while theirs.last().is_some_and(|r| r.is_empty()) {
                             theirs.pop();
                         }
@@ -605,7 +731,10 @@ impl ShellSmoke {
                         }
                     }
                     Ok(o) => {
-                        record("real_capture_error", json!(String::from_utf8_lossy(&o.stderr).to_string()));
+                        record(
+                            "real_capture_error",
+                            json!(String::from_utf8_lossy(&o.stderr).to_string()),
+                        );
                         check("real_final_screen_matches_capture", false);
                     }
                     Err(e) => {
@@ -613,7 +742,18 @@ impl ShellSmoke {
                         check("real_final_screen_matches_capture", false);
                     }
                 }
-                record("real_server_log_tail", json!(self.real.server_log.lock().unwrap().iter().rev().take(15).collect::<Vec<_>>()));
+                record(
+                    "real_server_log_tail",
+                    json!(self
+                        .real
+                        .server_log
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .rev()
+                        .take(15)
+                        .collect::<Vec<_>>()),
+                );
                 // Panics and errors, without the iroh relay probe noise that fills the tail.
                 let key: Vec<String> = self
                     .real
@@ -623,7 +763,12 @@ impl ShellSmoke {
                     .iter()
                     .filter(|l| {
                         let l = l.to_ascii_lowercase();
-                        (l.contains("panic") || l.contains(" error") || l.contains("capture") || l.contains("rpc") || l.contains("socket")) && !l.contains("reportgen")
+                        (l.contains("panic")
+                            || l.contains(" error")
+                            || l.contains("capture")
+                            || l.contains("rpc")
+                            || l.contains("socket"))
+                            && !l.contains("reportgen")
                     })
                     .rev()
                     .take(30)

@@ -81,6 +81,23 @@ impl SearchJob {
         self.matches.len() + self.overflow
     }
 
+    /// Output arrived: the buffer now has `new_total` rows. Keep what the job found in rows
+    /// before `rescan_from` and read again from there (the live screen can change in place, so
+    /// the caller passes the first row of the screen as it was). A running job keeps its place
+    /// when it has not reached that row. Returns false when the job cannot be continued (the
+    /// buffer shrank, or matches were dropped for the cap): the caller starts a new one.
+    pub fn extend(&mut self, new_total: usize, rescan_from: usize) -> bool {
+        if new_total < self.total || self.overflow > 0 {
+            return false;
+        }
+        let from = rescan_from.min(self.total);
+        let keep = self.matches.partition_point(|m| (m.row as usize) < from);
+        self.matches.truncate(keep);
+        self.next = self.next.min(from);
+        self.total = new_total;
+        true
+    }
+
     /// Read rows until the budget is used or the job is done. Returns true when done. At least
     /// one row is read per call, so a zero budget still makes progress.
     pub fn step(&mut self, reader: &mut impl RowReader, budget: Duration) -> bool {
@@ -379,5 +396,51 @@ mod tests {
         let m = job.matches[0];
         assert_eq!((m.col, m.len), (12, 6));
         assert_eq!(t.scrollbar_state().1, off);
+    }
+
+    /// Output arrives while a scan runs: the job goes on from where it is, reads only the rows
+    /// added since, and re-reads the old screen rows (they change in place).
+    #[test]
+    fn extend_reads_only_new_rows_and_the_old_screen() {
+        let mut rows: Vec<String> = (0..100).map(|i| if i % 10 == 0 { format!("hit {i}") } else { format!("row {i}") }).collect();
+        let reads = std::cell::Cell::new(0usize);
+        let rd = |rows: &Vec<String>| {
+            let rows = rows.clone();
+            let reads = &reads;
+            move |abs: usize, text: &mut String, cols: &mut Vec<u16>| {
+                reads.set(reads.get() + 1);
+                text.clear();
+                cols.clear();
+                let Some(r) = rows.get(abs) else { return false };
+                for (i, ch) in r.chars().enumerate() {
+                    text.push(ch);
+                    cols.push(i as u16);
+                }
+                cols.push(r.chars().count() as u16);
+                true
+            }
+        };
+        let mut job = SearchJob::new("hit", 100).unwrap();
+        assert!(job.step(&mut rd(&rows), Duration::from_secs(5)));
+        assert_eq!(job.matches.len(), 10);
+        // 20 rows arrive; the old screen was rows 76..100, and row 90 changed in place.
+        rows[90] = "row 90".into();
+        rows[95] = "now a hit 95".into();
+        rows.extend((100..120).map(|i| if i == 110 { "hit 110".to_string() } else { format!("row {i}") }));
+        reads.set(0);
+        assert!(job.extend(120, 76));
+        assert!(!job.done());
+        assert!(job.step(&mut rd(&rows), Duration::from_secs(5)));
+        assert_eq!(reads.get(), 120 - 76, "only the screen and the new rows are read");
+        let found: Vec<u32> = job.matches.iter().map(|m| m.row).collect();
+        assert_eq!(found, vec![0, 10, 20, 30, 40, 50, 60, 70, 80, 95, 110]);
+        // A running job that has not reached the screen keeps its place.
+        let mut job = SearchJob::new("hit", 100).unwrap();
+        job.step(&mut rd(&rows), Duration::ZERO);
+        let at = job.progress().0;
+        assert!(job.extend(120, 76));
+        assert_eq!(job.progress().0, at.min(76));
+        // A buffer that shrank cannot be continued.
+        assert!(!job.extend(50, 20));
     }
 }

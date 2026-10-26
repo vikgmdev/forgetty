@@ -11,7 +11,10 @@ use std::time::{Duration, Instant};
 
 use forgetty_shell_core::selection::Sel;
 use forgetty_shell_core::{PaneEvent, PaneId, PaneSource};
-use gpui::{point, px, size, AppContext as _, Bounds, Context, Entity, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Window};
+use gpui::{
+    point, px, size, AppContext as _, Bounds, Context, Entity, Modifiers, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Window,
+};
 use serde_json::json;
 
 use super::{check, fail, record, row_text, ShellSmoke};
@@ -104,7 +107,12 @@ impl ShellSmoke {
         }
     }
 
-    pub(super) fn wp1(&mut self, shell: &mut AppShell, window: &mut Window, cx: &mut Context<AppShell>) {
+    pub(super) fn wp1(
+        &mut self,
+        shell: &mut AppShell,
+        window: &mut Window,
+        cx: &mut Context<AppShell>,
+    ) {
         let cfg = &shell.cfg.clone();
         if self.sub_t0.elapsed() > Duration::from_secs(20) {
             fail(&format!("wp1 checks stuck at step {}", self.sub));
@@ -116,7 +124,17 @@ impl ShellSmoke {
                 let input = Arc::new(Mutex::new(Vec::new()));
                 let mut cfg = cfg.clone();
                 cfg.paste_warn_size = 100;
-                let v = cx.new(|cx| TerminalView::new(cfg, PaneId::new(), Box::new(Feed { rx, input }), ROWS, COLS, true, cx));
+                let v = cx.new(|cx| {
+                    TerminalView::new(
+                        cfg,
+                        PaneId::new(),
+                        Box::new(Feed { rx, input }),
+                        ROWS,
+                        COLS,
+                        true,
+                        cx,
+                    )
+                });
                 self.wp1.view = Some(v);
                 self.wp1.tx = Some(tx);
                 let bytes = content();
@@ -135,7 +153,12 @@ impl ShellSmoke {
                     let m = &v.read(cx).metrics;
                     (f32::from(m.cell_w), f32::from(m.line_h))
                 };
-                v.update(cx, |v, _| v.apply_bounds(Bounds::new(point(px(0.0), px(0.0)), size(px(cw * COLS as f32), px(lh * ROWS as f32)))));
+                v.update(cx, |v, _| {
+                    v.apply_bounds(Bounds::new(
+                        point(px(0.0), px(0.0)),
+                        size(px(cw * COLS as f32), px(lh * ROWS as f32)),
+                    ))
+                });
                 self.wp1_geometry_checks(&v, window, cx, (cw, lh));
                 // The find bar: a scan in slices on the timer, the way the app runs it.
                 v.update(cx, |v, vcx| v.search_set("find-me", vcx));
@@ -150,18 +173,27 @@ impl ShellSmoke {
                 }
                 let top = v.read(cx).term.scrollbar_state().1;
                 let spans = v.read(cx).search_spans();
-                record("wp1_search", json!({"found": found, "current": current, "spans": spans.len(), "top": top}));
+                record(
+                    "wp1_search",
+                    json!({"found": found, "current": current, "spans": spans.len(), "top": top}),
+                );
                 // Case-insensitive: "FIND-me" and "FIND-ME" both match "find-me".
                 check("search_finds_every_match_ignoring_case", found == 2);
                 // The first match at or below the viewport is current, and it is in view.
-                check("search_current_is_visible_match", current == 1 && spans.len() == 1 && spans[0].3);
+                check(
+                    "search_current_is_visible_match",
+                    current == 1 && spans.len() == 1 && spans[0].3,
+                );
                 // Enter wraps around to the match in the scrollback and scrolls to it.
                 v.update(cx, |v, vcx| v.search_goto(true, vcx));
                 let (top2, spans2, cur2) = {
                     let r = v.read(cx);
                     (r.term.scrollbar_state().1, r.search_spans(), r.search_status().map(|s| s.2))
                 };
-                check("search_next_scrolls_to_match", cur2 == Some(0) && top2 < top && spans2.len() == 1 && spans2[0].3);
+                check(
+                    "search_next_scrolls_to_match",
+                    cur2 == Some(0) && top2 < top && spans2.len() == 1 && spans2[0].3,
+                );
                 v.update(cx, |v, vcx| v.search_goto(false, vcx));
                 let cur3 = v.read(cx).search_status().map(|s| s.2);
                 check("search_previous_goes_back", cur3 == Some(1));
@@ -202,7 +234,10 @@ impl ShellSmoke {
                 check("bell_rings_after_the_gap", v.read(cx).bells == 2);
                 v.update(cx, |v, _| {
                     v.capture_input = Some(Vec::new());
-                    v.send_keystroke(&super::key("ctrl+c"), forgetty_vt::ffi::GHOSTTY_KEY_ACTION_PRESS);
+                    v.send_keystroke(
+                        &super::key("ctrl+c"),
+                        forgetty_vt::ffi::GHOSTTY_KEY_ACTION_PRESS,
+                    );
                 });
                 self.wp1_send(PaneEvent::Output(b"\x07".to_vec()));
                 self.sub = 104;
@@ -228,7 +263,11 @@ impl ShellSmoke {
                 check("bell_rings_again_after_ctrl_c", v.read(cx).bells == 3);
                 // The mouse tests focused this view, which is not in the window: give the focus
                 // back to the pane the user would be typing in (the SendInput tests need it).
-                if let Some(h) = shell.active_pane().and_then(|p| shell.views.get(&p)).map(|v| v.read(cx).focus.clone()) {
+                if let Some(h) = shell
+                    .active_pane()
+                    .and_then(|p| shell.views.get(&p))
+                    .map(|v| v.read(cx).focus.clone())
+                {
                     window.focus(&h, cx);
                 }
                 self.wp1.view = None;
@@ -241,8 +280,16 @@ impl ShellSmoke {
     }
 
     /// Everything that needs no waiting: links, code block, selection, scrollbar, paste, clear.
-    fn wp1_geometry_checks(&mut self, v: &Entity<TerminalView>, window: &mut Window, cx: &mut Context<AppShell>, (cw, lh): (f32, f32)) {
-        let cell = |row: usize, col: usize| point(px((col as f32 + 0.5) * cw), px((row as f32 + 0.5) * lh));
+    fn wp1_geometry_checks(
+        &mut self,
+        v: &Entity<TerminalView>,
+        window: &mut Window,
+        cx: &mut Context<AppShell>,
+        (cw, lh): (f32, f32),
+    ) {
+        let cell = |row: usize, col: usize| {
+            point(px((col as f32 + 0.5) * cw), px((row as f32 + 0.5) * lh))
+        };
         let rows = v.update(cx, |v, _| rows_of(v));
         let find = |needle: &str| rows.iter().position(|r| r.contains(needle));
         let (Some(r_simple), Some(r_wrap), Some(r_box), Some(r_two)) =
@@ -260,14 +307,34 @@ impl ShellSmoke {
         // ---- links ----
         let c_simple = rows[r_simple].find("example").unwrap_or(5);
         let simple = v.update(cx, |v, _| v.link_at(r_simple, c_simple));
-        check("link_found_and_trailing_punctuation_cut", simple.as_ref().is_some_and(|l| l.url == SIMPLE_URL));
+        check(
+            "link_found_and_trailing_punctuation_cut",
+            simple.as_ref().is_some_and(|l| l.url == SIMPLE_URL),
+        );
         let wrapped = v.update(cx, |v, _| v.link_at(r_wrap + 1, 3));
-        record("wp1_wrapped_link", json!(wrapped.as_ref().map(|l| (l.url.clone(), l.segments.clone()))));
-        check("link_wrapped_over_rows_found_whole", wrapped.as_ref().is_some_and(|l| l.url == WRAPPED_URL && l.segments.len() == 2));
+        record(
+            "wp1_wrapped_link",
+            json!(wrapped.as_ref().map(|l| (l.url.clone(), l.segments.clone()))),
+        );
+        check(
+            "link_wrapped_over_rows_found_whole",
+            wrapped.as_ref().is_some_and(|l| l.url == WRAPPED_URL && l.segments.len() == 2),
+        );
         check("link_none_on_plain_text", v.update(cx, |v, _| v.link_at(r_two, 2)).is_none());
         // Ctrl+click opens it, a plain click does not.
-        let down = |position, modifiers| MouseDownEvent { button: MouseButton::Left, position, modifiers, click_count: 1, first_mouse: false };
-        let up = |position| MouseUpEvent { button: MouseButton::Left, position, modifiers: Modifiers::default(), click_count: 1 };
+        let down = |position, modifiers| MouseDownEvent {
+            button: MouseButton::Left,
+            position,
+            modifiers,
+            click_count: 1,
+            first_mouse: false,
+        };
+        let up = |position| MouseUpEvent {
+            button: MouseButton::Left,
+            position,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+        };
         v.update(cx, |v, vcx| v.on_mouse_down(&down(cell(r_simple, c_simple), none), window, vcx));
         v.update(cx, |v, vcx| v.on_pointer_up(&up(cell(r_simple, c_simple)), vcx));
         check("link_plain_click_does_not_open", v.read(cx).opened_urls.is_empty());
@@ -286,7 +353,11 @@ impl ShellSmoke {
         v.update(cx, |v, vcx| bad.iter().for_each(|u| v.open_link(u, vcx)));
         check("link_other_schemes_refused", v.read(cx).opened_urls.len() == 1);
         // Hover underlines (the pointer must be over the pane) and clears when it leaves.
-        let mv = |position| MouseMoveEvent { position, pressed_button: None, modifiers: Modifiers::default() };
+        let mv = |position| MouseMoveEvent {
+            position,
+            pressed_button: None,
+            modifiers: Modifiers::default(),
+        };
         v.update(cx, |v, vcx| v.on_pointer_move(&mv(cell(r_simple, c_simple)), vcx));
         let spans = v.update(cx, |v, _| v.link_spans());
         check("link_hover_underlines", v.read(cx).hover_link.is_some() && spans.len() == 1);
@@ -297,17 +368,29 @@ impl ShellSmoke {
         let (c0, c1) = (rows[r_box].find('\u{2502}').unwrap_or(0), 5);
         v.update(cx, |v, vcx| v.on_pointer_move(&mv(cell(r_box, c0 + c1)), vcx));
         let block = v.read(cx).hover_block.clone();
-        record("wp1_block", json!(block.as_ref().map(|b| (b.top_row, b.bottom_row, b.left_col, b.right_col))));
+        record(
+            "wp1_block",
+            json!(block.as_ref().map(|b| (b.top_row, b.bottom_row, b.left_col, b.right_col))),
+        );
         check(
             "code_block_found_under_pointer",
-            block.as_ref().is_some_and(|b| b.top_row + 1 == r_box && b.bottom_row == r_box + 2 && b.left_col == 0 && b.right_col == 10),
+            block.as_ref().is_some_and(|b| {
+                b.top_row + 1 == r_box
+                    && b.bottom_row == r_box + 2
+                    && b.left_col == 0
+                    && b.right_col == 10
+            }),
         );
         if let Some(b) = block {
-            let btn = point(px((b.right_col as f32 + 1.0) * cw - 12.0), px(b.top_row as f32 * lh + 12.0));
+            let btn =
+                point(px((b.right_col as f32 + 1.0) * cw - 12.0), px(b.top_row as f32 * lh + 12.0));
             v.update(cx, |v, vcx| v.on_mouse_down(&down(btn, none), window, vcx));
             let clip = cx.read_from_clipboard().and_then(|i| i.text()).unwrap_or_default();
             record("wp1_block_clip", json!(clip));
-            check("code_block_button_copies_inner_text", clip.contains("code(x)") && clip.contains("more") && !clip.contains('\u{2502}'));
+            check(
+                "code_block_button_copies_inner_text",
+                clip.contains("code(x)") && clip.contains("more") && !clip.contains('\u{2502}'),
+            );
         } else {
             check("code_block_button_copies_inner_text", false);
         }
@@ -317,17 +400,34 @@ impl ShellSmoke {
         v.update(cx, |v, vcx| v.select_all(vcx));
         let (range, smart, raw) = v.update(cx, |v, _| {
             let range = v.sel.as_ref().map(|s| s.range());
-            (range, v.selection_text_as(true).unwrap_or_default(), v.selection_text_as(false).unwrap_or_default())
+            (
+                range,
+                v.selection_text_as(true).unwrap_or_default(),
+                v.selection_text_as(false).unwrap_or_default(),
+            )
         });
         let top = v.read(cx).term.scrollbar_state().1 as usize;
-        check("select_all_covers_the_screen", range == Some(((top, 0), (top + ROWS - 1, COLS - 1))));
-        check("smart_copy_strips_box_drawing", smart.contains("code(x)") && !smart.contains('\u{250c}') && !smart.contains('\u{2502}'));
+        check(
+            "select_all_covers_the_screen",
+            range == Some(((top, 0), (top + ROWS - 1, COLS - 1))),
+        );
+        check(
+            "smart_copy_strips_box_drawing",
+            smart.contains("code(x)") && !smart.contains('\u{250c}') && !smart.contains('\u{2502}'),
+        );
         check("raw_copy_keeps_box_drawing", raw.contains('\u{250c}') && raw.contains('\u{2502}'));
         // The two halves of the wrapped URL are one line of text, not two.
         check("copy_joins_soft_wrapped_rows", smart.contains(WRAPPED_URL));
-        v.update(cx, |v, _| v.sel = Some(Sel::new(forgetty_shell_core::selection::SelMode::Normal, (top + 2, 1), (top + 2, 3))));
+        v.update(cx, |v, _| {
+            v.sel = Some(Sel::new(
+                forgetty_shell_core::selection::SelMode::Normal,
+                (top + 2, 1),
+                (top + 2, 3),
+            ))
+        });
         v.update(cx, |v, vcx| v.on_mouse_down(&down(cell(5, 7), shift), window, vcx));
-        let (r, selecting) = v.read(cx).sel.as_ref().map(|s| (s.range(), v.read(cx).selecting)).unwrap_or_default();
+        let (r, selecting) =
+            v.read(cx).sel.as_ref().map(|s| (s.range(), v.read(cx).selecting)).unwrap_or_default();
         check("shift_click_extends_selection", r == ((top + 2, 1), (top + 5, 7)) && !selecting);
         v.update(cx, |v, _| v.sel = None);
 
@@ -335,14 +435,21 @@ impl ShellSmoke {
         v.update(cx, |v, _| v.scroll_rows(-8));
         let off0 = v.read(cx).term.scrollbar_state().1;
         v.update(cx, |v, vcx| v.on_mouse_down(&down(cell(4, 2), none), window, vcx));
-        let head0 = v.read(cx).sel.as_ref().map(|s| s.range().0.0).unwrap_or(0);
-        let drag = MouseMoveEvent { position: point(px(10.0), px(-3.0 * lh)), pressed_button: Some(MouseButton::Left), modifiers: none };
+        let head0 = v.read(cx).sel.as_ref().map(|s| s.range().0 .0).unwrap_or(0);
+        let drag = MouseMoveEvent {
+            position: point(px(10.0), px(-3.0 * lh)),
+            pressed_button: Some(MouseButton::Left),
+            modifiers: none,
+        };
         v.update(cx, |v, vcx| v.on_pointer_move(&drag, vcx));
         v.update(cx, |v, vcx| {
             v.autoscroll_tick(vcx);
             v.autoscroll_tick(vcx);
         });
-        let (off1, head1) = (v.read(cx).term.scrollbar_state().1, v.read(cx).sel.as_ref().map(|s| s.range().0.0).unwrap_or(0));
+        let (off1, head1) = (
+            v.read(cx).term.scrollbar_state().1,
+            v.read(cx).sel.as_ref().map(|s| s.range().0 .0).unwrap_or(0),
+        );
         record("wp1_autoscroll", json!({"off": [off0, off1], "head": [head0, head1]}));
         check("drag_past_top_scrolls_and_extends", off1 < off0 && head1 < head0);
         v.update(cx, |v, vcx| v.on_pointer_up(&up(cell(4, 2)), vcx));
@@ -357,7 +464,10 @@ impl ShellSmoke {
         let thumb = v.read(cx).sb_thumb();
         check("scrollbar_shown_with_scrollback", total > len && thumb.is_some());
         let track = lh * ROWS as f32 + 2.0 * v.read(cx).cfg.pane_padding_y;
-        check("scrollbar_thumb_at_bottom", thumb.is_some_and(|t| (t.top + t.height - track).abs() < 1.0) && off + len == total);
+        check(
+            "scrollbar_thumb_at_bottom",
+            thumb.is_some_and(|t| (t.top + t.height - track).abs() < 1.0) && off + len == total,
+        );
         v.update(cx, |v, vcx| v.scrollbar_drag_to(-1000.0, 0.0, vcx));
         check("scrollbar_drag_to_top", v.read(cx).term.scrollbar_state().1 == 0);
         v.update(cx, |v, vcx| v.scrollbar_drag_to(10_000.0, 0.0, vcx));
@@ -413,7 +523,10 @@ impl ShellSmoke {
         });
         let c2 = v.read(cx).term.cursor_color();
         record("wp1_cursor_color", json!([c, c2]));
-        check("osc12_sets_and_osc112_resets_cursor_color", c == Some((255, 136, 0)) && c2.is_none());
+        check(
+            "osc12_sets_and_osc112_resets_cursor_color",
+            c == Some((255, 136, 0)) && c2.is_none(),
+        );
     }
 
     /// The bells start here: two with a gap, and one that lands inside the rate limit.
@@ -429,9 +542,18 @@ impl ShellSmoke {
 
 impl ShellSmoke {
     /// The find bar and the program notifications on the real ConPTY panes of the 4-pane tab.
-    pub(super) fn wp1_pane(&mut self, shell: &mut AppShell, window: &mut Window, cx: &mut Context<AppShell>) {
+    pub(super) fn wp1_pane(
+        &mut self,
+        shell: &mut AppShell,
+        window: &mut Window,
+        cx: &mut Context<AppShell>,
+    ) {
         let (p0, p1, p3) = (self.panes4[0], self.panes4[1], self.panes4[3]);
-        let (Some(v0), Some(v1), Some(v3)) = (shell.views.get(&p0).cloned(), shell.views.get(&p1).cloned(), shell.views.get(&p3).cloned()) else {
+        let (Some(v0), Some(v1), Some(v3)) = (
+            shell.views.get(&p0).cloned(),
+            shell.views.get(&p1).cloned(),
+            shell.views.get(&p3).cloned(),
+        ) else {
             fail("wp1 pane views vanished")
         };
         if self.sub_t0.elapsed() > Duration::from_secs(12) {
@@ -478,7 +600,9 @@ impl ShellSmoke {
                 self.sub_t0 = Instant::now();
             }
             4 => {
-                if v3.read(cx).fed_bytes < self.wp1.fed || self.sub_t0.elapsed() < Duration::from_millis(300) {
+                if v3.read(cx).fed_bytes < self.wp1.fed
+                    || self.sub_t0.elapsed() < Duration::from_millis(300)
+                {
                     return;
                 }
                 v3.update(cx, |v, vcx| v.search_set("find-me", vcx));
@@ -496,16 +620,27 @@ impl ShellSmoke {
                     let (cw, lh) = (f32::from(v.metrics.cell_w), f32::from(v.metrics.line_h));
                     (rows_of(v), v.bounds, cw, lh)
                 });
-                let Some(r) = rows.iter().position(|t| t.contains("see https://example.com/x")) else {
+                let Some(r) = rows.iter().position(|t| t.contains("see https://example.com/x"))
+                else {
                     record("wp1_shot_rows", json!(rows));
                     check("wp1_shot_content_on_screen", false);
                     self.sub = 7;
                     return;
                 };
                 let c = rows[r].find("example").unwrap_or(8);
-                let pos = point(bounds.origin.x + px((c as f32 + 0.5) * cw), bounds.origin.y + px((r as f32 + 0.5) * lh));
+                let pos = point(
+                    bounds.origin.x + px((c as f32 + 0.5) * cw),
+                    bounds.origin.y + px((r as f32 + 0.5) * lh),
+                );
                 v3.update(cx, |v, vcx| {
-                    v.on_pointer_move(&MouseMoveEvent { position: pos, pressed_button: None, modifiers: Modifiers::default() }, vcx)
+                    v.on_pointer_move(
+                        &MouseMoveEvent {
+                            position: pos,
+                            pressed_button: None,
+                            modifiers: Modifiers::default(),
+                        },
+                        vcx,
+                    )
                 });
                 let (link, block, thumb) = {
                     let v = v3.read(cx);
@@ -525,7 +660,10 @@ impl ShellSmoke {
                 }
                 let r = crate::screenshot::capture(window, WP1_SHOT);
                 match &r {
-                    Ok(s) => record("wp1_screenshot", json!({"file": WP1_SHOT, "w": s.w, "h": s.h, "method": s.method, "distinct_colors": s.distinct, "non_background_pct": s.busy_pct})),
+                    Ok(s) => record(
+                        "wp1_screenshot",
+                        json!({"file": WP1_SHOT, "w": s.w, "h": s.h, "method": s.method, "distinct_colors": s.distinct, "non_background_pct": s.busy_pct}),
+                    ),
                     Err(e) => record("wp1_screenshot", json!({"error": e})),
                 }
                 check("wp1_screenshot", r.as_ref().is_ok_and(|s| s.distinct >= 8));
@@ -535,7 +673,14 @@ impl ShellSmoke {
                 // Back to a quiet pane: the find bar closes, the pointer leaves.
                 v3.update(cx, |v, vcx| {
                     v.close_search(vcx);
-                    v.on_pointer_move(&MouseMoveEvent { position: point(px(-9.0), px(-9.0)), pressed_button: None, modifiers: Modifiers::default() }, vcx);
+                    v.on_pointer_move(
+                        &MouseMoveEvent {
+                            position: point(px(-9.0), px(-9.0)),
+                            pressed_button: None,
+                            modifiers: Modifiers::default(),
+                        },
+                        vcx,
+                    );
                     v.term.scroll_viewport_bottom();
                 });
                 // A program asks for a desktop notification (OSC 9) in a pane the user is not in.
@@ -555,11 +700,17 @@ impl ShellSmoke {
                 }
                 let rec = shell.toast_log[self.wp1.toasts].clone();
                 record("wp1_toast", json!({"title": rec.text.title, "lines": rec.text.lines}));
-                check("local_osc9_raises_toast", rec.pane == p1 && rec.text.lines.first().map(String::as_str) == Some("smoke-ping"));
+                check(
+                    "local_osc9_raises_toast",
+                    rec.pane == p1
+                        && rec.text.lines.first().map(String::as_str) == Some("smoke-ping"),
+                );
                 self.wp1_restore_prompt(&v1, cx);
             }
             3 => {
-                if super::snap(shell, cx, p1).is_some_and(|s| s.at_prompt()) && self.sub_t0.elapsed() > Duration::from_millis(500) {
+                if super::snap(shell, cx, p1).is_some_and(|s| s.at_prompt())
+                    && self.sub_t0.elapsed() > Duration::from_millis(500)
+                {
                     self.goto(super::Phase::Keys4);
                 }
             }

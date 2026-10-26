@@ -712,19 +712,76 @@ impl ShellSmoke {
                     self.sub = 1;
                     return false;
                 }
-                if let Some(last) = self.thr_last {
-                    self.thr_max_gap = self.thr_max_gap.max(ms(now - last));
+                if self.sub == 1 {
+                    if let Some(last) = self.thr_last {
+                        self.thr_max_gap = self.thr_max_gap.max(ms(now - last));
+                    }
+                    self.thr_last = Some(now);
+                    if let Some((true, found, _, scanned)) = v.search_status() {
+                        record(
+                            "search_big_scrollback",
+                            json!({"rows": scanned, "found": found, "ms": ms(now - self.thr_t0), "max_frame_gap_ms": self.thr_max_gap}),
+                        );
+                        check("search_big_scrollback_finds_line", found == 1 && scanned > 5_000);
+                        check("search_does_not_block_frames", self.thr_max_gap <= 100.0);
+                        v.close_search(vcx);
+                        // Copy the whole scrollback: read in slices, frames keep coming.
+                        let total = v.term.scrollbar_state().0 as usize;
+                        let cols = v.cols;
+                        v.sel = Some(crate::view::Sel::new(crate::view::SelMode::Normal, (0, 0), (total - 1, cols - 1)));
+                        vcx.write_to_clipboard(gpui::ClipboardItem::new_string(String::new()));
+                        v.copy_selection_as(true, vcx);
+                        self.thr_t0 = Instant::now();
+                        self.thr_last = None;
+                        self.thr_max_gap = 0.0;
+                        self.sub = 2;
+                    }
+                    return false;
                 }
-                self.thr_last = Some(now);
-                if let Some((true, found, _, scanned)) = v.search_status() {
-                    record(
-                        "search_big_scrollback",
-                        json!({"rows": scanned, "found": found, "ms": ms(now - self.thr_t0), "max_frame_gap_ms": self.thr_max_gap}),
-                    );
-                    check("search_big_scrollback_finds_line", found == 1 && scanned > 5_000);
-                    check("search_does_not_block_frames", self.thr_max_gap <= 100.0);
-                    v.close_search(vcx);
-                    return true;
+                if self.sub == 2 {
+                    if let Some(last) = self.thr_last {
+                        self.thr_max_gap = self.thr_max_gap.max(ms(now - last));
+                    }
+                    self.thr_last = Some(now);
+                    if !v.copy_pending() {
+                        let text = vcx.read_from_clipboard().and_then(|i| i.text()).unwrap_or_default();
+                        let lines = text.lines().count();
+                        record(
+                            "copy_scrollback",
+                            json!({"lines": lines, "bytes": text.len(), "ms": ms(now - self.thr_t0), "max_frame_gap_ms": self.thr_max_gap}),
+                        );
+                        check("copy_scrollback_reaches_clipboard", lines > 5_000 && text.contains("0249999"));
+                        check("copy_scrollback_does_not_block_frames", self.thr_max_gap <= 100.0);
+                        // New output while a scan runs: the scan goes on, it does not start over.
+                        v.search_set("ext-find", vcx);
+                        self.sub = 3;
+                    }
+                    return false;
+                }
+                if self.sub == 3 {
+                    if let Some((true, 0, _, _)) = v.search_status() {
+                        if let Some(tx) = self.p1.and_then(|p| self.local.pty(p)).map(|p| p.injector()) {
+                            let text: String = (0..100).map(|i| format!("ext-find {i}\r\n")).collect();
+                            let _ = tx.try_send(PaneEvent::Output(text.into_bytes()));
+                        } else {
+                            fail("no pty for the first pane");
+                        }
+                        self.thr_t0 = Instant::now();
+                        self.sub = 4;
+                    }
+                    return false;
+                }
+                if self.sub == 4 {
+                    let st = v.search_status();
+                    let (restarts, extends) = v.search.as_ref().map_or((0, 0), |s| (s.restarts, s.extends));
+                    let found = matches!(st, Some((true, 100, _, _)));
+                    if found || self.thr_t0.elapsed() > Duration::from_secs(4) {
+                        record("search_extend", json!({"status": format!("{st:?}"), "restarts": restarts, "extends": extends}));
+                        check("search_goes_on_over_new_output", found && restarts == 1 && extends >= 1);
+                        v.close_search(vcx);
+                        return true;
+                    }
+                    return false;
                 }
             }
             _ => {}

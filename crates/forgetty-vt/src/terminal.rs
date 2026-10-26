@@ -387,6 +387,22 @@ impl Terminal {
         Some((rgb.r, rgb.g, rgb.b))
     }
 
+    /// The grid size libghostty holds now: `(rows, cols)`. It changes when `resize` returns
+    /// true and when a program changes the width itself (DECCOLM). It is read from libghostty,
+    /// so it is the answer after a refused resize too.
+    pub fn grid_size(&self) -> (usize, usize) {
+        let mut rows: u16 = 0;
+        let rc = unsafe {
+            ffi::ghostty_terminal_get(self.handle, ffi::GHOSTTY_TERMINAL_DATA_ROWS, &mut rows as *mut u16 as *mut c_void)
+        };
+        let rows = if rc == ffi::GHOSTTY_SUCCESS { rows as usize } else { self.rows };
+        let cols = match self.real_cols() {
+            0 => self.cols,
+            c => c,
+        };
+        (rows, cols)
+    }
+
     /// Resize the terminal to new dimensions. Returns false, and changes nothing, when
     /// libghostty refuses the new size.
     pub fn resize(&mut self, rows: usize, cols: usize) -> bool {

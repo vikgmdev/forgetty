@@ -72,6 +72,81 @@ pub fn join_rows(rows: &[(String, bool)]) -> String {
     out
 }
 
+/// Copy of a selection over many rows, read in slices so a selection over the whole scrollback
+/// never holds the UI thread (about 100 ms for 100 000 rows in one go). The caller gives it the
+/// row reader and a time budget per slice, as for `search::SearchJob`.
+pub struct CopyJob {
+    r0: usize,
+    c0: usize,
+    r1: usize,
+    c1: usize,
+    next: usize,
+    rows: Vec<(String, bool)>,
+    text: String,
+    cols: Vec<u16>,
+}
+
+impl CopyJob {
+    /// Rows `r0..=r1`, from column `c0` of the first row to column `c1` of the last.
+    pub fn new(r0: usize, c0: usize, r1: usize, c1: usize) -> Self {
+        Self {
+            r0,
+            c0,
+            r1,
+            c1,
+            next: r0,
+            rows: Vec::with_capacity((r1.saturating_sub(r0) + 1).min(200_000)),
+            text: String::new(),
+            cols: Vec::new(),
+        }
+    }
+
+    pub fn done(&self) -> bool {
+        self.next > self.r1
+    }
+
+    /// Rows to read in all.
+    pub fn total_rows(&self) -> usize {
+        self.r1.saturating_sub(self.r0) + 1
+    }
+
+    /// Read rows until the budget is used. `reader` fills the text and the column list of a row
+    /// and returns whether the row soft-wraps, or `None` when the row is gone. At least one row
+    /// is read per call. Returns true when done.
+    pub fn step(
+        &mut self,
+        reader: &mut impl FnMut(usize, &mut String, &mut Vec<u16>) -> Option<bool>,
+        budget: std::time::Duration,
+    ) -> bool {
+        let t0 = std::time::Instant::now();
+        let mut n = 0usize;
+        while self.next <= self.r1 {
+            let ar = self.next;
+            self.next += 1;
+            if let Some(wrapped) = reader(ar, &mut self.text, &mut self.cols) {
+                let first = if ar == self.r0 { self.c0 } else { 0 };
+                let last = if ar == self.r1 { self.c1 } else { usize::MAX };
+                self.rows.push((slice_cols(&self.text, &self.cols, first, last), wrapped));
+            }
+            n += 1;
+            if n % 32 == 0 && t0.elapsed() >= budget {
+                break;
+            }
+        }
+        self.done()
+    }
+
+    /// The text of the rows read so far, cleaned as `smart` says.
+    pub fn finish(&self, smart: bool) -> String {
+        let joined = join_rows(&self.rows);
+        if smart {
+            smart_copy(&joined)
+        } else {
+            raw_copy(&joined)
+        }
+    }
+}
+
 /// Remove leading and trailing lines that hold only white space. Inner blank lines stay.
 pub fn trim_blank_lines(text: &str) -> String {
     let lines: Vec<&str> = text.lines().collect();
@@ -136,5 +211,36 @@ mod tests {
         assert_eq!(trim_blank_lines("hello\n\nworld"), "hello\n\nworld");
         assert_eq!(trim_blank_lines("  \n  "), "");
         assert_eq!(trim_blank_lines(""), "");
+    }
+
+    #[test]
+    fn a_copy_job_in_slices_equals_one_pass() {
+        let rows: Vec<String> = (0..500).map(|i| format!("line {i}   ")).collect();
+        let read = |ar: usize, text: &mut String, cols: &mut Vec<u16>| -> Option<bool> {
+            let r = rows.get(ar)?;
+            text.clear();
+            text.push_str(r);
+            cols.clear();
+            cols.extend(0..=(r.chars().count() as u16));
+            Some(ar % 100 == 99)
+        };
+        let mut one = CopyJob::new(3, 2, 497, 4);
+        assert!(one.step(&mut { read }, std::time::Duration::from_secs(60)));
+        // A zero budget still reads 32 rows per call: many calls, same text.
+        let mut sliced = CopyJob::new(3, 2, 497, 4);
+        let mut calls = 0;
+        while !sliced.step(&mut { read }, std::time::Duration::ZERO) {
+            calls += 1;
+            assert!(calls < 100);
+        }
+        assert!(calls > 3);
+        assert_eq!(sliced.finish(true), one.finish(true));
+        assert_eq!(one.total_rows(), 495);
+        let t = one.finish(true);
+        assert!(t.starts_with("ne 3\n") && t.ends_with("\nline"), "{}", &t[t.len() - 20..]);
+        // A row that is gone is skipped.
+        let mut gone = CopyJob::new(498, 0, 505, 9);
+        assert!(gone.step(&mut { read }, std::time::Duration::from_secs(1)));
+        assert_eq!(gone.finish(false), "line 498\nline 499");
     }
 }

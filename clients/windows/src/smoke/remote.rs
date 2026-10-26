@@ -16,8 +16,8 @@ use forgetty_remote::acl;
 use forgetty_shell_core::{BackendEvent, ConnState, MachineKind, PaneStatus};
 
 use super::*;
-use gpui::AppContext as _;
 use crate::machines::PairStage;
+use gpui::AppContext as _;
 
 const SECRET: &str = "TESTSECRET0000000000000000";
 const PORT: u16 = 47297;
@@ -118,13 +118,48 @@ struct KeyCase {
 /// Dead keys compose through WM_CHAR, and AltGr gives the layout's own character. Keyboard
 /// layout ids (KLID): 0409 US, 20409 US-International, 40C French, 40A Spanish, 407 German.
 const KEY_CASES: &[KeyCase] = &[
-    KeyCase { name: "intl_acute_e", klid: "00020409", steps: &[Step::Tap(inject::VK_OEM_7), Step::Tap(inject::VK_E)], want: "\u{e9}" },
-    KeyCase { name: "intl_acute_space", klid: "00020409", steps: &[Step::Tap(inject::VK_OEM_7), Step::Tap(inject::VK_SPACE)], want: "'" },
-    KeyCase { name: "fr_circumflex_e", klid: "0000040C", steps: &[Step::Tap(inject::VK_OEM_6), Step::Tap(inject::VK_E)], want: "\u{ea}" },
-    KeyCase { name: "es_acute_a", klid: "0000040A", steps: &[Step::Tap(inject::VK_OEM_7), Step::Tap(inject::VK_A)], want: "\u{e1}" },
-    KeyCase { name: "de_acute_a", klid: "00000407", steps: &[Step::Tap(inject::VK_OEM_6), Step::Tap(inject::VK_A)], want: "\u{e1}" },
-    KeyCase { name: "de_altgr_q", klid: "00000407", steps: &[Step::AltGr(inject::VK_Q)], want: "@" },
-    KeyCase { name: "es_altgr_2", klid: "0000040A", steps: &[Step::AltGr(inject::VK_2)], want: "@" },
+    KeyCase {
+        name: "intl_acute_e",
+        klid: "00020409",
+        steps: &[Step::Tap(inject::VK_OEM_7), Step::Tap(inject::VK_E)],
+        want: "\u{e9}",
+    },
+    KeyCase {
+        name: "intl_acute_space",
+        klid: "00020409",
+        steps: &[Step::Tap(inject::VK_OEM_7), Step::Tap(inject::VK_SPACE)],
+        want: "'",
+    },
+    KeyCase {
+        name: "fr_circumflex_e",
+        klid: "0000040C",
+        steps: &[Step::Tap(inject::VK_OEM_6), Step::Tap(inject::VK_E)],
+        want: "\u{ea}",
+    },
+    KeyCase {
+        name: "es_acute_a",
+        klid: "0000040A",
+        steps: &[Step::Tap(inject::VK_OEM_7), Step::Tap(inject::VK_A)],
+        want: "\u{e1}",
+    },
+    KeyCase {
+        name: "de_acute_a",
+        klid: "00000407",
+        steps: &[Step::Tap(inject::VK_OEM_6), Step::Tap(inject::VK_A)],
+        want: "\u{e1}",
+    },
+    KeyCase {
+        name: "de_altgr_q",
+        klid: "00000407",
+        steps: &[Step::AltGr(inject::VK_Q)],
+        want: "@",
+    },
+    KeyCase {
+        name: "es_altgr_2",
+        klid: "0000040A",
+        steps: &[Step::AltGr(inject::VK_2)],
+        want: "@",
+    },
 ];
 
 #[derive(Default)]
@@ -166,31 +201,55 @@ impl ShellSmoke {
         shell.views.get(self.w3.panes.get(i)?).cloned()
     }
 
-    pub(super) fn w3_step(&mut self, shell: &mut AppShell, window: &mut Window, cx: &mut Context<AppShell>, now_t: Instant) {
+    pub(super) fn w3_step(
+        &mut self,
+        shell: &mut AppShell,
+        window: &mut Window,
+        cx: &mut Context<AppShell>,
+        now_t: Instant,
+    ) {
         match self.phase {
             // ---- pair through the dialog's code path ---------------------------------
             Phase::RSetup => match self.sub {
                 0 => {
                     // Pane padding: the grid starts 6 px right of and 4 px below the pane edge.
-                    if let (Some((_, geo)), Some(p)) = (shell.active_geometry(), shell.active_pane()) {
-                        if let (Some(r), Some(v)) = (geo.panes.iter().find(|(q, _)| *q == p).map(|x| x.1), shell.views.get(&p)) {
+                    if let (Some((_, geo)), Some(p)) =
+                        (shell.active_geometry(), shell.active_pane())
+                    {
+                        if let (Some(r), Some(v)) = (
+                            geo.panes.iter().find(|(q, _)| *q == p).map(|x| x.1),
+                            shell.views.get(&p),
+                        ) {
                             let v = v.read(cx);
                             let (ox, oy) = shell.content_origin();
                             let dx = f32::from(v.bounds.origin.x) - (ox + r.x);
                             let dy = f32::from(v.bounds.origin.y) - (oy + r.y);
                             let dw = r.w - f32::from(v.bounds.size.width);
-                            record("pane_padding_px", json!({"left": dx, "top": dy, "width_loss": dw}));
+                            record(
+                                "pane_padding_px",
+                                json!({"left": dx, "top": dy, "width_loss": dw}),
+                            );
                             let (px_, py_) = (v.cfg.pane_padding_x, v.cfg.pane_padding_y);
                             check(
                                 "pane_padding",
-                                (dx - px_).abs() < 0.6 && (dy - py_).abs() < 0.6 && (dw - 2.0 * px_).abs() < 0.6 && px_ == 6.0 && py_ == 4.0,
+                                (dx - px_).abs() < 0.6
+                                    && (dy - py_).abs() < 0.6
+                                    && (dw - 2.0 * px_).abs() < 0.6
+                                    && px_ == 6.0
+                                    && py_ == 4.0,
                             );
                         }
                     }
-                    let exe = std::env::var_os("FORGETTY_TEST_SERVER").map(PathBuf::from).unwrap_or_else(|| {
-                        std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("v2-test-server.exe"))).unwrap_or_default()
-                    });
-                    let key = std::env::temp_dir().join(format!("forgetty-smoke-server-{}.key", std::process::id()));
+                    let exe = std::env::var_os("FORGETTY_TEST_SERVER")
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| {
+                            std::env::current_exe()
+                                .ok()
+                                .and_then(|p| p.parent().map(|d| d.join("v2-test-server.exe")))
+                                .unwrap_or_default()
+                        });
+                    let key = std::env::temp_dir()
+                        .join(format!("forgetty-smoke-server-{}.key", std::process::id()));
                     let _ = std::fs::remove_file(&key);
                     self.w3.exe = exe;
                     self.w3.args = vec![
@@ -216,7 +275,9 @@ impl ShellSmoke {
                     if !srv.ready() {
                         return;
                     }
-                    let (Some(node), Some(addr), Some(qr)) = (srv.value("NODE_ID"), srv.value("ADDR"), srv.value("QR")) else {
+                    let (Some(node), Some(addr), Some(qr)) =
+                        (srv.value("NODE_ID"), srv.value("ADDR"), srv.value("QR"))
+                    else {
                         fail("test server printed READY without NODE_ID, ADDR and QR");
                     };
                     self.w3.node_id = node.clone();
@@ -224,18 +285,23 @@ impl ShellSmoke {
                     self.w3.local_id = Some(shell.machine.id);
                     self.w3.t_start = Some(Instant::now());
                     record("test_server_addr", json!(addr));
-                    let store_empty = shell.remote.as_ref().is_some_and(|r| r.store.machines().is_empty());
+                    let store_empty =
+                        shell.remote.as_ref().is_some_and(|r| r.store.machines().is_empty());
 
                     // Garbage is refused before any dialog.
                     shell.pair_submit_text("this is not a payload", cx);
-                    check("pair_rejects_garbage", matches!(shell.pair.as_ref().map(|d| &d.stage), Some(PairStage::Failed(_))));
+                    check(
+                        "pair_rejects_garbage",
+                        matches!(shell.pair.as_ref().map(|d| &d.stage), Some(PairStage::Failed(_))),
+                    );
 
                     // The clipboard watch: the whole output of `forgetty pair` (QR block, payload line,
                     // status lines) is taken from the clipboard while the dialog waits for text.
                     if let Some(d) = shell.pair.as_mut() {
                         d.stage = PairStage::Input;
                     }
-                    let block: String = (0..30).map(|_| "\u{2588}\u{2580}\u{2584} ".repeat(30) + "\n").collect();
+                    let block: String =
+                        (0..30).map(|_| "\u{2588}\u{2580}\u{2584} ".repeat(30) + "\n").collect();
                     cx.write_to_clipboard(gpui::ClipboardItem::new_string(format!(
                         "{block}\nUse {{the camera}} or paste:\npayload: {qr}\nwaiting for pairing...\n"
                     )));
@@ -252,9 +318,14 @@ impl ShellSmoke {
 
                     // The real payload: parse and show the offer. Nothing is paired yet.
                     shell.pair_hint = addr.parse().ok();
-                    shell.pair_submit_text(&format!("Scan the QR code or paste this payload:\n{qr}\n"), cx);
+                    shell.pair_submit_text(
+                        &format!("Scan the QR code or paste this payload:\n{qr}\n"),
+                        cx,
+                    );
                     let offer_ok = match shell.pair.as_ref().map(|d| &d.stage) {
-                        Some(PairStage::Confirm(o)) => o.machine == "ci-remote" && o.node_short == node[..8],
+                        Some(PairStage::Confirm(o)) => {
+                            o.machine == "ci-remote" && o.node_short == node[..8]
+                        }
                         _ => false,
                     };
                     check("pair_dialog_shows_offer", offer_ok);
@@ -279,16 +350,31 @@ impl ShellSmoke {
                 // connect, so give it a few seconds before judging the store files.
                 let store_ready = shell.remote.as_ref().is_some_and(|r| {
                     let st = &r.store;
-                    [st.identity_path(), st.client_id_path(), st.machines_path(), st.addr_cache_path()]
-                        .iter()
-                        .all(|f| f.exists())
+                    [
+                        st.identity_path(),
+                        st.client_id_path(),
+                        st.machines_path(),
+                        st.addr_cache_path(),
+                    ]
+                    .iter()
+                    .all(|f| f.exists())
                 });
-                if !store_ready && self.w3.t_start.is_some_and(|t| t.elapsed() < Duration::from_secs(10)) {
+                if !store_ready
+                    && self.w3.t_start.is_some_and(|t| t.elapsed() < Duration::from_secs(10))
+                {
                     return;
                 }
-                record("pair_to_panes_ms", json!(ms(self.w3.t_start.map(|t| t.elapsed()).unwrap_or_default())));
+                record(
+                    "pair_to_panes_ms",
+                    json!(ms(self.w3.t_start.map(|t| t.elapsed()).unwrap_or_default())),
+                );
                 let names: Vec<String> = shell.machines.iter().map(|m| m.name.clone()).collect();
-                check("sidebar_lists_machines", names.len() == 2 && names[1] == "ci-remote" && shell.machines[0].kind == MachineKind::Local);
+                check(
+                    "sidebar_lists_machines",
+                    names.len() == 2
+                        && names[1] == "ci-remote"
+                        && shell.machines[0].kind == MachineKind::Local,
+                );
                 self.w3.remote_id = Some(shell.machine.id);
                 // Panes in tab order: tab 0 = server pane 1, tab 1 = server pane 2.
                 self.w3.panes = shell
@@ -302,15 +388,28 @@ impl ShellSmoke {
                 let (stored, files_ok, sddl) = match shell.remote.as_ref() {
                     Some(r) => {
                         let st = &r.store;
-                        let files = [st.identity_path(), st.client_id_path(), st.machines_path(), st.addr_cache_path()];
-                        let ok = files.iter().all(|f| f.exists() && acl::is_user_only(f).unwrap_or(false));
-                        let sddl = acl::describe(&files[0]).unwrap_or_else(|e| format!("error: {e}"));
+                        let files = [
+                            st.identity_path(),
+                            st.client_id_path(),
+                            st.machines_path(),
+                            st.addr_cache_path(),
+                        ];
+                        let ok = files
+                            .iter()
+                            .all(|f| f.exists() && acl::is_user_only(f).unwrap_or(false));
+                        let sddl =
+                            acl::describe(&files[0]).unwrap_or_else(|e| format!("error: {e}"));
                         (st.machines(), ok, sddl)
                     }
                     None => (Vec::new(), false, String::new()),
                 };
                 record("identity_acl", json!(sddl));
-                check("machine_stored", stored.len() == 1 && stored[0].name == "ci-remote" && stored[0].node_id == self.w3.node_id);
+                check(
+                    "machine_stored",
+                    stored.len() == 1
+                        && stored[0].name == "ci-remote"
+                        && stored[0].node_id == self.w3.node_id,
+                );
                 check("store_files_user_only", files_ok);
                 self.goto(Phase::REcho);
             }
@@ -321,7 +420,9 @@ impl ShellSmoke {
                     let tok = |n: usize| format!("W3-ECHO-{n}");
                     let mut isolated = true;
                     for n in 0..2 {
-                        let Some(s) = self.w3.panes.get(n).and_then(|p| snap(shell, cx, *p)) else { fail("remote pane view vanished") };
+                        let Some(s) = self.w3.panes.get(n).and_then(|p| snap(shell, cx, *p)) else {
+                            fail("remote pane view vanished")
+                        };
                         for m in 0..2 {
                             let has = s.rows.iter().any(|r| r.contains(&tok(m)));
                             if has != (m == n) {
@@ -329,7 +430,11 @@ impl ShellSmoke {
                             }
                         }
                     }
-                    let resets = self.w3.panes.iter().all(|p| shell.views.get(p).is_some_and(|v| v.read(cx).resets >= 1));
+                    let resets = self
+                        .w3
+                        .panes
+                        .iter()
+                        .all(|p| shell.views.get(p).is_some_and(|v| v.read(cx).resets >= 1));
                     check("remote_echo_2_panes", true);
                     check("remote_echo_isolated", isolated);
                     check("remote_vt_reset_on_attach", resets);
@@ -347,7 +452,9 @@ impl ShellSmoke {
                         shell.focus_pane(p, window, cx);
                     }
                     let Some(s) = snap(shell, cx, p) else { return };
-                    if (!in_active || shell.active_pane() == Some(p)) && s.rows.iter().any(|r| r.contains("forgetty v2 test server")) {
+                    if (!in_active || shell.active_pane() == Some(p))
+                        && s.rows.iter().any(|r| r.contains("forgetty v2 test server"))
+                    {
                         let Some(view) = shell.views.get(&p).cloned() else { return };
                         view.update(cx, |v, _| v.send_bytes(tok.as_bytes()));
                         self.sub += 1;
@@ -382,7 +489,10 @@ impl ShellSmoke {
                             let v = view.read(cx);
                             (v.term.cursor().1, v.fed_bytes)
                         };
-                        if cc == 0 && fed > self.w3.fed_before && self.sub_t0.elapsed() > Duration::from_millis(100) {
+                        if cc == 0
+                            && fed > self.w3.fed_before
+                            && self.sub_t0.elapsed() > Duration::from_millis(100)
+                        {
                             if self.sub == 1 {
                                 self.lat_ms.clear();
                                 self.max_reshaped_per_key = 0;
@@ -405,7 +515,10 @@ impl ShellSmoke {
                         let (done, reshaped) = {
                             let v = view.read(cx);
                             match &self.probe {
-                                Some(p) => (v.term.screen().cell(p.row, p.col).grapheme.starts_with(p.ch), v.rows_reshaped_last),
+                                Some(p) => (
+                                    v.term.screen().cell(p.row, p.col).grapheme.starts_with(p.ch),
+                                    v.rows_reshaped_last,
+                                ),
                                 None => (false, 0),
                             }
                         };
@@ -416,13 +529,20 @@ impl ShellSmoke {
                         self.lat_ms.push(ms(now_t - p.t0));
                         self.max_reshaped_per_key = self.max_reshaped_per_key.max(reshaped);
                         if self.lat_ms.len() >= PROBES {
-                            let (p50, _) = summarize_keys(&self.lat_ms, self.max_reshaped_per_key, "_remote");
+                            let (p50, _) =
+                                summarize_keys(&self.lat_ms, self.max_reshaped_per_key, "_remote");
                             check("key_p50_remote_le_25ms", p50 <= 25.0);
                             // The server saw the pane's size (the view's grid).
                             let v = view.read(cx);
                             let size = shell.meta.get(&p0).and_then(|m| m.size);
-                            record("remote_pane_size", json!({"view": [v.rows, v.cols], "server": size}));
-                            check("remote_resize_reaches_server", size == Some((v.rows as u16, v.cols as u16)));
+                            record(
+                                "remote_pane_size",
+                                json!({"view": [v.rows, v.cols], "server": size}),
+                            );
+                            check(
+                                "remote_resize_reaches_server",
+                                size == Some((v.rows as u16, v.cols as u16)),
+                            );
                             self.w3.resets_before = v.resets;
                             self.goto(Phase::RKill);
                         } else if self.lat_ms.len() % 20 == 0 {
@@ -454,7 +574,10 @@ impl ShellSmoke {
                             _ => return,
                         };
                         self.w3.since = Some(since);
-                        record("link_loss_detected_ms", json!(ms(self.w3.t_kill.map(|t| t.elapsed()).unwrap_or_default())));
+                        record(
+                            "link_loss_detected_ms",
+                            json!(ms(self.w3.t_kill.map(|t| t.elapsed()).unwrap_or_default())),
+                        );
                         check("no_overlay_before_1s", shell.overlay_text(Instant::now()).is_none());
                         // Typed while the link is down: the client buffers it.
                         view.update(cx, |v, _| v.send_bytes(b"OFFLINE-OK"));
@@ -465,8 +588,14 @@ impl ShellSmoke {
                         if shell.overlay_text(Instant::now()).is_some() {
                             let d = since.elapsed();
                             record("overlay_after_ms", json!(ms(d)));
-                            check("overlay_after_1s", d >= Duration::from_millis(1000) && d < Duration::from_millis(2500));
-                            let label = shell.machines.iter().any(|m| m.kind == MachineKind::Remote && matches!(m.conn, ConnState::Reconnecting { .. }));
+                            check(
+                                "overlay_after_1s",
+                                d >= Duration::from_millis(1000) && d < Duration::from_millis(2500),
+                            );
+                            let label = shell.machines.iter().any(|m| {
+                                m.kind == MachineKind::Remote
+                                    && matches!(m.conn, ConnState::Reconnecting { .. })
+                            });
                             check("sidebar_shows_reconnecting", label);
                             // What the network and resume hooks do.
                             let pokes = shell.net_pokes;
@@ -493,7 +622,10 @@ impl ShellSmoke {
                         if ready && self.w3.t_ready.is_none() {
                             // READY is printed after the server bound its port and started accepting.
                             self.w3.t_ready = Some(Instant::now());
-                            record("server_restart_ready_ms", json!(ms(self.w3.t_spawn.map(|t| t.elapsed()).unwrap_or_default())));
+                            record(
+                                "server_restart_ready_ms",
+                                json!(ms(self.w3.t_spawn.map(|t| t.elapsed()).unwrap_or_default())),
+                            );
                         }
                         let up = ready && shell.active_conn() == Some(&ConnState::Connected);
                         if up {
@@ -501,12 +633,18 @@ impl ShellSmoke {
                             record("reconnect_after_accept_ms", json!(ms(after)));
                             // Target 1 s (the client aborts a dial in flight on a network change and races
                             // attempts). Measured at frame granularity.
-                            check("reconnect_under_1s_after_accept", after < Duration::from_millis(1000));
+                            check(
+                                "reconnect_under_1s_after_accept",
+                                after < Duration::from_millis(1000),
+                            );
                             if let Some(since) = self.w3.since {
                                 record("reconnect_ms", json!(ms(since.elapsed())));
                             }
                             check("reconnected_after_restart", true);
-                            check("overlay_gone_after_reconnect", shell.overlay_text(Instant::now()).is_none());
+                            check(
+                                "overlay_gone_after_reconnect",
+                                shell.overlay_text(Instant::now()).is_none(),
+                            );
                             self.sub = 1;
                             self.sub_t0 = Instant::now();
                         }
@@ -522,7 +660,8 @@ impl ShellSmoke {
                         if super::input_lost_bytes(notice.as_deref()).is_some_and(|n| n >= 10) {
                             record("input_lost_notice_restart", json!(notice));
                             check("input_lost_notice_after_restart", true);
-                            let typed_again = snap(shell, cx, self.w3.panes[0]).is_some_and(|s| s.rows.iter().any(|r| r.contains("OFFLINE-OK")));
+                            let typed_again = snap(shell, cx, self.w3.panes[0])
+                                .is_some_and(|s| s.rows.iter().any(|r| r.contains("OFFLINE-OK")));
                             check("typing_during_restart_not_replayed", !typed_again);
                             let resets = view.read(cx).resets;
                             check("vt_reset_after_restart", resets > self.w3.resets_before);
@@ -533,7 +672,9 @@ impl ShellSmoke {
                     }
                     _ => {
                         let Some(s) = snap(shell, cx, self.w3.panes[0]) else { return };
-                        if s.rows.iter().any(|r| r.contains("AFTER-RESTART")) && !s.rows.iter().any(|r| r.contains("OFFLINE-OK")) {
+                        if s.rows.iter().any(|r| r.contains("AFTER-RESTART"))
+                            && !s.rows.iter().any(|r| r.contains("OFFLINE-OK"))
+                        {
                             check("input_continues_after_restart", true);
                             self.goto(Phase::RToast);
                         }
@@ -589,9 +730,13 @@ impl ShellSmoke {
                     return;
                 }
                 let rec = shell.toast_log[self.w3.toasts_before].clone();
-                record("toast_text", json!({"title": rec.text.title, "lines": rec.text.lines, "target": rec.target}));
+                record(
+                    "toast_text",
+                    json!({"title": rec.text.title, "lines": rec.text.lines, "target": rec.target}),
+                );
                 let ok = rec.machine == remote
-                    && rec.text.lines.first().map(String::as_str) == Some("Waiting for input: needs-input")
+                    && rec.text.lines.first().map(String::as_str)
+                        == Some("Waiting for input: needs-input")
                     && rec.text.lines.iter().any(|l| l == "on ci-remote");
                 check("toast_waiting_off_screen_machine", ok);
                 self.w3.target = rec.target.clone();
@@ -613,14 +758,21 @@ impl ShellSmoke {
                     self.w3.toasts_before = shell.toast_log.len();
                     shell.machine_events(
                         remote,
-                        vec![BackendEvent::StatusChanged { pane_id: want.unwrap(), status: PaneStatus::Failed, message: "x".into() }],
+                        vec![BackendEvent::StatusChanged {
+                            pane_id: want.unwrap(),
+                            status: PaneStatus::Failed,
+                            message: "x".into(),
+                        }],
                         cx,
                     );
                     self.sub = 4;
                     self.sub_t0 = Instant::now();
                 } else if self.sub_t0.elapsed() > Duration::from_secs(5) {
                     check("toast_click_focuses_pane", false);
-                    record("toast_click_debug", json!({"machine_ok": shell.machine.id == remote, "pane": shell.active_pane().map(|p| p.0.to_string())}));
+                    record(
+                        "toast_click_debug",
+                        json!({"machine_ok": shell.machine.id == remote, "pane": shell.active_pane().map(|p| p.0.to_string())}),
+                    );
                     self.finish_w3(shell);
                 }
             }
@@ -636,7 +788,11 @@ impl ShellSmoke {
                 self.w3.toasts_before = shell.toast_log.len();
                 shell.machine_events(
                     remote,
-                    vec![BackendEvent::StatusChanged { pane_id: other, status: PaneStatus::Done, message: "exit 0".into() }],
+                    vec![BackendEvent::StatusChanged {
+                        pane_id: other,
+                        status: PaneStatus::Done,
+                        message: "exit 0".into(),
+                    }],
                     cx,
                 );
                 shell.window_active = true;
@@ -647,8 +803,14 @@ impl ShellSmoke {
             5 => {
                 // `sync` may have reset `window_active`; the decision was made in the call above.
                 let n = shell.toast_log.len() - self.w3.toasts_before.min(shell.toast_log.len());
-                let got = shell.toast_log.last().map(|r| r.text.lines.first().cloned().unwrap_or_default());
-                check("toast_done_window_in_background", n == 1 && got.as_deref() == Some("Finished: exit 0"));
+                let got = shell
+                    .toast_log
+                    .last()
+                    .map(|r| r.text.lines.first().cloned().unwrap_or_default());
+                check(
+                    "toast_done_window_in_background",
+                    n == 1 && got.as_deref() == Some("Finished: exit 0"),
+                );
                 self.sub = 6;
                 self.sub_t0 = Instant::now();
             }
@@ -661,7 +823,11 @@ impl ShellSmoke {
                 self.w3.toasts_before = shell.toast_log.len();
                 shell.machine_events(
                     remote,
-                    vec![BackendEvent::Notification { pane_id: other, title: "build\u{1b}]0;x\u{7}".into(), body: "all\r\ngreen".into() }],
+                    vec![BackendEvent::Notification {
+                        pane_id: other,
+                        title: "build\u{1b}]0;x\u{7}".into(),
+                        body: "all\r\ngreen".into(),
+                    }],
                     cx,
                 );
                 self.sub = 7;
@@ -670,15 +836,28 @@ impl ShellSmoke {
                 let n = shell.toast_log.len() - self.w3.toasts_before.min(shell.toast_log.len());
                 let rec = shell.toast_log.last().cloned();
                 let ok = n == 1
-                    && rec.as_ref().is_some_and(|r| !r.text.title.contains('\u{1b}') && !r.text.lines.iter().any(|l| l.contains('\n') || l.contains('\u{1b}')))
-                    && rec.as_ref().is_some_and(|r| r.text.lines.first().map(String::as_str) == Some("all green"));
+                    && rec.as_ref().is_some_and(|r| {
+                        !r.text.title.contains('\u{1b}')
+                            && !r
+                                .text
+                                .lines
+                                .iter()
+                                .any(|l| l.contains('\n') || l.contains('\u{1b}'))
+                    })
+                    && rec.as_ref().is_some_and(|r| {
+                        r.text.lines.first().map(String::as_str) == Some("all green")
+                    });
                 check("toast_notification_sanitized", ok);
                 // Right away again: rate limited.
                 self.w3.toasts_before = shell.toast_log.len();
                 let other = self.w3.toast_pane.unwrap();
                 shell.machine_events(
                     remote,
-                    vec![BackendEvent::Notification { pane_id: other, title: "again".into(), body: "".into() }],
+                    vec![BackendEvent::Notification {
+                        pane_id: other,
+                        title: "again".into(),
+                        body: "".into(),
+                    }],
                     cx,
                 );
                 check("toast_rate_limited", shell.toast_log.len() == self.w3.toasts_before);
@@ -692,7 +871,11 @@ impl ShellSmoke {
                 }
                 // The Action Center: each toast the shell requested is held there. Windows adds a
                 // toast to the history a moment after `Show`, so wait for it.
-                let want: Vec<(String, String)> = shell.toast_log.iter().map(|r| (r.target.clone(), r.text.title.clone())).collect();
+                let want: Vec<(String, String)> = shell
+                    .toast_log
+                    .iter()
+                    .map(|r| (r.target.clone(), r.text.title.clone()))
+                    .collect();
                 let hist = crate::winsys::action_center();
                 let missing: Vec<&(String, String)> = match &hist {
                     Ok(h) => want.iter().filter(|w| !h.contains(w)).collect(),
@@ -714,7 +897,10 @@ impl ShellSmoke {
                 check("toast_reaches_action_center", !want.is_empty() && missing.is_empty());
                 if let Some(h) = &shell.hooks {
                     let st = &h.stats;
-                    let (shown, failed) = (st.toasts_shown.load(Ordering::SeqCst), st.toasts_failed.load(Ordering::SeqCst));
+                    let (shown, failed) = (
+                        st.toasts_shown.load(Ordering::SeqCst),
+                        st.toasts_failed.load(Ordering::SeqCst),
+                    );
                     record(
                         "windows_hooks",
                         json!({
@@ -726,9 +912,19 @@ impl ShellSmoke {
                             "last_error": st.last_error.lock().map(|e| e.clone()).unwrap_or_default(),
                         }),
                     );
-                    check("toast_requests_processed", shown + failed >= shell.toast_log.len() as u64);
-                    check("net_change_hook_registered", st.net_registered.load(Ordering::SeqCst) && st.net_callbacks.load(Ordering::SeqCst) >= 1);
-                    check("power_resume_hook_registered", st.power_registered.load(Ordering::SeqCst));
+                    check(
+                        "toast_requests_processed",
+                        shown + failed >= shell.toast_log.len() as u64,
+                    );
+                    check(
+                        "net_change_hook_registered",
+                        st.net_registered.load(Ordering::SeqCst)
+                            && st.net_callbacks.load(Ordering::SeqCst) >= 1,
+                    );
+                    check(
+                        "power_resume_hook_registered",
+                        st.power_registered.load(Ordering::SeqCst),
+                    );
                 } else {
                     check("toast_requests_processed", false);
                 }
@@ -740,7 +936,12 @@ impl ShellSmoke {
     /// The server side of what the shell does: snapshot catch-up, the real tab
     /// switch, pane focus, split ratios and labels, each read back from the
     /// layout the server owns.
-    fn w3_server_ops(&mut self, shell: &mut AppShell, window: &mut Window, cx: &mut Context<AppShell>) {
+    fn w3_server_ops(
+        &mut self,
+        shell: &mut AppShell,
+        window: &mut Window,
+        cx: &mut Context<AppShell>,
+    ) {
         let stuck = |this: &Self, what: &str| {
             if this.sub_t0.elapsed() > Duration::from_secs(15) {
                 fail(&format!("remote ops stuck: {what}"));
@@ -759,7 +960,8 @@ impl ShellSmoke {
             }
             1 => {
                 stuck(self, "snapshot");
-                let seen = snap(shell, cx, self.w3.panes[0]).is_some_and(|s| s.rows.iter().any(|r| r.contains("SNAP-OK")));
+                let seen = snap(shell, cx, self.w3.panes[0])
+                    .is_some_and(|s| s.rows.iter().any(|r| r.contains("SNAP-OK")));
                 if view.read(cx).resets > self.w3.resets_before && seen {
                     let top = view.update(cx, |v, _| {
                         v.scroll_rows(-1000);
@@ -769,7 +971,10 @@ impl ShellSmoke {
                     });
                     record("remote_snapshot_top_of_scrollback", json!(top));
                     check("remote_snapshot_resets_vt", true);
-                    check("remote_snapshot_marker_in_scrollback", top.contains("earlier output not loaded"));
+                    check(
+                        "remote_snapshot_marker_in_scrollback",
+                        top.contains("earlier output not loaded"),
+                    );
                     self.sub = 2;
                     self.sub_t0 = Instant::now();
                 }
@@ -780,7 +985,12 @@ impl ShellSmoke {
                 if shell.active_conn() != Some(&ConnState::Connected) {
                     return;
                 }
-                let tabs: Vec<Uuid> = shell.layout.workspaces.iter().flat_map(|w| w.tabs.iter().map(|t| t.id)).collect();
+                let tabs: Vec<Uuid> = shell
+                    .layout
+                    .workspaces
+                    .iter()
+                    .flat_map(|w| w.tabs.iter().map(|t| t.id))
+                    .collect();
                 if tabs.len() < 2 {
                     return;
                 }
@@ -790,7 +1000,12 @@ impl ShellSmoke {
             }
             3 => {
                 stuck(self, "focus_tab");
-                let tabs: Vec<Uuid> = shell.layout.workspaces.iter().flat_map(|w| w.tabs.iter().map(|t| t.id)).collect();
+                let tabs: Vec<Uuid> = shell
+                    .layout
+                    .workspaces
+                    .iter()
+                    .flat_map(|w| w.tabs.iter().map(|t| t.id))
+                    .collect();
                 if shell.active_tab().map(|t| t.id) == tabs.get(1).copied() {
                     check("remote_focus_tab_switches", true);
                     shell.focus_tab(tabs[0], cx);
@@ -813,7 +1028,10 @@ impl ShellSmoke {
                 stuck(self, "split");
                 let Some(tab) = shell.active_tab() else { return };
                 let leaves = tab.pane_tree.leaves();
-                if leaves.len() == 2 && shell.views.contains_key(&leaves[1]) && tab.active_pane_id == Some(leaves[1]) {
+                if leaves.len() == 2
+                    && shell.views.contains_key(&leaves[1])
+                    && tab.active_pane_id == Some(leaves[1])
+                {
                     check("remote_split_focuses_new_pane", true);
                     shell.focus_pane(leaves[0], window, cx);
                     self.sub = 6;
@@ -826,7 +1044,11 @@ impl ShellSmoke {
                 let leaves = tab.pane_tree.leaves();
                 if tab.active_pane_id == leaves.first().copied() {
                     check("remote_set_active_pane_roundtrip", true);
-                    let fut = shell.backend.update_split_ratios(vec![forgetty_shell_core::SplitRatio { pane_id: leaves[0], ratio: 0.3 }]);
+                    let fut =
+                        shell.backend.update_split_ratios(vec![forgetty_shell_core::SplitRatio {
+                            pane_id: leaves[0],
+                            ratio: 0.3,
+                        }]);
                     shell.call(cx, fut, |_, _, _| {});
                     self.sub = 7;
                     self.sub_t0 = Instant::now();
@@ -858,12 +1080,24 @@ impl ShellSmoke {
                     shell.handle_key(&typed(ch), window, cx);
                 }
                 shell.handle_key(&key("enter"), window, cx);
-                let (Some(tab), Some(pane)) = (shell.active_tab().map(|t| t.id), shell.active_pane()) else { return };
+                let (Some(tab), Some(pane)) =
+                    (shell.active_tab().map(|t| t.id), shell.active_pane())
+                else {
+                    return;
+                };
                 let _ = tab;
-                let f1 = shell.backend.set_label(forgetty_shell_core::LabelTarget::Pane, pane.0, "plab".into());
+                let f1 = shell.backend.set_label(
+                    forgetty_shell_core::LabelTarget::Pane,
+                    pane.0,
+                    "plab".into(),
+                );
                 shell.call(cx, f1, |_, _, _| {});
                 let ws = shell.layout.workspaces[0].id;
-                let f2 = shell.backend.set_label(forgetty_shell_core::LabelTarget::Workspace, ws, "wlab".into());
+                let f2 = shell.backend.set_label(
+                    forgetty_shell_core::LabelTarget::Workspace,
+                    ws,
+                    "wlab".into(),
+                );
                 shell.call(cx, f2, |_, _, _| {});
                 self.sub = 9;
                 self.sub_t0 = Instant::now();
@@ -884,7 +1118,10 @@ impl ShellSmoke {
             }
             // "Check for updates" never runs by itself, and a click ends with an answer.
             10 => {
-                check("update_check_idle_until_asked", shell.update == forgetty_shell_core::update::UpdateState::Idle);
+                check(
+                    "update_check_idle_until_asked",
+                    shell.update == forgetty_shell_core::update::UpdateState::Idle,
+                );
                 shell.check_for_updates(cx);
                 self.sub = 11;
                 self.sub_t0 = Instant::now();
@@ -910,8 +1147,18 @@ impl ShellSmoke {
 
 /// Text service profiles of the Microsoft IMEs: (language, CLSID, profile GUID).
 /// (language, CLSID, profile GUID, keyboard layout id of the IME).
-const IME_JA: (u16, &str, &str, &str) = (0x0411, "03B5835F-F03C-411B-9CE2-AA23E1171E36", "A76C93D9-5523-4E90-AAFA-4DB112F9AC76", "E0010411");
-const IME_ZH: (u16, &str, &str, &str) = (0x0804, "81D4E9C9-1D3B-41BC-9E6C-4B40BF79E35E", "FA550B04-5AD7-411F-A5AC-CA038EC515D7", "E00E0804");
+const IME_JA: (u16, &str, &str, &str) = (
+    0x0411,
+    "03B5835F-F03C-411B-9CE2-AA23E1171E36",
+    "A76C93D9-5523-4E90-AAFA-4DB112F9AC76",
+    "E0010411",
+);
+const IME_ZH: (u16, &str, &str, &str) = (
+    0x0804,
+    "81D4E9C9-1D3B-41BC-9E6C-4B40BF79E35E",
+    "FA550B04-5AD7-411F-A5AC-CA038EC515D7",
+    "E00E0804",
+);
 
 impl ShellSmoke {
     /// Real Japanese and Chinese IME through the window's message loop: switch to the text
@@ -930,7 +1177,8 @@ impl ShellSmoke {
                 bounds_calls: v.ime_bounds_calls,
                 bounds_last: v.ime_bounds_last,
                 cursor: v.term.cursor(),
-                input: String::from_utf8_lossy(v.capture_input.as_deref().unwrap_or_default()).to_string(),
+                input: String::from_utf8_lossy(v.capture_input.as_deref().unwrap_or_default())
+                    .to_string(),
                 cell: (f32::from(v.metrics.cell_w), f32::from(v.metrics.line_h)),
             })
         };
@@ -944,7 +1192,10 @@ impl ShellSmoke {
             // then the text service profile.
             let hkl = inject::activate_layout(prof.3);
             let act = inject::activate_text_service(prof.0, prof.1, prof.2);
-            record(&format!("ime_real_{name}_activate"), json!({"layout": hkl.map(|h| format!("{h:x}")), "profile": act.clone().map(|_| "ok".to_string())}));
+            record(
+                &format!("ime_real_{name}_activate"),
+                json!({"layout": hkl.map(|h| format!("{h:x}")), "profile": act.clone().map(|_| "ok".to_string())}),
+            );
         };
         // The layout switch lands through the message loop: wait until the thread has it.
         let on_layout = |want: u16| (inject::current_hkl() & 0xffff) as u16 == want;
@@ -968,19 +1219,28 @@ impl ShellSmoke {
                     return;
                 }
                 check("ime_real_ja_layout_active", on_layout(IME_JA.0));
-                let imm = hwnd.map(inject::ime_open_native).unwrap_or_else(|| "no window handle".into());
+                let imm =
+                    hwnd.map(inject::ime_open_native).unwrap_or_else(|| "no window handle".into());
                 let sent = inject::tap_word(inject::current_hkl(), "nihongo");
-                record("ime_real_ja_typed", json!({"sent": sent, "imm": imm, "hkl": format!("{:x}", inject::current_hkl())}));
+                record(
+                    "ime_real_ja_typed",
+                    json!({"sent": sent, "imm": imm, "hkl": format!("{:x}", inject::current_hkl())}),
+                );
                 self.sub = 82;
                 self.sub_t0 = Instant::now();
             }
             82 => {
                 let st = state(cx);
-                if st.marked.as_deref() != Some("\u{306b}\u{307b}\u{3093}\u{3054}") && !timeout(self) {
+                if st.marked.as_deref() != Some("\u{306b}\u{307b}\u{3093}\u{3054}")
+                    && !timeout(self)
+                {
                     return;
                 }
                 rec("ime_real_ja_composing", &st);
-                check("ime_real_ja_preedit_in_view", st.marked.as_deref() == Some("\u{306b}\u{307b}\u{3093}\u{3054}"));
+                check(
+                    "ime_real_ja_preedit_in_view",
+                    st.marked.as_deref() == Some("\u{306b}\u{307b}\u{3093}\u{3054}"),
+                );
                 // Nothing reaches the pane while composing.
                 check("ime_real_ja_preedit_sends_nothing", st.input.is_empty());
                 // Where the IME put its candidate window: the cursor cell of the pane.
@@ -990,7 +1250,10 @@ impl ShellSmoke {
                         && (y - (ey + st.cell.1 * r as f32)).abs() < 1.5
                         && (h - st.cell.1).abs() < 1.5
                 });
-                check("ime_real_ja_candidate_window_at_cursor_cell", st.bounds_calls > 0 && at_cell);
+                check(
+                    "ime_real_ja_candidate_window_at_cursor_cell",
+                    st.bounds_calls > 0 && at_cell,
+                );
                 // Space asks for candidates: the preedit becomes the first conversion.
                 inject::send_keys(inject::current_hkl(), &[Step::Tap(inject::VK_SPACE)]);
                 self.sub = 83;
@@ -998,7 +1261,10 @@ impl ShellSmoke {
             }
             83 => {
                 let st = state(cx);
-                let converted = st.marked.as_deref().is_some_and(|m| m != "\u{306b}\u{307b}\u{3093}\u{3054}" && m.chars().any(|c| (c as u32) >= 0x4e00));
+                let converted = st.marked.as_deref().is_some_and(|m| {
+                    m != "\u{306b}\u{307b}\u{3093}\u{3054}"
+                        && m.chars().any(|c| (c as u32) >= 0x4e00)
+                });
                 if !converted && !timeout(self) {
                     return;
                 }
@@ -1026,16 +1292,21 @@ impl ShellSmoke {
                     return;
                 }
                 check("ime_real_zh_layout_active", on_layout(IME_ZH.0));
-                let imm = hwnd.map(inject::ime_open_native).unwrap_or_else(|| "no window handle".into());
+                let imm =
+                    hwnd.map(inject::ime_open_native).unwrap_or_else(|| "no window handle".into());
                 let sent = inject::tap_word(inject::current_hkl(), "zhongwen");
-                record("ime_real_zh_typed", json!({"sent": sent, "imm": imm, "hkl": format!("{:x}", inject::current_hkl())}));
+                record(
+                    "ime_real_zh_typed",
+                    json!({"sent": sent, "imm": imm, "hkl": format!("{:x}", inject::current_hkl())}),
+                );
                 self.sub = 86;
                 self.sub_t0 = Instant::now();
             }
             86 => {
                 // Pinyin answers more slowly: wait until the preedit has the whole syllable run.
                 let st = state(cx);
-                let full = st.marked.as_deref().is_some_and(|m| m.replace(['\'', ' '], "") == "zhongwen");
+                let full =
+                    st.marked.as_deref().is_some_and(|m| m.replace(['\'', ' '], "") == "zhongwen");
                 if !full && !timeout(self) {
                     return;
                 }
@@ -1087,7 +1358,13 @@ pub struct W7 {
 
 impl Default for W7 {
     fn default() -> Self {
-        W7 { machine: uuid::Uuid::new_v4(), auto_before: 0, denied_sent: 0, nonce: 0, dropped_before: 0 }
+        W7 {
+            machine: uuid::Uuid::new_v4(),
+            auto_before: 0,
+            denied_sent: 0,
+            nonce: 0,
+            dropped_before: 0,
+        }
     }
 }
 
@@ -1120,8 +1397,14 @@ impl ShellSmoke {
         match self.sub {
             50 => {
                 let id = m;
-                cx.subscribe(&spy, move |s, _v, ev: &crate::view::ViewEvent, cx| s.on_view_event(id, ev, cx)).detach();
-                check("osc52_default_policy_is_ask", shell.osc52.get(&m.to_string()) == Policy::Ask);
+                cx.subscribe(&spy, move |s, _v, ev: &crate::view::ViewEvent, cx| {
+                    s.on_view_event(id, ev, cx)
+                })
+                .detach();
+                check(
+                    "osc52_default_policy_is_ask",
+                    shell.osc52.get(&m.to_string()) == Policy::Ask,
+                );
                 cx.write_to_clipboard(gpui::ClipboardItem::new_string("SENTINEL".to_string()));
                 self.w7.auto_before = self.w5.log.lock().unwrap().len();
                 send(PaneEvent::Output(osc52_seq(&encode_base64(b"first"))));
@@ -1133,8 +1416,14 @@ impl ShellSmoke {
                 if seen(cx).writes < 1 {
                     return;
                 }
-                check("osc52_ask_does_not_copy_before_answer", clip_text(cx).as_deref() == Some("SENTINEL"));
-                check("osc52_ask_shows_prompt", shell.clip_prompt.as_ref().is_some_and(|p| p.machine == m && p.text == "first"));
+                check(
+                    "osc52_ask_does_not_copy_before_answer",
+                    clip_text(cx).as_deref() == Some("SENTINEL"),
+                );
+                check(
+                    "osc52_ask_shows_prompt",
+                    shell.clip_prompt.as_ref().is_some_and(|p| p.machine == m && p.text == "first"),
+                );
                 self.w7.nonce = shell.clip_prompt.as_ref().map(|p| p.nonce).unwrap_or(0);
                 self.w7.dropped_before = shell.clip_stats.dropped_while_prompt;
                 send(PaneEvent::Output(osc52_seq(&encode_base64(b"swap"))));
@@ -1149,19 +1438,37 @@ impl ShellSmoke {
                 let Some(p) = shell.clip_prompt.clone() else { fail("osc52: the prompt vanished") };
                 check(
                     "osc52_prompt_not_swapped_by_later_request",
-                    p.text == "first" && p.nonce == self.w7.nonce && shell.clip_stats.dropped_while_prompt == self.w7.dropped_before + 1,
+                    p.text == "first"
+                        && p.nonce == self.w7.nonce
+                        && shell.clip_stats.dropped_while_prompt == self.w7.dropped_before + 1,
                 );
                 let ignored_before = shell.clip_stats.answers_ignored;
-                shell.clip_answer_at(true, p.nonce + 1, p.shown_at + Duration::from_millis(600), cx);
-                let stale_ignored = shell.clip_prompt.is_some() && shell.clip_stats.answers_ignored == ignored_before + 1;
+                shell.clip_answer_at(
+                    true,
+                    p.nonce + 1,
+                    p.shown_at + Duration::from_millis(600),
+                    cx,
+                );
+                let stale_ignored = shell.clip_prompt.is_some()
+                    && shell.clip_stats.answers_ignored == ignored_before + 1;
                 check("osc52_answer_with_wrong_nonce_ignored", stale_ignored);
                 shell.clip_answer_at(true, p.nonce, p.shown_at + Duration::from_millis(100), cx);
-                let early_ignored = shell.clip_prompt.is_some() && shell.clip_stats.answers_ignored == ignored_before + 2;
-                check("osc52_click_in_first_500ms_ignored", early_ignored && clip_text(cx).as_deref() == Some("SENTINEL"));
+                let early_ignored = shell.clip_prompt.is_some()
+                    && shell.clip_stats.answers_ignored == ignored_before + 2;
+                check(
+                    "osc52_click_in_first_500ms_ignored",
+                    early_ignored && clip_text(cx).as_deref() == Some("SENTINEL"),
+                );
                 shell.clip_answer_at(true, p.nonce, p.shown_at + Duration::from_millis(600), cx);
                 check("osc52_allow_copies", clip_text(cx).as_deref() == Some("first"));
-                check("osc52_answer_remembered", shell.osc52.get(&m.to_string()) == Policy::Allow && shell.clip_prompt.is_none());
-                let on_disk = shell.remote.as_ref().map(|r| Policies::open(r.store.dir()).get(&m.to_string()));
+                check(
+                    "osc52_answer_remembered",
+                    shell.osc52.get(&m.to_string()) == Policy::Allow && shell.clip_prompt.is_none(),
+                );
+                let on_disk = shell
+                    .remote
+                    .as_ref()
+                    .map(|r| Policies::open(r.store.dir()).get(&m.to_string()));
                 check("osc52_answer_persisted", on_disk == Some(Policy::Allow));
                 send(PaneEvent::Output(osc52_seq(&encode_base64(b"second"))));
                 self.sub = 53;
@@ -1173,7 +1480,10 @@ impl ShellSmoke {
                 if seen(cx).writes < 3 {
                     return;
                 }
-                check("osc52_allow_needs_no_prompt", shell.clip_prompt.is_none() && clip_text(cx).as_deref() == Some("second"));
+                check(
+                    "osc52_allow_needs_no_prompt",
+                    shell.clip_prompt.is_none() && clip_text(cx).as_deref() == Some("second"),
+                );
                 shell.open_pair(cx);
                 let offer = format!("Scan or paste:\npayload: {}\n", self.w3.qr_text);
                 send(PaneEvent::Output(osc52_seq(&encode_base64(offer.as_bytes()))));
@@ -1198,7 +1508,10 @@ impl ShellSmoke {
                 cx.write_to_clipboard(gpui::ClipboardItem::new_string(user_text));
                 shell.pair_clipboard_tick(cx);
                 let (input, prefilled) = match shell.pair.as_ref() {
-                    Some(d) => (matches!(d.stage, PairStage::Input), d.prefill.as_ref().is_some_and(|(_, o)| o.machine == "ci-remote")),
+                    Some(d) => (
+                        matches!(d.stage, PairStage::Input),
+                        d.prefill.as_ref().is_some_and(|(_, o)| o.machine == "ci-remote"),
+                    ),
                     None => (false, false),
                 };
                 check("pair_user_copy_is_offered_not_submitted", input && prefilled);
@@ -1214,7 +1527,10 @@ impl ShellSmoke {
                 if seen(cx).writes < 5 {
                     return;
                 }
-                check("osc52_off_drops", clip_text(cx).as_deref() == Some("second") && shell.clip_prompt.is_none());
+                check(
+                    "osc52_off_drops",
+                    clip_text(cx).as_deref() == Some("second") && shell.clip_prompt.is_none(),
+                );
                 shell.set_clip_policy(m, Policy::Allow, None, cx);
                 // A read is never answered, and even `allow` does not make it a write.
                 send(PaneEvent::Output(b"\x1b]52;c;?\x1b\\".to_vec()));
@@ -1229,7 +1545,11 @@ impl ShellSmoke {
                 if self.sub_t0.elapsed() < Duration::from_millis(400) {
                     return;
                 }
-                check("osc52_read_never_answered", self.w5.log.lock().unwrap().len() == self.w7.auto_before && clip_text(cx).as_deref() == Some("second"));
+                check(
+                    "osc52_read_never_answered",
+                    self.w5.log.lock().unwrap().len() == self.w7.auto_before
+                        && clip_text(cx).as_deref() == Some("second"),
+                );
                 // More than 1 MiB is dropped, exactly 1 MiB is not.
                 send(PaneEvent::Output(osc52_seq(&encode_base64(&vec![b'a'; MAX_BYTES + 1]))));
                 self.sub = 57;
@@ -1248,7 +1568,10 @@ impl ShellSmoke {
                 if seen(cx).writes < 6 {
                     return;
                 }
-                check("osc52_exactly_1mib_copied", clip_text(cx).is_some_and(|t| t.len() == MAX_BYTES));
+                check(
+                    "osc52_exactly_1mib_copied",
+                    clip_text(cx).is_some_and(|t| t.len() == MAX_BYTES),
+                );
                 // Cleaned like a paste: escapes and bells go, line breaks stay.
                 send(PaneEvent::Output(osc52_seq(&encode_base64(b"ls\x1b[31m\x07 -la\r\nok\x7f"))));
                 self.sub = 59;
@@ -1258,7 +1581,10 @@ impl ShellSmoke {
                 if seen(cx).writes < 7 {
                     return;
                 }
-                check("osc52_text_sanitized_like_paste", clip_text(cx).as_deref() == Some("ls[31m -la\r\nok"));
+                check(
+                    "osc52_text_sanitized_like_paste",
+                    clip_text(cx).as_deref() == Some("ls[31m -la\r\nok"),
+                );
                 // A replay (after a reset) re-runs old output: it must not touch the clipboard.
                 send(PaneEvent::Reset { rows: 10, cols: 40, exact_replay: false });
                 send(PaneEvent::Output(osc52_seq(&encode_base64(b"from a replay"))));
@@ -1269,7 +1595,10 @@ impl ShellSmoke {
                 if seen(cx).replayed < 1 {
                     return;
                 }
-                check("osc52_replay_does_not_copy", clip_text(cx).as_deref() == Some("ls[31m -la\r\nok") && seen(cx).writes == 7);
+                check(
+                    "osc52_replay_does_not_copy",
+                    clip_text(cx).as_deref() == Some("ls[31m -la\r\nok") && seen(cx).writes == 7,
+                );
                 // Back to ask. The replay ends when the channel drains: then output is live again.
                 shell.set_clip_policy(m, Policy::Ask, None, cx);
                 self.sub = 61;
@@ -1291,12 +1620,24 @@ impl ShellSmoke {
                 let pv = shell.clip_prompt.as_ref().map(|p| p.preview.clone());
                 check(
                     "osc52_prompt_flags_trailing_enter",
-                    pv.as_ref().is_some_and(|p| p.ends_with_enter && p.lines == 1 && p.bytes == 8 && p.head == vec!["echo hi\u{23ce}".to_string()]),
+                    pv.as_ref().is_some_and(|p| {
+                        p.ends_with_enter
+                            && p.lines == 1
+                            && p.bytes == 8
+                            && p.head == vec!["echo hi\u{23ce}".to_string()]
+                    }),
                 );
-                check("osc52_ask_prompts_again_after_reset_to_ask", shell.clip_prompt.as_ref().is_some_and(|p| p.text == "echo hi\n"));
+                check(
+                    "osc52_ask_prompts_again_after_reset_to_ask",
+                    shell.clip_prompt.as_ref().is_some_and(|p| p.text == "echo hi\n"),
+                );
                 let p = shell.clip_prompt.clone().unwrap_or_else(|| fail("osc52: no prompt"));
                 shell.clip_answer_at(false, p.nonce, p.shown_at + Duration::from_millis(600), cx);
-                check("osc52_deny_remembered_as_off", shell.osc52.get(&m.to_string()) == Policy::Off && clip_text(cx).as_deref() == Some("ls[31m -la\r\nok"));
+                check(
+                    "osc52_deny_remembered_as_off",
+                    shell.osc52.get(&m.to_string()) == Policy::Off
+                        && clip_text(cx).as_deref() == Some("ls[31m -la\r\nok"),
+                );
                 let st = shell.clip_stats;
                 record(
                     "osc52_stats",
@@ -1339,12 +1680,18 @@ impl ShellSmoke {
                 let mut cand_ok = true;
                 let mut ranges_ok = true;
                 // Composition grows: each step replaces the preedit.
-                for (text, cells, units) in [("\u{306b}", 2usize, 1usize), ("\u{306b}\u{307b}", 4, 2), ("\u{306b}\u{307b}\u{3093}", 6, 3), ("\u{20bb7}a", 3, 3)] {
+                for (text, cells, units) in [
+                    ("\u{306b}", 2usize, 1usize),
+                    ("\u{306b}\u{307b}", 4, 2),
+                    ("\u{306b}\u{307b}\u{3093}", 6, 3),
+                    ("\u{20bb7}a", 3, 3),
+                ] {
                     let b = spy.update(cx, |v, cx| {
                         v.replace_and_mark_text_in_range(None, text, None, window, cx);
                         let r = v.marked_text_range(window, cx);
                         ranges_ok &= r == Some(0..units);
-                        ranges_ok &= v.selected_text_range(false, window, cx).map(|s| s.range) == Some(units..units);
+                        ranges_ok &= v.selected_text_range(false, window, cx).map(|s| s.range)
+                            == Some(units..units);
                         v.bounds_for_range(0..units, eb, window, cx)
                     });
                     match b {
@@ -1359,18 +1706,35 @@ impl ShellSmoke {
                 }
                 check("ime_composition_marks_preedit", ranges_ok);
                 check("ime_candidate_window_at_cursor_cell", cand_ok);
-                check("ime_composition_sends_nothing", self.w5.log.lock().unwrap().len() == sent_before);
+                check(
+                    "ime_composition_sends_nothing",
+                    self.w5.log.lock().unwrap().len() == sent_before,
+                );
                 // Cancel (Esc in the IME): the preedit goes, nothing is sent.
                 spy.update(cx, |v, cx| v.unmark_text(window, cx));
-                check("ime_cancel_clears_preedit", spy.read(cx).marked.is_none() && self.w5.log.lock().unwrap().len() == sent_before);
+                check(
+                    "ime_cancel_clears_preedit",
+                    spy.read(cx).marked.is_none()
+                        && self.w5.log.lock().unwrap().len() == sent_before,
+                );
                 // Commit: the composed text goes to the pane once, as typed input (not auto).
                 spy.update(cx, |v, cx| {
-                    v.replace_and_mark_text_in_range(None, "\u{306b}\u{307b}\u{3093}", None, window, cx);
+                    v.replace_and_mark_text_in_range(
+                        None,
+                        "\u{306b}\u{307b}\u{3093}",
+                        None,
+                        window,
+                        cx,
+                    );
                     v.replace_text_in_range(None, "\u{65e5}\u{672c}\u{8a9e}", window, cx);
                 });
                 let log = self.w5.log.lock().unwrap().clone();
                 let last = log.last().cloned();
-                check("ime_commit_sends_text_once", log.len() == sent_before + 1 && last == Some((false, "\u{65e5}\u{672c}\u{8a9e}".as_bytes().to_vec())));
+                check(
+                    "ime_commit_sends_text_once",
+                    log.len() == sent_before + 1
+                        && last == Some((false, "\u{65e5}\u{672c}\u{8a9e}".as_bytes().to_vec())),
+                );
                 check("ime_commit_clears_preedit", spy.read(cx).marked.is_none());
                 // With the cursor on the last column the candidate window is still placed at the cell.
                 let _ = tx.try_send(PaneEvent::Output(b"\x1b[1;40H".to_vec()));
@@ -1386,14 +1750,21 @@ impl ShellSmoke {
                     let m = &spy.read(cx).metrics;
                     (f32::from(m.cell_w), f32::from(m.line_h))
                 };
-                let eb = gpui::Bounds::new(gpui::point(gpui::px(0.0), gpui::px(0.0)), gpui::size(gpui::px(400.0), gpui::px(200.0)));
+                let eb = gpui::Bounds::new(
+                    gpui::point(gpui::px(0.0), gpui::px(0.0)),
+                    gpui::size(gpui::px(400.0), gpui::px(200.0)),
+                );
                 let b = spy.update(cx, |v, cx| {
                     v.replace_and_mark_text_in_range(None, "\u{3042}", None, window, cx);
                     let b = v.bounds_for_range(0..1, eb, window, cx);
                     v.unmark_text(window, cx);
                     b
                 });
-                let ok = b.is_some_and(|b| (f32::from(b.origin.x) - cw * 39.0).abs() < 0.01 && f32::from(b.origin.y).abs() < 0.01 && f32::from(b.size.height) == lh);
+                let ok = b.is_some_and(|b| {
+                    (f32::from(b.origin.x) - cw * 39.0).abs() < 0.01
+                        && f32::from(b.origin.y).abs() < 0.01
+                        && f32::from(b.size.height) == lh
+                });
                 check("ime_candidate_window_last_column", ok);
                 self.w5.spy = None;
                 self.w5.tx = None;
@@ -1425,7 +1796,10 @@ impl ShellSmoke {
                 // Another client owns a PTY of about half the window grid.
                 let small = ((self.w5.win.0 / 2).max(3), (self.w5.win.1 / 2).max(10));
                 self.w5.small = small;
-                record("letterbox_grids", json!({"window": [self.w5.win.0, self.w5.win.1], "pty": [small.0, small.1]}));
+                record(
+                    "letterbox_grids",
+                    json!({"window": [self.w5.win.0, self.w5.win.1], "pty": [small.0, small.1]}),
+                );
                 if let Some(srv) = self.w3.server.as_mut() {
                     srv.send(&format!("size {} {} Victor Phone", small.0, small.1));
                 }
@@ -1445,8 +1819,14 @@ impl ShellSmoke {
                 // AD-026: the client that set the size is named in the letterbox area.
                 let label = view.read(cx).size_owner_label();
                 record("size_owner_label", json!(label));
-                check("size_owner_label_shown", label.as_deref() == Some("Size set by Victor Phone (Windows)"));
-                check("letterbox_window_grid_kept", resizes_win == self.w5.win && resizes_win.0 > rows && resizes_win.1 > cols);
+                check(
+                    "size_owner_label_shown",
+                    label.as_deref() == Some("Size set by Victor Phone (Windows)"),
+                );
+                check(
+                    "letterbox_window_grid_kept",
+                    resizes_win == self.w5.win && resizes_win.0 > rows && resizes_win.1 > cols,
+                );
                 check("letterbox_centered", pad.0 > 0.0 && pad.1 > 0.0);
                 // The owner gives it back at the window size.
                 if let Some(srv) = self.w3.server.as_mut() {
@@ -1465,15 +1845,29 @@ impl ShellSmoke {
                 }
                 check("letterbox_fills_when_sizes_match", pad.0 < 8.0 && pad.1 < 20.0);
                 // The server restarted and input was dropped: a notice in the pane, no modal.
-                shell.on_events(vec![forgetty_shell_core::BackendEvent::InputLost { bytes: 7 }], cx);
+                shell
+                    .on_events(vec![forgetty_shell_core::BackendEvent::InputLost { bytes: 7 }], cx);
                 let notice = view.read(cx).notice_text();
                 record("input_lost_notice", json!(notice));
-                check("input_lost_notice_shown", notice.as_deref() == Some("Server restarted, 7 bytes of input not sent"));
+                check(
+                    "input_lost_notice_shown",
+                    notice.as_deref() == Some("Server restarted, 7 bytes of input not sent"),
+                );
                 // A spy view: what does the view write, and as which kind?
                 let (tx, rx) = async_channel::unbounded();
                 let cfg = shell.cfg.clone();
                 let log = self.w5.log.clone();
-                let spy = cx.new(|cx| TerminalView::new(cfg, PaneId::new(), Box::new(Spy { rx, log }), 10, 40, true, cx));
+                let spy = cx.new(|cx| {
+                    TerminalView::new(
+                        cfg,
+                        PaneId::new(),
+                        Box::new(Spy { rx, log }),
+                        10,
+                        40,
+                        true,
+                        cx,
+                    )
+                });
                 self.w5.spy = Some(spy);
                 self.w5.tx = Some(tx);
                 send(&self.w5, PaneEvent::Output(b"\x1b[c".to_vec()));
@@ -1584,7 +1978,13 @@ impl ShellSmoke {
                     use crate::view::{Sel, SelMode};
                     let before = v.term.scrollbar_state().1;
                     // Absolute rows 2..=20: row 0 is the first line.
-                    v.sel = Some(Sel { mode: SelMode::Normal, a0: (2, 0), a1: (20, 3), h0: (2, 0), h1: (20, 3) });
+                    v.sel = Some(Sel {
+                        mode: SelMode::Normal,
+                        a0: (2, 0),
+                        a1: (20, 3),
+                        h0: (2, 0),
+                        h1: (20, 3),
+                    });
                     let t = v.selection_text().unwrap_or_default();
                     let after = v.term.scrollbar_state().1;
                     v.sel = None;
@@ -1592,7 +1992,10 @@ impl ShellSmoke {
                 });
                 record("copy_scrollback_text", json!(text));
                 let lines: Vec<&str> = text.lines().collect();
-                check("copy_includes_scrollback", lines.len() == 19 && lines[0] == "L03" && lines[18] == "L21");
+                check(
+                    "copy_includes_scrollback",
+                    lines.len() == 19 && lines[0] == "L03" && lines[18] == "L21",
+                );
                 check("copy_restores_viewport", before == after);
                 check("no_input_dropped", view.read(cx).dropped_input() == 0);
                 self.sub = 100;
@@ -1612,7 +2015,9 @@ impl ShellSmoke {
                 }
                 target.update(cx, |v, _| v.capture_input = Some(Vec::new()));
                 self.w5.target = Some(target);
-                let ok = inject::activate_layout("00000409").map(|hkl| inject::send_keys(hkl, &[Step::Tap(inject::VK_A)])).unwrap_or(false);
+                let ok = inject::activate_layout("00000409")
+                    .map(|hkl| inject::send_keys(hkl, &[Step::Tap(inject::VK_A)]))
+                    .unwrap_or(false);
                 record("sendinput_sent", json!(ok));
                 self.sub = 10;
                 self.sub_t0 = Instant::now();
@@ -1628,7 +2033,10 @@ impl ShellSmoke {
                 } else if self.sub_t0.elapsed() > Duration::from_secs(3) {
                     // The runner's desktop does not deliver injected keys: say so, skip the rest.
                     record("sendinput_works", json!(false));
-                    record("sendinput_probe_bytes", json!(String::from_utf8_lossy(&got).to_string()));
+                    record(
+                        "sendinput_probe_bytes",
+                        json!(String::from_utf8_lossy(&got).to_string()),
+                    );
                     t.update(cx, |v, _| v.capture_input = None);
                     self.sub = 20;
                     self.sub_t0 = Instant::now();
@@ -1651,7 +2059,10 @@ impl ShellSmoke {
                         self.sub = 12;
                     }
                     None => {
-                        record(&format!("dead_key_{}_skipped", case.name), json!("layout not installed"));
+                        record(
+                            &format!("dead_key_{}_skipped", case.name),
+                            json!("layout not installed"),
+                        );
                         self.w5.case_i += 1;
                     }
                 }
@@ -1665,7 +2076,10 @@ impl ShellSmoke {
                 let case = &KEY_CASES[self.w5.case_i];
                 let got = t.read(cx).capture_input.clone().unwrap_or_default();
                 let ok = got == case.want.as_bytes();
-                record(&format!("key_case_{}_bytes", case.name), json!(String::from_utf8_lossy(&got).to_string()));
+                record(
+                    &format!("key_case_{}_bytes", case.name),
+                    json!(String::from_utf8_lossy(&got).to_string()),
+                );
                 check(&format!("layout_{}", case.name), ok);
                 if !ok {
                     // Flush a dead key that is still waiting for its letter.
@@ -1690,8 +2104,10 @@ impl ShellSmoke {
                 let scale = window.scale_factor();
                 let b = t.read(cx).bounds;
                 let ok = origin.is_some_and(|(ox, oy)| {
-                    let x = ox as f32 + (f32::from(b.origin.x) + f32::from(b.size.width) / 2.0) * scale;
-                    let y = oy as f32 + (f32::from(b.origin.y) + f32::from(b.size.height) / 2.0) * scale;
+                    let x =
+                        ox as f32 + (f32::from(b.origin.x) + f32::from(b.size.width) / 2.0) * scale;
+                    let y = oy as f32
+                        + (f32::from(b.origin.y) + f32::from(b.size.height) / 2.0) * scale;
                     inject::move_cursor(x as i32, y as i32) && inject::left_down()
                 });
                 record("mouse_press_sent", json!(ok));
@@ -1715,7 +2131,8 @@ impl ShellSmoke {
                     let scale = window.scale_factor();
                     let b = t.read(cx).bounds;
                     let x = ox as f32 + (crate::shell::SIDEBAR_W / 2.0) * scale;
-                    let y = oy as f32 + (f32::from(b.origin.y) + f32::from(b.size.height) / 2.0) * scale;
+                    let y = oy as f32
+                        + (f32::from(b.origin.y) + f32::from(b.size.height) / 2.0) * scale;
                     inject::move_cursor(x as i32, y as i32);
                 }
                 self.sub = 22;
