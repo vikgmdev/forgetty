@@ -210,7 +210,8 @@ impl ShellSmoke {
             }
             104 => {
                 let Some(v) = view else { return };
-                if self.sub_t0.elapsed() < Duration::from_millis(250) {
+                // Past the quiet window (300 ms) so the next bell is judged on its own.
+                if self.sub_t0.elapsed() < Duration::from_millis(450) {
                     return;
                 }
                 check("bell_after_ctrl_c_is_dropped", v.read(cx).bells == 2);
