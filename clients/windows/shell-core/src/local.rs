@@ -3,6 +3,7 @@
 //! shell cannot tell it from a remote backend.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use forgetty_core::PaneId;
@@ -42,6 +43,9 @@ struct Pane {
     /// Where this pane's process was started. New tabs and splits inherit this.
     spawn_cwd: Option<String>,
     status: PaneStatus,
+    /// The process is being started on a worker thread. The pane is in the layout already; its
+    /// title says so until the start finishes.
+    starting: bool,
     /// When this pane last raised a notification event (a program in a loop must not flood
     /// the channel; the shell's toast limiter is stricter still).
     last_notify: Option<std::time::Instant>,
@@ -56,7 +60,12 @@ struct State {
     shell: Vec<String>,
 }
 
+/// The title of a pane whose process is being started.
+const STARTING_TITLE: &str = "Starting...";
+
 struct Inner {
+    /// Test and smoke hook: how long a start waits before it begins (milliseconds).
+    spawn_delay_ms: AtomicU64,
     cfg: LocalConfig,
     machine_id: Uuid,
     state: Mutex<State>,
@@ -86,6 +95,7 @@ impl LocalBackend {
         };
         LocalBackend {
             inner: Arc::new(Inner {
+                spawn_delay_ms: AtomicU64::new(0),
                 cfg,
                 machine_id: Uuid::new_v4(),
                 state: Mutex::new(State { layout, panes: HashMap::new(), closed: Vec::new(), shell }),
@@ -105,6 +115,12 @@ impl LocalBackend {
 
     pub fn default_shell(&self) -> Vec<String> {
         self.inner.lock().shell.clone()
+    }
+
+    /// Make every process start wait this long before it begins, so a test or the smoke can show
+    /// that the caller is not held by a slow start. Zero (the default) is no wait.
+    pub fn set_spawn_delay(&self, d: std::time::Duration) {
+        self.inner.spawn_delay_ms.store(d.as_millis() as u64, Ordering::SeqCst);
     }
 
     // ---- test and smoke hooks (not part of SessionBackend) --------------------
@@ -152,20 +168,16 @@ impl Inner {
         self.emit(BackendEvent::LayoutChanged(st.layout.clone()));
     }
 
-    fn spawn_pane(
-        self: &Arc<Self>,
-        st: &mut State,
-        argv: Vec<String>,
-        cwd: Option<String>,
-        rows: u16,
-        cols: u16,
-    ) -> BackendResult<PaneId> {
+    /// Add a pane to the state and start its process on a worker thread. This returns at once: the
+    /// pane exists (title "Starting..."), its channels work, and anything typed waits for the
+    /// process. The worker reports through `finish_start`.
+    fn spawn_pane(self: &Arc<Self>, st: &mut State, argv: Vec<String>, cwd: Option<String>, rows: u16, cols: u16) -> PaneId {
         let id = PaneId::new();
         let argv = if argv.is_empty() { st.shell.clone() } else { argv };
         let weak: Weak<Inner> = Arc::downgrade(self);
         let mut scanner = OscScanner::new();
         let w_out = weak.clone();
-        let w_exit = weak;
+        let w_exit = weak.clone();
         let hooks = Hooks {
             on_output: Box::new(move |bytes| {
                 // A panic inside the scanner may leave it half-updated: log,
@@ -196,30 +208,98 @@ impl Inner {
         };
         let rows = rows.max(1);
         let cols = cols.max(2);
-        // Spawn directory: the caller's (the parent pane's spawn cwd), else the
-        // configured default, else the user profile. Never taken from escape
-        // codes, and never a UNC/device path.
-        let spawn_cwd = [cwd, self.cfg.default_cwd.clone(), user_profile_dir()]
+        // Start folders, best first: the caller's (the parent pane's spawn cwd), else the
+        // configured default, else the user profile. Never taken from escape codes, and never a
+        // UNC/device path.
+        let folders: Vec<String> = [cwd.clone(), self.cfg.default_cwd.clone(), user_profile_dir()]
             .into_iter()
             .flatten()
-            .find(|c| crate::osc::is_safe_local_path(c));
-        let pty = LocalConPty::spawn(&argv, spawn_cwd.as_deref(), rows, cols, hooks)
-            .map_err(|e| BackendError::Spawn(format!("{e:#}")))?;
-        let cwd_s = spawn_cwd.clone().unwrap_or_default();
+            .filter(|c| crate::osc::is_safe_local_path(c))
+            .collect();
+        let (pty, pending) = LocalConPty::begin(rows, cols, hooks);
+        let spawn_cwd = folders.first().cloned();
         st.panes.insert(
             id,
             Pane {
                 pty: Arc::new(pty),
                 rows,
                 cols,
-                title: String::new(),
-                cwd: cwd_s,
+                title: STARTING_TITLE.to_string(),
+                cwd: spawn_cwd.clone().unwrap_or_default(),
                 spawn_cwd,
                 status: PaneStatus::None,
+                starting: true,
                 last_notify: None,
             },
         );
-        Ok(id)
+        self.emit(BackendEvent::TitleChanged { pane_id: id, title: STARTING_TITLE.to_string() });
+        let delay = std::time::Duration::from_millis(self.spawn_delay_ms.load(Ordering::SeqCst));
+        let wanted = cwd.or_else(|| self.cfg.default_cwd.clone()).or_else(user_profile_dir);
+        let started = std::thread::Builder::new().name("pty-spawn".into()).spawn(move || {
+            if !delay.is_zero() {
+                std::thread::sleep(delay);
+            }
+            let result = pending.run(&argv, &folders);
+            if let Some(inner) = weak.upgrade() {
+                inner.finish_start(id, &argv, wanted, &folders, result);
+            }
+        });
+        if let Err(e) = started {
+            eprintln!("forgetty: cannot start a thread for a new pane: {e}");
+            self.emit(BackendEvent::PaneNotice { pane_id: id, text: format!("Could not start the shell: {e}") });
+        }
+        id
+    }
+
+    /// The worker finished starting `id`'s process (or failed). Clears the "starting" title,
+    /// tells the pane where it really started, and says so when the wanted folder was not used.
+    fn finish_start(&self, id: PaneId, argv: &[String], wanted: Option<String>, folders: &[String], result: Result<crate::conpty::Started, String>) {
+        let mut out = Vec::new();
+        {
+            let mut st = self.lock();
+            // The pane was closed while it started: the process was ended by the start itself.
+            let Some(p) = st.panes.get_mut(&id) else { return };
+            p.starting = false;
+            let was_placeholder = p.title == STARTING_TITLE;
+            match result {
+                Ok(started) => {
+                    if was_placeholder {
+                        p.title.clear();
+                        out.push(BackendEvent::TitleChanged { pane_id: id, title: String::new() });
+                    }
+                    let used = started.folder.and_then(|i| folders.get(i)).cloned();
+                    // New tabs and splits from this pane start where it really started.
+                    p.spawn_cwd = used.clone();
+                    if let Some(u) = &used {
+                        if p.cwd.is_empty() || Some(&p.cwd) == wanted.as_ref() {
+                            p.cwd = u.clone();
+                        }
+                    }
+                    if let Some(w) = wanted.as_ref().filter(|w| Some(*w) != used.as_ref()) {
+                        let why = if crate::osc::is_safe_local_path(w) { "it does not exist or cannot be entered" } else { "network and device paths are not allowed" };
+                        let at = used.map(|u| format!("{u}")).unwrap_or_else(|| "the default folder".to_string());
+                        out.push(BackendEvent::PaneNotice {
+                            pane_id: id,
+                            text: format!("The folder {} cannot be used ({why}). Started in {}.", crate::notify::sanitize(w, 60), crate::notify::sanitize(&at, 60)),
+                        });
+                    }
+                }
+                Err(e) => {
+                    let prog = argv.first().map(String::as_str).unwrap_or("");
+                    if was_placeholder {
+                        p.title = "Could not start".to_string();
+                        out.push(BackendEvent::TitleChanged { pane_id: id, title: p.title.clone() });
+                    }
+                    out.push(BackendEvent::PaneNotice {
+                        pane_id: id,
+                        text: format!("Could not start {}: {}", crate::notify::sanitize(prog, 60), crate::notify::sanitize(&e, 100)),
+                    });
+                }
+            }
+        }
+        for e in out {
+            self.emit(e);
+        }
     }
 
     fn apply_osc(&self, id: PaneId, events: Vec<OscEvent>) {
@@ -394,7 +474,7 @@ impl SessionBackend for LocalBackend {
                 .cwd
                 .clone()
                 .or_else(|| req.inherit_cwd_from.and_then(|p| st.panes.get(&p).and_then(|p| p.spawn_cwd.clone())));
-            let pane = inner.spawn_pane(&mut st, req.command.clone(), cwd, req.rows, req.cols)?;
+            let pane = inner.spawn_pane(&mut st, req.command.clone(), cwd, req.rows, req.cols);
             let tab_id = Uuid::new_v4();
             let ws = &mut st.layout.workspaces[req.workspace_idx];
             ws.tabs.push(Tab {
@@ -464,7 +544,7 @@ impl SessionBackend for LocalBackend {
         let inner = &self.inner;
         let mut st = inner.lock();
         let r = (|| {
-            let pane = inner.spawn_pane(&mut st, Vec::new(), None, rows, cols)?;
+            let pane = inner.spawn_pane(&mut st, Vec::new(), None, rows, cols);
             let (workspace_id, tab_id) = (Uuid::new_v4(), Uuid::new_v4());
             let n = st.layout.workspaces.len();
             st.layout.workspaces.push(Workspace {
@@ -615,21 +695,8 @@ impl SessionBackend for LocalBackend {
                 .iter()
                 .map(|t| st.panes.get(&t.pane_tree.first_leaf()).and_then(|p| p.spawn_cwd.clone()))
                 .collect();
-            // All or nothing: a shell that fails to start undoes the ones started before it.
-            let mut spawned: Vec<PaneId> = Vec::new();
-            for cwd in cwds {
-                match inner.spawn_pane(&mut st, Vec::new(), cwd, rows, cols) {
-                    Ok(p) => spawned.push(p),
-                    Err(e) => {
-                        for p in spawned {
-                            if let Some(pane) = st.panes.remove(&p) {
-                                pane.pty.kill();
-                            }
-                        }
-                        return Err(e);
-                    }
-                }
-            }
+            // The panes exist at once; a shell that fails to start says so in its own pane.
+            let spawned: Vec<PaneId> = cwds.into_iter().map(|cwd| inner.spawn_pane(&mut st, Vec::new(), cwd, rows, cols)).collect();
             let (workspace_id, at) = (Uuid::new_v4(), source_idx + 1);
             let tabs: Vec<Tab> = spawned
                 .iter()
@@ -700,7 +767,7 @@ impl SessionBackend for LocalBackend {
             };
             // The parent's spawn cwd, not the display cwd the program reported.
             let cwd = req.cwd.clone().or_else(|| st.panes.get(&req.pane_id).and_then(|p| p.spawn_cwd.clone()));
-            let new_pane = inner.spawn_pane(&mut st, Vec::new(), cwd, req.rows, req.cols)?;
+            let new_pane = inner.spawn_pane(&mut st, Vec::new(), cwd, req.rows, req.cols);
             let tab = &mut st.layout.workspaces[w].tabs[t];
             tab.pane_tree.split_leaf_placed(req.pane_id, req.direction, new_pane, req.before);
             tab.active_pane_id = Some(new_pane);
@@ -1123,7 +1190,10 @@ mod tests {
         let evs = drain(&rx);
         let closed = evs.iter().filter(|e| matches!(e, BackendEvent::PaneClosed { .. })).count();
         assert_eq!(closed, doomed.len());
-        assert!(matches!(evs.last(), Some(BackendEvent::LayoutChanged(_))));
+        // A pane that finished starting meanwhile may still report its title; layout comes last
+        // among the events about the delete.
+        let rest: Vec<&BackendEvent> = evs.iter().filter(|e| !matches!(e, BackendEvent::TitleChanged { .. } | BackendEvent::PaneNotice { .. })).collect();
+        assert!(matches!(rest.last(), Some(BackendEvent::LayoutChanged(_))));
         // The first workspace still has its own tabs.
         assert!(l.find_tab(t0.tab_id).is_some());
         b.shutdown_all();
@@ -1175,6 +1245,98 @@ mod tests {
         // An explicit cwd wins over the inherited one.
         let t3 = now(b.new_tab(NewTab { workspace_idx: 0, rows: 24, cols: 80, cwd: Some("/".into()), inherit_cwd_from: Some(t.pane_id), ..Default::default() })).unwrap();
         assert_eq!(now(b.get_pane_info(t3.pane_id)).unwrap().cwd, "/");
+        b.shutdown_all();
+    }
+    #[test]
+    fn a_slow_start_does_not_hold_the_caller_and_input_waits_in_order() {
+        let b = backend();
+        let rx = b.subscribe();
+        b.set_spawn_delay(Duration::from_millis(600));
+        let t0 = Instant::now();
+        let t = now(b.new_tab(NewTab { workspace_idx: 0, rows: 24, cols: 80, ..Default::default() })).unwrap();
+        let sp = now(b.split_pane(SplitPane { pane_id: t.pane_id, direction: SplitDir::Horizontal, rows: 24, cols: 40, cwd: None, before: false })).unwrap();
+        assert!(t0.elapsed() < Duration::from_millis(300), "tab and split took {:?}", t0.elapsed());
+        // Both panes are in the layout at once, in the starting state.
+        let l = now(b.get_layout()).unwrap();
+        assert_eq!(l.workspaces[0].tabs[0].pane_tree.leaves(), vec![t.pane_id, sp]);
+        assert_eq!(now(b.get_pane_info(t.pane_id)).unwrap().title, STARTING_TITLE);
+        // Typing before the process exists is kept, in order.
+        let src = now(b.attach_pane(t.pane_id)).unwrap();
+        src.write_input(b"echo FIRST-$((1+1))\n");
+        src.write_input(b"echo SECOND-$((2+2))\n");
+        let out = read_until(&src.events(), "SECOND-4");
+        let (a, c) = (out.find("FIRST-2").expect("first"), out.find("SECOND-4").expect("second"));
+        assert!(a < c, "out of order: {out:?}");
+        wait_for(|| now(b.get_pane_info(t.pane_id)).unwrap().title != STARTING_TITLE, "title leaves the starting state");
+        let evs = drain(&rx);
+        assert!(evs.iter().any(|e| matches!(e, BackendEvent::TitleChanged { title, .. } if title == STARTING_TITLE)));
+        b.shutdown_all();
+    }
+
+    #[test]
+    fn a_missing_start_folder_falls_back_and_names_the_folder() {
+        let b = backend();
+        let rx = b.subscribe();
+        let gone = "/this/folder/does/not/exist";
+        let t = now(b.new_tab(NewTab { workspace_idx: 0, rows: 24, cols: 80, cwd: Some(gone.into()), ..Default::default() })).unwrap();
+        let src = now(b.attach_pane(t.pane_id)).unwrap();
+        src.write_input(b"pwd; echo MARK-$((3*3))\n");
+        let out = read_until(&src.events(), "MARK-9");
+        assert!(out.contains("/tmp"), "should start in the default folder: {out:?}");
+        wait_for(|| drain_notices(&rx, t.pane_id).iter().any(|n| n.contains(gone)), "a notice that names the folder");
+        b.shutdown_all();
+    }
+
+    fn drain_notices(rx: &async_channel::Receiver<BackendEvent>, pane: PaneId) -> Vec<String> {
+        // Keep what was read: the next call asks for the same notice again if it was not there.
+        thread_local! { static SEEN: std::cell::RefCell<Vec<(PaneId, String)>> = const { std::cell::RefCell::new(Vec::new()) }; }
+        SEEN.with(|seen| {
+            let mut seen = seen.borrow_mut();
+            for e in drain(rx) {
+                if let BackendEvent::PaneNotice { pane_id, text } = e {
+                    seen.push((pane_id, text));
+                }
+            }
+            seen.iter().filter(|(p, _)| *p == pane).map(|(_, t)| t.clone()).collect()
+        })
+    }
+
+    #[test]
+    fn a_shell_that_cannot_start_leaves_the_pane_with_a_message() {
+        let b = backend();
+        let rx = b.subscribe();
+        let t = now(b.new_tab(NewTab {
+            workspace_idx: 0,
+            rows: 24,
+            cols: 80,
+            command: vec!["/no/such/program".into()],
+            ..Default::default()
+        }))
+        .unwrap();
+        let src = now(b.attach_pane(t.pane_id)).unwrap();
+        wait_for(|| drain_notices(&rx, t.pane_id).iter().any(|n| n.contains("Could not start")), "a failure notice");
+        // The pane stays in the layout: closing the only tab would end the app.
+        assert!(now(b.get_layout()).unwrap().find_tab(t.tab_id).is_some());
+        let mut saw_closed = false;
+        let ev = src.events();
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(5) && !saw_closed {
+            saw_closed = matches!(ev.try_recv(), Ok(PaneEvent::Closed(_)));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(saw_closed, "the view is told the pane ended");
+        b.shutdown_all();
+    }
+
+    #[test]
+    fn closing_a_pane_while_it_starts_leaves_no_process() {
+        let b = backend();
+        b.set_spawn_delay(Duration::from_millis(300));
+        let t = now(b.new_tab(NewTab { workspace_idx: 0, rows: 24, cols: 80, ..Default::default() })).unwrap();
+        let t2 = now(b.new_tab(NewTab { workspace_idx: 0, rows: 24, cols: 80, ..Default::default() })).unwrap();
+        now(b.close_tab(t.tab_id)).unwrap();
+        wait_for(|| b.closed_ptys().iter().all(|(_, p)| p.try_exited()) && !b.closed_ptys().is_empty(), "the closed pane's process is gone");
+        assert!(now(b.get_layout()).unwrap().find_tab(t2.tab_id).is_some());
         b.shutdown_all();
     }
 }

@@ -19,18 +19,91 @@ pub struct Hooks {
     pub on_exit: Box<dyn FnOnce(String) + Send>,
 }
 
-pub struct LocalConPty {
-    rx: async_channel::Receiver<PaneEvent>,
-    tx: async_channel::Sender<PaneEvent>,
-    input_tx: mpsc::Sender<Vec<u8>>,
-    master: Mutex<Box<dyn MasterPty + Send>>,
-    child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
+/// What a pane's process needs from more than one thread. The process is started on a worker
+/// thread (see [`Pending::run`]) while the pane already exists, so each part is filled in when
+/// the start finishes.
+struct Shared {
+    master: Mutex<Option<Box<dyn MasterPty + Send>>>,
+    child: Arc<Mutex<Option<Box<dyn Child + Send + Sync>>>>,
+    /// The size the pane wants. The process starts at the latest value; a resize that comes
+    /// before the start only updates this.
+    size: Mutex<(u16, u16)>,
+    /// `kill` was called. A start that finishes after it ends the new process at once.
+    killed: AtomicBool,
     exited: Arc<AtomicBool>,
 }
 
+pub struct LocalConPty {
+    rx: async_channel::Receiver<PaneEvent>,
+    tx: async_channel::Sender<PaneEvent>,
+    /// Input typed before the process exists waits in this channel, and goes out in order once
+    /// the writer thread starts.
+    input_tx: mpsc::Sender<Vec<u8>>,
+    shared: Arc<Shared>,
+}
+
+/// The part of a pane that starts the process. Made with [`LocalConPty::begin`], run on a worker
+/// thread.
+pub struct Pending {
+    shared: Arc<Shared>,
+    tx: async_channel::Sender<PaneEvent>,
+    input_rx: mpsc::Receiver<Vec<u8>>,
+    hooks: Hooks,
+}
+
+/// How a start went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Started {
+    /// Index in the folder list of the folder the process started in. `None`: none of them
+    /// could be entered, or the list was empty.
+    pub folder: Option<usize>,
+}
+
 impl LocalConPty {
-    pub fn spawn(argv: &[String], cwd: Option<&str>, rows: u16, cols: u16, hooks: Hooks) -> Result<Self> {
+    /// A pane whose process is not started yet. Its channels work at once: a view can attach and
+    /// type, and everything waits for [`Pending::run`].
+    pub fn begin(rows: u16, cols: u16, hooks: Hooks) -> (Self, Pending) {
+        let (tx, rx) = async_channel::bounded::<PaneEvent>(256);
+        let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>();
+        let shared = Arc::new(Shared {
+            master: Mutex::new(None),
+            child: Arc::new(Mutex::new(None)),
+            size: Mutex::new((rows, cols)),
+            killed: AtomicBool::new(false),
+            exited: Arc::new(AtomicBool::new(false)),
+        });
+        let pending = Pending { shared: shared.clone(), tx: tx.clone(), input_rx, hooks };
+        (Self { rx, tx, input_tx, shared }, pending)
+    }
+}
+
+impl Pending {
+    /// Open the pseudo console and start the process. This blocks (ConPTY, `CreateProcess`, the
+    /// folder checks inside portable-pty), so it runs on a worker thread, never on the UI thread.
+    ///
+    /// `folders` are tried in order as the start folder. A folder the process cannot start in is
+    /// skipped; the result says which one worked. If none works the process starts without one.
+    /// On an error the pane gets the message as text and a `Closed` event, and the error is
+    /// returned.
+    pub fn run(self, argv: &[String], folders: &[String]) -> Result<Started, String> {
+        let shared = self.shared.clone();
+        let tx = self.tx.clone();
+        match self.start(argv, folders) {
+            Ok(s) => Ok(s),
+            Err(e) => {
+                let msg = format!("{e:#}");
+                shared.exited.store(true, Ordering::SeqCst);
+                let _ = tx.try_send(PaneEvent::Output(format!("\x1b[31mforgetty: could not start the shell: {msg}\x1b[0m\r\n").into_bytes()));
+                let _ = tx.try_send(PaneEvent::Closed(format!("could not start: {msg}")));
+                Err(msg)
+            }
+        }
+    }
+
+    fn start(self, argv: &[String], folders: &[String]) -> Result<Started> {
+        let Pending { shared, tx, input_rx, hooks } = self;
         let (shell, args) = argv.split_first().context("empty command")?;
+        let (rows, cols) = *shared.size.lock().unwrap_or_else(|e| e.into_inner());
         let pair = native_pty_system()
             .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
             .context("openpty (ConPTY)")?;
@@ -46,107 +119,141 @@ impl LocalConPty {
             cmd.env("TERM", "xterm-256color");
             cmd
         };
-        // Never enter a UNC/device/NT-namespace path: on Windows that can send NTLM credentials
-        // to a server named by program output. The folder is not stat-ed here (this runs on the
-        // UI thread, and a slow or mapped drive would stall a frame): the process start checks
-        // it, and a folder that is gone is started without one, as before.
-        let safe_cwd = cwd.filter(|c| crate::osc::is_safe_local_path(c));
-        let child = match safe_cwd {
-            Some(c) => match pair.slave.spawn_command(build(Some(c))) {
-                Ok(child) => child,
-                Err(_) => pair.slave.spawn_command(build(None)).with_context(|| format!("spawn {shell}"))?,
-            },
+        // The caller checked the folders for UNC/device/NT-namespace paths (entering one can send
+        // NTLM credentials to a server named by program output). The stat below can be slow on a
+        // dead mapped drive, so it runs here on the worker thread. It is also needed: portable-pty
+        // starts in the home folder, without an error, when the folder is not a directory, and the
+        // caller must know that the wanted folder was not used.
+        let mut child = None;
+        let mut folder = None;
+        for (i, f) in folders.iter().enumerate() {
+            if !std::path::Path::new(f).is_dir() {
+                continue;
+            }
+            if let Ok(c) = pair.slave.spawn_command(build(Some(f))) {
+                child = Some(c);
+                folder = Some(i);
+                break;
+            }
+        }
+        let child = match child {
+            Some(c) => c,
             None => pair.slave.spawn_command(build(None)).with_context(|| format!("spawn {shell}"))?,
         };
         drop(pair.slave);
 
-        let mut reader = pair.master.try_clone_reader().context("clone reader")?;
-        let mut writer = pair.master.take_writer().context("take writer")?;
-
-        // Bounded: ~4 MB in flight, then the reader blocks and ConPTY backs off.
-        let (tx, rx) = async_channel::bounded::<PaneEvent>(256);
-        let closed_sent = Arc::new(AtomicBool::new(false));
-        let child = Arc::new(Mutex::new(child));
-        let Hooks { mut on_output, on_exit } = hooks;
-        let on_exit = Arc::new(Mutex::new(Some(on_exit)));
-        let fire_exit = {
-            let tx = tx.clone();
-            let closed_sent = closed_sent.clone();
-            Arc::new(move |why: String| {
-                if !closed_sent.swap(true, Ordering::SeqCst) {
-                    if let Some(f) = on_exit.lock().ok().and_then(|mut g| g.take()) {
-                        f(why.clone());
-                    }
-                    // A view may be gone already: do not block on a full channel.
-                    let _ = tx.try_send(PaneEvent::Closed(why));
+        // From here the process exists: publish it, so a `kill` that came earlier (or comes now)
+        // reaches it.
+        *shared.child.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
+        let rest = (|| -> Result<()> {
+            if shared.killed.load(Ordering::SeqCst) {
+                if let Some(c) = shared.child.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                    let _ = c.kill();
                 }
-            })
-        };
+            }
+            let mut reader = pair.master.try_clone_reader().context("clone reader")?;
+            let mut writer = pair.master.take_writer().context("take writer")?;
+            {
+                // A resize that came while the process was starting.
+                let mut m = shared.master.lock().unwrap_or_else(|e| e.into_inner());
+                let want = *shared.size.lock().unwrap_or_else(|e| e.into_inner());
+                if want != (rows, cols) {
+                    let _ = pair.master.resize(PtySize { rows: want.0, cols: want.1, pixel_width: 0, pixel_height: 0 });
+                }
+                *m = Some(pair.master);
+            }
 
-        {
-            let tx = tx.clone();
-            let fire_exit = fire_exit.clone();
-            std::thread::Builder::new().name("pty-reader".into()).spawn(move || {
-                let mut buf = [0u8; 16 * 1024];
-                loop {
-                    match reader.read(&mut buf) {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            let kept = strip_win32_input_mode(&mut buf[..n]);
-                            if kept == 0 {
-                                continue;
-                            }
-                            let n = kept;
-                            // A bad sequence must never kill the reader: log and drop.
-                            let chunk = &buf[..n];
-                            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| on_output(chunk))).is_err() {
-                                eprintln!("forgetty: output hook panicked, chunk dropped from scanning");
-                            }
-                            if tx.send_blocking(PaneEvent::Output(buf[..n].to_vec())).is_err() {
-                                return;
+            let closed_sent = Arc::new(AtomicBool::new(false));
+            let Hooks { mut on_output, on_exit } = hooks;
+            let on_exit = Arc::new(Mutex::new(Some(on_exit)));
+            let fire_exit = {
+                let tx = tx.clone();
+                let closed_sent = closed_sent.clone();
+                Arc::new(move |why: String| {
+                    if !closed_sent.swap(true, Ordering::SeqCst) {
+                        if let Some(f) = on_exit.lock().ok().and_then(|mut g| g.take()) {
+                            f(why.clone());
+                        }
+                        // A view may be gone already: do not block on a full channel.
+                        let _ = tx.try_send(PaneEvent::Closed(why));
+                    }
+                })
+            };
+
+            {
+                let tx = tx.clone();
+                let fire_exit = fire_exit.clone();
+                std::thread::Builder::new().name("pty-reader".into()).spawn(move || {
+                    let mut buf = [0u8; 16 * 1024];
+                    loop {
+                        match reader.read(&mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                let kept = strip_win32_input_mode(&mut buf[..n]);
+                                if kept == 0 {
+                                    continue;
+                                }
+                                let n = kept;
+                                // A bad sequence must never kill the reader: log and drop.
+                                let chunk = &buf[..n];
+                                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| on_output(chunk))).is_err() {
+                                    eprintln!("forgetty: output hook panicked, chunk dropped from scanning");
+                                }
+                                if tx.send_blocking(PaneEvent::Output(buf[..n].to_vec())).is_err() {
+                                    return;
+                                }
                             }
                         }
                     }
-                }
-                fire_exit("pty closed".into());
-            })?;
-        }
-        let exited = Arc::new(AtomicBool::new(false));
-        {
-            // ConPTY often keeps the output pipe open after the child exits.
-            let child = child.clone();
-            let exited = exited.clone();
-            std::thread::Builder::new().name("pty-wait".into()).spawn(move || loop {
-                std::thread::sleep(Duration::from_millis(100));
-                let status = match child.lock() {
-                    Ok(mut c) => c.try_wait(),
-                    Err(_) => return,
-                };
-                match status {
-                    Ok(Some(st)) => {
-                        exited.store(true, Ordering::SeqCst);
-                        std::thread::sleep(Duration::from_millis(300));
-                        fire_exit(format!("exited: {st:?}"));
-                        return;
-                    }
-                    Ok(None) => {}
-                    Err(_) => return,
-                }
-            })?;
-        }
-
-        let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>();
-        std::thread::Builder::new().name("pty-writer".into()).spawn(move || {
-            while let Ok(bytes) = input_rx.recv() {
-                if writer.write_all(&bytes).is_err() || writer.flush().is_err() {
-                    break;
-                }
+                    fire_exit("pty closed".into());
+                })?;
             }
-        })?;
-
-        Ok(Self { rx, tx, input_tx, master: Mutex::new(pair.master), child, exited })
+            {
+                // ConPTY often keeps the output pipe open after the child exits.
+                let child = shared.child.clone();
+                let exited = shared.exited.clone();
+                std::thread::Builder::new().name("pty-wait".into()).spawn(move || loop {
+                    std::thread::sleep(Duration::from_millis(100));
+                    let status = match child.lock() {
+                        Ok(mut c) => match c.as_mut() {
+                            Some(c) => c.try_wait(),
+                            None => return,
+                        },
+                        Err(_) => return,
+                    };
+                    match status {
+                        Ok(Some(st)) => {
+                            exited.store(true, Ordering::SeqCst);
+                            std::thread::sleep(Duration::from_millis(300));
+                            fire_exit(format!("exited: {st:?}"));
+                            return;
+                        }
+                        Ok(None) => {}
+                        Err(_) => return,
+                    }
+                })?;
+            }
+            // Everything typed so far is already queued: it goes out first, in order.
+            std::thread::Builder::new().name("pty-writer".into()).spawn(move || {
+                while let Ok(bytes) = input_rx.recv() {
+                    if writer.write_all(&bytes).is_err() || writer.flush().is_err() {
+                        break;
+                    }
+                }
+            })?;
+            Ok(())
+        })();
+        if let Err(e) = rest {
+            if let Some(c) = shared.child.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                let _ = c.kill();
+            }
+            return Err(e);
+        }
+        Ok(Started { folder })
     }
+}
 
+impl LocalConPty {
     /// Sender into the same bounded channel the PTY reader uses. The smoke test
     /// uses it to push synthetic output through the real pump.
     pub fn injector(&self) -> async_channel::Sender<PaneEvent> {
@@ -162,34 +269,40 @@ impl LocalConPty {
     }
 
     pub fn resize(&self, rows: u16, cols: u16) {
-        if let Ok(m) = self.master.lock() {
+        *self.shared.size.lock().unwrap_or_else(|e| e.into_inner()) = (rows, cols);
+        if let Some(m) = self.shared.master.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
             let _ = m.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
         }
     }
 
     pub fn kill(&self) {
-        if let Ok(mut c) = self.child.lock() {
+        self.shared.killed.store(true, Ordering::SeqCst);
+        if let Some(c) = self.shared.child.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             let _ = c.kill();
         }
     }
 
-    /// True once the child process ended (checked by the wait thread).
+    /// True once the child process ended (checked by the wait thread), or could not start.
     pub fn has_exited(&self) -> bool {
-        self.exited.load(Ordering::SeqCst)
+        self.shared.exited.load(Ordering::SeqCst)
     }
 
-    /// Process id of the shell, `None` once it is gone.
+    /// Process id of the shell, `None` while it is starting and once it is gone.
     pub fn pid(&self) -> Option<u32> {
-        self.child.lock().ok().and_then(|c| c.process_id())
+        self.shared.child.lock().ok().and_then(|c| c.as_ref().and_then(|c| c.process_id()))
     }
 
-    /// Poll the child directly. Used by tests to confirm a kill took effect.
+    /// Poll the child directly. Used by tests to confirm a kill took effect. A pane that was
+    /// killed before its process started counts as ended: the start ends the process at once.
     pub fn try_exited(&self) -> bool {
         if self.has_exited() {
             return true;
         }
-        match self.child.lock() {
-            Ok(mut c) => matches!(c.try_wait(), Ok(Some(_))),
+        match self.shared.child.lock() {
+            Ok(mut c) => match c.as_mut() {
+                Some(c) => matches!(c.try_wait(), Ok(Some(_))),
+                None => self.shared.killed.load(Ordering::SeqCst),
+            },
             Err(_) => true,
         }
     }

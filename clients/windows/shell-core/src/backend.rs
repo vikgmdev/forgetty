@@ -158,6 +158,9 @@ pub enum BackendEvent {
     /// The server dropped input for this pane because the program did not read it (AD-024).
     InputDropped { pane_id: PaneId, bytes: u64 },
     StatusChanged { pane_id: PaneId, status: PaneStatus, message: String },
+    /// A message from the backend about one pane, for the user: the start folder was not usable,
+    /// the shell could not be started. Shown as a notice on that pane.
+    PaneNotice { pane_id: PaneId, text: String },
     /// A desktop notification from the pane (OSC 9/99/777).
     Notification { pane_id: PaneId, title: String, body: String },
     /// The link to the machine changed state.

@@ -472,6 +472,14 @@ impl AppShell {
                         v.update(cx, |v, cx| v.show_notice(text, cx));
                     }
                 }
+                BackendEvent::PaneNotice { pane_id, text } => {
+                    // On the pane it is about. A pane that has no view yet gets it from the
+                    // active one, so the message is not lost.
+                    match self.views.get(&pane_id).cloned() {
+                        Some(v) => v.update(cx, |v, cx| v.show_notice(text, cx)),
+                        None => self.notice_active(text, cx),
+                    }
+                }
                 BackendEvent::StatusChanged { pane_id, status, message } => {
                     let m = self.meta.entry(pane_id).or_default();
                     m.status = status;
@@ -812,7 +820,7 @@ impl AppShell {
         self.new_tab_with(p.argv.clone(), p.start_dir.clone(), cx);
     }
 
-    fn new_tab_with(&mut self, command: Vec<String>, cwd: Option<String>, cx: &mut Context<Self>) {
+    pub(crate) fn new_tab_with(&mut self, command: Vec<String>, cwd: Option<String>, cx: &mut Context<Self>) {
         let r = self.content_rect();
         let (rows, cols) = self.grid_for(r.w, r.h);
         // With no cwd the backend decides (it never trusts escape-code paths).
