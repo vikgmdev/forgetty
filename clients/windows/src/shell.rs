@@ -153,6 +153,8 @@ pub struct AppShell {
     pub layout: Layout,
     pub views: HashMap<PaneId, Entity<TerminalView>>,
     pub(crate) attaching: HashSet<PaneId>,
+    /// Backend messages about a pane that has no view yet; shown when the view appears.
+    pending_notices: HashMap<PaneId, String>,
     /// Failed attaches per pane. A new pane can be listed a moment before its server-side
     /// byte log exists, so a failed attach retries a few times.
     attach_tries: HashMap<PaneId, u8>,
@@ -278,6 +280,7 @@ impl AppShell {
             layout: Layout::default(),
             views: HashMap::new(),
             attaching: HashSet::new(),
+            pending_notices: HashMap::new(),
             attach_tries: HashMap::new(),
             meta: HashMap::new(),
             local_active: HashMap::new(),
@@ -428,6 +431,7 @@ impl AppShell {
                 BackendEvent::LayoutChanged(l) => layout = Some(l),
                 BackendEvent::PaneClosed { pane_id } => {
                     self.meta.remove(&pane_id);
+                    self.pending_notices.remove(&pane_id);
                 }
                 BackendEvent::TitleChanged { pane_id, title } => {
                     self.meta.entry(pane_id).or_default().title = title;
@@ -473,11 +477,13 @@ impl AppShell {
                     }
                 }
                 BackendEvent::PaneNotice { pane_id, text } => {
-                    // On the pane it is about. A pane that has no view yet gets it from the
-                    // active one, so the message is not lost.
+                    // On the pane it is about. A pane whose view does not exist yet gets it when the
+                    // view appears.
                     match self.views.get(&pane_id).cloned() {
                         Some(v) => v.update(cx, |v, cx| v.show_notice(text, cx)),
-                        None => self.notice_active(text, cx),
+                        None => {
+                            self.pending_notices.insert(pane_id, text);
+                        }
                     }
                 }
                 BackendEvent::StatusChanged { pane_id, status, message } => {
@@ -607,7 +613,9 @@ impl AppShell {
         let (rows, cols) = info.as_ref().map(|i| (i.rows as usize, i.cols as usize)).unwrap_or((30, 120));
         if let Some(i) = info {
             let m = self.meta.entry(pane).or_default();
-            if m.title.is_empty() {
+            // The "starting" title is a placeholder: it is already in `meta` from its event, and
+            // a stale copy must not come back after the start finished.
+            if m.title.is_empty() && i.title != forgetty_shell_core::local::STARTING_TITLE {
                 m.title = i.title;
             }
             if m.cwd.is_empty() {
@@ -627,6 +635,9 @@ impl AppShell {
         }
         let machine = self.machine.id;
         cx.subscribe(&view, move |s, _v, ev: &crate::view::ViewEvent, cx| s.on_view_event(machine, ev, cx)).detach();
+        if let Some(text) = self.pending_notices.remove(&pane) {
+            view.update(cx, |v, cx| v.show_notice(text, cx));
+        }
         self.views.insert(pane, view);
         self.sync_dirty = true;
         cx.notify();

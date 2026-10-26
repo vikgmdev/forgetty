@@ -20,6 +20,9 @@ use gpui::{Context, Window};
 /// Samples of each kind.
 const TABS: usize = 6;
 const SPLITS: usize = 4;
+/// The slow-start check makes every start wait this long, and starts in a folder that is not there.
+const SLOW_MS: u64 = 1500;
+const MISSING_DIR: &str = r"C:\forgetty-no-such-folder-wp3d";
 
 #[derive(Default)]
 pub struct Wp3d {
@@ -37,6 +40,9 @@ pub struct Wp3d {
     tabs0: usize,
     last_step: Option<Instant>,
     max_gap: f64,
+    slow_gap: f64,
+    typed: bool,
+    notice: Option<String>,
 }
 
 #[derive(Default, PartialEq, Clone, Copy)]
@@ -45,6 +51,7 @@ enum Stage {
     Init,
     Tabs,
     Splits,
+    Slow,
     Close,
 }
 
@@ -68,7 +75,12 @@ impl ShellSmoke {
         if let Some(prev) = self.wp3d.last_step.replace(now) {
             // Only the gaps while a sample is running count.
             if self.wp3d.t0.is_some() {
-                self.wp3d.max_gap = self.wp3d.max_gap.max(now.duration_since(prev).as_secs_f64() * 1000.0);
+                let gap = now.duration_since(prev).as_secs_f64() * 1000.0;
+                if self.wp3d.stage == Stage::Slow {
+                    self.wp3d.slow_gap = self.wp3d.slow_gap.max(gap);
+                } else {
+                    self.wp3d.max_gap = self.wp3d.max_gap.max(gap);
+                }
             }
         }
         match self.wp3d.stage {
@@ -129,9 +141,10 @@ impl ShellSmoke {
                     self.wp3d.stage = Stage::Splits;
                     self.wp3d.i = 0;
                 } else if splitting && self.wp3d.i == SPLITS {
-                    self.wp3d.stage = Stage::Close;
+                    self.wp3d.stage = Stage::Slow;
                 }
             }
+            Stage::Slow => self.wp3d_slow(shell, cx),
             Stage::Close => {
                 if !self.wp3d.tabs.is_empty() {
                     for t in std::mem::take(&mut self.wp3d.tabs) {
@@ -168,5 +181,66 @@ impl ShellSmoke {
         }
         record("wp3d_max_frame_gap_ms", json!(r1(d.max_gap)));
         check("wp3d_measured", d.new_tab.len() == TABS && d.split.len() == SPLITS);
+    }
+
+    /// A start that takes 1.5 s, in a folder that does not exist. The tab must be there at once
+    /// and say it is starting, what is typed before the shell is up must arrive in order, the
+    /// notice must name the folder, and the UI must keep painting meanwhile.
+    fn wp3d_slow(&mut self, shell: &mut AppShell, cx: &mut Context<AppShell>) {
+        let Some(t0) = self.wp3d.t0 else {
+            self.local.set_spawn_delay(Duration::from_millis(SLOW_MS));
+            self.wp3d.tabs_before = shell.layout.tab_count();
+            self.sub_t0 = Instant::now();
+            let t0 = Instant::now();
+            shell.new_tab_with(Vec::new(), Some(MISSING_DIR.into()), cx);
+            self.wp3d.call_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            self.wp3d.t0 = Some(t0);
+            return;
+        };
+        if shell.layout.tab_count() != self.wp3d.tabs_before + 1 {
+            return;
+        }
+        let Some(pane) = shell.active_pane() else { return };
+        let Some(view) = shell.views.get(&pane).cloned() else { return };
+        if !self.wp3d.typed {
+            let up = t0.elapsed().as_secs_f64() * 1000.0;
+            let title = shell.meta.get(&pane).map(|m| m.title.clone()).unwrap_or_default();
+            record("wp3d_slow_call_ms", json!(r1(self.wp3d.call_ms)));
+            record("wp3d_slow_view_ms", json!(r1(up)));
+            check("wp3d_slow_call_returns", self.wp3d.call_ms < SLOW_MS as f64 / 4.0);
+            check("wp3d_slow_pane_at_once", up < SLOW_MS as f64 / 2.0);
+            check("wp3d_slow_starting_title", title == forgetty_shell_core::local::STARTING_TITLE);
+            // Typed before the shell exists: kept, and sent in this order.
+            view.update(cx, |v, _| {
+                v.send_bytes(b"echo ORDER-A\r");
+                v.send_bytes(b"echo ORDER-B\r");
+            });
+            self.wp3d.typed = true;
+            return;
+        }
+        if self.wp3d.notice.is_none() {
+            self.wp3d.notice = view.read(cx).notice_text();
+        }
+        let rows = snap(shell, cx, pane).map(|s| s.rows).unwrap_or_default();
+        let b_lines = rows.iter().filter(|r| r.contains("ORDER-B")).count();
+        // The command line and its output: two lines each.
+        if b_lines < 2 || self.wp3d.notice.is_none() {
+            return;
+        }
+        let a_last = rows.iter().rposition(|r| r.contains("ORDER-A"));
+        let b_first = rows.iter().position(|r| r.contains("ORDER-B"));
+        record("wp3d_slow_notice", json!(self.wp3d.notice.clone().unwrap_or_default()));
+        check("wp3d_slow_input_in_order", matches!((a_last, b_first), (Some(a), Some(b)) if a < b));
+        check("wp3d_slow_notice_names_folder", self.wp3d.notice.as_deref().is_some_and(|n| n.contains("forgetty-no-such-folder-wp3d")));
+        let title = shell.meta.get(&pane).map(|m| m.title.clone()).unwrap_or_default();
+        check("wp3d_slow_title_cleared", title != forgetty_shell_core::local::STARTING_TITLE);
+        record("wp3d_slow_max_frame_gap_ms", json!(r1(self.wp3d.slow_gap)));
+        self.local.set_spawn_delay(Duration::ZERO);
+        if let Some(t) = shell.active_tab().map(|t| t.id) {
+            self.wp3d.tabs.push(t);
+        }
+        self.wp3d.t0 = None;
+        self.sub_t0 = Instant::now();
+        self.wp3d.stage = Stage::Close;
     }
 }

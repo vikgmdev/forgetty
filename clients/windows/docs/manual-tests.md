@@ -529,6 +529,15 @@ command = "wsl.exe -d Ubuntu --cd ~"
 - [ ] WP3c.4 "Open configuration file" opens the editor (it now initializes COM on its worker thread) from a fresh start, with no association error.
 - Accepted, not tested: a drive the user mapped or `subst`-ed to a share is a local path to the app (see README, Security).
 
+### WP3d
+
+- [ ] WP3d.1 Hold Ctrl+Shift+T for two seconds. Tabs appear one after another with no freeze of the window or the tab strip, even with `%USERPROFILE%` on a slow disk or an antivirus that scans new processes.
+- [ ] WP3d.2 Open a tab, then immediately type `echo one`, Enter, `echo two`, Enter as fast as you can. Both lines run, in this order, and the tab title goes from "Starting..." to the shell title.
+- [ ] WP3d.3 Set `default_cwd = 'C:\no-such-folder'` in `config.toml` (or a profile with `directory` that is gone) and open a tab. The shell starts in your home folder and a notice on the pane names `C:\no-such-folder`. Nothing is silent.
+- [ ] WP3d.4 A profile whose program is deleted after the app started: the tab opens, shows the red "could not start" message, a notice names the program, and the tab stays. Close it with Ctrl+Shift+W.
+- [ ] WP3d.5 Split a pane three times quickly, close one of the new panes before it prints anything: no stray shell process remains in Task Manager (look for `cmd.exe` or `pwsh.exe` children of `forgetty-win.exe`).
+- [ ] WP3d.6 Duplicate a workspace with several tabs: the new workspace and its tabs appear at once, each tab with its own shell a moment later.
+
 ### Not done in WP3
 
 - A Settings window (not decided).

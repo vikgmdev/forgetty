@@ -112,7 +112,17 @@ Notes and decisions:
   before any stat; `%VAR%` in a PATH entry is expanded first. A `FORGETTY_CONFIG` on a network path is
   not used. Accepted: a drive letter the user mapped (`net use`) or `subst`-ed to a share looks like a
   local path and is treated as one. No process stat-s a folder on the UI thread: the start-folder checks run
-  when the file is read (worker thread), and the process start checks the rest.
+  when the file is read (worker thread), and the process start (ConPTY open, CreateProcess, the stat of the
+  start folder) runs on its own worker thread (WP3d).
+- Starting a local shell (WP3d): `new_tab`, `split_pane`, `create_workspace` and `duplicate_workspace` add the
+  pane to the layout at once and return. The pane's title is "Starting..." until its worker thread has
+  opened the pseudo console and started the process (`conpty.rs` `LocalConPty::begin` + `Pending::run`).
+  Input typed meanwhile waits in a queue and goes out in order when the writer thread starts; a resize
+  meanwhile sets the size the shell starts at; closing the pane meanwhile ends the new process at once. The
+  start folders are tried in order: the parent pane's, `default_cwd`, the user profile. When the first is
+  not usable, the shell starts in the next one and the pane shows a notice that names the wanted folder
+  (`BackendEvent::PaneNotice`). When the shell cannot start, the pane stays open with the red error message
+  and a notice (closing the last tab would end the app). Shell start errors are never silent.
 - Mica is used on Windows 11 22H2+ (`backdrop = "mica"`); older builds and `backdrop = "none"` get a solid
   themed background. Panes always paint opaque.
 - Rendering cost: `windows-latest` has no GPU, so GPUI draws through WARP and every full-window

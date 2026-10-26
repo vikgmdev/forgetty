@@ -61,7 +61,7 @@ struct State {
 }
 
 /// The title of a pane whose process is being started.
-const STARTING_TITLE: &str = "Starting...";
+pub const STARTING_TITLE: &str = "Starting...";
 
 struct Inner {
     /// Test and smoke hook: how long a start waits before it begins (milliseconds).
