@@ -76,7 +76,7 @@ Verdict: local shells on Windows do not survive closing the app. Everything the 
 | ID | GTK feature (cite) | Windows | Windows evidence / what is missing | Size | Flags |
 |---|---|---|---|---|---|
 | C1 | Split right / split down, Alt+Shift+= and Alt+Shift+- (`app.rs:1366-1416`) | PRESENT | Same default chords (`keys.rs:81-82`) | - | - |
-| C2 | Split left / split up (before=true; menu only; `app.rs:1385-1386`) | MISSING | `SplitPane` has only direction, no placement (`backend.rs:205-214`) and `shell.rs:758` `split` takes only a direction. Whether the wire `split_pane` supports it: Checked in WP2: the wire `split_pane` takes pane_id, direction, rows, cols, cwd and no placement, so this needs a server change (optional `before`). Returned to the coordinator, not built. | M | protocol change |
+| C2 | Split left / split up (before=true; menu only; `app.rs:1385-1386`) | PRESENT | Menu items "Split Left" and "Split Up" (pane and tab menus) and palette actions `split_left`, `split_up` (no default chords, as GTK). The server `split_pane` takes an optional `before` (capability `split_before`). A machine whose server does not report the capability hides the two menu items, and the palette action says the server is too old: the client never sends `before` to it. Smoke `split_left_puts_the_new_pane_first`, `split_up_puts_the_new_pane_first`, `real_split_left_puts_the_new_pane_first`. | - | WP2b done, needs the server of this branch |
 | C3 | Directional focus, Alt+Arrow, geometry based (`app.rs:1536-1556`, `app.rs:4814`) | PRESENT | Ctrl+Alt+Arrows (`keys.rs:84-87`) | - | chords differ |
 | C4 | Keyboard pane resize, Alt+Shift+Arrow (`app.rs:1560-1580`, `app.rs:4951`) | PRESENT | Alt+Shift+Arrow moves the nearest divider 20 px, saved through `update_split_ratios` (`layout::resize_by_key`). Free on Windows, so GTK's chord is kept. Limit: a nested split is saved under its first leaf, like divider drag. | - | WP2 done |
 | C5 | Divider drag, ratios persisted (`app.rs:2684-2730`, `app.rs:2312`) | PRESENT | Drag + `update_split_ratios` (`shell.rs:1148`, `README.md` W2) | - | - |
@@ -93,7 +93,7 @@ Verdict: local shells on Windows do not survive closing the app. Everything the 
 | D2 | New workspace, Ctrl+Alt+N (`app.rs:1960-1975`) | PRESENT | Ctrl+Shift+N, "+ New workspace" (`keys.rs:91`, `shell.rs:826`) | - | - |
 | D3 | Switch workspace: click, Alt+1..9, Ctrl+Alt+PgUp/PgDn (`app.rs:2030-2145`) | PARTIAL | Click works. Next/Previous workspace actions exist with NO default chord (`keys.rs:92-93`). No number keys. | S | - |
 | D4 | Rename workspace (dialog; `app.rs:1982`, `app.rs:8175`) | PRESENT | Double click in sidebar, palette (`shell.rs:901`) | - | - |
-| D5 | Delete workspace (`app.rs:1998-2025`, `app.rs:9971`) | PRESENT | `SessionBackend::delete_workspace` in LocalBackend and RemoteBackend. More than one tab asks first (Enter or Esc cancels, y deletes). The last workspace cannot be deleted (menu item greyed). | - | WP2 done |
+| D5 | Delete workspace (`app.rs:1998-2025`, `app.rs:9971`) | PRESENT | `SessionBackend::delete_workspace` in LocalBackend and RemoteBackend. It asks first when the workspace has more than one tab or pane, or a program at work, and always on a remote machine (Enter or Esc cancels, y deletes; GTK asks only for more than one tab, the stricter rule stays). The call names the workspace by id (capability `workspace_id`), so a workspace another client moved is never mistaken for another. The last workspace cannot be deleted (menu item greyed). | - | WP2 done |
 | D6 | Duplicate workspace (`app.rs:9389-9830`) | PRESENT | `SessionBackend::duplicate_workspace`: one fresh tab per source tab in the first pane's start directory, name "<source> (copy)", opens after the source. Splits and programs are not copied (server rule, local does the same). | - | WP2 done |
 | D7 | Move workspace up/down (`app.rs:9827-9970`) | PRESENT | `SessionBackend::move_workspace` (a swap of two positions, like the server). The active workspace stays the same workspace. | - | WP2 done |
 | D8 | Workspace color, persisted via daemon (`app.rs:9043-9160`) | PRESENT | `SessionBackend::set_workspace_color`, only `#rrggbb` is written. The sidebar row bar shows it. | - | WP2 done |
@@ -107,8 +107,8 @@ Verdict: local shells on Windows do not survive closing the app. Everything the 
 | E1 | libghostty key encoder, Kitty protocol, release events (`input.rs:89-134`) | PRESENT | `encoder.rs`, `view.rs:663-760` | - | - |
 | E2 | Focus reporting DECSET 1004 (`term.rs:712-757`) | PRESENT | `view.rs:456` | - | - |
 | E3 | Mouse reporting, Shift bypasses it (`term.rs:759-975`, `input.rs:160-260`) | PRESENT | `view.rs:959-1060`, `encoder.rs` | - | - |
-| E4 | Ctrl+C copies when a selection exists, else SIGINT (`term.rs:600-640`) | PARTIAL | Ctrl+C always goes to the program. Copy is Ctrl+Shift+C, right click, or copy-on-select (`view.rs:690-700`, `view.rs:995-1000`, `view.rs:1053`). Different design by choice. | S | decision: keep Windows Terminal style |
-| E5 | Ctrl+V and Ctrl+Shift+V paste (`app.rs:1490-1506`) | PARTIAL | Ctrl+Shift+V and right click only (`view.rs:700-705`). Ctrl+V goes to the program. | S | same decision as E4 |
+| E4 | Ctrl+C copies when a selection exists, else SIGINT (`term.rs:600-640`) | PARTIAL | Ctrl+C always goes to the program. Copy is Ctrl+Shift+C, copy-on-select, or right click with `right_click = "copy_paste"` (the default right click opens the menu, as GTK) (`view.rs:690-700`, `view.rs:995-1000`, `view.rs:1053`). Different design by choice. | S | decision: keep Windows Terminal style |
+| E5 | Ctrl+V and Ctrl+Shift+V paste (`app.rs:1490-1506`) | PARTIAL | Ctrl+Shift+V, the menu's Paste, and right click with `right_click = "copy_paste"` (`view.rs:700-705`). Ctrl+V goes to the program. | S | same decision as E4 |
 | E6 | Configurable keybindings in `[keybindings]` (`app.rs:683-720`, `schema.rs` `keybindings`) | PRESENT | `[keybindings]`, multiple chords, `"none"` unbinds (`config.rs:5-24`, `keys.rs:204-260`) | - | - |
 | E7 | Keybinding editor UI with conflict detection and reset (`sv.rs:474-510`, `sv.rs:1111-1520`) | MISSING | Config file only. Palette shows current chords (`shell.rs:965-986`). | M | depends on L3 |
 | E8 | Keyboard Shortcuts window, F1 (`app.rs:6293-6410`) | PARTIAL | Command palette lists actions with chords (`shell.rs:953-986`). No cheat-sheet window, no F1. | S | - |
@@ -135,7 +135,7 @@ Verdict: local shells on Windows do not survive closing the app. Everything the 
 | ID | GTK feature (cite) | Windows | Windows evidence / what is missing | Size | Flags |
 |---|---|---|---|---|---|
 | G1 | http/https URL detection on hover: underline and pointer cursor (`term.rs:1729-1805`, `term.rs:1080-1100`, `term.rs:2622`) | PRESENT | `shell-core/src/links.rs` (http/https only, trailing punctuation cut, wrapped URLs whole), underline and hand cursor. | M | WP1 done
-| G2 | Ctrl+click opens URL in browser; context menu "Open <url>" (`term.rs:798-818`, `app.rs:6271`, `term.rs:1639-1685`) | PRESENT | Ctrl+click opens via ShellExecute after the scheme allow-list. The pane menu (Shift+right-click) shows "Open <url>" when the pointer was on a link, same allow-list. | - | WP1, WP2 done |
+| G2 | Ctrl+click opens URL in browser; context menu "Open <url>" (`term.rs:798-818`, `app.rs:6271`, `term.rs:1639-1685`) | PRESENT | Ctrl+click opens via ShellExecute after the scheme allow-list. The pane menu (right-click) shows "Open <url>" when the pointer was on a link, same allow-list. | - | WP1, WP2 done |
 | G3 | In-terminal search bar, Ctrl+Shift+F: whole scrollback, case-insensitive, "N of M", Enter/Shift+Enter, Esc, highlights, scroll to match (`term.rs:1340-1440`, `term.rs:1863-1920`, `term.rs:2077-2340`, `term.rs:2787`, `app.rs:1468-1486`) | PRESENT | Ctrl+Shift+F find bar, whole scrollback, case-insensitive, "N of M", Enter/Shift+Enter/Esc, highlights in GTK colors. Time-sliced (4 ms) off the key path (`shell-core/src/search.rs`). | M | WP1 done
 | G4 | Mouse wheel scroll, 3 rows per notch (`input.rs:261-335`) | PRESENT | `view.rs:1061-1100` | - | - |
 | G5 | Scrollbar widget with drag (`term.rs:1224-1340`) | PRESENT | 10 px overlay strip with draggable thumb (`view.rs` `scrollbar_overlay`, `shell-core/src/scrollbar.rs`). | S | WP1 done
@@ -196,7 +196,7 @@ Windows only:
 - OSC 52 clipboard write with per-machine policy off/ask/allow (`shell-core/src/osc52.rs`, `clipboard.rs`).
 - OSC 133 program status (working/waiting/done/failed) with tab and sidebar icons and status toasts (`osc.rs:111-129`, `chrome.rs:52`).
 - Bracketed paste, paste sanitizing against pastejacking, confirm overlay (`view.rs:775-800`). GTK writes pasted text raw (no `2004` handling: grep `bracketed` in `forgetty-gtk` is empty).
-- Copy on select and right click copy/paste (`view.rs:995-1053`).
+- Copy on select. Right click copy/paste is the `right_click = "copy_paste"` option (`view.rs`).
 - Shift+PgUp/PgDn scrollback keys (`view.rs:709-730`).
 - IME through TSF, dead keys, AltGr handling (`view.rs:728-760`, `view.rs:1309-1410`). GTK has no input-method code (grep `IMContext`: none).
 - Mica/Mica Alt/blur backdrop, custom titlebar, snap layouts (`main.rs:94-122`, `chrome.rs:156-246`).
@@ -218,7 +218,7 @@ Neither has: window size/position/maximized restore (A14), file drag and drop in
 4. Theme catalog (K1): reuse `forgetty-config` on Windows or copy the theme TOML files into the Windows crate.
 5. Chord policy (E4, E5, E9): keep Windows Terminal conventions or copy GTK chords. Pure product call.
 6. Image paste for remote panes (F8): needs a server upload path or is limited to local panes.
-7. Split left/up (C2): the wire `split_pane` has no placement (checked in WP2). Either add an optional `before` param on the server, or leave it unsupported.
+7. Split left/up (C2): built in WP2b with an optional `before` param on the server (capability `split_before`).
 
 ## 13. Counts
 

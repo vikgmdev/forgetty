@@ -359,25 +359,25 @@ Look at another tab or another window first, so the pane is not the one you are 
 ## WP2: menus, workspace and tab operations, pane resize, attention
 
 Run once on the local machine and once on a paired Linux server (the workspace items need the server of this branch).
-Config key: `right_click = "copy_paste"` (default) or `"menu"` in `%APPDATA%\forgetty\config.toml`.
+Config key: `right_click = "menu"` (default, as GTK) or `"copy_paste"` (Windows Terminal) in `%APPDATA%\forgetty\config.toml`.
 
 ### WP2.1 Pane menu
 
-- [ ] WP2.1.1 Shift+right-click inside a pane. Expected: a menu opens at the pointer: Copy (grey with no selection), Paste, Select All,
-  Find, Clear, Reset, Split Right, Split Down. Each shows its chord on the right where it has one.
-- [ ] WP2.1.2 Select some text, Shift+right-click. Copy is enabled. Click it: the text is on the clipboard. Paste, Select All, Find (opens the find bar),
+- [ ] WP2.1.1 Right-click inside a pane. Expected: a menu opens at the pointer: Copy (grey with no selection), Paste, Select All,
+  Find, Clear, Reset, Split Right, Split Down, Split Left, Split Up (the last two only when the machine's server supports them). Each shows its chord on the right where it has one.
+- [ ] WP2.1.2 Select some text, right-click. Copy is enabled. Click it: the text is on the clipboard. Paste, Select All, Find (opens the find bar),
   Clear, Reset, Split Right and Split Down each do what the palette command does, in the pane you clicked (also when it is not the focused one).
-- [ ] WP2.1.3 Print a URL, Shift+right-click on it. Expected: the last item reads "Open https://...". Click it: the browser opens that URL.
+- [ ] WP2.1.3 Print a URL, right-click on it. Expected: the last item reads "Open https://...". Click it: the browser opens that URL.
   Right-click on plain text: no such item. A `file://` or `javascript:` text never shows it.
-- [ ] WP2.1.4 A plain right-click still copies a selection or pastes (Windows Terminal style). With `right_click = "menu"` it opens the menu instead.
-- [ ] WP2.1.5 In `vim` with `:set mouse=a`, Shift+right-click still opens the menu. A plain right-click goes to vim.
+- [ ] WP2.1.4 A plain right-click opens the menu. With `right_click = "copy_paste"` it copies a selection or pastes instead (Windows Terminal style), and Shift+right-click still opens the menu.
+- [ ] WP2.1.5 In `vim` with `:set mouse=a`, Shift+right-click opens the menu. A plain right-click goes to vim.
 - [ ] WP2.1.6 Open the menu near the right and bottom edge. Expected: it flips to stay inside the window. Click outside, or press Esc: it closes. The terminal gets the keyboard back.
 - [ ] WP2.1.7 Palette: "Pane menu" opens it at the top left of the active pane. Up and Down move (grey rows are skipped), Enter runs the row.
 
 ### WP2.2 Tab menu
 
 - [ ] WP2.2.1 Right-click a tab, then a row of the sidebar's TABS list. Expected: a color row (8 colors and a cross), Rename Tab, Duplicate Tab,
-  Split Right, Split Down, Move Left, Move Right, Find, Close Tabs to the Right, Close Other Tabs, Close Tab. Move Left is grey on the first tab,
+  Split Right, Split Down, Split Left, Split Up, Move Left, Move Right, Find, Close Tabs to the Right, Close Other Tabs, Close Tab. Move Left is grey on the first tab,
   Move Right and Close Tabs to the Right on the last, Close Other Tabs with one tab.
 - [ ] WP2.2.2 Pick a color. A dot shows in the tab and the sidebar row, and the active tab's top line takes that color. The cross clears it. Colors are not kept after a restart (as in GTK).
 - [ ] WP2.2.3 Duplicate Tab on a tab whose shell is in `C:\Users` (`cd` there first). Expected: a new tab right after it, in the same directory. In a pane that printed
@@ -394,7 +394,8 @@ Config key: `right_click = "copy_paste"` (default) or `"menu"` in `%APPDATA%\for
 - [ ] WP2.3.3 Duplicate Workspace on a workspace with 3 tabs and a split. Expected: a new workspace named "<name> (copy)" right after it, with 3 fresh tabs (no split, no running program), each in
   the directory of the source tab. It opens.
 - [ ] WP2.3.4 Move Down then Move Up. Expected: two rows swap, the highlighted (active) workspace stays the one you were in.
-- [ ] WP2.3.5 Delete a workspace with 1 tab: it goes at once. With 2 or more tabs: a question shows, Enter or Esc cancels, "y" or the Delete button deletes. Its shells end.
+- [ ] WP2.3.5 Delete a local workspace with 1 tab and 1 pane and nothing running: it goes at once. With 2 or more tabs, or one tab split in 2 panes, or an agent at work (status Working or Waiting): a question shows,
+  Enter or Esc cancels, "y" or the Delete button deletes. Its shells end. On a remote machine the question always shows.
 - [ ] WP2.3.6 Window title: with two or more workspaces it reads `<workspace> - <tab> - Forgetty`. With one it reads `<tab> - Forgetty`.
 - [ ] WP2.3.7 Two apps on one server: delete or move a workspace in one. The other follows within a second.
 
@@ -413,9 +414,18 @@ Config key: `right_click = "copy_paste"` (default) or `"menu"` in `%APPDATA%\for
 - [ ] WP2.5.3 A bell in the pane you are typing in does not leave a ring. With the window in the background, it does (until you come back).
 - [ ] WP2.5.4 `bell_mode = "none"`: no ring from a bell. A program notification (OSC 9) still raises the badge.
 
+### WP2b: split left and up, workspace ids, errors, big copy
+
+Needs the server of this branch (capabilities `split_before` and `workspace_id`). Check against an older server too.
+
+- [ ] WP2b.1 Right-click a pane, Split Left: the new pane appears on the left of the one you clicked and has the focus. Split Up: the new pane is above. Same from the tab menu and from the palette ("Split pane left", "Split pane up"). They have no chords (as GTK).
+- [ ] WP2b.2 Paired Linux server that has NOT been updated: the pane and tab menus show no Split Left or Split Up. The palette command shows "This machine's server is too old to split left or up..." and nothing is split. Split Right and Split Down work.
+- [ ] WP2b.3 Two apps on one server. In app A open the workspace menu and keep it open. In app B, move a workspace so the order changes. In A, choose Delete Workspace and say yes. Expected: the workspace you chose goes, never another one. With an older server the same holds as long as the order did not change in the last second.
+- [ ] WP2b.4 Make a backend call fail (delete a workspace another client just deleted). Expected: a notice "Failed: ..." at the bottom of the pane, not only a silent no-op.
+- [ ] WP2b.5 Fill the scrollback (`1..300000 | % { "line $_" }`), select all of it and copy. Expected: a "Copying N lines..." notice while it reads, the clipboard stays as it was until the copy is whole, then it holds every line. If the output keeps scrolling while it reads and the scrollback is full, "Copy stopped: output moved the lines while copying" shows and the clipboard is unchanged.
+
 ### Not done in WP2
 
-- Split left / split up: the wire has no placement. Waits for the coordinator's decision.
 - Tab menu "Move to New Window" and Export (no multi-window, GTK's Export is a stub).
 - A custom color picker (the 8 presets only).
 
