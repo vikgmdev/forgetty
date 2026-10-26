@@ -541,10 +541,12 @@ command = "wsl.exe -d Ubuntu --cd ~"
 ### Keymap presets
 
 - [ ] KM.1 Fresh install, no `keymap` in the file: the palette (Ctrl+Shift+P) ends with "Shortcuts: GTK shortcuts (keymap in config.toml)". Alt+Left / Alt+Right moves between panes, Ctrl+Alt+N makes a workspace, Alt+1 and Alt+2 switch between workspaces, Ctrl+Alt+B toggles the sidebar.
-- [ ] KM.2 In the GTK set, Ctrl+V pastes, Ctrl+C with text selected copies (and clears nothing else), Ctrl+C with no selection interrupts a running program (`ping -t localhost`). Right-click menus show "Ctrl+C" and "Ctrl+V".
+- [ ] KM.2 In the GTK set, Ctrl+V pastes, Ctrl+C with text selected copies and the selection disappears, so a second Ctrl+C interrupts a running program (`ping -t localhost`); Ctrl+C with no selection interrupts at once; a selection scrolled out of view counts as none. Right-click menus show "Ctrl+C" and "Ctrl+V".
 - [ ] KM.3 Put `keymap = "windows"` in `config.toml` and save with the app open: a notice says keys changed, the palette line says "Windows shortcuts", Ctrl+Alt+Left moves between panes, Ctrl+Shift+Q closes the tab, Ctrl+3 jumps to tab 3, Ctrl+V goes to the program (in PowerShell it prints nothing, Ctrl+Shift+V pastes).
 - [ ] KM.4 Switch back with `keymap = "gtk"`: the GTK chords work again without a restart. `keymap = "emacs"` is refused with "Configuration not applied" and the old set stays.
 - [ ] KM.5 An entry in `[keybindings]` (for example `focus_left = "ctrl+h"`) wins in both sets.
+- [ ] KM.7 In the GTK set, Ctrl+Shift+Q with a local shell open shows "Quit Forgetty? N local shells will end." with N the number of panes. Enter and Esc cancel, `y` or the Quit button quits. The window's close button shows the same question. With no local pane open (only a remote machine's tabs) the app quits without a question.
+- [ ] KM.8 Put `paste_ctrl_v = "none"` and `copy_or_interrupt = "none"` under `[keybindings]`: Ctrl+V and Ctrl+C reach the program in the GTK set (Ctrl+Shift+V and Ctrl+Shift+C still paste and copy). Alt+9 in a window with fewer than nine workspaces reaches the program (in `cat -v` it prints `^[9`).
 - [ ] KM.6 In the GTK set Ctrl+Shift+Q quits the app. Ctrl+Shift+N, Ctrl+1 and Ctrl+Shift+Z reach the program (they are not shortcuts there).
 
 ### Not done in WP3

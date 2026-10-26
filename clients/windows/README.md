@@ -106,6 +106,8 @@ Notes and decisions:
   pane's spawn directory (else `default_cwd`, else the user profile). UNC, device (`\\?\`, `\\.\`)
   paths and non-local `file://` hosts are dropped, so program output cannot make the client touch a
   network share. The OSC scanner decodes on bytes and runs under `catch_unwind`.
+  A redirected profile (`USERPROFILE` on a UNC path) is replaced for child shells by the local profile
+  (`HOMEDRIVE`+`HOMEPATH`, else the system drive), because the PTY layer would stat the share on every start.
 - Paths from `config.toml` follow the same rule (`shell-core/src/resolve.rs`): `shell` and profile
   programs are a PATH lookup (never the working folder) or a full `C:\...` path; network, device and
   NT-namespace (`\??\`) paths, and the forms that depend on the working drive (`\x`, `C:x`), are refused
@@ -141,7 +143,14 @@ Ctrl+Shift+Tab / Ctrl+PageUp previous tab, Ctrl+Shift+PageUp/Down move tab, Alt+
 Alt+Arrows focus pane, Alt+Shift+Arrows resize pane, Ctrl+Alt+N new workspace, Ctrl+Alt+B sidebar,
 Alt+1..9 workspace N, Ctrl+Alt+PageUp/Down previous / next workspace, Ctrl+Shift+F find, Ctrl+Shift+1..9
 profile N, Ctrl+= / Ctrl+- / Ctrl+0 zoom, Ctrl+, theme list, Ctrl+Shift+Q quit, Ctrl+V and Ctrl+Shift+V paste,
-Ctrl+C copies while text is selected (else it is the interrupt), Ctrl+Shift+C copies. The palette stays on
+Ctrl+C copies while text is selected on screen and then clears the selection (so the next Ctrl+C is the
+interrupt), Ctrl+Shift+C copies. Ctrl+V and Ctrl+C are the actions `paste_ctrl_v` and `copy_or_interrupt`: set
+them to `"none"` in `[keybindings]` and both keys go to the program. Alt+1..9 with no such workspace goes to the
+program. Ctrl+Shift+Q (and the window's close button) asks "Quit Forgetty? N local shells will end." while a
+local shell is open (y or the Quit button quits, Enter or Esc cancels); with only remote panes it quits at
+once. In this set Alt+Arrows (focus), Alt+Shift+Arrows and Ctrl+PageUp/PageDown (tabs) are shortcuts, so a
+program that wants those keys (a readline Alt+Left, a pager) does not see them: move them in `[keybindings]` or
+use `keymap = "windows"`. The palette stays on
 Ctrl+Shift+P (GTK opens its shortcuts list there). No chord for: close tab, go to tab N, rename tab, zoom pane,
 select all (GTK has none; use the palette or the menus). `keymap = "windows"` is this client's own set:
 Ctrl+Shift+Q close tab, Ctrl+1..9 go to tab, Ctrl+Shift+R rename tab, Ctrl+Alt+Arrows focus,

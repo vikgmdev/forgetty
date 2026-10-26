@@ -129,6 +129,9 @@ fn main() {
             },
             move |window, cx| {
                 let shell = cx.new(|cx| AppShell::new(cfg, backend, smoke_state, window, cx));
+                // The close button asks first while a local shell is open (as Ctrl+Shift+Q).
+                let weak = shell.downgrade();
+                window.on_window_should_close(cx, move |_w, cx| weak.update(cx, |s, cx| s.close_allowed(cx)).unwrap_or(true));
                 shell.update(cx, |s, cx| {
                     s.local = Some(local.clone());
                     s.startup_notice = reload::startup_notice(&startup_warnings);

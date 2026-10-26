@@ -27,11 +27,16 @@ fn has(shell: &AppShell, ctrl: bool, alt: bool, shift: bool, k: &str) -> Option<
     shell.keymap.lookup(&Chord::new(ctrl, alt, shift, false, k))
 }
 
-/// A key pressed in the pane, the way the window delivers it when the shell did not take it.
-fn pane_key(shell: &AppShell, pane: PaneId, chord: &str, window: &mut Window, cx: &mut Context<AppShell>) {
-    let Some(v) = shell.views.get(&pane).cloned() else { return };
+/// A key as the window delivers it: the shell first, the pane when the shell did not take it.
+/// Returns true when the shell took it.
+fn pane_key(shell: &mut AppShell, pane: PaneId, chord: &str, window: &mut Window, cx: &mut Context<AppShell>) -> bool {
+    if shell.handle_key(&key(chord), window, cx) {
+        return true;
+    }
+    let Some(v) = shell.views.get(&pane).cloned() else { return false };
     let ev = KeyDownEvent { keystroke: key(chord), is_held: false, prefer_character_input: false };
     v.update(cx, |v, vcx| v.on_key_down(&ev, window, vcx));
+    false
 }
 
 impl ShellSmoke {
@@ -88,7 +93,8 @@ impl ShellSmoke {
                 check("keymap_reload_says_keys", n.contains("keys"));
                 // Ctrl+V belongs to the program in this set.
                 cx.write_to_clipboard(gpui::ClipboardItem::new_string("WIN-NOPASTE".to_string()));
-                pane_key(shell, pane, "ctrl+v", window, cx);
+                let taken = pane_key(shell, pane, "ctrl+v", window, cx);
+                check("keymap_windows_ctrl_v_is_not_a_shortcut", !taken);
                 self.keymap_next();
             }
             2 => {
@@ -131,7 +137,19 @@ impl ShellSmoke {
                     });
                 }
                 cx.write_to_clipboard(gpui::ClipboardItem::new_string("x-before".to_string()));
-                pane_key(shell, pane, "ctrl+c", window, cx);
+                let taken = pane_key(shell, pane, "ctrl+c", window, cx);
+                check("keymap_gtk_ctrl_c_is_taken_with_a_selection", taken);
+                let cleared = shell.views.get(&pane).is_some_and(|v| v.read(cx).sel.is_none());
+                check("keymap_gtk_ctrl_c_clears_the_selection", cleared);
+                // The next Ctrl+C is the interrupt: the shell leaves it to the program.
+                check("keymap_gtk_second_ctrl_c_is_the_interrupt", !shell.handle_key(&key("ctrl+c"), window, cx));
+                // Alt+9 with no ninth workspace is the program's key.
+                check("keymap_gtk_alt_digit_without_a_workspace_is_the_programs", shell.layout.workspaces.len() < 9 && !shell.handle_key(&key("alt+9"), window, cx));
+                // Ctrl+Shift+Q asks first while a local shell is open; Enter says no.
+                shell.request_quit(cx);
+                check("keymap_quit_asks_with_a_local_shell", shell.confirm.as_ref().is_some_and(|c| c.text.contains("local shell")));
+                shell.handle_key(&key("enter"), window, cx);
+                check("keymap_quit_enter_cancels", shell.confirm.is_none());
                 let clip = cx.read_from_clipboard().and_then(|i| i.text()).unwrap_or_default();
                 record("keymap_ctrl_c_clip", json!(clip));
                 check("keymap_gtk_ctrl_c_copies_a_selection", !clip.is_empty() && clip != "x-before");

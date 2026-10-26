@@ -46,6 +46,8 @@ pub struct OpenMenu {
 pub enum ConfirmAct {
     /// Delete the workspace with this id.
     DeleteWorkspace(Uuid),
+    /// End the app while local shells are open.
+    Quit,
 }
 
 /// A question that waits for y (do it) or Enter/Esc/click on Cancel (do not).
@@ -427,6 +429,11 @@ impl AppShell {
         let Some(c) = self.confirm.take() else { return };
         match c.act {
             ConfirmAct::DeleteWorkspace(id) => self.delete_workspace_now(id, cx),
+            ConfirmAct::Quit => {
+                self.quit_ok = true;
+                cx.quit();
+                return;
+            }
         }
         self.request_sync(cx);
     }
@@ -440,7 +447,7 @@ impl AppShell {
     pub fn confirm_key(&mut self, ks: &Keystroke, cx: &mut Context<Self>) {
         match ks.key.as_str() {
             "y" if !ks.modifiers.control && !ks.modifiers.alt => self.confirm_yes(cx),
-            // Enter is "no" too: a stray Enter must not delete a workspace.
+            // Enter is "no" too: a stray Enter must not delete a workspace or end the shells.
             "enter" | "escape" | "n" => self.confirm_no(cx),
             _ => {}
         }
@@ -631,6 +638,7 @@ impl AppShell {
 
     pub(crate) fn render_confirm(&self, cx: &mut Context<Self>) -> Option<Div> {
         let c = self.confirm.as_ref()?;
+        let quit = matches!(c.act, ConfirmAct::Quit);
         let th = self.theme;
         let button = |id: &'static str, label: &'static str, danger: bool| {
             div()
@@ -667,9 +675,9 @@ impl AppShell {
                     .justify_end()
                     .gap(px(8.0))
                     .child(button("confirm-no", "Cancel", false).on_mouse_down(MouseButton::Left, cx.listener(|s, _e, _w, cx| s.confirm_no(cx))))
-                    .child(button("confirm-yes", "Delete", true).on_mouse_down(MouseButton::Left, cx.listener(|s, _e, _w, cx| s.confirm_yes(cx)))),
+                    .child(button("confirm-yes", if quit { "Quit" } else { "Delete" }, true).on_mouse_down(MouseButton::Left, cx.listener(|s, _e, _w, cx| s.confirm_yes(cx)))),
             )
-            .child(div().text_size(px(11.0)).text_color(hsla(th.dim)).child("y deletes. Enter or Esc cancels."));
+            .child(div().text_size(px(11.0)).text_color(hsla(th.dim)).child(if quit { "y quits. Enter or Esc cancels." } else { "y deletes. Enter or Esc cancels." }));
         Some(
             div()
                 .absolute()

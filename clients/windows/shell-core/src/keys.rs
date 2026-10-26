@@ -78,8 +78,13 @@ pub enum Action {
     ChooseTheme,
     /// Switch to workspace N (1-based), as GTK's Alt+1..9.
     GotoWorkspace(u8),
-    /// End the app (GTK's Ctrl+Shift+Q).
+    /// End the app (GTK's Ctrl+Shift+Q). Asks first while a local shell is open.
     Quit,
+    /// Paste (GTK's Ctrl+V). Ctrl+Shift+V pastes in both sets and is not an action.
+    PasteCtrlV,
+    /// Copy while a selection is on screen, else the key goes to the program as the interrupt
+    /// (GTK's Ctrl+C). Ctrl+Shift+C copies in both sets and is not an action.
+    CopyOrInterrupt,
 }
 
 /// Which set of default chords is in force. `gtk` (the default) takes the chords of the GTK app,
@@ -229,6 +234,8 @@ pub const ACTIONS: &[ActionInfo] = &[
     // GTK: Ctrl+, opens the Appearance sidebar (theme and font).
     differ!(Action::ChooseTheme, "choose_theme", "Choose theme...", gtk ["ctrl+,"], windows []),
     differ!(Action::Quit, "quit", "Quit", gtk ["ctrl+shift+q"], windows []),
+    differ!(Action::PasteCtrlV, "paste_ctrl_v", "Paste (Ctrl+V)", gtk ["ctrl+v"], windows []),
+    differ!(Action::CopyOrInterrupt, "copy_or_interrupt", "Copy, else interrupt (Ctrl+C)", gtk ["ctrl+c"], windows []),
     differ!(Action::GotoWorkspace(1), "goto_workspace_1", "Go to workspace 1", gtk ["alt+1"], windows []),
     differ!(Action::GotoWorkspace(2), "goto_workspace_2", "Go to workspace 2", gtk ["alt+2"], windows []),
     differ!(Action::GotoWorkspace(3), "goto_workspace_3", "Go to workspace 3", gtk ["alt+3"], windows []),
@@ -598,6 +605,23 @@ mod tests {
         assert_eq!(c(false, true, false, "1"), None);
         assert!(km.chords(Action::Quit).is_empty());
         assert!(km.warnings.is_empty());
+    }
+
+    #[test]
+    fn ctrl_v_and_ctrl_c_are_actions_that_can_be_unbound() {
+        let gtk = Keymap::defaults(KeymapPreset::Gtk);
+        assert_eq!(gtk.lookup(&Chord::new(true, false, false, false, "v")), Some(Action::PasteCtrlV));
+        assert_eq!(gtk.lookup(&Chord::new(true, false, false, false, "c")), Some(Action::CopyOrInterrupt));
+        let win = Keymap::defaults(KeymapPreset::Windows);
+        assert_eq!(win.lookup(&Chord::new(true, false, false, false, "v")), None);
+        assert_eq!(win.lookup(&Chord::new(true, false, false, false, "c")), None);
+        let mut o = HashMap::new();
+        o.insert("paste_ctrl_v".to_string(), vec!["none".to_string()]);
+        o.insert("copy_or_interrupt".to_string(), vec!["none".to_string()]);
+        let km = Keymap::new(KeymapPreset::Gtk, &o);
+        assert_eq!(km.lookup(&Chord::new(true, false, false, false, "v")), None);
+        assert_eq!(km.lookup(&Chord::new(true, false, false, false, "c")), None);
+        assert!(km.warnings.is_empty(), "{:?}", km.warnings);
     }
 
     #[test]

@@ -50,6 +50,11 @@ pub fn can_delete_workspace(workspace_count: usize) -> bool {
     workspace_count > 1
 }
 
+/// The question before the app ends with `n` local shells open.
+pub fn quit_text(n: usize) -> String {
+    if n == 1 { "Quit Forgetty? 1 local shell will end.".to_string() } else { format!("Quit Forgetty? {n} local shells will end.") }
+}
+
 /// The words of the delete confirmation.
 pub fn delete_workspace_text(name: &str, i: &DeleteInfo) -> String {
     let plural = |n: usize, w: &str| if n == 1 { format!("{n} {w}") } else { format!("{n} {w}s") };
@@ -86,6 +91,12 @@ pub fn raises_attention(window_active: bool, pane_focused: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_quit_question_counts_the_shells() {
+        assert_eq!(super::quit_text(1), "Quit Forgetty? 1 local shell will end.");
+        assert_eq!(super::quit_text(3), "Quit Forgetty? 3 local shells will end.");
+    }
+
     use super::*;
 
     fn ids(n: usize) -> Vec<Uuid> {

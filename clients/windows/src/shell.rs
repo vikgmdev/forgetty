@@ -169,6 +169,8 @@ pub struct AppShell {
     /// The open context menu and the question that waits for an answer.
     pub menu: Option<crate::menus::OpenMenu>,
     pub confirm: Option<crate::menus::Confirm>,
+    /// The user said yes to the quit question (the window may close).
+    pub quit_ok: bool,
     /// Panes whose bell or notification the user has not looked at yet.
     pub attention: HashSet<PaneId>,
     /// Tab colors. Like GTK's they live in memory only (the server has no tab color).
@@ -290,6 +292,7 @@ impl AppShell {
             drag: None,
             menu: None,
             confirm: None,
+            quit_ok: false,
             attention: HashSet::new(),
             tab_colors: HashMap::new(),
             focus,
@@ -1142,7 +1145,13 @@ impl AppShell {
                     self.set_workspace(i, cx);
                 }
             }
-            Action::Quit => cx.quit(),
+            Action::Quit => self.request_quit(cx),
+            Action::PasteCtrlV => self.on_active_view(window, cx, |v, cx| {
+                v.key_paste(cx);
+            }),
+            Action::CopyOrInterrupt => self.on_active_view(window, cx, |v, cx| {
+                v.key_copy(cx);
+            }),
         }
         cx.notify();
     }
@@ -1222,6 +1231,8 @@ impl AppShell {
                         Some(w) => format!("Go to workspace {n}: {}", forgetty_shell_core::notify::sanitize(&w.name, 40)),
                         None => continue,
                     },
+                    // The Ctrl+V and Ctrl+C keys have their own menu rows.
+                    Action::PasteCtrlV | Action::CopyOrInterrupt => continue,
                     _ => info.title.to_string(),
                 };
                 if let Some((score, hits)) = fuzzy::score(&p.edit.text, &title) {
@@ -1274,9 +1285,47 @@ impl AppShell {
             return true;
         }
         if let Some(a) = self.keymap.lookup(&chord) {
+            // These keys are the program's when the shell has nothing to do with them: Alt+N
+            // with no workspace N, Ctrl+V while a paste question waits, Ctrl+C with nothing
+            // selected on screen (the interrupt).
+            let mine = match a {
+                Action::GotoWorkspace(n) => usize::from(n) <= self.layout.workspaces.len(),
+                Action::PasteCtrlV | Action::CopyOrInterrupt => {
+                    let Some(view) = self.active_pane().and_then(|p| self.views.get(&p)).cloned() else { return false };
+                    let v = view.read(cx);
+                    if matches!(a, Action::PasteCtrlV) { v.takes_key_paste() } else { v.takes_key_copy() }
+                }
+                _ => true,
+            };
+            if !mine {
+                return false;
+            }
             self.run_action(a, window, cx);
             return true;
         }
+        false
+    }
+
+    /// Quit (Ctrl+Shift+Q, the window's close button): at once, or after a question while a local
+    /// shell is open. Only remote panes open: no question.
+    pub fn request_quit(&mut self, cx: &mut Context<Self>) {
+        if self.close_allowed(cx) {
+            cx.quit();
+        }
+    }
+
+    /// May the window close now? With a local shell open it asks, and the answer is no until the
+    /// user says yes.
+    pub fn close_allowed(&mut self, cx: &mut Context<Self>) -> bool {
+        let n = self.local.as_ref().map_or(0, |l| l.live_panes());
+        if n == 0 || self.quit_ok {
+            return true;
+        }
+        self.menu = None;
+        self.palette = None;
+        self.rename = None;
+        self.confirm = Some(crate::menus::Confirm { text: forgetty_shell_core::ops::quit_text(n), act: crate::menus::ConfirmAct::Quit });
+        cx.notify();
         false
     }
 

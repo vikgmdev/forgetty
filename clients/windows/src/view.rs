@@ -1481,28 +1481,8 @@ impl TerminalView {
             cx.stop_propagation();
             return;
         }
-        // The GTK key set: Ctrl+V pastes, and Ctrl+C copies while there is a selection (else it
-        // is the interrupt, which goes to the program below). The Windows set sends both to the
-        // program, and copies and pastes with Ctrl+Shift+C and Ctrl+Shift+V only.
-        if self.cfg.keymap == forgetty_shell_core::keys::KeymapPreset::Gtk && m.control && !m.shift && !m.alt && !m.platform {
-            match ks.key.as_str() {
-                "v" => {
-                    if self.search.is_some() {
-                        self.search_paste(cx);
-                    } else {
-                        self.paste(cx);
-                    }
-                    cx.stop_propagation();
-                    return;
-                }
-                "c" if self.sel.is_some() && self.search.is_none() => {
-                    self.copy_selection(cx);
-                    cx.stop_propagation();
-                    return;
-                }
-                _ => {}
-            }
-        }
+        // Ctrl+V and Ctrl+C in the GTK set are keymap actions (`paste_ctrl_v`, `copy_or_interrupt`)
+        // that the shell runs before the key gets here. The Shift forms are below.
         if m.control && m.shift && !m.alt {
             match ks.key.as_str() {
                 "c" => {
@@ -1756,6 +1736,45 @@ impl TerminalView {
             d = d.child(format!("... {} more line(s)", p.total_lines - p.preview.len()));
         }
         Some(d)
+    }
+
+    /// Does the Ctrl+V key paste now? Not while a paste question waits for Enter or Esc.
+    pub(crate) fn takes_key_paste(&self) -> bool {
+        self.pending_paste.is_none()
+    }
+
+    pub(crate) fn key_paste(&mut self, cx: &mut Context<Self>) {
+        if self.search.is_some() {
+            self.search_paste(cx);
+        } else {
+            self.paste(cx);
+        }
+    }
+
+    /// Is a selection on screen? (A selection that has scrolled out of view, or is empty, counts
+    /// as none.)
+    fn selection_on_screen(&self) -> bool {
+        let Some(sel) = self.sel.as_ref() else { return false };
+        if sel.is_empty() {
+            return false;
+        }
+        let ((r0, _), (r1, _)) = sel.range();
+        let (total, top, len) = self.term.scrollbar_state();
+        let (total, top, len) = (total as usize, top as usize, len as usize);
+        r0 < total && r1 >= top && r0 < top + len.max(self.rows)
+    }
+
+    /// Does the Ctrl+C key copy now? Only with a selection on screen and no search box open;
+    /// else it is the interrupt and goes to the program.
+    pub(crate) fn takes_key_copy(&self) -> bool {
+        self.pending_paste.is_none() && self.search.is_none() && self.selection_on_screen()
+    }
+
+    /// Copy for Ctrl+C. The selection goes away, so the next Ctrl+C is the interrupt.
+    pub(crate) fn key_copy(&mut self, cx: &mut Context<Self>) {
+        self.copy_selection(cx);
+        self.sel = None;
+        cx.notify();
     }
 
     pub fn copy_selection(&mut self, cx: &mut Context<Self>) {
