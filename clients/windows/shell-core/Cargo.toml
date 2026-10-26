@@ -7,6 +7,9 @@ description = "Forgetty app-shell core: layout model, SessionBackend trait, Loca
 
 [dependencies]
 forgetty-core = { path = "../../../crates/forgetty-core" }
+forgetty-config = { path = "../../../crates/forgetty-config" }
+toml = "0.8"
+notify = "7"
 portable-pty = "0.9"
 async-channel = "2"
 serde = { version = "1", features = ["derive"] }

@@ -3,10 +3,13 @@
 //! the fuzzy matcher. The Windows GPUI client and the remote backend on
 //! `forgetty-client` (`clients/windows/remote`) plug into these types.
 
+pub mod argv;
 pub mod backend;
 pub mod bell;
 pub mod codeblock;
 pub mod colors;
+pub mod config;
+pub mod confwatch;
 pub mod conpty;
 pub mod copytext;
 pub mod fingerprint;
