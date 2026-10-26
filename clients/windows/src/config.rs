@@ -7,6 +7,9 @@
 //! sidebar = false               # start with the sidebar open
 //! pane_padding_x = 6.0          # px between a pane border and its text (default 6)
 //! pane_padding_y = 4.0          # default 4
+//! bell_mode = "visual"          # visual | audio | both | none
+//! paste_warn_size = 5120        # ask before pasting more bytes than this (0 = never)
+//! smart_copy = true             # copy strips box-drawing characters (false keeps them)
 //! [font]
 //! family = "Cascadia Mono"
 //! size = 11.0            # points
@@ -41,6 +44,9 @@ struct FileConfig {
     sidebar: Option<bool>,
     pane_padding_x: Option<f32>,
     pane_padding_y: Option<f32>,
+    bell_mode: Option<String>,
+    paste_warn_size: Option<usize>,
+    smart_copy: Option<bool>,
     keybindings: HashMap<String, KeyValue>,
     font: FontSection,
     theme: ThemeSection,
@@ -89,6 +95,11 @@ pub struct Config {
     /// Space between a pane's border and its cell grid, in px.
     pub pane_padding_x: f32,
     pub pane_padding_y: f32,
+    pub bell_mode: forgetty_shell_core::bell::BellMode,
+    /// A paste over this many bytes asks first. 0 turns the question off.
+    pub paste_warn_size: usize,
+    /// Copy strips box-drawing characters (the text of a bordered TUI, without its border).
+    pub smart_copy: bool,
     /// Action name to chords, from `[keybindings]`. Overrides the defaults.
     pub keybindings: HashMap<String, Vec<String>>,
     pub accent: u32,
@@ -117,6 +128,9 @@ impl Default for Config {
             sidebar_open: false,
             pane_padding_x: 6.0,
             pane_padding_y: 4.0,
+            bell_mode: Default::default(),
+            paste_warn_size: forgetty_shell_core::paste::DEFAULT_WARN_SIZE,
+            smart_copy: true,
             keybindings: HashMap::new(),
             accent: 0x60cdff,
             font_family: "Cascadia Mono".into(),
@@ -184,6 +198,16 @@ impl Config {
         }
         if let Some(v) = f.pane_padding_y.filter(|v| (0.0..=64.0).contains(v)) {
             c.pane_padding_y = v;
+        }
+        if let Some(m) = f.bell_mode.as_deref() {
+            c.bell_mode = forgetty_shell_core::bell::BellMode::parse(m)
+                .ok_or_else(|| format!("bell_mode: unknown value '{m}' (visual, audio, both, none)"))?;
+        }
+        if let Some(n) = f.paste_warn_size {
+            c.paste_warn_size = n;
+        }
+        if let Some(v) = f.smart_copy {
+            c.smart_copy = v;
         }
         for (name, v) in f.keybindings {
             let keys = match v {

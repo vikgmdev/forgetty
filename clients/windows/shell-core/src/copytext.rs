@@ -38,6 +38,22 @@ pub fn raw_copy(text: &str) -> String {
     strip_trailing_whitespace(&normalize_line_endings(text))
 }
 
+/// The part of a row that lies in columns `first..=last`. `cols` is `forgetty_vt::RowText::cols`:
+/// one column per char of `text`, then the row width. A char is kept when any of its cells is
+/// inside the range, so a wide glyph is kept whole when either half is selected.
+pub fn slice_cols(text: &str, cols: &[u16], first: usize, last: usize) -> String {
+    let mut out = String::new();
+    for (i, ch) in text.chars().enumerate() {
+        let Some(&start) = cols.get(i) else { break };
+        // The char ends where the next cell starts: combining chars share their base column.
+        let end = cols[i + 1..].iter().copied().find(|&c| c > start).unwrap_or(start + 1);
+        if (start as usize) <= last && (end as usize) > first {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 /// Join selected rows. Each row is its text and whether it soft-wraps into the next one. A row
 /// that ends a line loses its trailing spaces (they are the terminal's padding); a wrapped row
 /// keeps everything. The last row never gets a newline.
@@ -99,6 +115,19 @@ mod tests {
         // The last row is trimmed even when marked as wrapped (its continuation is not selected).
         assert_eq!(join_rows(&[("tail   ".to_string(), true)]), "tail");
         assert_eq!(join_rows(&[]), "");
+    }
+
+    #[test]
+    fn slice_keeps_wide_glyphs_whole_and_combining_marks_with_their_base() {
+        // "a", wide "\u{4e2d}" (cols 1-2), "e" + combining acute (col 3), "z" (col 4); width 5.
+        let text = "a\u{4e2d}e\u{301}z";
+        let cols = [0u16, 1, 3, 3, 4, 5];
+        assert_eq!(slice_cols(text, &cols, 0, 0), "a");
+        assert_eq!(slice_cols(text, &cols, 2, 2), "\u{4e2d}", "the tail half selects the glyph");
+        assert_eq!(slice_cols(text, &cols, 1, 1), "\u{4e2d}");
+        assert_eq!(slice_cols(text, &cols, 3, 3), "e\u{301}");
+        assert_eq!(slice_cols(text, &cols, 3, 9), "e\u{301}z");
+        assert_eq!(slice_cols(text, &cols, 5, 9), "");
     }
 
     #[test]

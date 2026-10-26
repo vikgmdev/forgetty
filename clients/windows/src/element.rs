@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use gpui::{
-    fill, outline, point, relative, size, App, Bounds, BorderStyle, Element, ElementId,
+    fill, outline, DispatchPhase, MouseMoveEvent, MouseUpEvent, point, relative, size, App, Bounds, BorderStyle, Element, ElementId,
     ElementInputHandler, Entity, GlobalElementId, InspectorElementId, IntoElement, LayoutId,
     Pixels, Style, TextAlign, TextRun, UnderlineStyle, Window, px,
 };
@@ -145,6 +145,20 @@ impl Element for TerminalElement {
                 v.term.cursor(),
             )
         };
+        // A selection drag goes on outside the pane (the pointer is captured while the button is
+        // held): the view hears every move and release of the window, not only those over it.
+        let view = self.view.clone();
+        window.on_mouse_event(move |ev: &MouseMoveEvent, phase, _w, cx| {
+            if phase == DispatchPhase::Capture {
+                view.update(cx, |v, cx| v.on_pointer_move(ev, cx));
+            }
+        });
+        let view = self.view.clone();
+        window.on_mouse_event(move |ev: &MouseUpEvent, phase, _w, cx| {
+            if phase == DispatchPhase::Capture {
+                view.update(cx, |v, cx| v.on_pointer_up(ev, cx));
+            }
+        });
         // IME: register the handler so TSF/IMM talks to the view.
         window.handle_input(&focus, ElementInputHandler::new(bounds, self.view.clone()), cx);
         // Pass 1: backgrounds.

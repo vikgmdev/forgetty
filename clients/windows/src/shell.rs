@@ -944,8 +944,26 @@ impl AppShell {
             Action::PairMachine => self.open_pair(cx),
             Action::NextMachine => self.cycle_machine(1, cx),
             Action::PrevMachine => self.cycle_machine(-1, cx),
+            Action::SelectAll => self.on_active_view(window, cx, |v, cx| v.select_all(cx)),
+            Action::CopyRaw => self.on_active_view(window, cx, |v, cx| v.copy_selection_as(false, cx)),
+            Action::ClearTerminal => self.on_active_view(window, cx, |v, cx| v.clear_terminal(cx)),
+            Action::ResetTerminal => self.on_active_view(window, cx, |v, cx| v.reset_terminal(cx)),
         }
         cx.notify();
+    }
+
+    /// Run `f` on the active pane's view and give it the keyboard focus (a command from the
+    /// palette or a chord acts on the pane the user is working in).
+    fn on_active_view(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut TerminalView, &mut Context<TerminalView>),
+    ) {
+        let Some(view) = self.active_pane().and_then(|p| self.views.get(&p)).cloned() else { return };
+        let focus = view.read(cx).focus.clone();
+        window.focus(&focus, cx);
+        view.update(cx, |v, cx| f(v, cx));
     }
 
     // ---- palette ------------------------------------------------------------------

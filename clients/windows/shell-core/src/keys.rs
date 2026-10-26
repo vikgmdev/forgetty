@@ -38,6 +38,13 @@ pub enum Action {
     PairMachine,
     NextMachine,
     PrevMachine,
+    SelectAll,
+    /// Copy the selection without the smart-copy cleanup (box-drawing characters stay).
+    CopyRaw,
+    /// Ctrl+L to the program, as GTK's "Clear".
+    ClearTerminal,
+    /// Full reset of the terminal state (RIS), then Ctrl+L, as GTK's "Reset".
+    ResetTerminal,
 }
 
 pub struct ActionInfo {
@@ -94,6 +101,10 @@ pub const ACTIONS: &[ActionInfo] = &[
     info!(Action::PairMachine, "pair_machine", "Pair machine...", []),
     info!(Action::NextMachine, "next_machine", "Next machine", []),
     info!(Action::PrevMachine, "prev_machine", "Previous machine", []),
+    info!(Action::SelectAll, "select_all", "Select all", ["ctrl+shift+a"]),
+    info!(Action::CopyRaw, "copy_raw", "Copy selection as is", []),
+    info!(Action::ClearTerminal, "clear_terminal", "Clear terminal", []),
+    info!(Action::ResetTerminal, "reset_terminal", "Reset terminal", []),
 ];
 
 impl Action {
@@ -316,5 +327,14 @@ mod tests {
         assert_eq!(km.warnings.len(), 1);
         let names: std::collections::HashSet<_> = ACTIONS.iter().map(|a| a.name).collect();
         assert_eq!(names.len(), ACTIONS.len());
+    }
+
+    #[test]
+    fn terminal_actions_have_their_default_chords_and_no_warnings() {
+        let km = Keymap::default_map();
+        assert_eq!(km.lookup(&Chord::new(true, false, true, false, "a")), Some(Action::SelectAll));
+        assert!(km.chords(Action::ResetTerminal).is_empty(), "menu-only in GTK: palette only here");
+        assert!(km.warnings.is_empty(), "{:?}", km.warnings);
+        assert_eq!(Action::from_name("copy_raw"), Some(Action::CopyRaw));
     }
 }

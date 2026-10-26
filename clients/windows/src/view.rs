@@ -12,10 +12,11 @@ use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
 
 use forgetty_core::Rgba as CoreRgba;
-use forgetty_shell_core::{PaneEvent, PaneId, PaneSource};
+use forgetty_shell_core::selection::{self, AUTOSCROLL_TICK};
+use forgetty_shell_core::{copytext, paste as paste_rules, PaneEvent, PaneId, PaneSource};
 use forgetty_vt::ffi;
 use forgetty_vt::screen::{CellAttributes, Color};
-use forgetty_vt::{Screen, Terminal};
+use forgetty_vt::{RowText, Screen, Terminal};
 use gpui::{
     div, font, point, prelude::*, px, rgb, size, App, Bounds, ClipboardItem, Context, FocusHandle,
     Focusable, Font, FontStyle, FontWeight, Hsla, IntoElement, KeyDownEvent, KeyUpEvent,
@@ -83,33 +84,7 @@ pub struct RowShaped {
     pub bgs: Vec<(usize, usize, Hsla)>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum SelMode {
-    Normal,
-    Word,
-    Line,
-}
-
-/// Selection in absolute rows (scrollback offset + viewport row).
-#[derive(Clone)]
-pub struct Sel {
-    pub mode: SelMode,
-    /// Initial unit (a single cell, a word, or a line) as inclusive (row, col) ends.
-    pub a0: (usize, usize),
-    pub a1: (usize, usize),
-    /// Current drag unit.
-    pub h0: (usize, usize),
-    pub h1: (usize, usize),
-}
-
-impl Sel {
-    pub fn range(&self) -> ((usize, usize), (usize, usize)) {
-        (self.a0.min(self.h0), self.a1.max(self.h1))
-    }
-    pub fn is_empty(&self) -> bool {
-        self.mode == SelMode::Normal && self.a0 == self.h0 && self.a1 == self.h1
-    }
-}
+pub use forgetty_shell_core::selection::{Sel, SelMode};
 
 fn make_term(cfg: &Config, rows: usize, cols: usize) -> Terminal {
     let palette: [CoreRgba; 16] = std::array::from_fn(|i| {
@@ -157,6 +132,10 @@ pub struct TerminalView {
     pub scroll_accum: f32,
     pub sel: Option<Sel>,
     pub selecting: bool,
+    /// The pointer as last seen during a selection drag (window coordinates).
+    last_pointer: Point<Pixels>,
+    /// The auto-scroll timer of a selection drag is running.
+    autoscrolling: bool,
     pub mouse_reporting: bool,
     pub marked: Option<String>,
     pub cursor_on: bool,
@@ -218,6 +197,9 @@ pub struct PendingPaste {
     pub preview: Vec<String>,
     pub total_lines: usize,
     pub stripped: usize,
+    /// Bytes of the text as copied. Shown when it is over `paste_warn_size`.
+    pub size: usize,
+    pub large: bool,
 }
 
 struct YieldNow(bool);
@@ -327,6 +309,8 @@ impl TerminalView {
             scroll_accum: 0.0,
             sel: None,
             selecting: false,
+            last_pointer: Point::default(),
+            autoscrolling: false,
             mouse_reporting: false,
             marked: None,
             cursor_on: true,
@@ -623,6 +607,29 @@ impl TerminalView {
         self.last_gen = gen_now;
     }
 
+    // ---- clear and reset -----------------------------------------------------------
+
+    /// Ctrl+L to the program: it clears the screen and draws its prompt (GTK's "Clear").
+    pub fn clear_terminal(&mut self, cx: &mut Context<Self>) {
+        self.snap_to_bottom();
+        self.send_bytes(&[0x0c]);
+        cx.notify();
+    }
+
+    /// Reset the terminal state, then Ctrl+L so the shell draws its prompt again (GTK's
+    /// "Reset"). This resets this client's VT: colors, modes, scrollback. The program is not
+    /// told, as in GTK.
+    pub fn reset_terminal(&mut self, cx: &mut Context<Self>) {
+        self.term.reset();
+        self.row_hash = vec![0; self.rows];
+        self.rows_shaped = vec![None; self.rows];
+        self.last_gen = 0;
+        self.sel = None;
+        self.scroll_accum = 0.0;
+        self.send_bytes(&[0x0c]);
+        cx.notify();
+    }
+
     // ---- scrolling -----------------------------------------------------------
 
     /// Scroll the viewport by whole rows (negative = into history). No re-parse:
@@ -775,12 +782,16 @@ impl TerminalView {
     pub fn send_paste(&mut self, text: &str) -> bool {
         let bracketed = encoder::private_mode(self.term.raw_handle(), 2004);
         let p = forgetty_vt::paste::prepare(text, bracketed);
-        if p.needs_confirm {
+        // GTK asks only for a big paste. This also asks for what could run commands unseen.
+        let large = paste_rules::is_large(text, self.cfg.paste_warn_size);
+        if p.needs_confirm || large {
             self.pending_paste = Some(PendingPaste {
                 bytes: p.bytes,
                 preview: text.lines().take(8).map(visible).collect(),
                 total_lines: text.lines().count().max(1),
                 stripped: p.stripped,
+                size: text.len(),
+                large,
             });
             return true;
         }
@@ -910,7 +921,10 @@ impl TerminalView {
             .text_size(self.metrics.font_size)
             .flex()
             .flex_col();
-        let note = if p.stripped > 0 { format!(", {} control char(s) removed", p.stripped) } else { String::new() };
+        let mut note = if p.large { format!(", {}", paste_rules::size_label(p.size)) } else { String::new() };
+        if p.stripped > 0 {
+            note.push_str(&format!(", {} control char(s) removed", p.stripped));
+        }
         d = d.child(format!(
             "Paste {} line(s){note}?  Enter = paste, Esc = cancel",
             p.total_lines
@@ -925,11 +939,25 @@ impl TerminalView {
     }
 
     pub fn copy_selection(&mut self, cx: &mut Context<Self>) {
-        if let Some(text) = self.selection_text() {
+        self.copy_selection_as(self.cfg.smart_copy, cx);
+    }
+
+    /// Copy the selection. `smart` strips box-drawing characters as well (trailing spaces and
+    /// line endings are always cleaned).
+    pub fn copy_selection_as(&mut self, smart: bool, cx: &mut Context<Self>) {
+        if let Some(text) = self.selection_text_as(smart) {
             if !text.is_empty() {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
             }
         }
+    }
+
+    /// Select what is on screen now (GTK's "Select All" does the same: not the scrollback).
+    pub fn select_all(&mut self, cx: &mut Context<Self>) {
+        let top = self.term.scrollbar_state().1 as usize;
+        self.sel = Some(Sel::all(top, top + self.rows.saturating_sub(1), self.cols.saturating_sub(1)));
+        self.selecting = false;
+        cx.notify();
     }
 
     // ---- mouse ----------------------------------------------------------------
@@ -939,6 +967,15 @@ impl TerminalView {
         (
             (f32::from(p.x) - f32::from(self.bounds.origin.x) - px_).max(0.0),
             (f32::from(p.y) - f32::from(self.bounds.origin.y) - py_).max(0.0),
+        )
+    }
+
+    /// Pointer position inside the text area; negative above and left of it.
+    fn local_unclamped(&self, p: Point<Pixels>) -> (f32, f32) {
+        let (px_, py_) = self.letterbox_pad();
+        (
+            f32::from(p.x) - f32::from(self.bounds.origin.x) - px_,
+            f32::from(p.y) - f32::from(self.bounds.origin.y) - py_,
         )
     }
 
@@ -980,6 +1017,15 @@ impl TerminalView {
             MouseButton::Left => {
                 let (vr, col) = self.cell_at(ev.position);
                 let ar = self.abs_row(vr);
+                // Shift+click moves the end of an existing selection (GTK: no drag after it).
+                if ev.modifiers.shift && ev.click_count <= 1 {
+                    if let Some(sel) = self.sel.as_mut() {
+                        sel.extend_to((ar, col), (ar, col));
+                        self.selecting = false;
+                        cx.notify();
+                        return;
+                    }
+                }
                 let (mode, u0, u1) = match ev.click_count {
                     0 | 1 => (SelMode::Normal, (ar, col), (ar, col)),
                     2 => {
@@ -988,8 +1034,9 @@ impl TerminalView {
                     }
                     _ => (SelMode::Line, (ar, 0), (ar, self.cols.saturating_sub(1))),
                 };
-                self.sel = Some(Sel { mode, a0: u0, a1: u1, h0: u0, h1: u1 });
+                self.sel = Some(Sel::new(mode, u0, u1));
                 self.selecting = true;
+                self.last_pointer = ev.position;
                 cx.notify();
             }
             MouseButton::Right => {
@@ -1006,7 +1053,7 @@ impl TerminalView {
         }
     }
 
-    fn on_mouse_move(&mut self, ev: &MouseMoveEvent, _w: &mut Window, cx: &mut Context<Self>) {
+    fn on_mouse_move(&mut self, ev: &MouseMoveEvent, _w: &mut Window, _cx: &mut Context<Self>) {
         if self.wants_mouse(ev.modifiers.shift) {
             let (pos, g, c) = self.mouse_args(ev.position);
             let handle = self.term.raw_handle();
@@ -1015,24 +1062,90 @@ impl TerminalView {
             }
             return;
         }
-        if self.selecting && ev.pressed_button == Some(MouseButton::Left) {
-            let (vr, col) = self.cell_at(ev.position);
-            let ar = self.abs_row(vr);
-            let (h0, h1) = match self.sel.as_ref().map(|s| s.mode) {
-                Some(SelMode::Word) => {
-                    let (c0, c1) = self.word_bounds(vr, col);
-                    ((ar, c0), (ar, c1))
-                }
-                Some(SelMode::Line) => ((ar, 0), (ar, self.cols.saturating_sub(1))),
-                _ => ((ar, col), (ar, col)),
-            };
-            if let Some(s) = self.sel.as_mut() {
-                if s.h0 != h0 || s.h1 != h1 {
-                    s.h0 = h0;
-                    s.h1 = h1;
-                    cx.notify();
-                }
+    }
+
+    /// Every mouse move of the window, also while the pointer is outside the pane (it is
+    /// captured while a button is held). The element registers this each frame.
+    pub fn on_pointer_move(&mut self, ev: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if !self.selecting {
+            return;
+        }
+        if ev.pressed_button != Some(MouseButton::Left) {
+            self.finish_selection(cx);
+            return;
+        }
+        self.last_pointer = ev.position;
+        self.extend_to_pointer(cx);
+        self.autoscroll_ensure(cx);
+    }
+
+    /// The left button went up anywhere in the window.
+    pub fn on_pointer_up(&mut self, ev: &MouseUpEvent, cx: &mut Context<Self>) {
+        if ev.button == MouseButton::Left && self.selecting {
+            self.finish_selection(cx);
+        }
+    }
+
+    /// Move the end of the selection under the pointer (clamped to the grid).
+    fn extend_to_pointer(&mut self, cx: &mut Context<Self>) {
+        let (vr, col) = self.cell_at(self.last_pointer);
+        let ar = self.abs_row(vr);
+        let (h0, h1) = match self.sel.as_ref().map(|s| s.mode) {
+            Some(SelMode::Word) => {
+                let (c0, c1) = self.word_bounds(vr, col);
+                ((ar, c0), (ar, c1))
             }
+            Some(SelMode::Line) => ((ar, 0), (ar, self.cols.saturating_sub(1))),
+            _ => ((ar, col), (ar, col)),
+        };
+        if self.sel.as_mut().is_some_and(|s| s.extend_to(h0, h1)) {
+            cx.notify();
+        }
+    }
+
+    /// Rows to scroll per tick for the pointer where it is now (see `selection::autoscroll_rows`).
+    fn autoscroll_amount(&self) -> isize {
+        let (_, y) = self.local_unclamped(self.last_pointer);
+        selection::autoscroll_rows(y, self.rows as f32 * f32::from(self.metrics.line_h), f32::from(self.metrics.line_h))
+    }
+
+    /// While a drag holds the pointer above or below the text, scroll on a timer. GTK scrolls
+    /// only when the mouse moves; this keeps going while the pointer rests there. The timer
+    /// runs only during such a drag.
+    fn autoscroll_ensure(&mut self, cx: &mut Context<Self>) {
+        if self.autoscrolling || self.autoscroll_amount() == 0 {
+            return;
+        }
+        self.autoscrolling = true;
+        cx.spawn(async move |this, cx| loop {
+            let keep = this.update(cx, |v, cx| v.autoscroll_tick(cx)).unwrap_or(false);
+            if !keep {
+                break;
+            }
+            cx.background_executor().timer(AUTOSCROLL_TICK).await;
+        })
+        .detach();
+    }
+
+    fn autoscroll_tick(&mut self, cx: &mut Context<Self>) -> bool {
+        let rows = if self.selecting { self.autoscroll_amount() } else { 0 };
+        if rows == 0 {
+            self.autoscrolling = false;
+            return false;
+        }
+        self.scroll_rows(rows);
+        self.extend_to_pointer(cx);
+        cx.notify();
+        true
+    }
+
+    fn finish_selection(&mut self, cx: &mut Context<Self>) {
+        self.selecting = false;
+        if self.sel.as_ref().is_some_and(|s| !s.is_empty()) {
+            self.copy_selection(cx); // copy on select
+        } else {
+            self.sel = None;
+            cx.notify();
         }
     }
 
@@ -1048,13 +1161,7 @@ impl TerminalView {
             return;
         }
         if ev.button == MouseButton::Left && self.selecting {
-            self.selecting = false;
-            if self.sel.as_ref().is_some_and(|s| !s.is_empty()) {
-                self.copy_selection(cx); // copy on select
-            } else {
-                self.sel = None;
-                cx.notify();
-            }
+            self.finish_selection(cx);
         }
     }
 
@@ -1142,52 +1249,32 @@ impl TerminalView {
         out
     }
 
-    /// The selected text, including rows that scrolled out of the viewport. Selection rows are
-    /// absolute, so the viewport is moved over them one page at a time and put back after.
+    /// The selected text for the clipboard (smart copy unless `smart_copy = false`).
     pub fn selection_text(&mut self) -> Option<String> {
+        self.selection_text_as(self.cfg.smart_copy)
+    }
+
+    /// The selected text, including rows that scrolled out of the viewport. Rows are read by
+    /// absolute number, so the viewport stays where it is.
+    pub fn selection_text_as(&mut self, smart: bool) -> Option<String> {
         let ((r0, c0), (r1, c1)) = self.sel.as_ref()?.range();
-        let (total, off0, len) = self.term.scrollbar_state();
-        let (total, len) = (total as usize, (len as usize).max(1));
-        let at_bottom = off0 as usize + len >= total;
+        let total = self.term.scrollbar_state().0 as usize;
         let r1 = r1.min(total.saturating_sub(1));
         if r0 > r1 {
             return None;
         }
-        let cols = self.cols;
-        let mut out = String::new();
+        let mut rt = RowText::default();
+        let mut rows: Vec<(String, bool)> = Vec::with_capacity(r1 - r0 + 1);
         for ar in r0..=r1 {
-            let mut off = self.term.scrollbar_state().1 as usize;
-            if ar < off || ar >= off + len {
-                self.term.scroll_viewport_delta(ar as isize - off as isize);
-                off = self.term.scrollbar_state().1 as usize;
-            }
-            if ar < off || ar >= off + len {
+            if !self.term.row_text(ar, &mut rt) {
                 continue; // the row is gone (scrollback was trimmed)
             }
-            let v = ar - off;
-            let a = if ar == r0 { c0 } else { 0 };
-            let b = if ar == r1 { c1 } else { cols.saturating_sub(1) };
-            let screen = self.term.screen();
-            let mut line = String::new();
-            for c in screen.row(v).iter().take(b + 1).skip(a) {
-                if !c.attrs.spacer {
-                    line.push_str(&c.grapheme);
-                }
-            }
-            let wrapped = screen.is_row_wrapped(v);
-            out.push_str(if wrapped { &line } else { line.trim_end() });
-            if ar < r1 && !wrapped {
-                out.push('\n');
-            }
+            let first = if ar == r0 { c0 } else { 0 };
+            let last = if ar == r1 { c1 } else { usize::MAX };
+            rows.push((copytext::slice_cols(&rt.text, &rt.cols, first, last), rt.wrapped));
         }
-        // Put the viewport back.
-        if at_bottom {
-            self.term.scroll_viewport_bottom();
-        } else {
-            let now = self.term.scrollbar_state().1 as isize;
-            self.term.scroll_viewport_delta(off0 as isize - now);
-        }
-        Some(out)
+        let joined = copytext::join_rows(&rows);
+        Some(if smart { copytext::smart_copy(&joined) } else { copytext::raw_copy(&joined) })
     }
 
     // ---- after paint ---------------------------------------------------------------
