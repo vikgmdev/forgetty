@@ -9,6 +9,7 @@ pub mod codeblock;
 pub mod colors;
 pub mod conpty;
 pub mod copytext;
+pub mod fingerprint;
 pub mod fuzzy;
 pub mod keys;
 pub mod layout;
