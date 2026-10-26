@@ -401,6 +401,12 @@ impl Config {
         for k in WINDOWS_KEYS {
             shared_table.remove(*k);
         }
+        // The older Windows parser took `bell_mode = "Both"`; forgetty-config wants lower case.
+        for k in ["bell_mode", "notification_mode", "cursor_style", "on_launch"] {
+            if let Some(toml::Value::String(v)) = shared_table.get_mut(k) {
+                *v = v.trim().to_ascii_lowercase();
+            }
+        }
         let shared: forgetty_config::Config =
             toml::Value::Table(shared_table).try_into().map_err(|e: toml::de::Error| e.to_string())?;
 
@@ -875,6 +881,13 @@ session_trash_days = 3
         // [font] wins over font_family when both are there.
         let c = p("font_family = \"A\"\n[font]\nfamily = \"B\"\n").config;
         assert_eq!(c.font_family, "B");
+    }
+
+    #[test]
+    fn enum_values_are_not_case_sensitive_as_before() {
+        let c = p("bell_mode = \"Both\"\nnotification_mode = \"RingOnly\"\n").config;
+        assert_eq!(c.bell_mode, BellMode::Both);
+        assert_eq!(c.notification_mode, NotificationMode::RingOnly);
     }
 
     #[test]
