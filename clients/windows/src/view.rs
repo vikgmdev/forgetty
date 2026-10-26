@@ -1569,6 +1569,8 @@ impl TerminalView {
     /// Show `text` at the bottom of the pane for a few seconds. It does not take the focus or
     /// block input.
     pub fn show_notice(&mut self, text: String, cx: &mut Context<Self>) {
+        // Notices can carry text from the server or the wire: always cleaned here.
+        let text = forgetty_shell_core::notify::notice_text(&text);
         self.notice = Some((text, Instant::now() + NOTICE_FOR));
         cx.notify();
         // Repaint when it expires, even if nothing else happens.

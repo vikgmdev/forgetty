@@ -45,6 +45,15 @@ pub struct ToastText {
     pub lines: Vec<String>,
 }
 
+/// The longest notice shown at the bottom of a pane.
+pub const NOTICE_MAX: usize = 160;
+
+/// The words of a pane notice. Error text can come from the server or the wire, so every
+/// notice goes through this: no control characters, no bidi overrides, one line, bounded.
+pub fn notice_text(s: &str) -> String {
+    sanitize(s, NOTICE_MAX)
+}
+
 /// Text from a pane is untrusted: no control characters, no bidi overrides,
 /// bounded length.
 pub fn sanitize(s: &str, max: usize) -> String {
@@ -236,5 +245,16 @@ mod tests {
         assert_eq!(parse_target("forgetty:focus?m=x&p=y"), None);
         assert_eq!(parse_target("calc.exe"), None);
         assert_eq!(parse_target(&format!("{}&extra", encode_target(m, p))), None);
+    }
+
+    #[test]
+    fn notices_lose_control_bidi_and_newlines_and_are_cut() {
+        let t = notice_text("Failed: bad\n\x1b[31mred\x07\u{202e}gnp.exe\u{2066}\r\nnext\tline\u{200b}");
+        assert!(!t.contains('\n') && !t.contains('\r') && !t.contains('\x1b') && !t.contains('\x07'), "{t:?}");
+        assert!(!t.contains('\u{202e}') && !t.contains('\u{2066}') && !t.contains('\u{200b}'), "{t:?}");
+        assert!(t.starts_with("Failed: bad") && t.contains("next line"), "{t:?}");
+        let long = notice_text(&"x".repeat(1000));
+        assert_eq!(long.chars().count(), NOTICE_MAX);
+        assert!(long.ends_with('\u{2026}'));
     }
 }

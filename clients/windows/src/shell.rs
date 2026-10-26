@@ -384,7 +384,7 @@ impl AppShell {
         let view = self.active_pane().and_then(|p| self.views.get(&p).cloned()).or_else(|| self.views.values().next().cloned());
         match view {
             Some(v) => v.update(cx, |v, cx| v.show_notice(text, cx)),
-            None => eprintln!("forgetty-win: {text}"),
+            None => eprintln!("forgetty-win: {}", forgetty_shell_core::notify::notice_text(&text)),
         }
     }
 
