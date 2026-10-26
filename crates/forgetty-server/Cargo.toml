@@ -62,9 +62,21 @@ rmp-serde = "1"
 serde = { workspace = true }
 serde_bytes = "0.11"
 base64 = "0.22"
-libc = "0.2"
 hostname = "0.4"
 rmpv = { version = "1", features = ["with-serde"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
 
 # ---------------------------------------------------------------------------
 # Packages (P6). Build with:

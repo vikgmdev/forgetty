@@ -1,15 +1,25 @@
 //! CLI half of the `forgetty` binary. Talks to the server over the local
-//! Unix socket (JSON-RPC, one request per line). Blocking and synchronous.
+//! Unix socket, or the named pipe on Windows (JSON-RPC, one request per line).
+//! Blocking and synchronous.
 
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use serde_json::{json, Value};
 
-use forgetty_server::sockpath::{self, default_socket_path, SocketCheck};
+#[cfg(windows)]
+use forgetty_server::pipe_client::PipeStream;
+#[cfg(unix)]
+use forgetty_server::sockpath::{self, SocketCheck};
+use forgetty_server::sockpath::default_socket_path;
+
+/// The connection to the server.
+#[cfg(unix)]
+type Stream = std::os::unix::net::UnixStream;
+#[cfg(windows)]
+type Stream = PipeStream;
 
 pub const EXIT_FAILED: i32 = 1;
 pub const EXIT_USAGE: i32 = 2;
@@ -80,8 +90,8 @@ pub fn finish_code(result: Result<i32>) -> i32 {
 // ---------------------------------------------------------------------------
 
 struct Client {
-    reader: BufReader<UnixStream>,
-    writer: UnixStream,
+    reader: BufReader<Stream>,
+    writer: Stream,
     next_id: u64,
 }
 
@@ -102,7 +112,9 @@ impl Client {
     fn raw() -> Result<Self> {
         let path = default_socket_path();
         // Never talk to a socket we cannot trust: a squatter could answer with
-        // a fake server or read what we send.
+        // a fake server or read what we send. (On Windows `PipeStream::connect` checks the
+        // user of the server process instead.)
+        #[cfg(unix)]
         match sockpath::verify_socket_path(&path, sockpath::current_uid()) {
             SocketCheck::Ok => {}
             SocketCheck::Missing => {
@@ -115,7 +127,12 @@ impl Client {
                 return Err(CliError::Failed(format!("refusing to use the server socket: {why}")))
             }
         }
-        let stream = UnixStream::connect(&path).map_err(|e| {
+        let stream = Stream::connect(&path).map_err(|e| {
+            // A pipe server of another user is not "not running": do not start over it.
+            #[cfg(windows)]
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                return CliError::Failed(format!("refusing to use the server pipe: {e}"));
+            }
             CliError::Unreachable(format!(
                 "server not reachable at {} ({e}). Start it with `forgetty server start`.",
                 path.display()
@@ -412,6 +429,7 @@ pub fn server_start() -> Result<()> {
 
     let mut cmd = std::process::Command::new(exe);
     cmd.args(["server", "run"]).stdin(std::process::Stdio::null()).stdout(log).stderr(log_err);
+    #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         // SAFETY: setsid is async-signal-safe and runs between fork and exec.
@@ -424,7 +442,7 @@ pub fn server_start() -> Result<()> {
     }
     // Where this run's output starts, to read its error back on a config exit.
     let log_start = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
-    let mut child = cmd.spawn().map_err(|e| CliError::Failed(format!("spawn server: {e}")))?;
+    let mut child = spawn_detached(&mut cmd)?;
 
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
@@ -467,16 +485,56 @@ pub fn server_start() -> Result<()> {
     }
 }
 
+/// Start the server process so that it outlives this one and the terminal it was started from.
+#[cfg(unix)]
+fn spawn_detached(cmd: &mut std::process::Command) -> Result<std::process::Child> {
+    cmd.spawn().map_err(|e| CliError::Failed(format!("spawn server: {e}")))
+}
+
+/// Start the server process so that it outlives this one and the terminal it was started from:
+/// no console, its own process group (a Ctrl+C in the shell does not reach it), and out of the
+/// job of the caller (a terminal or an installer that kills its job on exit would take it down).
+#[cfg(windows)]
+fn spawn_detached(cmd: &mut std::process::Command) -> Result<std::process::Child> {
+    use std::os::windows::process::CommandExt;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+    let base = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW;
+    match cmd.creation_flags(base | CREATE_BREAKAWAY_FROM_JOB).spawn() {
+        Ok(child) => Ok(child),
+        // The job of the caller does not allow a breakaway: start without it. The server is
+        // then part of that job, which is what the job asked for.
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => cmd
+            .creation_flags(base)
+            .spawn()
+            .map_err(|e| CliError::Failed(format!("spawn server: {e}"))),
+        Err(e) => Err(CliError::Failed(format!("spawn server: {e}"))),
+    }
+}
+
+/// Does a process with this id exist?
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    // SAFETY: signal 0 only checks that the process exists.
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+#[cfg(windows)]
+fn process_alive(pid: u32) -> bool {
+    forgetty_session::input_watch::child_alive(pid)
+}
+
 pub fn server_stop(if_idle: bool) -> Result<()> {
     let (mut client, info) = Client::connect()?;
-    let pid = info.num("pid") as i32;
+    let pid = info.num("pid") as u32;
     client.call("shutdown", json!({ "if_idle": if_idle }))?;
     drop(client);
 
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        // SAFETY: signal 0 only checks that the process exists.
-        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        let alive = process_alive(pid);
         if !alive && Client::raw().is_err() {
             println!("server stopped");
             return Ok(());

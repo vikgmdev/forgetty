@@ -1522,9 +1522,8 @@ mod tests {
         let _g = XdgGuard::new();
         let id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
         let path = session_path_active_for(id);
-        assert!(path
-            .to_string_lossy()
-            .ends_with("sessions/active/550e8400-e29b-41d4-a716-446655440000.json"));
+        // `ends_with` on a Path compares components, so `/` and `\` both pass.
+        assert!(path.ends_with("sessions/active/550e8400-e29b-41d4-a716-446655440000.json"));
     }
 
     #[test]

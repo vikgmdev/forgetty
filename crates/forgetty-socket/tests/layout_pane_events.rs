@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! P-010: `subscribe_layout` forwards pane lifecycle events, and AD-019 pane
 //! metadata events (title, cwd, status).
 

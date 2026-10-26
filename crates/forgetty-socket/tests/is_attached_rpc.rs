@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! Integration test for the V2-007 fix cycle 2 `is_attached` RPC.
 //!
 //! Covers the launcher's restore-path correctness question: "is any GUI

@@ -123,9 +123,8 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 60
     env:
-      CHECK_CRATES: "-p forgetty-core -p forgetty-config -p forgetty-workspace -p forgetty-sync -p forgetty-pty -p forgetty-session"
-      TEST_CRATES: "-p forgetty-core -p forgetty-config -p forgetty-workspace -p forgetty-sync -p forgetty-pty"
-      PENDING_CRATES: "-p forgetty-socket -p forgetty-server"
+      CHECK_CRATES: "-p forgetty-core -p forgetty-config -p forgetty-workspace -p forgetty-sync -p forgetty-pty -p forgetty-session -p forgetty-socket -p forgetty-server"
+      TEST_CRATES: "-p forgetty-core -p forgetty-config -p forgetty-workspace -p forgetty-sync -p forgetty-pty -p forgetty-socket"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -154,16 +153,10 @@ jobs:
           cargo test --locked --no-fail-fast @crates
 
       - name: Tests of crates that are compiled but not gated yet (does not gate)
+        if: ${{ !cancelled() }}
         continue-on-error: true
         shell: pwsh
-        run: cargo test --locked --no-fail-fast -p forgetty-session
-
-      - name: Check the crates that are not ported yet (does not gate)
-        continue-on-error: true
-        shell: pwsh
-        run: |
-          $crates = $env:PENDING_CRATES -split ' '
-          cargo check --locked --keep-going @crates
+        run: cargo test --locked --no-fail-fast -p forgetty-session -p forgetty-server
 
   # The real Linux server, built here, for the WSL end-to-end test below.
   linux-server:

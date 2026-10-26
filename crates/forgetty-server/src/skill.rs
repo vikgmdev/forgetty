@@ -323,6 +323,7 @@ mod tests {
         (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap())
     }
 
+    #[cfg(unix)]
     fn outside_is_untouched(outside: &Path, names: &[&str]) {
         let mut seen: Vec<String> = std::fs::read_dir(outside)
             .unwrap()

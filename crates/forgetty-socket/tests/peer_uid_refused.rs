@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! A connection from another uid gets no service.
 //!
 //! The test cannot switch accounts, so the server is told to serve only

@@ -12,7 +12,13 @@
 
 pub mod iroh_terminal;
 
+#[cfg(unix)]
 pub mod sockpath;
+#[cfg(windows)]
+#[path = "sockpath_windows.rs"]
+pub mod sockpath;
+#[cfg(windows)]
+pub mod pipe_client;
 
 pub mod control_queue;
 #[cfg(not(windows))]

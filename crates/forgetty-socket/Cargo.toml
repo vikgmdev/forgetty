@@ -22,8 +22,17 @@ base64 = "0.22"
 bytes = "1"
 uuid = { workspace = true }
 hostname = "0.4"
-libc = "0.2"
 schemars = { version = "1", features = ["uuid1"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+] }
 
 [dev-dependencies]
 jsonschema = { version = "0.59", default-features = false }

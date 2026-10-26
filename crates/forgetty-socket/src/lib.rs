@@ -1,4 +1,4 @@
-//! Unix domain socket IPC server for Forgetty.
+//! Local IPC server for Forgetty: a Unix domain socket, or a named pipe on Windows.
 //!
 //! Provides a JSON-RPC 2.0 interface over a local Unix domain socket that
 //! external tools (CLI, editor plugins, AI agents) can use to communicate
@@ -15,6 +15,8 @@ pub mod api;
 pub mod apidoc;
 pub mod framing;
 pub mod handlers;
+#[cfg(windows)]
+pub mod pipe;
 pub mod protocol;
 #[cfg(feature = "qa-tools")]
 pub mod qa;

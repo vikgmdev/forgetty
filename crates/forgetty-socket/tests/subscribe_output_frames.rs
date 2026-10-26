@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! Integration test for the V2-003 binary framing on the `subscribe_output`
 //! streaming path.
 //!

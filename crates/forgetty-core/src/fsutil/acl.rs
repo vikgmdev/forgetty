@@ -85,8 +85,9 @@ pub fn is_user_only(path: &Path) -> io::Result<bool> {
 
 #[cfg(windows)]
 pub use win::{
-    create_private_file, create_private_new, current_user_sid, describe, is_user_only, replace_file,
-    restrict_dir_to_user, restrict_to_user, sync_dir,
+    create_private_file, create_private_new, current_user_sid, describe, is_user_only, only_sid_sddl,
+    pipe_client_sid, process_user_sid, replace_file, restrict_dir_to_user, restrict_to_user,
+    same_account, sync_dir,
 };
 
 /// Like [`restrict_to_user`] for a folder. On Unix the mode is 0700.
@@ -170,31 +171,100 @@ mod win {
         Ok(())
     }
 
+    /// The user SID of an access token, in string form (`S-1-5-21-...`).
+    fn token_user_sid(token: HANDLE) -> io::Result<String> {
+        // SAFETY: plain Win32 calls on a valid token handle with buffers sized by the API.
+        unsafe {
+            let mut len = 0u32;
+            // First call reports the size.
+            let _ = GetTokenInformation(token, TokenUser, None, 0, &mut len);
+            if len == 0 {
+                return Err(io::Error::other("GetTokenInformation returned no size"));
+            }
+            let mut buf = vec![0u8; len as usize];
+            GetTokenInformation(token, TokenUser, Some(buf.as_mut_ptr() as *mut c_void), len, &mut len)
+                .map_err(err)?;
+            let user = &*(buf.as_ptr() as *const TOKEN_USER);
+            let mut s = PWSTR::null();
+            ConvertSidToStringSidW(user.User.Sid, &mut s).map_err(err)?;
+            let out = s.to_string().map_err(|e| io::Error::other(e.to_string()));
+            let _ = LocalFree(Some(HLOCAL(s.0 as *mut c_void)));
+            out
+        }
+    }
+
     /// The current user's SID in string form (`S-1-5-21-...`).
     pub fn current_user_sid() -> io::Result<String> {
+        // SAFETY: the pseudo handle of this process is valid; the token is closed after use.
         unsafe {
             let mut token = HANDLE::default();
             OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).map_err(err)?;
-            let result = (|| {
-                let mut len = 0u32;
-                // First call reports the size.
-                let _ = GetTokenInformation(token, TokenUser, None, 0, &mut len);
-                if len == 0 {
-                    return Err(io::Error::other("GetTokenInformation returned no size"));
-                }
-                let mut buf = vec![0u8; len as usize];
-                GetTokenInformation(token, TokenUser, Some(buf.as_mut_ptr() as *mut c_void), len, &mut len)
-                    .map_err(err)?;
-                let user = &*(buf.as_ptr() as *const TOKEN_USER);
-                let mut s = PWSTR::null();
-                ConvertSidToStringSidW(user.User.Sid, &mut s).map_err(err)?;
-                let out = s.to_string().map_err(|e| io::Error::other(e.to_string()));
-                let _ = LocalFree(Some(HLOCAL(s.0 as *mut c_void)));
-                out
-            })();
+            let result = token_user_sid(token);
             let _ = CloseHandle(token);
             result
         }
+    }
+
+    /// The user SID of the process `pid`. Fails (access denied) for a process of another user and
+    /// for an elevated process when this one is not elevated.
+    pub fn process_user_sid(pid: u32) -> io::Result<String> {
+        use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+        // SAFETY: handles are closed on every path.
+        unsafe {
+            let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).map_err(err)?;
+            let mut token = HANDLE::default();
+            let opened = OpenProcessToken(process, TOKEN_QUERY, &mut token).map_err(err);
+            let _ = CloseHandle(process);
+            opened?;
+            let result = token_user_sid(token);
+            let _ = CloseHandle(token);
+            result
+        }
+    }
+
+    /// The user SID of the client on the other end of a named pipe, read by impersonating the
+    /// client for a moment on this thread. Works for an elevated client, which `process_user_sid`
+    /// cannot see. Windows allows it only after the server read from the pipe once
+    /// (`ERROR_CANNOT_IMPERSONATE` before), so call it after the first read.
+    pub fn pipe_client_sid(pipe: HANDLE) -> io::Result<String> {
+        use windows::Win32::Security::RevertToSelf;
+        use windows::Win32::System::Pipes::ImpersonateNamedPipeClient;
+        use windows::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
+
+        /// Reverts on every exit path: a thread must never stay in the client's identity.
+        struct Revert;
+        impl Drop for Revert {
+            fn drop(&mut self) {
+                // SAFETY: no preconditions. If this failed the thread would keep the client's
+                // identity, so stop the process rather than run on as someone else.
+                if unsafe { RevertToSelf() }.is_err() {
+                    std::process::abort();
+                }
+            }
+        }
+
+        // SAFETY: the pipe handle is valid for the call; the thread token is closed.
+        unsafe {
+            ImpersonateNamedPipeClient(pipe).map_err(err)?;
+            let _revert = Revert;
+            let mut token = HANDLE::default();
+            // `true`: open with the identity of the process, so the check does not depend on
+            // what the client's token allows.
+            OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, true, &mut token).map_err(err)?;
+            let result = token_user_sid(token);
+            let _ = CloseHandle(token);
+            result
+        }
+    }
+
+    /// Do the two SID strings name the same account?
+    pub fn same_account(a: &str, b: &str) -> bool {
+        same_sid(a, b)
+    }
+
+    /// An SDDL string for a pipe or other kernel object that only `sid` may use.
+    pub fn only_sid_sddl(sid: &str) -> String {
+        format!("D:P(A;;GA;;;{sid})")
     }
 
     /// Create `path` new with `bytes`, readable by the current user only from the first moment
@@ -428,5 +498,24 @@ mod win_tests {
         assert!(super::win::sddl_is_user_only("D:P(A;;FA;;;S-1-5-21-1)", "S-1-5-21-1"));
         assert!(!super::win::sddl_is_user_only("D:(A;;FA;;;S-1-5-21-1)", "S-1-5-21-1"));
         assert!(!super::win::sddl_is_user_only("D:P(A;;FA;;;S-1-5-21-1)(A;;FA;;;SY)", "S-1-5-21-1"));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod sid_tests {
+    use super::*;
+
+    #[test]
+    fn this_process_is_owned_by_the_current_user() {
+        let me = current_user_sid().unwrap();
+        assert!(me.starts_with("S-1-5-"), "{me}");
+        assert_eq!(process_user_sid(std::process::id()).unwrap(), me);
+        assert!(same_account(&me, &me));
+        assert!(!same_account(&me, "S-1-5-18"));
+    }
+
+    #[test]
+    fn the_pipe_sddl_names_one_sid() {
+        assert_eq!(only_sid_sddl("S-1-5-21-1-2-3-1001"), "D:P(A;;GA;;;S-1-5-21-1-2-3-1001)");
     }
 }
