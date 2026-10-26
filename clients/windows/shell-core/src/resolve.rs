@@ -27,8 +27,14 @@ pub struct Host {
 impl Host {
     /// This machine. `themes_dir` is the folder next to the config file.
     pub fn real(themes_dir: Option<PathBuf>) -> Self {
+        // A PATH entry such as `%USERPROFILE%\bin` (a REG_EXPAND_SZ value copied as it is) is
+        // expanded first, then judged by the same rules as any other entry.
         let path_dirs = std::env::var_os("PATH")
-            .map(|p| std::env::split_paths(&p).map(|d| d.to_string_lossy().into_owned()).collect())
+            .map(|p| {
+                std::env::split_paths(&p)
+                    .map(|d| expand_env(&d.to_string_lossy(), &|name| std::env::var(name).ok()))
+                    .collect()
+            })
             .unwrap_or_default();
         let pathext = std::env::var("PATHEXT")
             .ok()
@@ -60,6 +66,35 @@ impl Host {
             themes_dir: None,
         }
     }
+}
+
+/// `%NAME%` replaced by the variable's value, as `ExpandEnvironmentStringsW` does. A name that is
+/// not set, or a lone `%`, stays as written. One pass: a value is not expanded again.
+pub fn expand_env(s: &str, lookup: &dyn Fn(&str) -> Option<String>) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find('%') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        match after.find('%') {
+            Some(end) if end > 0 && !after[..end].contains(['\\', '/', ' ']) => match lookup(&after[..end]) {
+                Some(v) => {
+                    out.push_str(&v);
+                    rest = &after[end + 1..];
+                }
+                None => {
+                    out.push('%');
+                    rest = after;
+                }
+            },
+            _ => {
+                out.push('%');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 fn is_sep(c: char) -> bool {
@@ -140,6 +175,11 @@ pub fn resolve_dir(text: &str, host: &Host) -> Result<Option<String>, String> {
     if !crate::osc::is_safe_local_path(&path) {
         return Err(format!("`{shown}`: network and device paths are not allowed"));
     }
+    // `\x` (the current drive) and `C:x` (the current folder of a drive) depend on where the app
+    // was started.
+    if !is_absolute(&path) {
+        return Err(format!("`{shown}` is not a full path (write C:\\...)"));
+    }
     if !(host.is_dir)(&path) {
         return Err(format!("`{shown}` does not exist"));
     }
@@ -216,7 +256,15 @@ mod tests {
             }),
             ..host()
         };
-        for p in ["\\\\srv\\share\\x.exe", "//srv/share/x.exe", "\\\\?\\C:\\x.exe", "\\\\.\\pipe\\x"] {
+        for p in [
+            "\\\\srv\\share\\x.exe",
+            "//srv/share/x.exe",
+            "\\\\?\\C:\\x.exe",
+            "\\\\.\\pipe\\x",
+            "\\??\\UNC\\srv\\share\\x.exe",
+            "/??/UNC/srv/share/x.exe",
+            "\\??/UNC\\srv\\share",
+        ] {
             assert!(resolve_program(p, &h).unwrap_err().contains("network"), "{p}");
             assert!(resolve_dir(p, &h).unwrap_err().contains("network"), "{p}");
         }
@@ -238,6 +286,47 @@ mod tests {
         let mut unc_home = host();
         unc_home.home = Some("\\\\srv\\home".into());
         assert!(resolve_dir("~", &unc_home).unwrap_err().contains("network"));
+    }
+
+    #[test]
+    fn a_directory_that_depends_on_the_working_drive_is_refused_without_asking_the_disk() {
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let a = asked.clone();
+        let h = Host {
+            is_dir: Box::new(move |_| {
+                a.store(true, std::sync::atomic::Ordering::SeqCst);
+                true
+            }),
+            ..host()
+        };
+        for p in ["\\x", "/x", "C:x", "src", ".\\src", "..\\src", "~x"] {
+            let e = resolve_dir(p, &h).unwrap_err();
+            assert!(e.contains("not a full path"), "{p}: {e}");
+        }
+        assert!(!asked.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(resolve_dir("D:\\work", &h).unwrap().as_deref(), Some("D:\\work"));
+    }
+
+    #[test]
+    fn percent_variables_in_a_path_entry_are_expanded_then_judged() {
+        let env = |n: &str| match n.to_ascii_uppercase().as_str() {
+            "USERPROFILE" => Some("C:\\Users\\v".to_string()),
+            "SHARE" => Some("\\\\srv\\share".to_string()),
+            "REL" => Some("bin".to_string()),
+            _ => None,
+        };
+        assert_eq!(expand_env("%USERPROFILE%\\bin", &env), "C:\\Users\\v\\bin");
+        assert_eq!(expand_env("%userprofile%\\%REL%", &env), "C:\\Users\\v\\bin");
+        assert_eq!(expand_env("%NOPE%\\x", &env), "%NOPE%\\x");
+        assert_eq!(expand_env("100%", &env), "100%");
+        assert_eq!(expand_env("a%b c%d", &env), "a%b c%d");
+        assert_eq!(expand_env("%%", &env), "%%");
+        // The rules apply to what it expands to.
+        let mut h = Host::fake(&["C:\\Users\\v\\bin\\tool.exe", "\\\\srv\\share\\tool.exe", "bin\\tool.exe"], &[]);
+        h.path_dirs = ["%SHARE%", "%REL%", "%USERPROFILE%\\bin", "%NOPE%"].iter().map(|d| expand_env(d, &env)).collect();
+        same(resolve_program("tool.exe", &h).unwrap(), "C:\\Users\\v\\bin\\tool.exe");
+        h.path_dirs.truncate(2);
+        assert!(resolve_program("tool.exe", &h).is_err(), "a network or relative entry is skipped after expansion");
     }
 
     #[test]

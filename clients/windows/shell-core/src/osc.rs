@@ -205,7 +205,8 @@ fn is_local_host(host: &str) -> bool {
 }
 
 /// A path that is safe to show and to use as a local directory: no UNC share,
-/// no device namespace (`\\?\`, `\\.\`), no `//server` form. Escape codes
+/// no device namespace (`\\?\`, `\\.\`), no NT namespace (`\??\`, which reaches `\??\UNC\srv\share`),
+/// no `//server` form, with either separator in any mix. Escape codes
 /// come from untrusted program output, and touching a UNC path on Windows
 /// sends NTLM credentials to the named server.
 pub fn is_safe_local_path(p: &str) -> bool {
@@ -215,6 +216,9 @@ pub fn is_safe_local_path(p: &str) -> bool {
     }
     let sep = |c: u8| c == b'\\' || c == b'/';
     if b.len() >= 2 && sep(b[0]) && sep(b[1]) {
+        return false;
+    }
+    if b.len() >= 4 && sep(b[0]) && b[1] == b'?' && b[2] == b'?' && sep(b[3]) {
         return false;
     }
     true
@@ -304,6 +308,11 @@ mod tests {
         assert!(!is_safe_local_path("\\\\?\\C:\\x"));
         assert!(!is_safe_local_path("\\\\.\\pipe\\x"));
         assert!(!is_safe_local_path("//evil/share"));
+        assert!(!is_safe_local_path("\\??\\UNC\\evil\\share"));
+        assert!(!is_safe_local_path("/??/UNC/evil/share"));
+        assert!(!is_safe_local_path("\\??/C:\\x"));
+        assert!(!is_safe_local_path("/??\\C:\\x"));
+        assert!(is_safe_local_path("C:\\??\\x"), "only a leading prefix is the NT namespace");
         assert!(is_safe_local_path("C:\\Users\\a"));
         let mut s = OscScanner::new();
         assert!(s.feed(b"\x1b]7;file://evil/share\x07\x1b]9;9;\"\\\\evil\\share\"\x07").is_empty());
