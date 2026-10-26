@@ -26,8 +26,6 @@ const MACHINES_VERSION: u32 = 2;
 /// Retries (and the wait between them) when `machines.json` cannot be read before a write.
 const READ_RETRIES: u32 = 3;
 const READ_RETRY_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
-/// Most direct addresses kept from one pairing payload.
-const MAX_PINNED: usize = 8;
 /// The whole output of `forgetty pair` (an ASCII QR block, the payload line, status lines) is accepted.
 const MAX_OFFER_BYTES: usize = 64 * 1024;
 
@@ -318,7 +316,7 @@ pub struct PairingOffer {
     pub relays: Vec<String>,
     /// The payload says the server uses no relay (a WireGuard-only server).
     pub relays_disabled: bool,
-    /// The direct addresses of the payload (at most `MAX_PINNED`), to pin.
+    /// The direct addresses of the payload (`QrPayload::direct_addrs` keeps the usable ones, at most `MAX_PINNED_ADDRS`), to pin.
     pub direct: Vec<SocketAddr>,
 }
 
@@ -368,7 +366,7 @@ pub fn parse_offer(text: &str) -> Result<PairingOffer, String> {
         return Err("The payload has no machine name.".into());
     }
     let relays = if qr.relays_disabled { Vec::new() } else { qr.relay_urls() };
-    let direct = usable_direct(qr.direct_addrs());
+    let direct = qr.direct_addrs();
     Ok(PairingOffer {
         node_short: qr.node_id.chars().take(8).collect(),
         node_grouped: group_id(&qr.node_id, 8),
@@ -379,22 +377,6 @@ pub fn parse_offer(text: &str) -> Result<PairingOffer, String> {
         machine,
         qr,
     })
-}
-
-/// Direct addresses worth pinning: no wildcard, no multicast, no port 0, no duplicates, a
-/// handful at most.
-fn usable_direct(list: Vec<SocketAddr>) -> Vec<SocketAddr> {
-    let mut out: Vec<SocketAddr> = Vec::new();
-    for a in list {
-        if a.port() == 0 || a.ip().is_unspecified() || a.ip().is_multicast() || out.contains(&a) {
-            continue;
-        }
-        out.push(a);
-        if out.len() == MAX_PINNED {
-            break;
-        }
-    }
-    out
 }
 
 /// What `pair` dials and stores for `offer`: the pinned addresses (the payload's direct
