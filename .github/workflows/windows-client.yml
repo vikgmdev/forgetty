@@ -58,7 +58,7 @@ jobs:
         working-directory: clients/windows
         run: |
           # The ConPTY tests in shell-core's local module are covered by the smoke.
-          cargo test --release -p forgetty-shell-core --lib -- conpty:: notify:: layout:: keys:: osc:: osc52:: fuzzy:: update:: search:: links:: copytext:: paste:: selection:: scrollbar:: bell:: codeblock::
+          cargo test --release -p forgetty-shell-core --lib -- conpty:: notify:: layout:: keys:: osc:: osc52:: fuzzy:: update:: search:: links:: copytext:: paste:: selection:: scrollbar:: bell:: codeblock:: colors:: menu:: ops::
           cargo test --release -p forgetty-remote
 
       - name: Turn on the Japanese and Chinese input methods for the smoke
@@ -94,6 +94,7 @@ jobs:
           path: |
             clients/windows/target/release/layout-4pane.png
             clients/windows/target/release/wp1-panes.png
+            clients/windows/target/release/wp2-menu.png
 
       - name: Upload artifact
         if: always()

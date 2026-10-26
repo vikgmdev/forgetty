@@ -26,6 +26,7 @@ mod inject;
 mod real;
 mod remote;
 mod wp1;
+mod wp2;
 
 pub const KEYSTROKES: usize = 100;
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(420);
@@ -163,6 +164,8 @@ enum Phase {
     PaletteOpen,
     PaletteRun,
     Rename,
+    // WP2: menus, workspace and tab operations, attention.
+    Wp2,
     // W3: remote machines.
     RSetup,
     RPair,
@@ -215,6 +218,7 @@ impl Phase {
             Phase::PaletteOpen => "w2-palette-open",
             Phase::PaletteRun => "w2-palette-run",
             Phase::Rename => "w2-rename",
+            Phase::Wp2 => "wp2-menus-workspaces-attention",
             Phase::RSetup => "w3-start-server-and-pair",
             Phase::RPair => "w3-wait-for-panes",
             Phase::REcho => "w3-remote-echo",
@@ -285,6 +289,7 @@ pub struct ShellSmoke {
     w5: remote::W5,
     w7: remote::W7,
     wp1: wp1::Wp1,
+    wp2: wp2::Wp2,
     real: real::Real,
 }
 
@@ -378,6 +383,7 @@ impl ShellSmoke {
             w5: remote::W5::default(),
             w7: remote::W7::default(),
             wp1: wp1::Wp1::default(),
+            wp2: wp2::Wp2::default(),
             real: real::Real::new(real_distro),
         }
     }
@@ -1326,7 +1332,7 @@ impl ShellSmoke {
                             self.sub = 2;
                         } else if self.sub_t0.elapsed() > Duration::from_secs(5) {
                             check("tab_rename", false);
-                            self.goto(Phase::RSetup);
+                            self.goto(Phase::Wp2);
                         }
                     }
                     _ => {
@@ -1334,15 +1340,16 @@ impl ShellSmoke {
                         let labeled = shell.active_tab().is_some_and(|t| t.label == "abc");
                         if shell.rename.is_none() && title.as_deref() == Some("abc") && labeled {
                             check("tab_rename", true);
-                            self.goto(Phase::RSetup);
+                            self.goto(Phase::Wp2);
                         } else if self.sub_t0.elapsed() > Duration::from_secs(5) {
                             record("rename_debug", json!(title));
                             check("tab_rename", false);
-                            self.goto(Phase::RSetup);
+                            self.goto(Phase::Wp2);
                         }
                     }
                 }
             }
+            Phase::Wp2 => self.wp2(shell, window, cx),
             Phase::RSetup | Phase::RPair | Phase::REcho | Phase::RKeys | Phase::RKill | Phase::RRestart | Phase::RToast | Phase::RServer | Phase::W5View => {
                 self.w3_step(shell, window, cx, now_t)
             }
