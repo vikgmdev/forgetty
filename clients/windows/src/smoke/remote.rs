@@ -1584,8 +1584,13 @@ impl ShellSmoke {
                 check("copy_includes_scrollback", lines.len() == 19 && lines[0] == "L03" && lines[18] == "L21");
                 check("copy_restores_viewport", before == after);
                 check("no_input_dropped", view.read(cx).dropped_input() == 0);
-                self.sub = 50;
+                self.sub = 100;
                 self.sub_t0 = Instant::now();
+            }
+            // ---- WP1: terminal pane parity (find, links, copy, scrollbar, bell, ...) --------------
+            100..=108 => {
+                let cfg = shell.cfg.clone();
+                self.wp1(window, cx, &cfg)
             }
             // ---- OSC 52 (a program sets the clipboard): write only, per machine ----------------
             50..=61 => self.w7_clipboard(shell, cx),

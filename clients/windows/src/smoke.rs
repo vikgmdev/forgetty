@@ -25,6 +25,7 @@ use crate::view::TerminalView;
 mod inject;
 mod real;
 mod remote;
+mod wp1;
 
 pub const KEYSTROKES: usize = 100;
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(420);
@@ -144,6 +145,7 @@ enum Phase {
     ResizeAsk,
     Throughput,
     Synth,
+    SynthSearch,
     // W2: app shell.
     Restore,
     Tabs4,
@@ -151,6 +153,7 @@ enum Phase {
     SplitSteps,
     SplitSettle,
     Echo4,
+    Wp1Pane,
     Keys4,
     DividerWait,
     Status,
@@ -195,12 +198,14 @@ impl Phase {
             Phase::ResizeAsk => "resize-ask-shell",
             Phase::Throughput => "throughput-conpty",
             Phase::Synth => "throughput-pump",
+            Phase::SynthSearch => "wp1-search-big-scrollback",
             Phase::Restore => "w2-restore-window",
             Phase::Tabs4 => "w2-open-4-tabs",
             Phase::TabNav => "w2-tab-navigation",
             Phase::SplitSteps => "w2-split-steps",
             Phase::SplitSettle => "w2-split-settle",
             Phase::Echo4 => "w2-echo-per-pane",
+            Phase::Wp1Pane => "wp1-find-and-notify-real-panes",
             Phase::Keys4 => "w2-keystrokes-4-panes",
             Phase::DividerWait => "w2-divider-drag",
             Phase::Status => "w2-status",
@@ -279,6 +284,7 @@ pub struct ShellSmoke {
     w3: remote::W3,
     w5: remote::W5,
     w7: remote::W7,
+    wp1: wp1::Wp1,
     real: real::Real,
 }
 
@@ -371,6 +377,7 @@ impl ShellSmoke {
             w3: remote::W3::default(),
             w5: remote::W5::default(),
             w7: remote::W7::default(),
+            wp1: wp1::Wp1::default(),
             real: real::Real::new(real_distro),
         }
     }
@@ -431,6 +438,7 @@ fn is_w1(p: Phase) -> bool {
             | Phase::ResizeAsk
             | Phase::Throughput
             | Phase::Synth
+            | Phase::SynthSearch
     )
 }
 
@@ -497,8 +505,8 @@ impl ShellSmoke {
             self.p1 = Some(p1);
             let frames = shell.frames;
             let mut finished = false;
-            view.update(cx, |v, _| {
-                finished = self.w1_step(v, window, now_t, frames);
+            view.update(cx, |v, vcx| {
+                finished = self.w1_step(v, vcx, window, now_t, frames);
             });
             if finished {
                 self.goto(Phase::Restore);
@@ -510,7 +518,7 @@ impl ShellSmoke {
 
     // ---- W1: unchanged checks on the first pane --------------------------------------
 
-    fn w1_step(&mut self, v: &mut TerminalView, window: &mut Window, now: Instant, frames: u64) -> bool {
+    fn w1_step(&mut self, v: &mut TerminalView, vcx: &mut Context<TerminalView>, window: &mut Window, now: Instant, frames: u64) -> bool {
         let (rows, cr, cc) = {
             let screen = v.term.screen();
             let rows: Vec<String> = (0..screen.rows()).map(|r| row_text(screen, r)).collect();
@@ -689,6 +697,33 @@ impl ShellSmoke {
                     record("vt_feed_max_ms", json!(ms(v.max_feed)));
                     record("font", json!(format!("{} {:.1}pt", v.metrics.font.family, v.cfg.font_size_pt)));
                     record("grid_w1", json!([v.rows, v.cols]));
+                    self.goto(Phase::SynthSearch);
+                    return false;
+                }
+            }
+            // Search the scrollback the pump just filled. Frames must keep coming while it runs.
+            Phase::SynthSearch => {
+                if self.sub == 0 {
+                    // The last numbered line is in the scrollback (the first ones were trimmed).
+                    v.search_set("0249999", vcx);
+                    self.thr_t0 = Instant::now();
+                    self.thr_last = None;
+                    self.thr_max_gap = 0.0;
+                    self.sub = 1;
+                    return false;
+                }
+                if let Some(last) = self.thr_last {
+                    self.thr_max_gap = self.thr_max_gap.max(ms(now - last));
+                }
+                self.thr_last = Some(now);
+                if let Some((true, found, _, scanned)) = v.search_status() {
+                    record(
+                        "search_big_scrollback",
+                        json!({"rows": scanned, "found": found, "ms": ms(now - self.thr_t0), "max_frame_gap_ms": self.thr_max_gap}),
+                    );
+                    check("search_big_scrollback_finds_line", found == 1 && scanned > 10_000);
+                    check("search_does_not_block_frames", self.thr_max_gap <= 100.0);
+                    v.close_search(vcx);
                     return true;
                 }
             }
@@ -910,7 +945,7 @@ impl ShellSmoke {
                     }
                     check("echo_per_pane", true);
                     check("echo_isolated", isolated);
-                    self.goto(Phase::Keys4);
+                    self.goto(Phase::Wp1Pane);
                     return;
                 }
                 let p = self.panes4[i];
@@ -928,6 +963,7 @@ impl ShellSmoke {
                     }
                 }
             }
+            Phase::Wp1Pane => self.wp1_pane(shell, window, cx),
             Phase::Keys4 => {
                 let p0 = self.panes4[0];
                 let Some(view) = shell.views.get(&p0).cloned() else { return };
@@ -1365,6 +1401,22 @@ fn run_direct_checks() {
             alt_a.as_deref() == Some("\u{1b}\u{e4}".as_bytes())
                 && alt_n.as_deref() == Some("\u{1b}\u{f1}".as_bytes())
                 && plain_e.as_deref() == Some("\u{e9}".as_bytes()),
+        );
+    }
+
+    // WP1 config keys: bell_mode, paste_warn_size, smart_copy.
+    {
+        use forgetty_shell_core::bell::BellMode;
+        let c = Config::from_toml("bell_mode = \"Both\"\npaste_warn_size = 0\nsmart_copy = false\n");
+        let d = Config::default();
+        let bad = Config::from_toml("bell_mode = \"loud\"");
+        check(
+            "config_wp1_keys",
+            c.as_ref().is_ok_and(|c| c.bell_mode == BellMode::Both && c.paste_warn_size == 0 && !c.smart_copy)
+                && d.bell_mode == BellMode::Visual
+                && d.paste_warn_size == 5120
+                && d.smart_copy
+                && bad.is_err(),
         );
     }
 

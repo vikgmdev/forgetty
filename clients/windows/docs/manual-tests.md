@@ -14,6 +14,10 @@ Build to test: the `forgetty-win-msi` artifact of the latest green `windows-clie
 Window, ConPTY shell, rendering through the WARP software renderer, key encoder, wide characters,
 scrollback, paste sanitizing, selection, pairing dialog logic, reconnect after a server restart,
 letterbox, `size_owner` label, toast requests, the Action Center holding the toast, OSC 52 policy,
+find in the scrollback (also over a 40000 row scrollback while frames keep coming), the scrollbar maths, link detection and the
+scheme allow-list, copy text (smart copy, soft wraps, scrollback rows), shift-click and drag auto-scroll, bell rate limit and
+Ctrl+C rule, OSC 12, OSC 9/99/777 raising a toast from a real ConPTY pane, code block detection and copy button, paste size
+warning, clear and reset,
 the IME handler (preedit, commit, cancel, candidate window anchor at the cursor cell), a real Microsoft IME
 (Japanese) and Microsoft Pinyin driven by injected keys (preedit, conversion, commit, anchor), MSI install and uninstall.
 
@@ -244,6 +248,113 @@ Use two monitors with different scaling, for example 100% and 150% or 175% (Sett
   terminal is centered with a label "Size set by <client name>", and it grows back when you press a key (you take the size).
 
 ---
+
+## WP1: terminal pane features (find, scrollbar, links, bell, copy, code blocks)
+
+Run in a local pane first, then once in a pane of a paired Linux server. Config keys are in
+`%APPDATA%\forgetty\config.toml`: `bell_mode`, `paste_warn_size`, `smart_copy`.
+Prepare some scrollback: `1..3000 | % { "line $_ marker" }` in PowerShell, or `seq 1 3000` on the server.
+
+### WP1.1 Find in the scrollback (Ctrl+Shift+F)
+
+- [ ] WP1.1.1 Press Ctrl+Shift+F. A bar floats at the top right of the pane. The terminal does not resize (the shell
+  prompt does not move). Type `line 1500`. Expected: the label reads "Searching..." for a moment, then "1 of N", and the
+  matches in view are tinted amber, the current one orange.
+- [ ] WP1.1.2 With 40000+ lines of scrollback (`seq 1 200000` on the server, or a long build log), type a word that is
+  far up. Keep typing and deleting letters. Expected: typing never stalls, the label counts up while it scans.
+- [ ] WP1.1.3 Enter goes to the next match, Shift+Enter to the previous one, both wrap around. When the match is above the
+  screen the view scrolls so the match sits about a third of the way down. A match already on screen does not move the view.
+- [ ] WP1.1.4 Case: search for `MARKER` when the text says `marker`. Expected: found (there is no case toggle, as in GTK).
+- [ ] WP1.1.5 Esc closes the bar and the tint goes away. Ctrl+Shift+F again toggles it. Ctrl+Shift+V pastes the first line
+  of the clipboard into the field. Home, End, Left, Right, Backspace, Delete edit the field.
+- [ ] WP1.1.6 While the bar is open, run a command that prints. Expected: the bar stays, the count updates about every half
+  second, the view does not jump.
+- [ ] WP1.1.7 A wide character: `echo "a日本b"` then search `本`. Expected: the tint covers the two cells of the glyph.
+- [ ] WP1.1.8 Open the bar in two panes of a split. Each keeps its own query. The keys go to the pane with focus.
+
+### WP1.2 Scrollbar
+
+- [ ] WP1.2.1 With no scrollback (new tab, `clear`) there is no bar. After output scrolls, a thin strip appears at the right edge.
+  The columns do not change when it appears (it floats over the text).
+- [ ] WP1.2.2 Drag the thumb to the top and the bottom. Expected: the text follows the pointer, also when the pointer leaves the
+  strip sideways or leaves the pane. Release outside the window: the drag ends.
+- [ ] WP1.2.3 Click on the track above or below the thumb. Expected: the thumb centers there.
+- [ ] WP1.2.4 The thumb gets brighter under the pointer and while dragged. A very long scrollback still leaves a thumb you can grab.
+- [ ] WP1.2.5 Run `vim` or `less` (alternate screen). Expected: no bar there. Leave it: the bar is back.
+
+### WP1.3 Links
+
+- [ ] WP1.3.1 Print `echo "docs: https://example.com/a_(b). done"`. Hover the URL. Expected: underline under
+  `https://example.com/a_(b)` (not the final dot) and the hand cursor. Move away: both go.
+- [ ] WP1.3.2 Ctrl+click it. Expected: the default browser opens that URL. A plain click only starts a selection.
+- [ ] WP1.3.3 Print a URL longer than the pane width so it wraps. Expected: hover underlines both rows, Ctrl+click opens the whole URL.
+- [ ] WP1.3.4 Print `file:///C:/Windows/System32/calc.exe`, `javascript:alert(1)` and `ms-msdt:x`. Expected: no underline, Ctrl+click does nothing.
+- [ ] WP1.3.5 In `vim` with `:set mouse=a` (mouse reporting on): no underline, clicks go to vim. Hold Shift: selection works again.
+- [ ] WP1.3.6 Scroll while the pointer rests on a link. Expected: no underline stuck on the wrong text.
+- [ ] WP1.3.7 Not done on purpose: OSC 8 hyperlinks (GTK ignores them too) and the "Open <url>" context menu entry (no context menu yet).
+
+### WP1.4 Bell
+
+- [ ] WP1.4.1 `echo ^G` style test: PowerShell `[char]7` or `printf '\a'`. Default (`bell_mode = "visual"`): a white flash of the pane for about
+  0.15 s, no sound.
+- [ ] WP1.4.2 Set `bell_mode = "audio"` and restart: the Windows default beep, no flash. `both`: both. `none`: nothing.
+- [ ] WP1.4.3 `1..5 | % { [char]7 }` prints five bells at once. Expected: one flash, not five.
+- [ ] WP1.4.4 Press Ctrl+C in a shell that beeps after an interrupt. Expected: no flash for that beep. The next bell flashes.
+- [ ] WP1.4.5 Reconnect to a server with old bells in the pane history. Expected: no flash from the replay.
+
+### WP1.5 Cursor color (OSC 12)
+
+- [ ] WP1.5.1 `printf '\e]12;#ff8800\a'` (or PowerShell `"$([char]27)]12;#ff8800$([char]7)"`). Expected: the cursor turns orange.
+  `printf '\e]112\a'` brings the theme color back.
+
+### WP1.6 Notifications from programs (OSC 9, 99, 777)
+
+Look at another tab or another window first, so the pane is not the one you are in.
+
+- [ ] WP1.6.1 In a local pane: `"$([char]27)]9;build done$([char]7)"` (PowerShell). Expected: a Windows toast "build done" within a second.
+- [ ] WP1.6.2 `"$([char]27)]777;notify;CI;all green$([char]7)"`: a toast titled "CI" with "all green".
+- [ ] WP1.6.3 `"$([char]27)]99;;hello kitty$([char]27)\"`: a toast with "hello kitty". `printf '\e]99;i=1:d=0;Title\e\\\e]99;i=1:p=body;Text\e\\'`: one toast, title "Title", body "Text".
+- [ ] WP1.6.4 Send ten in a loop. Expected: at most one toast per 3 seconds for the pane.
+- [ ] WP1.6.5 Click the toast: the window comes up on that pane. With the pane in focus and the window active: no toast.
+- [ ] WP1.6.6 ConEmu progress `"$([char]27)]9;4;1;50$([char]7)" ` does NOT produce a toast.
+
+### WP1.7 Selection
+
+- [ ] WP1.7.1 Drag a selection and keep the pointer below the last row, then above the first row. Expected: the view scrolls
+  by itself, faster the farther you are from the edge, and keeps going while you hold still. The selection grows. Release
+  anywhere: it stops and the text is on the clipboard.
+- [ ] WP1.7.2 Click, then Shift+click further down. Expected: the selection extends to the clicked cell. Double click a word,
+  Shift+click elsewhere: the word stays inside the selection.
+- [ ] WP1.7.3 Ctrl+Shift+A selects what is on screen (the scrollback is not included, as in GTK). Ctrl+Shift+C copies it.
+- [ ] WP1.7.4 Selection plus Ctrl+Shift+C of a bordered box (for example the Claude Code input box, or `tree` output).
+  Expected: the pasted text has no box-drawing characters and no trailing spaces. Palette "Copy selection as is" keeps the box
+  characters. With `smart_copy = false` the normal copy keeps them.
+- [ ] WP1.7.5 Copy a long line that the terminal wrapped. Expected: it pastes as one line. Copy two short lines: two lines.
+  (Difference to GTK: GTK also joins lines that are more than 80% full. Here only real terminal wraps are joined.)
+- [ ] WP1.7.6 Select a range that starts in the scrollback and ends on screen. Expected: all of it is copied.
+
+### WP1.8 Paste warning
+
+- [ ] WP1.8.1 Copy about 10 KB of text (one long line, so no newline) and paste with Ctrl+Shift+V. Expected: a confirm prompt at the
+  top of the pane saying the size ("Paste 1 line(s), 9.8 KB?"). Enter pastes, Esc cancels. Nothing reached the shell before Enter.
+- [ ] WP1.8.2 `paste_warn_size = 0` turns the size question off. A 3 line paste at a plain prompt still asks (Windows is stricter
+  than GTK here: GTK pastes raw; this client always asks before text with newlines goes to a program that did not ask for bracketed paste).
+
+### WP1.9 Clear and reset (palette: "Clear terminal", "Reset terminal")
+
+- [ ] WP1.9.1 Fill the screen, run "Clear terminal". Expected: the shell clears and redraws its prompt (it is Ctrl+L, so a program
+  in the foreground gets Ctrl+L too).
+- [ ] WP1.9.2 `printf '\e[31m\e[?1000h'` (red text, mouse mode on), then "Reset terminal". Expected: the colors are default again, mouse
+  mode is off, the screen is empty, the prompt is back.
+
+### WP1.10 Code blocks
+
+- [ ] WP1.10.1 Show a box: `printf '\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2510\n\u2502 hi() \u2502\n\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2518\n'`
+  or open Claude Code. Hover inside. Expected: a faint wash on the border cells and a small copy button in the top right corner of the box.
+- [ ] WP1.10.2 Click the button. Expected: the clipboard holds the text inside the box, without the border, and the button shows a check mark for about 1.5 s.
+- [ ] WP1.10.3 A block with a colored background (a fenced code block in a TUI with a different background): same hover and button.
+- [ ] WP1.10.4 In `vim` (alternate screen) or with mouse reporting on: no block highlight.
+- [ ] WP1.10.5 Move the pointer over fast-changing output (`1..100000 | % { $_ }`). Expected: no slowdown, no flicker of the button.
 
 ## Part B: a week of daily use
 
