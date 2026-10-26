@@ -70,6 +70,10 @@ pub enum SessionEvent {
     /// `idle`, `working`, `waiting`, `done`, `failed`.
     StatusChanged { pane_id: PaneId, status: String, message: Option<String> },
 
+    /// The shell state of the pane changed (P7.1): a prompt mark (OSC 133), a
+    /// new OSC 7 directory, or a new tty mode. Carries the whole state.
+    ShellState { pane_id: PaneId, state: crate::shell::ShellSnapshot },
+
     /// A program in the pane sent a desktop notification (OSC 9, 99, 777).
     /// Rate limited per pane.
     Notification { pane_id: PaneId, title: Option<String>, body: String },

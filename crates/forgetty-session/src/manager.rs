@@ -116,6 +116,9 @@ struct SessionManagerInner {
     /// remove panes from the layout: the process exits right after and the
     /// saved layout has to keep every pane for the next start.
     shutting_down: bool,
+    /// Shell integration scripts for the shells new panes start (P7.1). `None`:
+    /// off, panes start their shell as it is.
+    shell_integration: Option<crate::shell_integration::ShellIntegration>,
 }
 
 // ---------------------------------------------------------------------------
@@ -254,6 +257,7 @@ impl SessionManager {
                 exit_history: std::collections::VecDeque::new(),
                 osc_scanning: true,
                 shutting_down: false,
+                shell_integration: None,
                 size_owners: HashMap::new(),
             })),
         }
@@ -286,6 +290,29 @@ impl SessionManager {
     pub fn set_osc_scanning(&self, on: bool) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.osc_scanning = on;
+    }
+
+    /// Set the shell integration (P7.1) that panes created from now on start
+    /// their shell with, or turn it off with `None`. Panes that run already keep
+    /// their shell as it is.
+    pub fn set_shell_integration(&self, si: Option<crate::shell_integration::ShellIntegration>) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.shell_integration = si;
+    }
+
+    /// Spawn the PTY of a new pane with the shell integration on, when it is
+    /// set (P7.1).
+    fn spawn_bridge(
+        &self,
+        size: PtySize,
+        cwd: Option<&std::path::Path>,
+        command: Option<&[String]>,
+        shell: Option<&str>,
+        login_shell: bool,
+    ) -> std::result::Result<PtyBridge, String> {
+        let integration =
+            self.inner.lock().unwrap_or_else(|e| e.into_inner()).shell_integration.clone();
+        PtyBridge::spawn(size, cwd, command, shell, login_shell, integration.as_ref())
     }
 
     /// Registry of attached clients (iroh connections and streaming sockets).
@@ -382,7 +409,7 @@ impl SessionManager {
     ) -> Result<PaneId> {
         let id = PaneId::new();
 
-        let pty_bridge = PtyBridge::spawn(
+        let pty_bridge = self.spawn_bridge(
             size,
             cwd.as_deref(),
             command.as_deref(),
@@ -947,7 +974,7 @@ impl SessionManager {
         let mut spawned: Vec<(PaneId, PtyBridge, PathBuf)> = Vec::with_capacity(cwds.len());
         for cwd_opt in &cwds {
             let pane_id = PaneId::new();
-            match PtyBridge::spawn(default_size, cwd_opt.as_deref(), None, None, true) {
+            match self.spawn_bridge(default_size, cwd_opt.as_deref(), None, None, true) {
                 Ok(bridge) => {
                     let initial_cwd = cwd_opt.clone().unwrap_or_else(home_dir_fallback);
                     spawned.push((pane_id, bridge, initial_cwd));
@@ -1142,8 +1169,15 @@ impl SessionManager {
         // Spawn PTY first; insert into layout only if spawn succeeds (R-2).
         // When a profile command is provided, pass it as the explicit argv.
         // When absent, fall back to existing auto-detect (None, None, login=true).
-        let pty_bridge = PtyBridge::spawn(size, cwd.as_deref(), command.as_deref(), None, true)
-            .map_err(forgetty_core::ForgettyError::Pty)?;
+        let pty_bridge = PtyBridge::spawn(
+            size,
+            cwd.as_deref(),
+            command.as_deref(),
+            None,
+            true,
+            inner.shell_integration.as_ref(),
+        )
+        .map_err(forgetty_core::ForgettyError::Pty)?;
 
         let initial_cwd = cwd.unwrap_or_else(home_dir_fallback);
 
@@ -1221,8 +1255,9 @@ impl SessionManager {
 
         // Spawn new PTY BEFORE mutating the tree (R-2).
         let new_pane_id = PaneId::new();
-        let pty_bridge = PtyBridge::spawn(size, cwd.as_deref(), None, None, true)
-            .map_err(forgetty_core::ForgettyError::Pty)?;
+        let pty_bridge =
+            PtyBridge::spawn(size, cwd.as_deref(), None, None, true, inner.shell_integration.as_ref())
+                .map_err(forgetty_core::ForgettyError::Pty)?;
 
         let initial_cwd = cwd.unwrap_or_else(home_dir_fallback);
 
@@ -1316,8 +1351,9 @@ impl SessionManager {
             )));
         }
 
-        let pty_bridge = PtyBridge::spawn(size, cwd.as_deref(), None, None, true)
-            .map_err(forgetty_core::ForgettyError::Pty)?;
+        let pty_bridge =
+            PtyBridge::spawn(size, cwd.as_deref(), None, None, true, inner.shell_integration.as_ref())
+                .map_err(forgetty_core::ForgettyError::Pty)?;
 
         let initial_cwd = cwd.unwrap_or_else(home_dir_fallback);
 
@@ -1500,7 +1536,7 @@ impl SessionManager {
 
         // Spawn PTY first; if it fails the workspace stays empty and the
         // caller logs. Same shell-resolution path as `create_tab`.
-        let pty_bridge = PtyBridge::spawn(size, None, None, None, true)
+        let pty_bridge = PtyBridge::spawn(size, None, None, None, true, inner.shell_integration.as_ref())
             .map_err(forgetty_core::ForgettyError::Pty)?;
 
         let pane_id = PaneId::new();
@@ -2122,6 +2158,10 @@ impl SessionManager {
         if !found.is_empty() {
             apply_osc_events(id, pane, found, &mut meta_events);
         }
+        // P7.1: the tty mode is read a little after the output, never per
+        // chunk and never per byte (see `shell::TTY_CHECK_DELAYS`): a chunk
+        // starts a chain of checks only when no first check is waiting.
+        let tty_chain = if scanning { pane.osc.shell.output() } else { None };
 
         // V2-007 AC-13: ring write BEFORE broadcast, both under the same
         // `inner` mutex guard. This is the ordering invariant that makes
@@ -2144,7 +2184,86 @@ impl SessionManager {
         for ev in meta_events {
             let _ = inner.event_tx.send(ev);
         }
+        drop(guard);
+        if let Some(epoch) = tty_chain {
+            self.schedule_tty_check(id, epoch);
+        }
         Ok(DrainResult { pty_exited })
+    }
+
+    /// Start chain number `epoch` of tty checks for a pane: one read after each
+    /// of `shell::TTY_CHECK_DELAYS`. The chain ends early when the pane is gone
+    /// or a newer chain took over.
+    fn schedule_tty_check(&self, id: PaneId, epoch: u64) {
+        // No runtime (a plain thread): no timer. The state is read on demand.
+        let Ok(rt) = tokio::runtime::Handle::try_current() else { return };
+        let sm = self.clone();
+        rt.spawn(async move {
+            for (i, delay) in crate::shell::TTY_CHECK_DELAYS.into_iter().enumerate() {
+                tokio::time::sleep(delay).await;
+                let current = sm.with_pane(id, |pane| {
+                    if i == 0 {
+                        pane.osc.shell.first_check(epoch)
+                    } else {
+                        pane.osc.shell.chain_epoch == epoch
+                    }
+                });
+                if current != Some(true) {
+                    return;
+                }
+                let _ = sm.read_tty_now(id);
+            }
+        });
+    }
+
+    fn with_pane<R>(&self, id: PaneId, f: impl FnOnce(&mut PaneState) -> R) -> Option<R> {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.panes.get_mut(&id).map(f)
+    }
+
+    /// Read the termios of the pane now and broadcast a `ShellState` when the
+    /// tty mode changed. Returns the state as it is after the read.
+    fn read_tty_now(&self, id: PaneId) -> Option<crate::shell::ShellSnapshot> {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let inner = &mut *guard;
+        let pane = inner.panes.get_mut(&id)?;
+        let flags = pane.pty_bridge.pty.tty_flags();
+        let cwd = pane.osc.display_cwd.clone();
+        let changed = pane.osc.shell.read_tty(flags, cwd.as_deref(), now_ms());
+        let now = pane.osc.shell.current(cwd.as_deref());
+        match changed {
+            Some(state) => {
+                let _ = inner.event_tx.send(SessionEvent::ShellState { pane_id: id, state: state.clone() });
+                Some(state)
+            }
+            None => Some(now),
+        }
+    }
+
+    /// The shell state of a pane, with a fresh read of its tty mode. A change
+    /// found by the read is broadcast as a `ShellState` event. `None` when the
+    /// pane is unknown.
+    pub fn shell_state(&self, id: PaneId) -> Option<crate::shell::ShellSnapshot> {
+        self.read_tty_now(id)
+    }
+
+    /// How many times the termios of the pane was read (tests).
+    pub fn shell_tty_reads(&self, id: PaneId) -> Option<u64> {
+        self.with_pane(id, |pane| pane.osc.shell.tty_reads)
+    }
+
+    /// The shell state of every pane that has any (a mark seen or a tty mode
+    /// read), after a fresh read of each tty mode. For a client that starts to
+    /// listen: it gets the state as it is, then the changes.
+    pub fn shell_states(&self) -> Vec<(PaneId, crate::shell::ShellSnapshot)> {
+        let ids: Vec<PaneId> = {
+            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            inner.pane_order.clone()
+        };
+        ids.into_iter()
+            .filter_map(|id| self.read_tty_now(id).map(|s| (id, s)))
+            .filter(|(_, s)| s.phase != crate::shell::Phase::Unknown || s.tty.is_some())
+            .collect()
     }
 
     // -----------------------------------------------------------------------
@@ -3005,7 +3124,18 @@ fn apply_osc_events(
                 }
                 if pane.osc.display_cwd.as_deref() != Some(path.as_str()) {
                     pane.osc.display_cwd = Some(path.clone());
+                    let state = pane.osc.shell.cwd_changed(&path, now_ms());
                     out.push(SessionEvent::CwdChanged { pane_id: id, cwd: path });
+                    out.push(SessionEvent::ShellState { pane_id: id, state });
+                }
+            }
+            OscEvent::Mark { kind, exit_code } => {
+                let cwd = pane.osc.display_cwd.clone();
+                let tty = pane.pty_bridge.pty.tty_flags();
+                if let Some(state) =
+                    pane.osc.shell.mark(kind, exit_code, tty, cwd.as_deref(), now_ms())
+                {
+                    out.push(SessionEvent::ShellState { pane_id: id, state });
                 }
             }
             OscEvent::Status(report) => {

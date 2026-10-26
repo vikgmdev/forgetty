@@ -408,3 +408,24 @@ unit), so the unit has no `After=` for the tunnel. The retry covers it.
   client is back within 5 s. The server's socket is bound to the address, so
   check in the log that it keeps answering after the interface returns. If it
   does not, restart the server and report it.
+
+## Shell integration
+
+For zsh, bash and fish the server can make the shell write the standard prompt
+marks (OSC 133: prompt start, command line start, command start, command end with
+the exit code) and the working directory (OSC 7). Clients get them, with the tty
+mode of the pane, as `ShellState` events (`PROTOCOL_V2.md`, section 14).
+
+It is on by default for panes the server creates after it reads `config.toml`:
+
+```toml
+shell_integration = false   # turn it off
+```
+
+The server never edits your rc files. It writes its scripts to
+`<data dir>/shell-integration` at start, and sets `ZDOTDIR` (zsh), `PROMPT_COMMAND`
+(bash) or `XDG_DATA_DIRS` (fish) for the shell it starts, so the scripts load by
+themselves. Your own startup files run as before. A bash startup file that
+replaces `PROMPT_COMMAND` instead of adding to it turns the integration off for
+that shell. A shell that was started before the server read the setting keeps
+running without it.

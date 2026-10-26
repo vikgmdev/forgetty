@@ -174,7 +174,7 @@ const KEEPING_PACE_RATE: f64 = 1024.0 * 1024.0;
 const SNAPSHOT_SEND_OK: Duration = Duration::from_millis(500);
 
 /// Capabilities the server offers.
-pub const SERVER_CAPS: [&str; 10] = [
+pub const SERVER_CAPS: [&str; 11] = [
     cap::RESUME,
     cap::LAYOUT_EVENTS,
     cap::STATUS_EVENTS,
@@ -185,6 +185,7 @@ pub const SERVER_CAPS: [&str; 10] = [
     cap::SIZE_OWNER,
     cap::SPLIT_BEFORE,
     cap::WORKSPACE_ID,
+    cap::SHELL_STATE,
 ];
 
 /// Methods a v2 client may call through the shared socket dispatch table.
@@ -593,6 +594,15 @@ impl RpcV2 {
         let mut seq = lock(&self.event_seq);
         *seq += 1;
         let _ = self.events.send((*seq, event));
+    }
+
+    /// Send the shell state of every pane that has one (P7.1). For a client
+    /// that just subscribed: it sees the state as it is, then the changes. The
+    /// state reaches every subscriber; one that has it drops the repeat by `rev`.
+    fn emit_shell_states(&self) {
+        for (pane_id, state) in self.sm.shell_states() {
+            self.emit(shell_state_event(pane_id.0, &state));
+        }
     }
 
     fn subscribe(&self) -> (u64, broadcast::Receiver<(u64, ServerEvent)>) {
@@ -1510,6 +1520,21 @@ fn wire_owner(o: &SizeOwner) -> forgetty_proto::SizeOwner {
     }
 }
 
+/// The wire form of the shell state of a pane.
+fn shell_state_event(pane_id: Uuid, s: &forgetty_session::ShellSnapshot) -> ServerEvent {
+    ServerEvent::ShellState {
+        pane_id,
+        rev: s.rev,
+        phase: s.phase.as_str().to_string(),
+        exit_code: s.exit_code,
+        cwd: s.cwd.clone(),
+        canonical: s.tty.map(|t| t.canonical),
+        echo: s.tty.map(|t| t.echo),
+        mark: s.mark.map(|m| m.letter().to_string()),
+        at_ms: s.at_ms,
+    }
+}
+
 fn pump_event(rpc: &RpcV2, ev: SessionEvent, layout_dirty: &mut bool) {
     match ev {
         SessionEvent::TitleChanged { pane_id, title } => {
@@ -1524,6 +1549,9 @@ fn pump_event(rpc: &RpcV2, ev: SessionEvent, layout_dirty: &mut bool) {
                 status,
                 message: message.unwrap_or_default(),
             })
+        }
+        SessionEvent::ShellState { pane_id, state } => {
+            rpc.emit(shell_state_event(pane_id.0, &state));
         }
         SessionEvent::Notification { pane_id, title, body } => {
             rpc.emit(ServerEvent::Notification {
@@ -2033,6 +2061,7 @@ impl Session {
         match event {
             ServerEvent::LayoutChanged { .. } => self.has(cap::LAYOUT_EVENTS),
             ServerEvent::SizeOwnerChanged { .. } => self.has(cap::SIZE_OWNER),
+            ServerEvent::ShellState { .. } => self.has(cap::SHELL_STATE),
             ServerEvent::StatusChanged { .. }
             | ServerEvent::Notification { .. }
             | ServerEvent::PaneExited { .. } => self.has(cap::STATUS_EVENTS),
@@ -2103,6 +2132,12 @@ impl Session {
                         } else {
                             let (seq, rx) = s2.rpc.subscribe();
                             let _ = s2.events_tx.send(rx);
+                            // The shell state as it is now, for panes that have
+                            // one. It goes out as events after the answer; the
+                            // `rev` keeps an older state from replacing a newer.
+                            if s2.has(cap::SHELL_STATE) {
+                                s2.rpc.emit_shell_states();
+                            }
                             seq
                         }
                     })
