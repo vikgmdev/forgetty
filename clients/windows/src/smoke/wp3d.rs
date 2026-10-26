@@ -143,13 +143,13 @@ impl ShellSmoke {
                 if shell.layout.tab_count() != self.wp3d.tabs0 {
                     return;
                 }
-                self.finish();
+                self.wp3d_report();
                 self.goto(super::Phase::RSetup);
             }
         }
     }
 
-    fn finish(&mut self) {
+    fn wp3d_report(&mut self) {
         let d = &self.wp3d;
         let col = |v: &[[f64; 3]], k: usize| v.iter().map(|s| s[k]).collect::<Vec<f64>>();
         for (name, v) in [("new_tab", &d.new_tab), ("split", &d.split)] {
