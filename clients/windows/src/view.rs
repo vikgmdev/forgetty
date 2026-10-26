@@ -280,6 +280,9 @@ struct CopyTask {
     job: CopyJob,
     smart: bool,
     fp: Fingerprint,
+    /// What was fed to the terminal (`fed_bytes`, `resets`) when `fp` last matched. The rows
+    /// can only move when the terminal is fed, so while this is the same nothing is checked.
+    checked: (u64, u64),
 }
 
 /// Fingerprint of rows `lo..hi` of the buffer (see `fingerprint.rs`).
@@ -1689,7 +1692,8 @@ impl TerminalView {
         let mut rt = RowText::default();
         let fp = rows_fp(&self.term, &mut rt, r0, (r1 + 1).min(settled));
         let n = job.total_rows();
-        self.copy_task = Some(CopyTask { job, smart, fp });
+        let checked = (self.fed_bytes, self.resets);
+        self.copy_task = Some(CopyTask { job, smart, fp, checked });
         self.show_notice(format!("Copying {n} lines..."), cx);
         self.copy_drive(cx);
     }
@@ -1712,21 +1716,28 @@ impl TerminalView {
 
     /// One slice of a big copy. True while more is to come.
     fn copy_tick(&mut self, cx: &mut Context<Self>) -> bool {
+        let started = Instant::now();
+        let gen = (self.fed_bytes, self.resets);
         let Some(task) = self.copy_task.as_mut() else {
             self.copy_driver = false;
             return false;
         };
         let mut rt = RowText::default();
-        // The rows must still be the rows that were selected.
-        if rows_fp(&self.term, &mut rt, task.fp.lo, task.fp.hi) != task.fp {
-            return self.copy_refused(cx);
+        // The rows must still be the rows that were selected. They can only have moved if the
+        // terminal was fed since the last check. Nothing feeds it inside this call (the UI
+        // thread is the only one that does), so the check at the start also covers the rows
+        // of the last slice.
+        if task.checked != gen {
+            if rows_fp(&self.term, &mut rt, task.fp.lo, task.fp.hi) != task.fp {
+                return self.copy_refused(cx);
+            }
+            task.checked = gen;
         }
-        if !task.job.step(&mut copy_reader(&self.term, &mut rt), COPY_SLICE) {
+        // The time the check took comes out of the slice (at least 1 ms is left to read).
+        let budget = COPY_SLICE.saturating_sub(started.elapsed()).max(Duration::from_millis(1));
+        let done = task.job.step(&mut copy_reader(&self.term, &mut rt), budget);
+        if !done {
             return true;
-        }
-        // The last slice may have been the one the output moved the rows in.
-        if rows_fp(&self.term, &mut rt, task.fp.lo, task.fp.hi) != task.fp {
-            return self.copy_refused(cx);
         }
         if let Some(t) = self.copy_task.take() {
             write_copy(&t.job, t.smart, cx);
