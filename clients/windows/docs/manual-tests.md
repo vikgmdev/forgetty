@@ -461,7 +461,7 @@ The file is `%APPDATA%\forgetty\config.toml`. Keep an editor open on it. Everyth
 
 ### WP3.3 Open and reload
 
-- [ ] WP3.3.1 Ctrl+Shift+P, "Open configuration file". Expected: the file opens in your editor; if it did not exist it was created with a commented template. With no program set for `.toml`, Notepad opens it.
+- [ ] WP3.3.1 Ctrl+Shift+P, "Open configuration file". Expected: the file opens in your editor; if it did not exist it was created with a commented template. With no program set for `.toml`, Notepad opens it. The window does not freeze while it opens (the file work is off the UI thread).
 - [ ] WP3.3.2 Ctrl+Shift+P, "Reload configuration". Expected: "Configuration reloaded, nothing changed" when the file is as loaded.
 
 ### WP3.4 Zoom
@@ -499,7 +499,7 @@ command = "wsl.exe -d Ubuntu --cd ~"
 - [ ] WP3.6.3 Click the small arrow next to "+" (or right-click "+"). Expected: the profiles with their chords, "New Tab", then Split Right, Down, Left, Up. Pick one.
 - [ ] WP3.6.4 Ctrl+Shift+P: "Open profile: PowerShell" and the others are listed.
 - [ ] WP3.6.5 On a paired Linux machine: "+" opens that machine's shell, the arrow menu lists no profiles, Ctrl+Shift+1 says profiles start programs on this PC.
-- [ ] WP3.6.6 A profile whose program does not exist: a notice with the error, no tab left half open.
+- [ ] WP3.6.6 A profile whose program is not found: see WP3b.2 (it is skipped when the file is read, with a warning).
 
 ### WP3.7 Paste rules
 
@@ -510,6 +510,16 @@ command = "wsl.exe -d Ubuntu --cd ~"
 
 - [ ] WP2c.1 Fill the scrollback, select all, copy (a "Copying N lines..." notice). While it copies, run Reset from the pane menu. Expected: "Copy stopped: the terminal was reset." and the clipboard is unchanged. Repeat, and drag the window narrower while it copies: the copy either finishes with the right text or stops with "Copy stopped"; never a text with wrong rows.
 - [ ] WP2c.2 With a paired server that was upgraded and then replaced by an older one while the app ran (restart the old binary under the same name): "Delete workspace" works against the older server too (no "missing param").
+
+### WP3b: programs, network paths, the themes folder, pairing, the installed copy
+
+- [ ] WP3b.1 Set `FORGETTY_CONFIG` to `C:\temp\notes.txt` (any name that does not end in `.toml`) and start the app. Ctrl+Shift+P, "Open configuration file". Expected: "Not opened: the configuration file notes.txt is not a .toml file", and no file is created. Point `FORGETTY_CONFIG` at `\\someserver\share\config.toml`: "Not opened: ... is on a network path", and no network traffic to that server (check with a capture if you can).
+- [ ] WP3b.2 In `config.toml` set `shell = "no-such-thing.exe"` and a profile `command = "no-such-thing.exe"`. Expected: on save, a notice with "is not on PATH"; the profile is not in the new-tab menu; plain tabs use your usual shell. A profile `command = ".\\pwsh.exe"` is refused with "not a full path". A bare `pwsh.exe` still works (found on PATH). Put a program called `pwsh.exe` in the folder you start the app from, with no such program on PATH: it must not run.
+- [ ] WP3b.3 A profile with `directory = '\\server\share'`: the profile loads, a plain tab from it says "directory ... network and device paths are not allowed, started in the home directory", and no network traffic to the server. A profile with a folder that does not exist says "does not exist". Create the folder, then save the config (or run "Reload configuration"): the profile uses it.
+- [ ] WP3b.4 Open the theme list (Ctrl+Shift+P, "Choose theme...") and pick a theme while a network drive is slow or disconnected (or while the disk is busy). Expected: no pause. The list is ready when the app starts.
+- [ ] WP3b.5 Make `%APPDATA%\forgetty\themes\mine.toml` (`name = "Mine"` and a `[colors]` table with `foreground` and `background`). Expected: "Mine" is in the theme list within a second, with the app running. Set `theme = "Mine"`: the colors apply. Edit the file's background and save: the window follows. With `FORGETTY_CONFIG=D:\x\config.toml` the folder is `D:\x\themes`.
+- [ ] WP3b.6 The "+" drop-down ends with "Pair machine...". It opens the pairing dialog, also with no machine paired and no pane. The sidebar (Ctrl+Shift+B) lists "+ Pair machine..." under the machines, in the accent color.
+- [ ] WP3b.7 Install the MSI from CI, run it from the Start menu, then run `forgetty-win.exe --smoke` from the install folder in a temporary folder. The CI installer job does this on every push (it also checks that the installed `ghostty-vt.dll` and exe are the tested files).
 
 ### Not done in WP3
 
