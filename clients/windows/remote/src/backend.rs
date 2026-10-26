@@ -192,9 +192,10 @@ impl RemoteBackend {
     }
 
 
-    /// True when the server (this session) understands `cap`.
+    /// True when the server of this machine understands `cap`: in this session, or while the
+    /// link is down, in the latest session that came up.
     fn server_has(&self, cap: &str) -> bool {
-        self.inner.client.has_capability(cap)
+        self.inner.client.known_capability(cap)
     }
 
     /// Workspace calls act on the workspace id. A server with the `workspace_id`
@@ -239,6 +240,13 @@ impl RemoteBackend {
         let client = self.inner.client.clone();
         self.run(async move {
             client.request(method, from_json(&params)).await.map(|v| to_json(&v)).map_err(map_err)
+        })
+    }
+
+    fn call_needing(&self, cap: &'static str, method: &'static str, params: Json) -> BackendFuture<Json> {
+        let client = self.inner.client.clone();
+        self.run(async move {
+            client.request_needing(cap, method, from_json(&params)).await.map(|v| to_json(&v)).map_err(map_err)
         })
     }
 
@@ -522,7 +530,12 @@ impl SessionBackend for RemoteBackend {
             }
             p["before"] = json!(true);
         }
-        let f = self.call("split_pane", p);
+        let f = if req.before {
+            // Checked again on the session the request goes out on (see `request_needing`).
+            self.call_needing(forgetty_client::proto::cap::SPLIT_BEFORE, "split_pane", p)
+        } else {
+            self.call("split_pane", p)
+        };
         Box::pin(async move { Ok(PaneId(uuid_at(&f.await?, "pane_id")?)) })
     }
 

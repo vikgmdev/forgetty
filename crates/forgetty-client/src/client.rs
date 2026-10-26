@@ -488,6 +488,9 @@ pub(crate) struct Shared {
     events_gen: Arc<tokio::sync::Mutex<u64>>,
     ever_connected: AtomicBool,
     welcome: Mutex<Option<Welcome>>,
+    /// Capabilities of the latest session that came up (both sides listed them). Kept while
+    /// the link is down, so a client can tell what the server of this machine can do.
+    last_caps: Mutex<std::collections::HashSet<String>>,
     /// `Welcome.boot_id` of the last connection.
     boot_id: Mutex<Option<Uuid>>,
     /// Input bytes dropped because the server restarted, in total.
@@ -653,6 +656,7 @@ impl Client {
             events_gen: Arc::new(tokio::sync::Mutex::new(0)),
             ever_connected: AtomicBool::new(false),
             welcome: Mutex::new(None),
+            last_caps: Mutex::new(Default::default()),
             boot_id: Mutex::new(None),
             input_lost: AtomicU64::new(0),
             shutdown_tx,
@@ -931,6 +935,17 @@ impl ClientHandle {
         self.shared().link_tx.borrow().as_ref().is_some_and(|l| l.has_cap(name))
     }
 
+    /// Like [`has_capability`](Self::has_capability), but while the link is down it answers
+    /// from the latest session that came up. A machine that was never reached says `false`.
+    /// A new session replaces the list, so a server that was updated or replaced is
+    /// seen as soon as the client is connected again.
+    pub fn known_capability(&self, name: &str) -> bool {
+        match self.shared().link_tx.borrow().as_ref() {
+            Some(l) => l.has_cap(name),
+            None => lock(&self.shared().last_caps).contains(name),
+        }
+    }
+
     /// The direct addresses learned so far. Persist the snapshot and pass it
     /// back in `ClientOptions::addr_cache` on the next start.
     pub fn addr_cache(&self) -> AddrCache {
@@ -973,6 +988,29 @@ impl ClientHandle {
             asked.elapsed().as_millis()
         );
         result
+    }
+
+    /// [`ClientHandle::request`] for a method whose meaning depends on a capability. It waits
+    /// for the link like `request`, then checks the capability of the session the request is
+    /// about to go out on, not of one that is gone. A server that does not list it gets
+    /// nothing: the error says `capability_missing`. This matters when the request was held
+    /// over a reconnect and the server on the other side was replaced by an older one.
+    pub async fn request_needing(
+        &self,
+        capability: &str,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, ClientError> {
+        let deadline = tokio::time::Instant::now() + self.shared().opts.request_timeout;
+        let shared = self.shared();
+        let link = wait_link(shared, deadline).await?;
+        if !link.has_cap(capability) {
+            return Err(ClientError::Server {
+                code: "capability_missing".into(),
+                message: format!("the server does not list `{capability}` (needed by {method})"),
+            });
+        }
+        call(shared, &link, method, params, deadline).await
     }
 
     /// Typed variant of [`ClientHandle::request`].
@@ -2442,6 +2480,7 @@ async fn run_session(
     tasks.spawn(liveness(shared.clone(), link.clone()));
 
     *lock(&shared.welcome) = Some(welcome);
+    *lock(&shared.last_caps) = link.caps.clone();
     shared.link_tx.send_replace(Some(link.clone()));
     shared.state_tx.send_replace(ConnectionState::Connected);
     tl!(shared, "state Connected");

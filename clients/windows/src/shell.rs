@@ -805,7 +805,14 @@ impl AppShell {
 
     fn split_placed(&mut self, dir: SplitDir, before: bool, cx: &mut Context<Self>) {
         if before && !self.backend.supports_split_before() {
-            self.notice_active("This machine's server is too old to split left or up. Update it to use this.".into(), cx);
+            // Not knowing is not the same as "too old": a machine that was never reached
+            // in this run has told us nothing yet.
+            let text = if self.backend.connection().is_connected() {
+                "This machine's server is too old to split left or up. Update it to use this."
+            } else {
+                "Not connected to this machine yet, so split left or up is not known to work. Try again when it is connected."
+            };
+            self.notice_active(text.into(), cx);
             return;
         }
         let (Some(tab), Some(pane)) = (self.active_tab().map(|t| t.id), self.active_pane()) else { return };

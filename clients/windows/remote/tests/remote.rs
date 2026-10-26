@@ -519,3 +519,73 @@ async fn split_before_needs_the_capability() {
     let l = b.get_layout().await.unwrap();
     assert_eq!(l.workspaces[0].tabs[0].pane_tree.leaves(), vec![left, PaneId(pane(1))]);
 }
+
+/// What a machine's server can do is remembered while the link is down. A request held over
+/// the outage goes out on the new session, and the capability is checked on that one: if the
+/// server that came back is older, a split left/up is refused and nothing is split.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capabilities_are_remembered_while_the_link_is_down() {
+    use forgetty_client::proto::cap;
+    let key = forgetty_client::SecretKey::generate(&mut rand::rng());
+    let port = {
+        let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        s.local_addr().unwrap().port()
+    };
+    let cfg = |k: &forgetty_client::SecretKey, caps: &[&str]| TestServerConfig {
+        pair_secret: Some(SECRET.into()),
+        port: Some(port),
+        secret_key: Some(k.clone()),
+        panes: vec![(pane(1), b"$ ".to_vec())],
+        capabilities: [cap::RESUME, cap::LAYOUT_EVENTS].iter().chain(caps.iter()).map(|c| c.to_string()).collect(),
+        ..Default::default()
+    };
+    let server = TestServer::start(cfg(&key, &[cap::SPLIT_BEFORE, cap::WORKSPACE_ID])).await;
+    let dir = tempfile::tempdir().unwrap();
+    let st = MachineStore::open(dir.path().join("forgetty"));
+    let node = server.addr().id.to_string();
+    let text = format!(r#"{{"v":2,"node_id":"{node}","machine":"m","relay":"","secret":"{SECRET}"}}"#);
+    let m = store::pair(&st, &store::parse_offer(&text).unwrap(), "win-test", Some(server.udp_addr())).await.unwrap();
+    let cache = st.addr_cache();
+    let backend = RemoteBackend::start(RemoteParams {
+        machine_id: m.id,
+        name: m.name.clone(),
+        server: store::machine_addr(&m).unwrap(),
+        identity: st.identity().unwrap(),
+        info: ClientInfo::new(st.client_id().unwrap(), ClientKind::Windows, "win-test", "0.0.1"),
+        opts: ClientOptions {
+            relay: RelayChoice::Disabled,
+            dial_timeout: store::dial_timeout_for(&cache, &m),
+            addr_cache: cache,
+            ..Default::default()
+        },
+    })
+    .await
+    .unwrap();
+    // Never reached yet: nothing is known.
+    assert!(!backend.supports_split_before());
+    until("connected", || backend.connection().is_connected()).await;
+    assert!(backend.supports_split_before());
+
+    // The link goes down: the answer stays.
+    server.shutdown().await;
+    until("link loss seen", || !backend.connection().is_connected()).await;
+    assert!(backend.supports_split_before());
+
+    // A split left held over the outage ...
+    let held = {
+        let b = backend.clone();
+        tokio::spawn(async move {
+            b.split_pane(SplitPane { pane_id: PaneId(pane(1)), direction: SplitDir::Horizontal, rows: 24, cols: 40, cwd: None, before: true })
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    // ... meets an older server: refused, nothing split, and the answer follows the new session.
+    let old = TestServer::start(cfg(&key, &[])).await;
+    let r = held.await.unwrap();
+    assert!(r.is_err_and(|e| e.to_string().contains("capability_missing")));
+    until("connected again", || backend.connection().is_connected()).await;
+    until("capability gone", || !backend.supports_split_before()).await;
+    assert_eq!(backend.get_layout().await.unwrap().workspaces[0].tabs[0].pane_tree.leaves().len(), 1);
+    old.shutdown().await;
+}
