@@ -753,6 +753,7 @@ impl SessionBackend for LocalBackend {
                 cols: p.cols,
                 title: p.title.clone(),
                 cwd: p.cwd.clone(),
+                spawn_cwd: p.spawn_cwd.clone(),
                 status: p.status,
                 exited: p.pty.has_exited(),
                 size_owner: None,
@@ -944,6 +945,17 @@ mod tests {
             out.push_str(&String::from_utf8_lossy(&b));
         }
         assert!(out.contains("PWD=/tmp=END"), "split cwd: {out:?}");
+        // Duplicate tab: the pane printed OSC 7 for /usr, the copy still starts in /tmp.
+        assert_eq!(now(b.get_pane_info(t.pane_id)).unwrap().spawn_cwd.as_deref(), Some("/tmp"));
+        let dup = now(b.new_tab(NewTab { workspace_idx: 0, rows: 24, cols: 80, inherit_cwd_from: Some(t.pane_id), ..Default::default() })).unwrap();
+        let d = now(b.attach_pane(dup.pane_id)).unwrap();
+        d.write_input(b"echo DUP=$(pwd)=END\n");
+        let mut out = read_until(&d.events(), "DUP=/");
+        std::thread::sleep(Duration::from_millis(300));
+        while let Ok(PaneEvent::Output(b)) = d.events().try_recv() {
+            out.push_str(&String::from_utf8_lossy(&b));
+        }
+        assert!(out.contains("DUP=/tmp=END"), "duplicate cwd: {out:?}");
         b.shutdown_all();
     }
 

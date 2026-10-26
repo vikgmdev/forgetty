@@ -292,6 +292,10 @@ struct State {
     clients: Mutex<Vec<ClientEntry>>,
     /// `(pane, from_offset)` of every `attach_pane`, in order.
     attaches: Mutex<Vec<(Uuid, Option<u64>)>>,
+    /// The `cwd` param of every `new_tab` (None: the client sent none).
+    new_tab_cwds: Mutex<Vec<Option<String>>>,
+    /// Answer `get_pane_info` like a server from before `spawn_cwd`.
+    hide_spawn_cwd: AtomicBool,
     handshakes: AtomicU64,
     paused: AtomicBool,
     die_mode: AtomicU8,
@@ -367,6 +371,8 @@ impl TestServer {
             pair_secret: Mutex::new(cfg.pair_secret.clone()),
             clients: Mutex::new(Vec::new()),
             attaches: Mutex::new(Vec::new()),
+            new_tab_cwds: Mutex::new(Vec::new()),
+            hide_spawn_cwd: AtomicBool::new(false),
             handshakes: AtomicU64::new(0),
             paused: AtomicBool::new(false),
             die_mode: AtomicU8::new(cfg.die_mode),
@@ -550,6 +556,16 @@ impl TestServer {
     /// `(pane, from_offset)` of every `attach_pane` seen so far.
     pub fn attaches(&self) -> Vec<(Uuid, Option<u64>)> {
         lock(&self.state.attaches).clone()
+    }
+
+    /// The `cwd` of every `new_tab` seen so far.
+    pub fn new_tab_cwds(&self) -> Vec<Option<String>> {
+        lock(&self.state.new_tab_cwds).clone()
+    }
+
+    /// Answer `get_pane_info` without `spawn_cwd`, like an older server.
+    pub fn set_hide_spawn_cwd(&self, hide: bool) {
+        self.state.hide_spawn_cwd.store(hide, Ordering::SeqCst);
     }
 
     /// Number of completed handshakes.
@@ -1022,6 +1038,7 @@ fn handle_request(
             Ok(map(&[("tabs", Value::Array(tabs))]))
         }
         "new_tab" => {
+            lock(&state.new_tab_cwds).push(param_str(&params, "cwd").map(str::to_string));
             let pane = new_pane_log(state, 24, 80);
             let tab_id = Uuid::new_v4();
             lock(&state.layout).tabs.push(TabNode {
@@ -1307,15 +1324,21 @@ fn handle_request(
                 ]),
                 None => Value::Nil,
             };
-            Ok(map(&[
+            // `cwd` is the display value (a program's OSC 7 can set it to anything). `spawn_cwd`
+            // is where the shell really started.
+            let mut fields = vec![
                 ("size_owner", owner),
                 ("pane_id", str_val(&pane.to_string())),
                 ("rows", Value::from(p.rows)),
                 ("cols", Value::from(p.cols)),
                 ("title", str_val(&format!("pane {}", &pane.to_string()[..8]))),
-                ("cwd", str_val("/home/test")),
+                ("cwd", str_val("/shown/by/osc7")),
                 ("pid", Value::from(1u32)),
-            ]))
+            ];
+            if !state.hide_spawn_cwd.load(Ordering::SeqCst) {
+                fields.push(("spawn_cwd", str_val("/real/start")));
+            }
+            Ok(map(&fields))
         }
         _ => Err((error_code::UNKNOWN_METHOD, format!("unknown method {m}"))),
     }

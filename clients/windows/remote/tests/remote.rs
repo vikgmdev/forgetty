@@ -408,20 +408,33 @@ async fn workspace_ops_over_the_wire() {
 }
 
 /// "Duplicate tab" over the wire: the new tab starts where the source pane runs.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn duplicate_tab_asks_the_server_for_the_directory() {
+#[tokio::test(flavor = "multi_thread")]
+async fn duplicate_tab_sends_the_spawn_directory_never_the_display_one() {
     let r = rig(1).await;
     let b = &r.backend;
     until("connected", || b.connection().is_connected()).await;
     let l = b.get_layout().await.unwrap();
     let src = l.workspaces[0].tabs[0].pane_tree.first_leaf();
-    // The test server reports "/home/test" for every pane. The request must still succeed
-    // with an unknown source pane (the directory is then the server's default).
-    let t = b.new_tab(NewTab { workspace_idx: 0, rows: 24, cols: 80, inherit_cwd_from: Some(src), ..Default::default() }).await.unwrap();
+    // The test server shows "/shown/by/osc7" (what a program printed) and started the shell
+    // in "/real/start".
+    let info = b.get_pane_info(src).await.unwrap();
+    assert_eq!(info.cwd, "/shown/by/osc7");
+    assert_eq!(info.spawn_cwd.as_deref(), Some("/real/start"));
+    b.new_tab(NewTab { workspace_idx: 0, rows: 24, cols: 80, inherit_cwd_from: Some(src), ..Default::default() }).await.unwrap();
+    assert_eq!(r.server.new_tab_cwds().last().cloned().flatten().as_deref(), Some("/real/start"));
     assert_eq!(b.get_layout().await.unwrap().tab_count(), 2);
+    // A server from before `spawn_cwd`: no cwd goes out (the display value is not a fallback).
+    r.server.set_hide_spawn_cwd(true);
+    b.new_tab(NewTab { workspace_idx: 0, rows: 24, cols: 80, inherit_cwd_from: Some(src), ..Default::default() }).await.unwrap();
+    assert_eq!(r.server.new_tab_cwds().last().cloned(), Some(None));
+    // An unknown source pane: the tab still opens, with no cwd.
     let t2 = b
         .new_tab(NewTab { workspace_idx: 0, rows: 24, cols: 80, inherit_cwd_from: Some(PaneId(Uuid::new_v4())), ..Default::default() })
         .await
         .unwrap();
-    assert_ne!(t.tab_id, t2.tab_id);
+    assert_eq!(r.server.new_tab_cwds().last().cloned(), Some(None));
+    // An explicit cwd wins.
+    b.new_tab(NewTab { workspace_idx: 0, rows: 24, cols: 80, cwd: Some("/x".into()), inherit_cwd_from: Some(src), ..Default::default() }).await.unwrap();
+    assert_eq!(r.server.new_tab_cwds().last().cloned().flatten().as_deref(), Some("/x"));
+    let _ = t2;
 }

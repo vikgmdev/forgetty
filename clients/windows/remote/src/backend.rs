@@ -305,8 +305,9 @@ impl SessionBackend for RemoteBackend {
         if !req.command.is_empty() {
             p["command"] = json!(req.command);
         }
-        // "Duplicate tab": the server knows where that pane runs (`get_pane_info.cwd`), and
-        // checks the directory itself. An explicit `cwd` wins.
+        // "Duplicate tab": the directory the pane was started in (`get_pane_info.spawn_cwd`).
+        // The display `cwd` is what a program printed (OSC 7) and is never sent. A server
+        // that does not report `spawn_cwd` gets no cwd and picks its own. An explicit `cwd` wins.
         let inherit = match (&req.cwd, req.inherit_cwd_from) {
             (None, Some(pane)) => Some(self.get_pane_info(pane)),
             _ => None,
@@ -317,7 +318,7 @@ impl SessionBackend for RemoteBackend {
         let this = self.clone();
         Box::pin(async move {
             if let Some(info) = inherit {
-                if let Some(cwd) = info.await.ok().map(|i| i.cwd).filter(|c| !c.is_empty()) {
+                if let Some(cwd) = info.await.ok().and_then(|i| i.spawn_cwd) {
                     p["cwd"] = json!(cwd);
                 }
             }
@@ -485,6 +486,7 @@ impl SessionBackend for RemoteBackend {
                 cols: num("cols", 80),
                 title: text("title"),
                 cwd: text("cwd"),
+                spawn_cwd: Some(text("spawn_cwd")).filter(|c| !c.is_empty()),
                 status: v.get("status").and_then(Json::as_str).map(PaneStatus::parse).unwrap_or_default(),
                 exited: v.get("exited").and_then(Json::as_bool).unwrap_or(false),
                 size_owner: owner_from_json(&v),

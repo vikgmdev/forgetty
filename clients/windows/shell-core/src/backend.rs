@@ -275,7 +275,11 @@ pub struct PaneInfo {
     pub rows: u16,
     pub cols: u16,
     pub title: String,
+    /// The directory to show. A program sets it (OSC 7), so it is never a place to start in.
     pub cwd: String,
+    /// The directory the shell was started in, when the server says (`spawn_cwd`). The only
+    /// directory "Duplicate tab" may reuse.
+    pub spawn_cwd: Option<String>,
     pub status: PaneStatus,
     /// True once the process ended (the pane is about to be removed).
     pub exited: bool,

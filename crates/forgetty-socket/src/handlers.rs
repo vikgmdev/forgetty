@@ -2492,6 +2492,19 @@ mod tests {
         assert_eq!(tab["cwd"], "/etc");
         assert_eq!(tab["spawn_cwd"], tmp.display().to_string());
 
+        // `get_pane_info` (what v2 clients call) keeps the two apart too: a client that
+        // duplicates a tab reads `spawn_cwd` and never `cwd`.
+        let info = dispatch(
+            &req("get_pane_info", serde_json::json!({ "pane_id": pane })),
+            Arc::clone(&sm),
+            None,
+            None,
+        )
+        .result
+        .unwrap();
+        assert_eq!(info["cwd"], "/etc");
+        assert_eq!(info["spawn_cwd"], tmp.display().to_string());
+
         // A split without an explicit cwd opens in the real directory.
         let resp = dispatch(
             &req("split_pane", serde_json::json!({ "pane_id": pane, "direction": "vertical" })),
