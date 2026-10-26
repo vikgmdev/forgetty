@@ -589,3 +589,63 @@ async fn capabilities_are_remembered_while_the_link_is_down() {
     assert_eq!(backend.get_layout().await.unwrap().workspaces[0].tabs[0].pane_tree.leaves().len(), 1);
     old.shutdown().await;
 }
+
+/// A workspace call held over an outage meets a server that lacks `workspace_id`: it takes the
+/// position path (the id is looked up in the new layout), not an id the server cannot read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_workspace_call_after_a_reconnect_to_an_older_server_uses_positions() {
+    use forgetty_client::proto::cap;
+    let key = forgetty_client::SecretKey::generate(&mut rand::rng());
+    let port = {
+        let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        s.local_addr().unwrap().port()
+    };
+    let cfg = |caps: &[&str]| TestServerConfig {
+        pair_secret: Some(SECRET.into()),
+        port: Some(port),
+        secret_key: Some(key.clone()),
+        panes: vec![(pane(1), b"$ ".to_vec())],
+        capabilities: [cap::RESUME, cap::LAYOUT_EVENTS].iter().chain(caps.iter()).map(|c| c.to_string()).collect(),
+        ..Default::default()
+    };
+    let server = TestServer::start(cfg(&[cap::WORKSPACE_ID])).await;
+    let dir = tempfile::tempdir().unwrap();
+    let st = MachineStore::open(dir.path().join("forgetty"));
+    let node = server.addr().id.to_string();
+    let text = format!(r#"{{"v":2,"node_id":"{node}","machine":"m","relay":"","secret":"{SECRET}"}}"#);
+    let m = store::pair(&st, &store::parse_offer(&text).unwrap(), "win-test", Some(server.udp_addr())).await.unwrap();
+    let cache = st.addr_cache();
+    let backend = RemoteBackend::start(RemoteParams {
+        machine_id: m.id,
+        name: m.name.clone(),
+        server: store::machine_addr(&m).unwrap(),
+        identity: st.identity().unwrap(),
+        info: ClientInfo::new(st.client_id().unwrap(), ClientKind::Windows, "win-test", "0.0.1"),
+        opts: ClientOptions {
+            relay: RelayChoice::Disabled,
+            dial_timeout: store::dial_timeout_for(&cache, &m),
+            addr_cache: cache,
+            ..Default::default()
+        },
+    })
+    .await
+    .unwrap();
+    until("connected", || backend.connection().is_connected()).await;
+    let ws = backend.get_layout().await.unwrap().workspaces[0].id;
+    server.shutdown().await;
+    until("link loss seen", || !backend.connection().is_connected()).await;
+    // The call is made while the link is down, on the answer of the old session ...
+    let held = {
+        let b = backend.clone();
+        tokio::spawn(async move { b.set_workspace_color(ws, Some("#112233".into())).await })
+    };
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    // ... and the server that comes back has no `workspace_id`: an id in the request would be
+    // refused as a missing position.
+    let old = TestServer::start(cfg(&[])).await;
+    held.await.unwrap().expect("the call took the position path");
+    until("connected again", || backend.connection().is_connected()).await;
+    let l = backend.get_layout().await.unwrap();
+    assert_eq!(l.workspaces[0].color.as_deref(), Some("#112233"));
+    old.shutdown().await;
+}

@@ -210,11 +210,22 @@ impl RemoteBackend {
         build_ids: impl FnOnce(&[Uuid]) -> Json + Send + 'static,
         build_idx: impl FnOnce(&[usize]) -> Json + Send + 'static,
     ) -> BackendFuture<Json> {
-        if self.server_has(forgetty_client::proto::cap::WORKSPACE_ID) {
-            return self.call(method, build_ids(&ids));
-        }
+        // The answer may come from the session before an outage. The call checks the link it goes
+        // out on: a server that no longer lists `workspace_id` gets the position path instead.
+        let known = self.server_has(forgetty_client::proto::cap::WORKSPACE_ID);
         let inner = self.inner.clone();
         self.run(async move {
+            if known {
+                let params = build_ids(&ids);
+                let r = inner
+                    .client
+                    .request_needing(forgetty_client::proto::cap::WORKSPACE_ID, method, from_json(&params))
+                    .await;
+                match r {
+                    Err(ClientError::Server { code, .. }) if code == "capability_missing" => {}
+                    r => return r.map(|v| to_json(&v)).map_err(map_err),
+                }
+            }
             let v = inner.client.request("get_layout", Value::Map(Vec::new())).await.map_err(map_err)?;
             let l = parse_layout(&v)?;
             *inner.layout.lock().unwrap_or_else(|e| e.into_inner()) = l.clone();
