@@ -344,7 +344,7 @@ impl AppShell {
                 .items_center()
                 .rounded(px(5.0))
                 .cursor_pointer()
-                .text_color(hsla(th.dim))
+                .text_color(hsla(th.accent))
                 .hover(move |s| s.bg(hover))
                 .on_mouse_down(MouseButton::Left, cx.listener(|s, _e, _w, cx| s.open_pair(cx)))
                 .child("+ Pair machine..."),

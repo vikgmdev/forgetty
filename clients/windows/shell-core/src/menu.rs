@@ -29,6 +29,8 @@ pub enum MenuCmd {
     NewTab,
     /// A new tab with profile N, 1-based. Only the first 9 have a chord.
     Profile(usize),
+    /// Open the pairing dialog (the same as the palette entry and the sidebar row).
+    PairMachine,
     // Pane.
     Copy,
     Paste,
@@ -96,6 +98,7 @@ pub fn action_of(cmd: &MenuCmd) -> Option<Action> {
     Some(match cmd {
         MenuCmd::Paste => return None,
         MenuCmd::NewTab => Action::NewTab,
+        MenuCmd::PairMachine => Action::PairMachine,
         MenuCmd::Profile(n) => return u8::try_from(*n).ok().filter(|n| (1..=9).contains(n)).map(Action::Profile),
         MenuCmd::SelectAll => Action::SelectAll,
         MenuCmd::Find => Action::Search,
@@ -195,6 +198,9 @@ pub fn new_tab_menu(c: &NewTabMenuCtx) -> Vec<Item> {
         }
     }
     v.extend(splits);
+    // Pairing is easy to miss in the palette and in a sidebar that starts closed.
+    v.push(Item::Sep);
+    v.push(Item::cmd(MenuCmd::PairMachine, "Pair machine...", true));
     v
 }
 
@@ -401,7 +407,10 @@ mod tests {
         let m = new_tab_menu(&c);
         assert_eq!(
             labels(&m),
-            ["PowerShell", "WSLx", "-", "New Tab", "-", "Split Right", "Split Down", "Split Left", "Split Up"]
+            [
+                "PowerShell", "WSLx", "-", "New Tab", "-", "Split Right", "Split Down", "Split Left", "Split Up", "-",
+                "Pair machine..."
+            ]
         );
         assert!(matches!(&m[0], Item::Cmd { cmd: MenuCmd::Profile(1), .. }));
         assert_eq!(action_of(&MenuCmd::Profile(2)), Some(Action::Profile(2)));
@@ -409,7 +418,9 @@ mod tests {
         assert_eq!(action_of(&MenuCmd::NewTab), Some(Action::NewTab));
         // No profiles: no first group, no separator.
         let m = new_tab_menu(&NewTabMenuCtx { profiles: vec![], split_before: false, has_pane: false });
-        assert_eq!(labels(&m), ["New Tab", "-", "Split Right", "Split Down"]);
+        assert_eq!(labels(&m), ["New Tab", "-", "Split Right", "Split Down", "-", "Pair machine..."]);
+        assert!(enabled(&m, "Pair machine..."), "pairing does not need a pane");
+        assert_eq!(action_of(&MenuCmd::PairMachine), Some(Action::PairMachine));
         assert!(enabled(&m, "New Tab") && !enabled(&m, "Split Right"));
     }
 

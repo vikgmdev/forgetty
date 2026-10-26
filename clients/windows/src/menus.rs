@@ -249,6 +249,7 @@ impl AppShell {
         match cmd {
             MenuCmd::NewTab => self.new_tab(cx),
             MenuCmd::Profile(n) => self.open_profile(n, cx),
+            MenuCmd::PairMachine => self.open_pair(cx),
             MenuCmd::SplitRight => self.split(SplitDir::Horizontal, cx),
             MenuCmd::SplitDown => self.split(SplitDir::Vertical, cx),
             MenuCmd::SplitLeft => self.split_before(SplitDir::Horizontal, cx),
