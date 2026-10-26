@@ -412,6 +412,7 @@ Config key: `right_click = "copy_paste"` (default) or `"menu"` in `%APPDATA%\for
 - [ ] WP2.5.2 Split a pane, ring the bell in the pane without focus: that pane gets a 3 px amber ring. Click it: the ring goes.
 - [ ] WP2.5.3 A bell in the pane you are typing in does not leave a ring. With the window in the background, it does (until you come back).
 - [ ] WP2.5.4 `bell_mode = "none"`: no ring from a bell. A program notification (OSC 9) still raises the badge.
+
 ### Not done in WP2
 
 - Split left / split up: the wire has no placement. Waits for the coordinator's decision.
