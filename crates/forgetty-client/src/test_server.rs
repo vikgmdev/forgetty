@@ -1297,7 +1297,7 @@ fn handle_request(
                 let id = Uuid::new_v4();
                 v.insert(src + 1, Ws { id, name, color: None, tabs, active_tab: 0 });
                 put_workspaces(&mut l, v);
-                if l.active_workspace >= src + 1 {
+                if l.active_workspace > src {
                     l.active_workspace += 1;
                 }
                 (id, src + 1, made)
