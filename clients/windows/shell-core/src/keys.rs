@@ -63,6 +63,19 @@ pub enum Action {
     MoveWorkspaceDown,
     /// The context menu of the active pane, at its top-left corner.
     PaneMenu,
+    /// Font size of the active pane, one point at a time (6 to 72), as GTK. Reset returns to
+    /// the configured size.
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
+    /// A new tab with profile N (1-based), as GTK's Ctrl+Shift+1..9.
+    Profile(u8),
+    /// Open `config.toml` in the default editor (created when missing).
+    OpenConfig,
+    /// Read `config.toml` again now.
+    ReloadConfig,
+    /// A list of every theme: choosing one applies it to this session.
+    ChooseTheme,
 }
 
 pub struct ActionInfo {
@@ -139,6 +152,23 @@ pub const ACTIONS: &[ActionInfo] = &[
     info!(Action::MoveWorkspaceUp, "move_workspace_up", "Move workspace up", []),
     info!(Action::MoveWorkspaceDown, "move_workspace_down", "Move workspace down", []),
     info!(Action::PaneMenu, "pane_menu", "Pane menu", []),
+    // GTK: <Control>equal / <Control>plus, <Control>minus, <Control>0.
+    info!(Action::ZoomIn, "zoom_in", "Zoom in", ["ctrl+=", "ctrl+shift+="]),
+    info!(Action::ZoomOut, "zoom_out", "Zoom out", ["ctrl+-"]),
+    info!(Action::ZoomReset, "zoom_reset", "Reset zoom", ["ctrl+0"]),
+    info!(Action::Profile(1), "profile_1", "Open profile 1", ["ctrl+shift+1"]),
+    info!(Action::Profile(2), "profile_2", "Open profile 2", ["ctrl+shift+2"]),
+    info!(Action::Profile(3), "profile_3", "Open profile 3", ["ctrl+shift+3"]),
+    info!(Action::Profile(4), "profile_4", "Open profile 4", ["ctrl+shift+4"]),
+    info!(Action::Profile(5), "profile_5", "Open profile 5", ["ctrl+shift+5"]),
+    info!(Action::Profile(6), "profile_6", "Open profile 6", ["ctrl+shift+6"]),
+    info!(Action::Profile(7), "profile_7", "Open profile 7", ["ctrl+shift+7"]),
+    info!(Action::Profile(8), "profile_8", "Open profile 8", ["ctrl+shift+8"]),
+    info!(Action::Profile(9), "profile_9", "Open profile 9", ["ctrl+shift+9"]),
+    // GTK has these in its menu only, so no chord here either.
+    info!(Action::OpenConfig, "open_config", "Open configuration file", []),
+    info!(Action::ReloadConfig, "reload_config", "Reload configuration", []),
+    info!(Action::ChooseTheme, "choose_theme", "Choose theme...", []),
 ];
 
 impl Action {
@@ -371,6 +401,30 @@ mod tests {
         assert!(km.chords(Action::ResetTerminal).is_empty(), "menu-only in GTK: palette only here");
         assert!(km.warnings.is_empty(), "{:?}", km.warnings);
         assert_eq!(Action::from_name("copy_raw"), Some(Action::CopyRaw));
+    }
+
+    /// WP3: GTK's zoom and profile chords. Config and theme actions are menu-only, as in GTK.
+    #[test]
+    fn wp3_actions_take_gtks_chords_and_move_no_existing_one() {
+        let km = Keymap::default_map();
+        let c = |ctrl, alt, shift, key: &str| km.lookup(&Chord::new(ctrl, alt, shift, false, key));
+        assert_eq!(c(true, false, false, "="), Some(Action::ZoomIn));
+        assert_eq!(c(true, false, false, "plus"), Some(Action::ZoomIn));
+        assert_eq!(c(true, false, true, "="), Some(Action::ZoomIn));
+        assert_eq!(c(true, false, false, "-"), Some(Action::ZoomOut));
+        assert_eq!(c(true, false, false, "0"), Some(Action::ZoomReset));
+        for n in 1..=9u8 {
+            assert_eq!(c(true, false, true, &n.to_string()), Some(Action::Profile(n)));
+            // Ctrl+N alone is still "go to tab N".
+            assert_eq!(c(true, false, false, &n.to_string()), Some(Action::GotoTab(n)));
+        }
+        assert_eq!(c(false, true, true, "="), Some(Action::SplitRight));
+        for a in [Action::OpenConfig, Action::ReloadConfig, Action::ChooseTheme] {
+            assert!(km.chords(a).is_empty());
+        }
+        assert!(km.warnings.is_empty(), "{:?}", km.warnings);
+        assert_eq!(Action::from_name("profile_3"), Some(Action::Profile(3)));
+        assert_eq!(km.shortcut(Action::ZoomIn), "Ctrl+=");
     }
 
     /// WP2: only the keyboard pane resize has a chord (GTK's Alt+Shift+Arrow, free on Windows).

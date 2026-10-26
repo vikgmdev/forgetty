@@ -18,10 +18,17 @@ pub enum MenuKind {
     Pane,
     Tab,
     Workspace,
+    /// The drop-down of the new-tab button: profiles, a plain tab, the splits.
+    NewTab,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum MenuCmd {
+    // New-tab drop-down.
+    /// A new tab with the default profile (what the "+" button does).
+    NewTab,
+    /// A new tab with profile N, 1-based. Only the first 9 have a chord.
+    Profile(usize),
     // Pane.
     Copy,
     Paste,
@@ -88,6 +95,8 @@ impl Item {
 pub fn action_of(cmd: &MenuCmd) -> Option<Action> {
     Some(match cmd {
         MenuCmd::Paste => return None,
+        MenuCmd::NewTab => Action::NewTab,
+        MenuCmd::Profile(n) => return u8::try_from(*n).ok().filter(|n| (1..=9).contains(n)).map(Action::Profile),
         MenuCmd::SelectAll => Action::SelectAll,
         MenuCmd::Find => Action::Search,
         MenuCmd::Clear => Action::ClearTerminal,
@@ -156,6 +165,36 @@ pub fn pane_menu(c: &PaneMenuCtx) -> Vec<Item> {
         v.push(Item::Sep);
         v.push(Item::cmd(MenuCmd::OpenLink(u.clone()), &link_label(u), true));
     }
+    v
+}
+
+pub struct NewTabMenuCtx {
+    /// Names of the profiles, in order.
+    pub profiles: Vec<String>,
+    /// See `PaneMenuCtx::split_before`.
+    pub split_before: bool,
+    /// Splits act on a pane: greyed when there is none.
+    pub has_pane: bool,
+}
+
+/// GTK's new-tab drop-down: the profiles (when there are any), New Tab, the four splits.
+pub fn new_tab_menu(c: &NewTabMenuCtx) -> Vec<Item> {
+    let mut v = Vec::new();
+    for (i, name) in c.profiles.iter().enumerate() {
+        v.push(Item::cmd(MenuCmd::Profile(i + 1), &crate::notify::sanitize(name, 40), true));
+    }
+    if !c.profiles.is_empty() {
+        v.push(Item::Sep);
+    }
+    v.push(Item::cmd(MenuCmd::NewTab, "New Tab", true));
+    v.push(Item::Sep);
+    let mut splits = split_rows(c.split_before);
+    for it in &mut splits {
+        if let Item::Cmd { enabled, .. } = it {
+            *enabled = c.has_pane;
+        }
+    }
+    v.extend(splits);
     v
 }
 
@@ -354,6 +393,24 @@ mod tests {
                 _ => None,
             })
             .unwrap_or_else(|| panic!("no {name}"))
+    }
+
+    #[test]
+    fn the_new_tab_menu_lists_profiles_then_new_tab_then_splits() {
+        let c = NewTabMenuCtx { profiles: vec!["PowerShell".into(), "WSL\u{202e}x".into()], split_before: true, has_pane: true };
+        let m = new_tab_menu(&c);
+        assert_eq!(
+            labels(&m),
+            ["PowerShell", "WSLx", "-", "New Tab", "-", "Split Right", "Split Down", "Split Left", "Split Up"]
+        );
+        assert!(matches!(&m[0], Item::Cmd { cmd: MenuCmd::Profile(1), .. }));
+        assert_eq!(action_of(&MenuCmd::Profile(2)), Some(Action::Profile(2)));
+        assert_eq!(action_of(&MenuCmd::Profile(10)), None);
+        assert_eq!(action_of(&MenuCmd::NewTab), Some(Action::NewTab));
+        // No profiles: no first group, no separator.
+        let m = new_tab_menu(&NewTabMenuCtx { profiles: vec![], split_before: false, has_pane: false });
+        assert_eq!(labels(&m), ["New Tab", "-", "Split Right", "Split Down"]);
+        assert!(enabled(&m, "New Tab") && !enabled(&m, "Split Right"));
     }
 
     #[test]

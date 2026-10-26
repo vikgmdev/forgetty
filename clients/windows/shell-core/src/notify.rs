@@ -9,6 +9,7 @@ use forgetty_core::PaneId;
 use uuid::Uuid;
 
 use crate::backend::PaneStatus;
+use crate::config::NotificationMode;
 
 /// What the user can see right now.
 #[derive(Clone, Copy, Debug)]
@@ -37,6 +38,16 @@ pub fn status_wants_toast(prev: PaneStatus, now: PaneStatus, vis: Visibility) ->
 /// looking at the pane.
 pub fn notification_wants_toast(vis: Visibility) -> bool {
     !vis.user_is_looking()
+}
+
+/// `notification_mode` as GTK reads it: `all` is ring, tab badge and desktop toast,
+/// `ringonly` drops the toast, `none` drops all three.
+pub fn mode_allows_ring(mode: NotificationMode) -> bool {
+    mode != NotificationMode::None
+}
+
+pub fn mode_allows_toast(mode: NotificationMode) -> bool {
+    mode == NotificationMode::All
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -180,6 +191,13 @@ pub fn parse_target(s: &str) -> Option<(Uuid, PaneId)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notification_mode_decides_ring_and_toast() {
+        assert!(mode_allows_ring(NotificationMode::All) && mode_allows_toast(NotificationMode::All));
+        assert!(mode_allows_ring(NotificationMode::RingOnly) && !mode_allows_toast(NotificationMode::RingOnly));
+        assert!(!mode_allows_ring(NotificationMode::None) && !mode_allows_toast(NotificationMode::None));
+    }
 
     const AWAY: Visibility = Visibility { window_active: false, machine_active: true, pane_focused: true };
     const LOOKING: Visibility = Visibility { window_active: true, machine_active: true, pane_focused: true };

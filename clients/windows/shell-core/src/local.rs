@@ -52,6 +52,8 @@ struct State {
     panes: HashMap<PaneId, Pane>,
     /// Ptys of closed panes, kept so tests can confirm the process exited.
     closed: Vec<(PaneId, Arc<LocalConPty>)>,
+    /// The shell for a tab with no command. A config reload changes it.
+    shell: Vec<String>,
 }
 
 struct Inner {
@@ -70,6 +72,7 @@ pub struct LocalBackend {
 impl LocalBackend {
     /// One empty workspace named "Default".
     pub fn new(cfg: LocalConfig) -> Self {
+        let shell = cfg.shell.clone();
         let (tx, rx) = async_channel::unbounded();
         let layout = Layout {
             workspaces: vec![Workspace {
@@ -85,11 +88,23 @@ impl LocalBackend {
             inner: Arc::new(Inner {
                 cfg,
                 machine_id: Uuid::new_v4(),
-                state: Mutex::new(State { layout, panes: HashMap::new(), closed: Vec::new() }),
+                state: Mutex::new(State { layout, panes: HashMap::new(), closed: Vec::new(), shell }),
                 tx,
                 rx,
             }),
         }
+    }
+
+    /// The shell for new tabs and splits that name no command. Panes already running keep theirs.
+    /// An empty argv is ignored.
+    pub fn set_default_shell(&self, shell: Vec<String>) {
+        if !shell.is_empty() {
+            self.inner.lock().shell = shell;
+        }
+    }
+
+    pub fn default_shell(&self) -> Vec<String> {
+        self.inner.lock().shell.clone()
     }
 
     // ---- test and smoke hooks (not part of SessionBackend) --------------------
@@ -146,7 +161,7 @@ impl Inner {
         cols: u16,
     ) -> BackendResult<PaneId> {
         let id = PaneId::new();
-        let argv = if argv.is_empty() { self.cfg.shell.clone() } else { argv };
+        let argv = if argv.is_empty() { st.shell.clone() } else { argv };
         let weak: Weak<Inner> = Arc::downgrade(self);
         let mut scanner = OscScanner::new();
         let w_out = weak.clone();
@@ -831,6 +846,31 @@ mod tests {
             }
         }
         panic!("timeout reading {needle:?}, got {acc:?}");
+    }
+
+    #[test]
+    fn the_default_shell_can_change_and_a_command_still_wins() {
+        let b = backend();
+        let rx = b.subscribe();
+        b.set_default_shell(vec![]);
+        assert_eq!(b.default_shell(), ["/bin/sh"]);
+        b.set_default_shell(vec!["/bin/sh".into(), "-c".into(), "while true; do echo changed-shell; sleep 0.2; done".into()]);
+        let t = now(b.new_tab(NewTab { workspace_idx: 0, rows: 24, cols: 80, ..Default::default() })).unwrap();
+        let src = now(b.attach_pane(t.pane_id)).unwrap();
+        read_until(&src.events(), "changed-shell");
+        // A profile command is used as it is, with its arguments.
+        let t2 = now(b.new_tab(NewTab {
+            workspace_idx: 0,
+            rows: 24,
+            cols: 80,
+            command: vec!["/bin/sh".into(), "-c".into(), "while true; do echo from-profile $0; sleep 0.2; done".into()],
+            ..Default::default()
+        }))
+        .unwrap();
+        let src2 = now(b.attach_pane(t2.pane_id)).unwrap();
+        read_until(&src2.events(), "from-profile");
+        b.shutdown_all();
+        drop(rx);
     }
 
     #[test]
