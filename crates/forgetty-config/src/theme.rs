@@ -254,6 +254,12 @@ fn preview_from_toml(toml_str: &str) -> Option<PreviewColors> {
 /// - "Default Dark" is always pinned to the top.
 /// - All other entries are sorted alphabetically by name.
 pub fn load_theme_catalog() -> Vec<ThemeCatalogEntry> {
+    load_theme_catalog_in(&forgetty_core::platform::config_dir().join("themes"))
+}
+
+/// [`load_theme_catalog`] with the custom themes read from `themes_dir` (a client that keeps
+/// its config somewhere else, such as `FORGETTY_CONFIG`, names the folder next to its file).
+pub fn load_theme_catalog_in(themes_dir: &std::path::Path) -> Vec<ThemeCatalogEntry> {
     let mut entries: Vec<ThemeCatalogEntry> = Vec::with_capacity(BUNDLED_THEMES.len() + 16);
 
     // 1. Add "Default Dark" (hardcoded fallback theme, not in BUNDLED_THEMES).
@@ -295,9 +301,8 @@ pub fn load_theme_catalog() -> Vec<ThemeCatalogEntry> {
 
     // 3. Load custom themes from ~/.config/forgetty/themes/
     let mut custom: Vec<ThemeCatalogEntry> = Vec::new();
-    let themes_dir = forgetty_core::platform::config_dir().join("themes");
     if themes_dir.is_dir() {
-        if let Ok(read_dir) = std::fs::read_dir(&themes_dir) {
+        if let Ok(read_dir) = std::fs::read_dir(themes_dir) {
             for entry in read_dir.filter_map(|e| e.ok()) {
                 let path = entry.path();
                 if path.extension().is_some_and(|ext| ext == "toml") {
@@ -386,6 +391,11 @@ pub fn load_theme_catalog() -> Vec<ThemeCatalogEntry> {
 /// Search order: custom themes first, then bundled, then "Default Dark".
 /// Returns `None` if the name is not found.
 pub fn load_theme_by_name(name: &str) -> Option<Theme> {
+    load_theme_by_name_in(name, &forgetty_core::platform::config_dir().join("themes"))
+}
+
+/// [`load_theme_by_name`] with the custom themes read from `themes_dir`.
+pub fn load_theme_by_name_in(name: &str, themes_dir: &std::path::Path) -> Option<Theme> {
     if name == "Default Dark" {
         return Some(Theme::default());
     }
@@ -398,9 +408,8 @@ pub fn load_theme_by_name(name: &str) -> Option<Theme> {
         .unwrap_or(name);
 
     // Check custom themes first (override bundled).
-    let themes_dir = forgetty_core::platform::config_dir().join("themes");
     if themes_dir.is_dir() {
-        if let Ok(read_dir) = std::fs::read_dir(&themes_dir) {
+        if let Ok(read_dir) = std::fs::read_dir(themes_dir) {
             for entry in read_dir.filter_map(|e| e.ok()) {
                 let path = entry.path();
                 if path.extension().is_some_and(|ext| ext == "toml") {
@@ -417,14 +426,42 @@ pub fn load_theme_by_name(name: &str) -> Option<Theme> {
         }
     }
 
-    // Check bundled themes (try both original name and resolved alias).
+    load_bundled_theme(name)
+}
+
+/// A bundled theme by display name (or alias), ignoring any custom folder.
+pub fn load_bundled_theme(name: &str) -> Option<Theme> {
+    if name == "Default Dark" {
+        return Some(Theme::default());
+    }
+    let resolved = THEME_ALIASES
+        .iter()
+        .find(|&&(alias, _)| alias == name)
+        .map(|&(_, upstream)| upstream)
+        .unwrap_or(name);
     for &(bundled_name, toml_str) in BUNDLED_THEMES {
         if bundled_name == name || bundled_name == resolved {
             return parse_theme_file(toml_str).ok();
         }
     }
-
     None
+}
+
+/// Every theme in the catalog with its full colors, in catalog order: what a client that keeps
+/// the list in memory needs, in one pass over the custom folder.
+pub fn load_all_themes_in(themes_dir: &std::path::Path) -> Vec<(String, Theme)> {
+    load_theme_catalog_in(themes_dir)
+        .into_iter()
+        .filter_map(|e| {
+            let theme = match &e.source {
+                ThemeSource::Custom(path) => {
+                    std::fs::read_to_string(path).ok().and_then(|c| parse_theme_file(&c).ok())
+                }
+                ThemeSource::Bundled => load_bundled_theme(&e.name),
+            };
+            theme.map(|t| (e.name, t))
+        })
+        .collect()
 }
 
 /// Extract the `name = "..."` field from a theme TOML string.
@@ -466,4 +503,35 @@ fn default_ansi_colors() -> [Rgba; 16] {
         Rgba::rgb(148, 226, 213), // Bright Cyan    #94e2d5
         Rgba::rgb(205, 214, 244), // Bright White   #cdd6f4
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CUSTOM: &str = "name = \"My Theme\"\n[colors]\nforeground = \"#102030\"\nbackground = \"#405060\"\n";
+
+    #[test]
+    fn a_named_folder_supplies_the_custom_themes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("mine.toml"), CUSTOM).unwrap();
+        // Overrides a bundled theme of the same name.
+        std::fs::write(dir.path().join("nord.toml"), CUSTOM.replace("My Theme", "Nord")).unwrap();
+
+        let names: Vec<String> = load_theme_catalog_in(dir.path()).into_iter().map(|e| e.name).collect();
+        assert!(names.iter().any(|n| n == "My Theme"));
+        let t = load_theme_by_name_in("My Theme", dir.path()).unwrap();
+        assert_eq!((t.foreground.r, t.background.b), (0x10, 0x60));
+        assert_eq!(load_theme_by_name_in("Nord", dir.path()).unwrap().background.b, 0x60);
+
+        let all = load_all_themes_in(dir.path());
+        assert_eq!(all.len(), names.len());
+        let nord = all.iter().find(|(n, _)| n == "Nord").unwrap();
+        assert_eq!(nord.1.background.b, 0x60);
+        assert!(all.iter().any(|(n, _)| n == "Dracula"));
+        // A folder that is not there is only the bundled themes.
+        let none = dir.path().join("absent");
+        assert!(load_theme_by_name_in("My Theme", &none).is_none());
+        assert!(load_bundled_theme("Dracula").is_some() && load_bundled_theme("My Theme").is_none());
+    }
 }

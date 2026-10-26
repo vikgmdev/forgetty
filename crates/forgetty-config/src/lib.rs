@@ -18,6 +18,7 @@ pub use loader::{
 pub use remote::{validate_remote_settings, ConfigError, RemoteOverrides, RemoteSettings};
 pub use schema::{BellMode, Config, CursorStyle, NotificationMode, OnLaunch, ProfileConfig};
 pub use theme::{
-    load_theme_by_name, load_theme_catalog, parse_theme_file, PreviewColors, Theme,
+    load_all_themes_in, load_bundled_theme, load_theme_by_name, load_theme_by_name_in,
+    load_theme_catalog, load_theme_catalog_in, parse_theme_file, PreviewColors, Theme,
     ThemeCatalogEntry, ThemeSource,
 };
