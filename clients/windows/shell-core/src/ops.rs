@@ -27,10 +27,23 @@ pub fn workspace_swap(index: usize, count: usize, up: bool) -> Option<(usize, us
     }
 }
 
-/// Deleting a workspace with more than one tab asks first (GTK, AC-31). The last workspace
-/// cannot be deleted at all.
-pub fn delete_workspace_asks(tab_count: usize) -> bool {
-    tab_count > 1
+/// What a workspace delete would end.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DeleteInfo {
+    pub tabs: usize,
+    pub panes: usize,
+    /// Panes that report a program at work (status Working or Waiting).
+    pub busy: usize,
+    /// The workspace is on a remote machine: its shells are not on this computer, and
+    /// they may be shared with other clients.
+    pub remote: bool,
+}
+
+/// Deleting a workspace asks first when it holds more than one tab or pane, when any program
+/// is running in it, and always on a remote machine. (GTK asks only for more than one tab;
+/// the stricter rule stays.) The last workspace cannot be deleted at all.
+pub fn delete_workspace_asks(i: &DeleteInfo) -> bool {
+    i.tabs > 1 || i.panes > 1 || i.busy > 0 || i.remote
 }
 
 pub fn can_delete_workspace(workspace_count: usize) -> bool {
@@ -38,9 +51,15 @@ pub fn can_delete_workspace(workspace_count: usize) -> bool {
 }
 
 /// The words of the delete confirmation.
-pub fn delete_workspace_text(name: &str, tab_count: usize) -> String {
+pub fn delete_workspace_text(name: &str, i: &DeleteInfo) -> String {
+    let plural = |n: usize, w: &str| if n == 1 { format!("{n} {w}") } else { format!("{n} {w}s") };
+    let mut what = format!("{} and {}", plural(i.tabs, "tab"), plural(i.panes.max(i.tabs), "pane"));
+    if i.busy > 0 {
+        what.push_str(&format!(", {} running a program", i.busy));
+    }
+    let on = if i.remote { " on the remote machine" } else { "" };
     format!(
-        "Delete \"{}\"? This workspace has {tab_count} tabs. Closing it will kill all running shells.",
+        "Delete \"{}\"? This workspace has {what}. Closing it will kill all running shells{on}.",
         crate::notify::sanitize(name, 60)
     )
 }
@@ -95,12 +114,21 @@ mod tests {
 
     #[test]
     fn delete_rules() {
+        let one = DeleteInfo { tabs: 1, panes: 1, busy: 0, remote: false };
         assert!(!can_delete_workspace(1));
         assert!(can_delete_workspace(2));
-        assert!(!delete_workspace_asks(1));
-        assert!(delete_workspace_asks(2));
-        let t = delete_workspace_text("work\u{202e}", 3);
-        assert!(t.contains("\"work\"") && t.contains("3 tabs") && !t.contains('\u{202e}'), "{t}");
+        // One idle shell on this computer goes without a question ...
+        assert!(!delete_workspace_asks(&one));
+        // ... anything more asks: a second tab, a split, a running program, a remote machine.
+        assert!(delete_workspace_asks(&DeleteInfo { tabs: 2, panes: 2, ..one }));
+        assert!(delete_workspace_asks(&DeleteInfo { panes: 2, ..one }));
+        assert!(delete_workspace_asks(&DeleteInfo { busy: 1, ..one }));
+        assert!(delete_workspace_asks(&DeleteInfo { remote: true, ..one }));
+        let t = delete_workspace_text("work\u{202e}", &DeleteInfo { tabs: 3, panes: 4, busy: 1, remote: true });
+        assert!(t.contains("\"work\"") && t.contains("3 tabs") && t.contains("4 panes") && !t.contains('\u{202e}'), "{t}");
+        assert!(t.contains("1 running a program") && t.contains("remote machine"), "{t}");
+        let t = delete_workspace_text("w", &one);
+        assert!(t.contains("1 tab and 1 pane") && !t.contains("running a program") && !t.contains("remote"), "{t}");
     }
 
     #[test]

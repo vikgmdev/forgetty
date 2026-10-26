@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use forgetty_shell_core::layout::Side;
 use forgetty_shell_core::menu::{self, Item, Menu, MenuCmd, MenuKind, PaneMenuCtx, TabMenuCtx, WorkspaceMenuCtx};
-use forgetty_shell_core::{colors, ops, NewTab, PaneId, SplitDir, SplitRatio, Uuid};
+use forgetty_shell_core::{colors, ops, NewTab, PaneId, PaneStatus, SplitDir, SplitRatio, Uuid};
 use gpui::{
     div, ease_out_quint, prelude::*, px, Animation, AnimationExt, Context, Div, Hsla, Keystroke, MouseButton,
     SharedString, Window,
@@ -32,7 +32,7 @@ pub const RESIZE_STEP: f32 = 20.0;
 pub enum MenuTarget {
     Pane(PaneId),
     Tab(Uuid),
-    Workspace(usize),
+    Workspace(Uuid),
 }
 
 pub struct OpenMenu {
@@ -84,14 +84,14 @@ impl AppShell {
     /// The pane's menu. `url` is the http(s) link under the pointer. `keys` opens it for the
     /// keyboard (the first row is selected).
     pub fn open_pane_menu(&mut self, pane: PaneId, pos: (f32, f32), url: Option<String>, has_selection: bool, keys: bool, cx: &mut Context<Self>) {
-        let items = menu::pane_menu(&PaneMenuCtx { has_selection, url });
+        let items = menu::pane_menu(&PaneMenuCtx { has_selection, url, split_before: self.backend.supports_split_before() });
         self.open_menu(MenuKind::Pane, items, MenuTarget::Pane(pane), pos, keys, cx);
     }
 
     pub fn open_tab_menu(&mut self, tab: Uuid, pos: (f32, f32), keys: bool, cx: &mut Context<Self>) {
         let Some((w, t)) = self.layout.find_tab(tab) else { return };
         let count = self.layout.workspaces[w].tabs.len();
-        let items = menu::tab_menu(&TabMenuCtx { index: t, count, color: self.tab_colors.get(&tab).copied() });
+        let items = menu::tab_menu(&TabMenuCtx { index: t, count, color: self.tab_colors.get(&tab).copied(), split_before: self.backend.supports_split_before() });
         self.open_menu(MenuKind::Tab, items, MenuTarget::Tab(tab), pos, keys, cx);
     }
 
@@ -102,7 +102,7 @@ impl AppShell {
             count: self.layout.workspaces.len(),
             color: colors::from_wire(ws.color.as_deref()),
         });
-        self.open_menu(MenuKind::Workspace, items, MenuTarget::Workspace(idx), pos, keys, cx);
+        self.open_menu(MenuKind::Workspace, items, MenuTarget::Workspace(ws.id), pos, keys, cx);
     }
 
     /// The "Pane menu" action: the active pane's menu at its top-left corner.
@@ -155,7 +155,7 @@ impl AppShell {
         match open.target {
             MenuTarget::Pane(pane) => self.run_pane_cmd(pane, cmd, window, cx),
             MenuTarget::Tab(tab) => self.run_tab_cmd(tab, cmd, cx),
-            MenuTarget::Workspace(idx) => self.run_workspace_cmd(idx, cmd, cx),
+            MenuTarget::Workspace(id) => self.run_workspace_cmd(id, cmd, cx),
         }
         cx.notify();
     }
@@ -178,6 +178,8 @@ impl AppShell {
             MenuCmd::OpenLink(url) => view.update(cx, |v, cx| v.open_link(&url, cx)),
             MenuCmd::SplitRight => self.split(SplitDir::Horizontal, cx),
             MenuCmd::SplitDown => self.split(SplitDir::Vertical, cx),
+            MenuCmd::SplitLeft => self.split_before(SplitDir::Horizontal, cx),
+            MenuCmd::SplitUp => self.split_before(SplitDir::Vertical, cx),
             _ => {}
         }
     }
@@ -186,13 +188,15 @@ impl AppShell {
         match cmd {
             MenuCmd::TabRename => self.begin_rename(tab, cx),
             MenuCmd::TabDuplicate => self.duplicate_tab(tab, cx),
-            MenuCmd::SplitRight => {
+            MenuCmd::SplitRight | MenuCmd::SplitDown | MenuCmd::SplitLeft | MenuCmd::SplitUp => {
                 self.focus_tab(tab, cx);
-                self.split_in(tab, SplitDir::Horizontal, cx);
-            }
-            MenuCmd::SplitDown => {
-                self.focus_tab(tab, cx);
-                self.split_in(tab, SplitDir::Vertical, cx);
+                let (dir, before) = match cmd {
+                    MenuCmd::SplitRight => (SplitDir::Horizontal, false),
+                    MenuCmd::SplitDown => (SplitDir::Vertical, false),
+                    MenuCmd::SplitLeft => (SplitDir::Horizontal, true),
+                    _ => (SplitDir::Vertical, true),
+                };
+                self.split_in(tab, dir, before, cx);
             }
             MenuCmd::TabMoveLeft => self.move_tab_id(tab, -1, cx),
             MenuCmd::TabMoveRight => self.move_tab_id(tab, 1, cx),
@@ -219,7 +223,10 @@ impl AppShell {
         }
     }
 
-    fn run_workspace_cmd(&mut self, idx: usize, cmd: MenuCmd, cx: &mut Context<Self>) {
+    fn run_workspace_cmd(&mut self, id: Uuid, cmd: MenuCmd, cx: &mut Context<Self>) {
+        // The menu names the workspace by id. Take its position now: the layout may have
+        // changed while the menu was open.
+        let Some(idx) = self.layout.workspaces.iter().position(|w| w.id == id) else { return };
         match cmd {
             MenuCmd::WsRename => self.begin_rename_workspace(idx, cx),
             MenuCmd::WsDuplicate => self.duplicate_workspace(idx, cx),
@@ -300,7 +307,8 @@ impl AppShell {
         if idx >= self.layout.workspaces.len() {
             return;
         }
-        let fut = self.backend.set_workspace_color(idx, colors::wire_color(color));
+        let id = self.layout.workspaces[idx].id;
+        let fut = self.backend.set_workspace_color(id, colors::wire_color(color));
         self.call(cx, fut, |_, _, _| {});
     }
 
@@ -311,7 +319,8 @@ impl AppShell {
         }
         let r = self.content_rect();
         let (rows, cols) = self.grid_for(r.w, r.h);
-        let fut = self.backend.duplicate_workspace(idx, None, rows, cols);
+        let id = self.layout.workspaces[idx].id;
+        let fut = self.backend.duplicate_workspace(id, None, rows, cols);
         self.call(cx, fut, |s, reply, cx| {
             for (tab, pane) in &reply.tabs {
                 s.local_active.insert(*tab, *pane);
@@ -322,22 +331,41 @@ impl AppShell {
 
     pub fn move_workspace(&mut self, idx: usize, up: bool, cx: &mut Context<Self>) {
         let Some((from, to)) = ops::workspace_swap(idx, self.layout.workspaces.len(), up) else { return };
-        let fut = self.backend.move_workspace(from, to);
+        let (Some(a), Some(b)) = (self.layout.workspaces.get(from), self.layout.workspaces.get(to)) else { return };
+        let fut = self.backend.move_workspace(a.id, b.id);
         self.call(cx, fut, |_, _, _| {});
     }
 
-    /// Delete a workspace. More than one tab asks first. The last workspace stays.
+    /// What deleting the workspace at `idx` would end.
+    fn delete_info(&self, idx: usize) -> Option<ops::DeleteInfo> {
+        let ws = self.layout.workspaces.get(idx)?;
+        let panes: Vec<PaneId> = ws.tabs.iter().flat_map(|t| t.pane_tree.leaves()).collect();
+        let busy = panes
+            .iter()
+            .filter(|p| self.meta.get(p).is_some_and(|m| matches!(m.status, PaneStatus::Working | PaneStatus::Waiting)))
+            .count();
+        Some(ops::DeleteInfo {
+            tabs: ws.tabs.len(),
+            panes: panes.len(),
+            busy,
+            remote: self.machine.kind == forgetty_shell_core::MachineKind::Remote,
+        })
+    }
+
+    /// Delete a workspace. It asks first when it holds more than one tab or pane, when a
+    /// program runs in it, and always on a remote machine. The last workspace stays.
     pub fn delete_workspace(&mut self, idx: usize, cx: &mut Context<Self>) {
         if !ops::can_delete_workspace(self.layout.workspaces.len()) {
             return;
         }
-        let Some(ws) = self.layout.workspaces.get(idx) else { return };
-        if ops::delete_workspace_asks(ws.tabs.len()) {
+        let Some(info) = self.delete_info(idx) else { return };
+        let ws = &self.layout.workspaces[idx];
+        if ops::delete_workspace_asks(&info) {
             self.menu = None;
             self.palette = None;
             self.rename = None;
             self.confirm = Some(Confirm {
-                text: ops::delete_workspace_text(&ws.name, ws.tabs.len()),
+                text: ops::delete_workspace_text(&ws.name, &info),
                 act: ConfirmAct::DeleteWorkspace(ws.id),
             });
             cx.notify();
@@ -348,11 +376,11 @@ impl AppShell {
     }
 
     fn delete_workspace_now(&mut self, id: Uuid, cx: &mut Context<Self>) {
-        let Some(idx) = self.layout.workspaces.iter().position(|w| w.id == id) else { return };
-        if !ops::can_delete_workspace(self.layout.workspaces.len()) {
+        if !ops::can_delete_workspace(self.layout.workspaces.len()) || !self.layout.workspaces.iter().any(|w| w.id == id) {
             return;
         }
-        let fut = self.backend.delete_workspace(idx);
+        // By id: a position could name another workspace by the time the server reads it.
+        let fut = self.backend.delete_workspace(id);
         self.call(cx, fut, |_, _, _| {});
     }
 
@@ -384,7 +412,7 @@ impl AppShell {
 
     /// Split the active pane of `tab` (the tab menu's Split items). The tab need not be on
     /// screen yet, so the size comes from the content area.
-    pub fn split_in(&mut self, tab: Uuid, dir: SplitDir, cx: &mut Context<Self>) {
+    pub fn split_in(&mut self, tab: Uuid, dir: SplitDir, before: bool, cx: &mut Context<Self>) {
         let Some((w, t)) = self.layout.find_tab(tab) else { return };
         let tb = &self.layout.workspaces[w].tabs[t];
         let pane = self.active_pane_of(tb);
@@ -396,7 +424,7 @@ impl AppShell {
             .find(|(p, _)| *p == pane)
             .map(|(_, r)| *r)
             .unwrap_or_else(|| self.content_rect());
-        self.split_pane_in(tab, pane, rect, dir, cx);
+        self.split_pane_in(tab, pane, rect, dir, before, cx);
     }
 
     // ---- keyboard resize --------------------------------------------------------------

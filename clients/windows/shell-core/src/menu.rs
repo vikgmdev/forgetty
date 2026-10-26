@@ -31,6 +31,8 @@ pub enum MenuCmd {
     Reset,
     SplitRight,
     SplitDown,
+    SplitLeft,
+    SplitUp,
     /// The link under the pointer when the menu opened.
     OpenLink(String),
     // Tab.
@@ -92,6 +94,8 @@ pub fn action_of(cmd: &MenuCmd) -> Option<Action> {
         MenuCmd::Reset => Action::ResetTerminal,
         MenuCmd::SplitRight => Action::SplitRight,
         MenuCmd::SplitDown => Action::SplitDown,
+        MenuCmd::SplitLeft => Action::SplitLeft,
+        MenuCmd::SplitUp => Action::SplitUp,
         MenuCmd::TabRename => Action::RenameTab,
         MenuCmd::TabDuplicate => Action::DuplicateTab,
         MenuCmd::TabMoveLeft => Action::MoveTabLeft,
@@ -118,6 +122,19 @@ pub struct PaneMenuCtx {
     pub has_selection: bool,
     /// The http(s) link under the pointer.
     pub url: Option<String>,
+    /// The machine's server can place a split first (left or up). Without it the two rows
+    /// are left out: an older server would split on the other side without saying so.
+    pub split_before: bool,
+}
+
+/// The four split rows. Left and Up only when the machine supports them.
+fn split_rows(split_before: bool) -> Vec<Item> {
+    let mut v = vec![Item::cmd(MenuCmd::SplitRight, "Split Right", true), Item::cmd(MenuCmd::SplitDown, "Split Down", true)];
+    if split_before {
+        v.push(Item::cmd(MenuCmd::SplitLeft, "Split Left", true));
+        v.push(Item::cmd(MenuCmd::SplitUp, "Split Up", true));
+    }
+    v
 }
 
 /// Copy, Paste, Select All, Find, Clear, Reset, Split, then Open <url> (GTK's menu has the
@@ -133,9 +150,8 @@ pub fn pane_menu(c: &PaneMenuCtx) -> Vec<Item> {
         Item::cmd(MenuCmd::Clear, "Clear", true),
         Item::cmd(MenuCmd::Reset, "Reset", true),
         Item::Sep,
-        Item::cmd(MenuCmd::SplitRight, "Split Right", true),
-        Item::cmd(MenuCmd::SplitDown, "Split Down", true),
     ];
+    v.extend(split_rows(c.split_before));
     if let Some(u) = &c.url {
         v.push(Item::Sep);
         v.push(Item::cmd(MenuCmd::OpenLink(u.clone()), &link_label(u), true));
@@ -147,18 +163,21 @@ pub struct TabMenuCtx {
     pub index: usize,
     pub count: usize,
     pub color: Option<u32>,
+    /// See `PaneMenuCtx::split_before`.
+    pub split_before: bool,
 }
 
 /// GTK's tab menu: color, rename, duplicate, split, move, find, then the three closes.
 /// ("Move to New Window" and the Export stub wait for the multi-window work.)
 pub fn tab_menu(c: &TabMenuCtx) -> Vec<Item> {
-    vec![
+    let mut v = vec![
         Item::Swatches { current: c.color },
         Item::Sep,
         Item::cmd(MenuCmd::TabRename, "Rename Tab", true),
         Item::cmd(MenuCmd::TabDuplicate, "Duplicate Tab", true),
-        Item::cmd(MenuCmd::SplitRight, "Split Right", true),
-        Item::cmd(MenuCmd::SplitDown, "Split Down", true),
+    ];
+    v.extend(split_rows(c.split_before));
+    v.extend([
         Item::Sep,
         Item::cmd(MenuCmd::TabMoveLeft, "Move Left", c.index > 0),
         Item::cmd(MenuCmd::TabMoveRight, "Move Right", c.index + 1 < c.count),
@@ -167,7 +186,8 @@ pub fn tab_menu(c: &TabMenuCtx) -> Vec<Item> {
         Item::cmd(MenuCmd::TabCloseRight, "Close Tabs to the Right", c.index + 1 < c.count),
         Item::cmd(MenuCmd::TabCloseOthers, "Close Other Tabs", c.count > 1),
         Item::cmd(MenuCmd::TabClose, "Close Tab", true),
-    ]
+    ]);
+    v
 }
 
 pub struct WorkspaceMenuCtx {
@@ -338,14 +358,14 @@ mod tests {
 
     #[test]
     fn the_pane_menu_has_gtks_items_and_the_link_last() {
-        let m = pane_menu(&PaneMenuCtx { has_selection: false, url: None });
+        let m = pane_menu(&PaneMenuCtx { has_selection: false, url: None, split_before: false });
         assert_eq!(
             labels(&m),
             ["Copy", "Paste", "-", "Select All", "Find", "-", "Clear", "Reset", "-", "Split Right", "Split Down"]
         );
         assert!(!enabled(&m, "Copy"), "nothing selected");
-        assert!(enabled(&pane_menu(&PaneMenuCtx { has_selection: true, url: None }), "Copy"));
-        let m = pane_menu(&PaneMenuCtx { has_selection: true, url: Some("https://example.com/a".into()) });
+        assert!(enabled(&pane_menu(&PaneMenuCtx { has_selection: true, url: None, split_before: false }), "Copy"));
+        let m = pane_menu(&PaneMenuCtx { has_selection: true, url: Some("https://example.com/a".into()), split_before: false });
         assert_eq!(labels(&m).last().unwrap(), "Open https://example.com/a");
         assert!(matches!(&m[m.len() - 1], Item::Cmd { cmd: MenuCmd::OpenLink(u), .. } if u == "https://example.com/a"));
         assert_eq!(m[m.len() - 2], Item::Sep);
@@ -356,8 +376,19 @@ mod tests {
     }
 
     #[test]
+    fn split_left_and_up_are_listed_only_for_a_server_that_can_place_them() {
+        let names = |before| labels(&pane_menu(&PaneMenuCtx { has_selection: false, url: None, split_before: before }));
+        assert!(!names(false).iter().any(|l| l == "Split Left" || l == "Split Up"));
+        let n = names(true);
+        assert_eq!(&n[n.len() - 4..], ["Split Right", "Split Down", "Split Left", "Split Up"]);
+        let tab = |before| labels(&tab_menu(&TabMenuCtx { index: 0, count: 2, color: None, split_before: before }));
+        assert!(!tab(false).iter().any(|l| l == "Split Left"));
+        assert!(tab(true).iter().any(|l| l == "Split Left") && tab(true).iter().any(|l| l == "Split Up"));
+    }
+
+    #[test]
     fn the_tab_menu_greys_what_cannot_happen() {
-        let c = |index, count| tab_menu(&TabMenuCtx { index, count, color: None });
+        let c = |index, count| tab_menu(&TabMenuCtx { index, count, color: None, split_before: false });
         let only = c(0, 1);
         assert!(!enabled(&only, "Move Left") && !enabled(&only, "Move Right"));
         assert!(!enabled(&only, "Close Tabs to the Right") && !enabled(&only, "Close Other Tabs"));
@@ -396,7 +427,7 @@ mod tests {
 
     #[test]
     fn the_keyboard_skips_rows_that_cannot_be_chosen_and_wraps() {
-        let items = pane_menu(&PaneMenuCtx { has_selection: false, url: None });
+        let items = pane_menu(&PaneMenuCtx { has_selection: false, url: None, split_before: false });
         let mut m = Menu::open(MenuKind::Pane, items, (10.0, 10.0), (1000.0, 700.0));
         m.move_selection(1);
         assert_eq!(m.selected, Some(1), "Copy is greyed, Paste is first");
@@ -405,7 +436,7 @@ mod tests {
         m.move_selection(1);
         assert_eq!(m.selected, Some(1));
         assert_eq!(m.activate(), Some(MenuCmd::Paste));
-        let mut m = Menu::open(MenuKind::Pane, pane_menu(&PaneMenuCtx { has_selection: true, url: None }), (0.0, 0.0), (900.0, 900.0));
+        let mut m = Menu::open(MenuKind::Pane, pane_menu(&PaneMenuCtx { has_selection: true, url: None, split_before: false }), (0.0, 0.0), (900.0, 900.0));
         m.move_selection(-1);
         assert_eq!(m.selected, Some(10));
         assert_eq!(m.activate(), Some(MenuCmd::SplitDown));
@@ -413,7 +444,7 @@ mod tests {
 
     #[test]
     fn the_color_row_takes_left_right_and_enter() {
-        let items = tab_menu(&TabMenuCtx { index: 0, count: 2, color: None });
+        let items = tab_menu(&TabMenuCtx { index: 0, count: 2, color: None, split_before: false });
         let mut m = Menu::open(MenuKind::Tab, items, (5.0, 5.0), (900.0, 900.0));
         m.move_selection(1);
         assert_eq!(m.selected, Some(0));
@@ -460,6 +491,8 @@ mod tests {
             MenuCmd::Reset,
             MenuCmd::SplitRight,
             MenuCmd::SplitDown,
+            MenuCmd::SplitLeft,
+            MenuCmd::SplitUp,
             MenuCmd::TabRename,
             MenuCmd::TabDuplicate,
             MenuCmd::TabMoveLeft,

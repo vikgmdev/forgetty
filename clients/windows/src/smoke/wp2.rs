@@ -9,7 +9,7 @@
 use std::time::{Duration, Instant};
 
 use forgetty_shell_core::menu::{Item, MenuCmd, MenuKind};
-use forgetty_shell_core::{PaneEvent, PaneId, Uuid};
+use forgetty_shell_core::{PaneEvent, PaneId, SplitDir, Uuid};
 use gpui::{point, px, Context, Modifiers, MouseButton, MouseDownEvent, Window};
 use serde_json::json;
 
@@ -31,6 +31,9 @@ pub struct Wp2 {
     other_pane: Option<PaneId>,
     bells: u32,
     shot_frames: u32,
+    /// The pane a split left/up was aimed at, and the leaf count before it.
+    pub(in crate::smoke) split_target: Option<PaneId>,
+    pub(in crate::smoke) leaves: usize,
 }
 
 fn ws_count(s: &AppShell) -> usize {
@@ -246,8 +249,8 @@ impl ShellSmoke {
                         && menu_has(shell, "Split Right", true),
                 );
                 shell.close_menu(cx);
-                // A plain right-click keeps the Windows copy/paste behavior unless configured.
-                check("right_click_default_is_copy_paste", !shell.cfg.right_click_menu);
+                // A plain right-click opens the menu (GTK) unless `right_click = "copy_paste"`.
+                check("right_click_default_is_the_menu", !shell.cfg.right_click_copy_paste);
                 let Some(view) = shell.views.get(&pane).cloned() else { fail("wp2: no view") };
                 // Open the pane menu with a link and use the keyboard.
                 shell.open_pane_menu(pane, (200.0, 200.0), Some("https://example.com/menu".into()), false, true, cx);
@@ -346,6 +349,57 @@ impl ShellSmoke {
             23 => {
                 until!(shell.active_tab().is_some_and(|t| t.id == self.wp2.other_tab) && shell.attention.is_empty());
                 check("attention_clears_when_the_pane_is_looked_at", true);
+                // A plain right-click on the pane.
+                let pane = shell.active_pane().unwrap();
+                let Some(view) = shell.views.get(&pane).cloned() else { fail("wp2: no view") };
+                let bounds = view.read(cx).bounds;
+                let at = point(bounds.origin.x + px(60.0), bounds.origin.y + px(40.0));
+                let down = MouseDownEvent { button: MouseButton::Right, position: at, modifiers: Modifiers::default(), click_count: 1, first_mouse: false };
+                view.update(cx, |v, vcx| v.on_mouse_down(&down, window, vcx));
+                self.wp2_next();
+            }
+            // ---- split left and up ------------------------------------------------------
+            24 => {
+                until!(shell.menu.is_some());
+                check("plain_right_click_opens_the_menu", shell.menu.as_ref().is_some_and(|o| o.menu.kind == MenuKind::Pane));
+                check(
+                    "menu_lists_split_left_and_up_when_the_backend_can",
+                    shell.backend.supports_split_before() && menu_has(shell, "Split Left", true) && menu_has(shell, "Split Up", true),
+                );
+                self.wp2.split_target = shell.active_pane();
+                self.wp2.leaves = shell.active_tab().map(|t| t.pane_tree.leaves().len()).unwrap_or(0);
+                shell.run_menu_cmd(MenuCmd::SplitLeft, window, cx);
+                self.wp2_next();
+            }
+            25 => {
+                let leaves = shell.active_tab().map(|t| t.pane_tree.leaves()).unwrap_or_default();
+                let old = leaves.iter().position(|p| Some(*p) == self.wp2.split_target);
+                // The new pane sits right before the one that was split, and has the focus.
+                until!(leaves.len() == self.wp2.leaves + 1 && old.is_some_and(|i| i > 0 && Some(leaves[i - 1]) == shell.active_pane()));
+                check("split_left_puts_the_new_pane_first", true);
+                self.wp2.leaves = leaves.len();
+                self.wp2.split_target = shell.active_pane();
+                shell.split_before(SplitDir::Vertical, cx);
+                self.wp2_next();
+            }
+            26 => {
+                let leaves = shell.active_tab().map(|t| t.pane_tree.leaves()).unwrap_or_default();
+                let old = leaves.iter().position(|p| Some(*p) == self.wp2.split_target);
+                until!(leaves.len() == self.wp2.leaves + 1 && old.is_some_and(|i| i > 0 && Some(leaves[i - 1]) == shell.active_pane()));
+                check("split_up_puts_the_new_pane_first", true);
+                self.wp2_next();
+            }
+            // ---- a failed backend call is shown, not just printed ----------------------
+            27 => {
+                // A workspace that does not exist: the backend answers with an error.
+                let fut = shell.backend.delete_workspace(Uuid::new_v4());
+                shell.call(cx, fut, |_, _, _| {});
+                self.wp2_next();
+            }
+            28 => {
+                let shown = shell.active_pane().and_then(|p| shell.views.get(&p).cloned()).and_then(|v| v.read(cx).notice_text());
+                until!(shown.as_ref().is_some_and(|t| t.starts_with("Failed")));
+                check("backend_error_is_shown_as_a_notice", true);
                 self.goto(super::Phase::RSetup);
             }
             _ => {}

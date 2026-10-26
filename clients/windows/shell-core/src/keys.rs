@@ -24,6 +24,8 @@ pub enum Action {
     RenameWorkspace,
     SplitRight,
     SplitDown,
+    SplitLeft,
+    SplitUp,
     ClosePane,
     FocusLeft,
     FocusRight,
@@ -103,6 +105,9 @@ pub const ACTIONS: &[ActionInfo] = &[
     info!(Action::RenameWorkspace, "rename_workspace", "Rename workspace", []),
     info!(Action::SplitRight, "split_right", "Split pane right", ["alt+shift+plus"]),
     info!(Action::SplitDown, "split_down", "Split pane down", ["alt+shift+minus"]),
+    // GTK has no chord for these two (menu only), so neither has one here.
+    info!(Action::SplitLeft, "split_left", "Split pane left", []),
+    info!(Action::SplitUp, "split_up", "Split pane up", []),
     info!(Action::ClosePane, "close_pane", "Close pane", ["ctrl+shift+w"]),
     info!(Action::FocusLeft, "focus_left", "Focus pane left", ["ctrl+alt+left"]),
     info!(Action::FocusRight, "focus_right", "Focus pane right", ["ctrl+alt+right"]),

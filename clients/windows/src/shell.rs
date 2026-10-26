@@ -370,9 +370,22 @@ impl AppShell {
             Ok(v) => {
                 let _ = this.update(cx, |s, cx| then(s, v, cx));
             }
-            Err(e) => eprintln!("forgetty-win: backend: {e}"),
+            Err(e) => {
+                eprintln!("forgetty-win: backend: {e}");
+                // The release exe has no console: show what failed.
+                let _ = this.update(cx, |s, cx| s.notice_active(format!("Failed: {e}"), cx));
+            }
         })
         .detach();
+    }
+
+    /// Show `text` as a notice on the active pane, or on any pane when none is active.
+    pub(crate) fn notice_active(&mut self, text: String, cx: &mut Context<Self>) {
+        let view = self.active_pane().and_then(|p| self.views.get(&p).cloned()).or_else(|| self.views.values().next().cloned());
+        match view {
+            Some(v) => v.update(cx, |v, cx| v.show_notice(text, cx)),
+            None => eprintln!("forgetty-win: {text}"),
+        }
     }
 
     pub(crate) fn on_events(&mut self, evs: Vec<BackendEvent>, cx: &mut Context<Self>) {
@@ -475,7 +488,7 @@ impl AppShell {
         if self.menu.as_ref().is_some_and(|o| match &o.target {
             crate::menus::MenuTarget::Pane(p) => !panes.contains(p),
             crate::menus::MenuTarget::Tab(t) => !tabs.contains(t),
-            crate::menus::MenuTarget::Workspace(i) => *i >= self.layout.workspaces.len(),
+            crate::menus::MenuTarget::Workspace(id) => !workspaces.contains(id),
         }) {
             self.menu = None;
         }
@@ -781,23 +794,37 @@ impl AppShell {
     }
 
     pub fn split(&mut self, dir: SplitDir, cx: &mut Context<Self>) {
+        self.split_placed(dir, false, cx);
+    }
+
+    /// Split left (`Horizontal`) or up (`Vertical`): the new pane goes first. A machine whose
+    /// server cannot do that says so and splits nothing.
+    pub fn split_before(&mut self, dir: SplitDir, cx: &mut Context<Self>) {
+        self.split_placed(dir, true, cx);
+    }
+
+    fn split_placed(&mut self, dir: SplitDir, before: bool, cx: &mut Context<Self>) {
+        if before && !self.backend.supports_split_before() {
+            self.notice_active("This machine's server is too old to split left or up. Update it to use this.".into(), cx);
+            return;
+        }
         let (Some(tab), Some(pane)) = (self.active_tab().map(|t| t.id), self.active_pane()) else { return };
         let rect = self
             .active_geometry()
             .and_then(|(_, g)| g.panes.iter().find(|(p, _)| *p == pane).map(|(_, r)| *r))
             .unwrap_or_else(|| self.content_rect());
-        self.split_pane_in(tab, pane, rect, dir, cx);
+        self.split_pane_in(tab, pane, rect, dir, before, cx);
     }
 
     /// Split `pane` of `tab`, which fills `rect` now. The new pane gets the focus.
-    pub(crate) fn split_pane_in(&mut self, tab: Uuid, pane: PaneId, rect: Rect, dir: SplitDir, cx: &mut Context<Self>) {
+    pub(crate) fn split_pane_in(&mut self, tab: Uuid, pane: PaneId, rect: Rect, dir: SplitDir, before: bool, cx: &mut Context<Self>) {
         let (w, h) = match dir {
             SplitDir::Horizontal => (rect.w / 2.0, rect.h),
             SplitDir::Vertical => (rect.w, rect.h / 2.0),
         };
         let (rows, cols) = self.grid_for(w, h);
         // The backend starts the new pane where the parent was started.
-        let fut = self.backend.split_pane(SplitPane { pane_id: pane, direction: dir, rows, cols, cwd: None });
+        let fut = self.backend.split_pane(SplitPane { pane_id: pane, direction: dir, rows, cols, cwd: None, before });
         // Splitting un-zooms: the new pane must be visible.
         self.zoomed.remove(&tab);
         self.call(cx, fut, move |s, new_pane, cx| {
@@ -960,6 +987,8 @@ impl AppShell {
             Action::RenameWorkspace => self.begin_rename_workspace(self.layout.active_workspace, cx),
             Action::SplitRight => self.split(SplitDir::Horizontal, cx),
             Action::SplitDown => self.split(SplitDir::Vertical, cx),
+            Action::SplitLeft => self.split_before(SplitDir::Horizontal, cx),
+            Action::SplitUp => self.split_before(SplitDir::Vertical, cx),
             Action::ClosePane => self.close_pane(cx),
             Action::FocusLeft => self.focus_side(Side::Left, window, cx),
             Action::FocusRight => self.focus_side(Side::Right, window, cx),

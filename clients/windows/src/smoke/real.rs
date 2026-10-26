@@ -696,7 +696,26 @@ impl ShellSmoke {
                             return;
                         }
                         check("real_ws_move", shell.layout.workspaces[n0 + 1].id == self.wp2.ids[0]);
+                        // The server of this run reports split_before and workspace_id.
+                        check("real_server_reports_split_before", shell.backend.supports_split_before());
+                        // Split left on the real server: the new pane comes first.
+                        self.wp2.split_target = shell.active_pane();
+                        self.wp2.leaves = shell.active_tab().map(|t| t.pane_tree.leaves().len()).unwrap_or(0);
+                        shell.split_before(forgetty_shell_core::SplitDir::Horizontal, cx);
+                        self.sub = 8;
+                        self.sub_t0 = Instant::now();
+                    }
+                    8 => {
+                        if !shell.active_tab().is_some_and(|t| t.pane_tree.leaves().len() == self.wp2.leaves + 1) {
+                            return;
+                        }
+                        let leaves = shell.active_tab().map(|t| t.pane_tree.leaves()).unwrap_or_default();
+                        let old = leaves.iter().position(|p| Some(*p) == self.wp2.split_target);
+                        check("real_split_left_puts_the_new_pane_first", old.is_some_and(|i| i > 0 && leaves[i - 1] != leaves[i]));
+                        // A remote machine always asks before it deletes a workspace.
                         shell.delete_workspace(n0, cx);
+                        check("real_ws_delete_always_asks_on_a_remote_machine", shell.confirm.is_some());
+                        shell.confirm_yes(cx);
                         self.sub = 5;
                         self.sub_t0 = Instant::now();
                     }
@@ -706,6 +725,7 @@ impl ShellSmoke {
                         }
                         check("real_ws_delete", shell.layout.workspaces.iter().all(|w| w.id != self.wp2.w1));
                         shell.delete_workspace(n0, cx);
+                        shell.confirm_yes(cx);
                         self.sub = 6;
                         self.sub_t0 = Instant::now();
                     }
