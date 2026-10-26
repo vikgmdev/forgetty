@@ -29,6 +29,9 @@ impl Default for LocalConfig {
     }
 }
 
+/// Notifications from one pane closer together than this are dropped.
+const NOTIFY_GAP: std::time::Duration = std::time::Duration::from_millis(500);
+
 struct Pane {
     pty: Arc<LocalConPty>,
     rows: u16,
@@ -39,6 +42,9 @@ struct Pane {
     /// Where this pane's process was started. New tabs and splits inherit this.
     spawn_cwd: Option<String>,
     status: PaneStatus,
+    /// When this pane last raised a notification event (a program in a loop must not flood
+    /// the channel; the shell's toast limiter is stricter still).
+    last_notify: Option<std::time::Instant>,
 }
 
 struct State {
@@ -195,6 +201,7 @@ impl Inner {
                 cwd: cwd_s,
                 spawn_cwd,
                 status: PaneStatus::None,
+                last_notify: None,
             },
         );
         Ok(id)
@@ -222,6 +229,13 @@ impl Inner {
                     OscEvent::Status(s, message) => {
                         p.status = s;
                         out.push(BackendEvent::StatusChanged { pane_id: id, status: s, message });
+                    }
+                    OscEvent::Notify { title, body } => {
+                        let now = std::time::Instant::now();
+                        if p.last_notify.map_or(true, |t| now.duration_since(t) >= NOTIFY_GAP) {
+                            p.last_notify = Some(now);
+                            out.push(BackendEvent::Notification { pane_id: id, title, body });
+                        }
                     }
                 }
             }
@@ -733,6 +747,30 @@ mod tests {
         src.write_input(b"exit\n");
         wait_for(|| now(b.get_layout()).unwrap().tab_count() == 0, "tab removed after exit");
         assert!(matches!(now(b.get_pane_info(t.pane_id)), Err(BackendError::NotFound(_))));
+    }
+
+    #[test]
+    fn osc_notifications_become_events_at_a_limited_rate() {
+        let b = backend();
+        let rx = b.subscribe();
+        let t = now(b.new_tab(NewTab { workspace_idx: 0, rows: 24, cols: 80, ..Default::default() })).unwrap();
+        let notes = |rx: &async_channel::Receiver<BackendEvent>| -> Vec<(String, String)> {
+            drain(rx)
+                .into_iter()
+                .filter_map(|e| match e {
+                    BackendEvent::Notification { title, body, .. } => Some((title, body)),
+                    _ => None,
+                })
+                .collect()
+        };
+        b.inject_osc(t.pane_id, b"\x1b]777;notify;T;B\x07");
+        // A second one right after is dropped (a loop must not flood the channel).
+        b.inject_osc(t.pane_id, b"\x1b]9;again\x07");
+        assert_eq!(notes(&rx), vec![("T".to_string(), "B".to_string())]);
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        b.inject_osc(t.pane_id, b"\x1b]9;later\x07");
+        assert_eq!(notes(&rx), vec![("".to_string(), "later".to_string())]);
+        b.shutdown_all();
     }
 
     #[test]

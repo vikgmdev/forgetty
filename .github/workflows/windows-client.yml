@@ -58,7 +58,7 @@ jobs:
         working-directory: clients/windows
         run: |
           # The ConPTY tests in shell-core's local module are covered by the smoke.
-          cargo test --release -p forgetty-shell-core --lib -- conpty:: notify:: layout:: keys:: osc:: osc52:: fuzzy:: update::
+          cargo test --release -p forgetty-shell-core --lib -- conpty:: notify:: layout:: keys:: osc:: osc52:: fuzzy:: update:: search:: links:: copytext:: paste:: selection:: scrollbar:: bell:: codeblock::
           cargo test --release -p forgetty-remote
 
       - name: Turn on the Japanese and Chinese input methods for the smoke

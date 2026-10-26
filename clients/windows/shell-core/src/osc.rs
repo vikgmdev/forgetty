@@ -1,6 +1,7 @@
 //! Scans a pane's output bytes for the OSC sequences the shell cares about:
 //! title (0, 2), cwd (7, and 9;9 from ConPTY), and shell-integration marks
-//! (133 A/C/D) which give the program status. The bytes are not modified.
+//! (133 A/C/D) which give the program status, and the notification sequences (OSC 9, 99, 777).
+//! The bytes are not modified.
 //! Sequences may be split across reads.
 
 use crate::backend::PaneStatus;
@@ -10,6 +11,8 @@ pub enum OscEvent {
     Title(String),
     Cwd(String),
     Status(PaneStatus, String),
+    /// A program asked for a desktop notification (OSC 9, 99 or 777). The text is untrusted.
+    Notify { title: String, body: String },
 }
 
 #[derive(Default)]
@@ -18,6 +21,8 @@ pub struct OscScanner {
     buf: Vec<u8>,
     /// 133;D result is sticky until the next command starts.
     last: PaneStatus,
+    /// A kitty notification (OSC 99) that is still arriving in chunks (`d=0`).
+    chunked: Option<(String, String)>,
 }
 
 #[derive(Default, PartialEq, Clone, Copy)]
@@ -104,8 +109,19 @@ impl OscScanner {
                     if !p.is_empty() && is_safe_local_path(p) {
                         out.push(OscEvent::Cwd(p.to_string()));
                     }
+                } else if !is_conemu_command(rest) && !rest.trim().is_empty() {
+                    // OSC 9;text (iTerm2, ConEmu): a notification with a body only.
+                    out.push(OscEvent::Notify { title: String::new(), body: rest.to_string() });
                 }
             }
+            "777" => {
+                // OSC 777;notify;title;body (rxvt-unicode). Other 777 verbs are not ours.
+                if let Some(r) = rest.strip_prefix("notify;") {
+                    let (title, body) = r.split_once(';').unwrap_or((r, ""));
+                    out.push(OscEvent::Notify { title: title.to_string(), body: body.to_string() });
+                }
+            }
+            "99" => self.kitty_notification(rest, out),
             "133" => {
                 let mut parts = rest.split(';');
                 match parts.next().unwrap_or("") {
@@ -130,6 +146,48 @@ impl OscScanner {
                 }
             }
             _ => {}
+        }
+    }
+}
+
+/// `OSC 9;<n>[;...]` with a number is a ConEmu command (progress bar, sleep, message box...),
+/// not a notification. GTK skips only `4`; the other numbered commands are skipped here too.
+fn is_conemu_command(rest: &str) -> bool {
+    let head = rest.split(';').next().unwrap_or("");
+    let numbered = !head.is_empty() && head.len() <= 2 && head.bytes().all(|b| b.is_ascii_digit());
+    numbered && (rest.len() == head.len() || rest.as_bytes()[head.len()] == b';')
+}
+
+impl OscScanner {
+    /// OSC 99 (kitty): `99;key=value:key=value;payload`. Handled: payload type `title` (the
+    /// default) and `body`, and chunks (`d=0` means more follows). Not handled, and dropped:
+    /// `close`, query (`?`), `alive`, base64 payloads (`e=1`) and icons.
+    fn kitty_notification(&mut self, rest: &str, out: &mut Vec<OscEvent>) {
+        let (meta, payload) = rest.split_once(';').unwrap_or((rest, ""));
+        let (mut kind, mut done, mut encoded) = ("title", true, false);
+        for kv in meta.split(':') {
+            match kv.split_once('=') {
+                Some(("p", v)) => kind = v,
+                Some(("d", v)) => done = v != "0",
+                Some(("e", v)) => encoded = v == "1",
+                _ => {}
+            }
+        }
+        if encoded || !matches!(kind, "title" | "body") {
+            self.chunked = None;
+            return;
+        }
+        let (mut title, mut body) = self.chunked.take().unwrap_or_default();
+        let slot = if kind == "title" { &mut title } else { &mut body };
+        if slot.len() + payload.len() <= 2048 {
+            slot.push_str(payload);
+        }
+        if done {
+            if !title.is_empty() || !body.is_empty() {
+                out.push(OscEvent::Notify { title, body });
+            }
+        } else {
+            self.chunked = Some((title, body));
         }
     }
 }
@@ -254,6 +312,72 @@ mod tests {
         let _ = parse_file_url("file:///%\u{1F600}");
         let mut s = OscScanner::new();
         assert!(s.feed(b"\x1b[31mred\x1b[0m \x1b]0;t\x18more").is_empty());
+    }
+
+    fn notes(bytes: &[u8]) -> Vec<(String, String)> {
+        OscScanner::new()
+            .feed(bytes)
+            .into_iter()
+            .filter_map(|e| match e {
+                OscEvent::Notify { title, body } => Some((title, body)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn osc9_and_osc777_notifications() {
+        assert_eq!(notes(b"\x1b]9;build done\x07"), vec![("".into(), "build done".into())]);
+        assert_eq!(notes(b"\x1b]9;build; done\x1b\\"), vec![("".into(), "build; done".into())]);
+        assert_eq!(notes(b"\x1b]777;notify;My Title;My Body\x07"), vec![("My Title".into(), "My Body".into())]);
+        assert_eq!(notes(b"\x1b]777;notify;Only title\x07"), vec![("Only title".into(), "".into())]);
+        assert_eq!(notes(b"\x1b]777;notify;t;a;b;c\x07"), vec![("t".into(), "a;b;c".into())]);
+        assert!(notes(b"\x1b]777;precmd\x07").is_empty());
+        assert!(notes(b"\x1b]9;\x07").is_empty());
+    }
+
+    #[test]
+    fn conemu_commands_are_not_notifications() {
+        // 9;4 is the progress bar (GTK skips it); the other numbered commands go too.
+        for s in ["\x1b]9;4;50\x07", "\x1b]9;4\x07", "\x1b]9;1;500\x07", "\x1b]9;3;title\x07", "\x1b]9;12\x07"] {
+            assert!(notes(s.as_bytes()).is_empty(), "{s:?}");
+        }
+        // Text that merely starts with a digit is a notification.
+        assert_eq!(notes(b"\x1b]9;5 minutes left\x07").len(), 1);
+        assert_eq!(notes(b"\x1b]9;100% done\x07").len(), 1);
+        // 9;9 is still the working directory, not a notification.
+        let ev = OscScanner::new().feed(b"\x1b]9;9;\"C:\\x\"\x07");
+        assert_eq!(ev, vec![OscEvent::Cwd("C:\\x".into())]);
+    }
+
+    #[test]
+    fn kitty_notifications() {
+        assert_eq!(notes(b"\x1b]99;;Hello\x07"), vec![("Hello".into(), "".into())]);
+        assert_eq!(notes(b"\x1b]99;i=1:p=body;the body\x07"), vec![("".into(), "the body".into())]);
+        // Title and body in chunks.
+        assert_eq!(
+            notes(b"\x1b]99;i=1:d=0:p=title;Build\x07\x1b]99;i=1:p=body;passed\x07"),
+            vec![("Build".into(), "passed".into())]
+        );
+        // Not handled: close, query, base64.
+        assert!(notes(b"\x1b]99;i=1:p=close;\x07").is_empty());
+        assert!(notes(b"\x1b]99;i=1:p=?;\x07").is_empty());
+        assert!(notes(b"\x1b]99;e=1:p=title;SGVsbG8=\x07").is_empty());
+        // A started chunk run that never ends does not leak into the next notification.
+        let mut s = OscScanner::new();
+        s.feed(b"\x1b]99;d=0:p=title;stale\x07\x1b]99;p=close;\x07");
+        let ev = s.feed(b"\x1b]99;;fresh\x07");
+        assert_eq!(ev, vec![OscEvent::Notify { title: "fresh".into(), body: "".into() }]);
+    }
+
+    #[test]
+    fn a_notification_split_across_reads_arrives_once() {
+        let mut s = OscScanner::new();
+        assert!(s.feed(b"x\x1b]777;notify;Ti").is_empty());
+        let ev = s.feed(b"tle;Bo");
+        assert!(ev.is_empty());
+        let ev = s.feed(b"dy\x07tail");
+        assert_eq!(ev, vec![OscEvent::Notify { title: "Title".into(), body: "Body".into() }]);
     }
 
     /// Random bytes (biased towards escape and URL fragments) never panic.
