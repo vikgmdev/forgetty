@@ -28,6 +28,8 @@ pub mod paste;
 pub mod resolve;
 pub mod scrollbar;
 pub mod search;
+pub mod settings;
+pub mod settings_file;
 pub mod selection;
 pub mod source;
 

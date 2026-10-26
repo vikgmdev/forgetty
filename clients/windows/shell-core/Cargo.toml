@@ -9,6 +9,7 @@ description = "Forgetty app-shell core: layout model, SessionBackend trait, Loca
 forgetty-core = { path = "../../../crates/forgetty-core" }
 forgetty-config = { path = "../../../crates/forgetty-config" }
 toml = "0.8"
+toml_edit = "0.22"
 notify = "7"
 portable-pty = "0.9"
 async-channel = "2"
@@ -21,3 +22,4 @@ serde_json = "1"
 [dev-dependencies]
 # Tests that run the pure code against real libghostty rows.
 forgetty-vt = { path = "../../../crates/forgetty-vt" }
+tempfile = "3"
