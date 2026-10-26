@@ -201,10 +201,10 @@ impl ShellSmoke {
                 // start over), and finds the new lines too.
                 let more: String = (0..5).map(|i| format!("find-me extra {i}\r\n")).collect();
                 self.wp1_send(PaneEvent::Output(more.into_bytes()));
-                self.sub = 120;
+                self.sub = 103;
                 self.sub_t0 = Instant::now();
             }
-            120 => {
+            103 => {
                 let Some(v) = view else { return };
                 let st = v.read(cx).search_status();
                 let (restarts, extends) = v.read(cx).search.as_ref().map_or((0, 0), |s| (s.restarts, s.extends));
