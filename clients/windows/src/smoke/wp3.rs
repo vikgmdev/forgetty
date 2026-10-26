@@ -294,7 +294,7 @@ impl ShellSmoke {
                 self.wp3_next();
             }
             14 => {
-                until!(notice(shell, cx).starts_with("Configuration not applied") && self.sub_t0.elapsed() > Duration::from_millis(400));
+                until!(notice(shell, cx).contains("TOML parse error") && self.sub_t0.elapsed() > Duration::from_millis(300));
                 check("syntax_error_keeps_the_last_good_settings", shell.cfg.font_size_pt == 13.0);
                 // ---- a deleted file keeps the last good settings --------------------------------
                 if let Err(e) = std::fs::remove_file(&self.wp3.path) {

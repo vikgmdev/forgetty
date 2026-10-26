@@ -47,15 +47,20 @@ impl ConfWatch {
     }
 }
 
+/// The file's name, for a message. The folder would eat the room of a short notice.
+fn shown(path: &Path) -> String {
+    path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string())
+}
+
 /// Read and parse `path`.
 pub fn read(path: &Path) -> Reload {
     match std::fs::read_to_string(path) {
         Ok(text) => match Config::parse(&text) {
             Ok(l) => Reload::Loaded(l),
-            Err(e) => Reload::Failed(format!("{}: {e}", path.display())),
+            Err(e) => Reload::Failed(format!("{}: {e}", shown(path))),
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Reload::Missing,
-        Err(e) => Reload::Failed(format!("{}: {e}", path.display())),
+        Err(e) => Reload::Failed(format!("{}: {e}", shown(path))),
     }
 }
 

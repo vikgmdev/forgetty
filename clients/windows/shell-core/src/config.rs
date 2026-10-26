@@ -1037,6 +1037,14 @@ command = "x"
     }
 
     #[test]
+    fn a_syntax_error_notice_names_the_problem_in_its_first_line() {
+        let e = Config::parse("font_size = [\n").unwrap_err();
+        assert!(failed_notice(&e).contains("TOML parse error"), "{e}");
+        let e = Config::parse("bell_mode = \"loud\"").unwrap_err();
+        assert!(failed_notice(&e).contains("loud"), "{e}");
+    }
+
+    #[test]
     fn notices() {
         let none = Changes::default();
         assert_eq!(reload_notice(&none, &[], false), None);
