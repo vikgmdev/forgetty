@@ -58,7 +58,7 @@ jobs:
         working-directory: clients/windows
         run: |
           # The ConPTY tests in shell-core's local module are covered by the smoke.
-          cargo test --release --locked -p forgetty-shell-core --lib -- conpty:: notify:: layout:: keys:: osc:: osc52:: fuzzy:: update:: search:: links:: copytext:: paste:: selection:: scrollbar:: bell:: codeblock:: colors:: menu:: ops:: fingerprint:: config:: argv:: confwatch::
+          cargo test --release --locked -p forgetty-shell-core --lib -- conpty:: notify:: layout:: keys:: osc:: osc52:: fuzzy:: update:: search:: links:: copytext:: paste:: selection:: scrollbar:: bell:: codeblock:: colors:: menu:: ops:: fingerprint:: config:: argv:: confwatch:: resolve::
           cargo test --release --locked -p forgetty-remote
 
       - name: Turn on the Japanese and Chinese input methods for the smoke
@@ -253,7 +253,16 @@ jobs:
           wix build -arch x64 -d Version=$ver -d Payload=payload clients/windows/installer/Package.wxs -o "out/forgetty-win-$ver-x64.msi"
           Get-ChildItem out | Format-Table Name, Length
 
-      - name: Install, check, uninstall
+      - name: Turn on the Japanese and Chinese input methods for the smoke
+        # Same as in build-and-smoke: the smoke switches to them like the language bar.
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $list = Get-WinUserLanguageList
+          foreach ($tag in 'ja-JP', 'zh-Hans-CN') { if (-not ($list | Where-Object LanguageTag -eq $tag)) { $list.Add($tag) } }
+          Set-WinUserLanguageList $list -Force
+
+      - name: Install and check
         shell: pwsh
         run: |
           $msi = (Get-ChildItem out/*.msi | Select-Object -First 1).FullName
@@ -275,6 +284,41 @@ jobs:
           if (Test-Path "C:\Program Files\Forgetty") { throw "wrote to Program Files" }
           if (Test-Path "HKLM:\Software\Forgetty") { throw "wrote to HKLM" }
           Write-Host "installed to $dir"
+
+      # The installed copy is what users run: it must be the build that was tested, and it must
+      # start and pass the same smoke. The smoke writes its screenshots into its working folder,
+      # so it runs from a temporary one and leaves the install folder as the MSI made it.
+      - name: Smoke the installed copy
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:LOCALAPPDATA "Programs\Forgetty"
+          foreach ($pair in @(@("forgetty-win.exe", "forgetty-win.exe"), @("forgetty.exe", "forgetty-win.exe"), @("ghostty-vt.dll", "ghostty-vt.dll"))) {
+            $got = (Get-FileHash (Join-Path $dir $pair[0]) -Algorithm SHA256).Hash
+            $want = (Get-FileHash (Join-Path "payload" $pair[1]) -Algorithm SHA256).Hash
+            Write-Host "$($pair[0]): installed $got, tested $want"
+            if ($got -ne $want) { throw "the installed $($pair[0]) is not the tested build" }
+          }
+          $work = Join-Path $env:RUNNER_TEMP "installed-smoke"
+          New-Item -ItemType Directory -Force $work | Out-Null
+          # The test server is not part of the product: it stays in the payload folder.
+          $env:FORGETTY_TEST_SERVER = (Resolve-Path "payload\v2-test-server.exe").Path
+          $p = Start-Process (Join-Path $dir "forgetty-win.exe") -ArgumentList '--smoke' -WorkingDirectory $work -Wait -PassThru -RedirectStandardOutput (Join-Path $work "smoke.json") -RedirectStandardError (Join-Path $work "smoke.err")
+          Get-Content (Join-Path $work "smoke.json")
+          Get-Content (Join-Path $work "smoke.err")
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item (Join-Path $work "smoke.json") out/installed-smoke.json -ErrorAction SilentlyContinue
+          Write-Host "installed forgetty-win --smoke exit code: $($p.ExitCode)"
+          if ($p.ExitCode -ne 0) { throw "the installed forgetty-win.exe failed its smoke" }
+          # Nothing the smoke did may stay in the install folder.
+          $extra = Get-ChildItem $dir | Where-Object { $_.Name -notin @("forgetty-win.exe", "forgetty.exe", "ghostty-vt.dll") }
+          if ($extra) { throw "the smoke left files in the install folder: $($extra.Name -join ', ')" }
+
+      - name: Uninstall and check
+        shell: pwsh
+        run: |
+          $msi = (Get-ChildItem out/*.msi | Select-Object -First 1).FullName
+          $dir = Join-Path $env:LOCALAPPDATA "Programs\Forgetty"
+          $lnk = Join-Path ([Environment]::GetFolderPath("Programs")) "Forgetty.lnk"
           $p = Start-Process msiexec.exe -ArgumentList "/x `"$msi`" /qn /l*v uninstall.log" -Wait -PassThru
           if ($p.ExitCode -ne 0) { Get-Content uninstall.log -Tail 60; throw "uninstall failed: $($p.ExitCode)" }
           if (Test-Path $dir) { throw "install folder left behind" }
@@ -289,6 +333,7 @@ jobs:
           if-no-files-found: error
           path: |
             out/*.msi
+            out/installed-smoke.json
             install.log
             uninstall.log
 
