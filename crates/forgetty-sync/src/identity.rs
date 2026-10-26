@@ -49,16 +49,15 @@ pub fn identity_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
+    use forgetty_core::fsutil::is_private;
 
     #[test]
     fn key_is_created_0600_in_a_0700_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("state/identity.key");
         let key = load_or_generate_at(&path).unwrap();
-        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode(&path), 0o600);
-        assert_eq!(mode(path.parent().unwrap()), 0o700);
+        assert!(is_private(&path).unwrap(), "the key is user-only");
+        assert!(is_private(path.parent().unwrap()).unwrap(), "the folder is user-only");
         // Reload gives the same key.
         assert_eq!(load_or_generate_at(&path).unwrap().to_bytes(), key.to_bytes());
     }
@@ -68,9 +67,15 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("identity.key");
         std::fs::write(&path, [7u8; 32]).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        // On Windows the file made by `fs::write` carries the folder's inherited entries.
+        assert!(!is_private(&path).unwrap(), "the test starts with a wide file");
         load_or_generate_at(&path).unwrap();
-        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(is_private(&path).unwrap());
     }
 
     #[test]

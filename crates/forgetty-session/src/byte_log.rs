@@ -41,7 +41,6 @@
 
 use std::collections::VecDeque;
 use std::io;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -433,8 +432,10 @@ impl ByteLog {
         let total_bytes_written = disk_first + file_len;
 
         // Open the log file for append, mode 0600 at creation.
-        let std_file =
-            std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(&log_path)?;
+        let std_file = forgetty_core::fsutil::open_private(
+            std::fs::OpenOptions::new().create(true).append(true),
+            &log_path,
+        )?;
         forgetty_core::fsutil::fix_file_mode(&log_path)?;
         let tokio_file = tokio::fs::File::from_std(std_file);
 
@@ -946,11 +947,10 @@ async fn write_with_retry(
             // How much of this chunk is in the file? A fresh handle drops
             // whatever the failed writer still buffers.
             let reopened = (|| -> io::Result<(tokio::fs::File, u64)> {
-                let f = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .mode(0o600)
-                    .open(log_path)?;
+                let f = forgetty_core::fsutil::open_private(
+                    std::fs::OpenOptions::new().create(true).append(true),
+                    log_path,
+                )?;
                 let len = f.metadata()?.len();
                 Ok((tokio::fs::File::from_std(f), len))
             })();
@@ -972,15 +972,15 @@ async fn write_with_retry(
 /// Truncate the log file and reopen it for append. Used when the log restarts
 /// at a new absolute offset.
 async fn restart_file(log_path: &Path) -> io::Result<tokio::fs::File> {
-    let std_file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(log_path)?;
+    let std_file = forgetty_core::fsutil::open_private(
+        std::fs::OpenOptions::new().create(true).write(true).truncate(true),
+        log_path,
+    )?;
     drop(std_file);
-    let std_file =
-        std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(log_path)?;
+    let std_file = forgetty_core::fsutil::open_private(
+        std::fs::OpenOptions::new().create(true).append(true),
+        log_path,
+    )?;
     Ok(tokio::fs::File::from_std(std_file))
 }
 
@@ -1013,12 +1013,10 @@ async fn rotate_log(
         }
         // Open tmp with mode 0600 via std then convert to tokio (same pattern
         // as the main log open).
-        let std_tmp = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o600)
-            .open(&tmp_path)?;
+        let std_tmp = forgetty_core::fsutil::open_private(
+            std::fs::OpenOptions::new().create(true).truncate(true).write(true),
+            &tmp_path,
+        )?;
         let mut dst = tokio::fs::File::from_std(std_tmp);
         // Copy in chunks — avoids loading entire log into memory.
         let mut buf = vec![0u8; 1024 * 1024];
@@ -1047,8 +1045,10 @@ async fn rotate_log(
     tokio::fs::rename(&tmp_path, log_path).await?;
 
     // Re-open the log for append — same flags as ByteLog::new.
-    let std_reopened =
-        std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(log_path)?;
+    let std_reopened = forgetty_core::fsutil::open_private(
+        std::fs::OpenOptions::new().create(true).append(true),
+        log_path,
+    )?;
     let tokio_reopened = tokio::fs::File::from_std(std_reopened);
     *writer = BufWriter::new(tokio_reopened);
 

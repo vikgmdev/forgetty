@@ -34,12 +34,16 @@ fn config_dir_resolved() -> PathBuf {
 }
 
 fn data_dir_resolved() -> PathBuf {
-    let base = if let Some(data) = std::env::var_os("XDG_DATA_HOME") {
-        PathBuf::from(data)
-    } else {
-        dirs::data_dir().unwrap_or_default()
-    };
-    base.join("forgetty")
+    if let Some(data) = std::env::var_os("XDG_DATA_HOME") {
+        return PathBuf::from(data).join("forgetty");
+    }
+    if is_windows() {
+        // The server keeps its state in the local (not roaming) folder, and in a `server`
+        // subfolder: `%APPDATA%\forgetty` is the Windows app's folder (its identity key and
+        // machine list), and the two must never share a file.
+        return dirs::data_local_dir().unwrap_or_default().join("forgetty").join("server");
+    }
+    dirs::data_dir().unwrap_or_default().join("forgetty")
 }
 
 fn runtime_dir_resolved() -> Option<PathBuf> {
@@ -310,8 +314,10 @@ pub fn config_dir() -> PathBuf {
 ///
 /// - Linux: `$XDG_DATA_HOME/forgetty` or `~/.local/share/forgetty`
 /// - macOS: `~/Library/Application Support/forgetty`
-/// - Windows: `%LOCALAPPDATA%/forgetty`
+/// - Windows: `%LOCALAPPDATA%\forgetty\server`. Not `%APPDATA%\forgetty`: that folder is the
+///   Windows app's (the app and the server are two programs with their own identity keys).
 ///
+/// `$XDG_DATA_HOME` wins on every platform (it is how `--state-dir` and the tests isolate).
 /// A test process never gets the real one (see [`isolate_state_for_tests`]).
 pub fn data_dir() -> PathBuf {
     let dir = data_dir_resolved();

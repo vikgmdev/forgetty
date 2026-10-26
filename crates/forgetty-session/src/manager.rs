@@ -2720,7 +2720,16 @@ impl Default for SessionManager {
 // ---------------------------------------------------------------------------
 
 fn home_dir_fallback() -> PathBuf {
-    std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/"))
+    #[cfg(windows)]
+    {
+        // `HOME` is not set for a normal Windows user (or it names a Unix-style folder of a
+        // tool that set it for itself). The profile folder is the home.
+        dirs::home_dir().unwrap_or_else(|| PathBuf::from("C:\\"))
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/"))
+    }
 }
 
 /// Pure matcher: is this `comm` value a known signal-forwarder?
@@ -2738,6 +2747,7 @@ fn home_dir_fallback() -> PathBuf {
 ///   is a Perl script that exec's into `mosh-client` post-handshake.
 /// - `telnet` — legacy but still in use; same forwarding semantics.
 /// - `rsh` — vintage but in scope for parity.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn is_signal_forwarder_comm(comm: &str) -> bool {
     matches!(comm, "ssh" | "mosh-client" | "telnet" | "rsh")
 }
@@ -2914,6 +2924,7 @@ fn is_local_host(host: &str) -> bool {
             .ok()
             .map(|s| s.trim().to_ascii_lowercase())
             .or_else(|| std::env::var("HOSTNAME").ok().map(|s| s.to_ascii_lowercase()))
+            .or_else(|| std::env::var("COMPUTERNAME").ok().map(|s| s.to_ascii_lowercase()))
             .unwrap_or_default()
     });
     if local.is_empty() {

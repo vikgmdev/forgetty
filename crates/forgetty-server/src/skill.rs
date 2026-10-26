@@ -167,13 +167,16 @@ fn make_dirs(t: &Target) -> Result<PathBuf> {
 /// `O_NOFOLLOW`), then rename it into place.
 fn write_atomic(dir: &Path, name: &str) -> Result<()> {
     use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
     let tmp = dir.join(format!(".{name}.tmp-{}", std::process::id()));
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o644)
-        .custom_flags(libc::O_NOFOLLOW)
+    let mut opts = std::fs::OpenOptions::new();
+    // `create_new` fails on an existing name, a symlink included, on every platform.
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o644).custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut f = opts
         .open(&tmp)
         .map_err(|e| CliError::Failed(format!("create {}: {e}", tmp.display())))?;
     let res = f.write_all(SKILL.as_bytes()).and_then(|_| f.sync_all());
@@ -343,6 +346,7 @@ mod tests {
         assert!(!remove_at(&t).unwrap());
     }
 
+    #[cfg(unix)]
     #[test]
     fn symlinked_dot_claude_is_refused() {
         let (proj, outside) = dirs();
@@ -355,6 +359,7 @@ mod tests {
         outside_is_untouched(outside.path(), &["precious"]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn symlinked_skills_dir_is_refused() {
         let (proj, outside) = dirs();
@@ -367,6 +372,7 @@ mod tests {
         outside_is_untouched(outside.path(), &["precious"]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn symlinked_target_file_is_refused_and_not_overwritten_or_deleted() {
         let (proj, outside) = dirs();
@@ -382,6 +388,7 @@ mod tests {
         outside_is_untouched(outside.path(), &["victim"]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn symlinked_forgetty_dir_is_refused() {
         let (proj, outside) = dirs();
@@ -393,6 +400,7 @@ mod tests {
         outside_is_untouched(outside.path(), &[]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_symlinked_base_is_allowed() {
         // /home or the project directory itself may be a link.

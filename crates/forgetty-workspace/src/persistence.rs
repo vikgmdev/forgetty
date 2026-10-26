@@ -1805,6 +1805,7 @@ mod tests {
 #[cfg(test)]
 mod p1qa_tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     fn named(name: &str) -> WorkspaceState {
@@ -1833,8 +1834,13 @@ mod p1qa_tests {
         assert!(!backup_path(&path).exists(), "no bak after the first save");
         save_to_path(&path, &named("two")).unwrap();
         save_to_path(&path, &named("three")).unwrap();
-        let mode = |p: &std::path::Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode(&path), 0o600);
+        #[cfg(unix)]
+        {
+            let mode = |p: &std::path::Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&path), 0o600);
+        }
+        #[cfg(windows)]
+        assert!(forgetty_core::fsutil::acl::is_user_only(&path).unwrap());
         let bak: WorkspaceState =
             serde_json::from_str(&fs::read_to_string(backup_path(&path)).unwrap()).unwrap();
         assert_eq!(marker(&bak), "two", "bak is the previous good save");

@@ -15,6 +15,10 @@ pub mod iroh_terminal;
 pub mod sockpath;
 
 pub mod control_queue;
+#[cfg(not(windows))]
+pub mod crash;
+#[cfg(windows)]
+#[path = "crash_windows.rs"]
 pub mod crash;
 pub mod rpc_v2;
 pub mod snapshot_hub;

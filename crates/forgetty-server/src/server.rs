@@ -13,7 +13,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Args;
-use tokio::signal::unix::{signal, SignalKind};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -179,28 +178,23 @@ pub struct StateLock(#[allow(dead_code)] std::fs::File);
 
 /// Take the state-dir lock. Waits up to 30 s for another starter to finish.
 pub fn lock_state_dir() -> anyhow::Result<StateLock> {
-    use std::os::unix::fs::OpenOptionsExt;
-    use std::os::unix::io::AsRawFd;
     let dir = forgetty_core::platform::data_dir();
     forgetty_core::fsutil::ensure_private_dir(&dir)?;
     let path = dir.join("server.lock");
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .mode(forgetty_core::fsutil::FILE_MODE)
-        .open(&path)?;
+    let file = forgetty_core::fsutil::open_private(
+        std::fs::OpenOptions::new().create(true).truncate(false).write(true),
+        &path,
+    )?;
     forgetty_core::fsutil::fix_file_mode(&path)?;
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
-        // SAFETY: the fd is valid for the lifetime of `file`; flock takes no pointers.
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if rc == 0 {
-            return Ok(StateLock(file));
-        }
-        let err = std::io::Error::last_os_error();
-        if err.kind() != std::io::ErrorKind::WouldBlock {
-            anyhow::bail!("lock {}: {err}", path.display());
+        // `flock(LOCK_EX | LOCK_NB)` on Unix, `LockFileEx` on Windows.
+        match file.try_lock() {
+            Ok(()) => return Ok(StateLock(file)),
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(err)) => {
+                anyhow::bail!("lock {}: {err}", path.display());
+            }
         }
         if std::time::Instant::now() >= deadline {
             anyhow::bail!("lock {} is held by another starter for over 30 s", path.display());
@@ -247,23 +241,20 @@ pub fn load_or_create_server_id(_lock: &StateLock) -> anyhow::Result<uuid::Uuid>
 /// The returned file must stay open for the life of the process. The lock is
 /// released by the kernel when the process exits, however it exits.
 fn acquire_instance_lock(server_id: uuid::Uuid) -> anyhow::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    use std::os::unix::io::AsRawFd;
     let dir = forgetty_core::platform::data_dir();
     forgetty_core::fsutil::ensure_private_dir(&dir)?;
     let path = dir.join(format!("server-{server_id}.lock"));
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .mode(forgetty_core::fsutil::FILE_MODE)
-        .open(&path)?;
-    // SAFETY: the fd is valid for the lifetime of `file`; flock takes no pointers.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc != 0 {
-        return Err(AlreadyRunning(path).into());
+    let file = forgetty_core::fsutil::open_private(
+        std::fs::OpenOptions::new().create(true).truncate(false).write(true),
+        &path,
+    )?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(AlreadyRunning(path).into()),
+        Err(std::fs::TryLockError::Error(e)) => {
+            Err(anyhow::anyhow!("lock {}: {e}", path.display()))
+        }
     }
-    Ok(file)
 }
 
 fn init_tracing() {
@@ -895,13 +886,8 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
     };
 
     // Wait for SIGTERM (from systemd stop) or SIGINT (Ctrl-C in --foreground mode).
-    let mut sigterm = signal(SignalKind::terminate())?;
-    let mut sigint = signal(SignalKind::interrupt())?;
-
-    tokio::select! {
-        _ = sigterm.recv() => { info!("Received SIGTERM"); }
-        _ = sigint.recv()  => { info!("Received SIGINT");  }
-    }
+    // On Windows: the console control events.
+    wait_for_stop_signal().await?;
     // Freeze the layout before anything else. Children that die with the
     // server (a signal to the whole group) must not shrink the saved layout.
     session_manager.begin_shutdown();
@@ -914,6 +900,40 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
         &socket_path,
     )
     .await
+}
+
+/// Wait for the signal that ends the server.
+#[cfg(unix)]
+async fn wait_for_stop_signal() -> anyhow::Result<()> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sigint = signal(SignalKind::interrupt())?;
+    tokio::select! {
+        _ = sigterm.recv() => { info!("Received SIGTERM"); }
+        _ = sigint.recv()  => { info!("Received SIGINT");  }
+    }
+    Ok(())
+}
+
+/// Wait for the console control event that ends the server (Ctrl+C, Ctrl+Break, the console
+/// closing, logoff, shutdown). A server started by `forgetty server start` has no console and
+/// gets none of them: `forgetty server stop` (the `shutdown` call) ends it.
+#[cfg(windows)]
+async fn wait_for_stop_signal() -> anyhow::Result<()> {
+    use tokio::signal::windows;
+    let mut ctrl_c = windows::ctrl_c()?;
+    let mut ctrl_break = windows::ctrl_break()?;
+    let mut ctrl_close = windows::ctrl_close()?;
+    let mut ctrl_logoff = windows::ctrl_logoff()?;
+    let mut ctrl_shutdown = windows::ctrl_shutdown()?;
+    tokio::select! {
+        _ = ctrl_c.recv() => { info!("Received Ctrl+C"); }
+        _ = ctrl_break.recv() => { info!("Received Ctrl+Break"); }
+        _ = ctrl_close.recv() => { info!("The console closed"); }
+        _ = ctrl_logoff.recv() => { info!("The user is logging off"); }
+        _ = ctrl_shutdown.recv() => { info!("The system is shutting down"); }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1146,15 +1166,15 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&id_path).unwrap(), "garbage");
 
         // The state lock is exclusive between processes: a second lock attempt
-        // from another open file description blocks, so test it with flock(2).
+        // from another open file description blocks, so test it with a try-lock.
         {
-            use std::os::unix::io::AsRawFd;
             let other =
                 std::fs::File::open(forgetty_core::platform::data_dir().join("server.lock"))
                     .unwrap();
-            // SAFETY: valid fd, no pointers.
-            let rc = unsafe { libc::flock(other.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-            assert_ne!(rc, 0, "server.lock is held while the StateLock lives");
+            assert!(
+                matches!(other.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+                "server.lock is held while the StateLock lives"
+            );
         }
 
         unsafe {

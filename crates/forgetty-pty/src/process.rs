@@ -8,7 +8,9 @@ use std::path::Path;
 
 use forgetty_core::error::{ForgettyError, Result};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty};
-use tracing::{debug, warn};
+use tracing::debug;
+#[cfg(not(windows))]
+use tracing::warn;
 
 /// PTY dimensions.
 #[derive(Debug, Clone, Copy)]
@@ -243,8 +245,15 @@ impl PtyProcess {
     /// ID of whatever process is currently in the foreground on this terminal.
     /// Returns `None` if the master does not expose a raw fd or `tcgetpgrp`
     /// fails (e.g., no foreground process group set yet).
+    #[cfg(unix)]
     pub fn foreground_pgrp(&self) -> Option<i32> {
         self.master.process_group_leader()
+    }
+
+    /// Non-Unix stub: Windows has no foreground process group.
+    #[cfg(not(unix))]
+    pub fn foreground_pgrp(&self) -> Option<i32> {
+        None
     }
 
     /// The terminal's interrupt setting: `(isig, c_cc[VINTR])`, read with

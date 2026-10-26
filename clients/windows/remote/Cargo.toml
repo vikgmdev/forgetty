@@ -7,6 +7,7 @@ description = "Forgetty Windows client: RemoteBackend on forgetty-client (protoc
 
 [dependencies]
 forgetty-shell-core = { path = "../shell-core" }
+forgetty-core = { path = "../../../crates/forgetty-core" }
 forgetty-client = { path = "../../../crates/forgetty-client" }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
 async-channel = "2"

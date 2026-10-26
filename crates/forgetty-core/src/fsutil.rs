@@ -8,11 +8,16 @@
 //! - a file is replaced atomically: unique temp name in the same directory,
 //!   `fsync` of the file, `rename`, `fsync` of the directory,
 //! - two processes writing the same file cannot share a temp file.
+//!
+//! On Windows the same promises hold with a protected DACL that has one entry (the current
+//! user, full access) in place of the Unix modes. See [`acl`].
 
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+pub mod acl;
 
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
@@ -47,7 +52,22 @@ pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
             fs::set_permissions(dir, fs::Permissions::from_mode(DIR_MODE))?;
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::collections::HashSet;
+        use std::sync::Mutex;
+        // The DACL of a folder this process already restricted is not set again on every
+        // call: the callers write state files often.
+        static DONE: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
+        fs::create_dir_all(dir)?;
+        let mut done = DONE.lock().unwrap_or_else(|e| e.into_inner());
+        let done = done.get_or_insert_with(HashSet::new);
+        if !done.contains(dir) {
+            acl::restrict_dir_to_user(dir)?;
+            done.insert(dir.to_path_buf());
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     fs::create_dir_all(dir)?;
     Ok(())
 }
@@ -55,11 +75,42 @@ pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
 /// Open a new file for writing with mode `0600` set at creation. Fails if the
 /// file exists.
 pub fn create_private_new(path: &Path) -> io::Result<fs::File> {
-    let mut opts = fs::OpenOptions::new();
-    opts.write(true).create_new(true);
+    #[cfg(windows)]
+    {
+        acl::create_private_file(path)
+    }
+    #[cfg(not(windows))]
+    {
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        opts.mode(FILE_MODE);
+        opts.open(path)
+    }
+}
+
+/// Open `path` with `opts`, and when `opts` creates the file, create it private (`0600` on Unix,
+/// a user-only DACL on Windows) from its first moment.
+pub fn open_private(opts: &fs::OpenOptions, path: &Path) -> io::Result<fs::File> {
     #[cfg(unix)]
-    opts.mode(FILE_MODE);
-    opts.open(path)
+    {
+        let mut opts = opts.clone();
+        opts.mode(FILE_MODE);
+        opts.open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        // `opts` may create the file. Make a missing one private first. Two racing callers: the
+        // loser gets `AlreadyExists`, which is fine, the file is there and private.
+        if !path.exists() {
+            match create_private_new(path) {
+                Ok(f) => drop(f),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e),
+            }
+        }
+        opts.open(path)
+    }
 }
 
 /// Make an existing file `0600`. A missing file is not an error. Returns
@@ -79,10 +130,41 @@ pub fn fix_file_mode(path: &Path) -> io::Result<bool> {
             Err(e) => Err(e),
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        if !path.exists() {
+            return Ok(false);
+        }
+        if matches!(acl::is_user_only(path), Ok(true)) {
+            return Ok(false);
+        }
+        acl::restrict_to_user(path)?;
+        Ok(true)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = path;
         Ok(false)
+    }
+}
+
+/// `true` when `path` (a file or a folder) can be used by the current user only: mode `0600`
+/// (`0700` for a folder) on Unix, a protected DACL with one entry for the user on Windows.
+pub fn is_private(path: &Path) -> io::Result<bool> {
+    #[cfg(unix)]
+    {
+        let meta = fs::metadata(path)?;
+        let want = if meta.is_dir() { DIR_MODE } else { FILE_MODE };
+        Ok(meta.permissions().mode() & 0o777 == want)
+    }
+    #[cfg(windows)]
+    {
+        acl::is_user_only(path)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Ok(true)
     }
 }
 
@@ -96,6 +178,18 @@ pub fn sync_dir(dir: &Path) -> io::Result<()> {
     {
         let _ = dir;
         Ok(())
+    }
+}
+
+/// Rename `tmp` over `path`. On Windows the move is written through to disk before it returns.
+fn replace_file(tmp: &Path, path: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        acl::replace_file(tmp, path)
+    }
+    #[cfg(not(windows))]
+    {
+        fs::rename(tmp, path)
     }
 }
 
@@ -119,7 +213,7 @@ pub fn write_private_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
         f.write_all(bytes)?;
         f.sync_all()?;
         drop(f);
-        fs::rename(&tmp, path)?;
+        replace_file(&tmp, path)?;
         sync_dir(dir)
     })();
     if result.is_err() {
@@ -269,5 +363,48 @@ mod tests {
         let content = fs::read(&p).unwrap();
         assert_eq!(content.len(), 32);
         assert!(content.iter().all(|b| *b == content[0]), "one writer's whole content");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_files_and_dirs_are_user_only_from_creation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("state/server");
+        ensure_private_dir(&d).unwrap();
+        // Calling it again is fine (the second call sets nothing).
+        ensure_private_dir(&d).unwrap();
+        let sddl = acl::describe(&d).unwrap();
+        assert!(sddl.starts_with("D:P") && sddl.contains("OICI"), "{sddl}");
+
+        let p = d.join("f");
+        let f = create_private_new(&p).unwrap();
+        drop(f);
+        assert!(acl::is_user_only(&p).unwrap(), "{:?}", acl::describe(&p));
+        assert_eq!(
+            create_private_new(&p).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists,
+            "a second create fails"
+        );
+
+        let q = d.join("g");
+        write_private_atomic(&q, b"x").unwrap();
+        assert!(acl::is_user_only(&q).unwrap(), "{:?}", acl::describe(&q));
+        assert_eq!(fs::read(&q).unwrap(), b"x");
+
+        // A file made by plain std inherits the folder's one entry. `fix_file_mode` makes
+        // it protected, like the Unix 0600 fix.
+        let r = d.join("h");
+        fs::write(&r, b"x").unwrap();
+        assert!(fix_file_mode(&r).unwrap());
+        assert!(acl::is_user_only(&r).unwrap());
+        assert!(!fix_file_mode(&r).unwrap());
+        assert!(!fix_file_mode(&d.join("missing")).unwrap());
+
+        // open_private makes a missing file private.
+        let t = d.join("i");
+        let mut o = fs::OpenOptions::new();
+        o.write(true).create(true).truncate(false);
+        drop(open_private(&o, &t).unwrap());
+        assert!(acl::is_user_only(&t).unwrap());
     }
 }

@@ -290,16 +290,18 @@ enum ClientCommand {
 /// read the environment.
 fn apply_state_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
+    // `canonicalize` gives a `\\?\C:\...` path on Windows. A plain absolute path is what the
+    // rest of the server (and a shell started from it) expects.
+    #[cfg(windows)]
+    let dir = std::path::absolute(dir)?;
+    #[cfg(not(windows))]
     let dir = std::fs::canonicalize(dir)?;
     for (var, sub) in
         [("XDG_DATA_HOME", "data"), ("XDG_CONFIG_HOME", "config"), ("XDG_RUNTIME_DIR", "run")]
     {
         let path = dir.join(sub);
         std::fs::create_dir_all(&path)?;
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
-        }
+        forgetty_core::fsutil::acl::restrict_dir_to_user(&path)?;
         std::env::set_var(var, &path);
     }
     Ok(())
@@ -319,6 +321,7 @@ fn main() {
     // A CLI command whose output is piped to `head` should end quietly, not
     // panic. The server keeps Rust's default (SIGPIPE ignored): it relies on
     // write errors from closed sockets.
+    #[cfg(unix)]
     if !matches!(cli.command, Command::Server { command: ServerCommand::Run(_) }) {
         // SAFETY: resetting a signal disposition before any thread starts.
         unsafe {

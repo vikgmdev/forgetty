@@ -17,6 +17,7 @@ uuid = { workspace = true }
 bytes = "1"
 memchr = "2"
 base64 = "0.22"
+dirs = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

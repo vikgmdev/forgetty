@@ -1211,6 +1211,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "uuid",
+ "windows 0.61.3",
 ]
 
 [[package]]
@@ -1303,6 +1304,7 @@ version = "0.1.0-beta"
 dependencies = [
  "base64",
  "bytes",
+ "dirs",
  "forgetty-core",
  "forgetty-pty",
  "forgetty-vt",

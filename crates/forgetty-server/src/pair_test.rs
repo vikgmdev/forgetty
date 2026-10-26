@@ -129,10 +129,7 @@ fn load_or_generate_key(path: Option<PathBuf>) -> anyhow::Result<SecretKey> {
         let key = SecretKey::generate(&mut rand::rng());
         std::fs::create_dir_all(path.parent().expect("identity path has parent"))?;
         std::fs::write(&path, key.to_bytes())?;
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-        }
+        forgetty_core::fsutil::acl::restrict_to_user(&path)?;
         eprintln!("pair-test: new identity generated, saved to {}", path.display());
         Ok(key)
     }

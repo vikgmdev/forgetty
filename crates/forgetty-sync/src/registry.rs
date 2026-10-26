@@ -150,19 +150,17 @@ impl DeviceRegistry {
     /// Make `revoked.pending` exist with [`PENDING_BYTES`] of blocks behind
     /// it, so recording a revoke later is a write in place.
     fn preallocate_pending(&self) {
-        use std::os::unix::fs::OpenOptionsExt;
         let path = self.pending_path();
         if path.exists() {
             return;
         }
         let made = (|| -> std::io::Result<()> {
             use std::io::Write;
-            let mut f =
-                std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path)?;
+            let mut f = forgetty_core::fsutil::create_private_new(&path)?;
             f.write_all(&[b'\n'; PENDING_BYTES])?;
             f.sync_all()?;
             if let Some(dir) = path.parent() {
-                std::fs::File::open(dir)?.sync_all()?;
+                forgetty_core::fsutil::sync_dir(dir)?;
             }
             Ok(())
         })();
@@ -176,26 +174,23 @@ impl DeviceRegistry {
     /// and, with the preallocated blocks, no free space. A restart before the
     /// registry file is saved still denies these devices.
     fn write_pending(&mut self) -> std::io::Result<()> {
-        use std::os::unix::fs::{FileExt, OpenOptionsExt};
         let path = self.pending_path();
         let existed = path.exists();
-        let f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(&path)?;
+        let f = forgetty_core::fsutil::open_private(
+            std::fs::OpenOptions::new().write(true).create(true).truncate(false),
+            &path,
+        )?;
         let old_len = f.metadata()?.len() as usize;
         let mut buf: Vec<u8> =
             self.pending_ids.iter().map(|id| format!("{id}\n")).collect::<String>().into();
         if buf.len() < old_len {
             buf.resize(old_len, b'\n');
         }
-        f.write_all_at(&buf, 0)?;
+        write_all_at(&f, &buf, 0)?;
         f.sync_all()?;
         if !existed {
             if let Some(dir) = path.parent() {
-                std::fs::File::open(dir)?.sync_all()?;
+                forgetty_core::fsutil::sync_dir(dir)?;
             }
         }
         self.pending_written = true;
@@ -207,7 +202,6 @@ impl DeviceRegistry {
     /// a device that is paired again later is taken out of it by [`Self::add`],
     /// so an old record cannot revoke a new pairing.
     fn clear_pending(&mut self) -> std::io::Result<()> {
-        use std::os::unix::fs::FileExt;
         let result = (|| {
             let f = match std::fs::OpenOptions::new().write(true).open(self.pending_path()) {
                 Ok(f) => f,
@@ -216,7 +210,7 @@ impl DeviceRegistry {
                 Err(e) => return Err(e),
             };
             let len = f.metadata()?.len() as usize;
-            f.write_all_at(&vec![b'\n'; len], 0)?;
+            write_all_at(&f, &vec![b'\n'; len], 0)?;
             f.sync_all()
         })();
         match &result {
@@ -475,10 +469,42 @@ pub fn spawn_save_retry(
     }
 }
 
+/// Write all of `buf` at `offset`, without moving a file cursor (`pwrite`; `WriteFile` with an
+/// offset on Windows).
+fn write_all_at(f: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        f.write_all_at(buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let (mut buf, mut offset) = (buf, offset);
+        while !buf.is_empty() {
+            match f.seek_write(buf, offset) {
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "failed to write the whole buffer",
+                    ))
+                }
+                Ok(n) => {
+                    buf = &buf[n..];
+                    offset += n as u64;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
+    use forgetty_core::fsutil::is_private;
 
     fn entry(id: &str) -> DeviceEntry {
         DeviceEntry {
@@ -497,9 +523,8 @@ mod tests {
         reg.add(entry("a")).unwrap();
         reg.add(entry("b")).unwrap();
         assert!(reg.remove("a").unwrap());
-        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode(&path), 0o600);
-        assert_eq!(mode(path.parent().unwrap()), 0o700);
+        assert!(is_private(&path).unwrap());
+        assert!(is_private(path.parent().unwrap()).unwrap());
         let mut names: Vec<_> = std::fs::read_dir(path.parent().unwrap())
             .unwrap()
             .flatten()

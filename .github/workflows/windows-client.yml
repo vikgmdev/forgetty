@@ -116,15 +116,16 @@ jobs:
             clients/windows/target/release/smoke.err
 
   # WP0 to WP3 of docs/architecture/WINDOWS_SERVER.md: the server crates on Windows.
-  # SERVER_CRATES is the set that must be green. It grows with each work package. The
-  # last step checks the crates that are not in the set yet and never fails the job: its
-  # output is the to-do list.
+  # CHECK_CRATES must compile (tests and benches too). TEST_CRATES must pass their tests. Both
+  # sets grow with each work package. The last steps look at the crates that are not in the
+  # sets yet and never fail the job: their output is the to-do list.
   server-crates:
     runs-on: windows-latest
     timeout-minutes: 60
     env:
-      SERVER_CRATES: "-p forgetty-core -p forgetty-config -p forgetty-workspace"
-      PENDING_CRATES: "-p forgetty-pty -p forgetty-sync -p forgetty-session -p forgetty-socket -p forgetty-server"
+      CHECK_CRATES: "-p forgetty-core -p forgetty-config -p forgetty-workspace -p forgetty-sync -p forgetty-pty -p forgetty-session"
+      TEST_CRATES: "-p forgetty-core -p forgetty-config -p forgetty-workspace -p forgetty-sync"
+      PENDING_CRATES: "-p forgetty-socket -p forgetty-server"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -143,14 +144,19 @@ jobs:
       - name: Check the server crates
         shell: pwsh
         run: |
-          $crates = $env:SERVER_CRATES -split ' '
+          $crates = $env:CHECK_CRATES -split ' '
           cargo check --locked --all-targets @crates
 
       - name: Test the server crates
         shell: pwsh
         run: |
-          $crates = $env:SERVER_CRATES -split ' '
+          $crates = $env:TEST_CRATES -split ' '
           cargo test --locked @crates
+
+      - name: Tests of crates that are compiled but not gated yet (does not gate)
+        continue-on-error: true
+        shell: pwsh
+        run: cargo test --locked --no-fail-fast -p forgetty-pty -p forgetty-session
 
       - name: Check the crates that are not ported yet (does not gate)
         continue-on-error: true
