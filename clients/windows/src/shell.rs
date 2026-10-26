@@ -137,6 +137,8 @@ pub struct AppShell {
     pub file_cfg: Config,
     /// A theme picked in the palette. A reload that changes the file's colors drops it.
     pub theme_override: Option<String>,
+    /// Every theme, built by the watcher's worker thread (None until its first list arrives).
+    pub themes: Option<std::sync::Arc<forgetty_shell_core::config::ThemeIndex>>,
     pub conf_watch: Option<forgetty_shell_core::confwatch::ConfWatch>,
     /// The user asked for the reload now on the way: say so even when nothing changed.
     pub reload_asked: bool,
@@ -263,6 +265,7 @@ impl AppShell {
         let shell = AppShell {
             file_cfg: cfg.clone(),
             theme_override: None,
+            themes: None,
             conf_watch: None,
             reload_asked: false,
             startup_notice: None,
@@ -802,15 +805,11 @@ impl AppShell {
     }
 
     fn start_profile_tab(&mut self, p: &forgetty_shell_core::config::Profile, cx: &mut Context<Self>) {
-        let home = std::env::var("USERPROFILE").ok();
-        let mut cwd = None;
-        if let Some(d) = p.directory.as_deref() {
-            match forgetty_shell_core::config::expand_dir(d, home.as_deref()) {
-                Some(path) if std::path::Path::new(&path).is_dir() => cwd = Some(path),
-                _ => self.notice_active(format!("Profile {}: the directory {d} does not exist, started in the home directory", p.name), cx),
-            }
+        // The directory was expanded and checked when the file was read: no disk access here.
+        if let Some(why) = &p.dir_problem {
+            self.notice_active(format!("Profile {}: directory {why}, started in the home directory", p.name), cx);
         }
-        self.new_tab_with(p.argv.clone(), cwd, cx);
+        self.new_tab_with(p.argv.clone(), p.start_dir.clone(), cx);
     }
 
     fn new_tab_with(&mut self, command: Vec<String>, cwd: Option<String>, cx: &mut Context<Self>) {
@@ -1153,14 +1152,13 @@ impl AppShell {
 
     /// The list of themes in the palette. Choosing one applies it to this session.
     pub fn open_theme_list(&mut self, cx: &mut Context<Self>) {
+        let Some(index) = self.themes.clone() else {
+            self.notice_active("The theme list is still loading".into(), cx);
+            return;
+        };
         self.rename = None;
         self.menu = None;
-        let mut p = Palette {
-            edit: LineEdit::default(),
-            selected: 0,
-            items: Vec::new(),
-            themes: Some(forgetty_shell_core::config::theme_names()),
-        };
+        let mut p = Palette { edit: LineEdit::default(), selected: 0, items: Vec::new(), themes: Some(index.names.clone()) };
         self.refresh_palette(&mut p);
         self.palette = Some(p);
         cx.notify();

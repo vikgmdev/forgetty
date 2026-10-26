@@ -1591,11 +1591,13 @@ fn run_direct_checks() {
 
     // Config parsing.
     let c = Config::from_toml(
-        "shell='pwsh.exe'\nscrollback=5000\n[font]\nfamily='Fira Code'\nsize=13.5\n[theme]\nforeground='#112233'\ncursor='abcdef'\nansi=['#000001','#000002']\n",
+        "shell='cmd.exe'\nscrollback=5000\n[font]\nfamily='Fira Code'\nsize=13.5\n[theme]\nforeground='#112233'\ncursor='abcdef'\nansi=['#000001','#000002']\n",
     );
     let d = Config::default();
     let ok = c.as_ref().is_ok_and(|c| {
-        c.shell.as_deref() == Some("pwsh.exe")
+        c.shell.as_deref() == Some("cmd.exe")
+            // The program was found when the file was read: a full path, not the bare name.
+            && c.shell_argv.as_ref().is_some_and(|a| a.len() == 1 && a[0].to_ascii_lowercase().ends_with("\\cmd.exe") && a[0].contains(":\\"))
             && c.scrollback_bytes == 5000 * 2048
             && c.font_family == "Fira Code"
             && c.font_size_pt == 13.5

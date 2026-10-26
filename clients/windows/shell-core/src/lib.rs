@@ -25,6 +25,7 @@ pub mod osc;
 pub mod ops;
 pub mod osc52;
 pub mod paste;
+pub mod resolve;
 pub mod scrollbar;
 pub mod search;
 pub mod selection;

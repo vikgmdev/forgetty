@@ -90,7 +90,7 @@ fn main() {
     }
 
     application().run(move |cx: &mut App| {
-        let shell_argv = if smoke { vec!["cmd.exe".to_string()] } else { reload::default_shell(&cfg) };
+        let shell_argv = if smoke { vec![reload::smoke_cmd()] } else { reload::default_shell(&cfg) };
         let local = LocalBackend::new(LocalConfig {
             shell: shell_argv,
             default_cwd: if smoke { Some("C:\\".into()) } else { None },

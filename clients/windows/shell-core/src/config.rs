@@ -50,12 +50,14 @@
 //! nobody knows is a warning, with a suggestion when it is close to a known one.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
 pub use forgetty_config::NotificationMode;
 
 use crate::bell::BellMode;
+use crate::resolve::{resolve_dir, resolve_program, Host};
 
 /// libghostty-vt's default scrollback (`forgetty_vt::DEFAULT_MAX_SCROLLBACK_BYTES`; a test keeps
 /// the two equal, because shell-core does not link the VT crate outside its tests).
@@ -98,8 +100,13 @@ pub struct Profile {
     pub command: String,
     /// `command` as an argv. Never empty.
     pub argv: Vec<String>,
-    /// Start directory. `~` is the home directory; see [`expand_dir`].
+    /// Start directory as written. `~` is the home directory; see [`expand_dir`].
     pub directory: Option<String>,
+    /// `directory` expanded and checked when the file was read (so a click costs no disk
+    /// access). `None` with `dir_problem` set: it is missing or a network path.
+    pub start_dir: Option<String>,
+    /// Why `directory` is not used, when it is not.
+    pub dir_problem: Option<String>,
     /// A GTK icon name. Kept so a file written for GTK loads; this client shows none.
     pub icon: Option<String>,
 }
@@ -108,6 +115,8 @@ pub struct Profile {
 pub struct Config {
     /// The shell program and arguments, as written. `None` means FORGETTY_SHELL, then COMSPEC.
     pub shell: Option<String>,
+    /// `shell` as an argv with the program's full path, found when the file was read.
+    pub shell_argv: Option<Vec<String>>,
     /// Scrollback budget per pane in libghostty-vt bytes.
     pub scrollback_bytes: usize,
     pub backdrop: Backdrop,
@@ -156,6 +165,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             shell: None,
+            shell_argv: None,
             scrollback_bytes: DEFAULT_SCROLLBACK_BYTES,
             backdrop: Backdrop::Mica,
             sidebar_open: false,
@@ -322,20 +332,25 @@ fn unknown_key_text<'a>(shown: &str, key: &str, known: impl IntoIterator<Item = 
     }
 }
 
-/// `text` as a command line: the whole text when it names a file (a path with spaces, as the
-/// old `shell = "C:\\Program Files\\...\\pwsh.exe"` was), else split into words with
-/// [`crate::argv::split`]. `exists` says whether a path is a file.
-pub fn command_argv(text: &str, exists: impl Fn(&str) -> bool) -> Result<Vec<String>, String> {
+/// `text` as a command line with the program's full path: the whole text when it is a full
+/// path to a file (a path with spaces, as the old `shell = "C:\\Program Files\\...\\pwsh.exe"`
+/// was), else split into words with [`crate::argv::split`]. The program is found with
+/// [`crate::resolve::resolve_program`]: PATH only, no network path, no relative path.
+pub fn command_argv(text: &str, host: &Host) -> Result<Vec<String>, String> {
     let t = text.trim();
     if t.is_empty() {
         return Err("the command is empty".into());
     }
-    if exists(t) {
+    if crate::resolve::is_absolute(t) && crate::osc::is_safe_local_path(t) && (host.is_file)(t) {
         return Ok(vec![t.to_string()]);
     }
-    let v = crate::argv::split(t)?;
-    if v.is_empty() {
-        return Err("the command is empty".into());
+    let mut v = crate::argv::split(t)?;
+    let Some(first) = v.first() else { return Err("the command is empty".into()) };
+    let hint = v.len() > 1 && crate::resolve::is_absolute(first);
+    match resolve_program(first, host) {
+        Ok(full) => v[0] = full,
+        Err(e) if hint => return Err(format!("{e} (put a path with spaces in quotes)")),
+        Err(e) => return Err(e),
     }
     Ok(v)
 }
@@ -362,11 +377,6 @@ fn rgba(c: forgetty_core::Rgba) -> u32 {
 }
 
 impl Config {
-    /// The config as a program and arguments. `exists` says whether a path is a file.
-    pub fn shell_argv(&self, exists: impl Fn(&str) -> bool) -> Option<Vec<String>> {
-        self.shell.as_deref().and_then(|s| command_argv(s, exists).ok())
-    }
-
     /// The profile a plain new tab uses: `default_profile` by name, else the first.
     pub fn default_profile(&self) -> Option<&Profile> {
         self.default_profile
@@ -388,10 +398,12 @@ impl Config {
     /// is an `Err` and changes nothing. Out-of-range numbers, unknown keys and an unknown theme
     /// name are warnings: the key keeps its default.
     pub fn parse(text: &str) -> Result<Loaded, String> {
-        Self::parse_with(text, &|p| std::path::Path::new(p).is_file())
+        Self::parse_with(text, &Host::real(None))
     }
 
-    pub fn parse_with(text: &str, exists: &dyn Fn(&str) -> bool) -> Result<Loaded, String> {
+    /// `parse` against `host`: where programs and folders are looked up, and where the custom
+    /// themes are. All the disk access of a read happens here, on the caller's (worker) thread.
+    pub fn parse_with(text: &str, host: &Host) -> Result<Loaded, String> {
         let table: toml::Table = text.parse().map_err(|e: toml::de::Error| e.to_string())?;
         let f: FileConfig =
             toml::Value::Table(table.clone()).try_into().map_err(|e: toml::de::Error| e.to_string())?;
@@ -427,10 +439,12 @@ impl Config {
 
         // shell
         if let Some(s) = f.shell.as_deref().or(shared.shell.as_deref()) {
-            if let Err(e) = command_argv(s, exists) {
-                warnings.push(format!("shell: {e} (using the default shell)"));
-            } else {
-                c.shell = Some(s.to_string());
+            match command_argv(s, host) {
+                Ok(argv) => {
+                    c.shell = Some(s.to_string());
+                    c.shell_argv = Some(argv);
+                }
+                Err(e) => warnings.push(format!("shell: {e} (using the default shell)")),
             }
         }
 
@@ -516,14 +530,27 @@ impl Config {
 
         // Profiles. forgetty-config already dropped the ones with no name or no command.
         for p in &shared.profiles {
-            match command_argv(&p.command, exists) {
-                Ok(argv) => c.profiles.push(Profile {
-                    name: p.name.clone(),
-                    command: p.command.clone(),
-                    argv,
-                    directory: p.directory.clone().filter(|d| !d.trim().is_empty()),
-                    icon: p.icon.clone(),
-                }),
+            match command_argv(&p.command, host) {
+                Ok(argv) => {
+                    let directory = p.directory.clone().filter(|d| !d.trim().is_empty());
+                    let (start_dir, dir_problem) = match directory.as_deref().map(|d| resolve_dir(d, host)) {
+                        Some(Ok(d)) => (d, None),
+                        Some(Err(e)) => {
+                            warnings.push(format!("profile `{}`: directory {e}, it starts in the home directory", p.name));
+                            (None, Some(e))
+                        }
+                        None => (None, None),
+                    };
+                    c.profiles.push(Profile {
+                        name: p.name.clone(),
+                        command: p.command.clone(),
+                        argv,
+                        directory,
+                        start_dir,
+                        dir_problem,
+                        icon: p.icon.clone(),
+                    })
+                }
                 Err(e) => warnings.push(format!("profile `{}`: {e}, skipped", p.name)),
             }
         }
@@ -564,12 +591,13 @@ impl Config {
         }
 
         // theme: a name, then the colors table on top of the defaults
+        let themes_dir = host.themes_dir.clone().unwrap_or_else(default_themes_dir);
         let mut named: Option<(String, forgetty_config::Theme)> = None;
         let mut section = ThemeSection::default();
         match f.theme {
-            Some(toml::Value::String(name)) => match forgetty_config::load_theme_by_name(&name) {
+            Some(toml::Value::String(name)) => match forgetty_config::load_theme_by_name_in(&name, &themes_dir) {
                 Some(t) => named = Some((name, t)),
-                None => warnings.push(theme_missing(&name)),
+                None => warnings.push(theme_missing(&name, &themes_dir)),
             },
             Some(v @ toml::Value::Table(_)) => {
                 section = v.try_into().map_err(|e: toml::de::Error| format!("theme: {e}"))?;
@@ -620,8 +648,13 @@ impl Config {
     }
 }
 
-fn theme_missing(name: &str) -> String {
-    let catalog = forgetty_config::load_theme_catalog();
+/// The themes folder next to the default config file (`%APPDATA%\\forgetty\\themes`).
+pub fn default_themes_dir() -> PathBuf {
+    forgetty_core::platform::config_dir().join("themes")
+}
+
+fn theme_missing(name: &str, dir: &Path) -> String {
+    let catalog = forgetty_config::load_theme_catalog_in(dir);
     let near = suggest(name, catalog.iter().map(|e| e.name.as_str()));
     match near {
         Some(n) => format!("theme `{name}` not found, did you mean `{n}`? (the colors stay default)"),
@@ -629,28 +662,57 @@ fn theme_missing(name: &str) -> String {
     }
 }
 
-/// Names of the bundled and custom themes, sorted, for a picker.
-pub fn theme_names() -> Vec<String> {
-    let mut v: Vec<String> = forgetty_config::load_theme_catalog().into_iter().map(|e| e.name).collect();
-    v.sort_by_key(|n| n.to_lowercase());
-    v.dedup();
-    v
-}
-
-/// A bundled or custom theme by name, as the colors this client uses.
-pub fn theme_colors(name: &str) -> Option<ThemeColors> {
-    let t = forgetty_config::load_theme_by_name(name)?;
+fn colors_of(t: &forgetty_config::Theme) -> ThemeColors {
     let mut ansi = [0u32; 16];
     for (i, c) in t.ansi_colors.iter().enumerate() {
         ansi[i] = rgba(*c);
     }
-    Some(ThemeColors {
+    ThemeColors {
         foreground: rgba(t.foreground),
         background: rgba(t.background),
         cursor: rgba(t.cursor),
         selection: rgba(t.selection),
         ansi,
-    })
+    }
+}
+
+/// Names of the bundled and custom themes, sorted, for a picker. Reads the disk: call it from a
+/// worker, or use a [`ThemeIndex`].
+pub fn theme_names() -> Vec<String> {
+    ThemeIndex::build(&default_themes_dir()).names
+}
+
+/// A bundled or custom theme by name, as the colors this client uses. Reads the disk.
+pub fn theme_colors(name: &str) -> Option<ThemeColors> {
+    forgetty_config::load_theme_by_name_in(name, &default_themes_dir()).map(|t| colors_of(&t))
+}
+
+/// Every theme, in memory: the names for the picker and the colors for a pick. Built on a
+/// worker thread (one pass over the bundled themes and the custom folder) and rebuilt when the
+/// folder changes, so the UI thread never reads a theme file.
+#[derive(Debug, Clone, Default)]
+pub struct ThemeIndex {
+    /// Sorted by lower-case name, no duplicates.
+    pub names: Vec<String>,
+    colors: HashMap<String, ThemeColors>,
+}
+
+impl ThemeIndex {
+    pub fn build(themes_dir: &Path) -> Self {
+        let mut colors = HashMap::new();
+        let mut names = Vec::new();
+        for (name, t) in forgetty_config::load_all_themes_in(themes_dir) {
+            if colors.insert(name.clone(), colors_of(&t)).is_none() {
+                names.push(name);
+            }
+        }
+        names.sort_by_key(|n| n.to_lowercase());
+        ThemeIndex { names, colors }
+    }
+
+    pub fn colors(&self, name: &str) -> Option<ThemeColors> {
+        self.colors.get(name).copied()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -755,7 +817,7 @@ pub fn diff(old: &Config, new: &Config) -> Changes {
         keybindings: old.keybindings != new.keybindings,
         profiles: old.profiles != new.profiles || old.default_profile != new.default_profile,
         paste: old.paste_warn_size != new.paste_warn_size || old.paste_warn_newline != new.paste_warn_newline,
-        shell: old.shell != new.shell,
+        shell: old.shell != new.shell || old.shell_argv != new.shell_argv,
         backdrop: old.backdrop != new.backdrop,
         padding: old.pane_padding_x != new.pane_padding_x || old.pane_padding_y != new.pane_padding_y,
         mouse_and_copy: old.smart_copy != new.smart_copy || old.right_click_copy_paste != new.right_click_copy_paste,
@@ -798,6 +860,21 @@ pub fn reload_notice(ch: &Changes, warnings: &[String], asked: bool) -> Option<S
     Some(text)
 }
 
+/// Why "Open configuration file" must not touch `path`, or `None` when it may. `FORGETTY_CONFIG`
+/// can name any path, and the action opens it with the shell's `open` verb and may write a
+/// template to it, so only a `.toml` file on a local path qualifies.
+pub fn open_refusal(path: &Path) -> Option<String> {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let name = crate::notify::sanitize(&name, 40);
+    if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("toml")) {
+        return Some(format!("Not opened: the configuration file {name} is not a .toml file"));
+    }
+    if !crate::osc::is_safe_local_path(&path.to_string_lossy()) {
+        return Some(format!("Not opened: {name} is on a network path"));
+    }
+    None
+}
+
 /// The notice for a config file that is gone: nothing changes.
 pub fn missing_notice() -> String {
     "config.toml is gone, the last good settings stay".to_string()
@@ -812,8 +889,22 @@ pub fn failed_notice(err: &str) -> String {
 mod tests {
     use super::*;
 
+    /// A machine with a few programs on PATH and a few folders.
+    fn host() -> Host {
+        Host::fake(
+            &[
+                "C:\\tools\\pwsh.exe",
+                "C:\\tools\\wsl.exe",
+                "C:\\tools\\a.exe",
+                "C:\\Program Files\\Git\\bin\\bash.exe",
+                "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+            ],
+            &["C:\\Users\\v\\src", "D:\\work"],
+        )
+    }
+
     fn p(t: &str) -> Loaded {
-        Config::parse_with(t, &|_| false).unwrap()
+        Config::parse_with(t, &host()).unwrap()
     }
 
     #[test]
@@ -955,16 +1046,18 @@ command = "pwsh.exe \"unclosed"
 name = ""
 command = "x"
 "#,
-            &|p| p == "C:\\Program Files\\Git\\bin\\bash.exe",
+            &host(),
         )
         .unwrap();
         let c = l.config;
         assert_eq!(c.profiles.len(), 3, "{:?}", l.warnings);
-        assert_eq!(c.profiles[0].argv, ["pwsh.exe", "-NoLogo", "-NoProfile"]);
+        assert_eq!(c.profiles[0].argv, ["C:\\tools\\pwsh.exe", "-NoLogo", "-NoProfile"]);
         assert_eq!(c.profiles[0].directory.as_deref(), Some("~\\src"));
+        assert_eq!(c.profiles[0].start_dir.as_deref(), Some("C:\\Users\\v\\src"));
+        assert!(c.profiles[0].dir_problem.is_none());
         // A command that names a file is one program, even with spaces.
         assert_eq!(c.profiles[1].argv, ["C:\\Program Files\\Git\\bin\\bash.exe"]);
-        assert_eq!(c.profiles[2].argv, ["wsl.exe", "-d", "Ubuntu 24.04", "--cd", "~"]);
+        assert_eq!(c.profiles[2].argv, ["C:\\tools\\wsl.exe", "-d", "Ubuntu 24.04", "--cd", "~"]);
         assert_eq!(c.default_profile().unwrap().name, "Git");
         assert_eq!(c.profile_n(1).unwrap().name, "PowerShell");
         assert!(c.profile_n(0).is_none() && c.profile_n(4).is_none());
@@ -979,13 +1072,86 @@ command = "x"
     #[test]
     fn shell_with_arguments_and_the_old_path_form() {
         let c = p("shell = \"pwsh.exe -NoLogo\"").config;
-        assert_eq!(c.shell_argv(|_| false).unwrap(), ["pwsh.exe", "-NoLogo"]);
-        let c = Config::parse_with("shell = 'C:\\Program Files\\PowerShell\\7\\pwsh.exe'", &|p| p.ends_with("pwsh.exe"))
-            .unwrap()
-            .config;
-        assert_eq!(c.shell_argv(|p| p.ends_with("pwsh.exe")).unwrap(), ["C:\\Program Files\\PowerShell\\7\\pwsh.exe"]);
+        assert_eq!(c.shell.as_deref(), Some("pwsh.exe -NoLogo"));
+        assert_eq!(c.shell_argv.unwrap(), ["C:\\tools\\pwsh.exe", "-NoLogo"]);
+        let c = p("shell = 'C:\\Program Files\\PowerShell\\7\\pwsh.exe'").config;
+        assert_eq!(c.shell_argv.unwrap(), ["C:\\Program Files\\PowerShell\\7\\pwsh.exe"]);
         let l = p("shell = \"\"");
         assert!(l.config.shell.is_none() && l.warnings[0].starts_with("shell:"));
+    }
+
+    #[test]
+    fn a_program_that_is_not_found_or_is_a_network_path_is_refused_with_a_warning() {
+        let l = p(r#"
+shell = "ghost.exe -x"
+[[profiles]]
+name = "Ghost"
+command = "ghost.exe"
+[[profiles]]
+name = "Share"
+command = '\\\\srv\\share\\tool.exe'
+[[profiles]]
+name = "Rel"
+command = ".\\tool.exe"
+[[profiles]]
+name = "Spaces"
+command = "C:\\Program Files\\Git\\bin\\bash.exe -l"
+[[profiles]]
+name = "Ok"
+command = "pwsh.exe"
+directory = '\\\\srv\\share'
+[[profiles]]
+name = "Gone"
+command = "pwsh.exe"
+directory = "D:\\nope"
+"#);
+        assert!(l.config.shell.is_none() && l.config.shell_argv.is_none());
+        let names: Vec<&str> = l.config.profiles.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["Ok", "Gone"], "{:?}", l.warnings);
+        let w = l.warnings.join("\n");
+        assert!(w.contains("shell: `ghost.exe` is not on PATH"), "{w}");
+        assert!(w.contains("profile `Ghost`") && w.contains("is not on PATH"), "{w}");
+        assert!(w.contains("profile `Share`") && w.contains("network"), "{w}");
+        assert!(w.contains("profile `Rel`") && w.contains("not a full path"), "{w}");
+        assert!(w.contains("profile `Spaces`") && w.contains("quotes"), "{w}");
+        // A bad folder keeps the profile and says why, once at read time and again on use.
+        let ok = &l.config.profiles[0];
+        assert!(ok.start_dir.is_none() && ok.dir_problem.as_deref().unwrap().contains("network"));
+        let gone = &l.config.profiles[1];
+        assert!(gone.start_dir.is_none() && gone.dir_problem.as_deref().unwrap().contains("does not exist"));
+        assert!(w.contains("profile `Ok`: directory") && w.contains("profile `Gone`: directory"), "{w}");
+    }
+
+    #[test]
+    fn the_custom_themes_come_from_the_folder_the_host_names() {
+        let dir = std::env::temp_dir().join(format!("forgetty-themes-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("mine.toml"), "name = \"My Theme\"\n[colors]\nforeground = \"#102030\"\nbackground = \"#405060\"\n").unwrap();
+        let mut h = host();
+        h.themes_dir = Some(dir.clone());
+        let l = Config::parse_with("theme = \"My Theme\"", &h).unwrap();
+        assert!(l.warnings.is_empty(), "{:?}", l.warnings);
+        assert_eq!((l.config.foreground, l.config.background), (0x102030, 0x405060));
+        let idx = ThemeIndex::build(&dir);
+        assert!(idx.names.iter().any(|n| n == "My Theme") && idx.names.len() >= 400);
+        assert_eq!(idx.colors("My Theme").unwrap().background, 0x405060);
+        assert_eq!(idx.colors("Nord").unwrap().background, theme_colors("Nord").unwrap().background);
+        assert!(idx.colors("No Such").is_none());
+        // Without the folder the theme is unknown.
+        h.themes_dir = Some(dir.join("absent"));
+        assert!(Config::parse_with("theme = \"My Theme\"", &h).unwrap().warnings[0].contains("not found"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn open_configuration_file_only_takes_a_local_toml_path() {
+        assert!(open_refusal(Path::new("C:\\Users\\v\\AppData\\forgetty\\config.toml")).is_none());
+        assert!(open_refusal(Path::new("/tmp/x/CONFIG.TOML")).is_none());
+        for bad in ["C:\\Windows\\System32\\calc.exe", "/tmp/x/config", "/tmp/x/config.toml.exe", "/tmp/x/.toml", "C:\\x\\evil.bat"] {
+            let r = open_refusal(Path::new(bad));
+            assert!(r.as_deref().is_some_and(|t| t.contains("not a .toml")), "{bad}: {r:?}");
+        }
+        assert!(open_refusal(Path::new("\\\\srv\\share\\config.toml")).unwrap().contains("network"));
     }
 
     #[test]
@@ -1026,7 +1192,7 @@ command = "x"
         assert_eq!(d.summary(), "font, bell, paste");
         let mut c = a.clone();
         c.ansi[3] = 1;
-        c.profiles.push(Profile { name: "x".into(), command: "x".into(), argv: vec!["x".into()], directory: None, icon: None });
+        c.profiles.push(Profile { name: "x".into(), command: "x".into(), argv: vec!["x".into()], directory: None, start_dir: None, dir_problem: None, icon: None });
         let d = diff(&a, &c);
         assert!(d.colors && d.profiles && !d.font);
         let mut e = a.clone();

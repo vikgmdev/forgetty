@@ -58,8 +58,13 @@ const TEMPLATE: &str = "# Forgetty configuration. Changes apply when you save th
 # directory = \"~\"\n";
 
 /// Open the config file in the editor Windows has for it, or Notepad. The file is created first
-/// (with a commented template) when it is missing.
+/// (with a commented template) when it is missing. Only a local `.toml` path is touched
+/// (`FORGETTY_CONFIG` can name anything); see [`open_refusal`]. It reads and writes the disk:
+/// call it from a worker thread.
 pub fn open_in_editor(path: &std::path::Path) -> Result<(), String> {
+    if let Some(why) = open_refusal(path) {
+        return Err(why);
+    }
     if !path.exists() {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
