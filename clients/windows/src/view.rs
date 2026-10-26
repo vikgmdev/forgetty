@@ -153,6 +153,8 @@ pub struct TerminalView {
     pub shape_misses: u64,
     pub rows_reshaped_last: usize,
     pub last_gen: u64,
+    /// Bumped by every resize and reset of the VT (a copy in slices checks its rows when it moves).
+    pub grid_gen: u64,
     pub focus: FocusHandle,
     pub scroll_accum: f32,
     pub sel: Option<Sel>,
@@ -280,9 +282,10 @@ struct CopyTask {
     job: CopyJob,
     smart: bool,
     fp: Fingerprint,
-    /// What was fed to the terminal (`fed_bytes`, `resets`) when `fp` last matched. The rows
-    /// can only move when the terminal is fed, so while this is the same nothing is checked.
-    checked: (u64, u64),
+    /// `copy_stamp()` when `fp` last matched. The rows move only when the terminal is fed,
+    /// resized (reflow) or reset, and each of those changes the stamp: while it is the same,
+    /// nothing is checked.
+    checked: (u64, u64, u64),
 }
 
 /// Fingerprint of rows `lo..hi` of the buffer (see `fingerprint.rs`).
@@ -410,6 +413,7 @@ impl TerminalView {
             shape_misses: 0,
             rows_reshaped_last: 0,
             last_gen: 0,
+            grid_gen: 0,
             focus: cx.focus_handle(),
             scroll_accum: 0.0,
             sel: None,
@@ -675,6 +679,8 @@ impl TerminalView {
     /// again until the window size changes.
     fn resize_vt(&mut self, rows: usize, cols: usize) -> bool {
         let ok = self.term.resize(rows, cols);
+        // A resize can reflow the rows a copy is reading.
+        self.grid_gen += 1;
         let (r, c) = if ok { (rows, cols) } else { self.term.grid_size() };
         self.resize_refused = if ok { None } else { Some((rows, cols)) };
         if (r, c) != (self.rows, self.cols) || self.row_hash.len() != r {
@@ -1329,6 +1335,12 @@ impl TerminalView {
     /// told, as in GTK.
     pub fn reset_terminal(&mut self, cx: &mut Context<Self>) {
         self.term.reset();
+        self.grid_gen += 1;
+        if self.copy_task.take().is_some() {
+            // The scrollback it was reading is gone. Nothing goes to the clipboard.
+            self.copy_driver = false;
+            self.show_notice("Copy stopped: the terminal was reset.".into(), cx);
+        }
         self.row_hash = vec![0; self.rows];
         self.rows_shaped = vec![None; self.rows];
         self.last_gen = 0;
@@ -1692,7 +1704,7 @@ impl TerminalView {
         let mut rt = RowText::default();
         let fp = rows_fp(&self.term, &mut rt, r0, (r1 + 1).min(settled));
         let n = job.total_rows();
-        let checked = (self.fed_bytes, self.resets);
+        let checked = self.copy_stamp();
         self.copy_task = Some(CopyTask { job, smart, fp, checked });
         self.show_notice(format!("Copying {n} lines..."), cx);
         self.copy_drive(cx);
@@ -1714,10 +1726,15 @@ impl TerminalView {
         .detach();
     }
 
+    /// What can move the rows under a copy: bytes fed, a fresh VT, a resize or a reset.
+    fn copy_stamp(&self) -> (u64, u64, u64) {
+        (self.fed_bytes, self.resets, self.grid_gen)
+    }
+
     /// One slice of a big copy. True while more is to come.
     fn copy_tick(&mut self, cx: &mut Context<Self>) -> bool {
         let started = Instant::now();
-        let gen = (self.fed_bytes, self.resets);
+        let gen = self.copy_stamp();
         let Some(task) = self.copy_task.as_mut() else {
             self.copy_driver = false;
             return false;

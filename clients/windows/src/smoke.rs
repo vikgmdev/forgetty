@@ -799,6 +799,30 @@ impl ShellSmoke {
                         check("search_over_full_scrollback_finds_new_lines", found && restarts >= 1);
                         let _ = extends;
                         v.close_search(vcx);
+                        // A Reset or a resize during a big copy: the rows it reads may be gone or
+                        // reflowed. A reset ends the copy at once and the clipboard stays as it was;
+                        // a resize makes the next slice check its rows again.
+                        let total = v.term.scrollbar_state().0 as usize;
+                        let cols = v.cols;
+                        v.sel = Some(crate::view::Sel::new(crate::view::SelMode::Normal, (0, 0), (total - 1, cols - 1)));
+                        vcx.write_to_clipboard(gpui::ClipboardItem::new_string("before".to_string()));
+                        v.copy_selection_as(true, vcx);
+                        let pending = v.copy_pending();
+                        let g0 = v.grid_gen;
+                        let b = v.bounds;
+                        let narrower = gpui::Bounds { origin: b.origin, size: gpui::size(b.size.width - v.metrics.cell_w * 3.0, b.size.height) };
+                        v.apply_bounds(narrower);
+                        let resized = v.grid_gen > g0;
+                        v.apply_bounds(b);
+                        v.reset_terminal(vcx);
+                        check("big_copy_starts_for_the_reset_check", pending);
+                        check("resize_marks_the_copy_rows_for_a_new_check", resized);
+                        check("reset_ends_a_big_copy", !v.copy_pending());
+                        check(
+                            "reset_during_a_copy_says_so_and_keeps_the_clipboard",
+                            v.notice_text().is_some_and(|t| t.contains("reset"))
+                                && vcx.read_from_clipboard().and_then(|i| i.text()).as_deref() == Some("before"),
+                        );
                         return true;
                     }
                     return false;
