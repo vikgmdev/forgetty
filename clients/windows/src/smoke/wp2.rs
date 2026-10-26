@@ -400,7 +400,7 @@ impl ShellSmoke {
                 let shown = shell.active_pane().and_then(|p| shell.views.get(&p).cloned()).and_then(|v| v.read(cx).notice_text());
                 until!(shown.as_ref().is_some_and(|t| t.starts_with("Failed")));
                 check("backend_error_is_shown_as_a_notice", true);
-                self.goto(super::Phase::RSetup);
+                self.goto(super::Phase::Wp3);
             }
             _ => {}
         }

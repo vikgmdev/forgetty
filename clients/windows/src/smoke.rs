@@ -27,6 +27,7 @@ mod real;
 mod remote;
 mod wp1;
 mod wp2;
+mod wp3;
 
 pub const KEYSTROKES: usize = 100;
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(420);
@@ -166,6 +167,8 @@ enum Phase {
     Rename,
     // WP2: menus, workspace and tab operations, attention.
     Wp2,
+    // WP3: config, hot reload, zoom, profiles, notification mode.
+    Wp3,
     // W3: remote machines.
     RSetup,
     RPair,
@@ -220,6 +223,7 @@ impl Phase {
             Phase::PaletteRun => "w2-palette-run",
             Phase::Rename => "w2-rename",
             Phase::Wp2 => "wp2-menus-workspaces-attention",
+            Phase::Wp3 => "wp3-config-reload-zoom-profiles",
             Phase::RSetup => "w3-start-server-and-pair",
             Phase::RPair => "w3-wait-for-panes",
             Phase::REcho => "w3-remote-echo",
@@ -292,6 +296,7 @@ pub struct ShellSmoke {
     w7: remote::W7,
     wp1: wp1::Wp1,
     wp2: wp2::Wp2,
+    wp3: wp3::Wp3,
     real: real::Real,
 }
 
@@ -386,6 +391,7 @@ impl ShellSmoke {
             w7: remote::W7::default(),
             wp1: wp1::Wp1::default(),
             wp2: wp2::Wp2::default(),
+            wp3: wp3::Wp3::default(),
             real: real::Real::new(real_distro),
         }
     }
@@ -1388,6 +1394,7 @@ impl ShellSmoke {
                 }
             }
             Phase::Wp2 => self.wp2(shell, window, cx),
+            Phase::Wp3 => self.wp3(shell, window, cx),
             Phase::RSetup | Phase::RPair | Phase::REcho | Phase::RKeys | Phase::RKill | Phase::RRestart | Phase::RToast | Phase::RServer | Phase::W5View => {
                 self.w3_step(shell, window, cx, now_t)
             }
