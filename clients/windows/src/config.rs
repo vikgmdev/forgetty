@@ -5,13 +5,20 @@ use std::path::PathBuf;
 
 pub use forgetty_shell_core::config::*;
 
-/// `FORGETTY_CONFIG`, else `%APPDATA%\forgetty\config.toml`.
-pub fn config_path() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("FORGETTY_CONFIG") {
-        return Some(PathBuf::from(p));
-    }
+fn default_path() -> Option<PathBuf> {
     let base = std::env::var_os("APPDATA").map(PathBuf::from)?;
     Some(base.join("forgetty").join("config.toml"))
+}
+
+/// `FORGETTY_CONFIG` when it is a local path, else `%APPDATA%\forgetty\config.toml`. A network
+/// path in the variable is not used (see [`env_refusal`]).
+pub fn config_path() -> Option<PathBuf> {
+    pick_config_path(std::env::var("FORGETTY_CONFIG").ok(), default_path()).0
+}
+
+/// Why `FORGETTY_CONFIG` is not used, when it is set to a network or device path.
+pub fn env_refusal() -> Option<String> {
+    pick_config_path(std::env::var("FORGETTY_CONFIG").ok(), default_path()).1
 }
 
 /// What the first read found.
@@ -24,6 +31,15 @@ pub struct Startup {
 }
 
 pub fn load() -> Startup {
+    let mut s = load_file();
+    // A network FORGETTY_CONFIG was not used: say so first.
+    if let Some(why) = env_refusal() {
+        s.warnings.insert(0, why);
+    }
+    s
+}
+
+fn load_file() -> Startup {
     let Some(path) = config_path() else {
         return Startup { config: Config::default(), warnings: Vec::new(), error: None };
     };
@@ -72,10 +88,17 @@ pub fn open_in_editor(path: &std::path::Path) -> Result<(), String> {
         std::fs::write(path, TEMPLATE).map_err(|e| e.to_string())?;
     }
     use windows::core::{w, PCWSTR};
+    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE};
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
     let wide: Vec<u16> = path.as_os_str().to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect();
+    // ShellExecuteW wants COM on the calling thread, and this runs on a background thread that has
+    // none. A thread that already has COM in another mode (RPC_E_CHANGED_MODE) is left alone.
+    let com = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) }.is_ok();
     let h = unsafe { ShellExecuteW(None, w!("open"), PCWSTR(wide.as_ptr()), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL) };
+    if com {
+        unsafe { CoUninitialize() };
+    }
     if h.0 as isize > 32 {
         return Ok(());
     }

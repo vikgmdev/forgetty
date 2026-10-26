@@ -860,6 +860,20 @@ pub fn reload_notice(ch: &Changes, warnings: &[String], asked: bool) -> Option<S
     Some(text)
 }
 
+/// The config file path: `FORGETTY_CONFIG` (`env`) when it is a local path, else `default`.
+/// The second value is the notice when the variable was set but refused: a network or device
+/// path would make the load, the watch and the theme list touch a share, so the default is used.
+pub fn pick_config_path(env: Option<String>, default: Option<PathBuf>) -> (Option<PathBuf>, Option<String>) {
+    match env.filter(|v| !v.trim().is_empty()) {
+        Some(v) if crate::osc::is_safe_local_path(&v) => (Some(PathBuf::from(v)), None),
+        Some(v) => (
+            default,
+            Some(format!("FORGETTY_CONFIG {} is a network or device path, so the default configuration file is used", crate::notify::sanitize(&v, 40))),
+        ),
+        None => (default, None),
+    }
+}
+
 /// Why "Open configuration file" must not touch `path`, or `None` when it may. `FORGETTY_CONFIG`
 /// can name any path, and the action opens it with the shell's `open` verb and may write a
 /// template to it, so only a `.toml` file on a local path qualifies.
@@ -1141,6 +1155,21 @@ directory = "D:\\nope"
         h.themes_dir = Some(dir.join("absent"));
         assert!(Config::parse_with("theme = \"My Theme\"", &h).unwrap().warnings[0].contains("not found"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_network_forgetty_config_is_not_used() {
+        let d = Some(PathBuf::from("C:\\Users\\v\\AppData\\forgetty\\config.toml"));
+        let (p, why) = pick_config_path(Some("D:\\x\\c.toml".into()), d.clone());
+        assert_eq!(p.unwrap(), PathBuf::from("D:\\x\\c.toml"));
+        assert!(why.is_none());
+        for bad in ["\\\\srv\\share\\c.toml", "//srv/share/c.toml", "\\\\?\\UNC\\srv\\s\\c.toml", "\\??\\UNC\\srv\\s\\c.toml"] {
+            let (p, why) = pick_config_path(Some(bad.into()), d.clone());
+            assert_eq!(p, d, "{bad}");
+            assert!(why.unwrap().contains("default configuration file"), "{bad}");
+        }
+        assert_eq!(pick_config_path(None, d.clone()), (d.clone(), None));
+        assert_eq!(pick_config_path(Some("  ".into()), d.clone()), (d, None));
     }
 
     #[test]
