@@ -1588,10 +1588,7 @@ impl ShellSmoke {
                 self.sub_t0 = Instant::now();
             }
             // ---- WP1: terminal pane parity (find, links, copy, scrollbar, bell, ...) --------------
-            100..=108 => {
-                let cfg = shell.cfg.clone();
-                self.wp1(window, cx, &cfg)
-            }
+            100..=108 => self.wp1(shell, window, cx),
             // ---- OSC 52 (a program sets the clipboard): write only, per machine ----------------
             50..=61 => self.w7_clipboard(shell, cx),
             70..=72 => self.w7_ime(window, cx),

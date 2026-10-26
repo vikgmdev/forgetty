@@ -42,8 +42,11 @@ pub struct Wp1 {
     tx: Option<async_channel::Sender<PaneEvent>>,
     fed: u64,
     toasts: usize,
+    shot_frames: u32,
 }
 
+/// The screenshot of the real pane with the find bar, link, code block and scrollbar showing.
+pub const WP1_SHOT: &str = "wp1-panes.png";
 const ROWS: usize = 10;
 const COLS: usize = 40;
 const SIMPLE_URL: &str = "https://example.com/a_(b)";
@@ -63,11 +66,29 @@ fn content() -> Vec<u8> {
     s.push_str(&format!("see {SIMPLE_URL}). end\r\n"));
     s.push_str(&format!("wrap: {WRAPPED_URL}"));
     s.push_str("\r\n");
-    s.push_str("\u{250c}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2510}\r\n");
+    // 11 columns wide: corner, nine rules, corner.
+    s.push_str("\u{250c}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2510}\r\n");
     s.push_str("\u{2502} code(x) \u{2502}\r\n");
-    s.push_str("\u{2502} more     \u{2502}\r\n");
-    s.push_str("\u{2514}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2518}\r\n");
+    s.push_str("\u{2502} more    \u{2502}\r\n");
+    s.push_str("\u{2514}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2518}\r\n");
     s.push_str("FIND-ME two");
+    s.into_bytes()
+}
+
+/// What a program would print into a real pane for the screenshot: scrollback, then a box with
+/// a link and a marker inside it, then a marker below.
+fn shot_content() -> Vec<u8> {
+    let mut s = String::from("\r\n");
+    for i in 1..=70 {
+        s.push_str(&format!("fill-{i}\r\n"));
+    }
+    let inner = 29;
+    s.push_str(&format!("\u{250c}{}\u{2510}\r\n", "\u{2500}".repeat(inner)));
+    for line in [" see https://example.com/x", " run FIND-me in the log"] {
+        s.push_str(&format!("\u{2502}{line:<inner$}\u{2502}\r\n"));
+    }
+    s.push_str(&format!("\u{2514}{}\u{2518}\r\n", "\u{2500}".repeat(inner)));
+    s.push_str("FIND-me again below\r\n");
     s.into_bytes()
 }
 
@@ -83,7 +104,8 @@ impl ShellSmoke {
         }
     }
 
-    pub(super) fn wp1(&mut self, window: &mut Window, cx: &mut Context<AppShell>, cfg: &crate::config::Config) {
+    pub(super) fn wp1(&mut self, shell: &mut AppShell, window: &mut Window, cx: &mut Context<AppShell>) {
+        let cfg = &shell.cfg.clone();
         if self.sub_t0.elapsed() > Duration::from_secs(20) {
             fail(&format!("wp1 checks stuck at step {}", self.sub));
         }
@@ -147,6 +169,7 @@ impl ShellSmoke {
                 v.update(cx, |v, vcx| v.search_key(&super::key("escape"), false, vcx));
                 check("search_escape_closes", v.read(cx).search.is_none());
                 v.update(cx, |v, _| v.term.scroll_viewport_bottom());
+                self.wp1_state_checks(&v, cx);
                 self.wp1_after_search(&v, cx)
             }
             // Two bells right behind each other: one rings, the flash shows.
@@ -202,6 +225,11 @@ impl ShellSmoke {
                     return;
                 }
                 check("bell_rings_again_after_ctrl_c", v.read(cx).bells == 3);
+                // The mouse tests focused this view, which is not in the window: give the focus
+                // back to the pane the user would be typing in (the SendInput tests need it).
+                if let Some(h) = shell.active_pane().and_then(|p| shell.views.get(&p)).map(|v| v.read(cx).focus.clone()) {
+                    window.focus(&h, cx);
+                }
                 self.wp1.view = None;
                 self.wp1.tx = None;
                 self.sub = 50;
@@ -271,7 +299,7 @@ impl ShellSmoke {
         record("wp1_block", json!(block.as_ref().map(|b| (b.top_row, b.bottom_row, b.left_col, b.right_col))));
         check(
             "code_block_found_under_pointer",
-            block.as_ref().is_some_and(|b| b.top_row + 1 == r_box && b.bottom_row == r_box + 2 && b.left_col == 0 && b.right_col == 9),
+            block.as_ref().is_some_and(|b| b.top_row + 1 == r_box && b.bottom_row == r_box + 2 && b.left_col == 0 && b.right_col == 10),
         );
         if let Some(b) = block {
             let btn = point(px((b.right_col as f32 + 1.0) * cw - 12.0), px(b.top_row as f32 * lh + 12.0));
@@ -347,8 +375,10 @@ impl ShellSmoke {
         v.update(cx, |v, _| v.resolve_paste(false));
         let small = v.update(cx, |v, _| v.send_paste("short"));
         check("paste_over_limit_asks_first", asked && large && !small);
+    }
 
-        // ---- clear and reset ----
+    /// Clear, reset and the cursor color: they wipe the screen, so they run after the search.
+    fn wp1_state_checks(&mut self, v: &Entity<TerminalView>, cx: &mut Context<AppShell>) {
         v.update(cx, |v, vcx| {
             v.capture_input = Some(Vec::new());
             v.clear_terminal(vcx);
@@ -399,8 +429,10 @@ impl ShellSmoke {
 impl ShellSmoke {
     /// The find bar and the program notifications on the real ConPTY panes of the 4-pane tab.
     pub(super) fn wp1_pane(&mut self, shell: &mut AppShell, window: &mut Window, cx: &mut Context<AppShell>) {
-        let (p0, p1) = (self.panes4[0], self.panes4[1]);
-        let (Some(v0), Some(v1)) = (shell.views.get(&p0).cloned(), shell.views.get(&p1).cloned()) else { fail("wp1 pane views vanished") };
+        let (p0, p1, p3) = (self.panes4[0], self.panes4[1], self.panes4[3]);
+        let (Some(v0), Some(v1), Some(v3)) = (shell.views.get(&p0).cloned(), shell.views.get(&p1).cloned(), shell.views.get(&p3).cloned()) else {
+            fail("wp1 pane views vanished")
+        };
         if self.sub_t0.elapsed() > Duration::from_secs(12) {
             record("wp1_pane_stuck_at", json!(self.sub));
             fail(&format!("wp1 pane checks stuck at step {}", self.sub));
@@ -431,6 +463,80 @@ impl ShellSmoke {
                 check("search_finds_token_in_real_pane", found >= 2 && spans.len() >= 2);
                 v0.update(cx, |v, vcx| v.search_key(&super::key("escape"), false, vcx));
                 check("search_closes_with_escape", v0.read(cx).search.is_none());
+                // Fill the pane the way a program would, for the screenshot: scrollback, a box
+                // with a link and a marker in it.
+                let bytes = shot_content();
+                self.wp1.fed = v3.read(cx).fed_bytes + bytes.len() as u64;
+                match self.local.pty(p3).map(|p| p.injector()) {
+                    Some(tx) => {
+                        let _ = tx.try_send(PaneEvent::Output(bytes));
+                    }
+                    None => fail("no pty for pane 3"),
+                }
+                self.sub = 4;
+                self.sub_t0 = Instant::now();
+            }
+            4 => {
+                if v3.read(cx).fed_bytes < self.wp1.fed || self.sub_t0.elapsed() < Duration::from_millis(300) {
+                    return;
+                }
+                v3.update(cx, |v, vcx| v.search_set("find-me", vcx));
+                self.sub = 5;
+                self.sub_t0 = Instant::now();
+            }
+            5 => {
+                let Some((done, found, _, _)) = v3.read(cx).search_status() else { return };
+                if !done {
+                    return;
+                }
+                check("search_in_real_pane_finds_scrolled_text", found >= 2);
+                // Put the pointer on the link inside the box: underline, hand, block wash, button.
+                let (rows, bounds, cw, lh) = v3.update(cx, |v, _| {
+                    let (cw, lh) = (f32::from(v.metrics.cell_w), f32::from(v.metrics.line_h));
+                    (rows_of(v), v.bounds, cw, lh)
+                });
+                let Some(r) = rows.iter().position(|t| t.contains("see https://example.com/x")) else {
+                    record("wp1_shot_rows", json!(rows));
+                    check("wp1_shot_content_on_screen", false);
+                    self.sub = 7;
+                    return;
+                };
+                let c = rows[r].find("example").unwrap_or(8);
+                let pos = point(bounds.origin.x + px((c as f32 + 0.5) * cw), bounds.origin.y + px((r as f32 + 0.5) * lh));
+                v3.update(cx, |v, vcx| {
+                    v.on_pointer_move(&MouseMoveEvent { position: pos, pressed_button: None, modifiers: Modifiers::default() }, vcx)
+                });
+                let (link, block, thumb) = {
+                    let v = v3.read(cx);
+                    (v.hover_link.is_some(), v.hover_block.is_some(), v.sb_thumb().is_some())
+                };
+                check("wp1_shot_content_on_screen", true);
+                check("hover_in_real_pane_finds_link_and_code_block", link && block);
+                check("scrollbar_in_real_pane", thumb);
+                self.wp1.shot_frames = 0;
+                self.sub = 6;
+                self.sub_t0 = Instant::now();
+            }
+            6 => {
+                self.wp1.shot_frames += 1;
+                if self.sub_t0.elapsed() < Duration::from_millis(600) || self.wp1.shot_frames < 6 {
+                    return;
+                }
+                let r = crate::screenshot::capture(window, WP1_SHOT);
+                match &r {
+                    Ok(s) => record("wp1_screenshot", json!({"file": WP1_SHOT, "w": s.w, "h": s.h, "method": s.method, "distinct_colors": s.distinct, "non_background_pct": s.busy_pct})),
+                    Err(e) => record("wp1_screenshot", json!({"error": e})),
+                }
+                check("wp1_screenshot", r.as_ref().is_ok_and(|s| s.distinct >= 8));
+                self.sub = 7;
+            }
+            7 => {
+                // Back to a quiet pane: the find bar closes, the pointer leaves.
+                v3.update(cx, |v, vcx| {
+                    v.close_search(vcx);
+                    v.on_pointer_move(&MouseMoveEvent { position: point(px(-9.0), px(-9.0)), pressed_button: None, modifiers: Modifiers::default() }, vcx);
+                    v.term.scroll_viewport_bottom();
+                });
                 // A program asks for a desktop notification (OSC 9) in a pane the user is not in.
                 self.wp1.toasts = shell.toast_log.len();
                 v1.update(cx, |v, _| v.send_bytes(b"prompt $E]9;smoke-ping$E\\$P$G\r"));

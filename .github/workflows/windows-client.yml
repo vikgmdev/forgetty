@@ -91,7 +91,9 @@ jobs:
         with:
           name: forgetty-win-layout-4pane
           if-no-files-found: warn
-          path: clients/windows/target/release/layout-4pane.png
+          path: |
+            clients/windows/target/release/layout-4pane.png
+            clients/windows/target/release/wp1-panes.png
 
       - name: Upload artifact
         if: always()

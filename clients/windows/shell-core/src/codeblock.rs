@@ -521,4 +521,62 @@ mod tests {
         g.paint(0, 0, 2, 5, 0x202020);
         assert_eq!(detect_code_blocks(&g).len(), 0);
     }
+
+    /// The scan runs on pointer moves over changing output, so a full screen of busy text
+    /// (many horizontal rules, many colored cells) must stay cheap.
+    #[test]
+    fn a_busy_full_screen_is_scanned_fast() {
+        let (rows, cols) = (60usize, 240usize);
+        let lines: Vec<String> = (0..rows)
+            .map(|r| match r % 4 {
+                0 => "\u{2500}".repeat(cols),
+                1 => format!("\u{2502}{}\u{2502}", "x".repeat(cols - 2)),
+                2 => "ab cd ".repeat(cols / 6 + 1).chars().take(cols).collect(),
+                _ => "\u{250c}\u{2500}\u{2510}".repeat(cols / 3),
+            })
+            .collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let mut g = G::text_rows(&refs);
+        for r in (0..rows).step_by(3) {
+            g.paint(r, r, 10, 200, 0x112233 + r as u32);
+        }
+        let t = std::time::Instant::now();
+        let _ = detect_code_blocks(&g);
+        let took = t.elapsed();
+        assert!(took < std::time::Duration::from_millis(100), "scan took {took:?}");
+    }
+
+    /// Real libghostty cells: an empty cell has an empty grapheme, a box edge is one char.
+    #[test]
+    fn finds_a_box_on_a_real_screen() {
+        use forgetty_vt::{Color, Screen, Terminal, ANSI_PALETTE_BLACK};
+        struct S<'a>(&'a Screen);
+        impl Grid for S<'_> {
+            fn rows(&self) -> usize {
+                self.0.rows()
+            }
+            fn cols(&self) -> usize {
+                self.0.cols()
+            }
+            fn text(&self, r: usize, c: usize) -> &str {
+                &self.0.cell(r, c).grapheme
+            }
+            fn bg(&self, r: usize, c: usize) -> Option<u32> {
+                match self.0.cell(r, c).attrs.bg {
+                    Color::Default => None,
+                    Color::Rgb(r, g, b) => Some(((r as u32) << 16) | ((g as u32) << 8) | b as u32),
+                }
+            }
+        }
+        let mut t = Terminal::with_scrollback(10, 40, [ANSI_PALETTE_BLACK; 16], 1 << 20);
+        t.feed(
+            "see\r\n\u{250c}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2510}\r\n\u{2502} code(x) \u{2502}\r\n\u{2502} more    \u{2502}\r\n\u{2514}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2518}\r\nend"
+                .as_bytes(),
+        );
+        let screen = t.screen();
+        let found = detect_code_blocks(&S(screen));
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!((found[0].top_row, found[0].bottom_row, found[0].left_col, found[0].right_col), (1, 4, 0, 10));
+        assert_eq!(extract_content(&S(screen), &found[0]), " code(x)\n more");
+    }
 }

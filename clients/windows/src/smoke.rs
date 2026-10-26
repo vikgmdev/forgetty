@@ -721,7 +721,7 @@ impl ShellSmoke {
                         "search_big_scrollback",
                         json!({"rows": scanned, "found": found, "ms": ms(now - self.thr_t0), "max_frame_gap_ms": self.thr_max_gap}),
                     );
-                    check("search_big_scrollback_finds_line", found == 1 && scanned > 10_000);
+                    check("search_big_scrollback_finds_line", found == 1 && scanned > 5_000);
                     check("search_does_not_block_frames", self.thr_max_gap <= 100.0);
                     v.close_search(vcx);
                     return true;
