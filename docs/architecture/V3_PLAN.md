@@ -131,6 +131,74 @@ A green build is not a gate.
 
 P3 can start after P2. P4 and P5 can run in parallel with P3.
 
+### P7 — Phone-native terminal (founder decisions, 2026-10-23)
+
+**Direction.** Forgetty is the self-hosted terminal for running any CLI agent
+from a phone. The terminal grid stays the source of truth. Phone views are
+added on top of it, and the raw grid is always one gesture away. Only standards
+carry the features: OSC 133 (prompt marks), OSC 7 (cwd), OSC 8 (hyperlinks),
+OSC 9 (notifications), kitty graphics and bracketed paste. No Forgetty-only
+escape sequences, except the one private OSC of P7.3, which only the user's own
+shell integration emits.
+
+**Order.** Real-phone test first, then P7.1 and P7.2, then P7.3, then P7.4 and
+P7.5, then P7.6.
+
+**Latency budget.** Local echo in the input box costs 0 ms of network. From
+send to first echo: under 50 ms on WireGuard. Each phase that touches the
+input or output path measures this with a probe, in the same way as the gates
+in section 7.2.
+
+#### P7.1 — Shell integration (the base)
+- The server tracks, per pane: the prompt marks (OSC 133 A, B, C, D with exit
+  code), the cwd (OSC 7) and the tty mode (canonical, echo off, full screen).
+  It sends all three to clients as an additive, capability-flagged part of
+  protocol v2 (`PROTOCOL_V2.md`).
+- The cwd is display only. It is never a spawn directory.
+- Scripts for zsh, bash and fish emit OSC 133 and OSC 7. The server installs
+  them and sources them automatically for shells it starts, when the user
+  enables it (config key). It never edits the user's rc files.
+- **Gate:** a pane per installed shell reports prompt start, command start and
+  end with exit code, the cwd, and echo off during a password-style read. No
+  extra cost per byte beyond the VT parser.
+
+#### P7.2 — Input box on the phone
+- Docked at the bottom, terminal-styled. It grows like Slack's field up to about
+  40 % of the screen, then scrolls. One draft per pane.
+- Native editing, voice input and history.
+- Send is bracketed paste plus Enter. A multi-line paste shows a preview first.
+- Modes come from the server (P7.1): shell prompt, line read, masked, full
+  screen (key row only) and agent TUI.
+- A context key row (Esc, Tab, Ctrl, arrows, and the keys the mode needs).
+- **Gate:** local echo costs 0 ms of network. Send to first echo under 50 ms on
+  WireGuard.
+
+#### P7.3 — Real shell completion
+- The phone asks the user's own connected shell for completions. A hidden key
+  binding runs the shell's own completion and returns the results in a private
+  OSC: zsh completion capture, bash `compgen`, fish `complete -C`.
+- The results show as chips above the input box.
+- **Gate:** completions match what the shell gives at a real prompt, for the
+  three shells, including aliases and functions of the user.
+
+#### P7.4 — Phone-native output
+- Command cards (from the OSC 133 marks), reflow of plain output, tappable
+  URLs, paths, hashes and errors (OSC 8 where the program sets it, detection
+  where it does not).
+- A push notification when a long command finishes.
+- **Gate:** the raw grid view of the same pane is unchanged and one gesture
+  away.
+
+#### P7.5 — Agent-aware panes
+- Agent state from agent hooks, a push notification with Approve and Deny, a
+  dashboard of all panes, and diffs that fit the screen.
+- **Gate:** an agent waiting for approval is approved from the lock screen.
+
+#### P7.6 — Other users
+- Optional relay per server, code signing, onboarding.
+- **Gate:** a person who is not the author installs the server and the app and
+  pairs without help.
+
 ## 6. Risks
 
 - **Server sits on the prod VLAN.** A paired device gets a shell as the server
