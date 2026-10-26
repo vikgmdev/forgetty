@@ -12,11 +12,16 @@ use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
 
 use forgetty_core::Rgba as CoreRgba;
+use forgetty_shell_core::bell::{self, BellGate};
+use forgetty_shell_core::codeblock::{self, CodeBlock};
+use forgetty_shell_core::links::{self, Link, LogicalLine};
+use forgetty_shell_core::scrollbar;
+use forgetty_shell_core::search::{self, SearchJob};
 use forgetty_shell_core::selection::{self, AUTOSCROLL_TICK};
 use forgetty_shell_core::{copytext, paste as paste_rules, PaneEvent, PaneId, PaneSource};
 use forgetty_vt::ffi;
 use forgetty_vt::screen::{CellAttributes, Color};
-use forgetty_vt::{RowText, Screen, Terminal};
+use forgetty_vt::{RowText, Screen, Terminal, TerminalEvent};
 use gpui::{
     div, font, point, prelude::*, px, rgb, size, App, Bounds, ClipboardItem, Context, FocusHandle,
     Focusable, Font, FontStyle, FontWeight, Hsla, IntoElement, KeyDownEvent, KeyUpEvent,
@@ -28,6 +33,7 @@ use gpui::{
 use crate::config::Config;
 use crate::element::TerminalElement;
 use crate::encoder::{self, Input};
+use crate::lineedit::{EditResult, LineEdit};
 
 const SHAPE_CACHE_MAX: usize = 4096;
 const FEED_CHUNK: usize = 256 * 1024;
@@ -37,6 +43,19 @@ const REPLAY_MAX: Duration = Duration::from_secs(2);
 /// How long the "input dropped" notice shows.
 const DROP_NOTICE: Duration = Duration::from_secs(4);
 const NOTICE_FOR: Duration = Duration::from_secs(8);
+/// The copy button of a code block, in px (GTK: 24).
+pub const CODE_BTN: f32 = 24.0;
+/// How long the copy button shows a check mark after a copy.
+const COPIED_FOR: Duration = Duration::from_millis(1500);
+/// Code blocks are looked for at most this often while the pointer moves over changing output.
+const CODE_SCAN_GAP: Duration = Duration::from_millis(50);
+/// Width of the scrollbar and the shortest thumb, in px.
+const SB_W: f32 = 10.0;
+const SB_MIN_THUMB: f32 = 24.0;
+/// One slice of a scrollback search on the UI thread. Input and paint run between slices.
+const SEARCH_SLICE: Duration = Duration::from_millis(4);
+/// New output makes the matches stale. The scan starts again after this, not on every chunk.
+const SEARCH_RESTART_GAP: Duration = Duration::from_millis(500);
 
 /// Scale brightness (same as a black overlay of alpha 1-k).
 pub fn shade(c: Hsla, k: f32) -> Hsla {
@@ -136,6 +155,8 @@ pub struct TerminalView {
     last_pointer: Point<Pixels>,
     /// The auto-scroll timer of a selection drag is running.
     autoscrolling: bool,
+    /// The scrollbar thumb is held: where in the thumb it was grabbed, in px from its top.
+    sb_drag: Option<f32>,
     pub mouse_reporting: bool,
     pub marked: Option<String>,
     pub cursor_on: bool,
@@ -160,6 +181,26 @@ pub struct TerminalView {
     pub ime_bounds_calls: u32,
     pub ime_bounds_last: Option<(usize, usize, f32, f32, f32, f32, f32, f32)>,
     pub pending_paste: Option<PendingPaste>,
+    pub search: Option<SearchState>,
+    /// The http(s) link under the pointer, and the cell and screen generation it was found for.
+    pub hover_link: Option<Link>,
+    hover_cell: Option<(usize, usize)>,
+    hover_gen: u64,
+    /// Smoke: opening a link only records it.
+    smoke_mode: bool,
+    pub opened_urls: Vec<String>,
+    /// Code blocks of the viewport, found when the pointer moves over changed output.
+    code_blocks: Vec<CodeBlock>,
+    code_gen: Option<u64>,
+    code_scanned: Option<Instant>,
+    pub hover_block: Option<CodeBlock>,
+    copied_until: Option<Instant>,
+    bell: BellGate,
+    bell_until: Option<Instant>,
+    /// Bells that passed the rate limit (the smoke reads it).
+    pub bells: u32,
+    /// The grid size or the VT changed since the last frame: row numbers moved.
+    layout_changed: bool,
     /// 0.0 normal, otherwise the share of brightness removed (unfocused pane in a split).
     pub dim: f32,
     /// Set after a VT reset: the next resize is sent even if the size is unchanged.
@@ -189,6 +230,28 @@ pub struct TerminalView {
     pub fed_bytes: u64,
     pub feed_time: Duration,
     pub max_feed: Duration,
+}
+
+/// The find bar of a pane and the scan behind it.
+pub struct SearchState {
+    pub edit: LineEdit,
+    /// The scan for the current query. Holds the matches (all of them once it is done).
+    pub job: Option<SearchJob>,
+    /// Index into `job.matches` of the match Enter moved to.
+    pub current: usize,
+    /// When the scan ends, move to the first match at or below the viewport and scroll to it.
+    /// Set by a new query, not by a restart for new output (that must not move the view).
+    jump: bool,
+    /// The match (row, col) that was current before a restart for new output.
+    keep: Option<(u32, u16)>,
+    /// Output arrived since the scan started.
+    stale: bool,
+    started: Instant,
+    /// The timer task that runs the slices is alive.
+    driver: bool,
+    /// The scan just finished for a new query: scroll to the current match.
+    scroll_now: bool,
+    scratch: RowText,
 }
 
 /// A paste waiting for the user's confirmation (Enter pastes, Esc cancels).
@@ -311,6 +374,7 @@ impl TerminalView {
             selecting: false,
             last_pointer: Point::default(),
             autoscrolling: false,
+            sb_drag: None,
             mouse_reporting: false,
             marked: None,
             cursor_on: true,
@@ -328,6 +392,21 @@ impl TerminalView {
             ime_bounds_calls: 0,
             ime_bounds_last: None,
             pending_paste: None,
+            search: None,
+            hover_link: None,
+            hover_cell: None,
+            hover_gen: 0,
+            smoke_mode,
+            opened_urls: Vec::new(),
+            code_blocks: Vec::new(),
+            code_gen: None,
+            code_scanned: None,
+            hover_block: None,
+            copied_until: None,
+            bell: BellGate::default(),
+            bell_until: None,
+            bells: 0,
+            layout_changed: false,
             dim: 0.0,
             force_size: false,
             replaying: false,
@@ -366,6 +445,7 @@ impl TerminalView {
         self.sel = None;
         self.scroll_accum = 0.0;
         self.force_size = true;
+        self.layout_changed = true;
         self.resets += 1;
     }
 
@@ -404,6 +484,10 @@ impl TerminalView {
                 cx.emit(ViewEvent::Clipboard(req));
             }
             self.fed_bytes += bytes.len() as u64;
+            if let Some(st) = self.search.as_mut() {
+                st.stale = true;
+            }
+            self.search_drive(cx);
             self.feed_time += dt;
             self.max_feed = self.max_feed.max(dt);
             // Terminal replies (DA, CPR, mode queries). ConPTY waits on these.
@@ -418,8 +502,13 @@ impl TerminalView {
                     self.source.write_auto(&resp);
                 }
             }
-            // Titles and cwd come from the backend (it scans the same bytes).
-            drop(self.term.drain_events());
+            // Titles and cwd come from the backend (it scans the same bytes). A bell in replayed
+            // output rang long ago.
+            for ev in self.term.drain_events() {
+                if matches!(ev, TerminalEvent::Bell) && !self.replaying {
+                    self.ring_bell(cx);
+                }
+            }
         }
         // With `replay_end` from the server the replay ends exactly there. Without it, the
         // replay is over when the channel drains or after `REPLAY_MAX`.
@@ -534,6 +623,7 @@ impl TerminalView {
         self.rows_shaped = vec![None; rows];
         self.last_gen = 0;
         self.sel = None;
+        self.layout_changed = true;
     }
 
     /// The server reported a new PTY size for this pane (`PaneResized`). A letterboxed view
@@ -554,6 +644,7 @@ impl TerminalView {
         self.rows_shaped = vec![None; rows];
         self.last_gen = 0;
         self.sel = None;
+        self.layout_changed = true;
         cx.notify();
     }
 
@@ -607,6 +698,536 @@ impl TerminalView {
         self.last_gen = gen_now;
     }
 
+    // ---- bell -------------------------------------------------------------------------
+
+    fn ring_bell(&mut self, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        if !self.bell.ring(now) {
+            return;
+        }
+        self.bells += 1;
+        let mode = self.cfg.bell_mode;
+        if mode.visual() {
+            self.bell_until = Some(now + bell::FLASH);
+            if self.visible {
+                cx.notify();
+            }
+            // One more frame when the flash is over, so it goes away without other input.
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(bell::FLASH + Duration::from_millis(20)).await;
+                let _ = this.update(cx, |v, cx| {
+                    if v.visible {
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
+        if mode.audio() && !self.smoke_mode {
+            crate::winsys::beep();
+        }
+    }
+
+    /// The white wash of a visual bell is on screen.
+    pub fn bell_flash(&self) -> bool {
+        self.bell_until.is_some_and(|t| Instant::now() < t)
+    }
+
+    // ---- links and code blocks -------------------------------------------------------------
+
+    /// The http(s) link that covers the viewport cell, looking through the whole wrapped line.
+    pub(crate) fn link_at(&mut self, vrow: usize, col: usize) -> Option<Link> {
+        let screen = self.term.screen();
+        let rows = screen.rows();
+        if vrow >= rows {
+            return None;
+        }
+        let (mut a, mut b) = (vrow, vrow);
+        while a > 0 && vrow - a < 16 && screen.is_row_wrapped(a - 1) {
+            a -= 1;
+        }
+        while b + 1 < rows && b - vrow < 16 && screen.is_row_wrapped(b) {
+            b += 1;
+        }
+        let mut line = LogicalLine::new();
+        for r in a..=b {
+            for (c, cell) in screen.row(r).iter().enumerate() {
+                if !cell.attrs.spacer {
+                    line.push(r, c, &cell.grapheme);
+                }
+            }
+        }
+        links::link_at(&line, vrow, col)
+    }
+
+    /// The pointer moved anywhere in the window: update the link and the code block under it.
+    fn update_hover(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
+        let (x, y) = self.local_unclamped(pos);
+        let grid_w = f32::from(self.metrics.cell_w) * self.cols as f32;
+        let grid_h = f32::from(self.metrics.line_h) * self.rows as f32;
+        let inside = x >= 0.0 && y >= 0.0 && x < grid_w && y < grid_h && self.bounds.contains(&pos);
+        // Apps that track the mouse own the clicks, and a drag in progress owns the pointer.
+        if !inside || self.selecting || self.sb_drag.is_some() || self.term.is_mouse_tracking() {
+            self.clear_hover(cx);
+            return;
+        }
+        let (vr, col) = self.cell_at(pos);
+        let gen = self.term.screen().generation();
+        if self.hover_cell == Some((vr, col)) && self.hover_gen == gen {
+            return;
+        }
+        self.hover_cell = Some((vr, col));
+        self.hover_gen = gen;
+        let link = self.link_at(vr, col);
+        let mut changed = link != self.hover_link;
+        self.hover_link = link;
+
+        let block = if self.term.is_alternate_screen() { None } else { self.block_at(vr, col, gen) };
+        if block != self.hover_block {
+            self.hover_block = block;
+            changed = true;
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
+    fn clear_hover(&mut self, cx: &mut Context<Self>) {
+        self.hover_cell = None;
+        if self.hover_link.take().is_some() | self.hover_block.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// The code block under a cell. The blocks are found again when the output changed, at
+    /// most every `CODE_SCAN_GAP`.
+    pub(crate) fn block_at(&mut self, vr: usize, col: usize, gen: u64) -> Option<CodeBlock> {
+        if self.code_gen != Some(gen) && self.code_scanned.is_none_or(|t| t.elapsed() >= CODE_SCAN_GAP) {
+            self.code_blocks = codeblock::detect_code_blocks(&ScreenGrid(self.term.screen()));
+            self.code_gen = Some(gen);
+            self.code_scanned = Some(Instant::now());
+        }
+        self.code_blocks.iter().find(|b| b.contains(vr, col)).cloned()
+    }
+
+    /// The link underline for this frame: `(row, first col, one past the last col)`. Empty when
+    /// the output changed since the pointer found the link (the cells moved).
+    pub fn link_spans(&mut self) -> Vec<(usize, usize, usize)> {
+        if self.hover_link.is_none() {
+            return Vec::new();
+        }
+        if self.term.screen().generation() != self.hover_gen {
+            return Vec::new();
+        }
+        self.hover_link.as_ref().map(|l| l.segments.clone()).unwrap_or_default()
+    }
+
+    /// The code block to highlight, and whether its button shows the check mark. Like links,
+    /// only while the output is the one the block was found in.
+    pub fn block_highlight(&mut self) -> Option<(CodeBlock, bool)> {
+        let b = self.hover_block.clone()?;
+        if self.term.screen().generation() != self.hover_gen {
+            return None;
+        }
+        let copied = self.copied_until.is_some_and(|t| Instant::now() < t);
+        Some((b, copied))
+    }
+
+    pub fn open_link(&mut self, url: &str, cx: &mut Context<Self>) {
+        if !links::is_openable(url) {
+            return;
+        }
+        if self.smoke_mode {
+            self.opened_urls.push(url.to_string());
+        } else {
+            cx.open_url(url);
+        }
+    }
+
+    /// A click on the copy button of the hovered code block.
+    fn click_code_button(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) -> bool {
+        let Some(b) = self.hover_block.clone() else { return false };
+        let (x, y) = self.local_unclamped(pos);
+        let (cw, lh) = (f32::from(self.metrics.cell_w), f32::from(self.metrics.line_h));
+        let bx = (b.right_col as f32 + 1.0) * cw - CODE_BTN;
+        let by = b.top_row as f32 * lh;
+        if x < bx || x > bx + CODE_BTN || y < by || y > by + CODE_BTN {
+            return false;
+        }
+        let text = codeblock::extract_content(&ScreenGrid(self.term.screen()), &b);
+        if !text.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            self.copied_until = Some(Instant::now() + COPIED_FOR);
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(COPIED_FOR + Duration::from_millis(20)).await;
+                let _ = this.update(cx, |_, cx| cx.notify());
+            })
+            .detach();
+            cx.notify();
+        }
+        true
+    }
+
+    // ---- scrollbar ------------------------------------------------------------------
+
+    /// The track spans the whole pane height. Window y of its top edge and its height.
+    fn sb_track(&self) -> (f32, f32) {
+        let pad = self.cfg.pane_padding_y;
+        (f32::from(self.bounds.origin.y) - pad, f32::from(self.bounds.size.height) + 2.0 * pad)
+    }
+
+    /// The thumb for the current scroll position, as `(top, height)` in the track.
+    pub(crate) fn sb_thumb(&self) -> Option<scrollbar::Thumb> {
+        let (total, off, len) = self.term.scrollbar_state();
+        scrollbar::thumb(total, off, len, self.sb_track().1, SB_MIN_THUMB)
+    }
+
+    fn on_scrollbar_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        cx.stop_propagation();
+        if ev.button != MouseButton::Left {
+            return;
+        }
+        window.focus(&self.focus, cx);
+        let Some(t) = self.sb_thumb() else { return };
+        let y = f32::from(ev.position.y) - self.sb_track().0;
+        // On the thumb: hold it where it was grabbed. On the track: put the thumb's middle there.
+        let grab = if y >= t.top && y <= t.top + t.height { y - t.top } else { t.height / 2.0 };
+        self.sb_drag = Some(grab);
+        self.scrollbar_drag_to(f32::from(ev.position.y), grab, cx);
+    }
+
+    pub(crate) fn scrollbar_drag_to(&mut self, window_y: f32, grab: f32, cx: &mut Context<Self>) {
+        let (total, off, len) = self.term.scrollbar_state();
+        let (top, h) = self.sb_track();
+        let to = scrollbar::offset_at(total, len, h, SB_MIN_THUMB, window_y - top - grab);
+        if to != off {
+            self.scroll_rows(to as isize - off as isize);
+        }
+        cx.notify();
+    }
+
+    /// The scrollbar: a thin strip over the right edge, only while there is scrollback. It
+    /// floats over the text, so it never changes the number of columns (GTK's sits beside it).
+    fn scrollbar_overlay(&self, cx: &mut Context<Self>) -> Option<gpui::Stateful<gpui::Div>> {
+        let t = self.sb_thumb()?;
+        let dragging = self.sb_drag.is_some();
+        let thumb = |a: f32| Hsla { h: 0.0, s: 0.0, l: 1.0, a };
+        Some(
+            div()
+                .id("scrollbar")
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .right_0()
+                .w(px(SB_W))
+                .on_mouse_down(MouseButton::Left, cx.listener(Self::on_scrollbar_down))
+                .child(
+                    div()
+                        .id("scrollbar-thumb")
+                        .absolute()
+                        .top(px(t.top))
+                        .left(px(2.0))
+                        .w(px(SB_W - 4.0))
+                        .h(px(t.height))
+                        .rounded(px(3.0))
+                        .bg(thumb(if dragging { 0.5 } else { 0.22 }))
+                        .hover(move |s| s.bg(thumb(0.4))),
+                ),
+        )
+    }
+
+    // ---- search ---------------------------------------------------------------------
+
+    pub fn toggle_search(&mut self, cx: &mut Context<Self>) {
+        if self.search.is_some() {
+            self.close_search(cx);
+            return;
+        }
+        self.search = Some(SearchState {
+            edit: LineEdit::default(),
+            job: None,
+            current: 0,
+            jump: false,
+            keep: None,
+            stale: false,
+            started: Instant::now(),
+            driver: false,
+            scroll_now: false,
+            scratch: RowText::default(),
+        });
+        cx.notify();
+    }
+
+    /// Open the find bar with `query` already typed (the smoke does this; so could a command).
+    pub fn search_set(&mut self, query: &str, cx: &mut Context<Self>) {
+        if self.search.is_none() {
+            self.toggle_search(cx);
+        }
+        if let Some(st) = self.search.as_mut() {
+            st.edit = LineEdit::new(query);
+        }
+        self.search_restart(cx);
+    }
+
+    /// `(scan finished, matches found, index of the current match, rows scanned)`.
+    pub fn search_status(&self) -> Option<(bool, usize, usize, usize)> {
+        let st = self.search.as_ref()?;
+        let j = st.job.as_ref()?;
+        Some((j.done(), j.found(), st.current, j.progress().0))
+    }
+
+    pub fn close_search(&mut self, cx: &mut Context<Self>) {
+        // Dropping the state ends the timer task at its next tick.
+        self.search = None;
+        cx.notify();
+    }
+
+    pub(crate) fn search_key(&mut self, ks: &gpui::Keystroke, prefer_char: bool, cx: &mut Context<Self>) {
+        let m = &ks.modifiers;
+        match ks.key.as_str() {
+            "escape" => return self.close_search(cx),
+            "enter" => return self.search_goto(!m.shift, cx),
+            "pageup" | "pagedown" => {
+                let page = self.rows.saturating_sub(1).max(1) as isize;
+                self.scroll_rows(if ks.key == "pageup" { -page } else { page });
+                return cx.notify();
+            }
+            "v" if m.control && !m.alt => return self.search_paste(cx),
+            _ => {}
+        }
+        // AltGr layouts report ctrl+alt with the composed character.
+        if prefer_char && m.control && m.alt {
+            if let Some(t) = ks.key_char.as_deref().filter(|t| !t.is_empty()) {
+                return self.search_insert(t, cx);
+            }
+        }
+        let Some(st) = self.search.as_mut() else { return };
+        let before = st.edit.text.clone();
+        let r = st.edit.key(ks);
+        if st.edit.text != before {
+            self.search_restart(cx);
+        } else if r != EditResult::Ignored {
+            cx.notify();
+        }
+    }
+
+    fn search_insert(&mut self, text: &str, cx: &mut Context<Self>) {
+        let clean: String = text.chars().filter(|c| !c.is_control()).collect();
+        if clean.is_empty() {
+            return;
+        }
+        if let Some(st) = self.search.as_mut() {
+            st.edit.insert(&clean);
+        }
+        self.search_restart(cx);
+    }
+
+    fn search_paste(&mut self, cx: &mut Context<Self>) {
+        let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) else { return };
+        let first = text.lines().next().unwrap_or("").to_string();
+        self.search_insert(&first, cx);
+    }
+
+    /// The query changed: scan again from the top.
+    fn search_restart(&mut self, cx: &mut Context<Self>) {
+        let total = self.term.scrollbar_state().0 as usize;
+        let Some(st) = self.search.as_mut() else { return };
+        st.job = SearchJob::new(&st.edit.text, total);
+        st.current = 0;
+        st.jump = true;
+        st.keep = None;
+        st.stale = false;
+        st.started = Instant::now();
+        self.search_drive(cx);
+        cx.notify();
+    }
+
+    /// Start the timer task that runs the scan in slices, if it is not running.
+    fn search_drive(&mut self, cx: &mut Context<Self>) {
+        let Some(st) = self.search.as_mut() else { return };
+        if st.driver {
+            return;
+        }
+        st.driver = true;
+        cx.spawn(async move |this, cx| loop {
+            let wait = this.update(cx, |v, cx| {
+                let w = v.search_tick();
+                if v.visible {
+                    cx.notify();
+                }
+                if v.search_jump_pending() {
+                    v.scroll_to_current_match();
+                }
+                w
+            });
+            match wait {
+                Ok(Some(d)) => cx.background_executor().timer(d).await,
+                _ => break,
+            }
+        })
+        .detach();
+    }
+
+    fn search_jump_pending(&mut self) -> bool {
+        self.search.as_mut().is_some_and(|s| std::mem::take(&mut s.scroll_now))
+    }
+
+    /// One slice of work. `Some(wait)` when the task should run again after `wait`.
+    fn search_tick(&mut self) -> Option<Duration> {
+        let total = self.term.scrollbar_state().0 as usize;
+        let top = self.term.scrollbar_state().1 as usize;
+        let st = self.search.as_mut()?;
+        if st.stale && st.started.elapsed() >= SEARCH_RESTART_GAP {
+            st.stale = false;
+            if !st.jump {
+                st.keep = st.job.as_ref().and_then(|j| j.matches.get(st.current)).map(|m| (m.row, m.col));
+            }
+            st.job = SearchJob::new(&st.edit.text, total);
+            st.started = Instant::now();
+        }
+        let Some(job) = st.job.as_mut() else {
+            st.driver = false;
+            return None;
+        };
+        if !job.done() {
+            let term = &self.term;
+            let scratch = &mut st.scratch;
+            let mut reader = |abs: usize, text: &mut String, cols: &mut Vec<u16>| {
+                if !term.row_text(abs, scratch) {
+                    return false;
+                }
+                std::mem::swap(text, &mut scratch.text);
+                std::mem::swap(cols, &mut scratch.cols);
+                true
+            };
+            if job.step(&mut reader, SEARCH_SLICE) {
+                let n = job.matches.len();
+                if st.jump {
+                    st.jump = false;
+                    st.current = search::first_at_or_after(&job.matches, top).unwrap_or(0);
+                    st.scroll_now = true;
+                } else if let Some((r, c)) = st.keep.take() {
+                    st.current = job.matches.partition_point(|m| (m.row, m.col) < (r, c)).min(n.saturating_sub(1));
+                } else {
+                    st.current = st.current.min(n.saturating_sub(1));
+                }
+            } else {
+                return Some(Duration::from_millis(1));
+            }
+        }
+        if st.stale {
+            return Some(SEARCH_RESTART_GAP.saturating_sub(st.started.elapsed()).max(Duration::from_millis(1)));
+        }
+        st.driver = false;
+        None
+    }
+
+    /// Enter / Shift+Enter: the next or previous match, wrapping around.
+    pub(crate) fn search_goto(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Some(st) = self.search.as_mut() else { return };
+        let Some(job) = st.job.as_ref().filter(|j| j.done()) else { return };
+        let n = job.matches.len();
+        if n == 0 {
+            return;
+        }
+        st.current = if forward { search::next_index(st.current, n) } else { search::prev_index(st.current, n) };
+        self.scroll_to_current_match();
+        cx.notify();
+    }
+
+    /// Scroll so the current match is in view, a third of the way down when it was not.
+    fn scroll_to_current_match(&mut self) {
+        let Some(m) = self
+            .search
+            .as_ref()
+            .and_then(|s| s.job.as_ref().and_then(|j| j.matches.get(s.current)))
+            .copied()
+        else {
+            return;
+        };
+        let (total, off, len) = self.term.scrollbar_state();
+        if search::in_view(m.row as usize, off as usize, len as usize) {
+            return;
+        }
+        let target = search::offset_for(m.row as usize, len as usize, total as usize);
+        self.scroll_rows(target as isize - off as isize);
+    }
+
+    /// Matches in the viewport: (viewport row, col, cells, is the current match).
+    pub fn search_spans(&self) -> Vec<(usize, usize, usize, bool)> {
+        let Some(st) = &self.search else { return Vec::new() };
+        let Some(job) = &st.job else { return Vec::new() };
+        let top = self.term.scrollbar_state().1 as usize;
+        let cur = job.done().then(|| job.matches.get(st.current)).flatten();
+        search::visible(&job.matches, top, self.rows)
+            .iter()
+            .map(|m| {
+                let col = (m.col as usize).min(self.cols.saturating_sub(1));
+                let len = (m.len as usize).min(self.cols - col);
+                (m.row as usize - top, col, len, cur == Some(m))
+            })
+            .collect()
+    }
+
+    /// Frame hook: row numbers moved (resize, reset), so the matches are old.
+    pub fn after_layout_change(&mut self, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.layout_changed) {
+            if let Some(st) = self.search.as_mut() {
+                st.stale = true;
+                st.jump = false;
+            }
+            self.search_drive(cx);
+        }
+    }
+
+    /// The find bar, top right of the pane. It floats over the text, so opening it does not
+    /// resize the PTY (GTK puts it above the terminal and the grid shrinks).
+    fn search_overlay(&self) -> Option<gpui::Div> {
+        let st = self.search.as_ref()?;
+        let t = &st.edit.text;
+        let split = t.char_indices().nth(st.edit.cursor).map(|x| x.0).unwrap_or(t.len());
+        let nb = |s: &str| SharedString::from(s.replace(' ', "\u{00a0}"));
+        let label = match &st.job {
+            Some(j) => search::label(!j.done(), false, st.current, j.matches.len() + j.overflow, j.overflow),
+            None => String::new(),
+        };
+        let accent = hsla(self.cfg.accent);
+        let hit = st.job.as_ref().is_some_and(|j| j.done() && j.found() == 0);
+        Some(
+            div()
+                .absolute()
+                .top(px(6.0))
+                .right(px(18.0))
+                .w(px(340.0))
+                .h(px(32.0))
+                .px(px(10.0))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .rounded(px(6.0))
+                .bg(hsla(0x252526))
+                .border_1()
+                .border_color(if hit { hsla(0xe06c75) } else { accent })
+                .text_color(hsla(0xffffff))
+                .font_family(self.metrics.font.family.clone())
+                .text_size(self.metrics.font_size)
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .items_center()
+                        .child(nb(&t[..split]))
+                        .child(div().w(px(1.0)).h(px(16.0)).bg(accent))
+                        .child(nb(&t[split..])),
+                )
+                .child(div().flex_none().text_color(hsla(0x9aa0a6)).child(SharedString::from(label))),
+        )
+    }
+
     // ---- clear and reset -----------------------------------------------------------
 
     /// Ctrl+L to the program: it clears the screen and draws its prompt (GTK's "Clear").
@@ -626,6 +1247,7 @@ impl TerminalView {
         self.last_gen = 0;
         self.sel = None;
         self.scroll_accum = 0.0;
+        self.layout_changed = true;
         self.send_bytes(&[0x0c]);
         cx.notify();
     }
@@ -674,6 +1296,11 @@ impl TerminalView {
                 if action != ffi::GHOSTTY_KEY_ACTION_RELEASE {
                     self.snap_to_bottom();
                     self.cursor_on = true;
+                    let m = &ks.modifiers;
+                    if m.control && !m.shift && !m.alt && ks.key == "c" {
+                        // The shell often beeps after an interrupt: that bell is not news.
+                        self.bell.quiet_after_ctrl_c(Instant::now());
+                    }
                 }
                 self.send_bytes(&bytes);
                 true
@@ -703,7 +1330,11 @@ impl TerminalView {
                     return;
                 }
                 "v" => {
-                    self.paste(cx);
+                    if self.search.is_some() {
+                        self.search_paste(cx);
+                    } else {
+                        self.paste(cx);
+                    }
                     cx.stop_propagation();
                     return;
                 }
@@ -737,6 +1368,12 @@ impl TerminalView {
         }
         if ev.prefer_character_input && !m.control && !m.alt && !m.platform && ks.key_char.is_some() {
             self.dead_pending = true;
+            return;
+        }
+        // The find bar takes every other key while it is open.
+        if self.search.is_some() {
+            self.search_key(ks, ev.prefer_character_input, cx);
+            cx.stop_propagation();
             return;
         }
         // AltGr layouts report ctrl+alt with the composed character: send the text.
@@ -1001,7 +1638,7 @@ impl TerminalView {
         self.term.scrollbar_state().1 as usize + vrow
     }
 
-    fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus, cx);
         if self.wants_mouse(ev.modifiers.shift) {
             let (pos, g, c) = self.mouse_args(ev.position);
@@ -1017,6 +1654,16 @@ impl TerminalView {
             MouseButton::Left => {
                 let (vr, col) = self.cell_at(ev.position);
                 let ar = self.abs_row(vr);
+                // Ctrl+click on a link opens it.
+                if ev.modifiers.control && !ev.modifiers.shift && !self.term.is_mouse_tracking() {
+                    if let Some(l) = self.link_at(vr, col) {
+                        self.open_link(&l.url, cx);
+                        return;
+                    }
+                }
+                if ev.click_count <= 1 && self.click_code_button(ev.position, cx) {
+                    return;
+                }
                 // Shift+click moves the end of an existing selection (GTK: no drag after it).
                 if ev.modifiers.shift && ev.click_count <= 1 {
                     if let Some(sel) = self.sel.as_mut() {
@@ -1067,6 +1714,16 @@ impl TerminalView {
     /// Every mouse move of the window, also while the pointer is outside the pane (it is
     /// captured while a button is held). The element registers this each frame.
     pub fn on_pointer_move(&mut self, ev: &MouseMoveEvent, cx: &mut Context<Self>) {
+        self.update_hover(ev.position, cx);
+        if let Some(grab) = self.sb_drag {
+            if ev.pressed_button == Some(MouseButton::Left) {
+                self.scrollbar_drag_to(f32::from(ev.position.y), grab, cx);
+            } else {
+                self.sb_drag = None;
+                cx.notify();
+            }
+            return;
+        }
         if !self.selecting {
             return;
         }
@@ -1081,6 +1738,9 @@ impl TerminalView {
 
     /// The left button went up anywhere in the window.
     pub fn on_pointer_up(&mut self, ev: &MouseUpEvent, cx: &mut Context<Self>) {
+        if ev.button == MouseButton::Left && self.sb_drag.take().is_some() {
+            cx.notify();
+        }
         if ev.button == MouseButton::Left && self.selecting {
             self.finish_selection(cx);
         }
@@ -1127,7 +1787,7 @@ impl TerminalView {
         .detach();
     }
 
-    fn autoscroll_tick(&mut self, cx: &mut Context<Self>) -> bool {
+    pub(crate) fn autoscroll_tick(&mut self, cx: &mut Context<Self>) -> bool {
         let rows = if self.selecting { self.autoscroll_amount() } else { 0 };
         if rows == 0 {
             self.autoscrolling = false;
@@ -1302,6 +1962,27 @@ impl TerminalView {
     }
 }
 
+/// The visible screen as the code block detector reads it.
+struct ScreenGrid<'a>(&'a Screen);
+
+impl codeblock::Grid for ScreenGrid<'_> {
+    fn rows(&self) -> usize {
+        self.0.rows()
+    }
+    fn cols(&self) -> usize {
+        self.0.cols()
+    }
+    fn text(&self, row: usize, col: usize) -> &str {
+        &self.0.cell(row, col).grapheme
+    }
+    fn bg(&self, row: usize, col: usize) -> Option<u32> {
+        match self.0.cell(row, col).attrs.bg {
+            Color::Default => None,
+            Color::Rgb(r, g, b) => Some(((r as u32) << 16) | ((g as u32) << 8) | b as u32),
+        }
+    }
+}
+
 /// Pixel geometry for the libghostty-vt mouse encoder. Its cell size is a whole number of
 /// pixels, but a cell is 8.6 px wide, so it would count columns wrong (at column 100 it is off
 /// by 5). The column and row are worked out here from the float cell size, and the encoder is
@@ -1434,6 +2115,10 @@ impl gpui::EntityInputHandler for TerminalView {
         // Commit: composed text (or plain typed text the key path did not handle).
         self.ime_note(format!("commit:{text}"));
         self.marked = None;
+        if self.search.is_some() {
+            self.search_insert(text, cx);
+            return;
+        }
         if !text.is_empty() {
             self.snap_to_bottom();
             self.send_bytes(text.as_bytes());
@@ -1641,6 +2326,8 @@ impl Render for TerminalView {
                     .py(px(self.cfg.pane_padding_y))
                     .child(TerminalElement::new(cx.entity())),
             )
+            .children(self.scrollbar_overlay(cx))
+            .children(self.search_overlay())
             .children(self.paste_overlay())
             .children(self.owner_label())
             .children(self.drop_overlay())

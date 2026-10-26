@@ -39,6 +39,8 @@ pub enum Action {
     NextMachine,
     PrevMachine,
     SelectAll,
+    /// Find in the scrollback of the active pane (toggles the find bar).
+    Search,
     /// Copy the selection without the smart-copy cleanup (box-drawing characters stay).
     CopyRaw,
     /// Ctrl+L to the program, as GTK's "Clear".
@@ -101,6 +103,7 @@ pub const ACTIONS: &[ActionInfo] = &[
     info!(Action::PairMachine, "pair_machine", "Pair machine...", []),
     info!(Action::NextMachine, "next_machine", "Next machine", []),
     info!(Action::PrevMachine, "prev_machine", "Previous machine", []),
+    info!(Action::Search, "search", "Find in terminal", ["ctrl+shift+f"]),
     info!(Action::SelectAll, "select_all", "Select all", ["ctrl+shift+a"]),
     info!(Action::CopyRaw, "copy_raw", "Copy selection as is", []),
     info!(Action::ClearTerminal, "clear_terminal", "Clear terminal", []),
@@ -332,6 +335,7 @@ mod tests {
     #[test]
     fn terminal_actions_have_their_default_chords_and_no_warnings() {
         let km = Keymap::default_map();
+        assert_eq!(km.lookup(&Chord::new(true, false, true, false, "f")), Some(Action::Search));
         assert_eq!(km.lookup(&Chord::new(true, false, true, false, "a")), Some(Action::SelectAll));
         assert!(km.chords(Action::ResetTerminal).is_empty(), "menu-only in GTK: palette only here");
         assert!(km.warnings.is_empty(), "{:?}", km.warnings);

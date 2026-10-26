@@ -105,6 +105,11 @@ pub fn clipboard_sequence() -> u32 {
     imp::clipboard_sequence()
 }
 
+/// The system alert sound (the audio bell). Returns at once.
+pub fn beep() {
+    imp::beep();
+}
+
 /// What the Action Center holds for this app: `(launch argument, title)` of each toast.
 /// The smoke uses it to see that a toast really arrived, not only that one was requested.
 pub fn action_center() -> Result<Vec<(String, String)>, String> {
@@ -274,6 +279,11 @@ mod imp {
         unsafe { windows::Win32::System::DataExchange::GetClipboardSequenceNumber() }
     }
 
+    pub fn beep() {
+        // MB_OK: the "Default Beep" sound of the user's sound scheme.
+        let _ = unsafe { windows::Win32::System::Diagnostics::Debug::MessageBeep(windows::Win32::UI::WindowsAndMessaging::MB_OK) };
+    }
+
     pub fn history() -> Result<Vec<(String, String)>, String> {
         let run = || -> windows::core::Result<Vec<(String, String)>> {
             let list = ToastNotificationManager::History()?.GetHistoryWithId(&HSTRING::from(AUMID))?;
@@ -331,6 +341,8 @@ mod imp {
     pub fn clipboard_sequence() -> u32 {
         0
     }
+
+    pub fn beep() {}
 
     pub fn history() -> Result<Vec<(String, String)>, String> {
         Err("not Windows".into())

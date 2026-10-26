@@ -944,6 +944,7 @@ impl AppShell {
             Action::PairMachine => self.open_pair(cx),
             Action::NextMachine => self.cycle_machine(1, cx),
             Action::PrevMachine => self.cycle_machine(-1, cx),
+            Action::Search => self.on_active_view(window, cx, |v, cx| v.toggle_search(cx)),
             Action::SelectAll => self.on_active_view(window, cx, |v, cx| v.select_all(cx)),
             Action::CopyRaw => self.on_active_view(window, cx, |v, cx| v.copy_selection_as(false, cx)),
             Action::ClearTerminal => self.on_active_view(window, cx, |v, cx| v.clear_terminal(cx)),

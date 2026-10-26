@@ -5,12 +5,14 @@
 use std::sync::Arc;
 
 use gpui::{
-    fill, outline, DispatchPhase, MouseMoveEvent, MouseUpEvent, point, relative, size, App, Bounds, BorderStyle, Element, ElementId,
+    fill, outline, CursorStyle, DispatchPhase, MouseMoveEvent, MouseUpEvent, point, relative, size, App, Bounds, BorderStyle, Element, ElementId,
     ElementInputHandler, Entity, GlobalElementId, InspectorElementId, IntoElement, LayoutId,
     Pixels, Style, TextAlign, TextRun, UnderlineStyle, Window, px,
 };
 
-use crate::view::{hsla, shade, RowShaped, TerminalView};
+use forgetty_shell_core::codeblock::CodeBlock;
+
+use crate::view::{hsla, shade, RowShaped, TerminalView, CODE_BTN};
 
 pub struct TerminalElement {
     view: Entity<TerminalView>,
@@ -41,6 +43,15 @@ pub struct Prepaint {
     rows: Vec<Option<Arc<RowShaped>>>,
     cursor: Option<(Bounds<Pixels>, CursorShape)>,
     selection: Vec<(usize, usize, usize)>,
+    /// (row, first col, cells, is the current match)
+    search: Vec<(usize, usize, usize, bool)>,
+    /// Link underline: (row, first col, one past the last col)
+    links: Vec<(usize, usize, usize)>,
+    /// The hovered code block, and whether its button shows the check mark.
+    block: Option<(CodeBlock, bool)>,
+    flash: bool,
+    /// Cursor color a program set with OSC 12.
+    cursor_rgb: Option<(u8, u8, u8)>,
 }
 
 impl Element for TerminalElement {
@@ -84,6 +95,7 @@ impl Element for TerminalElement {
             // One resize per frame: this runs once per frame.
             v.apply_bounds(bounds);
             v.prepare_rows(window);
+            v.after_layout_change(_cx);
             // A smaller PTY grid sits in the middle of the pane (letterbox).
             let pad = v.letterbox_pad();
             let bounds = Bounds::new(bounds.origin + point(px(pad.0), px(pad.1)), bounds.size);
@@ -112,7 +124,16 @@ impl Element for TerminalElement {
             } else {
                 None
             };
-            Prepaint { rows: v.rows_shaped.clone(), cursor, selection: v.selection_spans() }
+            Prepaint {
+                rows: v.rows_shaped.clone(),
+                cursor,
+                selection: v.selection_spans(),
+                search: v.search_spans(),
+                links: v.link_spans(),
+                block: v.block_highlight(),
+                flash: v.bell_flash(),
+                cursor_rgb: v.term.cursor_color(),
+            }
         })
     }
 
@@ -128,9 +149,9 @@ impl Element for TerminalElement {
     ) {
         let pad = self.view.read(cx).letterbox_pad();
         let bounds = Bounds::new(bounds.origin + point(px(pad.0), px(pad.1)), bounds.size);
+        let k = 1.0 - self.view.read(cx).dim;
         let (cw, lh, font, font_size, fg, bg, cur_col, sel_col, focus, marked, cursor_cell) = {
             let v = self.view.read(cx);
-            let k = 1.0 - v.dim;
             (
                 v.metrics.cell_w,
                 v.metrics.line_h,
@@ -176,6 +197,18 @@ impl Element for TerminalElement {
             let y = bounds.origin.y + lh * r as f32;
             window.paint_quad(fill(Bounds::new(point(x, y), size(cw * (c1 + 1 - c0) as f32, lh)), sel_col));
         }
+        // Pass 2b: search matches (GTK colors: amber, brighter for the current one).
+        for &(r, c0, n, current) in &prepaint.search {
+            let color = if current { gpui::rgba(0xfab387a0) } else { gpui::rgba(0xf9e2af50) };
+            let x = bounds.origin.x + cw * c0 as f32;
+            let y = bounds.origin.y + lh * r as f32;
+            window.paint_quad(fill(Bounds::new(point(x, y), size(cw * n as f32, lh)), color));
+        }
+        // The color a program set (OSC 12) wins over the theme's.
+        let cur_col = match prepaint.cursor_rgb {
+            Some((r, g, b)) => shade(hsla(((r as u32) << 16) | ((g as u32) << 8) | b as u32), k),
+            None => cur_col,
+        };
         // Pass 3: block cursor under the text.
         if let Some((b, CursorShape::Block)) = prepaint.cursor {
             let mut c = cur_col;
@@ -192,6 +225,15 @@ impl Element for TerminalElement {
                 if us > 3000 {
                 }
             }
+        }
+        // Pass 4b: link underline.
+        for &(r, c0, c1) in &prepaint.links {
+            let x = bounds.origin.x + cw * c0 as f32;
+            let y = bounds.origin.y + lh * (r + 1) as f32 - px(2.0);
+            window.paint_quad(fill(Bounds::new(point(x, y), size(cw * (c1 - c0) as f32, px(1.0))), fg));
+        }
+        if !prepaint.links.is_empty() {
+            window.set_window_cursor_style(CursorStyle::PointingHand);
         }
         // Pass 5: thin cursors over the text.
         if let Some((b, shape)) = prepaint.cursor {
@@ -211,6 +253,14 @@ impl Element for TerminalElement {
                 CursorShape::Hollow => window.paint_quad(outline(b, cur_col, BorderStyle::Solid)),
             }
         }
+        // Pass 5b: visual bell, a white wash over the pane (GTK: 15% white for 150 ms).
+        if prepaint.flash {
+            window.paint_quad(fill(bounds, gpui::rgba(0xffffff26)));
+        }
+        // Pass 5c: code block under the pointer: a wash on its border cells and a copy button.
+        if let Some((block, copied)) = &prepaint.block {
+            paint_code_block(window, cx, bounds, block, *copied, (cw, lh), (&font, font_size), bg);
+        }
         // Pass 6: IME preedit at the cursor.
         if let Some(text) = marked {
             let (r, c) = cursor_cell;
@@ -229,5 +279,71 @@ impl Element for TerminalElement {
             let _ = line.paint(origin, lh, TextAlign::Left, None, window, cx);
         }
         self.view.update(cx, |v, _cx| v.after_paint(window));
+    }
+}
+
+/// The hover treatment of a code block (GTK `draw_terminal` step 10): a faint wash on the
+/// border cells, and a copy button in the top right corner that shows a check mark for a
+/// moment after a copy.
+#[allow(clippy::too_many_arguments)]
+fn paint_code_block(
+    window: &mut Window,
+    cx: &mut App,
+    bounds: Bounds<Pixels>,
+    b: &CodeBlock,
+    copied: bool,
+    (cw, lh): (Pixels, Pixels),
+    (font, font_size): (&gpui::Font, Pixels),
+    bg: gpui::Hsla,
+) {
+    let dark = bg.l < 0.5;
+    let wash = if dark { gpui::rgba(0xffffff14) } else { gpui::rgba(0x0000000f) };
+    let cell = |r: usize, c: usize, w: usize| {
+        Bounds::new(
+            point(bounds.origin.x + cw * c as f32, bounds.origin.y + lh * r as f32),
+            size(cw * w as f32, lh),
+        )
+    };
+    let width = b.right_col - b.left_col + 1;
+    window.paint_quad(fill(cell(b.top_row, b.left_col, width), wash));
+    window.paint_quad(fill(cell(b.bottom_row, b.left_col, width), wash));
+    for r in (b.top_row + 1)..b.bottom_row {
+        window.paint_quad(fill(cell(r, b.left_col, 1), wash));
+        window.paint_quad(fill(cell(r, b.right_col, 1), wash));
+    }
+    let btn = Bounds::new(
+        point(
+            bounds.origin.x + cw * (b.right_col + 1) as f32 - px(CODE_BTN),
+            bounds.origin.y + lh * b.top_row as f32,
+        ),
+        size(px(CODE_BTN), px(CODE_BTN)),
+    );
+    let (btn_bg, ink) = if dark {
+        (gpui::rgba(0x00000099), gpui::rgba(0xffffffe6))
+    } else {
+        (gpui::rgba(0xffffffb3), gpui::rgba(0x000000cc))
+    };
+    window.paint_quad(fill(btn, btn_bg).corner_radii(px(4.0)));
+    if copied {
+        let run = TextRun {
+            len: "\u{2713}".len(),
+            font: font.clone(),
+            color: ink.into(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let line = window.text_system().shape_line("\u{2713}".into(), font_size, &[run], None);
+        let origin = point(btn.origin.x + (btn.size.width - line.width) / 2.0, btn.origin.y + (btn.size.height - lh) / 2.0);
+        let _ = line.paint(origin, lh, TextAlign::Left, None, window, cx);
+    } else {
+        // Two overlapping outlined squares, the usual "copy" glyph.
+        let pad = px(CODE_BTN * 0.22);
+        let side = px(CODE_BTN) - pad * 2.0 - px(3.0);
+        let back = Bounds::new(btn.origin + point(pad + px(3.0), pad), size(side, side));
+        let front = Bounds::new(btn.origin + point(pad, pad + px(3.0)), size(side, side));
+        window.paint_quad(outline(back, ink, BorderStyle::Solid));
+        window.paint_quad(fill(front, btn_bg));
+        window.paint_quad(outline(front, ink, BorderStyle::Solid));
     }
 }
