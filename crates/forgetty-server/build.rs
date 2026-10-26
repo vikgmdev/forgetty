@@ -7,6 +7,11 @@
 //! build.rs — Cargo does NOT propagate it from library crates.
 
 fn main() {
+    // These are GNU ld flags for ELF. Other targets (Windows) take none of them.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
+        return;
+    }
+
     // Use --enable-new-dtags so we get RUNPATH (not RPATH).
     // RUNPATH allows LD_LIBRARY_PATH to override, which is desired.
     println!("cargo:rustc-link-arg=-Wl,--enable-new-dtags");

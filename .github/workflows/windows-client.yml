@@ -17,6 +17,12 @@ on:
       - "crates/forgetty-sync/**"
       - "crates/forgetty-server/**"
       - "crates/forgetty-session/**"
+      - "crates/forgetty-pty/**"
+      - "crates/forgetty-socket/**"
+      - "crates/forgetty-config/**"
+      - "crates/forgetty-workspace/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
       - ".github/workflows/windows-client.yml"
   workflow_dispatch:
 
@@ -108,6 +114,50 @@ jobs:
             clients/windows/target/release/v2-test-server.exe
             clients/windows/target/release/smoke.json
             clients/windows/target/release/smoke.err
+
+  # WP0 to WP3 of docs/architecture/WINDOWS_SERVER.md: the server crates on Windows.
+  # SERVER_CRATES is the set that must be green. It grows with each work package. The
+  # last step checks the crates that are not in the set yet and never fails the job: its
+  # output is the to-do list.
+  server-crates:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      SERVER_CRATES: "-p forgetty-core -p forgetty-config -p forgetty-workspace"
+      PENDING_CRATES: "-p forgetty-pty -p forgetty-sync -p forgetty-session -p forgetty-socket -p forgetty-server"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: server-crates
+
+      - name: Check the server crates
+        shell: pwsh
+        run: |
+          $crates = $env:SERVER_CRATES -split ' '
+          cargo check --locked --all-targets @crates
+
+      - name: Test the server crates
+        shell: pwsh
+        run: |
+          $crates = $env:SERVER_CRATES -split ' '
+          cargo test --locked @crates
+
+      - name: Check the crates that are not ported yet (does not gate)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $crates = $env:PENDING_CRATES -split ' '
+          cargo check --locked --keep-going @crates
 
   # The real Linux server, built here, for the WSL end-to-end test below.
   linux-server:
