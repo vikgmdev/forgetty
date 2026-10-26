@@ -38,6 +38,13 @@ fn is_stripped(c: char, bracketed: bool) -> bool {
 }
 
 pub fn prepare(text: &str, bracketed: bool) -> Paste {
+    prepare_with(text, bracketed, true)
+}
+
+/// Like [`prepare`]. With `warn_newline` false (config `paste_warn_newline = false`), a
+/// plain multi-line paste in unbracketed mode does not ask. Stripped control bytes still do:
+/// every other cause of "unsafe" in unbracketed mode (ESC, the bracket end) is stripped.
+pub fn prepare_with(text: &str, bracketed: bool, warn_newline: bool) -> Paste {
     let has_newline = text.contains('\n') || text.contains('\r');
     let mut stripped = 0;
     let mut clean = String::with_capacity(text.len());
@@ -60,7 +67,8 @@ pub fn prepare(text: &str, bracketed: bool) -> Paste {
     }
 
     let ghostty_unsafe = !bracketed && !unsafe { ffi::ghostty_paste_is_safe(text.as_ptr(), text.len()) };
-    let needs_confirm = stripped > 0 || (!bracketed && (has_newline || ghostty_unsafe));
+    let needs_confirm =
+        stripped > 0 || (warn_newline && !bracketed && (has_newline || ghostty_unsafe));
 
     let bytes = if bracketed {
         let mut out = Vec::with_capacity(clean.len() + 12);
@@ -95,6 +103,18 @@ mod tests {
         assert_eq!(p.bytes, b"ls\rpwd\rwhoami");
         assert!(p.needs_confirm);
         assert_eq!(p.stripped, 0);
+    }
+
+    #[test]
+    fn newline_warning_can_be_turned_off_but_stripping_still_asks() {
+        let p = prepare_with("ls\npwd", false, false);
+        assert_eq!(p.bytes, b"ls\rpwd");
+        assert!(!p.needs_confirm);
+        let p = prepare_with("ls\n\x1b[31m", false, false);
+        assert!(p.needs_confirm);
+        assert_eq!(p.stripped, 1);
+        assert!(prepare_with("ls\npwd", false, true).needs_confirm);
+        assert_eq!(prepare("a\nb", false), prepare_with("a\nb", false, true));
     }
 
     #[test]
