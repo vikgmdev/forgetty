@@ -521,6 +521,14 @@ command = "wsl.exe -d Ubuntu --cd ~"
 - [ ] WP3b.6 The "+" drop-down ends with "Pair machine...". It opens the pairing dialog, also with no machine paired and no pane. The sidebar (Ctrl+Shift+B) lists "+ Pair machine..." under the machines, in the accent color.
 - [ ] WP3b.7 Install the MSI from CI, run it from the Start menu, then run `forgetty-win.exe --smoke` from the install folder in a temporary folder. The CI installer job does this on every push (it also checks that the installed `ghostty-vt.dll` and exe are the tested files).
 
+### WP3c
+
+- [ ] WP3c.1 A profile with `directory = '\??\UNC\someserver\share'` or `directory = '\temp'` or `directory = 'C:temp'`: refused with "network and device paths" or "not a full path"; no traffic to the server.
+- [ ] WP3c.2 `FORGETTY_CONFIG=\\someserver\share\config.toml`: the app starts with a notice that the default file is used, loads `%APPDATA%\forgetty\config.toml`, and sends nothing to that server.
+- [ ] WP3c.3 Add `%USERPROFILE%\bin` to the user PATH as an expandable value and put a program there: a profile naming it by bare name starts it.
+- [ ] WP3c.4 "Open configuration file" opens the editor (it now initializes COM on its worker thread) from a fresh start, with no association error.
+- Accepted, not tested: a drive the user mapped or `subst`-ed to a share is a local path to the app (see README, Security).
+
 ### Not done in WP3
 
 - A Settings window (not decided).

@@ -106,6 +106,13 @@ Notes and decisions:
   pane's spawn directory (else `default_cwd`, else the user profile). UNC, device (`\\?\`, `\\.\`)
   paths and non-local `file://` hosts are dropped, so program output cannot make the client touch a
   network share. The OSC scanner decodes on bytes and runs under `catch_unwind`.
+- Paths from `config.toml` follow the same rule (`shell-core/src/resolve.rs`): `shell` and profile
+  programs are a PATH lookup (never the working folder) or a full `C:\...` path; network, device and
+  NT-namespace (`\??\`) paths, and the forms that depend on the working drive (`\x`, `C:x`), are refused
+  before any stat; `%VAR%` in a PATH entry is expanded first. A `FORGETTY_CONFIG` on a network path is
+  not used. Accepted: a drive letter the user mapped (`net use`) or `subst`-ed to a share looks like a
+  local path and is treated as one. No process stat-s a folder on the UI thread: the start-folder checks run
+  when the file is read (worker thread), and the process start checks the rest.
 - Mica is used on Windows 11 22H2+ (`backdrop = "mica"`); older builds and `backdrop = "none"` get a solid
   themed background. Panes always paint opaque.
 - Rendering cost: `windows-latest` has no GPU, so GPUI draws through WARP and every full-window
