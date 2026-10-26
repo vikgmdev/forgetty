@@ -185,6 +185,7 @@ enum Phase {
     RealKill,
     RealRestart,
     RealBurst,
+    RealWs,
     RealFinal,
 }
 
@@ -236,6 +237,7 @@ impl Phase {
             Phase::RealKill => "w4-real-kill",
             Phase::RealRestart => "w4-real-restart",
             Phase::RealBurst => "w4-real-burst",
+            Phase::RealWs => "wp2-real-workspaces",
             Phase::RealFinal => "w4-real-final",
         }
     }
@@ -1363,6 +1365,7 @@ impl ShellSmoke {
             | Phase::RealKill
             | Phase::RealRestart
             | Phase::RealBurst
+            | Phase::RealWs
             | Phase::RealFinal => self.real_step(shell, window, cx, now_t),
             _ => {}
         }

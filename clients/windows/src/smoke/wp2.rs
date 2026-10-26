@@ -21,10 +21,10 @@ pub const WP2_SHOT: &str = "wp2-menu.png";
 
 #[derive(Default)]
 pub struct Wp2 {
-    w0: Uuid,
-    w1: Uuid,
-    ids: Vec<Uuid>,
-    target: usize,
+    pub(in crate::smoke) w0: Uuid,
+    pub(in crate::smoke) w1: Uuid,
+    pub(in crate::smoke) ids: Vec<Uuid>,
+    pub(in crate::smoke) target: usize,
     ratio: f32,
     ratio_after: f32,
     other_tab: Uuid,

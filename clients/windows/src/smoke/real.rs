@@ -639,6 +639,87 @@ impl ShellSmoke {
                             record("real_burst_max_frame_gap_ms", json!(self.real.burst_max_gap));
                             check("real_burst_complete", fed as f64 >= BURST_BYTES * 0.99);
                             self.real.fed_t = None;
+                            self.goto(Phase::RealWs);
+                        }
+                    }
+                }
+            }
+            // ---- WP2: workspace color, duplicate, move and delete against the real server ---------------
+            Phase::RealWs => {
+                if self.sub_t0.elapsed() > Duration::from_secs(20) {
+                    record("real_ws_layout", json!(shell.layout.workspaces.iter().map(|w| (w.name.clone(), w.tabs.len(), w.color.clone())).collect::<Vec<_>>()));
+                    fail(&format!("real workspace checks stuck at step {}", self.sub));
+                }
+                let n0 = self.wp2.target;
+                let count = shell.layout.workspaces.len();
+                match self.sub {
+                    0 => {
+                        self.wp2.target = count;
+                        self.wp2.w0 = shell.layout.workspaces[0].id;
+                        shell.new_workspace(cx);
+                        self.sub = 1;
+                        self.sub_t0 = Instant::now();
+                    }
+                    1 => {
+                        if count != n0 + 1 {
+                            return;
+                        }
+                        shell.set_workspace_color(n0, Some(0x3987e4), cx);
+                        self.sub = 2;
+                        self.sub_t0 = Instant::now();
+                    }
+                    2 => {
+                        if shell.layout.workspaces[n0].color.as_deref() != Some("#3987e4") {
+                            return;
+                        }
+                        check("real_ws_color_round_trip", true);
+                        shell.duplicate_workspace(n0, cx);
+                        self.sub = 3;
+                        self.sub_t0 = Instant::now();
+                    }
+                    3 => {
+                        if count != n0 + 2 {
+                            return;
+                        }
+                        let copy = &shell.layout.workspaces[n0 + 1];
+                        check("real_ws_duplicate", copy.name.ends_with("(copy)") && copy.tabs.len() == 1 && copy.color.is_none());
+                        // Swap the copy up: it takes the original's place.
+                        let (a, b) = (shell.layout.workspaces[n0].id, copy.id);
+                        self.wp2.w1 = b;
+                        self.wp2.ids = vec![a];
+                        shell.move_workspace(n0 + 1, true, cx);
+                        self.sub = 4;
+                        self.sub_t0 = Instant::now();
+                    }
+                    4 => {
+                        if shell.layout.workspaces[n0].id != self.wp2.w1 {
+                            return;
+                        }
+                        check("real_ws_move", shell.layout.workspaces[n0 + 1].id == self.wp2.ids[0]);
+                        shell.delete_workspace(n0, cx);
+                        self.sub = 5;
+                        self.sub_t0 = Instant::now();
+                    }
+                    5 => {
+                        if count != n0 + 1 {
+                            return;
+                        }
+                        check("real_ws_delete", shell.layout.workspaces.iter().all(|w| w.id != self.wp2.w1));
+                        shell.delete_workspace(n0, cx);
+                        self.sub = 6;
+                        self.sub_t0 = Instant::now();
+                    }
+                    6 => {
+                        if count != n0 || shell.layout.workspaces[0].id != self.wp2.w0 {
+                            return;
+                        }
+                        check("real_ws_back_to_start", true);
+                        shell.set_workspace(0, cx);
+                        self.sub = 7;
+                        self.sub_t0 = Instant::now();
+                    }
+                    _ => {
+                        if shell.layout.active_workspace == 0 && self.sub_t0.elapsed() > Duration::from_millis(500) {
                             self.goto(Phase::RealFinal);
                         }
                     }
