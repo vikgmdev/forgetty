@@ -13,7 +13,7 @@ use forgetty_client::{
     SecretKey,
 };
 use forgetty_shell_core::{
-    valid_label, BackendError, BackendEvent, BackendFuture, BackendResult, ConnState, LabelTarget, Layout, MachineInfo, MachineKind,
+    valid_label, valid_workspace_color, DuplicatedWorkspace, BackendError, BackendEvent, BackendFuture, BackendResult, ConnState, LabelTarget, Layout, MachineInfo, MachineKind,
     NewTab, NewTabReply, NewWorkspaceReply, PaneId, PaneInfo, PaneSource, PaneStatus, SessionBackend, SizeOwnerInfo,
     SplitDir, SplitPane, SplitRatio,
 };
@@ -302,15 +302,26 @@ impl SessionBackend for RemoteBackend {
 
     fn new_tab(&self, req: NewTab) -> BackendFuture<NewTabReply> {
         let mut p = json!({"workspace_idx": req.workspace_idx, "rows": req.rows, "cols": req.cols});
-        if let Some(cwd) = req.cwd {
-            p["cwd"] = json!(cwd);
-        }
         if !req.command.is_empty() {
             p["command"] = json!(req.command);
         }
-        let f = self.call("new_tab", p);
+        // "Duplicate tab": the server knows where that pane runs (`get_pane_info.cwd`), and
+        // checks the directory itself. An explicit `cwd` wins.
+        let inherit = match (&req.cwd, req.inherit_cwd_from) {
+            (None, Some(pane)) => Some(self.get_pane_info(pane)),
+            _ => None,
+        };
+        if let Some(cwd) = req.cwd {
+            p["cwd"] = json!(cwd);
+        }
+        let this = self.clone();
         Box::pin(async move {
-            let v = f.await?;
+            if let Some(info) = inherit {
+                if let Some(cwd) = info.await.ok().map(|i| i.cwd).filter(|c| !c.is_empty()) {
+                    p["cwd"] = json!(cwd);
+                }
+            }
+            let v = this.call("new_tab", p).await?;
             Ok(NewTabReply { tab_id: uuid_at(&v, "tab_id")?, pane_id: PaneId(uuid_at(&v, "pane_id")?) })
         })
     }
@@ -358,6 +369,54 @@ impl SessionBackend for RemoteBackend {
 
     fn rename_workspace(&self, workspace_idx: usize, name: String) -> BackendFuture<()> {
         self.call_unit("rename_workspace", json!({"workspace_idx": workspace_idx, "name": name}))
+    }
+
+    fn delete_workspace(&self, workspace_idx: usize) -> BackendFuture<()> {
+        self.call_unit("delete_workspace", json!({"workspace_idx": workspace_idx}))
+    }
+
+    fn duplicate_workspace(
+        &self,
+        source_idx: usize,
+        new_name: Option<String>,
+        _rows: u16,
+        _cols: u16,
+    ) -> BackendFuture<DuplicatedWorkspace> {
+        let mut p = json!({"source_workspace_idx": source_idx});
+        if let Some(n) = new_name {
+            p["new_name"] = json!(n);
+        }
+        let f = self.call("duplicate_workspace", p);
+        Box::pin(async move {
+            let v = f.await?;
+            let tabs = v
+                .get("tabs")
+                .and_then(Json::as_array)
+                .map(|a| {
+                    a.iter()
+                        .map(|t| Ok((uuid_at(t, "tab_id")?, PaneId(uuid_at(t, "pane_id")?))))
+                        .collect::<BackendResult<Vec<_>>>()
+                })
+                .transpose()?
+                .unwrap_or_default();
+            Ok(DuplicatedWorkspace {
+                workspace_id: uuid_at(&v, "workspace_id")?,
+                workspace_idx: v.get("workspace_idx").and_then(Json::as_u64).unwrap_or(0) as usize,
+                tabs,
+            })
+        })
+    }
+
+    fn move_workspace(&self, from_idx: usize, to_idx: usize) -> BackendFuture<()> {
+        self.call_unit("move_workspace", json!({"from_idx": from_idx, "to_idx": to_idx}))
+    }
+
+    fn set_workspace_color(&self, workspace_idx: usize, color: Option<String>) -> BackendFuture<()> {
+        let color = match valid_workspace_color(color.as_deref()) {
+            Ok(c) => c,
+            Err(e) => return forgetty_shell_core::ready(Err(e)),
+        };
+        self.call_unit("set_workspace_color", json!({"workspace_idx": workspace_idx, "color": color}))
     }
 
     fn split_pane(&self, req: SplitPane) -> BackendFuture<PaneId> {

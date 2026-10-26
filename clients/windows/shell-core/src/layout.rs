@@ -375,6 +375,84 @@ impl Divider {
     }
 }
 
+/// The result of a keyboard resize: the split to change and its new ratio.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RatioChange {
+    /// Path to the split from the root.
+    pub path: Vec<bool>,
+    /// Leftmost leaf of the split's first child: the key `update_split_ratios` takes.
+    pub first_leaf: PaneId,
+    pub ratio: f32,
+}
+
+/// The splits above `pane`, from the root down: path, direction, and whether the pane is in
+/// the split's first child.
+fn ancestors(tree: &PaneTree, pane: PaneId) -> Vec<(Vec<bool>, SplitDir, bool)> {
+    fn walk(t: &PaneTree, pane: PaneId, path: &mut Vec<bool>, out: &mut Vec<(Vec<bool>, SplitDir, bool)>) -> bool {
+        match t {
+            PaneTree::Leaf { pane_id } => *pane_id == pane,
+            PaneTree::Split { direction, first, second, .. } => {
+                path.push(false);
+                if walk(first, pane, path, out) {
+                    path.pop();
+                    out.push((path.clone(), *direction, true));
+                    return true;
+                }
+                path.pop();
+                path.push(true);
+                if walk(second, pane, path, out) {
+                    path.pop();
+                    out.push((path.clone(), *direction, false));
+                    return true;
+                }
+                path.pop();
+                false
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(tree, pane, &mut Vec::new(), &mut out);
+    out.reverse(); // root first
+    out
+}
+
+/// Alt+Shift+Arrow: move a divider `step_px` toward `side`, as GTK does (`resize_pane`). Right
+/// and Down grow the pane when it is in the first child of the split, Left and Up when it is in
+/// the second child. It takes the nearest split of the right direction where the pane is on that
+/// side (so the middle pane of three finds the divider that is on its right, and another one
+/// for its left), else the nearest split of that direction. `None` when there is no such split
+/// or the divider is at its limit already.
+pub fn resize_by_key(
+    tree: &PaneTree,
+    geo: &PaneGeometry,
+    pane: PaneId,
+    side: Side,
+    step_px: f32,
+    bar: f32,
+    min: f32,
+) -> Option<RatioChange> {
+    let want_dir = match side {
+        Side::Left | Side::Right => SplitDir::Horizontal,
+        Side::Up | Side::Down => SplitDir::Vertical,
+    };
+    let want_first = matches!(side, Side::Right | Side::Down);
+    let chain: Vec<_> = ancestors(tree, pane).into_iter().filter(|a| a.1 == want_dir).collect();
+    let (path, _, _) = chain.iter().rev().find(|a| a.2 == want_first).or_else(|| chain.last())?;
+    let d = geo.dividers.iter().find(|d| &d.path == path)?;
+    let total = match d.dir {
+        SplitDir::Horizontal => d.area.w,
+        SplitDir::Vertical => d.area.h,
+    };
+    let avail = (total - bar).max(1.0);
+    let lo = (min / avail).min(0.5);
+    let delta = if want_first { step_px } else { -step_px } / avail;
+    let new = (((d.ratio + delta).clamp(lo, 1.0 - lo)) * 1000.0).round() / 1000.0;
+    if (new - d.ratio).abs() < 1e-4 {
+        return None;
+    }
+    Some(RatioChange { path: path.clone(), first_leaf: d.first_leaf, ratio: new })
+}
+
 /// Pane to focus when moving in a direction. Picks the nearest pane whose
 /// extent overlaps along the other axis.
 pub fn neighbor(panes: &[(PaneId, Rect)], from: PaneId, side: Side) -> Option<PaneId> {
@@ -517,5 +595,70 @@ mod tests {
         assert_eq!(t.ratio_at(&[]), Some(0.3));
         assert!(t.set_ratio(a, 0.7));
         assert_eq!(t.ratio_at(&[]), Some(0.7));
+    }
+
+    #[test]
+    fn keyboard_resize_picks_the_divider_on_the_side_gtk_does() {
+        let (a, b, c) = (p(), p(), p());
+        // [a | b | c]: ((a, b), c) is how the server nests it, all horizontal.
+        let mut t = PaneTree::leaf(a);
+        t.split_leaf(a, SplitDir::Horizontal, b);
+        t.split_leaf(b, SplitDir::Horizontal, c);
+        let area = Rect::new(0.0, 0.0, 1001.0, 500.0);
+        let g = t.geometry(area, 1.0);
+        // a | (b | c): the root splits a from (b, c), the inner one b from c.
+        let root = t.ratio_at(&[]).unwrap();
+        let inner = t.ratio_at(&[true]).unwrap();
+        assert_eq!((root, inner), (0.5, 0.5));
+        // The left pane pressing Right grows by 20 px: the root divider, ratio up.
+        let r = resize_by_key(&t, &g, a, Side::Right, 20.0, 1.0, 100.0).unwrap();
+        assert_eq!(r.path, Vec::<bool>::new());
+        assert!((r.ratio - 0.52).abs() < 0.001, "{}", r.ratio);
+        assert_eq!(r.first_leaf, a);
+        // The middle pane: Right moves the inner divider (b is in its first child), Left moves
+        // the root divider (b is in the second child of the root), ratio down.
+        let r = resize_by_key(&t, &g, b, Side::Right, 20.0, 1.0, 100.0).unwrap();
+        assert_eq!(r.path, vec![true]);
+        assert!(r.ratio > 0.5);
+        let r = resize_by_key(&t, &g, b, Side::Left, 20.0, 1.0, 100.0).unwrap();
+        assert_eq!(r.path, Vec::<bool>::new());
+        assert!(r.ratio < 0.5);
+        // The left pane has no split where it is on the second side: the nearest one moves.
+        let r = resize_by_key(&t, &g, a, Side::Left, 20.0, 1.0, 100.0).unwrap();
+        assert_eq!(r.path, Vec::<bool>::new());
+        assert!(r.ratio < 0.5);
+        // Up and Down find no horizontal split.
+        assert!(resize_by_key(&t, &g, a, Side::Down, 20.0, 1.0, 100.0).is_none());
+        // A lone pane has nothing to move.
+        let one = PaneTree::leaf(a);
+        assert!(resize_by_key(&one, &one.geometry(area, 1.0), a, Side::Right, 20.0, 1.0, 100.0).is_none());
+    }
+
+    #[test]
+    fn keyboard_resize_stops_at_the_minimum_pane_size() {
+        let (a, b) = (p(), p());
+        let mut t = PaneTree::leaf(a);
+        t.split_leaf(a, SplitDir::Vertical, b);
+        let area = Rect::new(0.0, 0.0, 800.0, 601.0);
+        t.set_ratio_at(&[], 0.5);
+        let mut steps = 0;
+        // Down grows `a`, until `b` is at the minimum height of 60 px, and then it stops.
+        loop {
+            let g = t.geometry(area, 1.0);
+            match resize_by_key(&t, &g, a, Side::Down, 20.0, 1.0, 60.0) {
+                Some(r) => {
+                    t.set_ratio_at(&r.path, r.ratio);
+                    steps += 1;
+                    assert!(steps < 100);
+                }
+                None => break,
+            }
+        }
+        let g = t.geometry(area, 1.0);
+        let h2 = g.panes.iter().find(|(id, _)| *id == b).unwrap().1.h;
+        assert!(h2 >= 59.0 && h2 < 80.0, "{h2}");
+        assert!(steps > 5);
+        // Up from the second pane gives it room again.
+        assert!(resize_by_key(&t, &g, b, Side::Up, 20.0, 1.0, 60.0).is_some());
     }
 }

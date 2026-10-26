@@ -211,8 +211,28 @@ struct TabNode {
     tree: Tree,
 }
 
+/// A workspace other than the first. The tab methods (`new_tab`, `split_pane`, ...) work on the
+/// first workspace only; the workspace methods (`duplicate_workspace`, `move_workspace`,
+/// `delete_workspace`, `set_workspace_color`) work on all of them.
+struct Ws {
+    id: Uuid,
+    name: String,
+    color: Option<String>,
+    tabs: Vec<TabNode>,
+    active_tab: usize,
+}
+
+/// Id of the first workspace until it is moved or deleted (it follows its position).
+const FIRST_WS: Uuid = Uuid::from_u128(1);
+
 struct Layout {
     workspace: String,
+    /// Workspace id and color of the workspace at position 0 (`workspace` is its name).
+    ws_id: Uuid,
+    ws_color: Option<String>,
+    /// The workspaces after position 0, in order.
+    others: Vec<Ws>,
+    active_workspace: usize,
     tabs: Vec<TabNode>,
     /// Index of the active tab (`focus_tab`).
     active_tab: usize,
@@ -352,6 +372,10 @@ impl TestServer {
             die_mode: AtomicU8::new(cfg.die_mode),
             layout: Mutex::new(Layout {
                 workspace: "Default".into(),
+                ws_id: FIRST_WS,
+                ws_color: None,
+                others: Vec::new(),
+                active_workspace: 0,
                 tabs: Vec::new(),
                 active_tab: 0,
                 active_pane: HashMap::new(),
@@ -1158,6 +1182,117 @@ fn handle_request(
             layout_changed(state);
             Ok(map(&[("ok", Value::Boolean(true))]))
         }
+        "set_active_workspace" => {
+            {
+                let mut l = lock(&state.layout);
+                let n = 1 + l.others.len();
+                l.active_workspace = ws_index(&params, "workspace_idx", n)?;
+            }
+            layout_changed(state);
+            Ok(map(&[("ok", Value::Boolean(true))]))
+        }
+        "set_workspace_color" => {
+            let color = param_str(&params, "color").map(str::to_string);
+            let changed = {
+                let mut l = lock(&state.layout);
+                let n = 1 + l.others.len();
+                let i = ws_index(&params, "workspace_idx", n)?;
+                let slot = if i == 0 { &mut l.ws_color } else { &mut l.others[i - 1].color };
+                std::mem::replace(slot, color.clone()) != color
+            };
+            if changed {
+                layout_changed(state);
+            }
+            Ok(map(&[("ok", Value::Boolean(true))]))
+        }
+        "move_workspace" => {
+            {
+                let mut l = lock(&state.layout);
+                let n = 1 + l.others.len();
+                let (from, to) = (ws_index(&params, "from_idx", n)?, ws_index(&params, "to_idx", n)?);
+                if from != to {
+                    let mut v = take_workspaces(&mut l);
+                    v.swap(from, to);
+                    put_workspaces(&mut l, v);
+                    if l.active_workspace == from {
+                        l.active_workspace = to;
+                    } else if l.active_workspace == to {
+                        l.active_workspace = from;
+                    }
+                }
+            }
+            layout_changed(state);
+            Ok(map(&[("ok", Value::Boolean(true))]))
+        }
+        "delete_workspace" => {
+            let doomed: Vec<Uuid> = {
+                let mut l = lock(&state.layout);
+                let n = 1 + l.others.len();
+                let i = ws_index(&params, "workspace_idx", n)?;
+                if n <= 1 {
+                    return Err((error_code::INTERNAL, "delete_workspace: cannot delete last remaining workspace".into()));
+                }
+                let mut v = take_workspaces(&mut l);
+                let gone = v.remove(i);
+                put_workspaces(&mut l, v);
+                if l.active_workspace > i {
+                    l.active_workspace -= 1;
+                } else if l.active_workspace >= n - 1 {
+                    l.active_workspace = n - 2;
+                }
+                let mut ids = Vec::new();
+                for t in &gone.tabs {
+                    t.tree.panes(&mut ids);
+                }
+                ids
+            };
+            for id in doomed {
+                let notify = lock(&state.panes).remove(&id).map(|p| p.notify);
+                if let Some(nf) = notify {
+                    nf.notify_waiters();
+                }
+                let seq = state.event_seq.fetch_add(1, Ordering::SeqCst) + 1;
+                let _ = state.events.send((seq, ServerEvent::PaneClosed { pane_id: id }));
+            }
+            layout_changed(state);
+            Ok(map(&[("ok", Value::Boolean(true))]))
+        }
+        "duplicate_workspace" => {
+            let new_name = param_str(&params, "new_name").map(str::to_string);
+            let (ws_id, at, tabs) = {
+                let mut l = lock(&state.layout);
+                let n = 1 + l.others.len();
+                let src = ws_index(&params, "source_workspace_idx", n)?;
+                let mut v = take_workspaces(&mut l);
+                let name = new_name.unwrap_or_else(|| format!("{} (copy)", v[src].name));
+                let n_tabs = v[src].tabs.len();
+                let mut tabs = Vec::new();
+                let mut made = Vec::new();
+                for _ in 0..n_tabs {
+                    let pane = new_pane_log(state, 24, 80);
+                    let tab = Uuid::new_v4();
+                    tabs.push(TabNode { id: tab, title: String::new(), tree: Tree::Leaf(pane) });
+                    made.push((tab, pane));
+                }
+                let id = Uuid::new_v4();
+                v.insert(src + 1, Ws { id, name, color: None, tabs, active_tab: 0 });
+                put_workspaces(&mut l, v);
+                if l.active_workspace >= src + 1 {
+                    l.active_workspace += 1;
+                }
+                (id, src + 1, made)
+            };
+            layout_changed(state);
+            let tabs: Vec<Value> = tabs
+                .iter()
+                .map(|(t, p)| map(&[("tab_id", str_val(&t.to_string())), ("pane_id", str_val(&p.to_string()))]))
+                .collect();
+            Ok(map(&[
+                ("workspace_id", str_val(&ws_id.to_string())),
+                ("workspace_idx", Value::from(at as u32)),
+                ("tabs", Value::Array(tabs)),
+            ]))
+        }
         "get_pane_info" => {
             let pane = param_uuid(&params, "pane_id")?;
             let panes = lock(&state.panes);
@@ -1247,43 +1382,77 @@ fn remove_pane(state: &Arc<State>, pane: Uuid) {
     layout_changed(state);
 }
 
-fn layout_value(state: &Arc<State>) -> Value {
-    let layout = lock(&state.layout);
-    let tabs: Vec<Value> = layout
-        .tabs
+fn tab_value(layout: &Layout, t: &TabNode) -> Value {
+    let mut ids = Vec::new();
+    t.tree.panes(&mut ids);
+    let focused = layout.active_pane.get(&t.id).filter(|p| ids.contains(p)).or_else(|| ids.first());
+    let active = focused.map(|id| str_val(&id.to_string())).unwrap_or(Value::Nil);
+    let pane_labels: Vec<(Value, Value)> = ids
         .iter()
-        .map(|t| {
-            let mut ids = Vec::new();
-            t.tree.panes(&mut ids);
-            let focused = layout.active_pane.get(&t.id).filter(|p| ids.contains(p)).or_else(|| ids.first());
-            let active = focused.map(|id| str_val(&id.to_string())).unwrap_or(Value::Nil);
-            let pane_labels: Vec<(Value, Value)> = ids
-                .iter()
-                .filter_map(|id| layout.labels.get(id).map(|l| (str_val(&id.to_string()), str_val(l))))
-                .collect();
-            map(&[
-                ("id", str_val(&t.id.to_string())),
-                ("title", str_val(&t.title)),
-                ("label", str_val(layout.labels.get(&t.id).map(String::as_str).unwrap_or(""))),
-                ("pane_labels", Value::Map(pane_labels)),
-                ("pane_tree", t.tree.to_value()),
-                ("active_pane_id", active),
-            ])
-        })
+        .filter_map(|id| layout.labels.get(id).map(|l| (str_val(&id.to_string()), str_val(l))))
         .collect();
     map(&[
-        (
-            "workspaces",
-            Value::Array(vec![map(&[
-                ("id", str_val("00000000-0000-0000-0000-000000000001")),
-                ("name", str_val(&layout.workspace)),
-                ("tabs", Value::Array(tabs)),
-                ("active_tab", Value::from(layout.active_tab.min(layout.tabs.len().saturating_sub(1)) as u32)),
-                ("color", Value::Nil),
-            ])]),
-        ),
-        ("active_workspace", Value::from(0u32)),
+        ("id", str_val(&t.id.to_string())),
+        ("title", str_val(&t.title)),
+        ("label", str_val(layout.labels.get(&t.id).map(String::as_str).unwrap_or(""))),
+        ("pane_labels", Value::Map(pane_labels)),
+        ("pane_tree", t.tree.to_value()),
+        ("active_pane_id", active),
     ])
+}
+
+fn ws_value(layout: &Layout, id: Uuid, name: &str, color: &Option<String>, tabs: &[TabNode], active_tab: usize) -> Value {
+    map(&[
+        ("id", str_val(&id.to_string())),
+        ("name", str_val(name)),
+        ("tabs", Value::Array(tabs.iter().map(|t| tab_value(layout, t)).collect())),
+        ("active_tab", Value::from(active_tab.min(tabs.len().saturating_sub(1)) as u32)),
+        ("color", color.as_deref().map(str_val).unwrap_or(Value::Nil)),
+    ])
+}
+
+fn layout_value(state: &Arc<State>) -> Value {
+    let layout = lock(&state.layout);
+    let mut list = vec![ws_value(&layout, layout.ws_id, &layout.workspace, &layout.ws_color, &layout.tabs, layout.active_tab)];
+    for w in &layout.others {
+        list.push(ws_value(&layout, w.id, &w.name, &w.color, &w.tabs, w.active_tab));
+    }
+    let active = layout.active_workspace.min(list.len() - 1);
+    map(&[("workspaces", Value::Array(list)), ("active_workspace", Value::from(active as u32))])
+}
+
+/// All workspaces as one list (the first one moved out of the layout's own fields).
+fn take_workspaces(l: &mut Layout) -> Vec<Ws> {
+    let mut v = vec![Ws {
+        id: l.ws_id,
+        name: std::mem::take(&mut l.workspace),
+        color: l.ws_color.take(),
+        tabs: std::mem::take(&mut l.tabs),
+        active_tab: l.active_tab,
+    }];
+    v.append(&mut l.others);
+    v
+}
+
+/// Put the list back: its first workspace is the one the tab methods work on.
+fn put_workspaces(l: &mut Layout, mut v: Vec<Ws>) {
+    let first = v.remove(0);
+    l.ws_id = first.id;
+    l.workspace = first.name;
+    l.ws_color = first.color;
+    l.tabs = first.tabs;
+    l.active_tab = first.active_tab;
+    l.others = v;
+}
+
+fn ws_index(params: &Value, key: &str, len: usize) -> Result<usize, (&'static str, String)> {
+    let i = params_get(params, key)
+        .and_then(Value::as_u64)
+        .ok_or((error_code::BAD_REQUEST, format!("{key} is required")))? as usize;
+    if i >= len {
+        return Err((error_code::BAD_REQUEST, format!("workspace index {i} out of bounds (len={len})")));
+    }
+    Ok(i)
 }
 
 fn layout_changed(state: &Arc<State>) {

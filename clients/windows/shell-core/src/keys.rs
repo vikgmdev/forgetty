@@ -47,6 +47,20 @@ pub enum Action {
     ClearTerminal,
     /// Full reset of the terminal state (RIS), then Ctrl+L, as GTK's "Reset".
     ResetTerminal,
+    /// Move the divider next to the active pane, 20 px, as GTK's Alt+Shift+Arrow.
+    ResizeLeft,
+    ResizeRight,
+    ResizeUp,
+    ResizeDown,
+    DuplicateTab,
+    CloseTabsRight,
+    CloseOtherTabs,
+    DuplicateWorkspace,
+    DeleteWorkspace,
+    MoveWorkspaceUp,
+    MoveWorkspaceDown,
+    /// The context menu of the active pane, at its top-left corner.
+    PaneMenu,
 }
 
 pub struct ActionInfo {
@@ -108,6 +122,18 @@ pub const ACTIONS: &[ActionInfo] = &[
     info!(Action::CopyRaw, "copy_raw", "Copy selection as is", []),
     info!(Action::ClearTerminal, "clear_terminal", "Clear terminal", []),
     info!(Action::ResetTerminal, "reset_terminal", "Reset terminal", []),
+    info!(Action::ResizeLeft, "resize_pane_left", "Resize pane left", ["alt+shift+left"]),
+    info!(Action::ResizeRight, "resize_pane_right", "Resize pane right", ["alt+shift+right"]),
+    info!(Action::ResizeUp, "resize_pane_up", "Resize pane up", ["alt+shift+up"]),
+    info!(Action::ResizeDown, "resize_pane_down", "Resize pane down", ["alt+shift+down"]),
+    info!(Action::DuplicateTab, "duplicate_tab", "Duplicate tab", []),
+    info!(Action::CloseTabsRight, "close_tabs_right", "Close tabs to the right", []),
+    info!(Action::CloseOtherTabs, "close_other_tabs", "Close other tabs", []),
+    info!(Action::DuplicateWorkspace, "duplicate_workspace", "Duplicate workspace", []),
+    info!(Action::DeleteWorkspace, "delete_workspace", "Delete workspace", []),
+    info!(Action::MoveWorkspaceUp, "move_workspace_up", "Move workspace up", []),
+    info!(Action::MoveWorkspaceDown, "move_workspace_down", "Move workspace down", []),
+    info!(Action::PaneMenu, "pane_menu", "Pane menu", []),
 ];
 
 impl Action {
@@ -340,5 +366,36 @@ mod tests {
         assert!(km.chords(Action::ResetTerminal).is_empty(), "menu-only in GTK: palette only here");
         assert!(km.warnings.is_empty(), "{:?}", km.warnings);
         assert_eq!(Action::from_name("copy_raw"), Some(Action::CopyRaw));
+    }
+
+    /// WP2: only the keyboard pane resize has a chord (GTK's Alt+Shift+Arrow, free on Windows).
+    /// Every chord that existed before still does what it did.
+    #[test]
+    fn wp2_actions_take_only_gtks_chord_and_move_no_existing_one() {
+        let km = Keymap::default_map();
+        let c = |ctrl, alt, shift, key: &str| km.lookup(&Chord::new(ctrl, alt, shift, false, key));
+        assert_eq!(c(false, true, true, "left"), Some(Action::ResizeLeft));
+        assert_eq!(c(false, true, true, "right"), Some(Action::ResizeRight));
+        assert_eq!(c(false, true, true, "up"), Some(Action::ResizeUp));
+        assert_eq!(c(false, true, true, "down"), Some(Action::ResizeDown));
+        // Focus keeps Ctrl+Alt+Arrow, splits keep Alt+Shift+plus and minus.
+        assert_eq!(c(true, true, false, "left"), Some(Action::FocusLeft));
+        assert_eq!(c(false, true, true, "plus"), Some(Action::SplitRight));
+        assert_eq!(c(false, true, true, "minus"), Some(Action::SplitDown));
+        assert_eq!(c(true, false, true, "q"), Some(Action::CloseTab));
+        assert_eq!(c(true, false, true, "pageup"), Some(Action::MoveTabLeft));
+        for a in [
+            Action::DuplicateTab,
+            Action::CloseTabsRight,
+            Action::CloseOtherTabs,
+            Action::DuplicateWorkspace,
+            Action::DeleteWorkspace,
+            Action::MoveWorkspaceUp,
+            Action::MoveWorkspaceDown,
+            Action::PaneMenu,
+        ] {
+            assert!(km.chords(a).is_empty(), "{a:?} has no chord: GTK has none");
+        }
+        assert!(km.warnings.is_empty(), "{:?}", km.warnings);
     }
 }

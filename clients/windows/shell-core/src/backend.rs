@@ -11,7 +11,8 @@
 //!
 //! Method map (wire name, then Rust):
 //! `get_layout`, `new_tab`, `close_tab`, `focus_tab`, `move_tab`,
-//! `create_workspace`, `set_active_workspace`, `rename_workspace`,
+//! `create_workspace`, `set_active_workspace`, `rename_workspace`, `delete_workspace`,
+//! `duplicate_workspace`, `move_workspace`, `set_workspace_color`,
 //! `split_pane`, `close_pane`, `set_active_pane`, `resize_pane`,
 //! `update_split_ratios`, `get_pane_info`, and `attach_pane` (+ input stream)
 //! which yields a `PaneSource`.
@@ -185,6 +186,10 @@ pub struct NewTab {
     pub cwd: Option<String>,
     /// Profile argv. Empty means the backend's default shell.
     pub command: Vec<String>,
+    /// Start in the directory this pane was started in, as "Duplicate tab" does. The backend
+    /// reads the directory itself (never an escape-code path from the client). `cwd` wins when
+    /// both are set.
+    pub inherit_cwd_from: Option<PaneId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -199,6 +204,16 @@ pub struct NewWorkspaceReply {
     pub workspace_idx: usize,
     pub tab_id: Uuid,
     pub pane_id: PaneId,
+}
+
+/// The copy a `duplicate_workspace` made: one new tab per tab of the source.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DuplicatedWorkspace {
+    pub workspace_id: Uuid,
+    /// Where the copy sits (right after the source).
+    pub workspace_idx: usize,
+    /// `(tab id, pane id)` per tab, in the source's order.
+    pub tabs: Vec<(Uuid, PaneId)>,
 }
 
 #[derive(Clone, Debug)]
@@ -286,6 +301,16 @@ impl LabelTarget {
     }
 }
 
+/// A workspace color the backend will take: nothing, or `#rrggbb` (case is folded to lower).
+pub fn valid_workspace_color(color: Option<&str>) -> BackendResult<Option<String>> {
+    match color {
+        None => Ok(None),
+        Some(c) => crate::colors::parse_hex(c)
+            .map(|v| Some(crate::colors::to_hex(v)))
+            .ok_or_else(|| BackendError::Invalid("a workspace color is #rrggbb".into())),
+    }
+}
+
 /// Labels are at most 128 characters with no control characters. Only a
 /// tab or pane label may be empty (it clears the label).
 pub fn valid_label(target: LabelTarget, label: &str) -> BackendResult<String> {
@@ -326,6 +351,24 @@ pub trait SessionBackend: Send + Sync {
     fn create_workspace(&self, name: Option<String>, rows: u16, cols: u16) -> BackendFuture<NewWorkspaceReply>;
     fn set_active_workspace(&self, workspace_idx: usize) -> BackendFuture<()>;
     fn rename_workspace(&self, workspace_idx: usize, name: String) -> BackendFuture<()>;
+    /// Delete a workspace and close its panes. The last workspace cannot be deleted.
+    fn delete_workspace(&self, workspace_idx: usize) -> BackendFuture<()>;
+    /// Copy a workspace with fresh shells: one new tab per source tab, in the directory of the
+    /// source tab's first pane. Splits and running programs are not copied. The copy is named
+    /// `new_name`, else "<source> (copy)", has no color and sits right after the source.
+    /// `rows` and `cols` size the new panes (a server uses its own default).
+    fn duplicate_workspace(
+        &self,
+        source_idx: usize,
+        new_name: Option<String>,
+        rows: u16,
+        cols: u16,
+    ) -> BackendFuture<DuplicatedWorkspace>;
+    /// Swap the positions of two workspaces (the server's `move_workspace`). The active
+    /// workspace stays the same workspace.
+    fn move_workspace(&self, from_idx: usize, to_idx: usize) -> BackendFuture<()>;
+    /// Set or clear (`None`) a workspace's accent color. Only `#rrggbb` is accepted.
+    fn set_workspace_color(&self, workspace_idx: usize, color: Option<String>) -> BackendFuture<()>;
     /// Name a workspace, tab or pane (`set_label`, PROTOCOL_V2 section 13).
     fn set_label(&self, target: LabelTarget, id: Uuid, label: String) -> BackendFuture<()>;
     fn split_pane(&self, req: SplitPane) -> BackendFuture<PaneId>;

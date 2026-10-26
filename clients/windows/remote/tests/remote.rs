@@ -341,3 +341,87 @@ async fn reconnect_after_a_restart_is_quick() {
         assert!(d < Duration::from_millis(1500), "gap {gap}: reconnect took {d:?}");
     }
 }
+
+/// WP2: the workspace methods go over the wire with the server's names and shapes, and the
+/// answers come back as layout events.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workspace_ops_over_the_wire() {
+    let r = rig(1).await;
+    let b = &r.backend;
+    until("connected", || b.connection().is_connected()).await;
+    let t = b.new_tab(NewTab { workspace_idx: 0, rows: 24, cols: 80, ..Default::default() }).await.unwrap();
+    let n_tabs = b.get_layout().await.unwrap().workspaces[0].tabs.len();
+    assert_eq!(n_tabs, 2);
+
+    // The last workspace cannot go.
+    assert!(b.delete_workspace(0).await.is_err());
+
+    // A copy: one new tab (and pane) per tab, after the source, named "<source> (copy)".
+    let d = b.duplicate_workspace(0, None, 24, 80).await.unwrap();
+    assert_eq!((d.workspace_idx, d.tabs.len()), (1, n_tabs));
+    let l = b.get_layout().await.unwrap();
+    assert_eq!(l.workspaces.len(), 2);
+    assert_eq!(l.workspaces[1].name, "Default (copy)");
+    assert_eq!(l.workspaces[1].id, d.workspace_id);
+    assert_eq!(l.workspaces[1].tabs.iter().map(|t| t.id).collect::<Vec<_>>(), d.tabs.iter().map(|t| t.0).collect::<Vec<_>>());
+    assert_eq!(l.workspaces[1].tabs[0].pane_tree.first_leaf(), d.tabs[0].1);
+    assert!(l.find_tab(t.tab_id).is_some_and(|(w, _)| w == 0));
+    let named = b.duplicate_workspace(1, Some("mine".into()), 24, 80).await.unwrap();
+    assert_eq!(b.get_layout().await.unwrap().workspaces[2].name, "mine");
+    assert_eq!(named.workspace_idx, 2);
+    assert!(b.duplicate_workspace(9, None, 24, 80).await.is_err());
+
+    // Color: #rrggbb goes out, anything else is refused before it is sent, null clears it.
+    b.set_workspace_color(1, Some("#3987E4".into())).await.unwrap();
+    assert_eq!(b.get_layout().await.unwrap().workspaces[1].color.as_deref(), Some("#3987e4"));
+    assert!(b.set_workspace_color(1, Some("blue".into())).await.is_err());
+    assert!(b.set_workspace_color(9, None).await.is_err());
+    b.set_workspace_color(1, None).await.unwrap();
+    assert_eq!(b.get_layout().await.unwrap().workspaces[1].color, None);
+
+    // Move swaps two workspaces; the active workspace follows its workspace.
+    b.set_active_workspace(2).await.unwrap();
+    b.move_workspace(2, 0).await.unwrap();
+    let l = b.get_layout().await.unwrap();
+    assert_eq!(l.workspaces.iter().map(|w| w.name.as_str()).collect::<Vec<_>>(), ["mine", "Default (copy)", "Default"]);
+    assert_eq!(l.active_workspace, 0);
+    assert!(b.move_workspace(0, 9).await.is_err());
+
+    // Delete closes the workspace's panes: the server sends PaneClosed for each.
+    let events = b.subscribe();
+    let doomed: Vec<_> = l.workspaces[1].tabs.iter().map(|t| t.pane_tree.first_leaf()).collect();
+    b.delete_workspace(1).await.unwrap();
+    let l = b.get_layout().await.unwrap();
+    assert_eq!(l.workspaces.len(), 2);
+    assert_eq!(l.workspaces[1].name, "Default");
+    assert_eq!(l.active_workspace, 0);
+    let mut closed = Vec::new();
+    until("pane closed events", || {
+        while let Ok(e) = events.try_recv() {
+            if let forgetty_shell_core::BackendEvent::PaneClosed { pane_id } = e {
+                closed.push(pane_id);
+            }
+        }
+        doomed.iter().all(|p| closed.contains(p))
+    })
+    .await;
+}
+
+/// "Duplicate tab" over the wire: the new tab starts where the source pane runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn duplicate_tab_asks_the_server_for_the_directory() {
+    let r = rig(1).await;
+    let b = &r.backend;
+    until("connected", || b.connection().is_connected()).await;
+    let l = b.get_layout().await.unwrap();
+    let src = l.workspaces[0].tabs[0].pane_tree.first_leaf();
+    // The test server reports "/home/test" for every pane. The request must still succeed
+    // with an unknown source pane (the directory is then the server's default).
+    let t = b.new_tab(NewTab { workspace_idx: 0, rows: 24, cols: 80, inherit_cwd_from: Some(src), ..Default::default() }).await.unwrap();
+    assert_eq!(b.get_layout().await.unwrap().tab_count(), 2);
+    let t2 = b
+        .new_tab(NewTab { workspace_idx: 0, rows: 24, cols: 80, inherit_cwd_from: Some(PaneId(Uuid::new_v4())), ..Default::default() })
+        .await
+        .unwrap();
+    assert_ne!(t.tab_id, t2.tab_id);
+}
