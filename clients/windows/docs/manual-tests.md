@@ -17,7 +17,9 @@ letterbox, `size_owner` label, toast requests, the Action Center holding the toa
 find in the scrollback (also over a 40000 row scrollback while frames keep coming), the scrollbar maths, link detection and the
 scheme allow-list, copy text (smart copy, soft wraps, scrollback rows), shift-click and drag auto-scroll, bell rate limit and
 Ctrl+C rule, OSC 12, OSC 9/99/777 raising a toast from a real ConPTY pane, code block detection and copy button, paste size
-warning, clear and reset,
+warning, clear and reset, config hot reload (font, theme by name, bell, notification mode, paste rules, shell,
+profiles with arguments and directory, bad and deleted file, new-tab menu, theme list), zoom limits and chords,
+the config file watcher (burst, atomic rename, idle),
 the IME handler (preedit, commit, cancel, candidate window anchor at the cursor cell), a real Microsoft IME
 (Japanese) and Microsoft Pinyin driven by injected keys (preedit, conversion, commit, anchor), MSI install and uninstall.
 
@@ -428,6 +430,93 @@ Needs the server of this branch (capabilities `split_before` and `workspace_id`)
 
 - Tab menu "Move to New Window" and Export (no multi-window, GTK's Export is a stub).
 - A custom color picker (the 8 presets only).
+
+---
+
+## WP3: config, hot reload, themes, zoom, profiles, notification mode
+
+The file is `%APPDATA%\forgetty\config.toml`. Keep an editor open on it. Everything below applies when the file is saved.
+
+### WP3.1 Hot reload
+
+- [ ] WP3.1.1 Save `font_size = 16`. Expected, within a second and with no restart: every pane (also panes in other tabs and workspaces) uses the bigger font, the grid has fewer columns, the shell inside sees the new size (`$Host.UI.RawUI.WindowSize`), and a notice says "Configuration reloaded: font".
+- [ ] WP3.1.2 Save `theme = "Dracula"`. Expected: the pane colors, the 16 ANSI colors in output already on screen (run `Get-ChildItem` or print a color table), the tab bar and the sidebar all change. Try `theme = "Drakula"`: a notice says ``theme `Drakula` not found, did you mean `Dracula`?`` and the colors stay as they were.
+- [ ] WP3.1.3 Put a custom theme in `%APPDATA%\forgetty\themes\mine.toml` (copy one from the forgetty repo `resources/themes/`), save `theme = "mine"` (the name of the file without `.toml`, or its name inside). Expected: it loads.
+- [ ] WP3.1.4 Save `bell_mode = "none"`, print a bell (`echo "`a"`) in a pane: nothing. Save `bell_mode = "both"`: flash and sound.
+- [ ] WP3.1.5 Save `notification_mode = "ringonly"`, run `Start-Sleep 3; Write-Host "`e]9;hello`a"` in a tab, switch to another tab. Expected: the first tab gets the amber ring and badge, no Windows toast. With `"none"`: neither. With `"all"`: both.
+- [ ] WP3.1.6 Change a keybinding (`[keybindings]` `new_tab = "ctrl+t"`), save. Expected: Ctrl+T opens a tab now, Ctrl+Shift+T no longer does, the palette shows the new chord. A bad chord (`new_tab = "ctrl+bogus+t"`) shows a warning in the notice and the rest still loads.
+- [ ] WP3.1.7 Save `backdrop = "none"` then `"mica"` (Windows 11) and `"blur"`. Expected: the window background changes live. On Windows 10, mica falls back to a solid background as at start.
+- [ ] WP3.1.8 Save `shell = "pwsh.exe -NoLogo"` (or `cmd.exe /k echo hi`). Expected: tabs opened from then on use it, with the arguments; tabs already open keep their shell. `shell = 'C:\Program Files\PowerShell\7\pwsh.exe'` (a path with spaces, no quotes needed) works.
+- [ ] WP3.1.9 Save `sidebar = true` while running: the notice says "Later: sidebar (next start)". `scrollback_bytes` says "(new panes)".
+
+### WP3.2 A file that is wrong
+
+- [ ] WP3.2.1 Break the syntax (`font_size = [`) and save. Expected: "Configuration not applied, the last good settings stay" plus the first line of the error; nothing else changes. Fix it and save: it applies.
+- [ ] WP3.2.2 Save `bell_mode = "loud"`. Expected: the same notice naming the value. Settings stay.
+- [ ] WP3.2.3 Delete the file while the app runs. Expected: "config.toml is gone, the last good settings stay". Settings stay. Create the file again: it applies.
+- [ ] WP3.2.4 Save a file with a typo (`bell_mdoe = "none"`). Expected: it applies, and the notice ends with the warning ``unknown key `bell_mdoe`, did you mean `bell_mode`?``.
+- [ ] WP3.2.5 Start the app with a broken file. Expected: the error box as before and the defaults. Fix the file: it applies live without a restart.
+- [ ] WP3.2.6 Idle cost: leave the app 5 minutes with no output and the file untouched. Expected: Task Manager shows 0 % CPU for the app and no disk reads from the config folder (the watcher is event-driven). Edit another file in `%APPDATA%\forgetty` (for example `machines.json` is written when you pair): no reload notice.
+- [ ] WP3.2.7 Save the file from an editor that writes a temporary file and renames it (VS Code, Notepad++ with "save as temp"), and from `Add-Content`. Expected: one reload each, no double notice.
+
+### WP3.3 Open and reload
+
+- [ ] WP3.3.1 Ctrl+Shift+P, "Open configuration file". Expected: the file opens in your editor; if it did not exist it was created with a commented template. With no program set for `.toml`, Notepad opens it.
+- [ ] WP3.3.2 Ctrl+Shift+P, "Reload configuration". Expected: "Configuration reloaded, nothing changed" when the file is as loaded.
+
+### WP3.4 Zoom
+
+- [ ] WP3.4.1 Ctrl+= (also Ctrl+Plus): the active pane's text grows by 1 pt. Ctrl+-: shrinks. Ctrl+0: back to the configured size. Other panes do not change. Stops at 72 pt and at 6 pt.
+- [ ] WP3.4.2 Run `vim` or `htop` in a zoomed pane: it redraws for the new size. In a split, the divider and other panes keep their place.
+- [ ] WP3.4.3 Zoom a pane, then save a new `font_size`. Expected: the zoom is gone and the new size is used.
+- [ ] WP3.4.4 In a pane of a Linux server (paired machine), zoom works the same and the PTY size follows (`stty size`).
+
+### WP3.5 Themes by name
+
+- [ ] WP3.5.1 Ctrl+Shift+P, "Choose theme...". Expected: a list of about 486 names, typing filters it, Enter applies the theme to every pane at once and says it is for this session. Save the config file with a different `theme`: the picked theme is replaced.
+- [ ] WP3.5.2 Close and reopen the app: the theme from the file is back (the picker does not write the file).
+
+### WP3.6 Profiles
+
+Add to `config.toml`:
+
+```toml
+default_profile = "Git"
+[[profiles]]
+name = "PowerShell"
+command = "pwsh.exe -NoLogo"
+directory = "~\\src"
+[[profiles]]
+name = "Git"
+command = "C:\\Program Files\\Git\\bin\\bash.exe --login -i"
+[[profiles]]
+name = "WSL Ubuntu"
+command = "wsl.exe -d Ubuntu --cd ~"
+```
+
+- [ ] WP3.6.1 Ctrl+Shift+1: a PowerShell tab opens without the logo, in `~\src` (if that folder exists; if not, in your home folder with a notice naming the folder). Ctrl+Shift+2: Git Bash. Ctrl+Shift+3: Ubuntu.
+- [ ] WP3.6.2 The "+" button and Ctrl+Shift+T open the default profile (Git). Remove `default_profile`: they open the first profile. Remove all profiles: they open `shell`.
+- [ ] WP3.6.3 Click the small arrow next to "+" (or right-click "+"). Expected: the profiles with their chords, "New Tab", then Split Right, Down, Left, Up. Pick one.
+- [ ] WP3.6.4 Ctrl+Shift+P: "Open profile: PowerShell" and the others are listed.
+- [ ] WP3.6.5 On a paired Linux machine: "+" opens that machine's shell, the arrow menu lists no profiles, Ctrl+Shift+1 says profiles start programs on this PC.
+- [ ] WP3.6.6 A profile whose program does not exist: a notice with the error, no tab left half open.
+
+### WP3.7 Paste rules
+
+- [ ] WP3.7.1 In a program that does not use bracketed paste (plain `cmd.exe` prompt), paste two lines. Expected: the confirm overlay. Save `paste_warn_newline = false`: the same paste goes straight in. Pasting text with a hidden escape byte still asks.
+- [ ] WP3.7.2 Save `paste_warn_size = 100` and paste 200 characters: the overlay names the size. `0` turns the size question off.
+
+### WP2c fixes (re-test)
+
+- [ ] WP2c.1 Fill the scrollback, select all, copy (a "Copying N lines..." notice). While it copies, run Reset from the pane menu. Expected: "Copy stopped: the terminal was reset." and the clipboard is unchanged. Repeat, and drag the window narrower while it copies: the copy either finishes with the right text or stops with "Copy stopped"; never a text with wrong rows.
+- [ ] WP2c.2 With a paired server that was upgraded and then replaced by an older one while the app ran (restart the old binary under the same name): "Delete workspace" works against the older server too (no "missing param").
+
+### Not done in WP3
+
+- A Settings window (not decided).
+- Theme preview swatches, a font picker.
+- `cursor_style` (GTK ignores it as well) and `on_launch` (Windows has no session restore).
+- Profile icons (read and kept, not shown).
 
 ---
 
