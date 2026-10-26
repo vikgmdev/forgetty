@@ -181,6 +181,13 @@ impl ShellSmoke {
         }
         record("wp3d_max_frame_gap_ms", json!(r1(d.max_gap)));
         check("wp3d_measured", d.new_tab.len() == TABS && d.split.len() == SPLITS);
+        // The action must not hold the UI thread longer than one frame (16.7 ms at 60 Hz). Before
+        // the start moved to a worker thread the call took about 4.6 ms on the CI runner (more on a
+        // PC with a virus scanner); now it only updates the layout.
+        let call_max = d.new_tab.iter().chain(d.split.iter()).map(|s| s[0]).fold(0.0, f64::max);
+        check("wp3d_call_within_one_frame", call_max < 16.7);
+        // No gap between painted frames near the length of the slow start.
+        check("wp3d_no_long_frame_gap", d.max_gap < 250.0 && d.slow_gap < 250.0);
     }
 
     /// A start that takes 1.5 s, in a folder that does not exist. The tab must be there at once
