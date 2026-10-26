@@ -63,7 +63,39 @@ struct State {
 /// The title of a pane whose process is being started.
 pub const STARTING_TITLE: &str = "Starting...";
 
+/// Counts the worker threads that are starting a process, so the app can end without leaving a
+/// shell behind that was half started.
+#[derive(Default)]
+struct Inflight {
+    n: Mutex<usize>,
+    done: std::sync::Condvar,
+}
+
+impl Inflight {
+    fn begin(self: &Arc<Self>) -> InflightGuard {
+        *self.n.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        InflightGuard(self.clone())
+    }
+
+    /// Wait up to `max` for every start to finish.
+    fn wait(&self, max: std::time::Duration) {
+        let g = self.n.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = self.done.wait_timeout_while(g, max, |n| *n > 0);
+    }
+}
+
+struct InflightGuard(Arc<Inflight>);
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        let mut n = self.0.n.lock().unwrap_or_else(|e| e.into_inner());
+        *n = n.saturating_sub(1);
+        self.0.done.notify_all();
+    }
+}
+
 struct Inner {
+    inflight: Arc<Inflight>,
     /// Test and smoke hook: how long a start waits before it begins (milliseconds).
     spawn_delay_ms: AtomicU64,
     cfg: LocalConfig,
@@ -95,6 +127,7 @@ impl LocalBackend {
         };
         LocalBackend {
             inner: Arc::new(Inner {
+                inflight: Arc::new(Inflight::default()),
                 spawn_delay_ms: AtomicU64::new(0),
                 cfg,
                 machine_id: Uuid::new_v4(),
@@ -152,6 +185,9 @@ impl LocalBackend {
         for p in self.inner.lock().panes.values() {
             p.pty.kill();
         }
+        // A start that is under way ends its new process as soon as it sees the kill. Give it a
+        // moment, so the app does not leave a half started shell behind.
+        self.inner.inflight.wait(std::time::Duration::from_millis(500));
     }
 }
 
@@ -235,18 +271,34 @@ impl Inner {
         self.emit(BackendEvent::TitleChanged { pane_id: id, title: STARTING_TITLE.to_string() });
         let delay = std::time::Duration::from_millis(self.spawn_delay_ms.load(Ordering::SeqCst));
         let wanted = cwd.or_else(|| self.cfg.default_cwd.clone()).or_else(user_profile_dir);
+        // The worker takes the pending start from this slot. If no thread can be made, it is
+        // still here and the failure is reported the same way as a failed start.
+        let slot = Arc::new(Mutex::new(Some(pending)));
+        let guard = self.inflight.begin();
+        let (w_slot, w_argv, w_wanted, w_folders) = (slot.clone(), argv.clone(), wanted.clone(), folders.clone());
         let started = std::thread::Builder::new().name("pty-spawn".into()).spawn(move || {
-            if !delay.is_zero() {
-                std::thread::sleep(delay);
+            let _guard = guard;
+            let Some(pending) = w_slot.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
+            // The test hook delay, cut short when the pane is closed.
+            let t0 = std::time::Instant::now();
+            while t0.elapsed() < delay && !pending.is_killed() {
+                std::thread::sleep(std::time::Duration::from_millis(20));
             }
-            let result = pending.run(&argv, &folders);
+            let result = pending.run(&w_argv, &w_folders);
             if let Some(inner) = weak.upgrade() {
-                inner.finish_start(id, &argv, wanted, &folders, result);
+                inner.finish_start(id, &w_argv, w_wanted, &w_folders, result);
             }
         });
         if let Err(e) = started {
             eprintln!("forgetty: cannot start a thread for a new pane: {e}");
-            self.emit(BackendEvent::PaneNotice { pane_id: id, text: format!("Could not start the shell: {e}") });
+            if let Some(pending) = slot.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                let msg = pending.fail(&format!("no thread for the start: {e}"));
+                // The state is locked by the caller: report through the same step, without the lock.
+                let events = self.apply_start(st, id, &argv, wanted, &folders, Err(msg));
+                for ev in events {
+                    self.emit(ev);
+                }
+            }
         }
         id
     }
@@ -254,52 +306,68 @@ impl Inner {
     /// The worker finished starting `id`'s process (or failed). Clears the "starting" title,
     /// tells the pane where it really started, and says so when the wanted folder was not used.
     fn finish_start(&self, id: PaneId, argv: &[String], wanted: Option<String>, folders: &[String], result: Result<crate::conpty::Started, String>) {
-        let mut out = Vec::new();
-        {
+        let events = {
             let mut st = self.lock();
-            // The pane was closed while it started: the process was ended by the start itself.
-            let Some(p) = st.panes.get_mut(&id) else { return };
-            p.starting = false;
-            let was_placeholder = p.title == STARTING_TITLE;
-            match result {
-                Ok(started) => {
-                    if was_placeholder {
-                        p.title.clear();
-                        out.push(BackendEvent::TitleChanged { pane_id: id, title: String::new() });
-                    }
-                    let used = started.folder.and_then(|i| folders.get(i)).cloned();
-                    // New tabs and splits from this pane start where it really started.
-                    p.spawn_cwd = used.clone();
-                    if let Some(u) = &used {
-                        if p.cwd.is_empty() || Some(&p.cwd) == wanted.as_ref() {
-                            p.cwd = u.clone();
-                        }
-                    }
-                    if let Some(w) = wanted.as_ref().filter(|w| Some(*w) != used.as_ref()) {
-                        let why = if crate::osc::is_safe_local_path(w) { "it does not exist or cannot be entered" } else { "network and device paths are not allowed" };
-                        let at = used.map(|u| format!("{u}")).unwrap_or_else(|| "the default folder".to_string());
-                        out.push(BackendEvent::PaneNotice {
-                            pane_id: id,
-                            text: format!("The folder {} cannot be used ({why}). Started in {}.", crate::notify::sanitize(w, 60), crate::notify::sanitize(&at, 60)),
-                        });
+            self.apply_start(&mut st, id, argv, wanted, folders, result)
+        };
+        for e in events {
+            self.emit(e);
+        }
+    }
+
+    /// Record how the start of `id` went, and return the events about it. The caller has the
+    /// state locked. A pane that is gone, or a start that was cancelled by a close, says nothing.
+    fn apply_start(
+        &self,
+        st: &mut State,
+        id: PaneId,
+        argv: &[String],
+        wanted: Option<String>,
+        folders: &[String],
+        result: Result<crate::conpty::Started, String>,
+    ) -> Vec<BackendEvent> {
+        let mut out = Vec::new();
+        // The pane was closed while it started: the start ended its own process.
+        let Some(p) = st.panes.get_mut(&id) else { return out };
+        p.starting = false;
+        let was_placeholder = p.title == STARTING_TITLE;
+        match result {
+            Ok(started) => {
+                if was_placeholder {
+                    p.title.clear();
+                    out.push(BackendEvent::TitleChanged { pane_id: id, title: String::new() });
+                }
+                let used = started.folder.and_then(|i| folders.get(i)).cloned();
+                // New tabs and splits from this pane start where it really started.
+                p.spawn_cwd = used.clone();
+                if let Some(u) = &used {
+                    if p.cwd.is_empty() || Some(&p.cwd) == wanted.as_ref() {
+                        p.cwd = u.clone();
                     }
                 }
-                Err(e) => {
-                    let prog = argv.first().map(String::as_str).unwrap_or("");
-                    if was_placeholder {
-                        p.title = "Could not start".to_string();
-                        out.push(BackendEvent::TitleChanged { pane_id: id, title: p.title.clone() });
-                    }
+                if let Some(w) = wanted.as_ref().filter(|w| Some(*w) != used.as_ref()) {
+                    let why = if crate::osc::is_safe_local_path(w) { "it does not exist or cannot be entered" } else { "network and device paths are not allowed" };
+                    let at = used.unwrap_or_else(|| "the default folder".to_string());
                     out.push(BackendEvent::PaneNotice {
                         pane_id: id,
-                        text: format!("Could not start {}: {}", crate::notify::sanitize(prog, 60), crate::notify::sanitize(&e, 100)),
+                        text: format!("The folder {} cannot be used ({why}). Started in {}.", crate::notify::sanitize(w, 60), crate::notify::sanitize(&at, 60)),
                     });
                 }
             }
+            Err(e) if e == crate::conpty::CANCELLED => {}
+            Err(e) => {
+                let prog = argv.first().map(String::as_str).unwrap_or("");
+                if was_placeholder {
+                    p.title = "Could not start".to_string();
+                    out.push(BackendEvent::TitleChanged { pane_id: id, title: p.title.clone() });
+                }
+                out.push(BackendEvent::PaneNotice {
+                    pane_id: id,
+                    text: format!("Could not start {}: {}", crate::notify::sanitize(prog, 60), crate::notify::sanitize(&e, 100)),
+                });
+            }
         }
-        for e in out {
-            self.emit(e);
-        }
+        out
     }
 
     fn apply_osc(&self, id: PaneId, events: Vec<OscEvent>) {
@@ -880,6 +948,12 @@ mod tests {
         })
     }
 
+    /// Wait until no pane is in the starting state (their title events have been sent).
+    fn settle(b: &LocalBackend) {
+        wait_for(|| b.inner.lock().panes.values().all(|p| !p.starting), "panes finish starting");
+        std::thread::sleep(Duration::from_millis(30));
+    }
+
     fn drain(rx: &async_channel::Receiver<BackendEvent>) -> Vec<BackendEvent> {
         let mut v = Vec::new();
         while let Ok(e) = rx.try_recv() {
@@ -1166,6 +1240,7 @@ mod tests {
         now(b.move_workspace(wid(&b, 1), wid(&b, 1))).unwrap();
 
         // Color: only #rrggbb, and clearing works. An unchanged color sends no event.
+        settle(&b);
         assert!(now(b.set_workspace_color(wid(&b, 1), Some("red".into()))).is_err());
         assert!(now(b.set_workspace_color(Uuid::new_v4(), None)).is_err());
         now(b.set_workspace_color(wid(&b, 1), Some("#3987e4".into()))).unwrap();
@@ -1338,5 +1413,28 @@ mod tests {
         wait_for(|| b.closed_ptys().iter().all(|(_, p)| p.try_exited()) && !b.closed_ptys().is_empty(), "the closed pane's process is gone");
         assert!(now(b.get_layout()).unwrap().find_tab(t2.tab_id).is_some());
         b.shutdown_all();
+    }
+    #[test]
+    fn a_pane_closed_while_starting_never_runs_its_program() {
+        let b = backend();
+        let marker = format!("/tmp/forgetty-never-{}", std::process::id());
+        let _ = std::fs::remove_file(&marker);
+        b.set_spawn_delay(Duration::from_millis(800));
+        let t0 = Instant::now();
+        let t = now(b.new_tab(NewTab {
+            workspace_idx: 0,
+            rows: 24,
+            cols: 80,
+            command: vec!["/bin/sh".into(), "-c".into(), format!("touch {marker}; sleep 5")],
+            ..Default::default()
+        }))
+        .unwrap();
+        now(b.new_tab(NewTab { workspace_idx: 0, rows: 24, cols: 80, ..Default::default() })).unwrap();
+        now(b.close_tab(t.tab_id)).unwrap();
+        // The app ends while another start is under way: shutdown returns quickly, not after the delay.
+        b.shutdown_all();
+        assert!(t0.elapsed() < Duration::from_millis(1500), "shutdown waited {:?}", t0.elapsed());
+        std::thread::sleep(Duration::from_millis(900));
+        assert!(!std::path::Path::new(&marker).exists(), "the closed pane ran its program");
     }
 }

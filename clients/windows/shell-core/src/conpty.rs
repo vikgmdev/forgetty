@@ -51,6 +51,10 @@ pub struct Pending {
     hooks: Hooks,
 }
 
+/// The error text of a start that was cancelled because the pane was closed while it started.
+/// It is not a failure to tell the user about.
+pub const CANCELLED: &str = "closed while starting";
+
 /// How a start went.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Started {
@@ -78,6 +82,20 @@ impl LocalConPty {
 }
 
 impl Pending {
+    /// The pane was closed (or the app is ending) before the process started.
+    pub fn is_killed(&self) -> bool {
+        self.shared.killed.load(Ordering::SeqCst)
+    }
+
+    /// The start could not even begin (no thread for it). Same effect as a failed `run`.
+    pub fn fail(self, why: &str) -> String {
+        self.shared.exited.store(true, Ordering::SeqCst);
+        let msg = why.to_string();
+        let _ = self.tx.try_send(PaneEvent::Output(format!("\x1b[31mforgetty: could not start the shell: {msg}\x1b[0m\r\n").into_bytes()));
+        let _ = self.tx.try_send(PaneEvent::Closed(format!("could not start: {msg}")));
+        msg
+    }
+
     /// Open the pseudo console and start the process. This blocks (ConPTY, `CreateProcess`, the
     /// folder checks inside portable-pty), so it runs on a worker thread, never on the UI thread.
     ///
@@ -93,6 +111,11 @@ impl Pending {
             Err(e) => {
                 let msg = format!("{e:#}");
                 shared.exited.store(true, Ordering::SeqCst);
+                if msg == CANCELLED {
+                    // The pane is gone or the app is ending: nobody needs a message.
+                    let _ = tx.try_send(PaneEvent::Closed(CANCELLED.into()));
+                    return Err(msg);
+                }
                 let _ = tx.try_send(PaneEvent::Output(format!("\x1b[31mforgetty: could not start the shell: {msg}\x1b[0m\r\n").into_bytes()));
                 let _ = tx.try_send(PaneEvent::Closed(format!("could not start: {msg}")));
                 Err(msg)
@@ -103,11 +126,20 @@ impl Pending {
     fn start(self, argv: &[String], folders: &[String]) -> Result<Started> {
         let Pending { shared, tx, input_rx, hooks } = self;
         let (shell, args) = argv.split_first().context("empty command")?;
+        let cancelled = || shared.killed.load(Ordering::SeqCst);
+        // A pane closed while it waited for its turn never starts its program.
+        if cancelled() {
+            anyhow::bail!(CANCELLED);
+        }
         let (rows, cols) = *shared.size.lock().unwrap_or_else(|e| e.into_inner());
         let pair = native_pty_system()
             .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
             .context("openpty (ConPTY)")?;
 
+        let profile_fix = {
+            let var = |k: &str| std::env::var(k).ok();
+            profile_override(var("USERPROFILE").as_deref(), var("HOMEDRIVE").as_deref(), var("HOMEPATH").as_deref(), var("SystemDrive").as_deref())
+        };
         let build = |cwd: Option<&str>| {
             let mut cmd = CommandBuilder::new(shell);
             for a in args {
@@ -117,6 +149,11 @@ impl Pending {
                 cmd.cwd(cwd);
             }
             cmd.env("TERM", "xterm-256color");
+            // portable-pty stats USERPROFILE on every start. When it is a share, give the child
+            // a local one instead, so no start touches the network.
+            if let Some(p) = &profile_fix {
+                cmd.env("USERPROFILE", p);
+            }
             cmd
         };
         // The caller checked the folders for UNC/device/NT-namespace paths (entering one can send
@@ -127,6 +164,9 @@ impl Pending {
         let mut child = None;
         let mut folder = None;
         for (i, f) in folders.iter().enumerate() {
+            if cancelled() {
+                anyhow::bail!(CANCELLED);
+            }
             if !std::path::Path::new(f).is_dir() {
                 continue;
             }
@@ -135,6 +175,9 @@ impl Pending {
                 folder = Some(i);
                 break;
             }
+        }
+        if child.is_none() && cancelled() {
+            anyhow::bail!(CANCELLED);
         }
         let child = match child {
             Some(c) => c,
@@ -308,6 +351,21 @@ impl LocalConPty {
     }
 }
 
+/// A local `USERPROFILE` for the child when the inherited one is a network or device path (the
+/// start would stat it). `None`: the inherited value is fine, or there is none.
+pub fn profile_override(userprofile: Option<&str>, homedrive: Option<&str>, homepath: Option<&str>, systemdrive: Option<&str>) -> Option<String> {
+    let up = userprofile.filter(|u| !u.is_empty())?;
+    if crate::osc::is_safe_local_path(up) {
+        return None;
+    }
+    let home = format!("{}{}", homedrive.unwrap_or(""), homepath.unwrap_or(""));
+    if !home.is_empty() && crate::osc::is_safe_local_path(&home) {
+        return Some(home);
+    }
+    let sys = format!("{}\\", systemdrive.unwrap_or("C:").trim_end_matches('\\'));
+    Some(if crate::osc::is_safe_local_path(&sys) { sys } else { "C:\\".into() })
+}
+
 /// ConPTY starts its output with `CSI ? 9001 h` (win32-input-mode). The terminal never sends
 /// win32 key records, and libghostty-vt logs "unimplemented mode: 9001" for it, so the
 /// sequence is cut from the stream here. It arrives whole in the first read; one split
@@ -330,6 +388,17 @@ fn strip_win32_input_mode(buf: &mut [u8]) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_profile_on_a_share_is_replaced_for_the_child() {
+        use super::profile_override as f;
+        assert_eq!(f(Some(r"C:\Users\v"), None, None, None), None);
+        assert_eq!(f(None, None, None, None), None);
+        assert_eq!(f(Some(r"\\srv\share\v"), Some("D:"), Some(r"\Users\v"), Some("C:")), Some(r"D:\Users\v".into()));
+        assert_eq!(f(Some(r"\\srv\share\v"), None, None, Some("E:")), Some(r"E:\".into()));
+        assert_eq!(f(Some(r"\\?\UNC\srv\share"), Some(r"\\srv"), Some(r"\x"), None), Some(r"C:\".into()));
+        assert_eq!(f(Some(r"\??\UNC\srv\share"), None, None, None), Some(r"C:\".into()));
+    }
+
     use super::strip_win32_input_mode;
 
     fn strip(input: &[u8]) -> Vec<u8> {
