@@ -10,7 +10,7 @@
 //! bell_mode = "visual"          # visual | audio | both | none
 //! paste_warn_size = 5120        # ask before pasting more bytes than this (0 = never)
 //! smart_copy = true             # copy strips box-drawing characters (false keeps them)
-//! right_click = "copy_paste"    # copy_paste | menu (Shift+right-click always opens the menu)
+//! right_click = "menu"           # menu (default, as GTK) | copy_paste (Windows Terminal: copy a selection, else paste; Shift+right-click opens the menu)
 //! [font]
 //! family = "Cascadia Mono"
 //! size = 11.0            # points
@@ -102,8 +102,9 @@ pub struct Config {
     pub paste_warn_size: usize,
     /// Copy strips box-drawing characters (the text of a bordered TUI, without its border).
     pub smart_copy: bool,
-    /// A plain right-click opens the context menu (else it copies a selection or pastes).
-    pub right_click_menu: bool,
+    /// A plain right-click copies a selection or pastes (Windows Terminal). Off by default: a
+    /// plain right-click opens the context menu, as in GTK. Shift+right-click opens the menu either way.
+    pub right_click_copy_paste: bool,
     /// Action name to chords, from `[keybindings]`. Overrides the defaults.
     pub keybindings: HashMap<String, Vec<String>>,
     pub accent: u32,
@@ -135,7 +136,7 @@ impl Default for Config {
             bell_mode: Default::default(),
             paste_warn_size: forgetty_shell_core::paste::DEFAULT_WARN_SIZE,
             smart_copy: true,
-            right_click_menu: false,
+            right_click_copy_paste: false,
             keybindings: HashMap::new(),
             accent: 0x60cdff,
             font_family: "Cascadia Mono".into(),
@@ -215,9 +216,9 @@ impl Config {
             c.smart_copy = v;
         }
         if let Some(m) = f.right_click.as_deref() {
-            c.right_click_menu = match m.trim().to_ascii_lowercase().as_str() {
-                "copy_paste" => false,
-                "menu" => true,
+            c.right_click_copy_paste = match m.trim().to_ascii_lowercase().as_str() {
+                "copy_paste" => true,
+                "menu" => false,
                 _ => return Err(format!("right_click: unknown value '{m}' (copy_paste, menu)")),
             };
         }

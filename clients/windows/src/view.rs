@@ -19,6 +19,7 @@ use forgetty_shell_core::scrollbar;
 use forgetty_shell_core::search::{self, SearchJob};
 use forgetty_shell_core::selection::{self, AUTOSCROLL_TICK};
 use forgetty_shell_core::copytext::CopyJob;
+use forgetty_shell_core::fingerprint::{self, Fingerprint};
 use forgetty_shell_core::{paste as paste_rules, PaneEvent, PaneId, PaneSource};
 use forgetty_vt::ffi;
 use forgetty_vt::screen::{CellAttributes, Color};
@@ -213,7 +214,7 @@ pub struct TerminalView {
     /// libghostty refused this size: do not try it again until the target changes.
     pub(crate) resize_refused: Option<(usize, usize)>,
     /// A copy over many rows, read in slices: the job and whether to smart-copy.
-    copy_task: Option<(CopyJob, bool)>,
+    copy_task: Option<CopyTask>,
     copy_driver: bool,
     /// True from a reset until the replay has drained (or `REPLAY_MAX` passed).
     pub replaying: bool,
@@ -266,33 +267,30 @@ pub struct SearchState {
     /// over new output. The smoke reads them.
     pub restarts: u32,
     pub extends: u32,
-    /// Hashes of a few rows of the settled part of the buffer, taken when the scan was made.
+    /// Hashes of rows of the settled part of the buffer, taken when the scan was made.
     /// When the buffer is full, old rows are dropped and every row index moves up: the rows
     /// then differ, and the scan starts over instead of going on with wrong row numbers.
     fp: Fingerprint,
 }
 
-/// `(rows covered, hashes of up to 9 rows spread over them)`.
-#[derive(Default)]
-struct Fingerprint(usize, Vec<u64>);
+/// A big copy read in slices. `fp` is the fingerprint of the part of the selection that is
+/// already in the scrollback: if those rows are not the same rows at the next slice, the
+/// buffer dropped old lines in between and the row numbers are wrong.
+struct CopyTask {
+    job: CopyJob,
+    smart: bool,
+    fp: Fingerprint,
+}
 
-impl Fingerprint {
-    fn take(term: &Terminal, scratch: &mut RowText, settled: usize) -> Self {
-        use std::hash::{Hash, Hasher};
-        let mut v = Vec::new();
-        if settled > 0 {
-            for k in 0..=8usize {
-                let row = (settled * k / 8).min(settled - 1);
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                if term.row_text(row, scratch) {
-                    scratch.text.hash(&mut h);
-                    scratch.wrapped.hash(&mut h);
-                }
-                v.push(h.finish());
-            }
+/// Fingerprint of rows `lo..hi` of the buffer (see `fingerprint.rs`).
+fn rows_fp(term: &Terminal, scratch: &mut RowText, lo: usize, hi: usize) -> Fingerprint {
+    Fingerprint::take(lo, hi, |row| {
+        if term.row_text(row, scratch) {
+            fingerprint::hash_text(&scratch.text, scratch.wrapped)
+        } else {
+            0
         }
-        Fingerprint(settled, v)
-    }
+    })
 }
 
 /// A paste waiting for the user's confirmation (Enter pastes, Esc cancels).
@@ -1099,7 +1097,7 @@ impl TerminalView {
         let screen = self.rows;
         let Some(st) = self.search.as_mut() else { return };
         st.job = SearchJob::new(&st.edit.text, total);
-        st.fp = Fingerprint::take(&self.term, &mut st.scratch, total.saturating_sub(screen));
+        st.fp = rows_fp(&self.term, &mut st.scratch, 0, total.saturating_sub(screen));
         st.restarts += 1;
         st.current = 0;
         st.jump = true;
@@ -1157,7 +1155,7 @@ impl TerminalView {
             // shrank (clear, reset) starts a new scan.
             let screen = self.rows;
             // The rows that were settled when the scan was made are still the same rows.
-            let unmoved = Fingerprint::take(&self.term, &mut st.scratch, st.fp.0).1 == st.fp.1;
+            let unmoved = rows_fp(&self.term, &mut st.scratch, 0, st.fp.hi) == st.fp;
             let extended = unmoved
                 && st.job.as_mut().is_some_and(|j| {
                     let old_total = j.progress().1;
@@ -1169,7 +1167,7 @@ impl TerminalView {
                 st.job = SearchJob::new(&st.edit.text, total);
                 st.restarts += 1;
             }
-            st.fp = Fingerprint::take(&self.term, &mut st.scratch, total.saturating_sub(screen));
+            st.fp = rows_fp(&self.term, &mut st.scratch, 0, total.saturating_sub(screen));
         }
         let Some(job) = st.job.as_mut() else {
             st.driver = false;
@@ -1683,7 +1681,14 @@ impl TerminalView {
             write_copy(&job, smart, cx);
             return;
         }
-        self.copy_task = Some((job, smart));
+        // Rows that are still on the live screen change in place and may keep changing. The
+        // rows above them are settled: they must be the same rows until the copy is done.
+        let settled = total.saturating_sub(self.rows);
+        let mut rt = RowText::default();
+        let fp = rows_fp(&self.term, &mut rt, r0, (r1 + 1).min(settled));
+        let n = job.total_rows();
+        self.copy_task = Some(CopyTask { job, smart, fp });
+        self.show_notice(format!("Copying {n} lines..."), cx);
         self.copy_drive(cx);
     }
 
@@ -1705,19 +1710,38 @@ impl TerminalView {
 
     /// One slice of a big copy. True while more is to come.
     fn copy_tick(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some((job, smart)) = self.copy_task.as_mut() else {
+        let Some(task) = self.copy_task.as_mut() else {
             self.copy_driver = false;
             return false;
         };
         let mut rt = RowText::default();
-        if !job.step(&mut copy_reader(&self.term, &mut rt), COPY_SLICE) {
+        // The rows must still be the rows that were selected.
+        if rows_fp(&self.term, &mut rt, task.fp.lo, task.fp.hi) != task.fp {
+            return self.copy_refused(cx);
+        }
+        if !task.job.step(&mut copy_reader(&self.term, &mut rt), COPY_SLICE) {
             return true;
         }
-        let smart = *smart;
-        if let Some((job, _)) = self.copy_task.take() {
-            write_copy(&job, smart, cx);
+        // The last slice may have been the one the output moved the rows in.
+        if rows_fp(&self.term, &mut rt, task.fp.lo, task.fp.hi) != task.fp {
+            return self.copy_refused(cx);
         }
+        if let Some(t) = self.copy_task.take() {
+            write_copy(&t.job, t.smart, cx);
+        }
+        // The clipboard now holds the whole copy: end the "copying" notice.
+        self.notice = None;
         self.copy_driver = false;
+        cx.notify();
+        false
+    }
+
+    /// The scrollback dropped lines while a copy ran. Nothing is put on the clipboard: a text
+    /// made of the wrong rows would be worse than none.
+    fn copy_refused(&mut self, cx: &mut Context<Self>) -> bool {
+        self.copy_task = None;
+        self.copy_driver = false;
+        self.show_notice("Copy stopped: output moved the lines while copying. Select again and copy.".into(), cx);
         false
     }
 
@@ -1824,9 +1848,10 @@ impl TerminalView {
                 cx.notify();
             }
             MouseButton::Right => {
-                // Shift+right-click always opens the menu (also over a program that tracks
-                // the mouse). A plain right-click does too with `right_click = "menu"`.
-                if ev.modifiers.shift || self.cfg.right_click_menu {
+                // A right-click opens the menu (GTK). Shift+right-click always does, also over a
+                // program that tracks the mouse. `right_click = "copy_paste"` gives a plain
+                // right-click the Windows Terminal behavior instead.
+                if ev.modifiers.shift || !self.cfg.right_click_copy_paste {
                     self.request_context_menu(ev.position, cx);
                     return;
                 }

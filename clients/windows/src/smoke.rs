@@ -739,6 +739,15 @@ impl ShellSmoke {
                         v.sel = Some(crate::view::Sel::new(crate::view::SelMode::Normal, (0, 0), (total - 1, cols - 1)));
                         vcx.write_to_clipboard(gpui::ClipboardItem::new_string(String::new()));
                         v.copy_selection_as(true, vcx);
+                        // A big copy says so, and the clipboard is written only when it is whole.
+                        check(
+                            "big_copy_shows_a_copying_notice",
+                            v.copy_pending() && v.notice_text().is_some_and(|t| t.starts_with("Copying ")),
+                        );
+                        check(
+                            "big_copy_leaves_the_clipboard_alone_until_it_is_whole",
+                            vcx.read_from_clipboard().and_then(|i| i.text()).unwrap_or_default().is_empty(),
+                        );
                         self.thr_t0 = Instant::now();
                         self.thr_last = None;
                         self.thr_max_gap = 0.0;
@@ -759,6 +768,7 @@ impl ShellSmoke {
                             json!({"lines": lines, "bytes": text.len(), "ms": ms(now - self.thr_t0), "max_frame_gap_ms": self.thr_max_gap}),
                         );
                         check("copy_scrollback_reaches_clipboard", lines > 5_000 && text.contains("0249999"));
+                        check("copying_notice_ends_with_the_copy", v.notice_text().is_none());
                         check("copy_scrollback_does_not_block_frames", self.thr_max_gap <= 100.0);
                         // New output over a full scrollback: rows move, so the scan starts over and
                         // still finds every new line. (A scan that goes on is checked in wp1.rs.)
@@ -1485,6 +1495,20 @@ fn run_direct_checks() {
                 && d.bell_mode == BellMode::Visual
                 && d.paste_warn_size == 5120
                 && d.smart_copy
+                && bad.is_err(),
+        );
+    }
+
+    // The right-click option: the menu is the default (GTK), copy_paste is Windows Terminal's.
+    {
+        let cp = Config::from_toml("right_click = \"copy_paste\"");
+        let menu = Config::from_toml("right_click = \"menu\"");
+        let bad = Config::from_toml("right_click = \"always\"");
+        check(
+            "config_right_click",
+            !Config::default().right_click_copy_paste
+                && cp.as_ref().is_ok_and(|c| c.right_click_copy_paste)
+                && menu.as_ref().is_ok_and(|c| !c.right_click_copy_paste)
                 && bad.is_err(),
         );
     }
