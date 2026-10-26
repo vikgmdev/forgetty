@@ -35,19 +35,29 @@ impl LocalConPty {
             .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
             .context("openpty (ConPTY)")?;
 
-        let mut cmd = CommandBuilder::new(shell);
-        for a in args {
-            cmd.arg(a);
-        }
-        if let Some(cwd) = cwd {
-            // Never stat or enter a UNC/device path: on Windows that can send
-            // NTLM credentials to a server named by program output.
-            if crate::osc::is_safe_local_path(cwd) && std::path::Path::new(cwd).is_dir() {
+        let build = |cwd: Option<&str>| {
+            let mut cmd = CommandBuilder::new(shell);
+            for a in args {
+                cmd.arg(a);
+            }
+            if let Some(cwd) = cwd {
                 cmd.cwd(cwd);
             }
-        }
-        cmd.env("TERM", "xterm-256color");
-        let child = pair.slave.spawn_command(cmd).with_context(|| format!("spawn {shell}"))?;
+            cmd.env("TERM", "xterm-256color");
+            cmd
+        };
+        // Never enter a UNC/device/NT-namespace path: on Windows that can send NTLM credentials
+        // to a server named by program output. The folder is not stat-ed here (this runs on the
+        // UI thread, and a slow or mapped drive would stall a frame): the process start checks
+        // it, and a folder that is gone is started without one, as before.
+        let safe_cwd = cwd.filter(|c| crate::osc::is_safe_local_path(c));
+        let child = match safe_cwd {
+            Some(c) => match pair.slave.spawn_command(build(Some(c))) {
+                Ok(child) => child,
+                Err(_) => pair.slave.spawn_command(build(None)).with_context(|| format!("spawn {shell}"))?,
+            },
+            None => pair.slave.spawn_command(build(None)).with_context(|| format!("spawn {shell}"))?,
+        };
         drop(pair.slave);
 
         let mut reader = pair.master.try_clone_reader().context("clone reader")?;
