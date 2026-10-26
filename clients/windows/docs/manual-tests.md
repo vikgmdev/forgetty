@@ -356,6 +356,70 @@ Look at another tab or another window first, so the pane is not the one you are 
 - [ ] WP1.10.4 In `vim` (alternate screen) or with mouse reporting on: no block highlight.
 - [ ] WP1.10.5 Move the pointer over fast-changing output (`1..100000 | % { $_ }`). Expected: no slowdown, no flicker of the button.
 
+## WP2: menus, workspace and tab operations, pane resize, attention
+
+Run once on the local machine and once on a paired Linux server (the workspace items need the server of this branch).
+Config key: `right_click = "copy_paste"` (default) or `"menu"` in `%APPDATA%\forgetty\config.toml`.
+
+### WP2.1 Pane menu
+
+- [ ] WP2.1.1 Shift+right-click inside a pane. Expected: a menu opens at the pointer: Copy (grey with no selection), Paste, Select All,
+  Find, Clear, Reset, Split Right, Split Down. Each shows its chord on the right where it has one.
+- [ ] WP2.1.2 Select some text, Shift+right-click. Copy is enabled. Click it: the text is on the clipboard. Paste, Select All, Find (opens the find bar),
+  Clear, Reset, Split Right and Split Down each do what the palette command does, in the pane you clicked (also when it is not the focused one).
+- [ ] WP2.1.3 Print a URL, Shift+right-click on it. Expected: the last item reads "Open https://...". Click it: the browser opens that URL.
+  Right-click on plain text: no such item. A `file://` or `javascript:` text never shows it.
+- [ ] WP2.1.4 A plain right-click still copies a selection or pastes (Windows Terminal style). With `right_click = "menu"` it opens the menu instead.
+- [ ] WP2.1.5 In `vim` with `:set mouse=a`, Shift+right-click still opens the menu. A plain right-click goes to vim.
+- [ ] WP2.1.6 Open the menu near the right and bottom edge. Expected: it flips to stay inside the window. Click outside, or press Esc: it closes. The terminal gets the keyboard back.
+- [ ] WP2.1.7 Palette: "Pane menu" opens it at the top left of the active pane. Up and Down move (grey rows are skipped), Enter runs the row.
+
+### WP2.2 Tab menu
+
+- [ ] WP2.2.1 Right-click a tab, then a row of the sidebar's TABS list. Expected: a color row (8 colors and a cross), Rename Tab, Duplicate Tab,
+  Split Right, Split Down, Move Left, Move Right, Find, Close Tabs to the Right, Close Other Tabs, Close Tab. Move Left is grey on the first tab,
+  Move Right and Close Tabs to the Right on the last, Close Other Tabs with one tab.
+- [ ] WP2.2.2 Pick a color. A dot shows in the tab and the sidebar row, and the active tab's top line takes that color. The cross clears it. Colors are not kept after a restart (as in GTK).
+- [ ] WP2.2.3 Duplicate Tab on a tab whose shell is in `C:\Users` (`cd` there first). Expected: a new tab right after it, in the same directory. In a pane that printed
+  `printf '\033]7;file:///etc\007'` the copy still starts in the directory the shell was started in.
+- [ ] WP2.2.4 Close Tabs to the Right and Close Other Tabs on a menu of a tab that is not the active one: they act on the tab you clicked.
+- [ ] WP2.2.5 Right-click a background tab, choose Split Right: that tab opens and splits.
+- [ ] WP2.2.6 Left arrow and Right arrow in the color row move the cursor, Enter picks.
+
+### WP2.3 Workspace menu
+
+- [ ] WP2.3.1 Open the sidebar (Ctrl+Shift+B). Right-click a workspace row. Expected: colors, Rename Workspace, Duplicate Workspace, Move Up, Move Down, Delete Workspace.
+  Move Up is grey on the first row, Move Down on the last, Delete when only one workspace is left.
+- [ ] WP2.3.2 Pick a color. The small bar on the row takes it. The cross clears it. Restart the server: the color is still there (remote and server-hosted workspaces).
+- [ ] WP2.3.3 Duplicate Workspace on a workspace with 3 tabs and a split. Expected: a new workspace named "<name> (copy)" right after it, with 3 fresh tabs (no split, no running program), each in
+  the directory of the source tab. It opens.
+- [ ] WP2.3.4 Move Down then Move Up. Expected: two rows swap, the highlighted (active) workspace stays the one you were in.
+- [ ] WP2.3.5 Delete a workspace with 1 tab: it goes at once. With 2 or more tabs: a question shows, Enter or Esc cancels, "y" or the Delete button deletes. Its shells end.
+- [ ] WP2.3.6 Window title: with two or more workspaces it reads `<workspace> - <tab> - Forgetty`. With one it reads `<tab> - Forgetty`.
+- [ ] WP2.3.7 Two apps on one server: delete or move a workspace in one. The other follows within a second.
+
+### WP2.4 Keyboard pane resize
+
+- [ ] WP2.4.1 Split a pane. Press Alt+Shift+Left several times. Expected: the divider moves left by 20 px a press. Alt+Shift+Right moves it back. Up and Down do the same for a horizontal divider.
+- [ ] WP2.4.2 Keep pressing until the divider stops (a pane keeps at least 120 px wide or 60 px high). Expected: no jump, no crash.
+- [ ] WP2.4.3 Restart the app (remote) or reconnect: the ratio is kept. In a 3-pane layout, the middle pane resizes the divider on the side of the arrow.
+- [ ] WP2.4.4 Zoomed pane: Alt+Shift+Arrow does nothing.
+
+### WP2.5 Attention (bell and notification)
+
+- [ ] WP2.5.1 Open two tabs. In tab 1 run `Start-Sleep 5; [char]7` (or `sleep 5; printf '\a'`), then switch to tab 2. After 5 s: tab 1 shows an amber dot, the sidebar row too.
+  Switch to tab 1: the pane has an amber ring for as long as you do not look at it, and both clear when it has the focus.
+- [ ] WP2.5.2 Split a pane, ring the bell in the pane without focus: that pane gets a 3 px amber ring. Click it: the ring goes.
+- [ ] WP2.5.3 A bell in the pane you are typing in does not leave a ring. With the window in the background, it does (until you come back).
+- [ ] WP2.5.4 `bell_mode = "none"`: no ring from a bell. A program notification (OSC 9) still raises the badge.
+### Not done in WP2
+
+- Split left / split up: the wire has no placement. Waits for the coordinator's decision.
+- Tab menu "Move to New Window" and Export (no multi-window, GTK's Export is a stub).
+- A custom color picker (the 8 presets only).
+
+---
+
 ## Part B: a week of daily use
 
 Use the Windows client as the main terminal for real work for 5 working days. Keep Windows Terminal installed as a fallback and write down each

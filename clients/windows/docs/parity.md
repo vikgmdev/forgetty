@@ -62,11 +62,11 @@ Verdict: local shells on Windows do not survive closing the app. Everything the 
 | B5 | Drag to reorder tabs, sends `move_tab` (`app.rs:1206-1227`) | PRESENT | Tab drag (`shell.rs:1080-1150`), Ctrl+Shift+PgUp/PgDn (`keys.rs:72-73`) | - | - |
 | B6 | Rename tab ("Change Tab Title", dialog; `app.rs:1786-1803`, `app.rs:6518`) | PRESENT | Inline editor, Ctrl+Shift+R or double click, stored via `set_label` (`shell.rs:885`, `keys.rs:74`) | - | - |
 | B7 | Tab title = cwd with `~` collapse, 100 ms poll (`app.rs:5702-5900`) | PRESENT | Label, then pane label, then program title, plus cwd chip (`chrome.rs:106-118`, `shell.rs:604-640`) | - | - |
-| B8 | Tab attention badge when an unfocused pane rings (`set_needs_attention`, `app.rs:3955-3975`) | PARTIAL | Status icon in tab and sidebar for server/OSC 133 status (`chrome.rs:52-62`). No badge for BEL or OSC 9/99/777 on local panes. | S | - |
-| B9 | Tab color dot (presets + custom picker; not persisted; `app.rs:6672`, `app.rs:7195-7360`) | MISSING | No tab color. | S | - |
-| B10 | Tab right-click menu: Change color, Rename, Duplicate, Split, Move left/right/new window, Search, Export (disabled stub), Close to the right, Close others, Close (`app.rs:6803-7300`) | MISSING | No context menu anywhere in the Windows UI (grep for right click/menu in `chrome.rs`, `shell.rs`, `machines.rs`: none). | M | - |
-| B11 | Duplicate tab (`app.rs:7364-7415`) | MISSING | - | S | - |
-| B12 | Close tabs to the right / close other tabs (`app.rs:7120-7190`) | MISSING | - | S | - |
+| B8 | Tab attention badge when an unfocused pane rings (`set_needs_attention`, `app.rs:3955-3975`) | PRESENT | Amber dot in the tab and the sidebar rows (and the workspace row) for a bell or a program notification in a pane nobody looks at; clears when the pane is looked at (`menus.rs` `raise_attention`, `shell-core/src/ops.rs` `raises_attention`). The server status icon stays as before. Smoke `tab_badge_for_background_bell`. | - | WP2 done |
+| B9 | Tab color dot (presets + custom picker; not persisted; `app.rs:6672`, `app.rs:7195-7360`) | PARTIAL | The 8 GTK presets and "none" in the tab menu, a dot in the tab and the sidebar row, the active tab's top line takes the color. Not persisted (as GTK). No custom picker. | - | WP2 done, picker left out |
+| B10 | Tab right-click menu: Change color, Rename, Duplicate, Split, Move left/right/new window, Search, Export (disabled stub), Close to the right, Close others, Close (`app.rs:6803-7300`) | PARTIAL | Right-click on a tab or a sidebar tab row (`shell-core/src/menu.rs` `tab_menu`, `menus.rs`): color, rename, duplicate, split right/down, move left/right, find, close to the right, close others, close. Keyboard: arrows, Enter, Esc. Left out: Move to new window (no multi-window), the Export stub. | - | WP2 done |
+| B11 | Duplicate tab (`app.rs:7364-7415`) | PRESENT | Menu and palette "Duplicate tab": a new tab right after the source, started in the directory the source shell was started in (`spawn_cwd`, never an OSC 7 path). Local and remote. | - | WP2 done |
+| B12 | Close tabs to the right / close other tabs (`app.rs:7120-7190`) | PRESENT | Menu and palette. Smoke `tab_close_to_the_right`, `tab_close_others`. | - | WP2 done |
 | B13 | New-tab dropdown with profiles + split actions (`app.rs:443-590`) | MISSING | Palette has split actions; no profile menu. | M | - |
 | B14 | Profiles: named shell+dir+icon, default profile, Ctrl+Shift+1..9 (`schema.rs:9-26`, `app.rs:401-440`, `app.rs:616-720`) | MISSING | `NewTab.command` exists in the backend (`backend.rs:181-188`) but no config key or UI. `shell` is a single string with no arguments (`main.rs:80-90`, `config.rs:21`). | M | - |
 | B15 | Last tab closed closes the window (`app.rs:7585-7603`) | PRESENT | `shell.rs:455-458` (local machine only) | - | - |
@@ -76,13 +76,13 @@ Verdict: local shells on Windows do not survive closing the app. Everything the 
 | ID | GTK feature (cite) | Windows | Windows evidence / what is missing | Size | Flags |
 |---|---|---|---|---|---|
 | C1 | Split right / split down, Alt+Shift+= and Alt+Shift+- (`app.rs:1366-1416`) | PRESENT | Same default chords (`keys.rs:81-82`) | - | - |
-| C2 | Split left / split up (before=true; menu only; `app.rs:1385-1386`) | MISSING | `SplitPane` has only direction, no placement (`backend.rs:205-214`) and `shell.rs:758` `split` takes only a direction. Whether the wire `split_pane` supports it: AMBIGUOUS (not checked in `PROTOCOL_V2.md`). | M | maybe protocol |
+| C2 | Split left / split up (before=true; menu only; `app.rs:1385-1386`) | MISSING | `SplitPane` has only direction, no placement (`backend.rs:205-214`) and `shell.rs:758` `split` takes only a direction. Whether the wire `split_pane` supports it: Checked in WP2: the wire `split_pane` takes pane_id, direction, rows, cols, cwd and no placement, so this needs a server change (optional `before`). Returned to the coordinator, not built. | M | protocol change |
 | C3 | Directional focus, Alt+Arrow, geometry based (`app.rs:1536-1556`, `app.rs:4814`) | PRESENT | Ctrl+Alt+Arrows (`keys.rs:84-87`) | - | chords differ |
-| C4 | Keyboard pane resize, Alt+Shift+Arrow (`app.rs:1560-1580`, `app.rs:4951`) | MISSING | Divider drag only (`shell.rs:1094-1150`). | S | - |
+| C4 | Keyboard pane resize, Alt+Shift+Arrow (`app.rs:1560-1580`, `app.rs:4951`) | PRESENT | Alt+Shift+Arrow moves the nearest divider 20 px, saved through `update_split_ratios` (`layout::resize_by_key`). Free on Windows, so GTK's chord is kept. Limit: a nested split is saved under its first leaf, like divider drag. | - | WP2 done |
 | C5 | Divider drag, ratios persisted (`app.rs:2684-2730`, `app.rs:2312`) | PRESENT | Drag + `update_split_ratios` (`shell.rs:1148`, `README.md` W2) | - | - |
 | C6 | Close pane, Ctrl+Shift+W, pane closes when the shell exits (`app.rs:1422-1442`, `app.rs:3927`) | PRESENT | Ctrl+Shift+W (`keys.rs:83`), smoke `close_pane_pty_exit` | - | - |
 | C7 | Dim unfocused panes (`term.rs:2813`) | PRESENT | `README.md` W2 "dims unfocused panes" | - | - |
-| C8 | Notification ring around an unfocused pane (`term.rs:2834`) | MISSING | Status shows in tab/sidebar icon, no pane ring. | S | - |
+| C8 | Notification ring around an unfocused pane (`term.rs:2834`) | PRESENT | 3 px amber ring on a pane whose bell or notification nobody has looked at; clears when it gets the focus in an active window. | - | WP2 done |
 | C9 | Per-tab focused pane remembered and restored (`app.rs:73-99`) | PRESENT | `set_active_pane` (`shell.rs:775`) | - | - |
 
 ## 5. Workspaces
@@ -93,12 +93,12 @@ Verdict: local shells on Windows do not survive closing the app. Everything the 
 | D2 | New workspace, Ctrl+Alt+N (`app.rs:1960-1975`) | PRESENT | Ctrl+Shift+N, "+ New workspace" (`keys.rs:91`, `shell.rs:826`) | - | - |
 | D3 | Switch workspace: click, Alt+1..9, Ctrl+Alt+PgUp/PgDn (`app.rs:2030-2145`) | PARTIAL | Click works. Next/Previous workspace actions exist with NO default chord (`keys.rs:92-93`). No number keys. | S | - |
 | D4 | Rename workspace (dialog; `app.rs:1982`, `app.rs:8175`) | PRESENT | Double click in sidebar, palette (`shell.rs:901`) | - | - |
-| D5 | Delete workspace (`app.rs:1998-2025`, `app.rs:9971`) | MISSING | No method in `SessionBackend` (`backend.rs:321-338`). Server socket has `delete_workspace` (`forgetty-socket/src/protocol.rs`). | M | - |
-| D6 | Duplicate workspace (`app.rs:9389-9830`) | MISSING | Not in trait. Server socket has `duplicate_workspace`. | M | - |
-| D7 | Move workspace up/down (`app.rs:9827-9970`) | MISSING | Not in trait. Server socket has `move_workspace`. | S | - |
-| D8 | Workspace color, persisted via daemon (`app.rs:9043-9160`) | MISSING | `Workspace.color` exists in the layout type (`layout.rs:55`) but nothing sets or draws it. Server socket has `set_workspace_color`. | S | - |
-| D9 | Workspace right-click menu (color, rename, duplicate, move, delete; `app.rs:8671-8935`) | MISSING | No context menus. | M | depends on D5-D8 |
-| D10 | Window title shows workspace name (`app.rs:8347-8400`) | PARTIAL | Title is `<tab> - Forgetty` (`shell.rs:1178`), no workspace. | S | - |
+| D5 | Delete workspace (`app.rs:1998-2025`, `app.rs:9971`) | PRESENT | `SessionBackend::delete_workspace` in LocalBackend and RemoteBackend. More than one tab asks first (Enter or Esc cancels, y deletes). The last workspace cannot be deleted (menu item greyed). | - | WP2 done |
+| D6 | Duplicate workspace (`app.rs:9389-9830`) | PRESENT | `SessionBackend::duplicate_workspace`: one fresh tab per source tab in the first pane's start directory, name "<source> (copy)", opens after the source. Splits and programs are not copied (server rule, local does the same). | - | WP2 done |
+| D7 | Move workspace up/down (`app.rs:9827-9970`) | PRESENT | `SessionBackend::move_workspace` (a swap of two positions, like the server). The active workspace stays the same workspace. | - | WP2 done |
+| D8 | Workspace color, persisted via daemon (`app.rs:9043-9160`) | PRESENT | `SessionBackend::set_workspace_color`, only `#rrggbb` is written. The sidebar row bar shows it. | - | WP2 done |
+| D9 | Workspace right-click menu (color, rename, duplicate, move, delete; `app.rs:8671-8935`) | PRESENT | Right-click on a workspace row. | - | WP2 done |
+| D10 | Window title shows workspace name (`app.rs:8347-8400`) | PRESENT | With several workspaces: `<workspace> - <tab> - Forgetty`. With one: `<tab> - Forgetty` (GTK AC-09). The "- Forgetty" ending stays (GTK shows the bare pane title). | - | WP2 done |
 
 ## 6. Input, keyboard, command surface
 
@@ -122,7 +122,7 @@ Verdict: local shells on Windows do not survive closing the app. Everything the 
 | F1 | Drag select (deferred origin), double-click word, triple-click line (`term.rs:840-925`, `term.rs:2013-2075`) | PRESENT | `view.rs:967-1010`, `view.rs:1101` | - | - |
 | F2 | Auto-scroll while dragging past the top/bottom edge (`term.rs:992-1001`) | PRESENT | Window-level mouse listener scrolls and extends while the pointer is held outside the pane (`view.rs` `autoscroll_tick`); smoke `drag_past_top_scrolls_and_extends`. | S | WP1 done
 | F3 | Shift+click extends selection (`term.rs:864-872`) | PRESENT | `on_mouse_down` extends from the anchor; smoke `shift_click_extends_selection`. | S | WP1 done
-| F4 | Select All (context menu, `app.rs:6227`) | PRESENT | Ctrl+Shift+A and palette action `SelectAll`; context-menu entry waits for WP2. | S | WP1 done
+| F4 | Select All (context menu, `app.rs:6227`) | PRESENT | Ctrl+Shift+A and palette action `SelectAll`; the pane context menu has Select All. | S | WP1, WP2 done
 | F5 | Copy via Ctrl+Shift+C (`app.rs:1448-1463`, `app.rs:5186-5372`) | PRESENT | `view.rs:927`, `view.rs:690` | - | - |
 | F6 | Smart copy: strip box-drawing U+2500-257F, trailing spaces, CRLF; soft-wrap join with heuristic (`clipboard.rs:1-27`, `app.rs:5290-5360`) | PRESENT | Box-drawing strip, trailing-space trim, soft-wrap join over absolute rows (`shell-core/src/copytext.rs`); `CopyRaw` action and `smart_copy` key. No shell-wrap heuristic beyond GTK rules. | S | WP1 done
 | F7 | Paste warning: size over `paste_warn_size`, newlines, preview dialog, config keys (`app.rs:5950-6125`, `schema.rs` `paste_warn_*`) | PRESENT | Adds `paste_warn_size` (default 5120, 0 disables) with the size in the overlay. Windows stays stricter than GTK (bracketed paste, control strip, always confirm). | S | WP1 done
@@ -135,7 +135,7 @@ Verdict: local shells on Windows do not survive closing the app. Everything the 
 | ID | GTK feature (cite) | Windows | Windows evidence / what is missing | Size | Flags |
 |---|---|---|---|---|---|
 | G1 | http/https URL detection on hover: underline and pointer cursor (`term.rs:1729-1805`, `term.rs:1080-1100`, `term.rs:2622`) | PRESENT | `shell-core/src/links.rs` (http/https only, trailing punctuation cut, wrapped URLs whole), underline and hand cursor. | M | WP1 done
-| G2 | Ctrl+click opens URL in browser; context menu "Open <url>" (`term.rs:798-818`, `app.rs:6271`, `term.rs:1639-1685`) | PARTIAL | Ctrl+click opens via ShellExecute after the scheme allow-list. Context-menu "Open <url>" waits for the WP2 context menu. | S | WP1 done, rest in WP2
+| G2 | Ctrl+click opens URL in browser; context menu "Open <url>" (`term.rs:798-818`, `app.rs:6271`, `term.rs:1639-1685`) | PRESENT | Ctrl+click opens via ShellExecute after the scheme allow-list. The pane menu (Shift+right-click) shows "Open <url>" when the pointer was on a link, same allow-list. | - | WP1, WP2 done |
 | G3 | In-terminal search bar, Ctrl+Shift+F: whole scrollback, case-insensitive, "N of M", Enter/Shift+Enter, Esc, highlights, scroll to match (`term.rs:1340-1440`, `term.rs:1863-1920`, `term.rs:2077-2340`, `term.rs:2787`, `app.rs:1468-1486`) | PRESENT | Ctrl+Shift+F find bar, whole scrollback, case-insensitive, "N of M", Enter/Shift+Enter/Esc, highlights in GTK colors. Time-sliced (4 ms) off the key path (`shell-core/src/search.rs`). | M | WP1 done
 | G4 | Mouse wheel scroll, 3 rows per notch (`input.rs:261-335`) | PRESENT | `view.rs:1061-1100` | - | - |
 | G5 | Scrollbar widget with drag (`term.rs:1224-1340`) | PRESENT | 10 px overlay strip with draggable thumb (`view.rs` `scrollbar_overlay`, `shell-core/src/scrollbar.rs`). | S | WP1 done
@@ -218,7 +218,7 @@ Neither has: window size/position/maximized restore (A14), file drag and drop in
 4. Theme catalog (K1): reuse `forgetty-config` on Windows or copy the theme TOML files into the Windows crate.
 5. Chord policy (E4, E5, E9): keep Windows Terminal conventions or copy GTK chords. Pure product call.
 6. Image paste for remote panes (F8): needs a server upload path or is limited to local panes.
-7. Split left/up (C2): check whether the wire `split_pane` accepts a placement before sizing.
+7. Split left/up (C2): the wire `split_pane` has no placement (checked in WP2). Either add an optional `before` param on the server, or leave it unsupported.
 
 ## 13. Counts
 
