@@ -138,6 +138,13 @@ pub struct AppShell {
     pub palette: Option<Palette>,
     pub rename: Option<Rename>,
     pub drag: Option<Drag>,
+    /// The open context menu and the question that waits for an answer.
+    pub menu: Option<crate::menus::OpenMenu>,
+    pub confirm: Option<crate::menus::Confirm>,
+    /// Panes whose bell or notification the user has not looked at yet.
+    pub attention: HashSet<PaneId>,
+    /// Tab colors. Like GTK's they live in memory only (the server has no tab color).
+    pub tab_colors: HashMap<Uuid, u32>,
     pub focus: FocusHandle,
     pub metrics: Metrics,
     pub viewport: (f32, f32),
@@ -245,6 +252,10 @@ impl AppShell {
             palette: None,
             rename: None,
             drag: None,
+            menu: None,
+            confirm: None,
+            attention: HashSet::new(),
+            tab_colors: HashMap::new(),
             focus,
             metrics,
             viewport: (f32::from(vp.width), f32::from(vp.height)),
@@ -440,9 +451,11 @@ impl AppShell {
         let panes: HashSet<PaneId> = layout.all_panes().into_iter().collect();
         self.views.retain(|id, _| panes.contains(id));
         self.meta.retain(|id, _| panes.contains(id));
+        self.attention.retain(|id| panes.contains(id));
         let tabs: HashSet<Uuid> = layout.workspaces.iter().flat_map(|w| w.tabs.iter().map(|t| t.id)).collect();
         self.local_active.retain(|id, p| tabs.contains(id) && panes.contains(p));
         self.zoomed.retain(|id, p| tabs.contains(id) && panes.contains(p));
+        self.tab_colors.retain(|id, _| tabs.contains(id));
         let workspaces: HashSet<Uuid> = layout.workspaces.iter().map(|w| w.id).collect();
         if self.rename.as_ref().is_some_and(|r| match r.target {
             LabelTarget::Workspace => !workspaces.contains(&r.id),
@@ -458,6 +471,19 @@ impl AppShell {
             return;
         }
         self.layout = layout;
+        // A menu or question about something that is gone closes.
+        if self.menu.as_ref().is_some_and(|o| match &o.target {
+            crate::menus::MenuTarget::Pane(p) => !panes.contains(p),
+            crate::menus::MenuTarget::Tab(t) => !tabs.contains(t),
+            crate::menus::MenuTarget::Workspace(i) => *i >= self.layout.workspaces.len(),
+        }) {
+            self.menu = None;
+        }
+        if let Some(crate::menus::ConfirmAct::DeleteWorkspace(id)) = self.confirm.as_ref().map(|c| &c.act) {
+            if !workspaces.contains(id) {
+                self.confirm = None;
+            }
+        }
         if self.attach_enabled {
             let ids: Vec<PaneId> = panes.into_iter().collect();
             for p in ids {
@@ -657,6 +683,10 @@ impl AppShell {
         let win_active = window.is_window_active() || self.smoke_mode;
         self.window_active = win_active;
         let multi = visible.len() > 1;
+        // Looking at a pane answers its bell.
+        if let (true, Some(a)) = (win_active, active) {
+            self.attention.remove(&a);
+        }
         for (id, v) in &self.views {
             let (vis, foc) = (visible.contains(id), Some(*id) == active && win_active);
             let dim = if multi && vis && Some(*id) != active { 0.28 } else { 0.0 };
@@ -702,7 +732,7 @@ impl AppShell {
         let r = self.content_rect();
         let (rows, cols) = self.grid_for(r.w, r.h);
         // No cwd: the backend decides (it never trusts escape-code paths).
-        let req = NewTab { workspace_idx: self.layout.active_workspace, rows, cols, cwd: None, command: Vec::new() };
+        let req = NewTab { workspace_idx: self.layout.active_workspace, rows, cols, ..Default::default() };
         let fut = self.backend.new_tab(req);
         self.call(cx, fut, |s, reply, cx| {
             s.local_active.insert(reply.tab_id, reply.pane_id);
@@ -745,14 +775,9 @@ impl AppShell {
     }
 
     pub fn move_tab_by(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let Some(ws) = self.layout.active_workspace() else { return };
-        let to = ws.active_tab as isize + delta;
-        if to < 0 || to >= ws.tabs.len() as isize {
-            return;
+        if let Some(id) = self.active_tab().map(|t| t.id) {
+            self.move_tab_id(id, delta, cx);
         }
-        let id = ws.tabs[ws.active_tab].id;
-        let fut = self.backend.move_tab(id, to as usize);
-        self.call(cx, fut, |_, _, _| {});
     }
 
     pub fn split(&mut self, dir: SplitDir, cx: &mut Context<Self>) {
@@ -761,6 +786,11 @@ impl AppShell {
             .active_geometry()
             .and_then(|(_, g)| g.panes.iter().find(|(p, _)| *p == pane).map(|(_, r)| *r))
             .unwrap_or_else(|| self.content_rect());
+        self.split_pane_in(tab, pane, rect, dir, cx);
+    }
+
+    /// Split `pane` of `tab`, which fills `rect` now. The new pane gets the focus.
+    pub(crate) fn split_pane_in(&mut self, tab: Uuid, pane: PaneId, rect: Rect, dir: SplitDir, cx: &mut Context<Self>) {
         let (w, h) = match dir {
             SplitDir::Horizontal => (rect.w / 2.0, rect.h),
             SplitDir::Vertical => (rect.w, rect.h / 2.0),
@@ -949,6 +979,30 @@ impl AppShell {
             Action::CopyRaw => self.on_active_view(window, cx, |v, cx| v.copy_selection_as(false, cx)),
             Action::ClearTerminal => self.on_active_view(window, cx, |v, cx| v.clear_terminal(cx)),
             Action::ResetTerminal => self.on_active_view(window, cx, |v, cx| v.reset_terminal(cx)),
+            Action::ResizeLeft => self.resize_pane_key(Side::Left, cx),
+            Action::ResizeRight => self.resize_pane_key(Side::Right, cx),
+            Action::ResizeUp => self.resize_pane_key(Side::Up, cx),
+            Action::ResizeDown => self.resize_pane_key(Side::Down, cx),
+            Action::DuplicateTab => {
+                if let Some(t) = self.active_tab().map(|t| t.id) {
+                    self.duplicate_tab(t, cx);
+                }
+            }
+            Action::CloseTabsRight => {
+                if let Some(t) = self.active_tab().map(|t| t.id) {
+                    self.close_tabs_right(t, cx);
+                }
+            }
+            Action::CloseOtherTabs => {
+                if let Some(t) = self.active_tab().map(|t| t.id) {
+                    self.close_other_tabs(t, cx);
+                }
+            }
+            Action::DuplicateWorkspace => self.duplicate_workspace(self.layout.active_workspace, cx),
+            Action::DeleteWorkspace => self.delete_workspace(self.layout.active_workspace, cx),
+            Action::MoveWorkspaceUp => self.move_workspace(self.layout.active_workspace, true, cx),
+            Action::MoveWorkspaceDown => self.move_workspace(self.layout.active_workspace, false, cx),
+            Action::PaneMenu => self.open_active_pane_menu(cx),
         }
         cx.notify();
     }
@@ -974,6 +1028,7 @@ impl AppShell {
             self.palette = None;
         } else {
             self.rename = None;
+            self.menu = None;
             let mut p = Palette { edit: LineEdit::default(), selected: 0, items: Vec::new() };
             self.refresh_palette(&mut p);
             self.palette = Some(p);
@@ -1014,6 +1069,14 @@ impl AppShell {
         let chord = Self::chord_of(ks);
         if self.pair.is_some() {
             self.pair_key(ks, cx);
+            return true;
+        }
+        if self.confirm.is_some() {
+            self.confirm_key(ks, cx);
+            return true;
+        }
+        if self.menu.is_some() {
+            self.menu_key(ks, window, cx);
             return true;
         }
         if self.palette.is_some() {
@@ -1097,6 +1160,10 @@ impl AppShell {
     // ---- mouse --------------------------------------------------------------------
 
     pub fn on_tab_mouse_down(&mut self, id: Uuid, index: usize, ev: &MouseDownEvent, cx: &mut Context<Self>) {
+        if ev.button == MouseButton::Right {
+            self.open_tab_menu(id, (f32::from(ev.position.x), f32::from(ev.position.y)), false, cx);
+            return;
+        }
         if ev.button != MouseButton::Left {
             return;
         }
@@ -1195,10 +1262,9 @@ impl AppShell {
     // ---- after paint -----------------------------------------------------------------
 
     pub fn window_title(&self) -> String {
-        match self.active_tab() {
-            Some(t) => format!("{} - Forgetty", self.tab_title(t)),
-            None => "Forgetty".to_string(),
-        }
+        let tab = self.active_tab().map(|t| self.tab_title(t));
+        let ws = self.layout.active_workspace().map(|w| forgetty_shell_core::notify::sanitize(&w.name, 60)).unwrap_or_default();
+        forgetty_shell_core::ops::window_title(self.layout.workspaces.len(), &ws, tab.as_deref())
     }
 
     /// Called at the end of every painted frame.

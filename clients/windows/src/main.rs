@@ -15,6 +15,7 @@ mod element;
 mod encoder;
 mod lineedit;
 mod machines;
+mod menus;
 mod screenshot;
 mod shell;
 mod smoke;

@@ -120,6 +120,10 @@ fn make_term(cfg: &Config, rows: usize, cols: usize) -> Terminal {
 pub enum ViewEvent {
     /// A program asked for the clipboard (OSC 52). Never sent for replayed output.
     Clipboard(forgetty_shell_core::osc52::Request),
+    /// The pane's bell rang and passed the rate gate, and the bell mode is not `none`.
+    Bell { pane: PaneId },
+    /// The user asked for the pane's context menu at a window position.
+    ContextMenu { pane: PaneId, pos: (f32, f32), url: Option<String>, has_selection: bool },
 }
 
 /// Counts of OSC 52 requests seen live in this pane (the smoke reads them).
@@ -735,6 +739,9 @@ impl TerminalView {
         }
         self.bells += 1;
         let mode = self.cfg.bell_mode;
+        if mode.visual() || mode.audio() {
+            cx.emit(ViewEvent::Bell { pane: self.pane_id });
+        }
         if mode.visual() {
             self.bell_until = Some(now + bell::FLASH);
             if self.visible {
@@ -1783,6 +1790,12 @@ impl TerminalView {
                 cx.notify();
             }
             MouseButton::Right => {
+                // Shift+right-click always opens the menu (also over a program that tracks
+                // the mouse). A plain right-click does too with `right_click = "menu"`.
+                if ev.modifiers.shift || self.cfg.right_click_menu {
+                    self.request_context_menu(ev.position, cx);
+                    return;
+                }
                 // Windows Terminal convention: copy if selected, else paste.
                 if self.sel.as_ref().is_some_and(|s| !s.is_empty()) {
                     self.copy_selection(cx);
@@ -1794,6 +1807,24 @@ impl TerminalView {
             }
             _ => {}
         }
+    }
+
+    /// A selection that has at least one cell.
+    pub fn has_selection(&self) -> bool {
+        self.sel.as_ref().is_some_and(|s| !s.is_empty())
+    }
+
+    /// Tell the shell to open this pane's context menu at a window position. It carries the
+    /// link under the position and whether Copy has something to copy.
+    pub fn request_context_menu(&mut self, position: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+        let (vr, col) = self.cell_at(position);
+        let url = self.link_at(vr, col).map(|l| l.url).filter(|u| links::is_openable(u));
+        cx.emit(ViewEvent::ContextMenu {
+            pane: self.pane_id,
+            pos: (f32::from(position.x), f32::from(position.y)),
+            url,
+            has_selection: self.has_selection(),
+        });
     }
 
     fn on_mouse_move(&mut self, ev: &MouseMoveEvent, _w: &mut Window, _cx: &mut Context<Self>) {

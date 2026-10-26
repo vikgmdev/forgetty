@@ -71,6 +71,8 @@ pub struct MachineSlot {
     pub meta: HashMap<PaneId, PaneMeta>,
     pub local_active: HashMap<Uuid, PaneId>,
     pub zoomed: HashMap<Uuid, PaneId>,
+    pub attention: HashSet<PaneId>,
+    pub tab_colors: HashMap<Uuid, u32>,
     pub had_tabs: bool,
 }
 
@@ -85,6 +87,8 @@ impl MachineSlot {
             meta: HashMap::new(),
             local_active: HashMap::new(),
             zoomed: HashMap::new(),
+            attention: HashSet::new(),
+            tab_colors: HashMap::new(),
             had_tabs: false,
         }
     }
@@ -289,6 +293,7 @@ impl AppShell {
             match ev {
                 BackendEvent::ConnectionChanged(st) => self.on_conn(id, st, cx),
                 BackendEvent::Notification { pane_id, title, body } => {
+                    self.raise_attention(id, pane_id, cx);
                     self.with_machine(id, |s| {
                         let vis = s.visibility(shown, id, pane_id);
                         if notify::notification_wants_toast(vis) {
@@ -348,7 +353,7 @@ impl AppShell {
                 .machines
                 .iter()
                 .find(|m| m.id == id)
-                .map(|m| m.backend.new_tab(NewTab { workspace_idx: 0, rows, cols, cwd: None, command: Vec::new() }));
+                .map(|m| m.backend.new_tab(NewTab { workspace_idx: 0, rows, cols, ..Default::default() }));
             if let Some(fut) = fut {
                 cx.spawn(async move |_, _| {
                     if let Err(e) = fut.await {
@@ -414,6 +419,8 @@ impl AppShell {
         std::mem::swap(&mut self.meta, &mut slot.meta);
         std::mem::swap(&mut self.local_active, &mut slot.local_active);
         std::mem::swap(&mut self.zoomed, &mut slot.zoomed);
+        std::mem::swap(&mut self.attention, &mut slot.attention);
+        std::mem::swap(&mut self.tab_colors, &mut slot.tab_colors);
         std::mem::swap(&mut self.had_tabs, &mut slot.had_tabs);
     }
 
@@ -434,6 +441,8 @@ impl AppShell {
         self.swap_slot(&mut slot);
         self.parked.insert(slot.machine.id, slot);
         self.palette = None;
+        self.menu = None;
+        self.confirm = None;
         self.rename = None::<Rename>;
         self.drag = None::<Drag>;
         let panes = self.layout.all_panes();

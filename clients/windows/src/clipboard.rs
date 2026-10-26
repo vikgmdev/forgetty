@@ -70,7 +70,19 @@ impl AppShell {
 
     /// A pane of `machine` reported a request.
     pub fn on_view_event(&mut self, machine: Uuid, ev: &ViewEvent, cx: &mut Context<Self>) {
-        let ViewEvent::Clipboard(req) = ev;
+        let req = match ev {
+            ViewEvent::Clipboard(req) => req,
+            ViewEvent::Bell { pane } => {
+                self.raise_attention(machine, *pane, cx);
+                return;
+            }
+            ViewEvent::ContextMenu { pane, pos, url, has_selection } => {
+                if machine == self.machine.id {
+                    self.open_pane_menu(*pane, *pos, url.clone(), *has_selection, false, cx);
+                }
+                return;
+            }
+        };
         match req {
             Request::ReadDenied => self.clip_stats.reads_denied += 1,
             Request::TooLarge => self.clip_stats.too_large += 1,

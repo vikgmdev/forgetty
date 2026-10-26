@@ -68,6 +68,8 @@ impl AppShell {
         let title = self.tab_title(tab);
         let cwd = self.tab_cwd(tab);
         let status = self.tab_status(tab);
+        let tint = self.tab_colors.get(&id).copied();
+        let badge = self.tab_has_attention(tab);
         let hover = alpha(th.hover, if self.mica { 0.6 } else { 1.0 });
 
         let mut label = div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis();
@@ -106,14 +108,19 @@ impl AppShell {
             .text_color(hsla(if active { th.fg } else { th.dim }))
             .bg(if active { alpha(th.tab_active, 1.0) } else { alpha(th.chrome, 0.0) })
             .when(!active, |d| d.hover(move |s| s.bg(hover)))
-            .when(active, |d| d.border_t_2().border_color(hsla(th.accent)))
+            .when(active, |d| d.border_t_2().border_color(hsla(tint.unwrap_or(th.accent))))
             .on_mouse_down(MouseButton::Left, cx.listener(move |s, ev, _w, cx| s.on_tab_mouse_down(id, i, ev, cx)))
+            .on_mouse_down(MouseButton::Right, cx.listener(move |s, ev, _w, cx| s.on_tab_mouse_down(id, i, ev, cx)))
             .on_mouse_up(
                 MouseButton::Middle,
                 cx.listener(move |s, _ev, _w, cx| s.close_tab(id, cx)),
             )
+            .children(tint.map(|c| div().w(px(8.0)).h(px(8.0)).flex_none().rounded_full().bg(hsla(c))))
             .children(self.status_icon(status))
             .child(label)
+            .children(badge.then(|| {
+                div().w(px(8.0)).h(px(8.0)).flex_none().rounded_full().bg(hsla(crate::menus::ATTENTION))
+            }))
             .when(!cwd.is_empty() && tw >= 150.0 && renaming.is_none(), |d| {
                 d.child(
                     div()
@@ -327,6 +334,8 @@ impl AppShell {
         sb = sb.child(header("WORKSPACES"));
         for (i, ws) in self.layout.workspaces.iter().enumerate() {
             let active = i == self.layout.active_workspace;
+            let ws_color = forgetty_shell_core::colors::from_wire(ws.color.as_deref());
+            let ws_badge = ws.tabs.iter().any(|t| self.tab_has_attention(t));
             sb = sb.child(
                 div()
                     .id(("ws", i))
@@ -349,7 +358,14 @@ impl AppShell {
                             s.set_workspace(i, cx);
                         }
                     }))
-                    .child(div().w(px(3.0)).h(px(14.0)).rounded_full().bg(if active { hsla(th.accent) } else { alpha(th.border, 1.0) }))
+                    .on_mouse_down(MouseButton::Right, cx.listener(move |s, ev: &MouseDownEvent, _w, cx| {
+                        s.open_workspace_menu(i, (f32::from(ev.position.x), f32::from(ev.position.y)), false, cx);
+                    }))
+                    .child(div().w(px(3.0)).h(px(14.0)).rounded_full().bg(match ws_color {
+                        Some(c) => hsla(c),
+                        None if active => hsla(th.accent),
+                        None => alpha(th.border, 1.0),
+                    }))
                     .child(match self.rename.as_ref().filter(|r| r.target == LabelTarget::Workspace && r.id == ws.id) {
                         Some(r) => {
                             let t = &r.edit.text;
@@ -367,6 +383,9 @@ impl AppShell {
                         }
                         None => div().flex_1().truncate().child(SharedString::from(forgetty_shell_core::notify::sanitize(&ws.name, 80))),
                     })
+                    .children(ws_badge.then(|| {
+                        div().w(px(7.0)).h(px(7.0)).flex_none().rounded_full().bg(hsla(crate::menus::ATTENTION))
+                    }))
                     .child(div().text_size(px(10.5)).text_color(hsla(th.dim)).child(SharedString::from(ws.tabs.len().to_string()))),
             );
         }
@@ -394,6 +413,8 @@ impl AppShell {
                 let id = t.id;
                 let st = self.tab_status(t);
                 let cwd = self.tab_cwd(t);
+                let tint = self.tab_colors.get(&id).copied();
+                let badge = self.tab_has_attention(t);
                 sb = sb.child(
                     div()
                         .id(("sb-tab", i))
@@ -410,6 +431,10 @@ impl AppShell {
                         .when(active, |d| d.bg(alpha(th.hover, 0.8)))
                         .hover(move |s| s.bg(hover))
                         .on_mouse_down(MouseButton::Left, cx.listener(move |s, _e, _w, cx| s.focus_tab(id, cx)))
+                        .on_mouse_down(MouseButton::Right, cx.listener(move |s, ev: &MouseDownEvent, _w, cx| {
+                            s.open_tab_menu(id, (f32::from(ev.position.x), f32::from(ev.position.y)), false, cx);
+                        }))
+                        .children(tint.map(|c| div().w(px(8.0)).h(px(8.0)).flex_none().rounded_full().bg(hsla(c))))
                         .child(
                             div()
                                 .w(px(12.0))
@@ -417,6 +442,9 @@ impl AppShell {
                                 .children(self.status_icon(st)),
                         )
                         .child(div().flex_1().truncate().child(SharedString::from(self.tab_title(t))))
+                        .children(badge.then(|| {
+                            div().w(px(7.0)).h(px(7.0)).flex_none().rounded_full().bg(hsla(crate::menus::ATTENTION))
+                        }))
                         .child(
                             div()
                                 .flex_none()
@@ -499,6 +527,17 @@ impl AppShell {
                     .child(bar().bottom_0().left_0().w_full().h(px(1.0)))
                     .child(bar().top_0().left_0().h_full().w(px(1.0)))
                     .child(bar().top_0().right_0().h_full().w(px(1.0)));
+            }
+            if self.attention.contains(&pane) {
+                // The pane rang its bell or sent a notification while nobody looked: a 3 px
+                // amber ring until the user looks at it.
+                let ring = alpha(crate::menus::ATTENTION, 0.9);
+                let bar = || div().absolute().bg(ring);
+                d = d
+                    .child(bar().top_0().left_0().w_full().h(px(3.0)))
+                    .child(bar().bottom_0().left_0().w_full().h(px(3.0)))
+                    .child(bar().top_0().left_0().h_full().w(px(3.0)))
+                    .child(bar().top_0().right_0().h_full().w(px(3.0)));
             }
             if let Some(text) = &overlay {
                 // Only this machine's panes, only after the link has been down for 1 s.
@@ -996,6 +1035,8 @@ impl Render for AppShell {
             .children(self.render_palette())
             .children(self.render_pair(cx))
             .children(self.render_clip_prompt(cx))
+            .children(self.render_menu(cx))
+            .children(self.render_confirm(cx))
             .child(
                 canvas(
                     |_, _, _| (),
