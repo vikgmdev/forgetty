@@ -10,6 +10,7 @@
 mod chrome;
 mod clipboard;
 mod config;
+mod reload;
 mod console;
 mod element;
 mod encoder;
@@ -64,15 +65,24 @@ fn main() {
     let data_dir = if smoke {
         let d = std::env::temp_dir().join(format!("forgetty-smoke-{}", std::process::id()));
         std::env::set_var("FORGETTY_DATA_DIR", &d);
+        // The smoke watches (and may write) its own config file, never the user's.
+        std::env::set_var("FORGETTY_CONFIG", d.join("config.toml"));
         Some(d)
     } else {
         forgetty_remote::store::MachineStore::default_dir()
     };
 
-    let (mut cfg, cfg_err) = if smoke { (Config::default(), None) } else { Config::load() };
-    // Mica needs Windows 11 22H2 (build 22621). Older systems get a solid background.
-    if matches!(cfg.backdrop, Backdrop::Mica | Backdrop::MicaAlt) && windows_build() < 22621 {
-        cfg.backdrop = Backdrop::None;
+    let startup = if smoke {
+        config::Startup { config: Config::default(), warnings: Vec::new(), error: None }
+    } else {
+        config::load()
+    };
+    let mut cfg = startup.config;
+    let cfg_err = startup.error;
+    let startup_warnings = startup.warnings;
+    fit_backdrop(&mut cfg);
+    for w in &startup_warnings {
+        eprintln!("forgetty-win: config: {w}");
     }
     if let Some(e) = cfg_err {
         eprintln!("forgetty-win: config error, using defaults: {e}");
@@ -80,17 +90,9 @@ fn main() {
     }
 
     application().run(move |cx: &mut App| {
-        let shell_cmd = if smoke {
-            "cmd.exe".to_string()
-        } else {
-            cfg.shell
-                .clone()
-                .or_else(|| std::env::var("FORGETTY_SHELL").ok())
-                .or_else(|| std::env::var("COMSPEC").ok())
-                .unwrap_or_else(|| "cmd.exe".into())
-        };
+        let shell_argv = if smoke { vec!["cmd.exe".to_string()] } else { reload::default_shell(&cfg) };
         let local = LocalBackend::new(LocalConfig {
-            shell: vec![shell_cmd],
+            shell: shell_argv,
             default_cwd: if smoke { Some("C:\\".into()) } else { None },
             machine_name: std::env::var("COMPUTERNAME").unwrap_or_else(|_| "This PC".into()),
         });
@@ -125,6 +127,9 @@ fn main() {
             move |window, cx| {
                 let shell = cx.new(|cx| AppShell::new(cfg, backend, smoke_state, window, cx));
                 shell.update(cx, |s, cx| {
+                    s.local = Some(local.clone());
+                    s.startup_notice = reload::startup_notice(&startup_warnings);
+                    s.start_config_watch(cx);
                     cx.observe_window_activation(window, |s, window, cx| s.on_window_activation(window, cx))
                         .detach();
                     match data_dir {
@@ -154,6 +159,13 @@ fn main() {
         cx.activate(true);
     });
     drop(rt);
+}
+
+/// Mica needs Windows 11 22H2 (build 22621). Older systems get a solid background.
+pub(crate) fn fit_backdrop(cfg: &mut Config) {
+    if matches!(cfg.backdrop, Backdrop::Mica | Backdrop::MicaAlt) && windows_build() < 22621 {
+        cfg.backdrop = Backdrop::None;
+    }
 }
 
 fn fatal(smoke: bool, msg: &str) -> ! {

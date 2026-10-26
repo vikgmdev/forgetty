@@ -764,6 +764,44 @@ pub fn diff(old: &Config, new: &Config) -> Changes {
     ch
 }
 
+/// The first line of an error, which can be several lines long (TOML errors are).
+fn first_line(s: &str) -> &str {
+    s.lines().find(|l| !l.trim().is_empty()).unwrap_or(s).trim()
+}
+
+/// The notice text after a successful reload. `asked` is a reload the user asked for.
+pub fn reload_notice(ch: &Changes, warnings: &[String], asked: bool) -> Option<String> {
+    let mut text = if ch.any() {
+        let mut t = format!("Configuration reloaded: {}", ch.summary());
+        if !ch.later.is_empty() {
+            let later = ch.later.join(", ");
+            t = if ch.summary().is_empty() { format!("Configuration reloaded. Later: {later}") } else { format!("{t}. Later: {later}") };
+        }
+        t
+    } else if asked {
+        "Configuration reloaded, nothing changed".to_string()
+    } else if warnings.is_empty() {
+        return None;
+    } else {
+        "Configuration reloaded".to_string()
+    };
+    if let Some(first) = warnings.first() {
+        let more = if warnings.len() > 1 { format!(" (+{} more)", warnings.len() - 1) } else { String::new() };
+        text.push_str(&format!(". Warning: {first}{more}"));
+    }
+    Some(text)
+}
+
+/// The notice for a config file that is gone: nothing changes.
+pub fn missing_notice() -> String {
+    "config.toml is gone, the last good settings stay".to_string()
+}
+
+/// The notice for a file that was not applied.
+pub fn failed_notice(err: &str) -> String {
+    format!("Configuration not applied, the last good settings stay. {}", first_line(err))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -983,5 +1021,20 @@ command = "x"
         e.notification_mode = NotificationMode::None;
         let d = diff(&a, &e);
         assert!(d.keybindings && d.notifications);
+    }
+
+    #[test]
+    fn notices() {
+        let none = Changes::default();
+        assert_eq!(reload_notice(&none, &[], false), None);
+        assert_eq!(reload_notice(&none, &[], true).unwrap(), "Configuration reloaded, nothing changed");
+        let ch = Changes { font: true, colors: true, ..Default::default() };
+        assert_eq!(reload_notice(&ch, &[], false).unwrap(), "Configuration reloaded: font, colors");
+        let w = vec!["unknown key `a`".to_string(), "b".to_string()];
+        let t = reload_notice(&none, &w, false).unwrap();
+        assert!(t.contains("Warning: unknown key `a` (+1 more)"), "{t}");
+        let later = Changes { later: vec!["sidebar (next start)"], ..Default::default() };
+        assert!(reload_notice(&later, &[], false).unwrap().contains("Later: sidebar"));
+        assert!(failed_notice("TOML parse error at line 3\n  |\n3 | x").ends_with("TOML parse error at line 3"));
     }
 }

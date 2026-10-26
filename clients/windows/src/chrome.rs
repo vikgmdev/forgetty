@@ -214,7 +214,27 @@ impl AppShell {
                 .text_color(hsla(th.dim))
                 .hover(move |s| s.bg(hover))
                 .on_mouse_down(MouseButton::Left, cx.listener(|s, _e, _w, cx| s.new_tab(cx)))
+                .on_mouse_down(MouseButton::Right, cx.listener(|s, _e, _w, cx| s.open_new_tab_menu(false, cx)))
                 .child("+"),
+        );
+        // The drop-down: profiles, a plain tab, the splits.
+        bar = bar.child(
+            div()
+                .id("new-tab-menu")
+                .flex_none()
+                .w(px(CHEVRON_W))
+                .h(px(TITLEBAR_H - 6.0))
+                .mt(px(6.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_t(px(8.0))
+                .cursor_pointer()
+                .text_size(px(11.0))
+                .text_color(hsla(th.dim))
+                .hover(move |s| s.bg(hover))
+                .on_mouse_down(MouseButton::Left, cx.listener(|s, _e, _w, cx| s.open_new_tab_menu(false, cx)))
+                .child("\u{25be}"),
         );
         // Everything else is draggable titlebar.
         bar = bar.child(div().flex_1().h_full().min_w(px(24.0)).window_control_area(WindowControlArea::Drag));
@@ -651,7 +671,7 @@ impl AppShell {
             .text_size(px(14.0))
             .child(if t.is_empty() {
                 div().flex().flex_row().items_center().child(div().w(px(1.0)).h(px(18.0)).bg(hsla(th.accent))).child(
-                    div().ml(px(2.0)).text_color(hsla(th.dim)).child("Type a command"),
+                    div().ml(px(2.0)).text_color(hsla(th.dim)).child(if p.themes.is_some() { "Type a theme name" } else { "Type a command" }),
                 )
             } else {
                 div()
@@ -665,7 +685,7 @@ impl AppShell {
 
         let mut list = div().flex().flex_col().py(px(4.0)).max_h(px(380.0)).overflow_hidden();
         if p.items.is_empty() {
-            list = list.child(div().px(px(14.0)).h(px(30.0)).flex().items_center().text_color(hsla(th.dim)).child("No matching command"));
+            list = list.child(div().px(px(14.0)).h(px(30.0)).flex().items_center().text_color(hsla(th.dim)).child(if p.themes.is_some() { "No matching theme" } else { "No matching command" }));
         }
         // Keep the selection in view: show a window of 11 rows.
         let first = p.selected.saturating_sub(10);

@@ -34,6 +34,8 @@ pub const MIN_PANE_H: f32 = 60.0;
 pub const CAPTION_W: f32 = 138.0;
 pub const TAB_LEFT: f32 = 10.0;
 pub const PLUS_W: f32 = 34.0;
+/// The drop-down arrow next to the new-tab button.
+pub const CHEVRON_W: f32 = 22.0;
 const TAB_MIN_W: f32 = 104.0;
 const TAB_MAX_W: f32 = 220.0;
 
@@ -49,9 +51,17 @@ pub struct PaneMeta {
     pub owner: Option<forgetty_shell_core::SizeOwnerInfo>,
 }
 
+/// What Enter does on a palette row.
+#[derive(Clone, Debug)]
+pub enum Pick {
+    Action(Action),
+    /// A theme by name (the "Choose theme" list).
+    Theme(String),
+}
+
 pub struct PaletteItem {
-    pub action: Action,
-    pub title: &'static str,
+    pub pick: Pick,
+    pub title: String,
     pub shortcut: String,
     pub hits: Vec<usize>,
 }
@@ -60,6 +70,8 @@ pub struct Palette {
     pub edit: LineEdit,
     pub selected: usize,
     pub items: Vec<PaletteItem>,
+    /// The theme list is showing instead of the commands: every theme name.
+    pub themes: Option<Vec<String>>,
 }
 
 pub struct Rename {
@@ -119,7 +131,19 @@ impl Theme {
 }
 
 pub struct AppShell {
+    /// What is in force: the file plus a theme picked in the palette.
     pub cfg: Config,
+    /// The config file as last read (the defaults when it is missing or never loaded).
+    pub file_cfg: Config,
+    /// A theme picked in the palette. A reload that changes the file's colors drops it.
+    pub theme_override: Option<String>,
+    pub conf_watch: Option<forgetty_shell_core::confwatch::ConfWatch>,
+    /// The user asked for the reload now on the way: say so even when nothing changed.
+    pub reload_asked: bool,
+    /// Said once, on the first pane that exists (warnings about the file at start).
+    pub startup_notice: Option<String>,
+    /// The local backend, to change its default shell on a reload.
+    pub local: Option<forgetty_shell_core::LocalBackend>,
     pub theme: Theme,
     pub keymap: Keymap,
     pub backend: Arc<dyn SessionBackend>,
@@ -237,6 +261,12 @@ impl AppShell {
         window.focus(&focus, cx);
 
         let shell = AppShell {
+            file_cfg: cfg.clone(),
+            theme_override: None,
+            conf_watch: None,
+            reload_asked: false,
+            startup_notice: None,
+            local: None,
             theme: Theme::from_cfg(&cfg),
             sidebar_open: cfg.sidebar_open,
             keymap,
@@ -489,6 +519,7 @@ impl AppShell {
             crate::menus::MenuTarget::Pane(p) => !panes.contains(p),
             crate::menus::MenuTarget::Tab(t) => !tabs.contains(t),
             crate::menus::MenuTarget::Workspace(id) => !workspaces.contains(id),
+            crate::menus::MenuTarget::NewTab => false,
         }) {
             self.menu = None;
         }
@@ -683,13 +714,18 @@ impl AppShell {
     /// (left offset, tab width) of the tab strip for the active workspace.
     pub fn tab_strip(&self) -> (f32, f32) {
         let n = self.layout.active_workspace().map(|w| w.tabs.len()).unwrap_or(0).max(1) as f32;
-        let avail = self.viewport.0 - TAB_LEFT - CAPTION_W - PLUS_W - 48.0;
+        let avail = self.viewport.0 - TAB_LEFT - CAPTION_W - PLUS_W - CHEVRON_W - 48.0;
         (TAB_LEFT, (avail / n).clamp(TAB_MIN_W, TAB_MAX_W))
     }
 
     // ---- focus / visibility sync -----------------------------------------------
 
     pub fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.views.is_empty() {
+            if let Some(t) = self.startup_notice.take() {
+                self.notice_active(t, cx);
+            }
+        }
         let visible: HashSet<PaneId> =
             self.active_geometry().map(|(_, g)| g.panes.iter().map(|(p, _)| *p).collect()).unwrap_or_default();
         let active = self.active_pane();
@@ -741,11 +777,47 @@ impl AppShell {
 
     // ---- actions ----------------------------------------------------------------
 
+    /// A plain new tab: the default profile on this PC (as GTK: `default_profile`, else the first
+    /// profile), else the shell. A remote machine always opens its own shell.
     pub fn new_tab(&mut self, cx: &mut Context<Self>) {
+        let profile = self.cfg.default_profile().cloned().filter(|_| self.machine.kind == forgetty_shell_core::MachineKind::Local);
+        match profile {
+            Some(p) => self.start_profile_tab(&p, cx),
+            None => self.new_tab_with(Vec::new(), None, cx),
+        }
+    }
+
+    /// Profile `n` (1-based) in a new tab: Ctrl+Shift+1..9 and the new-tab menu.
+    pub fn open_profile(&mut self, n: usize, cx: &mut Context<Self>) {
+        let Some(p) = n.checked_sub(1).and_then(|i| self.cfg.profiles.get(i)).cloned() else {
+            self.notice_active(format!("There is no profile {n}"), cx);
+            return;
+        };
+        // A profile is a program on this PC. A remote machine has its own shells.
+        if self.machine.kind != forgetty_shell_core::MachineKind::Local {
+            self.notice_active("Profiles start programs on this PC. Switch to this PC to use one.".into(), cx);
+            return;
+        }
+        self.start_profile_tab(&p, cx);
+    }
+
+    fn start_profile_tab(&mut self, p: &forgetty_shell_core::config::Profile, cx: &mut Context<Self>) {
+        let home = std::env::var("USERPROFILE").ok();
+        let mut cwd = None;
+        if let Some(d) = p.directory.as_deref() {
+            match forgetty_shell_core::config::expand_dir(d, home.as_deref()) {
+                Some(path) if std::path::Path::new(&path).is_dir() => cwd = Some(path),
+                _ => self.notice_active(format!("Profile {}: the directory {d} does not exist, started in the home directory", p.name), cx),
+            }
+        }
+        self.new_tab_with(p.argv.clone(), cwd, cx);
+    }
+
+    fn new_tab_with(&mut self, command: Vec<String>, cwd: Option<String>, cx: &mut Context<Self>) {
         let r = self.content_rect();
         let (rows, cols) = self.grid_for(r.w, r.h);
-        // No cwd: the backend decides (it never trusts escape-code paths).
-        let req = NewTab { workspace_idx: self.layout.active_workspace, rows, cols, ..Default::default() };
+        // With no cwd the backend decides (it never trusts escape-code paths).
+        let req = NewTab { workspace_idx: self.layout.active_workspace, rows, cols, command, cwd, ..Default::default() };
         let fut = self.backend.new_tab(req);
         self.call(cx, fut, |s, reply, cx| {
             s.local_active.insert(reply.tab_id, reply.pane_id);
@@ -1039,6 +1111,13 @@ impl AppShell {
             Action::MoveWorkspaceUp => self.move_workspace(self.layout.active_workspace, true, cx),
             Action::MoveWorkspaceDown => self.move_workspace(self.layout.active_workspace, false, cx),
             Action::PaneMenu => self.open_active_pane_menu(cx),
+            Action::ZoomIn => self.on_active_view(window, cx, |v, cx| v.zoom(forgetty_shell_core::config::Zoom::In, cx)),
+            Action::ZoomOut => self.on_active_view(window, cx, |v, cx| v.zoom(forgetty_shell_core::config::Zoom::Out, cx)),
+            Action::ZoomReset => self.on_active_view(window, cx, |v, cx| v.zoom(forgetty_shell_core::config::Zoom::Reset, cx)),
+            Action::Profile(n) => self.open_profile(usize::from(n), cx),
+            Action::OpenConfig => self.open_config_file(cx),
+            Action::ReloadConfig => self.reload_config_now(cx),
+            Action::ChooseTheme => self.open_theme_list(cx),
         }
         cx.notify();
     }
@@ -1065,27 +1144,69 @@ impl AppShell {
         } else {
             self.rename = None;
             self.menu = None;
-            let mut p = Palette { edit: LineEdit::default(), selected: 0, items: Vec::new() };
+            let mut p = Palette { edit: LineEdit::default(), selected: 0, items: Vec::new(), themes: None };
             self.refresh_palette(&mut p);
             self.palette = Some(p);
         }
         cx.notify();
     }
 
+    /// The list of themes in the palette. Choosing one applies it to this session.
+    pub fn open_theme_list(&mut self, cx: &mut Context<Self>) {
+        self.rename = None;
+        self.menu = None;
+        let mut p = Palette {
+            edit: LineEdit::default(),
+            selected: 0,
+            items: Vec::new(),
+            themes: Some(forgetty_shell_core::config::theme_names()),
+        };
+        self.refresh_palette(&mut p);
+        self.palette = Some(p);
+        cx.notify();
+    }
+
     fn refresh_palette(&self, p: &mut Palette) {
         let mut scored: Vec<(i32, usize, PaletteItem)> = Vec::new();
-        for (order, info) in ACTIONS.iter().enumerate() {
-            if let Some((score, hits)) = fuzzy::score(&p.edit.text, info.title) {
-                scored.push((
-                    score,
-                    order,
-                    PaletteItem {
-                        action: info.action,
-                        title: info.title,
-                        shortcut: self.keymap.shortcut(info.action),
-                        hits,
+        if let Some(names) = &p.themes {
+            for (order, name) in names.iter().enumerate() {
+                if let Some((score, hits)) = fuzzy::score(&p.edit.text, name) {
+                    let current = self.cfg.theme_name.as_deref() == Some(name.as_str())
+                        || self.theme_override.as_deref() == Some(name.as_str());
+                    scored.push((
+                        score,
+                        order,
+                        PaletteItem {
+                            pick: Pick::Theme(name.clone()),
+                            title: name.clone(),
+                            shortcut: if current { "current".into() } else { String::new() },
+                            hits,
+                        },
+                    ));
+                }
+            }
+        } else {
+            for (order, info) in ACTIONS.iter().enumerate() {
+                // "Open profile N" is listed for the profiles that exist, by name.
+                let title = match info.action {
+                    Action::Profile(n) => match self.cfg.profiles.get(usize::from(n) - 1) {
+                        Some(pr) => format!("Open profile: {}", forgetty_shell_core::notify::sanitize(&pr.name, 40)),
+                        None => continue,
                     },
-                ));
+                    _ => info.title.to_string(),
+                };
+                if let Some((score, hits)) = fuzzy::score(&p.edit.text, &title) {
+                    scored.push((
+                        score,
+                        order,
+                        PaletteItem {
+                            pick: Pick::Action(info.action),
+                            title,
+                            shortcut: self.keymap.shortcut(info.action),
+                            hits,
+                        },
+                    ));
+                }
             }
         }
         scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
@@ -1141,10 +1262,12 @@ impl AppShell {
         let n = p.items.len();
         match ks.key.as_str() {
             "enter" => {
-                let action = p.items.get(p.selected).map(|i| i.action);
+                let pick = p.items.get(p.selected).map(|i| i.pick.clone());
                 cx.notify();
-                if let Some(a) = action {
-                    self.run_action(a, window, cx);
+                match pick {
+                    Some(Pick::Action(a)) => self.run_action(a, window, cx),
+                    Some(Pick::Theme(name)) => self.pick_theme(&name, cx),
+                    None => {}
                 }
                 return;
             }
@@ -1163,9 +1286,10 @@ impl AppShell {
     fn palette_edit(&self, p: &mut Palette, ks: &Keystroke) -> bool {
         if p.edit.key(ks) == EditResult::Edited {
             let old = p.edit.cursor;
-            let mut tmp = Palette { edit: p.edit.clone(), selected: 0, items: Vec::new() };
+            let mut tmp = Palette { edit: p.edit.clone(), selected: 0, items: Vec::new(), themes: p.themes.take() };
             self.refresh_palette(&mut tmp);
             p.items = tmp.items;
+            p.themes = tmp.themes;
             p.selected = 0;
             p.edit.cursor = old;
             return true;
@@ -1241,7 +1365,7 @@ impl AppShell {
             Some(Drag::Tab { id, index }) => {
                 let (left, tw) = {
                     let n = self.layout.active_workspace().map(|w| w.tabs.len()).unwrap_or(0).max(1) as f32;
-                    let avail = self.viewport.0 - TAB_LEFT - CAPTION_W - PLUS_W - 48.0;
+                    let avail = self.viewport.0 - TAB_LEFT - CAPTION_W - PLUS_W - CHEVRON_W - 48.0;
                     (TAB_LEFT, (avail / n).clamp(TAB_MIN_W, TAB_MAX_W))
                 };
                 let count = self.layout.active_workspace().map(|w| w.tabs.len()).unwrap_or(1);

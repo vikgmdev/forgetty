@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use forgetty_shell_core::layout::Side;
-use forgetty_shell_core::menu::{self, Item, Menu, MenuCmd, MenuKind, PaneMenuCtx, TabMenuCtx, WorkspaceMenuCtx};
+use forgetty_shell_core::menu::{self, Item, Menu, MenuCmd, MenuKind, NewTabMenuCtx, PaneMenuCtx, TabMenuCtx, WorkspaceMenuCtx};
 use forgetty_shell_core::{colors, ops, NewTab, PaneId, PaneStatus, SplitDir, SplitRatio, Uuid};
 use gpui::{
     div, ease_out_quint, prelude::*, px, Animation, AnimationExt, Context, Div, Hsla, Keystroke, MouseButton,
@@ -33,6 +33,8 @@ pub enum MenuTarget {
     Pane(PaneId),
     Tab(Uuid),
     Workspace(Uuid),
+    /// The new-tab drop-down. The splits act on the active pane.
+    NewTab,
 }
 
 pub struct OpenMenu {
@@ -105,6 +107,25 @@ impl AppShell {
         self.open_menu(MenuKind::Workspace, items, MenuTarget::Workspace(ws.id), pos, keys, cx);
     }
 
+    /// The new-tab drop-down, under the arrow. `keys` selects the first row.
+    pub fn open_new_tab_menu(&mut self, keys: bool, cx: &mut Context<Self>) {
+        let (left, tw) = self.tab_strip();
+        let n = self.layout.active_workspace().map(|w| w.tabs.len()).unwrap_or(0) as f32;
+        let at = (left + n * tw + PLUS_W, TITLEBAR_H);
+        // Profiles start programs on this PC: a remote machine's menu lists none.
+        let profiles = if self.machine.kind == forgetty_shell_core::MachineKind::Local {
+            self.cfg.profiles.iter().map(|p| p.name.clone()).collect()
+        } else {
+            Vec::new()
+        };
+        let items = menu::new_tab_menu(&NewTabMenuCtx {
+            profiles,
+            split_before: self.backend.supports_split_before(),
+            has_pane: self.active_pane().is_some(),
+        });
+        self.open_menu(MenuKind::NewTab, items, MenuTarget::NewTab, at, keys, cx);
+    }
+
     /// The "Pane menu" action: the active pane's menu at its top-left corner.
     pub fn open_active_pane_menu(&mut self, cx: &mut Context<Self>) {
         let Some(pane) = self.active_pane() else { return };
@@ -156,6 +177,7 @@ impl AppShell {
             MenuTarget::Pane(pane) => self.run_pane_cmd(pane, cmd, window, cx),
             MenuTarget::Tab(tab) => self.run_tab_cmd(tab, cmd, cx),
             MenuTarget::Workspace(id) => self.run_workspace_cmd(id, cmd, cx),
+            MenuTarget::NewTab => self.run_new_tab_cmd(cmd, cx),
         }
         cx.notify();
     }
@@ -219,6 +241,18 @@ impl AppShell {
             MenuCmd::TabCloseOthers => self.close_other_tabs(tab, cx),
             MenuCmd::TabClose => self.close_tab(tab, cx),
             MenuCmd::Color(c) => self.set_tab_color(tab, c, cx),
+            _ => {}
+        }
+    }
+
+    fn run_new_tab_cmd(&mut self, cmd: MenuCmd, cx: &mut Context<Self>) {
+        match cmd {
+            MenuCmd::NewTab => self.new_tab(cx),
+            MenuCmd::Profile(n) => self.open_profile(n, cx),
+            MenuCmd::SplitRight => self.split(SplitDir::Horizontal, cx),
+            MenuCmd::SplitDown => self.split(SplitDir::Vertical, cx),
+            MenuCmd::SplitLeft => self.split_before(SplitDir::Horizontal, cx),
+            MenuCmd::SplitUp => self.split_before(SplitDir::Vertical, cx),
             _ => {}
         }
     }

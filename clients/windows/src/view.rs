@@ -82,15 +82,20 @@ pub struct Metrics {
 impl Metrics {
     /// Picks the configured family if installed, else a monospace fallback.
     pub fn measure(cx: &App, cfg: &Config) -> Self {
+        Self::measure_pt(cx, &cfg.font_family, cfg.font_size_pt)
+    }
+
+    /// The same at a given size in points (a zoomed pane).
+    pub fn measure_pt(cx: &App, family: &str, pt: f32) -> Self {
         let ts = cx.text_system();
         let names = ts.all_font_names();
-        let family = std::iter::once(cfg.font_family.as_str())
+        let family = std::iter::once(family)
             .chain(["Cascadia Mono", "Cascadia Code", "Consolas", "Courier New"])
             .find(|f| names.iter().any(|n| n == f))
-            .unwrap_or(cfg.font_family.as_str())
+            .unwrap_or(family)
             .to_string();
         let font = font(family);
-        let font_size = px(cfg.font_size_px());
+        let font_size = px(pt * 96.0 / 72.0);
         let id = ts.resolve_font(&font);
         let cell_w = ts.advance(id, font_size, 'm').map(|s| s.width).unwrap_or(px(8.0));
         let line_h = px((f32::from(font_size) * 1.25).ceil());
@@ -107,11 +112,15 @@ pub struct RowShaped {
 
 pub use forgetty_shell_core::selection::{Sel, SelMode};
 
-fn make_term(cfg: &Config, rows: usize, cols: usize) -> Terminal {
-    let palette: [CoreRgba; 16] = std::array::from_fn(|i| {
+fn ansi_palette(cfg: &Config) -> [CoreRgba; 16] {
+    std::array::from_fn(|i| {
         let h = cfg.ansi[i];
         CoreRgba::rgb((h >> 16) as u8, (h >> 8) as u8, h as u8)
-    });
+    })
+}
+
+fn make_term(cfg: &Config, rows: usize, cols: usize) -> Terminal {
+    let palette = ansi_palette(cfg);
     // libghostty-vt budgets scrollback in bytes (default 10 MiB per pane).
     Terminal::with_scrollback(rows, cols, palette, cfg.scrollback_bytes)
 }
@@ -141,6 +150,8 @@ pub struct TerminalView {
     pub osc52: forgetty_shell_core::osc52::Scanner,
     pub clip_seen: ClipboardSeen,
     pub cfg: Config,
+    /// Font size of this pane after Ctrl+= / Ctrl+-, in points. `None`: the configured size.
+    pub zoom_pt: Option<f32>,
     pub term: Terminal,
     pub source: Box<dyn PaneSource>,
     pub input: Input,
@@ -401,6 +412,7 @@ impl TerminalView {
 
         Self {
             cfg,
+            zoom_pt: None,
             term,
             source,
             input: Input::new(),
@@ -479,6 +491,54 @@ impl TerminalView {
     }
 
     // ---- output ---------------------------------------------------------
+
+    /// The font size now, in points.
+    pub fn font_pt(&self) -> f32 {
+        self.zoom_pt.unwrap_or(self.cfg.font_size_pt)
+    }
+
+    /// Zoom this pane (GTK: 1 pt a step, 6 to 72, reset to the configured size). The grid
+    /// follows on the next frame: `apply_bounds` takes rows and columns from the metrics.
+    pub fn zoom(&mut self, how: forgetty_shell_core::config::Zoom, cx: &mut Context<Self>) {
+        let now = self.font_pt();
+        let next = forgetty_shell_core::config::zoomed(now, how, self.cfg.font_size_pt);
+        if (next - now).abs() < f32::EPSILON {
+            return;
+        }
+        self.zoom_pt = ((next - self.cfg.font_size_pt).abs() > f32::EPSILON).then_some(next);
+        self.remeasure(cx);
+    }
+
+    /// Measure the font again and draw every row new.
+    fn remeasure(&mut self, cx: &mut Context<Self>) {
+        self.metrics = Metrics::measure_pt(cx, &self.cfg.font_family, self.font_pt());
+        self.invalidate_rows();
+        self.sel = None;
+        self.layout_changed = true;
+        cx.notify();
+    }
+
+    fn invalidate_rows(&mut self) {
+        self.shape_cache.clear();
+        self.row_hash = vec![0; self.rows];
+        self.rows_shaped = vec![None; self.rows];
+        self.last_gen = 0;
+    }
+
+    /// A config reload: take what changed. A new font drops the zoom, as in GTK.
+    pub fn apply_config(&mut self, cfg: Config, ch: &forgetty_shell_core::config::Changes, cx: &mut Context<Self>) {
+        self.cfg = cfg;
+        if ch.colors {
+            self.term.set_ansi_palette(ansi_palette(&self.cfg));
+        }
+        if ch.font {
+            self.zoom_pt = None;
+            self.remeasure(cx);
+        } else if ch.colors || ch.padding {
+            self.invalidate_rows();
+            cx.notify();
+        }
+    }
 
     /// Start over with an empty VT at the PTY's size (a remote pane attached,
     /// or the server's log no longer holds our offset). The next frame sees the
@@ -1517,7 +1577,7 @@ impl TerminalView {
     /// control bytes). Returns true if a confirm prompt is now showing.
     pub fn send_paste(&mut self, text: &str) -> bool {
         let bracketed = encoder::private_mode(self.term.raw_handle(), 2004);
-        let p = forgetty_vt::paste::prepare(text, bracketed);
+        let p = forgetty_vt::paste::prepare_with(text, bracketed, self.cfg.paste_warn_newline);
         // GTK asks only for a big paste. This also asks for what could run commands unseen.
         let large = paste_rules::is_large(text, self.cfg.paste_warn_size);
         if p.needs_confirm || large {

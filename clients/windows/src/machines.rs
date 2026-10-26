@@ -293,10 +293,13 @@ impl AppShell {
             match ev {
                 BackendEvent::ConnectionChanged(st) => self.on_conn(id, st, cx),
                 BackendEvent::Notification { pane_id, title, body } => {
-                    self.raise_attention(id, pane_id, cx);
+                    let mode = self.cfg.notification_mode;
+                    if notify::mode_allows_ring(mode) {
+                        self.raise_attention(id, pane_id, cx);
+                    }
                     self.with_machine(id, |s| {
                         let vis = s.visibility(shown, id, pane_id);
-                        if notify::notification_wants_toast(vis) {
+                        if notify::mode_allows_toast(mode) && notify::notification_wants_toast(vis) {
                             let tab = s.tab_title_of_pane(pane_id);
                             let text = notify::note_text(&s.machine.name, &tab, &title, &body);
                             s.show_toast(id, pane_id, text);
@@ -307,7 +310,7 @@ impl AppShell {
                     self.with_machine(id, |s| {
                         let prev = s.meta.get(&pane_id).map(|m| m.status).unwrap_or_default();
                         let vis = s.visibility(shown, id, pane_id);
-                        if notify::status_wants_toast(prev, status, vis) {
+                        if notify::mode_allows_toast(s.cfg.notification_mode) && notify::status_wants_toast(prev, status, vis) {
                             let tab = s.tab_title_of_pane(pane_id);
                             let text = notify::status_text(&s.machine.name, &tab, status, &message);
                             s.show_toast(id, pane_id, text);

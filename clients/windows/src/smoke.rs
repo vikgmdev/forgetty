@@ -1324,7 +1324,7 @@ impl ShellSmoke {
                         .as_ref()
                         .map(|p| {
                             (
-                                p.items.first().map(|i| i.action),
+                                p.items.first().map(|i| match &i.pick { crate::shell::Pick::Action(a) => Some(*a), _ => None }).flatten(),
                                 p.items.len(),
                                 p.items.first().map(|i| i.shortcut.clone()).unwrap_or_default(),
                             )

@@ -1,155 +1,11 @@
-//! `%APPDATA%\forgetty\config.toml`. Every key is optional.
-//!
-//! ```toml
-//! shell = "pwsh.exe"
-//! scrollback_bytes = 10485760   # libghostty bytes per pane (default 10 MiB)
-//! backdrop = "mica"             # mica | mica_alt | blur | none
-//! sidebar = false               # start with the sidebar open
-//! pane_padding_x = 6.0          # px between a pane border and its text (default 6)
-//! pane_padding_y = 4.0          # default 4
-//! bell_mode = "visual"          # visual | audio | both | none
-//! paste_warn_size = 5120        # ask before pasting more bytes than this (0 = never)
-//! smart_copy = true             # copy strips box-drawing characters (false keeps them)
-//! right_click = "menu"           # menu (default, as GTK) | copy_paste (Windows Terminal: copy a selection, else paste; Shift+right-click opens the menu)
-//! [font]
-//! family = "Cascadia Mono"
-//! size = 11.0            # points
-//! [theme]
-//! foreground = "#cccccc"
-//! background = "#0c0c0c"
-//! cursor     = "#ffffff"
-//! selection  = "#264f78"
-//! accent     = "#60cdff"
-//! ansi = ["#0c0c0c", "#c50f1f", ... 16 entries]
-//! [keybindings]            # action = "chord" | ["chord", ...] | "none"
-//! new_tab = "ctrl+shift+t"
-//! split_right = ["alt+shift+plus", "ctrl+shift+d"]
-//! close_pane = "none"
-//! ```
-//! Action names: see `forgetty_shell_core::keys::ACTIONS`.
+//! The config is `forgetty_shell_core::config` (pure, tested on Linux). This adds the file
+//! location and the first read at start.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 
-use forgetty_vt::DEFAULT_MAX_SCROLLBACK_BYTES;
-use serde::Deserialize;
+pub use forgetty_shell_core::config::*;
 
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-struct FileConfig {
-    shell: Option<String>,
-    /// Legacy W1 key, in lines. `scrollback_bytes` wins when both are set.
-    scrollback: Option<usize>,
-    scrollback_bytes: Option<usize>,
-    backdrop: Option<String>,
-    sidebar: Option<bool>,
-    pane_padding_x: Option<f32>,
-    pane_padding_y: Option<f32>,
-    bell_mode: Option<String>,
-    paste_warn_size: Option<usize>,
-    smart_copy: Option<bool>,
-    right_click: Option<String>,
-    keybindings: HashMap<String, KeyValue>,
-    font: FontSection,
-    theme: ThemeSection,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum KeyValue {
-    One(String),
-    Many(Vec<String>),
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-struct FontSection {
-    family: Option<String>,
-    size: Option<f32>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-struct ThemeSection {
-    foreground: Option<String>,
-    background: Option<String>,
-    cursor: Option<String>,
-    selection: Option<String>,
-    accent: Option<String>,
-    ansi: Option<Vec<String>>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Backdrop {
-    Mica,
-    MicaAlt,
-    Blur,
-    None,
-}
-
-#[derive(Debug, Clone)]
-pub struct Config {
-    pub shell: Option<String>,
-    /// Scrollback budget per pane in libghostty-vt bytes.
-    pub scrollback_bytes: usize,
-    pub backdrop: Backdrop,
-    pub sidebar_open: bool,
-    /// Space between a pane's border and its cell grid, in px.
-    pub pane_padding_x: f32,
-    pub pane_padding_y: f32,
-    pub bell_mode: forgetty_shell_core::bell::BellMode,
-    /// A paste over this many bytes asks first. 0 turns the question off.
-    pub paste_warn_size: usize,
-    /// Copy strips box-drawing characters (the text of a bordered TUI, without its border).
-    pub smart_copy: bool,
-    /// A plain right-click copies a selection or pastes (Windows Terminal). Off by default: a
-    /// plain right-click opens the context menu, as in GTK. Shift+right-click opens the menu either way.
-    pub right_click_copy_paste: bool,
-    /// Action name to chords, from `[keybindings]`. Overrides the defaults.
-    pub keybindings: HashMap<String, Vec<String>>,
-    pub accent: u32,
-    pub font_family: String,
-    /// Points. GPUI sizes are px at 96 dpi, so px = pt * 96 / 72.
-    pub font_size_pt: f32,
-    pub foreground: u32,
-    pub background: u32,
-    pub cursor: u32,
-    pub selection: u32,
-    pub ansi: [u32; 16],
-}
-
-/// Windows Terminal "Campbell".
-pub const CAMPBELL: [u32; 16] = [
-    0x0c0c0c, 0xc50f1f, 0x13a10e, 0xc19c00, 0x0037da, 0x881798, 0x3a96dd, 0xcccccc, 0x767676,
-    0xe74856, 0x16c60c, 0xf9f1a5, 0x3b78ff, 0xb4009e, 0x61d6d6, 0xf2f2f2,
-];
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            shell: None,
-            scrollback_bytes: DEFAULT_MAX_SCROLLBACK_BYTES,
-            backdrop: Backdrop::Mica,
-            sidebar_open: false,
-            pane_padding_x: 6.0,
-            pane_padding_y: 4.0,
-            bell_mode: Default::default(),
-            paste_warn_size: forgetty_shell_core::paste::DEFAULT_WARN_SIZE,
-            smart_copy: true,
-            right_click_copy_paste: false,
-            keybindings: HashMap::new(),
-            accent: 0x60cdff,
-            font_family: "Cascadia Mono".into(),
-            font_size_pt: 11.0,
-            foreground: 0xcccccc,
-            background: 0x0c0c0c,
-            cursor: 0xffffff,
-            selection: 0x264f78,
-            ansi: CAMPBELL,
-        }
-    }
-}
-
+/// `FORGETTY_CONFIG`, else `%APPDATA%\forgetty\config.toml`.
 pub fn config_path() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("FORGETTY_CONFIG") {
         return Some(PathBuf::from(p));
@@ -158,104 +14,66 @@ pub fn config_path() -> Option<PathBuf> {
     Some(base.join("forgetty").join("config.toml"))
 }
 
-fn hex(s: &str) -> Option<u32> {
-    u32::from_str_radix(s.trim().trim_start_matches('#'), 16).ok().filter(|v| *v <= 0xffffff)
+/// What the first read found.
+pub struct Startup {
+    pub config: Config,
+    /// Unknown keys and the like. The file was used.
+    pub warnings: Vec<String>,
+    /// The file did not load: the defaults are in `config`.
+    pub error: Option<String>,
 }
 
-impl Config {
-    /// Load the user config. Missing file or parse errors fall back to defaults
-    /// (the error text is returned so the caller can log it).
-    pub fn load() -> (Self, Option<String>) {
-        let Some(path) = config_path() else { return (Self::default(), None) };
-        match std::fs::read_to_string(&path) {
-            Ok(text) => match Self::from_toml(&text) {
-                Ok(c) => (c, None),
-                Err(e) => (Self::default(), Some(format!("{}: {e}", path.display()))),
-            },
-            Err(_) => (Self::default(), None),
+pub fn load() -> Startup {
+    let Some(path) = config_path() else {
+        return Startup { config: Config::default(), warnings: Vec::new(), error: None };
+    };
+    match forgetty_shell_core::confwatch::read(&path) {
+        forgetty_shell_core::confwatch::Reload::Loaded(l) => {
+            Startup { config: l.config, warnings: l.warnings, error: None }
+        }
+        // No file at start is the defaults.
+        forgetty_shell_core::confwatch::Reload::Missing => {
+            Startup { config: Config::default(), warnings: Vec::new(), error: None }
+        }
+        forgetty_shell_core::confwatch::Reload::Failed(e) => {
+            Startup { config: Config::default(), warnings: Vec::new(), error: Some(e) }
         }
     }
+}
 
-    pub fn from_toml(text: &str) -> Result<Self, String> {
-        let f: FileConfig = toml::from_str(text).map_err(|e| e.to_string())?;
-        let mut c = Self::default();
-        c.shell = f.shell;
-        if let Some(n) = f.scrollback.filter(|n| *n <= 1_000_000) {
-            // W1 compatibility: ~2 KB of libghostty page memory per line.
-            c.scrollback_bytes = n * 2048;
-        }
-        if let Some(n) = f.scrollback_bytes.filter(|n| (64 * 1024..=4usize << 30).contains(n)) {
-            c.scrollback_bytes = n;
-        }
-        if let Some(b) = f.backdrop.as_deref() {
-            c.backdrop = match b.to_ascii_lowercase().as_str() {
-                "mica" => Backdrop::Mica,
-                "mica_alt" | "micaalt" => Backdrop::MicaAlt,
-                "blur" | "acrylic" => Backdrop::Blur,
-                "none" | "solid" | "opaque" => Backdrop::None,
-                other => return Err(format!("backdrop: unknown value '{other}'")),
-            };
-        }
-        if let Some(v) = f.sidebar {
-            c.sidebar_open = v;
-        }
-        if let Some(v) = f.pane_padding_x.filter(|v| (0.0..=64.0).contains(v)) {
-            c.pane_padding_x = v;
-        }
-        if let Some(v) = f.pane_padding_y.filter(|v| (0.0..=64.0).contains(v)) {
-            c.pane_padding_y = v;
-        }
-        if let Some(m) = f.bell_mode.as_deref() {
-            c.bell_mode = forgetty_shell_core::bell::BellMode::parse(m)
-                .ok_or_else(|| format!("bell_mode: unknown value '{m}' (visual, audio, both, none)"))?;
-        }
-        if let Some(n) = f.paste_warn_size {
-            c.paste_warn_size = n;
-        }
-        if let Some(v) = f.smart_copy {
-            c.smart_copy = v;
-        }
-        if let Some(m) = f.right_click.as_deref() {
-            c.right_click_copy_paste = match m.trim().to_ascii_lowercase().as_str() {
-                "copy_paste" => true,
-                "menu" => false,
-                _ => return Err(format!("right_click: unknown value '{m}' (copy_paste, menu)")),
-            };
-        }
-        for (name, v) in f.keybindings {
-            let keys = match v {
-                KeyValue::One(s) => vec![s],
-                KeyValue::Many(v) => v,
-            };
-            c.keybindings.insert(name, keys);
-        }
-        if let Some(v) = f.font.family {
-            c.font_family = v;
-        }
-        if let Some(v) = f.font.size.filter(|v| *v >= 4.0 && *v <= 96.0) {
-            c.font_size_pt = v;
-        }
-        let set = |dst: &mut u32, src: Option<String>| {
-            if let Some(v) = src.as_deref().and_then(hex) {
-                *dst = v;
-            }
-        };
-        set(&mut c.foreground, f.theme.foreground);
-        set(&mut c.background, f.theme.background);
-        set(&mut c.cursor, f.theme.cursor);
-        set(&mut c.selection, f.theme.selection);
-        set(&mut c.accent, f.theme.accent);
-        if let Some(list) = f.theme.ansi {
-            for (i, s) in list.iter().take(16).enumerate() {
-                if let Some(v) = hex(s) {
-                    c.ansi[i] = v;
-                }
-            }
-        }
-        Ok(c)
-    }
+const TEMPLATE: &str = "# Forgetty configuration. Changes apply when you save this file.\n\
+# Keys: https://forgetty.dev/docs/config\n\
+\n\
+# font_family = \"Cascadia Mono\"\n\
+# font_size = 11.0\n\
+# theme = \"Dracula\"\n\
+# shell = \"pwsh.exe -NoLogo\"\n\
+# bell_mode = \"visual\"          # visual | audio | both | none\n\
+# notification_mode = \"all\"     # all | ringonly | none\n\
+\n\
+# default_profile = \"PowerShell\"\n\
+# [[profiles]]\n\
+# name = \"PowerShell\"\n\
+# command = \"pwsh.exe -NoLogo\"\n\
+# directory = \"~\"\n";
 
-    pub fn font_size_px(&self) -> f32 {
-        self.font_size_pt * 96.0 / 72.0
+/// Open the config file in the editor Windows has for it, or Notepad. The file is created first
+/// (with a commented template) when it is missing.
+pub fn open_in_editor(path: &std::path::Path) -> Result<(), String> {
+    if !path.exists() {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(path, TEMPLATE).map_err(|e| e.to_string())?;
     }
+    use windows::core::{w, PCWSTR};
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    let wide: Vec<u16> = path.as_os_str().to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect();
+    let h = unsafe { ShellExecuteW(None, w!("open"), PCWSTR(wide.as_ptr()), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL) };
+    if h.0 as isize > 32 {
+        return Ok(());
+    }
+    // No program is set for .toml: Notepad is always there.
+    std::process::Command::new("notepad.exe").arg(path).spawn().map(|_| ()).map_err(|e| e.to_string())
 }
