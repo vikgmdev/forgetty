@@ -563,21 +563,51 @@ pub(crate) fn handle_rename_workspace(request: &Request, sm: &SessionManager) ->
     }
 }
 
+/// The workspace a request means. `id_key` (a workspace uuid) wins over `idx_key` (a position):
+/// an id names one workspace for good, a position can move under a request that waits (another
+/// client reorders, or the request is held over a reconnect). An id that is not there anymore
+/// is an error, never another workspace.
+fn workspace_index(request: &Request, sm: &SessionManager, id_key: &str, idx_key: &str) -> Result<usize, Response> {
+    match request.params.get(id_key) {
+        None | Some(serde_json::Value::Null) => {}
+        Some(v) => {
+            let raw = v.as_str().unwrap_or_default();
+            let Ok(id) = Uuid::parse_str(raw) else {
+                return Err(Response::error(
+                    request.id.clone(),
+                    protocol::INVALID_PARAMS,
+                    format!("invalid UUID for {id_key}"),
+                ));
+            };
+            return match sm.layout().workspaces.iter().position(|w| w.id == id) {
+                Some(i) => Ok(i),
+                None => Err(Response::error(
+                    request.id.clone(),
+                    protocol::INVALID_PARAMS,
+                    format!("workspace not found: {id}"),
+                )),
+            };
+        }
+    }
+    match request.params.get(idx_key).and_then(|v| v.as_u64()) {
+        Some(n) => Ok(n as usize),
+        None => Err(Response::error(
+            request.id.clone(),
+            protocol::INVALID_PARAMS,
+            format!("missing param: {idx_key} (u64) or {id_key} (uuid)"),
+        )),
+    }
+}
+
 /// Handle `delete_workspace` RPC (FIX-003).
 ///
-/// Params: `{ "workspace_idx": u64 }`.
+/// Params: `{ "workspace_idx": u64 }` or `{ "workspace_id": uuid }` (the id wins).
 /// Success: `{ "ok": true }`. Out-of-range index or last-workspace deletion
 /// return `INTERNAL_ERROR` with the message from `SessionManager::delete_workspace`.
 pub(crate) fn handle_delete_workspace(request: &Request, sm: &SessionManager) -> Response {
-    let workspace_idx = match request.params.get("workspace_idx").and_then(|v| v.as_u64()) {
-        Some(n) => n as usize,
-        None => {
-            return Response::error(
-                request.id.clone(),
-                protocol::INVALID_PARAMS,
-                "missing param: workspace_idx (u64)".to_string(),
-            )
-        }
+    let workspace_idx = match workspace_index(request, sm, "workspace_id", "workspace_idx") {
+        Ok(i) => i,
+        Err(e) => return e,
     };
 
     match sm.delete_workspace(workspace_idx) {
@@ -610,15 +640,9 @@ pub(crate) fn handle_delete_workspace(request: &Request, sm: &SessionManager) ->
 /// this response to build widgets without an extra `get_layout` round-trip.
 pub(crate) fn handle_duplicate_workspace(request: &Request, sm: &SessionManager) -> Response {
     let source_workspace_idx =
-        match request.params.get("source_workspace_idx").and_then(|v| v.as_u64()) {
-            Some(n) => n as usize,
-            None => {
-                return Response::error(
-                    request.id.clone(),
-                    protocol::INVALID_PARAMS,
-                    "missing param: source_workspace_idx (u64)".to_string(),
-                )
-            }
+        match workspace_index(request, sm, "source_workspace_id", "source_workspace_idx") {
+            Ok(i) => i,
+            Err(e) => return e,
         };
 
     // `new_name` is optional. `null` and absent are treated identically —
@@ -668,15 +692,9 @@ pub(crate) fn handle_duplicate_workspace(request: &Request, sm: &SessionManager)
 /// The daemon stores the hex string verbatim (see AD-007); GTK produces
 /// and validates the hex format client-side.
 pub(crate) fn handle_set_workspace_color(request: &Request, sm: &SessionManager) -> Response {
-    let workspace_idx = match request.params.get("workspace_idx").and_then(|v| v.as_u64()) {
-        Some(n) => n as usize,
-        None => {
-            return Response::error(
-                request.id.clone(),
-                protocol::INVALID_PARAMS,
-                "missing param: workspace_idx (u64)".to_string(),
-            )
-        }
+    let workspace_idx = match workspace_index(request, sm, "workspace_id", "workspace_idx") {
+        Ok(i) => i,
+        Err(e) => return e,
     };
 
     // `color` may be absent, null, or a string. Absent == null == clear.
@@ -702,26 +720,13 @@ pub(crate) fn handle_set_workspace_color(request: &Request, sm: &SessionManager)
 /// - Success → `{ "ok": true }` and a `WorkspacesReordered` event is
 ///   broadcast on the session event channel.
 pub(crate) fn handle_move_workspace(request: &Request, sm: &SessionManager) -> Response {
-    let from_idx = match request.params.get("from_idx").and_then(|v| v.as_u64()) {
-        Some(n) => n as usize,
-        None => {
-            return Response::error(
-                request.id.clone(),
-                protocol::INVALID_PARAMS,
-                "missing param: from_idx (u64)".to_string(),
-            )
-        }
+    let from_idx = match workspace_index(request, sm, "from_id", "from_idx") {
+        Ok(i) => i,
+        Err(e) => return e,
     };
-
-    let to_idx = match request.params.get("to_idx").and_then(|v| v.as_u64()) {
-        Some(n) => n as usize,
-        None => {
-            return Response::error(
-                request.id.clone(),
-                protocol::INVALID_PARAMS,
-                "missing param: to_idx (u64)".to_string(),
-            )
-        }
+    let to_idx = match workspace_index(request, sm, "to_id", "to_idx") {
+        Ok(i) => i,
+        Err(e) => return e,
     };
 
     match sm.move_workspace(from_idx, to_idx) {
@@ -991,6 +996,20 @@ pub(crate) fn handle_split_pane(request: &Request, sm: &SessionManager) -> Respo
         );
     }
 
+    // `before`: the new pane goes left of / above the source pane. Absent means false. A
+    // value that is not a boolean is refused (an old client never sends it).
+    let before = match request.params.get("before") {
+        None | Some(serde_json::Value::Null) => false,
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(_) => {
+            return Response::error(
+                request.id.clone(),
+                protocol::INVALID_PARAMS,
+                "before must be a boolean".to_string(),
+            )
+        }
+    };
+
     let rows = dim_param(request, "rows", DEFAULT_ROWS as u64);
     let cols = dim_param(request, "cols", DEFAULT_COLS as u64);
 
@@ -1007,7 +1026,7 @@ pub(crate) fn handle_split_pane(request: &Request, sm: &SessionManager) -> Respo
         .filter(|p| p.is_dir())
         .or_else(|| sm.pane_info(pane_id).map(|info| info.cwd));
 
-    match sm.split_pane(pane_id, &direction, size, cwd) {
+    match sm.split_pane_placed(pane_id, &direction, before, size, cwd) {
         Ok(new_pane_id) => Response::success(
             request.id.clone(),
             serde_json::json!({ "pane_id": new_pane_id.to_string() }),
@@ -2464,6 +2483,80 @@ mod tests {
             tab_idx: 0
         })
         .is_none());
+    }
+
+    /// A workspace named by id is the one acted on, wherever it is now. An id that is gone is
+    /// an error and no other workspace is touched.
+    #[tokio::test]
+    async fn workspace_calls_by_id_ignore_the_position() {
+        let sm = make_sm();
+        for name in ["b", "c"] {
+            dispatch(&req("create_workspace", serde_json::json!({ "name": name })), Arc::clone(&sm), None, None);
+        }
+        let ids: Vec<String> = sm.layout().workspaces.iter().map(|w| w.id.to_string()).collect();
+        assert_eq!(ids.len(), 3);
+        // The positions move under the caller: swap 0 and 2 by position, as another client would.
+        dispatch(&req("move_workspace", serde_json::json!({ "from_idx": 0, "to_idx": 2 })), Arc::clone(&sm), None, None);
+        // Color by id: the workspace that was at 0 is at 2 now.
+        let r = dispatch(&req("set_workspace_color", serde_json::json!({ "workspace_id": ids[0], "color": "#112233" })), Arc::clone(&sm), None, None);
+        assert!(r.error.is_none(), "{:?}", r.error);
+        assert_eq!(sm.layout().workspaces[2].color.as_deref(), Some("#112233"));
+        assert!(sm.layout().workspaces[0].color.is_none());
+        // Move by id swaps those two, not whatever is at those positions.
+        let r = dispatch(&req("move_workspace", serde_json::json!({ "from_id": ids[0], "to_id": ids[2] })), Arc::clone(&sm), None, None);
+        assert!(r.error.is_none(), "{:?}", r.error);
+        assert_eq!(sm.layout().workspaces[0].id.to_string(), ids[0]);
+        // Delete by id removes that workspace. A second delete of the same id fails and the
+        // others stay.
+        let r = dispatch(&req("delete_workspace", serde_json::json!({ "workspace_id": ids[1] })), Arc::clone(&sm), None, None);
+        assert!(r.error.is_none(), "{:?}", r.error);
+        assert_eq!(sm.layout().workspaces.len(), 2);
+        let r = dispatch(&req("delete_workspace", serde_json::json!({ "workspace_id": ids[1] })), Arc::clone(&sm), None, None);
+        assert!(r.error.as_ref().is_some_and(|e| e.message.contains("workspace not found")), "{:?}", r.error);
+        assert_eq!(sm.layout().workspaces.len(), 2);
+        // Duplicate by id of a gone workspace fails too. A bad id is an invalid param.
+        let r = dispatch(&req("duplicate_workspace", serde_json::json!({ "source_workspace_id": ids[1] })), Arc::clone(&sm), None, None);
+        assert!(r.error.is_some());
+        let r = dispatch(&req("delete_workspace", serde_json::json!({ "workspace_id": "nope" })), Arc::clone(&sm), None, None);
+        assert_eq!(r.error.unwrap().code, protocol::INVALID_PARAMS);
+        assert_eq!(sm.layout().workspaces.len(), 2);
+    }
+
+    /// `split_pane` with `before: true` puts the new pane first (left of / above). Without it,
+    /// and with `before: false`, it is second as always. A `before` that is not a boolean fails.
+    #[tokio::test]
+    async fn split_pane_before_places_the_new_pane_first() {
+        let sm = make_sm();
+        let resp = dispatch(&req("new_tab", serde_json::json!({"workspace_idx": 0})), Arc::clone(&sm), None, None);
+        let pane = resp.result.unwrap()["pane_id"].as_str().unwrap().to_string();
+        let split = |extra: serde_json::Value| {
+            let mut p = serde_json::json!({ "pane_id": pane, "direction": "horizontal" });
+            if let Some(o) = extra.as_object() {
+                for (k, v) in o {
+                    p[k] = v.clone();
+                }
+            }
+            dispatch(&req("split_pane", p), Arc::clone(&sm), None, None)
+        };
+        let left = split(serde_json::json!({ "before": true })).result.unwrap()["pane_id"].as_str().unwrap().to_string();
+        let right = split(serde_json::json!({ "before": false })).result.unwrap()["pane_id"].as_str().unwrap().to_string();
+        let plain = split(serde_json::json!({})).result.unwrap()["pane_id"].as_str().unwrap().to_string();
+        assert!(split(serde_json::json!({ "before": "yes" })).error.is_some());
+        // Leaves left to right: left, then the source, then what was added after it. Each plain
+        // split puts the new pane right after the source, so the later ones sit nearest to it.
+        fn leaves(t: &forgetty_session::PaneTreeLayout, out: &mut Vec<String>) {
+            match t {
+                forgetty_session::PaneTreeLayout::Leaf { pane_id } => out.push(pane_id.to_string()),
+                forgetty_session::PaneTreeLayout::Split { first, second, .. } => {
+                    leaves(first, out);
+                    leaves(second, out);
+                }
+            }
+        }
+        let layout = sm.layout();
+        let mut ids = Vec::new();
+        leaves(&layout.workspaces[0].tabs[0].pane_tree, &mut ids);
+        assert_eq!(ids, vec![left, pane, plain, right]);
     }
 
     #[tokio::test]

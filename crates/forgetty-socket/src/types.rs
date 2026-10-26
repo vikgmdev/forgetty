@@ -252,12 +252,18 @@ pub struct RenameWorkspaceParams {
 
 #[derive(JsonSchema, Serialize, Deserialize)]
 pub struct DeleteWorkspaceParams {
-    pub workspace_idx: u64,
+    /// Position of the workspace. Give this or `workspace_id`.
+    pub workspace_idx: Option<u64>,
+    /// The workspace's id. It wins over `workspace_idx` and fails when the workspace is gone.
+    pub workspace_id: Option<Uuid>,
 }
 
 #[derive(JsonSchema, Serialize, Deserialize)]
 pub struct DuplicateWorkspaceParams {
-    pub source_workspace_idx: u64,
+    /// Position of the source. Give this or `source_workspace_id`.
+    pub source_workspace_idx: Option<u64>,
+    /// The source's id. It wins over `source_workspace_idx` and fails when it is gone.
+    pub source_workspace_id: Option<Uuid>,
     /// Name of the copy. Default derived from the source name.
     pub new_name: Option<String>,
 }
@@ -278,15 +284,22 @@ pub struct DuplicateWorkspaceResult {
 
 #[derive(JsonSchema, Serialize, Deserialize)]
 pub struct SetWorkspaceColorParams {
-    pub workspace_idx: u64,
+    /// Position of the workspace. Give this or `workspace_id`.
+    pub workspace_idx: Option<u64>,
+    /// The workspace's id. It wins over `workspace_idx` and fails when the workspace is gone.
+    pub workspace_id: Option<Uuid>,
     /// `#RRGGBB`. `null` or absent clears the colour.
     pub color: Option<String>,
 }
 
 #[derive(JsonSchema, Serialize, Deserialize)]
 pub struct MoveWorkspaceParams {
-    pub from_idx: u64,
-    pub to_idx: u64,
+    /// Positions. Give each as an index or as an id.
+    pub from_idx: Option<u64>,
+    pub to_idx: Option<u64>,
+    /// Ids win over the positions and fail when the workspace is gone.
+    pub from_id: Option<Uuid>,
+    pub to_id: Option<Uuid>,
 }
 
 // ---------------------------------------------------------------------------
@@ -307,6 +320,10 @@ pub struct SplitPaneParams {
     pub cols: Option<u16>,
     /// Starting directory. Default: the directory of `pane_id`.
     pub cwd: Option<String>,
+    /// Put the new pane left of (`horizontal`) or above (`vertical`) the source pane. Default
+    /// false. A server that lists the capability `split_before` honors it. An older server
+    /// ignores it, so a client checks the capability first.
+    pub before: Option<bool>,
 }
 
 #[derive(JsonSchema, Serialize, Deserialize)]

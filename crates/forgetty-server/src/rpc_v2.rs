@@ -174,7 +174,7 @@ const KEEPING_PACE_RATE: f64 = 1024.0 * 1024.0;
 const SNAPSHOT_SEND_OK: Duration = Duration::from_millis(500);
 
 /// Capabilities the server offers.
-pub const SERVER_CAPS: [&str; 8] = [
+pub const SERVER_CAPS: [&str; 10] = [
     cap::RESUME,
     cap::LAYOUT_EVENTS,
     cap::STATUS_EVENTS,
@@ -183,6 +183,8 @@ pub const SERVER_CAPS: [&str; 8] = [
     cap::SNAPSHOT_CATCHUP,
     cap::INPUT_FLAGS,
     cap::SIZE_OWNER,
+    cap::SPLIT_BEFORE,
+    cap::WORKSPACE_ID,
 ];
 
 /// Methods a v2 client may call through the shared socket dispatch table.

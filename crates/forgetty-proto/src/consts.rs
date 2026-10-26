@@ -112,6 +112,11 @@ pub mod cap {
     pub const SIZE_OWNER: &str = "size_owner";
     /// Input frames carry a flags byte after `seq` (AD-025).
     pub const INPUT_FLAGS: &str = "input_flags";
+    /// `split_pane` takes `before` (the new pane goes left of or above the source).
+    pub const SPLIT_BEFORE: &str = "split_before";
+    /// `delete_workspace`, `duplicate_workspace`, `move_workspace` and `set_workspace_color`
+    /// take workspace ids (`workspace_id`, `source_workspace_id`, `from_id`, `to_id`).
+    pub const WORKSPACE_ID: &str = "workspace_id";
 }
 
 /// Method names that are new in v2 (section 4).

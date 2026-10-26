@@ -505,7 +505,7 @@ Kind: call. Protocol v2: yes.
 
 Split a pane and open a new pane next to it.
 
-`direction` is `horizontal` or `vertical`. The new pane starts in the directory of the source pane unless `cwd` is given. Returns the id of the new pane.
+`direction` is `horizontal` or `vertical`. The new pane starts in the directory of the source pane unless `cwd` is given. `before` (default false) puts the new pane left of or above the source pane. Returns the id of the new pane.
 
 Kind: call. Protocol v2: yes.
 
@@ -513,6 +513,7 @@ Kind: call. Protocol v2: yes.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
+| `before` | boolean or null | no | Put the new pane left of (`horizontal`) or above (`vertical`) the source pane. Default false. A server that lists the capability `split_before` honors it. An older server ignores it, so a client checks the capability first. |
 | `cols` | integer or null | no |  |
 | `cwd` | string or null | no | Starting directory. Default: the directory of `pane_id`. |
 | `direction` | string | yes | `horizontal` or `vertical`. |
@@ -957,7 +958,7 @@ Kind: call. Protocol v2: yes.
 
 Delete a workspace and close its panes.
 
-The last workspace cannot be deleted.
+The last workspace cannot be deleted. Name the workspace by `workspace_id` when other clients may reorder (a position can point to another workspace by the time the call runs).
 
 Kind: call. Protocol v2: yes.
 
@@ -965,7 +966,8 @@ Kind: call. Protocol v2: yes.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `workspace_idx` | integer | yes |  |
+| `workspace_id` | string (uuid) or null | no | The workspace's id. It wins over `workspace_idx` and fails when the workspace is gone. |
+| `workspace_idx` | integer or null | no | Position of the workspace. Give this or `workspace_id`. |
 
 **Result**
 
@@ -984,7 +986,7 @@ Kind: call. Protocol v2: yes.
 
 Copy a workspace with fresh shells.
 
-Opens one new shell per tab of the source, in the directory of the source tab. Running programs are not copied.
+Opens one new shell per tab of the source, in the directory of the source tab. Running programs are not copied. `source_workspace_id` names the source by id.
 
 Kind: call. Protocol v2: yes.
 
@@ -993,7 +995,8 @@ Kind: call. Protocol v2: yes.
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `new_name` | string or null | no | Name of the copy. Default derived from the source name. |
-| `source_workspace_idx` | integer | yes |  |
+| `source_workspace_id` | string (uuid) or null | no | The source's id. It wins over `source_workspace_idx` and fails when it is gone. |
+| `source_workspace_idx` | integer or null | no | Position of the source. Give this or `source_workspace_id`. |
 
 **Result**
 
@@ -1021,7 +1024,7 @@ Kind: call. Protocol v2: yes.
 
 Set or clear the accent colour of a workspace.
 
-The server stores the string as given.
+The server stores the string as given. `workspace_id` names the workspace by id.
 
 Kind: call. Protocol v2: yes.
 
@@ -1030,7 +1033,8 @@ Kind: call. Protocol v2: yes.
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `color` | string or null | no | `#RRGGBB`. `null` or absent clears the colour. |
-| `workspace_idx` | integer | yes |  |
+| `workspace_id` | string (uuid) or null | no | The workspace's id. It wins over `workspace_idx` and fails when the workspace is gone. |
+| `workspace_idx` | integer or null | no | Position of the workspace. Give this or `workspace_id`. |
 
 **Result**
 
@@ -1049,7 +1053,7 @@ Kind: call. Protocol v2: yes.
 
 Swap two workspaces.
 
-Swaps the positions of two workspaces. The same index twice does nothing.
+Swaps the positions of two workspaces. The same index twice does nothing. `from_id` and `to_id` name them by id.
 
 Kind: call. Protocol v2: yes.
 
@@ -1057,8 +1061,10 @@ Kind: call. Protocol v2: yes.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `from_idx` | integer | yes |  |
-| `to_idx` | integer | yes |  |
+| `from_id` | string (uuid) or null | no | Ids win over the positions and fail when the workspace is gone. |
+| `from_idx` | integer or null | no | Positions. Give each as an index or as an id. |
+| `to_id` | string (uuid) or null | no |  |
+| `to_idx` | integer or null | no |  |
 
 **Result**
 

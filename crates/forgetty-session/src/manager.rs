@@ -1144,6 +1144,19 @@ impl SessionManager {
         size: PtySize,
         cwd: Option<PathBuf>,
     ) -> Result<PaneId> {
+        self.split_pane_placed(pane_id, direction, false, size, cwd)
+    }
+
+    /// Like `split_pane`, with the new pane on either side. `before` puts it first (left of a
+    /// horizontal split, above a vertical one) and the old pane second.
+    pub fn split_pane_placed(
+        &self,
+        pane_id: PaneId,
+        direction: &str,
+        before: bool,
+        size: PtySize,
+        cwd: Option<PathBuf>,
+    ) -> Result<PaneId> {
         let size = clamp_size(size);
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -1182,7 +1195,7 @@ impl SessionManager {
         let mut found_tab_id: Option<Uuid> = None;
         'outer: for ws in inner.layout.workspaces.iter_mut() {
             for tab in ws.tabs.iter_mut() {
-                if replace_leaf(&mut tab.pane_tree, pane_id, new_pane_id, direction) {
+                if replace_leaf(&mut tab.pane_tree, pane_id, new_pane_id, direction, before) {
                     replaced = true;
                     found_tab_id = Some(tab.id);
                     break 'outer;
@@ -2701,8 +2714,9 @@ fn replace_leaf(
     target: PaneId,
     new_pane: PaneId,
     direction: &str,
+    before: bool,
 ) -> bool {
-    replace_leaf_with_ratio(tree, target, new_pane, direction, 0.5)
+    replace_leaf_placed(tree, target, new_pane, direction, 0.5, before)
 }
 
 fn replace_leaf_with_ratio(
@@ -2712,22 +2726,31 @@ fn replace_leaf_with_ratio(
     direction: &str,
     ratio: f32,
 ) -> bool {
+    replace_leaf_placed(tree, target, new_pane, direction, ratio, false)
+}
+
+fn replace_leaf_placed(
+    tree: &mut PaneTreeLayout,
+    target: PaneId,
+    new_pane: PaneId,
+    direction: &str,
+    ratio: f32,
+    before: bool,
+) -> bool {
     match tree {
         PaneTreeLayout::Leaf { pane_id } if *pane_id == target => {
-            *tree = PaneTreeLayout::Split {
-                direction: direction.to_string(),
-                ratio,
-                first: Box::new(PaneTreeLayout::Leaf { pane_id: target }),
-                second: Box::new(PaneTreeLayout::Leaf { pane_id: new_pane }),
-            };
+            let old = Box::new(PaneTreeLayout::Leaf { pane_id: target });
+            let new = Box::new(PaneTreeLayout::Leaf { pane_id: new_pane });
+            let (first, second) = if before { (new, old) } else { (old, new) };
+            *tree = PaneTreeLayout::Split { direction: direction.to_string(), ratio, first, second };
             true
         }
         PaneTreeLayout::Leaf { .. } => false,
         PaneTreeLayout::Split { first, second, .. } => {
-            if replace_leaf_with_ratio(first, target, new_pane, direction, ratio) {
+            if replace_leaf_placed(first, target, new_pane, direction, ratio, before) {
                 true
             } else {
-                replace_leaf_with_ratio(second, target, new_pane, direction, ratio)
+                replace_leaf_placed(second, target, new_pane, direction, ratio, before)
             }
         }
     }
@@ -3249,6 +3272,35 @@ mod tests {
         assert!(session.pane_info(pane_a).is_some(), "pane A must still exist");
         assert!(session.pane_info(pane_b).is_some(), "pane B must be registered");
 
+        session.close_tab(tab_id).ok();
+    }
+
+    /// `before` puts the new pane first: left of a horizontal split, above a vertical one.
+    #[tokio::test]
+    async fn test_split_pane_placed_before() {
+        let session = SessionManager::new();
+        let size = test_size();
+        let (pane_a, tab_id) = session.create_tab(0, None, size, None).expect("create_tab");
+        let pane_b = session.split_pane_placed(pane_a, "horizontal", true, size, None).expect("split left");
+        let layout = session.layout();
+        match &layout.workspaces[0].tabs[0].pane_tree {
+            PaneTreeLayout::Split { direction, first, second, .. } => {
+                assert_eq!(direction, "horizontal");
+                assert!(matches!(&**first, PaneTreeLayout::Leaf { pane_id } if *pane_id == pane_b));
+                assert!(matches!(&**second, PaneTreeLayout::Leaf { pane_id } if *pane_id == pane_a));
+            }
+            other => panic!("expected a split, got {other:?}"),
+        }
+        // Without `before` the new pane is second, as before.
+        let pane_c = session.split_pane(pane_a, "vertical", size, None).expect("split down");
+        let layout = session.layout();
+        let tree = &layout.workspaces[0].tabs[0].pane_tree;
+        let ids = {
+            let mut v = Vec::new();
+            collect_pane_ids(tree, &mut v);
+            v
+        };
+        assert_eq!(ids, vec![pane_b, pane_a, pane_c]);
         session.close_tab(tab_id).ok();
     }
 

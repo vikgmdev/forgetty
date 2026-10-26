@@ -71,7 +71,20 @@ know: an unknown `client_kind` is `unknown` (one entry of a `list_clients` must 
 make the list unreadable), and an unknown event inside `Event` is skipped but its
 `seq` counts. Initial capability names:
 `resume`, `layout_events`, `status_events`, `capture`, `size_policy_latest`,
-`snapshot_catchup`, `input_flags`, `size_owner`.
+`snapshot_catchup`, `input_flags`, `size_owner`, `split_before`, `workspace_id`.
+
+Two additive capabilities for the request methods (both sides list them, as for the others):
+
+- `split_before`: `split_pane` takes an optional `before` (bool, default false). With
+  `true` the new pane goes first (left of, or above, the pane being split). A server
+  without the capability ignores the field and splits after, so a client must not send
+  `before: true` to it.
+- `workspace_id`: `delete_workspace`, `set_workspace_color`, `duplicate_workspace` and
+  `move_workspace` take workspace ids (`workspace_id`, `source_workspace_id`, `from_id`,
+  `to_id`) in place of the positions. When an id is given it wins over the position, and
+  an id that no longer exists is an error. A position can point at another workspace
+  after another client moved or deleted one, an id cannot. A client without the
+  capability re-reads the layout and sends the position right away.
 
 ## 3a. Encoding rules
 
