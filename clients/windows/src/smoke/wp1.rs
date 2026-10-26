@@ -197,6 +197,30 @@ impl ShellSmoke {
                 v.update(cx, |v, vcx| v.search_goto(false, vcx));
                 let cur3 = v.read(cx).search_status().map(|s| s.2);
                 check("search_previous_goes_back", cur3 == Some(1));
+                // Output while the bar is open: the scan goes on over the new rows (it does not
+                // start over), and finds the new lines too.
+                let more: String = (0..5).map(|i| format!("find-me extra {i}\r\n")).collect();
+                self.wp1_send(PaneEvent::Output(more.into_bytes()));
+                self.sub = 120;
+                self.sub_t0 = Instant::now();
+            }
+            120 => {
+                let Some(v) = view else { return };
+                let st = v.read(cx).search_status();
+                let (restarts, extends) = v.read(cx).search.as_ref().map_or((0, 0), |s| (s.restarts, s.extends));
+                if !matches!(st, Some((true, 7, _, _))) {
+                    if self.sub_t0.elapsed() > Duration::from_secs(4) {
+                        record("wp1_search_extend", json!({"status": format!("{st:?}"), "restarts": restarts, "extends": extends}));
+                        check("search_goes_on_over_new_output", false);
+                        v.update(cx, |v, vcx| v.search_key(&super::key("escape"), false, vcx));
+                        v.update(cx, |v, _| v.term.scroll_viewport_bottom());
+                        self.wp1_state_checks(&v, cx);
+                        self.wp1_after_search(&v, cx);
+                    }
+                    return;
+                }
+                record("wp1_search_extend", json!({"status": format!("{st:?}"), "restarts": restarts, "extends": extends}));
+                check("search_goes_on_over_new_output", restarts == 1 && extends >= 1);
                 // Esc through the key path closes it and leaves the view where it is.
                 v.update(cx, |v, vcx| v.search_key(&super::key("escape"), false, vcx));
                 check("search_escape_closes", v.read(cx).search.is_none());

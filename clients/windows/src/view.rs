@@ -266,6 +266,33 @@ pub struct SearchState {
     /// over new output. The smoke reads them.
     pub restarts: u32,
     pub extends: u32,
+    /// Hashes of a few rows of the settled part of the buffer, taken when the scan was made.
+    /// When the buffer is full, old rows are dropped and every row index moves up: the rows
+    /// then differ, and the scan starts over instead of going on with wrong row numbers.
+    fp: Fingerprint,
+}
+
+/// `(rows covered, hashes of up to 9 rows spread over them)`.
+#[derive(Default)]
+struct Fingerprint(usize, Vec<u64>);
+
+impl Fingerprint {
+    fn take(term: &Terminal, scratch: &mut RowText, settled: usize) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut v = Vec::new();
+        if settled > 0 {
+            for k in 0..=8usize {
+                let row = (settled * k / 8).min(settled - 1);
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                if term.row_text(row, scratch) {
+                    scratch.text.hash(&mut h);
+                    scratch.wrapped.hash(&mut h);
+                }
+                v.push(h.finish());
+            }
+        }
+        Fingerprint(settled, v)
+    }
 }
 
 /// A paste waiting for the user's confirmation (Enter pastes, Esc cancels).
@@ -989,6 +1016,7 @@ impl TerminalView {
             driver: false,
             scroll_now: false,
             scratch: RowText::default(),
+            fp: Fingerprint::default(),
             restarts: 0,
             extends: 0,
         });
@@ -1068,8 +1096,10 @@ impl TerminalView {
     /// The query changed: scan again from the top.
     fn search_restart(&mut self, cx: &mut Context<Self>) {
         let total = self.term.scrollbar_state().0 as usize;
+        let screen = self.rows;
         let Some(st) = self.search.as_mut() else { return };
         st.job = SearchJob::new(&st.edit.text, total);
+        st.fp = Fingerprint::take(&self.term, &mut st.scratch, total.saturating_sub(screen));
         st.restarts += 1;
         st.current = 0;
         st.jump = true;
@@ -1126,16 +1156,20 @@ impl TerminalView {
             // while output keeps coming, so a long scan always completes. A buffer that
             // shrank (clear, reset) starts a new scan.
             let screen = self.rows;
-            let extended = st.job.as_mut().is_some_and(|j| {
-                let old_total = j.progress().1;
-                j.extend(total, old_total.saturating_sub(screen))
-            });
+            // The rows that were settled when the scan was made are still the same rows.
+            let unmoved = Fingerprint::take(&self.term, &mut st.scratch, st.fp.0).1 == st.fp.1;
+            let extended = unmoved
+                && st.job.as_mut().is_some_and(|j| {
+                    let old_total = j.progress().1;
+                    j.extend(total, old_total.saturating_sub(screen))
+                });
             if extended {
                 st.extends += 1;
             } else {
                 st.job = SearchJob::new(&st.edit.text, total);
                 st.restarts += 1;
             }
+            st.fp = Fingerprint::take(&self.term, &mut st.scratch, total.saturating_sub(screen));
         }
         let Some(job) = st.job.as_mut() else {
             st.driver = false;
