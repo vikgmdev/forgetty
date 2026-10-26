@@ -84,6 +84,15 @@ fn uuid_at(v: &Json, key: &str) -> BackendResult<Uuid> {
         .ok_or_else(|| BackendError::Invalid(format!("reply has no {key}")))
 }
 
+/// A reply that names a workspace position must carry it. A missing field is an error,
+/// not position 0, or the shell would act on the wrong workspace.
+fn idx_at(v: &Json, key: &str) -> BackendResult<usize> {
+    v.get(key)
+        .and_then(Json::as_u64)
+        .map(|n| n as usize)
+        .ok_or_else(|| BackendError::Invalid(format!("reply has no {key}")))
+}
+
 impl RemoteBackend {
     /// Bind the endpoint and start the reconnect supervisor. Returns at once:
     /// the link comes up in the background (`connection()` shows it). Call
@@ -182,6 +191,43 @@ impl RemoteBackend {
         });
     }
 
+
+    /// True when the server (this session) understands `cap`.
+    fn server_has(&self, cap: &str) -> bool {
+        self.inner.client.has_capability(cap)
+    }
+
+    /// Workspace calls act on the workspace id. A server with the `workspace_id`
+    /// capability takes ids. An older one takes positions, so read the layout again and
+    /// look the id up right before sending, which keeps the window for a stale index small.
+    /// `ids` are the workspace ids the call names, `build_ids` gives the params for a
+    /// server that takes ids and `build_idx` the params for one that takes positions.
+    fn ws_call(
+        &self,
+        method: &'static str,
+        ids: Vec<Uuid>,
+        build_ids: impl FnOnce(&[Uuid]) -> Json + Send + 'static,
+        build_idx: impl FnOnce(&[usize]) -> Json + Send + 'static,
+    ) -> BackendFuture<Json> {
+        if self.server_has(forgetty_client::proto::cap::WORKSPACE_ID) {
+            return self.call(method, build_ids(&ids));
+        }
+        let inner = self.inner.clone();
+        self.run(async move {
+            let v = inner.client.request("get_layout", Value::Map(Vec::new())).await.map_err(map_err)?;
+            let l = parse_layout(&v)?;
+            *inner.layout.lock().unwrap_or_else(|e| e.into_inner()) = l.clone();
+            let mut pos = Vec::new();
+            for id in &ids {
+                match l.workspaces.iter().position(|w| w.id == *id) {
+                    Some(i) => pos.push(i),
+                    None => return Err(BackendError::NotFound(format!("workspace {id}"))),
+                }
+            }
+            client_call(&inner, method, build_idx(&pos)).await
+        })
+    }
+
     /// Run `fut` on the backend's runtime; the returned future is safe to
     /// await from any executor.
     fn run<T: Send + 'static>(&self, fut: impl Future<Output = BackendResult<T>> + Send + 'static) -> BackendFuture<T> {
@@ -201,6 +247,10 @@ impl RemoteBackend {
         let f = self.call(method, params);
         Box::pin(async move { f.await.map(|_| ()) })
     }
+}
+
+async fn client_call(inner: &Inner, method: &'static str, params: Json) -> BackendResult<Json> {
+    inner.client.request(method, from_json(&params)).await.map(|v| to_json(&v)).map_err(map_err)
 }
 
 /// While reconnecting, end each backoff wait after this long ...
@@ -349,7 +399,7 @@ impl SessionBackend for RemoteBackend {
             let v = f.await?;
             Ok(NewWorkspaceReply {
                 workspace_id: uuid_at(&v, "workspace_id")?,
-                workspace_idx: v.get("workspace_idx").and_then(Json::as_u64).unwrap_or(0) as usize,
+                workspace_idx: idx_at(&v, "workspace_idx")?,
                 tab_id: uuid_at(&v, "tab_id")?,
                 pane_id: PaneId(uuid_at(&v, "pane_id")?),
             })
@@ -372,22 +422,42 @@ impl SessionBackend for RemoteBackend {
         self.call_unit("rename_workspace", json!({"workspace_idx": workspace_idx, "name": name}))
     }
 
-    fn delete_workspace(&self, workspace_idx: usize) -> BackendFuture<()> {
-        self.call_unit("delete_workspace", json!({"workspace_idx": workspace_idx}))
+    fn delete_workspace(&self, workspace_id: Uuid) -> BackendFuture<()> {
+        let f = self.ws_call(
+            "delete_workspace",
+            vec![workspace_id],
+            |i| json!({"workspace_id": i[0].to_string()}),
+            |p| json!({"workspace_idx": p[0]}),
+        );
+        Box::pin(async move { f.await.map(|_| ()) })
     }
 
     fn duplicate_workspace(
         &self,
-        source_idx: usize,
+        source_id: Uuid,
         new_name: Option<String>,
         _rows: u16,
         _cols: u16,
     ) -> BackendFuture<DuplicatedWorkspace> {
-        let mut p = json!({"source_workspace_idx": source_idx});
-        if let Some(n) = new_name {
-            p["new_name"] = json!(n);
-        }
-        let f = self.call("duplicate_workspace", p);
+        let name = new_name.clone();
+        let f = self.ws_call(
+            "duplicate_workspace",
+            vec![source_id],
+            move |i| {
+                let mut p = json!({"source_workspace_id": i[0].to_string()});
+                if let Some(n) = new_name {
+                    p["new_name"] = json!(n);
+                }
+                p
+            },
+            move |p| {
+                let mut p = json!({"source_workspace_idx": p[0]});
+                if let Some(n) = name {
+                    p["new_name"] = json!(n);
+                }
+                p
+            },
+        );
         Box::pin(async move {
             let v = f.await?;
             let tabs = v
@@ -402,22 +472,35 @@ impl SessionBackend for RemoteBackend {
                 .unwrap_or_default();
             Ok(DuplicatedWorkspace {
                 workspace_id: uuid_at(&v, "workspace_id")?,
-                workspace_idx: v.get("workspace_idx").and_then(Json::as_u64).unwrap_or(0) as usize,
+                workspace_idx: idx_at(&v, "workspace_idx")?,
                 tabs,
             })
         })
     }
 
-    fn move_workspace(&self, from_idx: usize, to_idx: usize) -> BackendFuture<()> {
-        self.call_unit("move_workspace", json!({"from_idx": from_idx, "to_idx": to_idx}))
+    fn move_workspace(&self, from_id: Uuid, to_id: Uuid) -> BackendFuture<()> {
+        let f = self.ws_call(
+            "move_workspace",
+            vec![from_id, to_id],
+            |i| json!({"from_id": i[0].to_string(), "to_id": i[1].to_string()}),
+            |p| json!({"from_idx": p[0], "to_idx": p[1]}),
+        );
+        Box::pin(async move { f.await.map(|_| ()) })
     }
 
-    fn set_workspace_color(&self, workspace_idx: usize, color: Option<String>) -> BackendFuture<()> {
+    fn set_workspace_color(&self, workspace_id: Uuid, color: Option<String>) -> BackendFuture<()> {
         let color = match valid_workspace_color(color.as_deref()) {
             Ok(c) => c,
             Err(e) => return forgetty_shell_core::ready(Err(e)),
         };
-        self.call_unit("set_workspace_color", json!({"workspace_idx": workspace_idx, "color": color}))
+        let c2 = color.clone();
+        let f = self.ws_call(
+            "set_workspace_color",
+            vec![workspace_id],
+            move |i| json!({"workspace_id": i[0].to_string(), "color": color}),
+            move |p| json!({"workspace_idx": p[0], "color": c2}),
+        );
+        Box::pin(async move { f.await.map(|_| ()) })
     }
 
     fn split_pane(&self, req: SplitPane) -> BackendFuture<PaneId> {
@@ -430,8 +513,21 @@ impl SessionBackend for RemoteBackend {
         if let Some(cwd) = req.cwd {
             p["cwd"] = json!(cwd);
         }
+        if req.before {
+            // An older server would split on the wrong side and not say so. Refuse.
+            if !self.supports_split_before() {
+                return forgetty_shell_core::ready(Err(BackendError::Invalid(
+                    "this machine's server cannot split to the left or up".into(),
+                )));
+            }
+            p["before"] = json!(true);
+        }
         let f = self.call("split_pane", p);
         Box::pin(async move { Ok(PaneId(uuid_at(&f.await?, "pane_id")?)) })
+    }
+
+    fn supports_split_before(&self) -> bool {
+        self.server_has(forgetty_client::proto::cap::SPLIT_BEFORE)
     }
 
     fn close_pane(&self, pane_id: PaneId) -> BackendFuture<()> {
@@ -501,5 +597,17 @@ impl SessionBackend for RemoteBackend {
             let src = RemotePaneSource::spawn(&inner.rt, inner.client.clone(), pane_id.0, stream);
             Ok(Box::new(src) as Box<dyn PaneSource>)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_reply_without_a_position_is_an_error_not_position_zero() {
+        assert!(idx_at(&json!({"workspace_id": "x"}), "workspace_idx").is_err());
+        assert!(idx_at(&json!({"workspace_idx": "3"}), "workspace_idx").is_err());
+        assert_eq!(idx_at(&json!({"workspace_idx": 3}), "workspace_idx").unwrap(), 3);
     }
 }

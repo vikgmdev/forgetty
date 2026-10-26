@@ -530,9 +530,12 @@ impl SessionBackend for LocalBackend {
         }
     }
 
-    fn delete_workspace(&self, workspace_idx: usize) -> BackendFuture<()> {
+    fn delete_workspace(&self, workspace_id: Uuid) -> BackendFuture<()> {
         let inner = &self.inner;
         let mut st = inner.lock();
+        let Some(workspace_idx) = st.layout.workspaces.iter().position(|w| w.id == workspace_id) else {
+            return ready(Err(BackendError::NotFound(format!("workspace {workspace_id}"))));
+        };
         let n = st.layout.workspaces.len();
         if workspace_idx >= n {
             return ready(Err(BackendError::Invalid(format!("workspace index {workspace_idx} out of bounds (len={n})"))));
@@ -570,7 +573,7 @@ impl SessionBackend for LocalBackend {
 
     fn duplicate_workspace(
         &self,
-        source_idx: usize,
+        source_id: Uuid,
         new_name: Option<String>,
         rows: u16,
         cols: u16,
@@ -578,6 +581,9 @@ impl SessionBackend for LocalBackend {
         let inner = &self.inner;
         let mut st = inner.lock();
         let r = (|| {
+            let Some(source_idx) = st.layout.workspaces.iter().position(|w| w.id == source_id) else {
+                return Err(BackendError::NotFound(format!("workspace {source_id}")));
+            };
             let Some(src) = st.layout.workspaces.get(source_idx) else {
                 return Err(BackendError::Invalid(format!(
                     "duplicate_workspace: workspace index {source_idx} out of bounds (len={})",
@@ -633,12 +639,12 @@ impl SessionBackend for LocalBackend {
         ready(r)
     }
 
-    fn move_workspace(&self, from_idx: usize, to_idx: usize) -> BackendFuture<()> {
+    fn move_workspace(&self, from_id: Uuid, to_id: Uuid) -> BackendFuture<()> {
         let mut st = self.inner.lock();
-        let n = st.layout.workspaces.len();
-        if from_idx >= n || to_idx >= n {
-            return ready(Err(BackendError::Invalid(format!("move_workspace: index out of bounds (len={n})"))));
-        }
+        let pos = |id: Uuid| st.layout.workspaces.iter().position(|w| w.id == id);
+        let (Some(from_idx), Some(to_idx)) = (pos(from_id), pos(to_id)) else {
+            return ready(Err(BackendError::NotFound("workspace".into())));
+        };
         if from_idx == to_idx {
             return ready(Ok(()));
         }
@@ -652,14 +658,14 @@ impl SessionBackend for LocalBackend {
         ready(Ok(()))
     }
 
-    fn set_workspace_color(&self, workspace_idx: usize, color: Option<String>) -> BackendFuture<()> {
+    fn set_workspace_color(&self, workspace_id: Uuid, color: Option<String>) -> BackendFuture<()> {
         let color = match valid_workspace_color(color.as_deref()) {
             Ok(c) => c,
             Err(e) => return ready(Err(e)),
         };
         let mut st = self.inner.lock();
-        match st.layout.workspaces.get_mut(workspace_idx) {
-            None => ready(Err(BackendError::Invalid(format!("workspace {workspace_idx}")))),
+        match st.layout.workspaces.iter_mut().find(|w| w.id == workspace_id) {
+            None => ready(Err(BackendError::NotFound(format!("workspace {workspace_id}")))),
             Some(ws) => {
                 if ws.color != color {
                     ws.color = color;
@@ -681,12 +687,16 @@ impl SessionBackend for LocalBackend {
             let cwd = req.cwd.clone().or_else(|| st.panes.get(&req.pane_id).and_then(|p| p.spawn_cwd.clone()));
             let new_pane = inner.spawn_pane(&mut st, Vec::new(), cwd, req.rows, req.cols)?;
             let tab = &mut st.layout.workspaces[w].tabs[t];
-            tab.pane_tree.split_leaf(req.pane_id, req.direction, new_pane);
+            tab.pane_tree.split_leaf_placed(req.pane_id, req.direction, new_pane, req.before);
             tab.active_pane_id = Some(new_pane);
             inner.emit_layout(&st);
             Ok(new_pane)
         })();
         ready(r)
+    }
+
+    fn supports_split_before(&self) -> bool {
+        true
     }
 
     fn close_pane(&self, pane_id: PaneId) -> BackendFuture<()> {
@@ -833,7 +843,7 @@ mod tests {
         assert_eq!(l.workspaces[0].tabs.len(), 2);
         assert_eq!(l.workspaces[0].active_tab, 1);
 
-        let p2 = now(b.split_pane(SplitPane { pane_id: t2.pane_id, direction: SplitDir::Horizontal, rows: 24, cols: 40, cwd: None })).unwrap();
+        let p2 = now(b.split_pane(SplitPane { pane_id: t2.pane_id, direction: SplitDir::Horizontal, rows: 24, cols: 40, cwd: None, before: false })).unwrap();
         let l = now(b.get_layout()).unwrap();
         assert_eq!(l.workspaces[0].tabs[1].pane_tree.leaves(), vec![t2.pane_id, p2]);
         assert_eq!(l.workspaces[0].tabs[1].focused_pane(), p2);
@@ -936,7 +946,7 @@ mod tests {
         read_until(&src.events(), "SAFE-DONE");
         wait_for(|| now(b.get_pane_info(t.pane_id)).unwrap().cwd == "/usr", "display cwd");
         // The split starts where the parent was started, not in /usr and not on a share.
-        let p2 = now(b.split_pane(SplitPane { pane_id: t.pane_id, direction: SplitDir::Vertical, rows: 24, cols: 80, cwd: None })).unwrap();
+        let p2 = now(b.split_pane(SplitPane { pane_id: t.pane_id, direction: SplitDir::Vertical, rows: 24, cols: 80, cwd: None, before: false })).unwrap();
         let s2 = now(b.attach_pane(p2)).unwrap();
         s2.write_input(b"echo PWD=$(pwd)=END\n");
         let mut out = read_until(&s2.events(), "PWD=/");
@@ -1010,16 +1020,18 @@ mod tests {
     fn workspace_delete_duplicate_move_color() {
         let b = backend();
         let rx = b.subscribe();
+        // Workspaces go by id, so a position that moved cannot hit another workspace.
+        let wid = |b: &LocalBackend, i: usize| now(b.get_layout()).unwrap().workspaces[i].id;
         let t0 = now(b.new_tab(NewTab { workspace_idx: 0, rows: 24, cols: 80, ..Default::default() })).unwrap();
         now(b.new_tab(NewTab { workspace_idx: 0, rows: 24, cols: 80, ..Default::default() })).unwrap();
         // The last workspace cannot go.
-        assert!(now(b.delete_workspace(0)).is_err());
-        assert!(now(b.delete_workspace(5)).is_err());
+        assert!(now(b.delete_workspace(wid(&b, 0))).is_err());
+        assert!(now(b.delete_workspace(Uuid::new_v4())).is_err());
 
         // A copy: one fresh shell per tab, named "<source> (copy)", right after the source, no
         // color, and the source stays active.
-        now(b.set_workspace_color(0, Some("#E0493A".into()))).unwrap();
-        let d = now(b.duplicate_workspace(0, None, 24, 80)).unwrap();
+        now(b.set_workspace_color(wid(&b, 0), Some("#E0493A".into()))).unwrap();
+        let d = now(b.duplicate_workspace(wid(&b, 0), None, 24, 80)).unwrap();
         assert_eq!((d.workspace_idx, d.tabs.len()), (1, 2));
         let l = now(b.get_layout()).unwrap();
         assert_eq!(l.workspaces.len(), 2);
@@ -1032,29 +1044,29 @@ mod tests {
         assert_eq!(l.workspaces[1].tabs.iter().map(|t| t.pane_tree.first_leaf()).collect::<Vec<_>>(), copy_panes);
         assert!(copy_panes.iter().all(|p| b.pty(*p).is_some()));
         assert!(!l.workspaces[0].tabs.iter().any(|t| copy_panes.contains(&t.pane_tree.first_leaf())));
-        let named = now(b.duplicate_workspace(1, Some("mine".into()), 24, 80)).unwrap();
+        let named = now(b.duplicate_workspace(wid(&b, 1), Some("mine".into()), 24, 80)).unwrap();
         assert_eq!(now(b.get_layout()).unwrap().workspaces[2].name, "mine");
         assert_eq!(named.workspace_idx, 2);
 
         // Move swaps, and the active workspace follows its workspace.
         now(b.set_active_workspace(2)).unwrap();
-        now(b.move_workspace(2, 0)).unwrap();
+        now(b.move_workspace(wid(&b, 2), wid(&b, 0))).unwrap();
         let l = now(b.get_layout()).unwrap();
         assert_eq!(l.workspaces[0].name, "mine");
         assert_eq!(l.workspaces[2].name, "Default");
         assert_eq!(l.active_workspace, 0);
-        assert!(now(b.move_workspace(0, 9)).is_err());
-        now(b.move_workspace(1, 1)).unwrap();
+        assert!(now(b.move_workspace(wid(&b, 0), Uuid::new_v4())).is_err());
+        now(b.move_workspace(wid(&b, 1), wid(&b, 1))).unwrap();
 
         // Color: only #rrggbb, and clearing works. An unchanged color sends no event.
-        assert!(now(b.set_workspace_color(1, Some("red".into()))).is_err());
-        assert!(now(b.set_workspace_color(9, None)).is_err());
-        now(b.set_workspace_color(1, Some("#3987e4".into()))).unwrap();
+        assert!(now(b.set_workspace_color(wid(&b, 1), Some("red".into()))).is_err());
+        assert!(now(b.set_workspace_color(Uuid::new_v4(), None)).is_err());
+        now(b.set_workspace_color(wid(&b, 1), Some("#3987e4".into()))).unwrap();
         assert_eq!(now(b.get_layout()).unwrap().workspaces[1].color.as_deref(), Some("#3987e4"));
         while rx.try_recv().is_ok() {}
-        now(b.set_workspace_color(1, Some("#3987E4".into()))).unwrap();
+        now(b.set_workspace_color(wid(&b, 1), Some("#3987E4".into()))).unwrap();
         assert!(rx.try_recv().is_err());
-        now(b.set_workspace_color(1, None)).unwrap();
+        now(b.set_workspace_color(wid(&b, 1), None)).unwrap();
         assert_eq!(now(b.get_layout()).unwrap().workspaces[1].color, None);
 
         // Delete: its panes close (one PaneClosed each, before the layout), the active
@@ -1062,7 +1074,7 @@ mod tests {
         while rx.try_recv().is_ok() {}
         let doomed: Vec<PaneId> = now(b.get_layout()).unwrap().workspaces[1].tabs.iter().map(|t| t.pane_tree.first_leaf()).collect();
         now(b.set_active_workspace(2)).unwrap();
-        now(b.delete_workspace(1)).unwrap();
+        now(b.delete_workspace(wid(&b, 1))).unwrap();
         let l = now(b.get_layout()).unwrap();
         assert_eq!(l.workspaces.len(), 2);
         assert_eq!(l.active_workspace, 1, "the active workspace moved up one place with the list");
@@ -1074,6 +1086,41 @@ mod tests {
         assert!(matches!(evs.last(), Some(BackendEvent::LayoutChanged(_))));
         // The first workspace still has its own tabs.
         assert!(l.find_tab(t0.tab_id).is_some());
+        b.shutdown_all();
+    }
+
+    #[test]
+    fn a_workspace_that_moved_is_still_the_one_acted_on() {
+        let b = backend();
+        now(b.new_tab(NewTab { workspace_idx: 0, rows: 24, cols: 80, ..Default::default() })).unwrap();
+        let w1 = now(b.create_workspace(Some("one".into()), 24, 80)).unwrap();
+        let w2 = now(b.create_workspace(Some("two".into()), 24, 80)).unwrap();
+        let first = now(b.get_layout()).unwrap().workspaces[0].id;
+        // Another client puts "two" first. A delete that was aimed at position 2 of the old
+        // order (the id of "two") still removes "two", not whatever sits at 2 now.
+        now(b.move_workspace(w2.workspace_id, first)).unwrap();
+        now(b.delete_workspace(w2.workspace_id)).unwrap();
+        let l = now(b.get_layout()).unwrap();
+        assert!(l.workspaces.iter().all(|w| w.id != w2.workspace_id));
+        assert_eq!(l.workspaces.len(), 2);
+        // The same id again: an error, and nothing else goes.
+        assert!(now(b.delete_workspace(w2.workspace_id)).is_err());
+        assert!(now(b.set_workspace_color(w2.workspace_id, Some("#112233".into()))).is_err());
+        assert!(now(b.duplicate_workspace(w2.workspace_id, None, 24, 80)).is_err());
+        assert_eq!(now(b.get_layout()).unwrap().workspaces.len(), 2);
+        let _ = w1;
+        b.shutdown_all();
+    }
+
+    #[test]
+    fn split_before_puts_the_new_pane_first() {
+        let b = backend();
+        assert!(b.supports_split_before());
+        let t = now(b.new_tab(NewTab { workspace_idx: 0, rows: 24, cols: 80, ..Default::default() })).unwrap();
+        let left = now(b.split_pane(SplitPane { pane_id: t.pane_id, direction: SplitDir::Horizontal, rows: 24, cols: 40, cwd: None, before: true })).unwrap();
+        let right = now(b.split_pane(SplitPane { pane_id: t.pane_id, direction: SplitDir::Horizontal, rows: 24, cols: 40, cwd: None, before: false })).unwrap();
+        let l = now(b.get_layout()).unwrap();
+        assert_eq!(l.workspaces[0].tabs[0].pane_tree.leaves(), vec![left, t.pane_id, right]);
         b.shutdown_all();
     }
 

@@ -214,19 +214,23 @@ impl PaneTree {
 
     /// Replace leaf `target` by a split holding `target` and `new_pane`.
     pub fn split_leaf(&mut self, target: PaneId, dir: SplitDir, new_pane: PaneId) -> bool {
+        self.split_leaf_placed(target, dir, new_pane, false)
+    }
+
+    /// Like `split_leaf`. With `before` the new pane is the first child: left of a horizontal
+    /// split, above a vertical one.
+    pub fn split_leaf_placed(&mut self, target: PaneId, dir: SplitDir, new_pane: PaneId, before: bool) -> bool {
         match self {
             PaneTree::Leaf { pane_id } if *pane_id == target => {
-                *self = PaneTree::Split {
-                    direction: dir,
-                    ratio: 0.5,
-                    first: Box::new(PaneTree::leaf(target)),
-                    second: Box::new(PaneTree::leaf(new_pane)),
-                };
+                let (old, new) = (Box::new(PaneTree::leaf(target)), Box::new(PaneTree::leaf(new_pane)));
+                let (first, second) = if before { (new, old) } else { (old, new) };
+                *self = PaneTree::Split { direction: dir, ratio: 0.5, first, second };
                 true
             }
             PaneTree::Leaf { .. } => false,
             PaneTree::Split { first, second, .. } => {
-                first.split_leaf(target, dir, new_pane) || second.split_leaf(target, dir, new_pane)
+                first.split_leaf_placed(target, dir, new_pane, before)
+                    || second.split_leaf_placed(target, dir, new_pane, before)
             }
         }
     }
@@ -496,6 +500,17 @@ mod tests {
 
     fn p() -> PaneId {
         PaneId::new()
+    }
+
+    #[test]
+    fn split_before_puts_the_new_pane_first() {
+        let (a, b, c) = (PaneId::new(), PaneId::new(), PaneId::new());
+        let mut t = PaneTree::leaf(a);
+        assert!(t.split_leaf_placed(a, SplitDir::Horizontal, b, true));
+        assert_eq!(t.leaves(), vec![b, a]);
+        assert!(t.split_leaf(a, SplitDir::Vertical, c));
+        assert_eq!(t.leaves(), vec![b, a, c]);
+        assert!(!t.split_leaf_placed(PaneId::new(), SplitDir::Vertical, PaneId::new(), true));
     }
 
     #[test]

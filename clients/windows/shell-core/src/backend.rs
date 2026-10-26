@@ -224,6 +224,10 @@ pub struct SplitPane {
     pub cols: u16,
     /// Defaults to the source pane's cwd.
     pub cwd: Option<String>,
+    /// The new pane goes left of (horizontal) or above (vertical) the source pane. Only when
+    /// `SessionBackend::supports_split_before` is true: a backend that cannot place it refuses
+    /// instead of splitting on the other side.
+    pub before: bool,
 }
 
 /// `pane_id` is the leftmost leaf of the split's first child, as in
@@ -356,26 +360,31 @@ pub trait SessionBackend: Send + Sync {
     fn set_active_workspace(&self, workspace_idx: usize) -> BackendFuture<()>;
     fn rename_workspace(&self, workspace_idx: usize, name: String) -> BackendFuture<()>;
     /// Delete a workspace and close its panes. The last workspace cannot be deleted.
-    fn delete_workspace(&self, workspace_idx: usize) -> BackendFuture<()>;
+    fn delete_workspace(&self, workspace_id: Uuid) -> BackendFuture<()>;
     /// Copy a workspace with fresh shells: one new tab per source tab, in the directory of the
     /// source tab's first pane. Splits and running programs are not copied. The copy is named
     /// `new_name`, else "<source> (copy)", has no color and sits right after the source.
     /// `rows` and `cols` size the new panes (a server uses its own default).
     fn duplicate_workspace(
         &self,
-        source_idx: usize,
+        source_id: Uuid,
         new_name: Option<String>,
         rows: u16,
         cols: u16,
     ) -> BackendFuture<DuplicatedWorkspace>;
     /// Swap the positions of two workspaces (the server's `move_workspace`). The active
     /// workspace stays the same workspace.
-    fn move_workspace(&self, from_idx: usize, to_idx: usize) -> BackendFuture<()>;
+    fn move_workspace(&self, from_id: Uuid, to_id: Uuid) -> BackendFuture<()>;
     /// Set or clear (`None`) a workspace's accent color. Only `#rrggbb` is accepted.
-    fn set_workspace_color(&self, workspace_idx: usize, color: Option<String>) -> BackendFuture<()>;
+    fn set_workspace_color(&self, workspace_id: Uuid, color: Option<String>) -> BackendFuture<()>;
     /// Name a workspace, tab or pane (`set_label`, PROTOCOL_V2 section 13).
     fn set_label(&self, target: LabelTarget, id: Uuid, label: String) -> BackendFuture<()>;
     fn split_pane(&self, req: SplitPane) -> BackendFuture<PaneId>;
+    /// This backend can put a split on the left or above (`SplitPane::before`). A server from
+    /// before the `split_before` capability cannot, and the shell then does not offer it.
+    fn supports_split_before(&self) -> bool {
+        false
+    }
     fn close_pane(&self, pane_id: PaneId) -> BackendFuture<()>;
     fn set_active_pane(&self, tab_id: Uuid, pane_id: Option<PaneId>) -> BackendFuture<()>;
     fn resize_pane(&self, pane_id: PaneId, rows: u16, cols: u16) -> BackendFuture<()>;

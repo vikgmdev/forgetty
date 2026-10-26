@@ -36,6 +36,11 @@ struct Rig {
 }
 
 async fn rig(panes: u128) -> Rig {
+    rig_caps(panes, &[]).await
+}
+
+/// `extra` adds capabilities (the rig's default server is an older one without the WP2b ones).
+async fn rig_caps(panes: u128, extra: &[&str]) -> Rig {
     let server = TestServer::start(TestServerConfig {
         pair_secret: Some(SECRET.into()),
         capabilities: vec![
@@ -43,7 +48,10 @@ async fn rig(panes: u128) -> Rig {
             forgetty_client::proto::cap::LAYOUT_EVENTS.to_string(),
             forgetty_client::proto::cap::SIZE_POLICY_LATEST.to_string(),
             forgetty_client::proto::cap::SNAPSHOT_CATCHUP.to_string(),
-        ],
+        ]
+        .into_iter()
+        .chain(extra.iter().map(|c| c.to_string()))
+        .collect(),
         panes: (1..=panes).map(|n| (pane(n), format!("hello {n}\r\n$ ").into_bytes())).collect(),
         ..Default::default()
     })
@@ -133,7 +141,7 @@ async fn tabs_splits_and_events() {
     assert!(l.find_tab(t.tab_id).is_some());
 
     let p2 = b
-        .split_pane(SplitPane { pane_id: t.pane_id, direction: SplitDir::Vertical, rows: 12, cols: 80, cwd: None })
+        .split_pane(SplitPane { pane_id: t.pane_id, direction: SplitDir::Vertical, rows: 12, cols: 80, cwd: None, before: false })
         .await
         .unwrap();
     let l = b.get_layout().await.unwrap();
@@ -233,7 +241,7 @@ async fn focus_active_pane_ratios_and_labels_reach_the_server() {
 
     // set_active_pane: split tab 0, focus the new pane.
     let p3 = b
-        .split_pane(SplitPane { pane_id: PaneId(pane(1)), direction: SplitDir::Horizontal, rows: 24, cols: 40, cwd: None })
+        .split_pane(SplitPane { pane_id: PaneId(pane(1)), direction: SplitDir::Horizontal, rows: 24, cols: 40, cwd: None, before: false })
         .await
         .unwrap();
     let l = b.get_layout().await.unwrap();
@@ -342,22 +350,26 @@ async fn reconnect_after_a_restart_is_quick() {
     }
 }
 
+async fn ws_id(b: &RemoteBackend, i: usize) -> Uuid {
+    b.get_layout().await.unwrap().workspaces[i].id
+}
+
 /// WP2: the workspace methods go over the wire with the server's names and shapes, and the
-/// answers come back as layout events.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn workspace_ops_over_the_wire() {
-    let r = rig(1).await;
+/// answers come back as layout events. Run against a server with and without `workspace_id`.
+async fn workspace_ops(r: Rig) {
     let b = &r.backend;
     until("connected", || b.connection().is_connected()).await;
     let t = b.new_tab(NewTab { workspace_idx: 0, rows: 24, cols: 80, ..Default::default() }).await.unwrap();
     let n_tabs = b.get_layout().await.unwrap().workspaces[0].tabs.len();
     assert_eq!(n_tabs, 2);
+    let w0 = ws_id(b, 0).await;
+    let gone = Uuid::new_v4();
 
     // The last workspace cannot go.
-    assert!(b.delete_workspace(0).await.is_err());
+    assert!(b.delete_workspace(w0).await.is_err());
 
     // A copy: one new tab (and pane) per tab, after the source, named "<source> (copy)".
-    let d = b.duplicate_workspace(0, None, 24, 80).await.unwrap();
+    let d = b.duplicate_workspace(w0, None, 24, 80).await.unwrap();
     assert_eq!((d.workspace_idx, d.tabs.len()), (1, n_tabs));
     let l = b.get_layout().await.unwrap();
     assert_eq!(l.workspaces.len(), 2);
@@ -366,35 +378,38 @@ async fn workspace_ops_over_the_wire() {
     assert_eq!(l.workspaces[1].tabs.iter().map(|t| t.id).collect::<Vec<_>>(), d.tabs.iter().map(|t| t.0).collect::<Vec<_>>());
     assert_eq!(l.workspaces[1].tabs[0].pane_tree.first_leaf(), d.tabs[0].1);
     assert!(l.find_tab(t.tab_id).is_some_and(|(w, _)| w == 0));
-    let named = b.duplicate_workspace(1, Some("mine".into()), 24, 80).await.unwrap();
+    let named = b.duplicate_workspace(d.workspace_id, Some("mine".into()), 24, 80).await.unwrap();
     assert_eq!(b.get_layout().await.unwrap().workspaces[2].name, "mine");
     assert_eq!(named.workspace_idx, 2);
-    assert!(b.duplicate_workspace(9, None, 24, 80).await.is_err());
+    assert!(b.duplicate_workspace(gone, None, 24, 80).await.is_err());
 
     // Color: #rrggbb goes out, anything else is refused before it is sent, null clears it.
-    b.set_workspace_color(1, Some("#3987E4".into())).await.unwrap();
+    b.set_workspace_color(d.workspace_id, Some("#3987E4".into())).await.unwrap();
     assert_eq!(b.get_layout().await.unwrap().workspaces[1].color.as_deref(), Some("#3987e4"));
-    assert!(b.set_workspace_color(1, Some("blue".into())).await.is_err());
-    assert!(b.set_workspace_color(9, None).await.is_err());
-    b.set_workspace_color(1, None).await.unwrap();
+    assert!(b.set_workspace_color(d.workspace_id, Some("blue".into())).await.is_err());
+    assert!(b.set_workspace_color(gone, None).await.is_err());
+    b.set_workspace_color(d.workspace_id, None).await.unwrap();
     assert_eq!(b.get_layout().await.unwrap().workspaces[1].color, None);
 
     // Move swaps two workspaces; the active workspace follows its workspace.
     b.set_active_workspace(2).await.unwrap();
-    b.move_workspace(2, 0).await.unwrap();
+    b.move_workspace(named.workspace_id, w0).await.unwrap();
     let l = b.get_layout().await.unwrap();
     assert_eq!(l.workspaces.iter().map(|w| w.name.as_str()).collect::<Vec<_>>(), ["mine", "Default (copy)", "Default"]);
     assert_eq!(l.active_workspace, 0);
-    assert!(b.move_workspace(0, 9).await.is_err());
+    assert!(b.move_workspace(w0, gone).await.is_err());
 
     // Delete closes the workspace's panes: the server sends PaneClosed for each.
     let events = b.subscribe();
     let doomed: Vec<_> = l.workspaces[1].tabs.iter().map(|t| t.pane_tree.first_leaf()).collect();
-    b.delete_workspace(1).await.unwrap();
+    b.delete_workspace(d.workspace_id).await.unwrap();
     let l = b.get_layout().await.unwrap();
     assert_eq!(l.workspaces.len(), 2);
     assert_eq!(l.workspaces[1].name, "Default");
     assert_eq!(l.active_workspace, 0);
+    // The same id again is an error, and the others stay.
+    assert!(b.delete_workspace(d.workspace_id).await.is_err());
+    assert_eq!(b.get_layout().await.unwrap().workspaces.len(), 2);
     let mut closed = Vec::new();
     until("pane closed events", || {
         while let Ok(e) = events.try_recv() {
@@ -405,6 +420,45 @@ async fn workspace_ops_over_the_wire() {
         doomed.iter().all(|p| closed.contains(p))
     })
     .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workspace_ops_over_the_wire_with_ids() {
+    use forgetty_client::proto::cap;
+    workspace_ops(rig_caps(1, &[cap::WORKSPACE_ID, cap::SPLIT_BEFORE]).await).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workspace_ops_over_the_wire_against_an_older_server() {
+    workspace_ops(rig(1).await).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_moved_workspace_is_still_the_one_acted_on_with_ids() {
+    use forgetty_client::proto::cap;
+    a_moved_workspace_is_still_the_one_acted_on(rig_caps(1, &[cap::WORKSPACE_ID]).await).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_moved_workspace_is_still_the_one_acted_on_against_an_older_server() {
+    a_moved_workspace_is_still_the_one_acted_on(rig(1).await).await;
+}
+
+/// The stale-index case: another client moved a workspace while this request was on its way.
+/// The request names the id, so it still acts on the workspace the user chose.
+async fn a_moved_workspace_is_still_the_one_acted_on(r: Rig) {
+    let b = &r.backend;
+    until("connected", || b.connection().is_connected()).await;
+    let w0 = ws_id(b, 0).await;
+    let a = b.duplicate_workspace(w0, Some("a".into()), 24, 80).await.unwrap();
+    let c = b.duplicate_workspace(a.workspace_id, Some("c".into()), 24, 80).await.unwrap();
+    // Order: Default, a, c. The user picked "c" (position 2) ...
+    // ... and meanwhile another client swaps Default and c.
+    b.move_workspace(w0, c.workspace_id).await.unwrap();
+    // Now position 2 is "Default". Deleting "c" by id removes "c" and keeps "Default".
+    b.delete_workspace(c.workspace_id).await.unwrap();
+    let names: Vec<_> = b.get_layout().await.unwrap().workspaces.into_iter().map(|w| w.name).collect();
+    assert_eq!(names, ["a", "Default"]);
 }
 
 /// "Duplicate tab" over the wire: the new tab starts where the source pane runs.
@@ -437,4 +491,31 @@ async fn duplicate_tab_sends_the_spawn_directory_never_the_display_one() {
     b.new_tab(NewTab { workspace_idx: 0, rows: 24, cols: 80, cwd: Some("/x".into()), inherit_cwd_from: Some(src), ..Default::default() }).await.unwrap();
     assert_eq!(r.server.new_tab_cwds().last().cloned().flatten().as_deref(), Some("/x"));
     let _ = t2;
+}
+
+/// Split left/up goes out only to a server that reports `split_before`. An older one would
+/// split on the wrong side without saying so, so the backend refuses before sending.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn split_before_needs_the_capability() {
+    use forgetty_client::proto::cap;
+    let req = |p: PaneId, before| SplitPane { pane_id: p, direction: SplitDir::Horizontal, rows: 24, cols: 40, cwd: None, before };
+
+    let r = rig(1).await;
+    let b = &r.backend;
+    until("connected", || b.connection().is_connected()).await;
+    assert!(!b.supports_split_before());
+    assert!(b.split_pane(req(PaneId(pane(1)), true)).await.is_err());
+    // Nothing was split by the refused call.
+    assert_eq!(b.get_layout().await.unwrap().workspaces[0].tabs[0].pane_tree.leaves().len(), 1);
+    // Right and down still work.
+    b.split_pane(req(PaneId(pane(1)), false)).await.unwrap();
+    drop(r);
+
+    let r = rig_caps(1, &[cap::SPLIT_BEFORE]).await;
+    let b = &r.backend;
+    until("connected", || b.connection().is_connected()).await;
+    until("capability", || b.supports_split_before()).await;
+    let left = b.split_pane(req(PaneId(pane(1)), true)).await.unwrap();
+    let l = b.get_layout().await.unwrap();
+    assert_eq!(l.workspaces[0].tabs[0].pane_tree.leaves(), vec![left, PaneId(pane(1))]);
 }
