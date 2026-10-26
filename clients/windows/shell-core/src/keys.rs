@@ -80,6 +80,10 @@ pub enum Action {
     GotoWorkspace(u8),
     /// End the app (GTK's Ctrl+Shift+Q). Asks first while a local shell is open.
     Quit,
+    /// The Settings window (GTK's Ctrl+.).
+    OpenSettings,
+    /// The shortcuts window (GTK's F1).
+    ShowShortcuts,
     /// Paste (GTK's Ctrl+V). Ctrl+Shift+V pastes in both sets and is not an action.
     PasteCtrlV,
     /// Copy while a selection is on screen, else the key goes to the program as the interrupt
@@ -234,6 +238,10 @@ pub const ACTIONS: &[ActionInfo] = &[
     // GTK: Ctrl+, opens the Appearance sidebar (theme and font).
     differ!(Action::ChooseTheme, "choose_theme", "Choose theme...", gtk ["ctrl+,"], windows []),
     differ!(Action::Quit, "quit", "Quit", gtk ["ctrl+shift+q"], windows []),
+    // GTK: win.open-settings is Ctrl+. and win.show-shortcuts is F1 (it also has Ctrl+Shift+P
+    // there, which stays the command palette here). F1 is not a key a shell needs.
+    differ!(Action::OpenSettings, "open_settings", "Settings...", gtk ["ctrl+."], windows []),
+    info!(Action::ShowShortcuts, "show_shortcuts", "Keyboard shortcuts", ["f1"]),
     differ!(Action::PasteCtrlV, "paste_ctrl_v", "Paste (Ctrl+V)", gtk ["ctrl+v"], windows []),
     differ!(Action::CopyOrInterrupt, "copy_or_interrupt", "Copy, else interrupt (Ctrl+C)", gtk ["ctrl+c"], windows []),
     differ!(Action::GotoWorkspace(1), "goto_workspace_1", "Go to workspace 1", gtk ["alt+1"], windows []),

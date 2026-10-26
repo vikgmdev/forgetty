@@ -30,8 +30,10 @@ pub mod scrollbar;
 pub mod search;
 pub mod settings;
 pub mod settings_file;
+pub mod shortcuts;
 pub mod selection;
 pub mod source;
+pub mod textarea;
 
 pub use backend::*;
 pub use forgetty_core::PaneId;
