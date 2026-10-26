@@ -20,6 +20,19 @@ pub enum TerminalEvent {
     ModeChanged,
 }
 
+/// One row of the whole screen (history and active area) as plain text. Filled by
+/// [`Terminal::row_text`]; reuse one value for many rows.
+#[derive(Debug, Clone, Default)]
+pub struct RowText {
+    /// The grapheme of every cell, a space for an empty cell. The tail half of a wide glyph adds
+    /// nothing.
+    pub text: String,
+    /// The column of each char of `text`, then one more entry: the width of the row in columns.
+    pub cols: Vec<u16>,
+    /// The row continues on the next row (soft wrap).
+    pub wrapped: bool,
+}
+
 /// Per-terminal userdata carried through C callbacks.
 struct CallbackState {
     events: Vec<TerminalEvent>,
@@ -591,6 +604,83 @@ impl Terminal {
             );
         }
         (sb.total, sb.offset, sb.len)
+    }
+
+    /// Read row `abs_row` of the whole screen (0 is the oldest row of the scrollback, the same
+    /// numbering as `scrollbar_state().1`) without moving the viewport. Returns false when the
+    /// row does not exist. Cost is a few FFI calls per cell: callers that read many rows must
+    /// spread the work over time.
+    pub fn row_text(&self, abs_row: usize, out: &mut RowText) -> bool {
+        out.text.clear();
+        out.cols.clear();
+        out.wrapped = false;
+        let mut r = ffi::GhosttyGridRef::init_sized();
+        let pt = ffi::GhosttyPoint {
+            tag: ffi::GHOSTTY_POINT_TAG_SCREEN,
+            value: ffi::GhosttyPointValue {
+                coordinate: ffi::GhosttyPointCoordinate { x: 0, y: abs_row.min(u32::MAX as usize) as u32 },
+            },
+        };
+        if unsafe { ffi::ghostty_terminal_grid_ref(self.handle, pt, &mut r) } != ffi::GHOSTTY_SUCCESS {
+            return false;
+        }
+        let mut row: ffi::GhosttyRow = 0;
+        if unsafe { ffi::ghostty_grid_ref_row(&r, &mut row) } == ffi::GHOSTTY_SUCCESS {
+            let mut wrap = false;
+            unsafe { ffi::ghostty_row_get(row, ffi::GHOSTTY_ROW_DATA_WRAP, &mut wrap as *mut bool as *mut c_void) };
+            out.wrapped = wrap;
+        }
+        let mut cps = [0u32; 16];
+        for x in 0..self.cols {
+            // The ref names a row of one page; moving `x` stays in that row.
+            r.x = x as u16;
+            let mut cell: ffi::GhosttyCell = 0;
+            if unsafe { ffi::ghostty_grid_ref_cell(&r, &mut cell) } != ffi::GHOSTTY_SUCCESS {
+                out.text.push(' ');
+                out.cols.push(x as u16);
+                continue;
+            }
+            let mut has_text = false;
+            unsafe { ffi::ghostty_cell_get(cell, ffi::GHOSTTY_CELL_DATA_HAS_TEXT, &mut has_text as *mut bool as *mut c_void) };
+            if !has_text {
+                let mut wide: i32 = 0;
+                unsafe { ffi::ghostty_cell_get(cell, ffi::GHOSTTY_CELL_DATA_WIDE, &mut wide as *mut i32 as *mut c_void) };
+                if wide >= ffi::GHOSTTY_CELL_WIDE_SPACER_TAIL {
+                    continue;
+                }
+                out.text.push(' ');
+                out.cols.push(x as u16);
+                continue;
+            }
+            let mut tag: i32 = 0;
+            unsafe { ffi::ghostty_cell_get(cell, ffi::GHOSTTY_CELL_DATA_CONTENT_TAG, &mut tag as *mut i32 as *mut c_void) };
+            let before = out.text.len();
+            if tag == ffi::GHOSTTY_CELL_CONTENT_CODEPOINT {
+                let mut cp: u32 = 0;
+                unsafe { ffi::ghostty_cell_get(cell, ffi::GHOSTTY_CELL_DATA_CODEPOINT, &mut cp as *mut u32 as *mut c_void) };
+                if let Some(ch) = char::from_u32(cp) {
+                    out.text.push(ch);
+                    out.cols.push(x as u16);
+                }
+            } else {
+                let mut n = 0usize;
+                let rc = unsafe { ffi::ghostty_grid_ref_graphemes(&r, cps.as_mut_ptr(), cps.len(), &mut n) };
+                if rc == ffi::GHOSTTY_SUCCESS {
+                    for &cp in &cps[..n.min(cps.len())] {
+                        if let Some(ch) = char::from_u32(cp) {
+                            out.text.push(ch);
+                            out.cols.push(x as u16);
+                        }
+                    }
+                }
+            }
+            if out.text.len() == before {
+                out.text.push(' ');
+                out.cols.push(x as u16);
+            }
+        }
+        out.cols.push(self.cols as u16);
+        true
     }
 
     /// Total lines: scrollback + visible rows.

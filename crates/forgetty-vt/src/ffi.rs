@@ -185,6 +185,9 @@ pub const GHOSTTY_CELL_DATA_CONTENT_TAG: i32 = 2;
 pub const GHOSTTY_CELL_DATA_WIDE: i32 = 3;
 pub const GHOSTTY_CELL_DATA_HAS_TEXT: i32 = 4;
 
+// Row data types (ghostty_row_get)
+pub const GHOSTTY_ROW_DATA_WRAP: i32 = 1;
+
 // Cell content tags
 pub const GHOSTTY_CELL_CONTENT_CODEPOINT: i32 = 0;
 pub const GHOSTTY_CELL_CONTENT_CODEPOINT_GRAPHEME: i32 = 1;
@@ -806,6 +809,8 @@ extern "C" {
         grid_ref: *const GhosttyGridRef,
         out_style: *mut GhosttyStyle,
     ) -> GhosttyResult;
+
+    pub fn ghostty_grid_ref_row(grid_ref: *const GhosttyGridRef, out_row: *mut GhosttyRow) -> GhosttyResult;
 
     pub fn ghostty_grid_ref_graphemes(
         grid_ref: *const GhosttyGridRef,
