@@ -275,6 +275,17 @@ impl ShellSmoke {
                 if !up {
                     return;
                 }
+                // The address cache is written by a background thread after the first
+                // connect, so give it a few seconds before judging the store files.
+                let store_ready = shell.remote.as_ref().is_some_and(|r| {
+                    let st = &r.store;
+                    [st.identity_path(), st.client_id_path(), st.machines_path(), st.addr_cache_path()]
+                        .iter()
+                        .all(|f| f.exists())
+                });
+                if !store_ready && self.w3.t_start.is_some_and(|t| t.elapsed() < Duration::from_secs(10)) {
+                    return;
+                }
                 record("pair_to_panes_ms", json!(ms(self.w3.t_start.map(|t| t.elapsed()).unwrap_or_default())));
                 let names: Vec<String> = shell.machines.iter().map(|m| m.name.clone()).collect();
                 check("sidebar_lists_machines", names.len() == 2 && names[1] == "ci-remote" && shell.machines[0].kind == MachineKind::Local);

@@ -120,29 +120,29 @@ Verdict: local shells on Windows do not survive closing the app. Everything the 
 | ID | GTK feature (cite) | Windows | Windows evidence / what is missing | Size | Flags |
 |---|---|---|---|---|---|
 | F1 | Drag select (deferred origin), double-click word, triple-click line (`term.rs:840-925`, `term.rs:2013-2075`) | PRESENT | `view.rs:967-1010`, `view.rs:1101` | - | - |
-| F2 | Auto-scroll while dragging past the top/bottom edge (`term.rs:992-1001`) | MISSING | `on_mouse_move` does not scroll (`view.rs:1009-1038`). | S | - |
-| F3 | Shift+click extends selection (`term.rs:864-872`) | MISSING | - | S | - |
-| F4 | Select All (context menu, `app.rs:6227`) | MISSING | - | S | - |
+| F2 | Auto-scroll while dragging past the top/bottom edge (`term.rs:992-1001`) | PRESENT | Window-level mouse listener scrolls and extends while the pointer is held outside the pane (`view.rs` `autoscroll_tick`); smoke `drag_past_top_scrolls_and_extends`. | S | WP1 done
+| F3 | Shift+click extends selection (`term.rs:864-872`) | PRESENT | `on_mouse_down` extends from the anchor; smoke `shift_click_extends_selection`. | S | WP1 done
+| F4 | Select All (context menu, `app.rs:6227`) | PRESENT | Ctrl+Shift+A and palette action `SelectAll`; context-menu entry waits for WP2. | S | WP1 done
 | F5 | Copy via Ctrl+Shift+C (`app.rs:1448-1463`, `app.rs:5186-5372`) | PRESENT | `view.rs:927`, `view.rs:690` | - | - |
-| F6 | Smart copy: strip box-drawing U+2500-257F, trailing spaces, CRLF; soft-wrap join with heuristic (`clipboard.rs:1-27`, `app.rs:5290-5360`) | PARTIAL | Trims trailing spaces on unwrapped rows and joins wrapped rows (`view.rs:1147-1190`). No box-drawing strip, no shell-wrap heuristic. | S | - |
-| F7 | Paste warning: size over `paste_warn_size`, newlines, preview dialog, config keys (`app.rs:5950-6125`, `schema.rs` `paste_warn_*`) | PARTIAL | Windows is stricter on content (bracketed paste, strips ESC/C1/C0, confirm overlay with preview: `view.rs:775-800`, `view.rs:897-925`) but has no size threshold and no config keys. | S | - |
+| F6 | Smart copy: strip box-drawing U+2500-257F, trailing spaces, CRLF; soft-wrap join with heuristic (`clipboard.rs:1-27`, `app.rs:5290-5360`) | PRESENT | Box-drawing strip, trailing-space trim, soft-wrap join over absolute rows (`shell-core/src/copytext.rs`); `CopyRaw` action and `smart_copy` key. No shell-wrap heuristic beyond GTK rules. | S | WP1 done
+| F7 | Paste warning: size over `paste_warn_size`, newlines, preview dialog, config keys (`app.rs:5950-6125`, `schema.rs` `paste_warn_*`) | PRESENT | Adds `paste_warn_size` (default 5120, 0 disables) with the size in the overlay. Windows stays stricter than GTK (bracketed paste, control strip, always confirm). | S | WP1 done
 | F8 | Paste an image: saves PNG to cache dir and pastes the path (`app.rs:6128-6165`) | MISSING | `view.rs:766` reads text only. For a REMOTE pane the Windows path means nothing on the Linux server. | M | ARCH for remote panes (needs upload or skip) |
-| F9 | Code block detection (box-drawing borders and uniform-background regions) with hover highlight and copy button (`code_block.rs:1-575`, `term.rs:819-857`, `term.rs:1096-1130`, `term.rs:2845-2970`) | MISSING | - | M | - |
+| F9 | Code block detection (box-drawing borders and uniform-background regions) with hover highlight and copy button (`code_block.rs:1-575`, `term.rs:819-857`, `term.rs:1096-1130`, `term.rs:2845-2970`) | PRESENT | Border-box detection in `shell-core/src/codeblock.rs`, hover wash and copy button (`element.rs` `paint_code_block`). Uniform-background regions are not detected (see deviations). | M | WP1 done
 | F10 | Selection color from theme, overlay with alpha (`term.rs:2714-2785`) | PRESENT | `theme.selection` (`config.rs:36`, `element.rs`) | - | - |
 
 ## 8. Links, search, scrollback, terminal commands
 
 | ID | GTK feature (cite) | Windows | Windows evidence / what is missing | Size | Flags |
 |---|---|---|---|---|---|
-| G1 | http/https URL detection on hover: underline and pointer cursor (`term.rs:1729-1805`, `term.rs:1080-1100`, `term.rs:2622`) | MISSING | No URL code (grep for http in `src`: only the update check). | M | - |
-| G2 | Ctrl+click opens URL in browser; context menu "Open <url>" (`term.rs:798-818`, `app.rs:6271`, `term.rs:1639-1685`) | MISSING | Needs a scheme allow-list and `ShellExecute`. | S | depends on G1 |
-| G3 | In-terminal search bar, Ctrl+Shift+F: whole scrollback, case-insensitive, "N of M", Enter/Shift+Enter, Esc, highlights, scroll to match (`term.rs:1340-1440`, `term.rs:1863-1920`, `term.rs:2077-2340`, `term.rs:2787`, `app.rs:1468-1486`) | MISSING | No search code. Scrollback is readable through libghostty (`selection_text` scrolls the viewport), so the data path exists. | M | - |
+| G1 | http/https URL detection on hover: underline and pointer cursor (`term.rs:1729-1805`, `term.rs:1080-1100`, `term.rs:2622`) | PRESENT | `shell-core/src/links.rs` (http/https only, trailing punctuation cut, wrapped URLs whole), underline and hand cursor. | M | WP1 done
+| G2 | Ctrl+click opens URL in browser; context menu "Open <url>" (`term.rs:798-818`, `app.rs:6271`, `term.rs:1639-1685`) | PARTIAL | Ctrl+click opens via ShellExecute after the scheme allow-list. Context-menu "Open <url>" waits for the WP2 context menu. | S | WP1 done, rest in WP2
+| G3 | In-terminal search bar, Ctrl+Shift+F: whole scrollback, case-insensitive, "N of M", Enter/Shift+Enter, Esc, highlights, scroll to match (`term.rs:1340-1440`, `term.rs:1863-1920`, `term.rs:2077-2340`, `term.rs:2787`, `app.rs:1468-1486`) | PRESENT | Ctrl+Shift+F find bar, whole scrollback, case-insensitive, "N of M", Enter/Shift+Enter/Esc, highlights in GTK colors. Time-sliced (4 ms) off the key path (`shell-core/src/search.rs`). | M | WP1 done
 | G4 | Mouse wheel scroll, 3 rows per notch (`input.rs:261-335`) | PRESENT | `view.rs:1061-1100` | - | - |
-| G5 | Scrollbar widget with drag (`term.rs:1224-1340`) | MISSING | No scrollbar drawn (grep `scrollbar` shows only state reads). | S | - |
+| G5 | Scrollbar widget with drag (`term.rs:1224-1340`) | PRESENT | 10 px overlay strip with draggable thumb (`view.rs` `scrollbar_overlay`, `shell-core/src/scrollbar.rs`). | S | WP1 done
 | G6 | Shift+PgUp/PgDn scroll | N/A (GTK lacks it) | Windows has it (`view.rs:709-730`). See section 11. | - | - |
 | G7 | Scroll to bottom on typing; scroll lock while scrolled up (`term.rs:612-690`) | PRESENT | `view.rs:636-650` | - | - |
 | G8 | Scrollback size config `scrollback_lines` (`schema.rs`) | PRESENT | `scrollback_bytes` (libghostty bytes, different unit) and legacy `scrollback` in lines (`config.rs:76-90`) | - | - |
-| G9 | Clear (Ctrl+L to PTY) and Reset (RIS then Ctrl+L), menu only (`app.rs:1806-1838`, `app.rs:6411`) | MISSING | Not in `ACTIONS` (`keys.rs:56-95`). | S | - |
+| G9 | Clear (Ctrl+L to PTY) and Reset (RIS then Ctrl+L), menu only (`app.rs:1806-1838`, `app.rs:6411`) | PRESENT | Palette actions `ClearTerminal` (Ctrl+L) and `ResetTerminal` (RIS then Ctrl+L). | S | WP1 done
 | G10 | Export Text (menu item, greyed out stub; `app.rs:7108`) | N/A (GTK lacks it) | Stub only. Not counted. | - | - |
 
 ## 9. OSC, bell, notifications, cursor
@@ -151,12 +151,12 @@ Verdict: local shells on Windows do not survive closing the app. Everything the 
 |---|---|---|---|---|---|
 | H1 | OSC 0/2 title (`app.rs:5819-5900`) | PRESENT | `osc.rs:99` | - | - |
 | H2 | cwd for new tabs (daemon `spawn_cwd`; OSC 7 display hint) | PRESENT | OSC 7 and OSC 9;9 as display hint, spawn dir tracked separately (`osc.rs:101-110`, `local.rs:37-40`) | - | - |
-| H3 | OSC 9 / 99 / 777 desktop notifications, scanned client side (`osc_notification.rs:36-190`, `term.rs:326-336`) | PARTIAL | Remote panes: server sends `Notification`, toast shown (`machines.rs:285-300`, `notify.rs:47`). Local panes: `OscScanner` handles only 0/2/7/9;9/133 (`osc.rs:98-130`), so a plain OSC 9 or 777 on a local shell is ignored. | S | - |
+| H3 | OSC 9 / 99 / 777 desktop notifications, scanned client side (`osc_notification.rs:36-190`, `term.rs:326-336`) | PRESENT | Local OSC 9, 99 and 777 raise a toast through the existing limiter (1 per pane per 3 s). | S | WP1 done
 | H4 | Notification rate limit 2 s (`term.rs:354-372`) | PRESENT | 1 per pane per 3 s, 10 per 30 s (`notify.rs`) | - | - |
 | H5 | Click the notification to focus the pane (`app.rs:4000-4055`, `app.rs:4083`) | PRESENT | `forgetty:focus?m=&p=` toast arg (`machines.rs:539`) | - | - |
 | H6 | `notification_mode = all / ringonly / none` (`schema.rs`) | MISSING | No key; toasts follow the fixed policy in `notify.rs`. | S | - |
-| H7 | Bell: `bell_mode = visual / audio / both / none`, 150 ms flash overlay, 200 ms rate limit, Ctrl+C suppression (`term.rs:410-460`, `term.rs:2821`) | MISSING | Terminal events are drained and dropped (`view.rs:438`). | S | - |
-| H8 | OSC 12 cursor color honored (`term.rs:2383`) | MISSING | Cursor color is always `cfg.cursor` (`element.rs:141`). | S | - |
+| H7 | Bell: `bell_mode = visual / audio / both / none`, 150 ms flash overlay, 200 ms rate limit, Ctrl+C suppression (`term.rs:410-460`, `term.rs:2821`) | PRESENT | `bell_mode` key, 150 ms flash, 200 ms rate limit, Ctrl+C suppression, `MessageBeep` for audio. | S | WP1 done
+| H8 | OSC 12 cursor color honored (`term.rs:2383`) | PRESENT | Cursor uses the OSC 12 color from libghostty, reset by OSC 112. | S | WP1 done
 | H9 | Cursor shape from DECSCUSR, blink, hidden in unfocused pane (`term.rs:2366-2380`, `term.rs:2647-2712`) | PRESENT | Bar/underline/hollow/block from DECSCUSR, blink timer (`element.rs:92-110`, `view.rs:491`). Windows draws a hollow cursor when unfocused, GTK hides it. | - | - |
 | H10 | `cursor_style` config key and Settings dropdown (`schema.rs`, `sv.rs:847-878`) | MISSING | NOTE: the GTK key is saved but never read by the renderer. `terminal.rs` starts every pane with `CSI 1 SP q` (`term.rs:234`) and only `cursor_visual_style` is used (`term.rs:2368`; grep finds no other `cursor_style` reader). So GTK itself has a dead setting. | S | decide: skip |
 | H11 | Window title from cwd / OSC title (`app.rs:5680`, `app.rs:5876`) | PRESENT | `shell.rs:1178` | - | - |
