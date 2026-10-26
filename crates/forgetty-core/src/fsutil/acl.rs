@@ -126,16 +126,42 @@ mod win {
     }
 
     fn err(e: windows::core::Error) -> io::Error {
-        io::Error::other(e.to_string())
+        // A Win32 error comes as HRESULT 0x8007xxxx: keep the code, so the kind is right.
+        let h = e.code().0 as u32;
+        if h & 0xFFFF_0000 == 0x8007_0000 {
+            io::Error::from_raw_os_error((h & 0xFFFF) as i32)
+        } else {
+            io::Error::other(e.to_string())
+        }
     }
 
     /// Rename `tmp` over `to` and wait until the move is on disk (`MOVEFILE_WRITE_THROUGH`).
+    ///
+    /// Windows refuses the replace with "access denied" or "sharing violation" while another
+    /// thread is replacing the same file or a reader (an indexer, a virus scanner) has it open
+    /// for a moment. Those errors go away within milliseconds, so the call is repeated.
     pub fn replace_file(tmp: &Path, to: &Path) -> io::Result<()> {
         use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH};
-        let (from, to) = (wide(tmp.as_os_str()), wide(to.as_os_str()));
-        // SAFETY: both buffers are NUL-terminated and live for the call.
-        unsafe {
-            MoveFileExW(PCWSTR(from.as_ptr()), PCWSTR(to.as_ptr()), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH).map_err(err)
+        let (from, dest) = (wide(tmp.as_os_str()), wide(to.as_os_str()));
+        let mut tries = 0u32;
+        loop {
+            // SAFETY: both buffers are NUL-terminated and live for the call.
+            let r = unsafe {
+                MoveFileExW(PCWSTR(from.as_ptr()), PCWSTR(dest.as_ptr()), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)
+            };
+            match r {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    let e = err(e);
+                    // 5 = ERROR_ACCESS_DENIED, 32 = ERROR_SHARING_VIOLATION, 33 = ERROR_LOCK_VIOLATION.
+                    let busy = matches!(e.raw_os_error(), Some(5 | 32 | 33));
+                    tries += 1;
+                    if !busy || tries > 200 {
+                        return Err(e);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
         }
     }
 

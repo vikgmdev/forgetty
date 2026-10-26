@@ -443,6 +443,8 @@ mod tests {
         assert!(len < 100, "{} is {len} bytes; sun_path holds 103 on macOS", sock.display());
     }
 
+    // Reads /proc, which Windows does not have.
+    #[cfg(not(windows))]
     #[test]
     fn only_a_root_whose_owner_is_gone_is_removed_as_stale() {
         let tmp = tempfile::tempdir().unwrap();

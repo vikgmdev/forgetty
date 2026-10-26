@@ -71,7 +71,26 @@ pub fn child_alive(pid: u32) -> bool {
             rc == 0 && info.si_pid() == 0
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+        use windows::Win32::System::Threading::{
+            OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
+        };
+        // SAFETY: plain calls; the handle is closed before returning. A process that cannot be
+        // opened is gone (or not ours).
+        unsafe {
+            match OpenProcess(PROCESS_SYNCHRONIZE, false, pid) {
+                Ok(h) => {
+                    let running = WaitForSingleObject(h, 0) == WAIT_TIMEOUT;
+                    let _ = CloseHandle(h);
+                    running
+                }
+                Err(_) => false,
+            }
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
         true

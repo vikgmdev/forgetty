@@ -1261,7 +1261,9 @@ dependencies = [
  "forgetty-core",
  "libc",
  "portable-pty",
+ "tempfile",
  "tracing",
+ "windows 0.61.3",
 ]
 
 [[package]]
@@ -1316,6 +1318,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "windows 0.61.3",
 ]
 
 [[package]]

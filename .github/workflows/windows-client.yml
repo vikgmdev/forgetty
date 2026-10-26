@@ -124,7 +124,7 @@ jobs:
     timeout-minutes: 60
     env:
       CHECK_CRATES: "-p forgetty-core -p forgetty-config -p forgetty-workspace -p forgetty-sync -p forgetty-pty -p forgetty-session"
-      TEST_CRATES: "-p forgetty-core -p forgetty-config -p forgetty-workspace -p forgetty-sync"
+      TEST_CRATES: "-p forgetty-core -p forgetty-config -p forgetty-workspace -p forgetty-sync -p forgetty-pty"
       PENDING_CRATES: "-p forgetty-socket -p forgetty-server"
     steps:
       - uses: actions/checkout@v4
@@ -151,12 +151,12 @@ jobs:
         shell: pwsh
         run: |
           $crates = $env:TEST_CRATES -split ' '
-          cargo test --locked @crates
+          cargo test --locked --no-fail-fast @crates
 
       - name: Tests of crates that are compiled but not gated yet (does not gate)
         continue-on-error: true
         shell: pwsh
-        run: cargo test --locked --no-fail-fast -p forgetty-pty -p forgetty-session
+        run: cargo test --locked --no-fail-fast -p forgetty-session
 
       - name: Check the crates that are not ported yet (does not gate)
         continue-on-error: true

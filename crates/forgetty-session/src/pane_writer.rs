@@ -98,6 +98,8 @@ struct Shared {
     /// write that is blocked on a program that never reads.
     #[cfg(unix)]
     thread: Mutex<Option<libc::pthread_t>>,
+    #[cfg(windows)]
+    thread: Mutex<Option<winthread::ThreadHandle>>,
 }
 
 /// `Shared::write_since_ms` while no write is under way.
@@ -175,7 +177,7 @@ impl Shared {
 impl Shared {
     /// The writer thread is done.
     fn finish(&self) {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             *self.thread.lock().unwrap_or_else(|e| e.into_inner()) = None;
         }
@@ -251,6 +253,73 @@ fn install_wake_handler() {
 #[cfg(unix)]
 const WAKE_SIGNAL: libc::c_int = libc::SIGUSR1;
 
+/// Make a `write` that is blocked in `t` return as interrupted.
+#[cfg(unix)]
+fn wake_thread(t: &libc::pthread_t) {
+    // SAFETY: `t` is the id of the live writer thread (the caller holds the lock that
+    // clears it before the thread returns).
+    unsafe { libc::pthread_kill(*t, WAKE_SIGNAL) };
+}
+
+#[cfg(windows)]
+fn wake_thread(t: &winthread::ThreadHandle) {
+    t.interrupt();
+}
+
+/// The writer thread on Windows: a real handle (the pseudo handle of `GetCurrentThread` means
+/// "the calling thread" for whoever uses it) so another thread can end its blocked `WriteFile`
+/// with `CancelSynchronousIo`. The write then fails with `ERROR_OPERATION_ABORTED`, which the PTY
+/// writer reports as `Interrupted`.
+#[cfg(windows)]
+mod winthread {
+    use windows::Win32::Foundation::{CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE};
+    use windows::Win32::System::IO::CancelSynchronousIo;
+    use windows::Win32::System::Threading::{GetCurrentProcess, GetCurrentThread};
+
+    pub struct ThreadHandle(HANDLE);
+
+    // SAFETY: a kernel handle value; the calls made with it are thread safe.
+    unsafe impl Send for ThreadHandle {}
+
+    impl ThreadHandle {
+        /// A handle to the calling thread, or `None` if Windows refuses to duplicate it.
+        pub fn current() -> Option<Self> {
+            let mut h = HANDLE::default();
+            // SAFETY: the pseudo handles are valid for the calling thread and process.
+            unsafe {
+                DuplicateHandle(
+                    GetCurrentProcess(),
+                    GetCurrentThread(),
+                    GetCurrentProcess(),
+                    &mut h,
+                    0,
+                    false,
+                    DUPLICATE_SAME_ACCESS,
+                )
+            }
+            .ok()
+            .map(|()| Self(h))
+        }
+
+        /// End the synchronous I/O the thread is blocked in, if any.
+        pub fn interrupt(&self) {
+            // SAFETY: `self.0` is a live thread handle. "No I/O to cancel" is an error we ignore.
+            unsafe {
+                let _ = CancelSynchronousIo(self.0);
+            }
+        }
+    }
+
+    impl Drop for ThreadHandle {
+        fn drop(&mut self) {
+            // SAFETY: closed once.
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+}
+
 /// Owner of a pane's writer thread. Dropping it closes the queue and ends the
 /// thread (once the write it may be stuck in returns).
 pub struct PaneWriterOwner {
@@ -277,7 +346,7 @@ impl PaneWriterOwner {
             base: Instant::now(),
             write_since_ms: AtomicU64::new(IDLE),
             progress_ms: AtomicU64::new(0),
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             thread: Mutex::new(None),
         });
         let s = shared.clone();
@@ -288,6 +357,10 @@ impl PaneWriterOwner {
                 // SAFETY: pthread_self has no preconditions.
                 *s.thread.lock().unwrap_or_else(|e| e.into_inner()) =
                     Some(unsafe { libc::pthread_self() });
+            }
+            #[cfg(windows)]
+            {
+                *s.thread.lock().unwrap_or_else(|e| e.into_inner()) = winthread::ThreadHandle::current();
             }
             loop {
                 let job = {
@@ -387,7 +460,7 @@ impl Drop for PaneWriterOwner {
         // itself, and the thread would hold the PTY fd for good. Interrupt it
         // until the thread is gone. A signal that lands just before the write
         // starts is lost, hence the repeats.
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             let shared = self.shared.clone();
             let _ = std::thread::Builder::new().name("pty-writer-kick".into()).spawn(move || {
@@ -395,10 +468,13 @@ impl Drop for PaneWriterOwner {
                     if shared.exited.load(Ordering::SeqCst) {
                         return;
                     }
-                    if let Some(t) = *shared.thread.lock().unwrap_or_else(|e| e.into_inner()) {
-                        // SAFETY: `t` is the id of the live writer thread
-                        // (cleared under this lock before it returns).
-                        unsafe { libc::pthread_kill(t, WAKE_SIGNAL) };
+                    {
+                        let guard = shared.thread.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(t) = guard.as_ref() {
+                            // `t` is the live writer thread (cleared under this lock before
+                            // it returns).
+                            wake_thread(t);
+                        }
                     }
                     std::thread::sleep(Duration::from_millis(50));
                 }
@@ -517,7 +593,7 @@ impl PaneWriter {
         self.shared.progress.notify_all();
         // A write blocked on a program that does not read is woken, so it can
         // see the change and stop.
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             let shared = self.shared.clone();
             let _ = std::thread::Builder::new().name("pty-writer-kick".into()).spawn(move || {
@@ -526,10 +602,13 @@ impl PaneWriter {
                     if shared.exited.load(Ordering::SeqCst) {
                         return;
                     }
-                    if let Some(t) = *shared.thread.lock().unwrap_or_else(|e| e.into_inner()) {
-                        // SAFETY: `t` is the live writer thread (cleared
-                        // under this lock before it returns).
-                        unsafe { libc::pthread_kill(t, WAKE_SIGNAL) };
+                    {
+                        let guard = shared.thread.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(t) = guard.as_ref() {
+                            // `t` is the live writer thread (cleared under this lock before
+                            // it returns).
+                            wake_thread(t);
+                        }
                     }
                 }
             });

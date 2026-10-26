@@ -311,6 +311,16 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
 
     let config: Config = load_server_config(config_path.as_deref())?;
 
+    // Windows: the shell of a pane without a command comes from `shell` in the config, and the
+    // server joins a job that ends its panes' processes with it.
+    #[cfg(windows)]
+    {
+        forgetty_pty::set_default_shell_from_config(config.shell.as_deref());
+        if let Err(e) = forgetty_pty::join_server_job() {
+            warn!("could not join the server job object: {e}");
+        }
+    }
+
     // One check of the remote settings, shared with the settings editor: a
     // setting the server refuses (exit 78) is a setting the editor refuses.
     let remote = validate_remote_settings(
