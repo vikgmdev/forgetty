@@ -1468,7 +1468,7 @@ impl TerminalView {
         }
     }
 
-    fn on_key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn on_key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
         let m = &ks.modifiers;
         if self.pending_paste.is_some() {
@@ -1480,6 +1480,28 @@ impl TerminalView {
             cx.notify();
             cx.stop_propagation();
             return;
+        }
+        // The GTK key set: Ctrl+V pastes, and Ctrl+C copies while there is a selection (else it
+        // is the interrupt, which goes to the program below). The Windows set sends both to the
+        // program, and copies and pastes with Ctrl+Shift+C and Ctrl+Shift+V only.
+        if self.cfg.keymap == forgetty_shell_core::keys::KeymapPreset::Gtk && m.control && !m.shift && !m.alt && !m.platform {
+            match ks.key.as_str() {
+                "v" => {
+                    if self.search.is_some() {
+                        self.search_paste(cx);
+                    } else {
+                        self.paste(cx);
+                    }
+                    cx.stop_propagation();
+                    return;
+                }
+                "c" if self.sel.is_some() && self.search.is_none() => {
+                    self.copy_selection(cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                _ => {}
+            }
         }
         if m.control && m.shift && !m.alt {
             match ks.key.as_str() {

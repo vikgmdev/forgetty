@@ -157,7 +157,7 @@ impl ShellSmoke {
                     return;
                 }
                 self.wp3d_report();
-                self.goto(super::Phase::RSetup);
+                self.goto(super::Phase::Keymap);
             }
         }
     }

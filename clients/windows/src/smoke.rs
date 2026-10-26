@@ -28,6 +28,7 @@ mod remote;
 mod wp1;
 mod wp2;
 mod wp3;
+mod keymap;
 mod wp3d;
 
 pub const KEYSTROKES: usize = 100;
@@ -172,6 +173,8 @@ enum Phase {
     Wp3,
     // WP3d: new tab and split latency.
     Wp3d,
+    // Keymap presets.
+    Keymap,
     // W3: remote machines.
     RSetup,
     RPair,
@@ -228,6 +231,7 @@ impl Phase {
             Phase::Wp2 => "wp2-menus-workspaces-attention",
             Phase::Wp3 => "wp3-config-reload-zoom-profiles",
             Phase::Wp3d => "wp3d-spawn-latency",
+            Phase::Keymap => "keymap-presets",
             Phase::RSetup => "w3-start-server-and-pair",
             Phase::RPair => "w3-wait-for-panes",
             Phase::REcho => "w3-remote-echo",
@@ -302,6 +306,7 @@ pub struct ShellSmoke {
     wp2: wp2::Wp2,
     wp3: wp3::Wp3,
     wp3d: wp3d::Wp3d,
+    keymap: keymap::KeymapPhase,
     real: real::Real,
 }
 
@@ -398,6 +403,7 @@ impl ShellSmoke {
             wp2: wp2::Wp2::default(),
             wp3: wp3::Wp3::default(),
             wp3d: wp3d::Wp3d::default(),
+            keymap: keymap::KeymapPhase::default(),
             real: real::Real::new(real_distro),
         }
     }
@@ -1402,6 +1408,7 @@ impl ShellSmoke {
             Phase::Wp2 => self.wp2(shell, window, cx),
             Phase::Wp3 => self.wp3(shell, window, cx),
             Phase::Wp3d => self.wp3d(shell, window, cx),
+            Phase::Keymap => self.keymap(shell, window, cx),
             Phase::RSetup | Phase::RPair | Phase::REcho | Phase::RKeys | Phase::RKill | Phase::RRestart | Phase::RToast | Phase::RServer | Phase::W5View => {
                 self.w3_step(shell, window, cx, now_t)
             }
@@ -1623,7 +1630,7 @@ fn run_direct_checks() {
     let c2 = Config::from_toml(
         "scrollback_bytes = 2097152\nbackdrop='none'\nsidebar=true\n[theme]\naccent='#ff8800'\n[keybindings]\nnew_tab='ctrl+alt+t'\nsplit_right=['ctrl+shift+d','alt+shift+plus']\nclose_pane='none'\n",
     );
-    let km = c2.as_ref().map(|c| Keymap::new(&c.keybindings)).unwrap_or_default();
+    let km = c2.as_ref().map(|c| Keymap::new(c.keymap, &c.keybindings)).unwrap_or_default();
     let chord = |s: &str| Chord::parse(s).unwrap();
     let ok2 = c2.as_ref().is_ok_and(|c| {
         c.scrollback_bytes == 2 * 1024 * 1024

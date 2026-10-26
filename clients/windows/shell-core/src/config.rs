@@ -28,6 +28,7 @@
 //! paste_warn_newline = true     # ask before a multi-line paste into a program without bracketed paste
 //! smart_copy = true             # copy strips box-drawing characters (false keeps them)
 //! right_click = "menu"           # menu (default, as GTK) | copy_paste (Windows Terminal)
+//! keymap = "gtk"                 # gtk (default, the GTK chords) | windows (this client's own set)
 //! [font]
 //! family = "Cascadia Mono"
 //! size = 11.0            # points
@@ -135,6 +136,8 @@ pub struct Config {
     /// A plain right-click copies a selection or pastes (Windows Terminal). Off by default: a
     /// plain right-click opens the context menu, as in GTK. Shift+right-click opens the menu either way.
     pub right_click_copy_paste: bool,
+    /// Which set of default chords is in force (`keymap`).
+    pub keymap: crate::keys::KeymapPreset,
     /// Action name to chords, from `[keybindings]`. Overrides the defaults.
     pub keybindings: HashMap<String, Vec<String>>,
     /// Named shells for new tabs, in file order.
@@ -177,6 +180,7 @@ impl Default for Config {
             paste_warn_newline: true,
             smart_copy: true,
             right_click_copy_paste: false,
+            keymap: Default::default(),
             keybindings: HashMap::new(),
             profiles: Vec::new(),
             default_profile: None,
@@ -216,6 +220,7 @@ struct FileConfig {
     pane_padding_y: Option<f32>,
     smart_copy: Option<bool>,
     right_click: Option<String>,
+    keymap: Option<String>,
     keybindings: HashMap<String, KeyValue>,
     font: FontSection,
     /// A name (`theme = "Dracula"`) or the colors table.
@@ -257,6 +262,7 @@ const WINDOWS_KEYS: &[&str] = &[
     "pane_padding_y",
     "smart_copy",
     "right_click",
+    "keymap",
     "keybindings",
     "font",
     "theme",
@@ -519,6 +525,9 @@ impl Config {
                 "menu" => false,
                 _ => return Err(format!("right_click: unknown value '{m}' (copy_paste, menu)")),
             };
+        }
+        if let Some(k) = f.keymap.as_deref() {
+            c.keymap = crate::keys::KeymapPreset::parse(k).ok_or_else(|| format!("keymap: unknown value '{k}' (gtk, windows)"))?;
         }
         for (name, v) in f.keybindings {
             let keys = match v {
@@ -814,7 +823,7 @@ pub fn diff(old: &Config, new: &Config) -> Changes {
             || old.ansi != new.ansi,
         bell: old.bell_mode != new.bell_mode,
         notifications: old.notification_mode != new.notification_mode,
-        keybindings: old.keybindings != new.keybindings,
+        keybindings: old.keybindings != new.keybindings || old.keymap != new.keymap,
         profiles: old.profiles != new.profiles || old.default_profile != new.default_profile,
         paste: old.paste_warn_size != new.paste_warn_size || old.paste_warn_newline != new.paste_warn_newline,
         shell: old.shell != new.shell || old.shell_argv != new.shell_argv,
@@ -927,6 +936,26 @@ mod tests {
         let l = p("");
         assert!(l.warnings.is_empty());
         assert_eq!(l.config, Config::default());
+    }
+
+    #[test]
+    fn keymap_picks_the_default_chord_set() {
+        use crate::keys::KeymapPreset;
+        assert_eq!(p("").config.keymap, KeymapPreset::Gtk);
+        let l = p("keymap = \"Windows\"");
+        assert!(l.warnings.is_empty(), "{:?}", l.warnings);
+        assert_eq!(l.config.keymap, KeymapPreset::Windows);
+        assert_eq!(p("keymap = \"gtk\"").config.keymap, KeymapPreset::Gtk);
+        let e = Config::parse("keymap = \"emacs\"").unwrap_err();
+        assert!(e.contains("keymap") && e.contains("emacs"), "{e}");
+        // A typo of the key is suggested.
+        let l = p("keymp = \"gtk\"");
+        assert!(l.warnings.iter().any(|w| w.contains("keymp") && w.contains("keymap")), "{:?}", l.warnings);
+        // A change of set is a change of keys, so a reload applies it and says so.
+        let (a, b) = (p("").config, p("keymap = \"windows\"").config);
+        let d = diff(&a, &b);
+        assert!(d.keybindings && d.any() && d.summary().contains("keys"));
+        assert!(!diff(&a, &a).any());
     }
 
     #[test]

@@ -653,6 +653,11 @@ impl AppShell {
         root
     }
 
+    /// The line at the bottom of the command palette: which set of shortcuts is in force.
+    pub fn palette_footer(&self) -> String {
+        format!("Shortcuts: {} (keymap in config.toml)", self.keymap.preset().label())
+    }
+
     fn render_palette(&self) -> Option<Div> {
         let p = self.palette.as_ref()?;
         let th = self.theme;
@@ -751,6 +756,20 @@ impl AppShell {
             .overflow_hidden()
             .child(input)
             .child(list)
+            .when(p.themes.is_none(), |d| {
+                d.child(
+                    div()
+                        .h(px(24.0))
+                        .px(px(14.0))
+                        .flex()
+                        .items_center()
+                        .border_t_1()
+                        .border_color(alpha(th.border, 1.0))
+                        .text_size(px(11.0))
+                        .text_color(hsla(th.dim))
+                        .child(SharedString::from(self.palette_footer())),
+                )
+            })
             .with_animation(
                 "palette-in",
                 Animation::new(Duration::from_millis(80)).with_easing(ease_out_quint()),

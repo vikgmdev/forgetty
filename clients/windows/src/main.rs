@@ -73,7 +73,10 @@ fn main() {
     };
 
     let startup = if smoke {
-        config::Startup { config: Config::default(), warnings: Vec::new(), error: None }
+        // The early smoke steps press the `windows` chords (close tab Ctrl+Shift+Q, Ctrl+1..9,
+        // Ctrl+Alt+Arrow ...). The keymap phase switches sets through the config file.
+        let config = Config { keymap: forgetty_shell_core::keys::KeymapPreset::Windows, ..Config::default() };
+        config::Startup { config, warnings: Vec::new(), error: None }
     } else {
         config::load()
     };

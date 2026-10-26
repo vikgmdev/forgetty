@@ -134,11 +134,22 @@ Notes and decisions:
 - Scrollback is 10 MiB of libghostty bytes per pane by default (`Terminal::new` too);
   `scrollback_bytes` in `config.toml` changes it.
 
-Default keys (all in `[keybindings]` of `config.toml`, action name = value; `"none"` unbinds):
-Ctrl+Shift+T new tab, Ctrl+Shift+Q close tab, Ctrl+Tab / Ctrl+Shift+Tab cycle, Ctrl+1..9 go to tab,
-Ctrl+Shift+PageUp/Down move tab, Ctrl+Shift+R rename tab (also double-click), Alt+Shift+Plus / Minus split,
-Ctrl+Shift+W close pane, Ctrl+Alt+Arrows focus, Ctrl+Shift+Z zoom, Ctrl+Shift+B sidebar, Ctrl+Shift+P palette,
-Ctrl+Shift+N new workspace. Middle-click closes a tab; tabs and dividers drag.
+Default keys come in two sets, chosen by `keymap` in `config.toml` (a reload switches it live, the palette
+shows the set in force on its bottom line). `keymap = "gtk"` (the default) uses the chords of the GTK app, so
+the same habits work on both: Ctrl+Shift+T new tab, Ctrl+Shift+W close pane, Ctrl+Tab / Ctrl+PageDown next tab,
+Ctrl+Shift+Tab / Ctrl+PageUp previous tab, Ctrl+Shift+PageUp/Down move tab, Alt+Shift+Plus / Minus split,
+Alt+Arrows focus pane, Alt+Shift+Arrows resize pane, Ctrl+Alt+N new workspace, Ctrl+Alt+B sidebar,
+Alt+1..9 workspace N, Ctrl+Alt+PageUp/Down previous / next workspace, Ctrl+Shift+F find, Ctrl+Shift+1..9
+profile N, Ctrl+= / Ctrl+- / Ctrl+0 zoom, Ctrl+, theme list, Ctrl+Shift+Q quit, Ctrl+V and Ctrl+Shift+V paste,
+Ctrl+C copies while text is selected (else it is the interrupt), Ctrl+Shift+C copies. The palette stays on
+Ctrl+Shift+P (GTK opens its shortcuts list there). No chord for: close tab, go to tab N, rename tab, zoom pane,
+select all (GTK has none; use the palette or the menus). `keymap = "windows"` is this client's own set:
+Ctrl+Shift+Q close tab, Ctrl+1..9 go to tab, Ctrl+Shift+R rename tab, Ctrl+Alt+Arrows focus,
+Ctrl+Shift+Z zoom pane, Ctrl+Shift+B sidebar, Ctrl+Shift+N new workspace, Ctrl+Shift+A select all; Ctrl+C and
+Ctrl+V always go to the program; the rest as above. Both sets are overridden entry by entry in `[keybindings]`
+of `config.toml` (action name = value; `"none"` unbinds). Middle-click closes a tab; tabs and dividers drag.
+The smoke starts on the `windows` set (its early steps press those chords) and the `keymap` phase switches
+sets through the config file.
 
 W2 smoke checks (on top of the W1 list): `tabs_4`, `tab_nav`, `split_4_panes`, `zoom_toggle`,
 `echo_per_pane`, `echo_isolated`, `key_p50_4panes_le_1frame_plus_1_5ms`, `damage_only_4panes` (re-shaped rows in

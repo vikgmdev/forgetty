@@ -153,7 +153,7 @@ impl AppShell {
         if let Some(t) = picked {
             effective = effective.with_colors(t);
         }
-        let km = Keymap::new(&effective.keybindings);
+        let km = Keymap::new(effective.keymap, &effective.keybindings);
         warnings.extend(km.warnings.iter().map(|w| format!("keybindings: {w}")));
         let ch = config::diff(&self.cfg, &effective);
         self.file_cfg = new_file;

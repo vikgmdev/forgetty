@@ -255,7 +255,7 @@ impl AppShell {
     ) -> Self {
         let metrics = Metrics::measure(cx, &cfg);
         let smoke_mode = smoke.is_some();
-        let keymap = Keymap::new(&cfg.keybindings);
+        let keymap = Keymap::new(cfg.keymap, &cfg.keybindings);
         for w in &keymap.warnings {
             eprintln!("forgetty-win: keybindings: {w}");
         }
@@ -1136,6 +1136,13 @@ impl AppShell {
             Action::OpenConfig => self.open_config_file(cx),
             Action::ReloadConfig => self.reload_config_now(cx),
             Action::ChooseTheme => self.open_theme_list(cx),
+            Action::GotoWorkspace(n) => {
+                let i = usize::from(n).saturating_sub(1);
+                if i < self.layout.workspaces.len() && i != self.layout.active_workspace {
+                    self.set_workspace(i, cx);
+                }
+            }
+            Action::Quit => cx.quit(),
         }
         cx.notify();
     }
@@ -1208,6 +1215,11 @@ impl AppShell {
                 let title = match info.action {
                     Action::Profile(n) => match self.cfg.profiles.get(usize::from(n) - 1) {
                         Some(pr) => format!("Open profile: {}", forgetty_shell_core::notify::sanitize(&pr.name, 40)),
+                        None => continue,
+                    },
+                    // "Go to workspace N" is listed for the workspaces that exist, by name.
+                    Action::GotoWorkspace(n) => match self.layout.workspaces.get(usize::from(n) - 1) {
+                        Some(w) => format!("Go to workspace {n}: {}", forgetty_shell_core::notify::sanitize(&w.name, 40)),
                         None => continue,
                     },
                     _ => info.title.to_string(),

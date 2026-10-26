@@ -61,6 +61,9 @@ impl AppShell {
         for it in items {
             if let Item::Cmd { cmd, hint, .. } = it {
                 let h = match cmd {
+                    // GTK shows Ctrl+C and Ctrl+V; both sets also take the Shift forms.
+                    MenuCmd::Copy if self.keymap.preset() == forgetty_shell_core::keys::KeymapPreset::Gtk => "Ctrl+C".to_string(),
+                    MenuCmd::Paste if self.keymap.preset() == forgetty_shell_core::keys::KeymapPreset::Gtk => "Ctrl+V".to_string(),
                     MenuCmd::Copy => "Ctrl+Shift+C".to_string(),
                     MenuCmd::Paste => "Ctrl+Shift+V".to_string(),
                     c => menu::action_of(c).map(|a| self.keymap.shortcut(a)).unwrap_or_default(),

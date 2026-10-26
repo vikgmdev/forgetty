@@ -89,6 +89,9 @@ fn with_mode(mode: &str) -> String {
 fn is_default(cfg: &Config) -> bool {
     let mut d = Config::default();
     d.backdrop = cfg.backdrop;
+    // The smoke starts on the `windows` chord set (its early steps press those chords); an empty
+    // file means the default set. The set has its own checks in the keymap phase.
+    d.keymap = cfg.keymap;
     *cfg == d
 }
 

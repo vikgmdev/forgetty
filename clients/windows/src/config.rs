@@ -66,6 +66,7 @@ const TEMPLATE: &str = "# Forgetty configuration. Changes apply when you save th
 # shell = \"pwsh.exe -NoLogo\"\n\
 # bell_mode = \"visual\"          # visual | audio | both | none\n\
 # notification_mode = \"all\"     # all | ringonly | none\n\
+# keymap = \"gtk\"              # gtk (same chords as the GTK app) | windows\n\
 \n\
 # default_profile = \"PowerShell\"\n\
 # [[profiles]]\n\

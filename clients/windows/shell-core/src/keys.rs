@@ -76,6 +76,45 @@ pub enum Action {
     ReloadConfig,
     /// A list of every theme: choosing one applies it to this session.
     ChooseTheme,
+    /// Switch to workspace N (1-based), as GTK's Alt+1..9.
+    GotoWorkspace(u8),
+    /// End the app (GTK's Ctrl+Shift+Q).
+    Quit,
+}
+
+/// Which set of default chords is in force. `gtk` (the default) takes the chords of the GTK app,
+/// so the same habits work on both. `windows` is the set this client had before, where several
+/// chords differ (close tab Ctrl+Shift+Q, new workspace Ctrl+Shift+N, focus Ctrl+Alt+Arrow, tab
+/// jump Ctrl+1..9, zoom pane, rename tab, select all). A `[keybindings]` entry overrides either.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum KeymapPreset {
+    #[default]
+    Gtk,
+    Windows,
+}
+
+impl KeymapPreset {
+    pub const ALL: [KeymapPreset; 2] = [KeymapPreset::Gtk, KeymapPreset::Windows];
+
+    /// The value in `config.toml`.
+    pub fn name(self) -> &'static str {
+        match self {
+            KeymapPreset::Gtk => "gtk",
+            KeymapPreset::Windows => "windows",
+        }
+    }
+
+    /// For the palette and the notice.
+    pub fn label(self) -> &'static str {
+        match self {
+            KeymapPreset::Gtk => "GTK shortcuts",
+            KeymapPreset::Windows => "Windows shortcuts",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<KeymapPreset> {
+        KeymapPreset::ALL.into_iter().find(|p| p.name() == s.trim().to_ascii_lowercase())
+    }
 }
 
 pub struct ActionInfo {
@@ -84,32 +123,51 @@ pub struct ActionInfo {
     pub name: &'static str,
     /// Title shown in the command palette.
     pub title: &'static str,
-    pub default_keys: &'static [&'static str],
+    /// Default chords in the `gtk` set and in the `windows` set.
+    pub gtk_keys: &'static [&'static str],
+    pub windows_keys: &'static [&'static str],
 }
 
+impl ActionInfo {
+    pub fn default_keys(&self, preset: KeymapPreset) -> &'static [&'static str] {
+        match preset {
+            KeymapPreset::Gtk => self.gtk_keys,
+            KeymapPreset::Windows => self.windows_keys,
+        }
+    }
+}
+
+/// An action with the same chords in both sets.
 macro_rules! info {
     ($a:expr, $n:expr, $t:expr, [$($k:expr),*]) => {
-        ActionInfo { action: $a, name: $n, title: $t, default_keys: &[$($k),*] }
+        ActionInfo { action: $a, name: $n, title: $t, gtk_keys: &[$($k),*], windows_keys: &[$($k),*] }
+    };
+}
+
+/// An action whose chords differ: `gtk` first, then `windows`.
+macro_rules! differ {
+    ($a:expr, $n:expr, $t:expr, gtk [$($g:expr),*], windows [$($w:expr),*]) => {
+        ActionInfo { action: $a, name: $n, title: $t, gtk_keys: &[$($g),*], windows_keys: &[$($w),*] }
     };
 }
 
 pub const ACTIONS: &[ActionInfo] = &[
     info!(Action::NewTab, "new_tab", "New tab", ["ctrl+shift+t"]),
-    info!(Action::CloseTab, "close_tab", "Close tab", ["ctrl+shift+q"]),
-    info!(Action::NextTab, "next_tab", "Next tab", ["ctrl+tab"]),
-    info!(Action::PrevTab, "prev_tab", "Previous tab", ["ctrl+shift+tab"]),
-    info!(Action::GotoTab(1), "goto_tab_1", "Go to tab 1", ["ctrl+1"]),
-    info!(Action::GotoTab(2), "goto_tab_2", "Go to tab 2", ["ctrl+2"]),
-    info!(Action::GotoTab(3), "goto_tab_3", "Go to tab 3", ["ctrl+3"]),
-    info!(Action::GotoTab(4), "goto_tab_4", "Go to tab 4", ["ctrl+4"]),
-    info!(Action::GotoTab(5), "goto_tab_5", "Go to tab 5", ["ctrl+5"]),
-    info!(Action::GotoTab(6), "goto_tab_6", "Go to tab 6", ["ctrl+6"]),
-    info!(Action::GotoTab(7), "goto_tab_7", "Go to tab 7", ["ctrl+7"]),
-    info!(Action::GotoTab(8), "goto_tab_8", "Go to tab 8", ["ctrl+8"]),
-    info!(Action::GotoTab(9), "goto_tab_9", "Go to last tab", ["ctrl+9"]),
+    differ!(Action::CloseTab, "close_tab", "Close tab", gtk [], windows ["ctrl+shift+q"]),
+    differ!(Action::NextTab, "next_tab", "Next tab", gtk ["ctrl+tab", "ctrl+pagedown"], windows ["ctrl+tab"]),
+    differ!(Action::PrevTab, "prev_tab", "Previous tab", gtk ["ctrl+shift+tab", "ctrl+pageup"], windows ["ctrl+shift+tab"]),
+    differ!(Action::GotoTab(1), "goto_tab_1", "Go to tab 1", gtk [], windows ["ctrl+1"]),
+    differ!(Action::GotoTab(2), "goto_tab_2", "Go to tab 2", gtk [], windows ["ctrl+2"]),
+    differ!(Action::GotoTab(3), "goto_tab_3", "Go to tab 3", gtk [], windows ["ctrl+3"]),
+    differ!(Action::GotoTab(4), "goto_tab_4", "Go to tab 4", gtk [], windows ["ctrl+4"]),
+    differ!(Action::GotoTab(5), "goto_tab_5", "Go to tab 5", gtk [], windows ["ctrl+5"]),
+    differ!(Action::GotoTab(6), "goto_tab_6", "Go to tab 6", gtk [], windows ["ctrl+6"]),
+    differ!(Action::GotoTab(7), "goto_tab_7", "Go to tab 7", gtk [], windows ["ctrl+7"]),
+    differ!(Action::GotoTab(8), "goto_tab_8", "Go to tab 8", gtk [], windows ["ctrl+8"]),
+    differ!(Action::GotoTab(9), "goto_tab_9", "Go to last tab", gtk [], windows ["ctrl+9"]),
     info!(Action::MoveTabLeft, "move_tab_left", "Move tab left", ["ctrl+shift+pageup"]),
     info!(Action::MoveTabRight, "move_tab_right", "Move tab right", ["ctrl+shift+pagedown"]),
-    info!(Action::RenameTab, "rename_tab", "Rename tab", ["ctrl+shift+r"]),
+    differ!(Action::RenameTab, "rename_tab", "Rename tab", gtk [], windows ["ctrl+shift+r"]),
     info!(Action::CheckUpdates, "check_updates", "Check for updates", []),
     info!(Action::ClipboardWriteOff, "clipboard_write_off", "Clipboard writes from programs on this machine: off", []),
     info!(Action::ClipboardWriteAsk, "clipboard_write_ask", "Clipboard writes from programs on this machine: ask", []),
@@ -122,21 +180,21 @@ pub const ACTIONS: &[ActionInfo] = &[
     info!(Action::SplitLeft, "split_left", "Split pane left", []),
     info!(Action::SplitUp, "split_up", "Split pane up", []),
     info!(Action::ClosePane, "close_pane", "Close pane", ["ctrl+shift+w"]),
-    info!(Action::FocusLeft, "focus_left", "Focus pane left", ["ctrl+alt+left"]),
-    info!(Action::FocusRight, "focus_right", "Focus pane right", ["ctrl+alt+right"]),
-    info!(Action::FocusUp, "focus_up", "Focus pane up", ["ctrl+alt+up"]),
-    info!(Action::FocusDown, "focus_down", "Focus pane down", ["ctrl+alt+down"]),
-    info!(Action::ZoomPane, "zoom_pane", "Toggle pane zoom", ["ctrl+shift+z"]),
-    info!(Action::ToggleSidebar, "toggle_sidebar", "Toggle sidebar", ["ctrl+shift+b"]),
+    differ!(Action::FocusLeft, "focus_left", "Focus pane left", gtk ["alt+left"], windows ["ctrl+alt+left"]),
+    differ!(Action::FocusRight, "focus_right", "Focus pane right", gtk ["alt+right"], windows ["ctrl+alt+right"]),
+    differ!(Action::FocusUp, "focus_up", "Focus pane up", gtk ["alt+up"], windows ["ctrl+alt+up"]),
+    differ!(Action::FocusDown, "focus_down", "Focus pane down", gtk ["alt+down"], windows ["ctrl+alt+down"]),
+    differ!(Action::ZoomPane, "zoom_pane", "Toggle pane zoom", gtk [], windows ["ctrl+shift+z"]),
+    differ!(Action::ToggleSidebar, "toggle_sidebar", "Toggle sidebar", gtk ["ctrl+alt+b"], windows ["ctrl+shift+b"]),
     info!(Action::CommandPalette, "command_palette", "Command palette", ["ctrl+shift+p"]),
-    info!(Action::NewWorkspace, "new_workspace", "New workspace", ["ctrl+shift+n"]),
-    info!(Action::NextWorkspace, "next_workspace", "Next workspace", []),
-    info!(Action::PrevWorkspace, "prev_workspace", "Previous workspace", []),
+    differ!(Action::NewWorkspace, "new_workspace", "New workspace", gtk ["ctrl+alt+n"], windows ["ctrl+shift+n"]),
+    differ!(Action::NextWorkspace, "next_workspace", "Next workspace", gtk ["ctrl+alt+pagedown"], windows []),
+    differ!(Action::PrevWorkspace, "prev_workspace", "Previous workspace", gtk ["ctrl+alt+pageup"], windows []),
     info!(Action::PairMachine, "pair_machine", "Pair machine...", []),
     info!(Action::NextMachine, "next_machine", "Next machine", []),
     info!(Action::PrevMachine, "prev_machine", "Previous machine", []),
     info!(Action::Search, "search", "Find in terminal", ["ctrl+shift+f"]),
-    info!(Action::SelectAll, "select_all", "Select all", ["ctrl+shift+a"]),
+    differ!(Action::SelectAll, "select_all", "Select all", gtk [], windows ["ctrl+shift+a"]),
     info!(Action::CopyRaw, "copy_raw", "Copy selection as is", []),
     info!(Action::ClearTerminal, "clear_terminal", "Clear terminal", []),
     info!(Action::ResetTerminal, "reset_terminal", "Reset terminal", []),
@@ -168,7 +226,18 @@ pub const ACTIONS: &[ActionInfo] = &[
     // GTK has these in its menu only, so no chord here either.
     info!(Action::OpenConfig, "open_config", "Open configuration file", []),
     info!(Action::ReloadConfig, "reload_config", "Reload configuration", []),
-    info!(Action::ChooseTheme, "choose_theme", "Choose theme...", []),
+    // GTK: Ctrl+, opens the Appearance sidebar (theme and font).
+    differ!(Action::ChooseTheme, "choose_theme", "Choose theme...", gtk ["ctrl+,"], windows []),
+    differ!(Action::Quit, "quit", "Quit", gtk ["ctrl+shift+q"], windows []),
+    differ!(Action::GotoWorkspace(1), "goto_workspace_1", "Go to workspace 1", gtk ["alt+1"], windows []),
+    differ!(Action::GotoWorkspace(2), "goto_workspace_2", "Go to workspace 2", gtk ["alt+2"], windows []),
+    differ!(Action::GotoWorkspace(3), "goto_workspace_3", "Go to workspace 3", gtk ["alt+3"], windows []),
+    differ!(Action::GotoWorkspace(4), "goto_workspace_4", "Go to workspace 4", gtk ["alt+4"], windows []),
+    differ!(Action::GotoWorkspace(5), "goto_workspace_5", "Go to workspace 5", gtk ["alt+5"], windows []),
+    differ!(Action::GotoWorkspace(6), "goto_workspace_6", "Go to workspace 6", gtk ["alt+6"], windows []),
+    differ!(Action::GotoWorkspace(7), "goto_workspace_7", "Go to workspace 7", gtk ["alt+7"], windows []),
+    differ!(Action::GotoWorkspace(8), "goto_workspace_8", "Go to workspace 8", gtk ["alt+8"], windows []),
+    differ!(Action::GotoWorkspace(9), "goto_workspace_9", "Go to workspace 9", gtk ["alt+9"], windows []),
 ];
 
 impl Action {
@@ -277,6 +346,7 @@ impl fmt::Display for Chord {
 
 #[derive(Clone, Debug, Default)]
 pub struct Keymap {
+    preset: KeymapPreset,
     by_chord: HashMap<Chord, Action>,
     by_action: HashMap<Action, Vec<Chord>>,
     /// Config entries that did not parse, for logging.
@@ -284,13 +354,13 @@ pub struct Keymap {
 }
 
 impl Keymap {
-    /// Defaults, then `overrides` (config key `name` to a list of chords; an
+    /// The defaults of `preset`, then `overrides` (config key `name` to a list of chords; an
     /// empty list or "none" unbinds the action).
-    pub fn new(overrides: &HashMap<String, Vec<String>>) -> Self {
-        let mut km = Keymap::default();
+    pub fn new(preset: KeymapPreset, overrides: &HashMap<String, Vec<String>>) -> Self {
+        let mut km = Keymap { preset, ..Keymap::default() };
         let mut per_action: Vec<(Action, Vec<String>)> = ACTIONS
             .iter()
-            .map(|i| (i.action, i.default_keys.iter().map(|s| s.to_string()).collect()))
+            .map(|i| (i.action, i.default_keys(preset).iter().map(|s| s.to_string()).collect()))
             .collect();
         for (name, keys) in overrides {
             match Action::from_name(name) {
@@ -333,8 +403,18 @@ impl Keymap {
         km
     }
 
+    /// The defaults of `preset`, no overrides.
+    pub fn defaults(preset: KeymapPreset) -> Self {
+        Self::new(preset, &HashMap::new())
+    }
+
+    /// The defaults of the default preset (`gtk`).
     pub fn default_map() -> Self {
-        Self::new(&HashMap::new())
+        Self::defaults(KeymapPreset::default())
+    }
+
+    pub fn preset(&self) -> KeymapPreset {
+        self.preset
     }
 
     pub fn lookup(&self, c: &Chord) -> Option<Action> {
@@ -371,7 +451,7 @@ mod tests {
 
     #[test]
     fn defaults_and_overrides() {
-        let km = Keymap::default_map();
+        let km = Keymap::defaults(KeymapPreset::Windows);
         assert_eq!(km.lookup(&Chord::new(true, false, true, false, "p")), Some(Action::CommandPalette));
         assert_eq!(km.lookup(&Chord::new(false, true, true, false, "=")), Some(Action::SplitRight));
         assert_eq!(km.lookup(&Chord::new(false, true, true, false, "-")), Some(Action::SplitDown));
@@ -382,7 +462,7 @@ mod tests {
         o.insert("new_tab".to_string(), vec!["none".to_string()]);
         o.insert("split_right".to_string(), vec!["ctrl+shift+k".to_string()]);
         o.insert("nonsense".to_string(), vec!["x".to_string()]);
-        let km = Keymap::new(&o);
+        let km = Keymap::new(KeymapPreset::Windows, &o);
         assert!(km.lookup(&Chord::new(true, false, true, false, "b")).is_none());
         assert!(km.chords(Action::NewTab).is_empty());
         // Conflict: both user-bound, last inserted wins, but only one owner remains.
@@ -395,7 +475,7 @@ mod tests {
 
     #[test]
     fn terminal_actions_have_their_default_chords_and_no_warnings() {
-        let km = Keymap::default_map();
+        let km = Keymap::defaults(KeymapPreset::Windows);
         assert_eq!(km.lookup(&Chord::new(true, false, true, false, "f")), Some(Action::Search));
         assert_eq!(km.lookup(&Chord::new(true, false, true, false, "a")), Some(Action::SelectAll));
         assert!(km.chords(Action::ResetTerminal).is_empty(), "menu-only in GTK: palette only here");
@@ -406,7 +486,7 @@ mod tests {
     /// WP3: GTK's zoom and profile chords. Config and theme actions are menu-only, as in GTK.
     #[test]
     fn wp3_actions_take_gtks_chords_and_move_no_existing_one() {
-        let km = Keymap::default_map();
+        let km = Keymap::defaults(KeymapPreset::Windows);
         let c = |ctrl, alt, shift, key: &str| km.lookup(&Chord::new(ctrl, alt, shift, false, key));
         assert_eq!(c(true, false, false, "="), Some(Action::ZoomIn));
         assert_eq!(c(true, false, false, "plus"), Some(Action::ZoomIn));
@@ -431,7 +511,7 @@ mod tests {
     /// Every chord that existed before still does what it did.
     #[test]
     fn wp2_actions_take_only_gtks_chord_and_move_no_existing_one() {
-        let km = Keymap::default_map();
+        let km = Keymap::defaults(KeymapPreset::Windows);
         let c = |ctrl, alt, shift, key: &str| km.lookup(&Chord::new(ctrl, alt, shift, false, key));
         assert_eq!(c(false, true, true, "left"), Some(Action::ResizeLeft));
         assert_eq!(c(false, true, true, "right"), Some(Action::ResizeRight));
@@ -456,5 +536,96 @@ mod tests {
             assert!(km.chords(a).is_empty(), "{a:?} has no chord: GTK has none");
         }
         assert!(km.warnings.is_empty(), "{:?}", km.warnings);
+    }
+
+    /// The `gtk` set is GTK's own table (`app.rs` accelerators and the shortcuts window).
+    #[test]
+    fn the_gtk_set_has_gtks_chords() {
+        let km = Keymap::defaults(KeymapPreset::Gtk);
+        assert_eq!(km.preset(), KeymapPreset::Gtk);
+        assert_eq!(KeymapPreset::default(), KeymapPreset::Gtk);
+        let c = |ctrl, alt, shift, key: &str| km.lookup(&Chord::new(ctrl, alt, shift, false, key));
+        // Tabs and panes.
+        assert_eq!(c(true, false, true, "t"), Some(Action::NewTab));
+        assert_eq!(c(true, false, true, "w"), Some(Action::ClosePane));
+        assert_eq!(c(false, true, true, "plus"), Some(Action::SplitRight));
+        assert_eq!(c(false, true, true, "minus"), Some(Action::SplitDown));
+        assert_eq!(c(false, true, false, "left"), Some(Action::FocusLeft));
+        assert_eq!(c(false, true, false, "down"), Some(Action::FocusDown));
+        assert_eq!(c(false, true, true, "right"), Some(Action::ResizeRight));
+        assert_eq!(c(true, false, true, "f"), Some(Action::Search));
+        // Workspaces.
+        assert_eq!(c(true, true, false, "n"), Some(Action::NewWorkspace));
+        assert_eq!(c(true, true, false, "b"), Some(Action::ToggleSidebar));
+        assert_eq!(c(true, true, false, "pagedown"), Some(Action::NextWorkspace));
+        assert_eq!(c(true, true, false, "pageup"), Some(Action::PrevWorkspace));
+        for n in 1..=9u8 {
+            assert_eq!(c(false, true, false, &n.to_string()), Some(Action::GotoWorkspace(n)));
+            // Ctrl+N is not a tab jump in GTK: the program gets it.
+            assert_eq!(c(true, false, false, &n.to_string()), None);
+            assert_eq!(c(true, false, true, &n.to_string()), Some(Action::Profile(n)));
+        }
+        // Help, settings, quit.
+        assert_eq!(c(true, false, true, "q"), Some(Action::Quit));
+        assert_eq!(c(true, false, false, ","), Some(Action::ChooseTheme));
+        // Libadwaita's tab view keys.
+        assert_eq!(c(true, false, false, "pagedown"), Some(Action::NextTab));
+        assert_eq!(c(true, false, false, "pageup"), Some(Action::PrevTab));
+        assert_eq!(c(true, false, false, "tab"), Some(Action::NextTab));
+        assert_eq!(c(true, false, true, "pageup"), Some(Action::MoveTabLeft));
+        // Windows-only chords are free for the program.
+        for (ctrl, alt, shift, key) in [(true, true, false, "left"), (true, false, true, "z"), (true, false, true, "r"), (true, false, true, "a")] {
+            assert_eq!(c(ctrl, alt, shift, key), None, "{ctrl} {alt} {shift} {key}");
+        }
+        // The palette stays on Ctrl+Shift+P (GTK opens its shortcuts list there).
+        assert_eq!(c(true, false, true, "p"), Some(Action::CommandPalette));
+        assert!(km.warnings.is_empty(), "{:?}", km.warnings);
+        assert_eq!(km.shortcut(Action::ToggleSidebar), "Ctrl+Alt+B");
+        assert_eq!(km.shortcut(Action::ChooseTheme), "Ctrl+,");
+    }
+
+    #[test]
+    fn the_windows_set_is_what_it_was() {
+        let km = Keymap::defaults(KeymapPreset::Windows);
+        let c = |ctrl, alt, shift, key: &str| km.lookup(&Chord::new(ctrl, alt, shift, false, key));
+        assert_eq!(c(true, false, true, "q"), Some(Action::CloseTab));
+        assert_eq!(c(true, false, true, "n"), Some(Action::NewWorkspace));
+        assert_eq!(c(true, true, false, "left"), Some(Action::FocusLeft));
+        assert_eq!(c(true, false, false, "5"), Some(Action::GotoTab(5)));
+        assert_eq!(c(true, false, true, "z"), Some(Action::ZoomPane));
+        assert_eq!(c(true, false, true, "b"), Some(Action::ToggleSidebar));
+        assert_eq!(c(false, true, false, "left"), None);
+        assert_eq!(c(false, true, false, "1"), None);
+        assert!(km.chords(Action::Quit).is_empty());
+        assert!(km.warnings.is_empty());
+    }
+
+    #[test]
+    fn no_chord_has_two_owners_in_either_set() {
+        for preset in KeymapPreset::ALL {
+            let mut seen: HashMap<Chord, &str> = HashMap::new();
+            for info in ACTIONS {
+                for k in info.default_keys(preset) {
+                    let c = Chord::parse(k).unwrap_or_else(|| panic!("{} has a bad chord {k}", info.name));
+                    if let Some(other) = seen.insert(c, info.name) {
+                        panic!("{preset:?}: {k} is on both {other} and {}", info.name);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn presets_parse_and_user_keys_win_in_both() {
+        assert_eq!(KeymapPreset::parse(" GTK "), Some(KeymapPreset::Gtk));
+        assert_eq!(KeymapPreset::parse("windows"), Some(KeymapPreset::Windows));
+        assert_eq!(KeymapPreset::parse("emacs"), None);
+        let mut o = HashMap::new();
+        o.insert("focus_left".to_string(), vec!["ctrl+h".to_string()]);
+        for p in KeymapPreset::ALL {
+            let km = Keymap::new(p, &o);
+            assert_eq!(km.lookup(&Chord::new(true, false, false, false, "h")), Some(Action::FocusLeft));
+            assert_eq!(km.chords(Action::FocusLeft).len(), 1);
+        }
     }
 }
