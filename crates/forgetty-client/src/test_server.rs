@@ -87,6 +87,8 @@ impl Default for TestServerConfig {
                 cap::SIZE_POLICY_LATEST.to_string(),
                 cap::INPUT_FLAGS.to_string(),
                 cap::SIZE_OWNER.to_string(),
+                cap::SPLIT_BEFORE.to_string(),
+                cap::WORKSPACE_ID.to_string(),
             ],
             pair_secret: None,
             echo_input: true,
@@ -118,20 +120,17 @@ impl Tree {
     }
 
     /// Replace the leaf `pane` with a split holding it and `new_pane`.
-    fn split(&mut self, pane: Uuid, new_pane: Uuid, direction: &str) -> bool {
+    fn split(&mut self, pane: Uuid, new_pane: Uuid, direction: &str, before: bool) -> bool {
         match self {
             Tree::Leaf(id) if *id == pane => {
-                *self = Tree::Split {
-                    direction: direction.to_string(),
-                    ratio: 0.5,
-                    first: Box::new(Tree::Leaf(pane)),
-                    second: Box::new(Tree::Leaf(new_pane)),
-                };
+                let (old, new) = (Box::new(Tree::Leaf(pane)), Box::new(Tree::Leaf(new_pane)));
+                let (first, second) = if before { (new, old) } else { (old, new) };
+                *self = Tree::Split { direction: direction.to_string(), ratio: 0.5, first, second };
                 true
             }
             Tree::Leaf(_) => false,
             Tree::Split { first, second, .. } => {
-                first.split(pane, new_pane, direction) || second.split(pane, new_pane, direction)
+                first.split(pane, new_pane, direction, before) || second.split(pane, new_pane, direction, before)
             }
         }
     }
@@ -1058,11 +1057,15 @@ fn handle_request(
             if !lock(&state.panes).contains_key(&pane) {
                 return Err((error_code::NOT_FOUND, "no such pane".into()));
             }
+            // Like the real server: `before` is honored only with the capability. An older
+            // server ignores it and splits after (the client never asks without the cap).
+            let before = state.cfg.capabilities.iter().any(|c| c == cap::SPLIT_BEFORE)
+                && matches!(params_get(&params, "before"), Some(Value::Boolean(true)));
             let new_pane = new_pane_log(state, 24, 80);
             let split = lock(&state.layout)
                 .tabs
                 .iter_mut()
-                .any(|t| t.tree.contains(pane) && t.tree.split(pane, new_pane, direction));
+                .any(|t| t.tree.contains(pane) && t.tree.split(pane, new_pane, direction, before));
             if !split {
                 remove_pane(state, new_pane);
                 return Err((error_code::NOT_FOUND, "pane is in no tab".into()));
@@ -1212,8 +1215,8 @@ fn handle_request(
             let color = param_str(&params, "color").map(str::to_string);
             let changed = {
                 let mut l = lock(&state.layout);
-                let n = 1 + l.others.len();
-                let i = ws_index(&params, "workspace_idx", n)?;
+                let _n = 1 + l.others.len();
+                let i = ws_ref(state, &params, &l, "workspace_id", "workspace_idx")?;
                 let slot = if i == 0 { &mut l.ws_color } else { &mut l.others[i - 1].color };
                 std::mem::replace(slot, color.clone()) != color
             };
@@ -1225,8 +1228,8 @@ fn handle_request(
         "move_workspace" => {
             {
                 let mut l = lock(&state.layout);
-                let n = 1 + l.others.len();
-                let (from, to) = (ws_index(&params, "from_idx", n)?, ws_index(&params, "to_idx", n)?);
+                let _n = 1 + l.others.len();
+                let (from, to) = (ws_ref(state, &params, &l, "from_id", "from_idx")?, ws_ref(state, &params, &l, "to_id", "to_idx")?);
                 if from != to {
                     let mut v = take_workspaces(&mut l);
                     v.swap(from, to);
@@ -1245,7 +1248,7 @@ fn handle_request(
             let doomed: Vec<Uuid> = {
                 let mut l = lock(&state.layout);
                 let n = 1 + l.others.len();
-                let i = ws_index(&params, "workspace_idx", n)?;
+                let i = ws_ref(state, &params, &l, "workspace_id", "workspace_idx")?;
                 if n <= 1 {
                     return Err((error_code::INTERNAL, "delete_workspace: cannot delete last remaining workspace".into()));
                 }
@@ -1278,8 +1281,8 @@ fn handle_request(
             let new_name = param_str(&params, "new_name").map(str::to_string);
             let (ws_id, at, tabs) = {
                 let mut l = lock(&state.layout);
-                let n = 1 + l.others.len();
-                let src = ws_index(&params, "source_workspace_idx", n)?;
+                let _n = 1 + l.others.len();
+                let src = ws_ref(state, &params, &l, "source_workspace_id", "source_workspace_idx")?;
                 let mut v = take_workspaces(&mut l);
                 let name = new_name.unwrap_or_else(|| format!("{} (copy)", v[src].name));
                 let n_tabs = v[src].tabs.len();
@@ -1466,6 +1469,30 @@ fn put_workspaces(l: &mut Layout, mut v: Vec<Ws>) {
     l.tabs = first.tabs;
     l.active_tab = first.active_tab;
     l.others = v;
+}
+
+/// Position of the workspace a call names. With the `workspace_id` capability an id wins
+/// and an unknown id is an error. Without it only the position counts (an older server).
+fn ws_ref(
+    state: &Arc<State>,
+    params: &Value,
+    l: &Layout,
+    id_key: &str,
+    idx_key: &str,
+) -> Result<usize, (&'static str, String)> {
+    let n = 1 + l.others.len();
+    let ids_ok = state.cfg.capabilities.iter().any(|c| c == cap::WORKSPACE_ID);
+    if ids_ok && params_get(params, id_key).is_some() {
+        let id = param_uuid(params, id_key)?;
+        if l.ws_id == id {
+            return Ok(0);
+        }
+        return match l.others.iter().position(|w| w.id == id) {
+            Some(i) => Ok(i + 1),
+            None => Err((error_code::BAD_REQUEST, format!("workspace not found: {id}"))),
+        };
+    }
+    ws_index(params, idx_key, n)
 }
 
 fn ws_index(params: &Value, key: &str, len: usize) -> Result<usize, (&'static str, String)> {

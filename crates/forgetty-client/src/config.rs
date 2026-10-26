@@ -44,6 +44,8 @@ impl ClientInfo {
                 cap::SNAPSHOT_CATCHUP.to_string(),
                 cap::SIZE_OWNER.to_string(),
                 cap::INPUT_FLAGS.to_string(),
+                cap::SPLIT_BEFORE.to_string(),
+                cap::WORKSPACE_ID.to_string(),
             ],
         }
     }
