@@ -24,3 +24,19 @@ Goal: local shells on Windows live in a per-user Forgetty server, as on Linux, s
 - WP5 (M): lifecycle and packaging (decisions 6, 8), MSI changes.
 - WP6 (M): Windows client integration. Local-server supervisor (find, start, auto-pair via pipe, connect over loopback), the local machine backed by RemoteBackend, first-run UX, fallback to in-process ConPTY.
 - WP7 (S-M): smoke. Close the window and panes survive. Kill and restart the server (cold restore). Key-to-frame latency against the local server (target: within 2 ms of the in-process path). Non-admin firewall check.
+
+## Status (WP0 to WP3)
+Done: WP0 to WP3. Server crates check and test in the `server-crates` job of `.github/workflows/windows-client.yml`.
+
+- The control pipe is `\\.\pipe\forgetty-<SID>`, and with `--state-dir` (or any `XDG_RUNTIME_DIR`) `\\.\pipe\forgetty-<SID>-<hash of the runtime folder>`, so a throwaway server never shares the pipe of the real one. Code: `crates/forgetty-socket/src/pipe.rs` (server), `crates/forgetty-server/src/pipe_client.rs` (CLI), `crates/forgetty-server/src/sockpath_windows.rs` (names).
+- The server check of the client SID runs after the first read from the connection, because Windows refuses `ImpersonateNamedPipeClient` before that. Until then nothing the client sent reaches a handler and nothing is written back. The impersonation reads the token of an elevated client too, which a process-id lookup cannot.
+- The client check of the server SID runs in `PipeStream::connect` before the first byte is sent: it reads the user SID of the process behind `GetNamedPipeServerProcessId`. A server it cannot identify (for example an elevated server and a normal CLI) is refused, with the reason in the error.
+- Default shell: `shell` in `config.toml`, then `FORGETTY_SHELL`, then `pwsh.exe`, `powershell.exe`, `%COMSPEC%`. Programs are found by walking PATH in Rust (no `where`).
+
+### Manual test: a client of another user is refused
+CI has one account, so the cross-user case is by hand (needs an administrator to make the second account):
+1. In an elevated shell: `net user fgtest P@ssw0rd-Test1 /add`.
+2. As your own user: `forgetty server start`, then `forgetty server status` (running).
+3. As the other user: `runas /user:fgtest cmd` and in that shell run `forgetty server status`. Expected: the open of `\\.\pipe\forgetty-<your SID>` fails with "Access is denied" (the DACL), and the CLI says the server is not reachable. The other user also computes a different pipe name (its own SID), so it does not even try yours.
+4. To see the server-side SID check as well, start the server with a DACL that is too wide (a test build) or use the unit test `a_client_of_another_user_gets_no_service` in `crates/forgetty-socket/tests/pipe_server.rs`, which makes the server expect the SYSTEM SID.
+5. Cleanup: `forgetty server stop`, `net user fgtest /delete`.
