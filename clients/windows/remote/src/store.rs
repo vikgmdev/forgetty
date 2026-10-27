@@ -48,6 +48,10 @@ pub struct StoredMachine {
     /// learns itself live in the address cache.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pinned_addrs: Vec<SocketAddr>,
+    /// The machine behind this app's own local server (`forgetty.exe` on this PC). The app pairs
+    /// it by itself and shows it as "This PC".
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub local: bool,
 }
 
 fn relays_de<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
@@ -194,6 +198,16 @@ impl MachineStore {
         }
         self.save_machines(&list)?;
         Ok(m)
+    }
+
+    /// The machine marked as this PC's local server, when there is one.
+    pub fn local_machine(&self) -> Option<StoredMachine> {
+        self.machines().into_iter().find(|m| m.local)
+    }
+
+    /// The device id other machines know this app by: the public key of its identity.
+    pub fn device_id(&self) -> io::Result<String> {
+        Ok(self.identity()?.public().to_string())
     }
 
     pub fn remove(&self, id: Uuid) -> io::Result<()> {
@@ -403,6 +417,17 @@ pub async fn pair(
     device_name: &str,
     manual: Option<SocketAddr>,
 ) -> Result<StoredMachine, ClientError> {
+    pair_as(store, offer, device_name, manual, false).await
+}
+
+/// [`pair`], with the machine marked as this PC's own local server when `local` is set.
+pub async fn pair_as(
+    store: &MachineStore,
+    offer: &PairingOffer,
+    device_name: &str,
+    manual: Option<SocketAddr>,
+    local: bool,
+) -> Result<StoredMachine, ClientError> {
     let identity = store.identity().map_err(|e| ClientError::Setup(format!("identity: {e}")))?;
     let (addr, opts, pinned) = pair_plan(offer, manual)?;
     pair_with_addr(addr, &offer.qr.secret, identity, device_name, ClientKind::Windows, &opts).await?;
@@ -413,6 +438,7 @@ pub async fn pair(
         relays: offer.relays.clone(),
         relays_disabled: offer.relays_disabled,
         pinned_addrs: pinned,
+        local,
     };
     store.add(m).map_err(|e| ClientError::Setup(format!("machines.json: {e}")))
 }
@@ -515,7 +541,7 @@ mod tests {
         assert_eq!(o.relay, "https://a.example.com/, https://b.example.com/");
         let dir = tempfile::tempdir().unwrap();
         let s = MachineStore::open(dir.path());
-        let m = s.add(StoredMachine { id: Uuid::new_v4(), name: "m".into(), node_id: n.clone(), relays: o.relays.clone(), relays_disabled: false, pinned_addrs: Vec::new() }).unwrap();
+        let m = s.add(StoredMachine { id: Uuid::new_v4(), name: "m".into(), node_id: n.clone(), relays: o.relays.clone(), relays_disabled: false, pinned_addrs: Vec::new(), local: false }).unwrap();
         assert_eq!(s.machines()[0].relays, o.relays);
         let addr = machine_addr(&m).unwrap();
         assert_eq!(addr.relay_urls().count(), 2);
@@ -545,7 +571,7 @@ mod tests {
         assert_eq!(c1, s.client_id().unwrap());
         assert!(s.machines().is_empty());
 
-        let m = StoredMachine { id: Uuid::new_v4(), name: "a".into(), node_id: node(), relays: Vec::new(), relays_disabled: false, pinned_addrs: Vec::new() };
+        let m = StoredMachine { id: Uuid::new_v4(), name: "a".into(), node_id: node(), relays: Vec::new(), relays_disabled: false, pinned_addrs: Vec::new(), local: false };
         let saved = s.add(m.clone()).unwrap();
         assert_eq!(s.machines(), vec![saved.clone()]);
         // Same node id again: replaced, local id kept.
@@ -631,6 +657,7 @@ mod tests {
             relays: o.relays.clone(),
             relays_disabled: true,
             pinned_addrs: pinned.clone(),
+            local: false,
         };
         let dir = tempfile::tempdir().unwrap();
         let s = MachineStore::open(dir.path());
@@ -697,14 +724,14 @@ mod tests {
         assert_eq!(std::fs::read_to_string(s.machines_path()).unwrap(), text);
         assert!(bad_copies(&s).is_empty());
         // The first write keeps a copy of the file with the bad entries, then the file is clean.
-        s.add(StoredMachine { id: Uuid::new_v4(), name: "new".into(), node_id: node(), relays: Vec::new(), relays_disabled: false, pinned_addrs: Vec::new() }).unwrap();
+        s.add(StoredMachine { id: Uuid::new_v4(), name: "new".into(), node_id: node(), relays: Vec::new(), relays_disabled: false, pinned_addrs: Vec::new(), local: false }).unwrap();
         let copies = bad_copies(&s);
         assert_eq!(copies.len(), 1);
         assert_eq!(std::fs::read_to_string(&copies[0]).unwrap(), text);
         assert!(crate::acl::is_user_only(&copies[0]).unwrap());
         assert_eq!(s.machines().len(), 3);
         // A clean file makes no more copies.
-        s.add(StoredMachine { id: Uuid::new_v4(), name: "again".into(), node_id: node(), relays: Vec::new(), relays_disabled: false, pinned_addrs: Vec::new() }).unwrap();
+        s.add(StoredMachine { id: Uuid::new_v4(), name: "again".into(), node_id: node(), relays: Vec::new(), relays_disabled: false, pinned_addrs: Vec::new(), local: false }).unwrap();
         assert_eq!(bad_copies(&s).len(), 1);
     }
 
@@ -719,7 +746,7 @@ mod tests {
             std::fs::write(s.machines_path(), junk).unwrap();
             assert!(s.machines().is_empty(), "{junk}");
             assert_eq!(std::fs::read_to_string(s.machines_path()).unwrap(), junk, "reading does not write");
-            s.add(StoredMachine { id: Uuid::new_v4(), name: "m".into(), node_id: node(), relays: Vec::new(), relays_disabled: false, pinned_addrs: Vec::new() }).unwrap();
+            s.add(StoredMachine { id: Uuid::new_v4(), name: "m".into(), node_id: node(), relays: Vec::new(), relays_disabled: false, pinned_addrs: Vec::new(), local: false }).unwrap();
             let copies = bad_copies(&s);
             assert_eq!(copies.len(), 1, "{junk}");
             assert_eq!(std::fs::read_to_string(&copies[0]).unwrap(), junk);
@@ -748,7 +775,7 @@ mod tests {
         assert!(bad_copies(&s).is_empty());
 
         // The next write keeps a copy of the file with the bad entry, then writes version 2.
-        s.add(StoredMachine { id: Uuid::new_v4(), name: "new".into(), node_id: b, relays: Vec::new(), relays_disabled: false, pinned_addrs: Vec::new() }).unwrap();
+        s.add(StoredMachine { id: Uuid::new_v4(), name: "new".into(), node_id: b, relays: Vec::new(), relays_disabled: false, pinned_addrs: Vec::new(), local: false }).unwrap();
         let copies = bad_copies(&s);
         assert_eq!(copies.len(), 1);
         assert_eq!(std::fs::read_to_string(&copies[0]).unwrap(), before);
@@ -763,7 +790,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let s = MachineStore::open(dir.path());
-        let m = StoredMachine { id: Uuid::new_v4(), name: "m".into(), node_id: node(), relays: Vec::new(), relays_disabled: false, pinned_addrs: Vec::new() };
+        let m = StoredMachine { id: Uuid::new_v4(), name: "m".into(), node_id: node(), relays: Vec::new(), relays_disabled: false, pinned_addrs: Vec::new(), local: false };
         s.add(m.clone()).unwrap();
         let before = std::fs::read(s.machines_path()).unwrap();
         std::fs::set_permissions(s.machines_path(), std::fs::Permissions::from_mode(0o000)).unwrap();
@@ -788,7 +815,7 @@ mod tests {
         let n = node();
         let id: EndpointId = n.parse().unwrap();
         let cache = AddrCache::new();
-        let mut m = StoredMachine { id: Uuid::new_v4(), name: "m".into(), node_id: n, relays: vec!["https://a.example.com/".into()], relays_disabled: false, pinned_addrs: Vec::new() };
+        let mut m = StoredMachine { id: Uuid::new_v4(), name: "m".into(), node_id: n, relays: vec!["https://a.example.com/".into()], relays_disabled: false, pinned_addrs: Vec::new(), local: false };
         assert_eq!(dial_timeout_for(&cache, &m), ClientOptions::default().dial_timeout, "relay only");
         cache.insert(id, "192.168.1.5:47297".parse().unwrap(), local_network());
         assert_eq!(dial_timeout_for(&cache, &m), Duration::from_secs(1), "a learned LAN address and no pinned list");
@@ -803,5 +830,29 @@ mod tests {
     fn machine_names_lose_bidi_and_control_characters() {
         let o = parse_offer(&offer_json(&node(), "ok\u{202e}\u{7}na\u{200b}me\u{2066}", "")).unwrap();
         assert_eq!(o.machine, "okname");
+    }
+
+    #[test]
+    fn the_local_machine_is_marked_and_old_files_have_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = MachineStore::open(dir.path());
+        assert!(s.local_machine().is_none());
+        let remote = StoredMachine { id: Uuid::new_v4(), name: "r".into(), node_id: node(), relays: Vec::new(), relays_disabled: false, pinned_addrs: Vec::new(), local: false };
+        let local = StoredMachine { id: Uuid::new_v4(), name: "WIN".into(), node_id: node(), relays: Vec::new(), relays_disabled: true, pinned_addrs: vec!["127.0.0.1:47297".parse().unwrap()], local: true };
+        s.add(remote.clone()).unwrap();
+        s.add(local.clone()).unwrap();
+        assert_eq!(s.local_machine(), Some(local.clone()));
+        let text = std::fs::read_to_string(s.machines_path()).unwrap();
+        // Only the local entry carries the flag.
+        assert_eq!(text.matches("\"local\"").count(), 1, "{text}");
+        // A file from before the flag reads as not local.
+        let old = text.replace("\"local\": true,", "").replace("\"local\": true", "\"x\": 0");
+        std::fs::write(s.machines_path(), old).unwrap();
+        assert!(s.local_machine().is_none());
+        assert_eq!(s.machines().len(), 2);
+        // The device id is stable and is the public key of the identity.
+        let id = s.device_id().unwrap();
+        assert_eq!(id, s.device_id().unwrap());
+        assert_eq!(id, s.identity().unwrap().public().to_string());
     }
 }

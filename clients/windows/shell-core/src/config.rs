@@ -20,6 +20,8 @@
 //! scrollback_bytes = 10485760   # libghostty bytes per pane (default 10 MiB)
 //! backdrop = "mica"             # mica | mica_alt | blur | none
 //! sidebar = false               # start with the sidebar open
+//! local_server = true           # terminals live in the local forgetty.exe server (false: in this window)
+//! on_launch = "restore"         # restore | new: tabs the server kept, or one new workspace
 //! pane_padding_x = 6.0          # px between a pane border and its text (default 6)
 //! pane_padding_y = 4.0          # default 4
 //! bell_mode = "visual"          # visual | audio | both | none
@@ -46,7 +48,7 @@
 //! ```
 //! Action names: see `keys::ACTIONS`.
 //!
-//! Keys that GTK reads and a client does not use (`cursor_style`, `on_launch`,
+//! Keys that GTK reads and a client does not use (`cursor_style`,
 //! `session_trash_days`, `byte_log_*`, `relay*`, `bind_addrs`) are accepted and ignored. A key
 //! nobody knows is a warning, with a suggestion when it is close to a known one.
 
@@ -122,6 +124,11 @@ pub struct Config {
     pub scrollback_bytes: usize,
     pub backdrop: Backdrop,
     pub sidebar_open: bool,
+    /// Terminals run in the local `forgetty.exe` server, so they outlive the window. Off: the
+    /// window uses its own ConPTY terminal (`local_server`).
+    pub local_server: bool,
+    /// Start with the server's saved tabs (`restore`) or with one new workspace (`new`).
+    pub on_launch: forgetty_config::OnLaunch,
     /// Space between a pane's border and its cell grid, in px.
     pub pane_padding_x: f32,
     pub pane_padding_y: f32,
@@ -172,6 +179,8 @@ impl Default for Config {
             scrollback_bytes: DEFAULT_SCROLLBACK_BYTES,
             backdrop: Backdrop::Mica,
             sidebar_open: false,
+            local_server: true,
+            on_launch: forgetty_config::OnLaunch::Restore,
             pane_padding_x: 6.0,
             pane_padding_y: 4.0,
             bell_mode: Default::default(),
@@ -216,6 +225,7 @@ struct FileConfig {
     scrollback_bytes: Option<usize>,
     backdrop: Option<String>,
     sidebar: Option<bool>,
+    local_server: Option<bool>,
     pane_padding_x: Option<f32>,
     pane_padding_y: Option<f32>,
     smart_copy: Option<bool>,
@@ -258,6 +268,7 @@ const WINDOWS_KEYS: &[&str] = &[
     "scrollback_bytes",
     "backdrop",
     "sidebar",
+    "local_server",
     "pane_padding_x",
     "pane_padding_y",
     "smart_copy",
@@ -486,6 +497,12 @@ impl Config {
         }
         if let Some(v) = f.sidebar {
             c.sidebar_open = v;
+        }
+        if let Some(v) = f.local_server {
+            c.local_server = v;
+        }
+        if table.contains_key("on_launch") {
+            c.on_launch = shared.on_launch;
         }
         for (name, val, dst) in [
             ("pane_padding_x", f.pane_padding_x, &mut c.pane_padding_x),
@@ -838,6 +855,12 @@ pub fn diff(old: &Config, new: &Config) -> Changes {
     if old.sidebar_open != new.sidebar_open {
         ch.later.push("sidebar (next start)");
     }
+    if old.local_server != new.local_server {
+        ch.later.push("local server (next start)");
+    }
+    if old.on_launch != new.on_launch {
+        ch.later.push("on_launch (next start)");
+    }
     ch
 }
 
@@ -1012,9 +1035,27 @@ session_trash_days = 3
         assert_eq!(c.notification_mode, NotificationMode::RingOnly);
         assert!(!c.paste_warn_newline);
         assert_eq!(c.scrollback_bytes, 5000 * 2048);
+        assert_eq!(c.on_launch, forgetty_config::OnLaunch::New);
         // [font] wins over font_family when both are there.
         let c = p("font_family = \"A\"\n[font]\nfamily = \"B\"\n").config;
         assert_eq!(c.font_family, "B");
+    }
+
+    #[test]
+    fn local_server_and_on_launch_defaults_and_edits() {
+        let d = Config::default();
+        assert!(d.local_server);
+        assert_eq!(d.on_launch, forgetty_config::OnLaunch::Restore);
+        let l = p("local_server = false\non_launch = \"Restore\"\n");
+        assert!(l.warnings.is_empty(), "{:?}", l.warnings);
+        assert!(!l.config.local_server);
+        assert_eq!(l.config.on_launch, forgetty_config::OnLaunch::Restore);
+        assert!(Config::parse("local_server = \"yes\"").is_err());
+        let mut b = Config::default();
+        b.local_server = false;
+        b.on_launch = forgetty_config::OnLaunch::New;
+        let ch = diff(&Config::default(), &b);
+        assert_eq!(ch.later, vec!["local server (next start)", "on_launch (next start)"]);
     }
 
     #[test]
