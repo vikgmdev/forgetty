@@ -43,7 +43,9 @@ use windows::Win32::System::JobObjects::{
 use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess, GetExitCodeProcess,
-    InitializeProcThreadAttributeList, ResumeThread, TerminateProcess,
+    GetProcessInformation, InitializeProcThreadAttributeList, ProcessPowerThrottling,
+    ResumeThread, SetProcessInformation, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+    PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_STATE, TerminateProcess,
     UpdateProcThreadAttribute, WaitForSingleObject, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
     EXTENDED_STARTUPINFO_PRESENT, INFINITE, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
     PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, STARTF_USESTDHANDLES, STARTUPINFOEXW,
@@ -52,6 +54,74 @@ use windows::Win32::System::Threading::{
 /// `PSEUDOCONSOLE_RESIZE_QUIRK`: the host does not reflow its own buffer on a resize. The
 /// terminal behind the pipe (libghostty-vt) does the reflow.
 const PSEUDOCONSOLE_RESIZE_QUIRK: u32 = 0x2;
+
+/// Extra `CreatePseudoConsole` flags for experiments (`FORGETTY_CONPTY_FLAGS`, decimal or `0x`
+/// hex, or-ed onto the default). `0x4` is `PSEUDOCONSOLE_WIN32_INPUT_MODE`, `0x1` is
+/// `PSEUDOCONSOLE_INHERIT_CURSOR` (portable-pty sets both). Unset: no extra flags.
+fn extra_conpty_flags() -> u32 {
+    let Ok(v) = std::env::var("FORGETTY_CONPTY_FLAGS") else { return 0 };
+    let v = v.trim();
+    match v.strip_prefix("0x") {
+        Some(h) => u32::from_str_radix(h, 16),
+        None => v.parse(),
+    }
+    .unwrap_or(0)
+}
+
+/// Where the power throttling (EcoQoS, "efficiency mode") opt-out applies
+/// (`FORGETTY_POWER_THROTTLING`): `off` (the default) leaves the system to decide, `server` opts
+/// the server process out, `shells` also opts every shell process out right after it is created.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PowerThrottling {
+    Off,
+    Server,
+    Shells,
+}
+
+/// The setting of `FORGETTY_POWER_THROTTLING`.
+pub fn power_throttling_mode() -> PowerThrottling {
+    match std::env::var("FORGETTY_POWER_THROTTLING").unwrap_or_default().as_str() {
+        "server" => PowerThrottling::Server,
+        "shells" => PowerThrottling::Shells,
+        _ => PowerThrottling::Off,
+    }
+}
+
+/// Turn execution speed throttling off for `process` (a control bit with its state bit clear),
+/// then read the setting back. Returns `(ControlMask, StateMask)` as the system reports them.
+pub fn opt_out_of_power_throttling(process: HANDLE) -> std::result::Result<(u32, u32), String> {
+    let set = PROCESS_POWER_THROTTLING_STATE {
+        Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        StateMask: 0,
+    };
+    // SAFETY: `set` is a valid PROCESS_POWER_THROTTLING_STATE of the size passed.
+    unsafe {
+        SetProcessInformation(
+            process,
+            ProcessPowerThrottling,
+            &set as *const _ as *const c_void,
+            std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+        )
+    }
+    .map_err(|e| format!("SetProcessInformation: {e}"))?;
+    let mut got = PROCESS_POWER_THROTTLING_STATE {
+        Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: 0,
+        StateMask: 0,
+    };
+    // SAFETY: `got` is a valid out buffer of the size passed.
+    unsafe {
+        GetProcessInformation(
+            process,
+            ProcessPowerThrottling,
+            &mut got as *mut _ as *mut c_void,
+            std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+        )
+    }
+    .map_err(|e| format!("GetProcessInformation: {e}"))?;
+    Ok((got.ControlMask, got.StateMask))
+}
 
 /// How long after the process exit the pseudo console stays open, so conhost can write the last
 /// output (the prompt, the text of a failing command) into the pipe.
@@ -726,7 +796,7 @@ impl PtyProcess {
                 coord(size.rows, size.cols),
                 in_r.raw(),
                 out_w.raw(),
-                PSEUDOCONSOLE_RESIZE_QUIRK,
+                PSEUDOCONSOLE_RESIZE_QUIRK | extra_conpty_flags(),
             )
         }
         .map_err(|e| win_err("failed to open PTY (ConPTY)", e))?;
@@ -772,6 +842,16 @@ impl PtyProcess {
         }
         let thread = OwnedHandle(pi.hThread);
         let process = Arc::new(OwnedHandle(pi.hProcess));
+        // The shell is still suspended: the opt-out is in place before its first instruction.
+        if power_throttling_mode() == PowerThrottling::Shells {
+            match opt_out_of_power_throttling(process.raw()) {
+                Ok((control, state)) => tracing::info!(
+                    pid = pi.dwProcessId,
+                    "shell power throttling: ControlMask {control:#x}, StateMask {state:#x} read back"
+                ),
+                Err(e) => warn!(pid = pi.dwProcessId, "shell power throttling opt-out failed: {e}"),
+            }
+        }
 
         let job = match new_kill_on_close_job() {
             Ok(job) => {
