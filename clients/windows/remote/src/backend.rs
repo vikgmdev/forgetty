@@ -281,6 +281,16 @@ fn owner_info(o: forgetty_client::proto::SizeOwner) -> SizeOwnerInfo {
     SizeOwnerInfo { client_id: o.client_id, kind: o.client_kind.as_str().to_string(), name: o.client_name }
 }
 
+/// `argv` of a `get_pane_info` reply: the command the pane was started with, or empty (the default
+/// shell, an older server, or a field that is not a list of strings). Bounded.
+fn argv_from_json(v: &Json) -> Vec<String> {
+    let Some(list) = v.get("argv").and_then(Json::as_array) else { return Vec::new() };
+    if list.len() > 64 || list.iter().any(|a| a.as_str().is_none_or(|s| s.len() > 4096)) {
+        return Vec::new();
+    }
+    list.iter().filter_map(|a| a.as_str().map(str::to_string)).collect()
+}
+
 /// `size_owner` of a `get_pane_info` reply: an object, or null/absent.
 fn owner_from_json(v: &Json) -> Option<SizeOwnerInfo> {
     let o = v.get("size_owner")?;
@@ -609,6 +619,7 @@ impl SessionBackend for RemoteBackend {
                 title: text("title"),
                 cwd: text("cwd"),
                 spawn_cwd: Some(text("spawn_cwd")).filter(|c| !c.is_empty()),
+                argv: argv_from_json(&v),
                 status: v.get("status").and_then(Json::as_str).map(PaneStatus::parse).unwrap_or_default(),
                 exited: v.get("exited").and_then(Json::as_bool).unwrap_or(false),
                 size_owner: owner_from_json(&v),
@@ -628,6 +639,17 @@ impl SessionBackend for RemoteBackend {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn argv_is_read_when_it_is_a_list_of_strings() {
+        use super::*;
+        assert_eq!(argv_from_json(&json!({"argv": ["wsl.exe", "-d", "Ubuntu"]})), ["wsl.exe", "-d", "Ubuntu"]);
+        assert!(argv_from_json(&json!({"argv": []})).is_empty());
+        assert!(argv_from_json(&json!({})).is_empty());
+        assert!(argv_from_json(&json!({"argv": "cmd.exe"})).is_empty());
+        assert!(argv_from_json(&json!({"argv": ["a", 1]})).is_empty());
+        assert!(argv_from_json(&json!({"argv": vec!["a"; 65]})).is_empty());
+    }
+
     use super::*;
 
     #[test]

@@ -687,6 +687,10 @@ impl AppShell {
                 m.status = i.status;
             }
             m.owner = i.size_owner;
+            // The program the server started the pane with beats a guess from the default shell.
+            if !i.argv.is_empty() {
+                self.pane_argv.insert(pane, i.argv);
+            }
         }
         let cfg = self.cfg.clone();
         let smoke_mode = self.smoke_mode;
