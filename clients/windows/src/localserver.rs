@@ -182,10 +182,11 @@ pub fn bring_up(
     pair_local(cli, rt, store, device, hint, &status)
 }
 
-/// Where the local server listens: the server's default port on this machine. The server listens
-/// on every address by default and its payload names no direct address, so the app pins this one
-/// (and uses no relay for this machine).
-const LOOPBACK: SocketAddr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 47297);
+/// Where the local server listens: loopback and the port `status --json` names (the server's
+/// default port while it names none). The app pins this address and uses no relay for this machine.
+fn loopback(port: u16) -> SocketAddr {
+    SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port)
+}
 
 /// `forgetty pair --ttl N` opens a pairing window and prints the payload; the app pairs over
 /// loopback while the command waits, then the command reports the device.
@@ -229,7 +230,7 @@ fn pair_local(
             return Err(Fallback::Pair("the server's identity changed while pairing".into()));
         }
         let m = rt
-            .block_on(store::pair_as(store, &offer, device, Some(hint.unwrap_or(LOOPBACK)), true))
+            .block_on(store::pair_as(store, &offer, device, Some(hint.unwrap_or_else(|| loopback(status.port_or_default()))), true))
             .map_err(|e| Fallback::Pair(format!("{e} (dialed {:?}, relays off: {})", offer.direct, offer.relays_disabled)))?;
         // The command prints `paired:` and ends. Not seeing it is not an error: the pairing worked.
         let t1 = Instant::now();

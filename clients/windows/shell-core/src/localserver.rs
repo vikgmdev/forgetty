@@ -144,6 +144,34 @@ pub fn cli_reason(stdout: &str, stderr: &str, code: Option<i32>) -> String {
 pub struct ServerStatus {
     pub node_id: String,
     pub pid: u64,
+    /// The UDP port of the server's endpoint, when `status --json` says one.
+    pub port: Option<u16>,
+}
+
+/// The server's default port, used while `status --json` names none.
+pub const DEFAULT_PORT: u16 = 47297;
+
+impl ServerStatus {
+    pub fn port_or_default(&self) -> u16 {
+        self.port.unwrap_or(DEFAULT_PORT)
+    }
+}
+
+/// The port in a status document: a `port` number, else the port of the first address of a list
+/// (`addresses`, `direct_addrs` or `addrs`, each `ip:port`) that is on loopback, else of the first.
+fn status_port(v: &serde_json::Value) -> Option<u16> {
+    let ok = |n: u64| u16::try_from(n).ok().filter(|p| *p != 0);
+    if let Some(p) = v.get("port").and_then(|p| p.as_u64()).and_then(ok) {
+        return Some(p);
+    }
+    for key in ["addresses", "direct_addrs", "addrs"] {
+        let Some(list) = v.get(key).and_then(|l| l.as_array()) else { continue };
+        let addrs: Vec<std::net::SocketAddr> = list.iter().filter_map(|a| a.as_str()?.trim().parse().ok()).filter(|a: &std::net::SocketAddr| a.port() != 0).collect();
+        if let Some(a) = addrs.iter().find(|a| a.ip().is_loopback()).or(addrs.first()) {
+            return Some(a.port());
+        }
+    }
+    None
 }
 
 pub fn parse_status(json: &str) -> Option<ServerStatus> {
@@ -155,7 +183,7 @@ pub fn parse_status(json: &str) -> Option<ServerStatus> {
     if node_id.is_empty() {
         return None;
     }
-    Some(ServerStatus { node_id, pid: v.get("pid").and_then(|p| p.as_u64()).unwrap_or(0) })
+    Some(ServerStatus { node_id, pid: v.get("pid").and_then(|p| p.as_u64()).unwrap_or(0), port: status_port(&v) })
 }
 
 /// A device paired with the server (`forgetty devices --json`).
@@ -413,10 +441,18 @@ mod tests {
     #[test]
     fn status_json() {
         let ok = r#"{"running":true,"pid":812,"node_id":"abc123","version":"0.1"}"#;
-        assert_eq!(parse_status(ok), Some(ServerStatus { node_id: "abc123".into(), pid: 812 }));
+        assert_eq!(parse_status(ok), Some(ServerStatus { node_id: "abc123".into(), pid: 812, port: None }));
         assert_eq!(parse_status(r#"{"running":false}"#), None);
         assert_eq!(parse_status(r#"{"running":true,"node_id":null}"#), None);
         assert_eq!(parse_status("not json"), None);
+        let with = |extra: &str| parse_status(&format!(r#"{{"running":true,"node_id":"n",{extra}}}"#)).unwrap();
+        assert_eq!(with(r#""pid":1"#).port_or_default(), 47297);
+        assert_eq!(with(r#""port":50123"#).port, Some(50123));
+        assert_eq!(with(r#""port":0"#).port, None);
+        assert_eq!(with(r#""port":70000"#).port, None);
+        assert_eq!(with(r#""addresses":["10.0.0.2:47300","127.0.0.1:47301"]"#).port, Some(47301));
+        assert_eq!(with(r#""direct_addrs":["[::1]:47400"]"#).port, Some(47400));
+        assert_eq!(with(r#""addresses":["junk"]"#).port, None);
         assert_eq!(parse_status(r#"{"running":true,"node_id":" "}"#), None);
     }
 
