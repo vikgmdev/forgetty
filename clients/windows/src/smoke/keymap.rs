@@ -39,6 +39,12 @@ fn pane_key(shell: &mut AppShell, pane: PaneId, chord: &str, window: &mut Window
     false
 }
 
+/// Start (`on`) or finish capturing what the pane's program would be sent.
+fn v_capture(shell: &mut AppShell, pane: PaneId, cx: &mut Context<AppShell>, on: bool) -> Vec<u8> {
+    let Some(v) = shell.views.get(&pane).cloned() else { return Vec::new() };
+    v.update(cx, |v, _| if on { v.capture_input = Some(Vec::new()); Vec::new() } else { v.capture_input.take().unwrap_or_default() })
+}
+
 impl ShellSmoke {
     fn keymap_put(&self, text: &str) {
         if let Err(e) = std::fs::write(&self.keymap.path, text) {
@@ -141,8 +147,18 @@ impl ShellSmoke {
                 check("keymap_gtk_ctrl_c_is_taken_with_a_selection", taken);
                 let cleared = shell.views.get(&pane).is_some_and(|v| v.read(cx).sel.is_none());
                 check("keymap_gtk_ctrl_c_clears_the_selection", cleared);
-                // The next Ctrl+C is the interrupt: the shell leaves it to the program.
-                check("keymap_gtk_second_ctrl_c_is_the_interrupt", !shell.handle_key(&key("ctrl+c"), window, cx));
+                // The next Ctrl+C is the interrupt: the shell leaves it to the program, and the
+                // program gets 0x03.
+                v_capture(shell, pane, cx, true);
+                let left_to_program = !shell.handle_key(&key("ctrl+c"), window, cx);
+                if let Some(v) = shell.views.get(&pane).cloned() {
+                    let ev = KeyDownEvent { keystroke: key("ctrl+c"), is_held: false, prefer_character_input: false };
+                    v.update(cx, |v, vcx| v.on_key_down(&ev, window, vcx));
+                }
+                let sent = v_capture(shell, pane, cx, false);
+                check("keymap_gtk_second_ctrl_c_is_the_interrupt", left_to_program);
+                record("keymap_second_ctrl_c_bytes", json!(format!("{sent:?}")));
+                check("keymap_gtk_second_ctrl_c_reaches_the_program_as_0x03", sent == vec![0x03]);
                 // Alt+9 with no ninth workspace is the program's key.
                 check("keymap_gtk_alt_digit_without_a_workspace_is_the_programs", shell.layout.workspaces.len() < 9 && !shell.handle_key(&key("alt+9"), window, cx));
                 // Ctrl+Shift+Q asks first while a local shell is open; Enter says no.
@@ -150,6 +166,28 @@ impl ShellSmoke {
                 check("keymap_quit_asks_with_a_local_shell", shell.confirm.as_ref().is_some_and(|c| c.text.contains("local shell")));
                 shell.handle_key(&key("enter"), window, cx);
                 check("keymap_quit_enter_cancels", shell.confirm.is_none());
+                // The pair dialog is closed by the question (it asks from the key and from the
+                // window's X alike).
+                shell.open_pair(cx);
+                shell.request_quit(cx);
+                check("keymap_quit_question_closes_the_pair_dialog", shell.confirm.is_some() && shell.pair.is_none());
+                shell.handle_key(&key("escape"), window, cx);
+                check("keymap_quit_escape_cancels", shell.confirm.is_none() && shell.pair.is_none());
+                shell.open_pair(cx);
+                let x_allowed = shell.close_allowed(cx);
+                check("keymap_window_x_asks_and_closes_the_pair_dialog", !x_allowed && shell.confirm.is_some() && shell.pair.is_none());
+                shell.confirm_no(cx);
+                // With both up (the question over a dialog), the keys belong to the question: Enter
+                // does not pair, Esc cancels the question and leaves the dialog alone.
+                shell.pair = Some(crate::machines::PairDialog { stage: crate::machines::PairStage::Input, raw: "not a payload".into(), prefill: None });
+                shell.confirm = Some(crate::menus::Confirm { text: "Quit?".into(), act: crate::menus::ConfirmAct::Quit });
+                shell.handle_key(&key("enter"), window, cx);
+                let untouched = shell.pair.as_ref().is_some_and(|d| matches!(d.stage, crate::machines::PairStage::Input));
+                check("keymap_enter_with_the_question_over_the_pair_dialog_does_not_pair", shell.confirm.is_none() && untouched);
+                shell.confirm = Some(crate::menus::Confirm { text: "Quit?".into(), act: crate::menus::ConfirmAct::Quit });
+                shell.handle_key(&key("escape"), window, cx);
+                check("keymap_escape_cancels_only_the_question", shell.confirm.is_none() && shell.pair.is_some());
+                shell.pair_cancel(cx);
                 let clip = cx.read_from_clipboard().and_then(|i| i.text()).unwrap_or_default();
                 record("keymap_ctrl_c_clip", json!(clip));
                 check("keymap_gtk_ctrl_c_copies_a_selection", !clip.is_empty() && clip != "x-before");

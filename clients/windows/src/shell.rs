@@ -1280,12 +1280,14 @@ impl AppShell {
     /// Returns true when the shell consumed the key (the terminal must not see it).
     pub fn handle_key(&mut self, ks: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let chord = Self::chord_of(ks);
-        if self.pair.is_some() {
-            self.pair_key(ks, cx);
-            return true;
-        }
+        // A question the shell asks (quit, delete) comes before every other overlay: its answer
+        // keys must not reach a dialog behind it.
         if self.confirm.is_some() {
             self.confirm_key(ks, cx);
+            return true;
+        }
+        if self.pair.is_some() {
+            self.pair_key(ks, cx);
             return true;
         }
         if self.shortcuts.is_some() {
@@ -1348,6 +1350,8 @@ impl AppShell {
         self.menu = None;
         self.palette = None;
         self.rename = None;
+        // The pair dialog goes first: Enter on the question must not pair a machine.
+        self.pair = None;
         self.confirm = Some(crate::menus::Confirm { text: forgetty_shell_core::ops::quit_text(n), act: crate::menus::ConfirmAct::Quit });
         cx.notify();
         false
