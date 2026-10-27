@@ -98,13 +98,17 @@ fn forgetty(state: &Path, timer: &str, args: &[&str]) -> Output {
     for (k, v) in EXTRA_ENV.lock().unwrap().iter() {
         command.env(k, v);
     }
+    // "default" leaves the variable unset: the server's own setting (the 1 ms tick while panes
+    // are in use).
+    if timer != "default" {
+        command.env("FORGETTY_TIMER_RES", timer);
+    }
     command
         .arg("--state-dir")
         .arg(state)
         .args(args)
         .env("FORGETTY_TEST_ALLOW_ELEVATED", "1")
         .env("FORGETTY_PORT", "0")
-        .env("FORGETTY_TIMER_RES", timer)
         .env("FORGETTY_TRACE_LATENCY", "1")
         .env("RUST_LOG", "latency=info,forgetty_pty=info,forgetty_server=info")
         .output()
@@ -151,6 +155,9 @@ fn in_process(label: &str) -> Stats {
 
 fn in_process_with(label: &str, argv: &[&str]) -> Stats {
     use std::io::{Read, Write};
+    // This process stands for a program that asks for no finer timer: the pty crate's own
+    // 1 ms request while a pane is in use stays off here (the servers started below have theirs).
+    std::env::set_var("FORGETTY_TIMER_RES", "off");
     let cmd: Vec<String> = argv.iter().map(|a| a.to_string()).collect();
     let mut pty =
         forgetty_pty::PtyProcess::spawn(forgetty_pty::PtySize::default(), None, Some(&cmd), false)
@@ -462,7 +469,7 @@ async fn powershell_echo_by_power_throttling_and_conpty_flags() {
         // The test process asks for no finer timer (the matrix test, which does, runs after this
         // one), so the system timer is at its default unless another process on the machine asked.
         println!("PROBE system timer period at the start of the steps: {:.2} ms", system_tick_ms());
-        let steps: [(&str, &str, &[(&str, &str)]); 7] = [
+        let steps: [(&str, &str, &[(&str, &str)]); 8] = [
             ("baseline", "off", &[]),
             ("1 server opted out", "off", &[("FORGETTY_POWER_THROTTLING", "server")]),
             ("2 server and shells opted out", "off", &[("FORGETTY_POWER_THROTTLING", "shells")]),
@@ -470,6 +477,7 @@ async fn powershell_echo_by_power_throttling_and_conpty_flags() {
             ("3b conpty inherit cursor and win32 input", "off", &[("FORGETTY_CONPTY_FLAGS", "0x5")]),
             ("4a server timeBeginPeriod(1)", "period", &[]),
             ("4b server timeBeginPeriod(1) and throttling off", "full", &[]),
+            ("5 server default (1 ms while in use)", "default", &[]),
         ];
         for shell in &shells {
             let base = in_process_with(&format!("in process, {}", shell[0]), shell);

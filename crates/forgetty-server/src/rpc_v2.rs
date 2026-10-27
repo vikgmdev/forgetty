@@ -2362,6 +2362,7 @@ impl Session {
         guard: InflightGuard,
     ) -> Result<Value, (&'static str, String)> {
         let pane = PaneId(p.pane_id);
+        forgetty_pty::timer_boost::note_activity();
         let t = std::time::Instant::now();
         let Some(info) = self.rpc.sm.pane_info(pane) else {
             return Err((error_code::NOT_FOUND, "no such pane".into()));

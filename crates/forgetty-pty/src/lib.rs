@@ -5,6 +5,7 @@
 //! terminal panes.
 
 pub mod multiplexer;
+pub mod timer_boost;
 #[cfg(not(windows))]
 pub mod process;
 #[cfg(windows)]

@@ -767,6 +767,7 @@ impl PtyProcess {
             Some(c) if !c.is_empty() => c.to_vec(),
             _ => default_shell_argv(),
         };
+        crate::timer_boost::note_activity();
         let program = resolve_program(&argv[0])?;
         check_batch_args(&program, &argv[1..]).map_err(ForgettyError::Pty)?;
         let mut cmdline = command_line(&program, &argv[1..])?;
