@@ -97,6 +97,7 @@ pub struct Settings {
     look: Look,
     editor: TextArea,
     editor_loaded: bool,
+    fonts_loading: bool,
     /// The file text the editor started from (or was last saved as, or kept over).
     expect: String,
     /// The text of a save on its way.
@@ -188,6 +189,8 @@ pub struct LookView {
     pub current_family: String,
     pub current_size: f32,
     pub theme_note: Option<String>,
+    /// The installed font names are still being read: the font list is empty until then.
+    pub fonts_loading: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -246,6 +249,7 @@ impl Settings {
             look: Look { zone: Zone::Theme, theme_filter: String::new(), theme_hi: 0, font_filter: String::new(), font_hi: 0, mono_only: true, size: ctx.cfg.font_size_pt },
             editor: TextArea::new(""),
             editor_loaded: false,
+            fonts_loading: false,
             expect: String::new(),
             sent: None,
             stale: None,
@@ -257,6 +261,17 @@ impl Settings {
         };
         s.look_sync(ctx);
         s
+    }
+
+    /// The font names are being read (the window opened before they were known).
+    pub fn set_fonts_loading(&mut self, b: bool) {
+        self.fonts_loading = b;
+    }
+
+    /// The font names arrived: the lists and the highlight come from them.
+    pub fn fonts_changed(&mut self, ctx: &Ctx) {
+        self.fonts_loading = false;
+        self.look_sync(ctx);
     }
 
     /// How many rows the page can show (the window sets it from its height).
@@ -1144,6 +1159,7 @@ impl Settings {
             current_family: ctx.cfg.font_family.clone(),
             current_size: ctx.cfg.font_size_pt,
             theme_note: None,
+            fonts_loading: self.fonts_loading,
         }
     }
 

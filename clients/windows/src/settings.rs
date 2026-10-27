@@ -57,12 +57,25 @@ impl AppShell {
             }
             return;
         }
-        if self.font_names.is_none() {
-            let mut names = cx.text_system().all_font_names();
-            names.retain(|n| !n.starts_with('@') && !n.is_empty());
-            names.sort_by_key(|n| n.to_lowercase());
-            names.dedup();
-            self.font_names = Some(names);
+        // Listing every installed font takes a moment: the window opens at once and the list
+        // fills in when the background thread is done.
+        let loading = self.font_names.is_none();
+        if loading {
+            let ts = cx.text_system().clone();
+            cx.spawn(async move |this, cx| {
+                let names = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let mut names = ts.all_font_names();
+                        names.retain(|n| !n.starts_with('@') && !n.is_empty());
+                        names.sort_by_key(|n| n.to_lowercase());
+                        names.dedup();
+                        names
+                    })
+                    .await;
+                let _ = this.update(cx, |s, cx| s.fonts_loaded(names, cx));
+            })
+            .detach();
         }
         let fonts = self.font_names.clone().unwrap_or_default();
         let idx = self.themes.clone();
@@ -71,12 +84,23 @@ impl AppShell {
             let colors = |n: &str| idx.as_ref().and_then(|t| t.colors(n));
             let path = config_path_text();
             let ctx = Ctx { cfg: &self.file_cfg, themes: names, fonts: &fonts, colors: &colors, config_path: &path };
-            Settings::new(&ctx)
+            let mut st = Settings::new(&ctx);
+            st.set_fonts_loading(loading);
+            st
         };
         self.settings = Some(Box::new(SettingsWin { st, fonts }));
         if let Some(p) = page {
             self.settings_page(p, cx);
         }
+        cx.notify();
+    }
+
+    fn fonts_loaded(&mut self, names: Vec<String>, cx: &mut Context<Self>) {
+        self.font_names = Some(names.clone());
+        if let Some(w) = self.settings.as_mut() {
+            w.fonts = names;
+        }
+        self.with_settings(|st, ctx| st.fonts_changed(ctx));
         cx.notify();
     }
 
@@ -766,7 +790,7 @@ impl AppShell {
                     .child(line(vec![("warning: ", ansi[3]), ("0O 1lI {} []", fg)]))
                     .child(line(vec![("info ", ansi[4]), ("42 ", ansi[5]), ("ms", fg)])),
             )
-            .child(div().text_size(px(11.5)).text_color(hsla(th.dim)).child(SharedString::from(format!("{} / {} / {} pt", l.preview_theme, l.preview_family, trim_pt(l.size)))))
+            .child(div().text_size(px(11.5)).text_color(hsla(th.dim)).child(SharedString::from(format!("{} / {} / {} pt{}", l.preview_theme, l.preview_family, trim_pt(l.size), if l.fonts_loading { "   (reading the installed fonts...)" } else { "" }))))
             .child(
                 div()
                     .flex()
