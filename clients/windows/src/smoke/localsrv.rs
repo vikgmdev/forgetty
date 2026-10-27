@@ -35,7 +35,7 @@ pub struct LsPhase {
     /// The PowerShell pair: shells (name, argv), the one under test, and its tab and probes.
     ps_shells: Vec<(String, Vec<String>)>,
     ps_idx: usize,
-    ps_tabs_before: usize,
+    ps_known_tabs: Vec<Uuid>,
     ps_focused: bool,
     ps_tab: Option<Uuid>,
     ps_pane: Option<PaneId>,
@@ -295,7 +295,8 @@ impl ShellSmoke {
         };
         match self.sub {
             0 => {
-                self.ls.ps_tabs_before = shell.layout.tab_count();
+                // The tab ids that exist now: the previous leg's tab may still be closing.
+                self.ls.ps_known_tabs = shell.layout.active_workspace().map(|w| w.tabs.iter().map(|t| t.id).collect()).unwrap_or_default();
                 self.ls.ps_focused = false;
                 self.ls.ps_model.clear();
                 self.ls.ps_probe = None;
@@ -310,13 +311,13 @@ impl ShellSmoke {
                 self.sub_t0 = Instant::now();
             }
             1 => {
-                if shell.layout.tab_count() <= self.ls.ps_tabs_before {
+                let known = &self.ls.ps_known_tabs;
+                let Some((tab, p)) = shell.layout.active_workspace().and_then(|w| w.tabs.iter().find(|t| !known.contains(&t.id)).map(|t| (t.id, t.pane_tree.first_leaf()))) else {
                     if self.sub_t0.elapsed() > Duration::from_secs(20) {
                         fail(&format!("powershell {leg} {name}: the new tab did not appear"));
                     }
                     return;
-                }
-                let Some((tab, p)) = shell.layout.active_workspace().and_then(|w| w.tabs.last().map(|t| (t.id, t.pane_tree.first_leaf()))) else { return };
+                };
                 if shell.active_pane() != Some(p) {
                     if !self.ls.ps_focused {
                         self.ls.ps_focused = true;
