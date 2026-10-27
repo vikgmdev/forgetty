@@ -9,6 +9,8 @@ pub struct KeyIn<'a> {
     pub ctrl: bool,
     pub shift: bool,
     pub alt: bool,
+    /// The Windows key.
+    pub win: bool,
     /// The characters the key types, if any.
     pub text: Option<&'a str>,
 }

@@ -30,6 +30,7 @@ pub mod scrollbar;
 pub mod search;
 pub mod settings;
 pub mod settings_file;
+pub mod settings_ui;
 pub mod shortcuts;
 pub mod selection;
 pub mod source;
