@@ -106,6 +106,31 @@ async fn probe_task(
         PROBE_MS.lock().unwrap().push(ms(t0.elapsed()));
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    // E5: the own pane at the size of the UI pane (is it the size?).
+    if let Ok(info) = backend.get_pane_info(forgetty_shell_core::PaneId(ui_pane)).await {
+        let _ = c.resize(pane, info.rows, info.cols).await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        while let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(300), stream.next()).await {}
+        for i in 0..40usize {
+            let key = b'a' + (i % 26) as u8;
+            let t0 = Instant::now();
+            c.send_input(pane, &[key]).await.map_err(|e| format!("send: {e}"))?;
+            loop {
+                let left = Duration::from_secs(5).saturating_sub(t0.elapsed());
+                match tokio::time::timeout(left, stream.next()).await {
+                    Ok(Some(PaneItem::Data { bytes, .. })) if bytes.contains(&key) => break,
+                    Ok(Some(_)) => {}
+                    _ => return Err(format!("resized pane: no echo of {:?}", key as char)),
+                }
+            }
+            E5_MS.lock().unwrap().push(ms(t0.elapsed()));
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    // The server reports the command a pane was started with (`argv` of the pane info).
+    if let Ok(info) = backend.get_pane_info(forgetty_shell_core::PaneId(ui_pane)).await {
+        *UI_PANE_ARGV.lock().unwrap() = Some(info.argv);
+    }
     // E2: the young connection typing into the pane the UI shows (the line is cleared after).
     {
         let mut ui = c.attach_pane(ui_pane).await.map_err(|e| format!("attach ui pane: {e}"))?;
@@ -136,6 +161,8 @@ async fn probe_task(
     Ok(())
 }
 
+static UI_PANE_ARGV: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
+static E5_MS: std::sync::Mutex<Vec<f64>> = std::sync::Mutex::new(Vec::new());
 static E2_MS: std::sync::Mutex<Vec<f64>> = std::sync::Mutex::new(Vec::new());
 static E3_MS: std::sync::Mutex<Vec<f64>> = std::sync::Mutex::new(Vec::new());
 
@@ -387,12 +414,17 @@ impl ShellSmoke {
                                 "local_server_in_app_probe_ms",
                                 json!({"n": sorted.len(), "p50": p50_of(&v), "p95": sorted.get(sorted.len() * 95 / 100), "max": sorted.last(), "error": PROBE_ERR.lock().unwrap().clone()}),
                             );
+                            let argv = UI_PANE_ARGV.lock().unwrap().clone();
+                            record("local_server_pane_info_argv", json!(argv));
+                            // The tab was started with the smoke's cmd.exe: the server says so.
+                            check("local_server_pane_info_reports_argv", argv.as_ref().is_some_and(|a| a.first().is_some_and(|p| p.to_ascii_lowercase().ends_with("cmd.exe"))));
                             let (e2, e3) = (E2_MS.lock().unwrap().clone(), E3_MS.lock().unwrap().clone());
                             record(
                                 "local_server_probe_variants_ms",
                                 json!({"own_pane_own_connection": p50_of(&v),
                                        "app_connection_and_pane_source_own_pane": {"n": e3.len(), "p50": p50_of(&e3)},
-                                       "own_connection_into_ui_pane": {"n": e2.len(), "p50": p50_of(&e2)}}),
+                                       "own_connection_into_ui_pane": {"n": e2.len(), "p50": p50_of(&e2)},
+                                       "own_pane_resized_to_the_ui_pane": {"n": E5_MS.lock().unwrap().len(), "p50": p50_of(&E5_MS.lock().unwrap())}}),
                             );
                             if let Some(d) = self.ls.cli.as_ref().and_then(|c| c.state_dir.as_deref()) {
                                 record("local_server_stage_us_after_in_app_probe", server_stages(d));
