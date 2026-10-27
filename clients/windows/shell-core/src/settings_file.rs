@@ -150,6 +150,9 @@ fn name_of(path: &Path) -> String {
     path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "the file".into())
 }
 
+/// What a refused editor save says when the file is not what the editor read.
+pub const CHANGED_ON_DISK: &str = "changed on disk";
+
 /// One write at a time in this process: two saves (a row and the editor, a second window) would
 /// otherwise read the same file and the second would drop the first one's change.
 static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -181,14 +184,9 @@ fn sweep_stale(path: &Path) {
 /// first byte is written. The data is on disk when this returns.
 fn write_new_like(model: &Path, dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
-    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(dest)?;
-    let r = (|| {
-        if model.exists() {
-            crate::fileperm::copy_security(model, dest)?;
-        }
-        f.write_all(bytes)?;
-        f.sync_all()
-    })();
+    // The file is created with the model's access rules (no moment with the folder's).
+    let mut f = crate::fileperm::create_new_like(model, dest)?;
+    let r = f.write_all(bytes).and_then(|()| f.sync_all());
     if r.is_err() {
         drop(f);
         let _ = std::fs::remove_file(dest);
@@ -288,7 +286,7 @@ pub fn save_text(path: &Path, text: &str, expect: &str) -> Result<Saved, String>
     let _guard = write_lock();
     let cur = read_current(path)?;
     if cur != expect {
-        return Err(format!("Not saved: {} changed on disk after the editor read it. Choose Reload or Keep in the editor, then save again.", name_of(path)));
+        return Err(format!("Not saved: {} {CHANGED_ON_DISK} after the editor read it. Choose Reload or Keep in the editor, then save again.", name_of(path)));
     }
     if cur != text && path.exists() {
         let bak = path.with_extension("toml.bak");
