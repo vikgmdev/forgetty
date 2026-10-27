@@ -914,6 +914,7 @@ impl SessionBackend for LocalBackend {
                 title: p.title.clone(),
                 cwd: p.cwd.clone(),
                 spawn_cwd: p.spawn_cwd.clone(),
+                argv: Vec::new(),
                 status: p.status,
                 exited: p.pty.has_exited(),
                 size_owner: None,

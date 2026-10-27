@@ -287,6 +287,9 @@ pub struct PaneInfo {
     /// The directory the shell was started in, when the server says (`spawn_cwd`). The only
     /// directory "Duplicate tab" may reuse.
     pub spawn_cwd: Option<String>,
+    /// The command the pane was started with (`argv` of the server's pane info). Empty for the
+    /// default shell, and when the server does not say.
+    pub argv: Vec<String>,
     pub status: PaneStatus,
     /// True once the process ended (the pane is about to be removed).
     pub exited: bool,
