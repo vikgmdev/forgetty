@@ -229,6 +229,8 @@ pub struct AppShell {
     /// Extra direct address for the next pairing (CI smoke, LAN). It is stored as a pinned address.
     pub pair_hint: Option<std::net::SocketAddr>,
     pub(crate) switch_to: Option<Uuid>,
+    /// The local server: state, the machine it backs, the watchdog.
+    pub lsrv: crate::localserver::LocalSrv,
 }
 
 pub fn basename(path: &str) -> String {
@@ -340,6 +342,7 @@ impl AppShell {
             pair_hint: None,
             pair_clip_seen: None,
             switch_to: None,
+            lsrv: Default::default(),
         };
         let mut shell = shell;
         // The local machine is on screen first; its events feed the same
@@ -393,7 +396,8 @@ impl AppShell {
             let layout = fut.await.unwrap_or_default();
             let _ = this.update(cx, |s, cx| {
                 s.apply_layout(layout, cx);
-                if s.layout.tab_count() == 0 {
+                // While the local server comes up the window waits for its tabs.
+                if s.layout.tab_count() == 0 && !s.lsrv.pending() {
                     s.new_tab(cx);
                 }
             });
@@ -540,6 +544,10 @@ impl AppShell {
             // The last local tab closed: the app ends. A remote machine just shows no tabs.
             cx.quit();
             return;
+        } else if self.had_tabs && self.lsrv.machine == Some(self.machine.id) {
+            // The same for the local server, after a look: a server that restarts can report
+            // an empty layout for a moment before it restores its tabs.
+            self.quit_if_still_empty(self.machine.id, cx);
         }
         self.layout = layout;
         // A menu or question about something that is gone closes.
@@ -813,7 +821,7 @@ impl AppShell {
     /// A plain new tab: the default profile on this PC (as GTK: `default_profile`, else the first
     /// profile), else the shell. A remote machine always opens its own shell.
     pub fn new_tab(&mut self, cx: &mut Context<Self>) {
-        let profile = self.cfg.default_profile().cloned().filter(|_| self.machine.kind == forgetty_shell_core::MachineKind::Local);
+        let profile = self.cfg.default_profile().cloned().filter(|_| self.is_this_pc());
         match profile {
             Some(p) => self.start_profile_tab(&p, cx),
             None => self.new_tab_with(Vec::new(), None, cx),
@@ -827,7 +835,7 @@ impl AppShell {
             return;
         };
         // A profile is a program on this PC. A remote machine has its own shells.
-        if self.machine.kind != forgetty_shell_core::MachineKind::Local {
+        if !self.is_this_pc() {
             self.notice_active("Profiles start programs on this PC. Switch to this PC to use one.".into(), cx);
             return;
         }

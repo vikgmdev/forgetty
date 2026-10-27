@@ -29,6 +29,7 @@ mod wp1;
 mod wp2;
 mod wp3;
 mod keymap;
+mod localsrv;
 mod settings;
 mod wp3d;
 
@@ -178,6 +179,12 @@ enum Phase {
     Keymap,
     // The Settings window (WP4).
     Settings,
+    // The local server (WP6).
+    LsStart,
+    LsWait,
+    LsKeys,
+    LsKill,
+    LsDone,
     // W3: remote machines.
     RSetup,
     RPair,
@@ -236,6 +243,11 @@ impl Phase {
             Phase::Wp3d => "wp3d-spawn-latency",
             Phase::Keymap => "keymap-presets",
             Phase::Settings => "settings-window",
+            Phase::LsStart => "ls-start",
+            Phase::LsWait => "ls-wait-for-server",
+            Phase::LsKeys => "ls-keystrokes",
+            Phase::LsKill => "ls-kill-and-restart",
+            Phase::LsDone => "ls-done",
             Phase::RSetup => "w3-start-server-and-pair",
             Phase::RPair => "w3-wait-for-panes",
             Phase::REcho => "w3-remote-echo",
@@ -311,6 +323,7 @@ pub struct ShellSmoke {
     wp3: wp3::Wp3,
     wp3d: wp3d::Wp3d,
     keymap: keymap::KeymapPhase,
+    ls: localsrv::LsPhase,
     settings: settings::SettingsPhase,
     real: real::Real,
 }
@@ -410,13 +423,14 @@ impl ShellSmoke {
             wp3d: wp3d::Wp3d::default(),
             keymap: keymap::KeymapPhase::default(),
             settings: settings::SettingsPhase::default(),
+            ls: localsrv::LsPhase::default(),
             real: real::Real::new(real_distro),
         }
     }
 
     /// Phases that measure latency or throughput must not get extra frames.
     pub fn wants_ticks(&self) -> bool {
-        !matches!(self.phase, Phase::Keys | Phase::Throughput | Phase::Synth | Phase::Keys4 | Phase::RKeys)
+        !matches!(self.phase, Phase::Keys | Phase::Throughput | Phase::Synth | Phase::Keys4 | Phase::RKeys | Phase::LsKeys)
     }
 
     /// The runner's frame interval in ms: the median gap between frames (60 Hz on WARP gives 16.7).
@@ -1416,6 +1430,7 @@ impl ShellSmoke {
             Phase::Wp3d => self.wp3d(shell, window, cx),
             Phase::Keymap => self.keymap(shell, window, cx),
             Phase::Settings => self.settings(shell, window, cx),
+            Phase::LsStart | Phase::LsWait | Phase::LsKeys | Phase::LsKill | Phase::LsDone => self.ls_step(shell, window, cx, now_t),
             Phase::RSetup | Phase::RPair | Phase::REcho | Phase::RKeys | Phase::RKill | Phase::RRestart | Phase::RToast | Phase::RServer | Phase::W5View => {
                 self.w3_step(shell, window, cx, now_t)
             }

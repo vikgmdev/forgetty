@@ -194,7 +194,8 @@ impl AppShell {
         })
         .detach();
 
-        for m in stored {
+        // The local server's machine is the supervisor's: it starts the server first.
+        for m in stored.into_iter().filter(|m| !m.local) {
             self.connect_stored(m, false, cx);
         }
     }
@@ -209,7 +210,17 @@ impl AppShell {
                 while let Ok(e) = rx.try_recv() {
                     evs.push(e);
                 }
-                if this.update(cx, |s, cx| s.machine_events(id, evs, cx)).is_err() {
+                // A machine that was dropped from the list ends its pump.
+                let alive = this
+                    .update(cx, |s, cx| {
+                        let known = s.machines.iter().any(|m| m.id == id);
+                        if known {
+                            s.machine_events(id, evs, cx);
+                        }
+                        known
+                    })
+                    .unwrap_or(false);
+                if !alive {
                     break;
                 }
             }
@@ -277,6 +288,7 @@ impl AppShell {
             self.switch_to = None;
             self.switch_machine(info.id, cx);
         }
+        self.adopted(info.id, cx);
         cx.notify();
     }
 

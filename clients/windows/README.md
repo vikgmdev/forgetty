@@ -308,7 +308,8 @@ the real server answers all of them.
 - puts the install folder on the user PATH (`HKCU\Environment`);
 - starts the server at login: the value `Forgetty server` under
   `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` runs
-  `forgetty.exe server start`. The server does not run elevated;
+  `forgetty-win.exe --start-server`, which runs `forgetty.exe server start`
+  without a console window. The server does not run elevated;
 - stops the server before an uninstall or an upgrade (`forgetty.exe server
   stop`), so the files are not in use. The server's data and saved layout stay;
 - uninstall removes all of it and keeps `%APPDATA%\forgetty` (paired machines,
@@ -369,3 +370,43 @@ ConPTY itself delivers only a few thousand lines per second, so the 20 MB drain 
 
 Keystrokes in the latency test are injected at `TerminalView::send_keystroke` (same encoder path
 as a real key), below the Win32 key event hop.
+
+## Local server (WP6)
+
+Tabs live in `forgetty.exe`, the per-user server, so they outlive the window.
+At start the app (a window that is not elevated, `local_server` not `false`):
+
+1. looks for `forgetty.exe` next to `forgetty-win.exe`, then on `PATH`;
+2. runs `forgetty.exe server start` with no console window (it does nothing when
+   a server answers);
+3. pairs by itself: `forgetty pair --ttl 30` prints a payload, the app pairs over
+   loopback with the code of the pair dialog, and stores the machine with
+   `local: true` in `machines.json`. An existing pairing is reused while the
+   server's node id is the same;
+4. shows the machine as **This PC** in the sidebar, over `RemoteBackend`, and
+   drops the built-in terminal from the list.
+
+While this runs the window has no tab (a second or two). When it cannot work the
+built-in ConPTY terminal is used and a notice says why: no `forgetty.exe`, the
+server did not start or pair, or the window is elevated (the server refuses to
+run elevated, so an administrator window always uses the built-in terminal and
+its tabs end with the window). `local_server = false` in the config turns the
+server off without a notice.
+
+A watchdog looks once a second. When the link to the server is down for 3 s it
+runs `forgetty server start` again (at 0, 5 and 15 s after that) and, when the
+link is still down 25 s after the third try, the built-in terminal comes back
+with a notice. The server machine is not shown for a server that was replaced
+(new node id): the next start pairs again.
+
+Closing the last tab ends the app, as for the built-in terminal, after 1.5 s
+(a server that restarts can report an empty layout before it restores its tabs).
+Closing the window leaves the tabs in the server.
+
+Differences from the built-in terminal: the `shell` setting and profiles are
+read by the server for new tabs (same `config.toml`); a changed `shell` applies
+after `forgetty server stop`. `--smoke` runs the real `forgetty.exe` named by
+`FORGETTY_SERVER_EXE` (a build that allows an elevated run, which the CI runner
+is) in its own `--state-dir`, pairs, times keys against the built-in pane
+(`local_server_key_p50_within_2ms_of_in_process`), kills the server and waits for
+the watchdog to bring it back.

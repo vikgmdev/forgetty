@@ -118,7 +118,7 @@ impl AppShell {
         let n = self.layout.active_workspace().map(|w| w.tabs.len()).unwrap_or(0) as f32;
         let at = (left + n * tw + PLUS_W, TITLEBAR_H);
         // Profiles start programs on this PC: a remote machine's menu lists none.
-        let profiles = if self.machine.kind == forgetty_shell_core::MachineKind::Local {
+        let profiles = if self.is_this_pc() {
             self.cfg.profiles.iter().map(|p| p.name.clone()).collect()
         } else {
             Vec::new()

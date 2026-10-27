@@ -68,11 +68,20 @@ jobs:
           Copy-Item target/release/forgetty.exe clients/windows/target/release/
         shell: pwsh
 
+      # The same server with debug assertions on: only such a build reads FORGETTY_TEST_ALLOW_ELEVATED
+      # (a release build never runs elevated), and this runner is an administrator. Everything else
+      # is the release code, so the smoke measures real latency. It is a copy for the smoke only.
+      - name: Build forgetty.exe that may run elevated (local server smoke only)
+        run: |
+          cargo build --release --locked -p forgetty-server --bin forgetty --config "profile.release.package.forgetty-server.debug-assertions=true"
+          Copy-Item target/release/forgetty.exe clients/windows/target/release/forgetty-test.exe
+        shell: pwsh
+
       - name: Unit tests (shell core, remote backend)
         working-directory: clients/windows
         run: |
           # The ConPTY tests in shell-core's local module are covered by the smoke.
-          cargo test --release --locked -p forgetty-shell-core --lib -- conpty:: notify:: layout:: keys:: osc:: osc52:: fuzzy:: update:: search:: links:: copytext:: paste:: selection:: scrollbar:: bell:: codeblock:: colors:: menu:: ops:: fingerprint:: config:: argv:: confwatch:: resolve:: settings:: settings_file:: settings_ui:: shortcuts:: textarea::
+          cargo test --release --locked -p forgetty-shell-core --lib -- conpty:: notify:: localserver:: layout:: keys:: osc:: osc52:: fuzzy:: update:: search:: links:: copytext:: paste:: selection:: scrollbar:: bell:: codeblock:: colors:: menu:: ops:: fingerprint:: config:: argv:: confwatch:: resolve:: settings:: settings_file:: settings_ui:: shortcuts:: textarea::
           cargo test --release --locked -p forgetty-remote
 
       - name: Turn on the Japanese and Chinese input methods for the smoke
@@ -89,6 +98,10 @@ jobs:
       - name: Smoke
         shell: pwsh
         working-directory: clients/windows/target/release
+        env:
+          # The local server phase starts this build with its own --state-dir.
+          FORGETTY_SERVER_EXE: ${{ github.workspace }}\clients\windows\target\release\forgetty-test.exe
+          FORGETTY_TEST_ALLOW_ELEVATED: "1"
         run: |
           Get-ChildItem *.exe, *.dll | Format-Table Name, Length
           # The release exe is GUI-subsystem: wait for it explicitly. It attaches to this console.
@@ -341,7 +354,7 @@ jobs:
           if (Test-Path "HKLM:\Software\Forgetty") { throw "wrote to HKLM" }
           # The login autostart for the server (design decision 8).
           $run = (Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run")."Forgetty server"
-          $want = "`"$dir\forgetty.exe`" server start"
+          $want = "`"$dir\forgetty-win.exe`" --start-server"
           if ($run -ne $want) { throw "Run value is '$run', want '$want'" }
           Write-Host "installed to $dir"
 
@@ -384,6 +397,11 @@ jobs:
             $out = & $cli --state-dir $state server run 2>&1
             Write-Host "forgetty.exe server run (elevated): exit $LASTEXITCODE, $out"
             if ($LASTEXITCODE -ne 78) { throw "an elevated server run must exit 78, got $LASTEXITCODE" }
+            # The Run value runs this. It shows no window, finds forgetty.exe next to itself, and
+            # ends with 1 when the server will not start (here: elevated). 2 would be "no forgetty.exe".
+            $p = Start-Process (Join-Path $dir "forgetty-win.exe") -ArgumentList '--start-server' -Wait -PassThru
+            Write-Host "forgetty-win.exe --start-server (elevated): exit $($p.ExitCode)"
+            if ($p.ExitCode -ne 1) { throw "--start-server must end with 1 when the server refuses to start, got $($p.ExitCode)" }
             # The step must not end with the exit code of this check.
             $global:LASTEXITCODE = 0
           }

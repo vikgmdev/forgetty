@@ -8,7 +8,9 @@
   - The install folder is added to the user PATH (HKCU). forgetty.exe there is the
     CLI and the per-user server (`forgetty server start|stop|status`, `forgetty ls`, ...).
     forgetty-win.exe is the app.
-  - An HKCU Run value starts the server at login: `forgetty.exe server start`.
+  - An HKCU Run value starts the server at login: `forgetty-win.exe --start-server`, which runs
+    `forgetty.exe server start` with no window (forgetty.exe is a console program, and Run
+    would flash a console window for it).
   - Before an uninstall or an upgrade the server is stopped (`forgetty.exe server stop`), so
     the exe is not in use. Its saved layout and data stay.
   - Unsigned for now: Windows SmartScreen shows "Unknown publisher" (README).
@@ -60,7 +62,7 @@
       </Component>
       <Component Id="ServerAutostart" Guid="*">
         <RegistryValue Root="HKCU" Key="Software\Microsoft\Windows\CurrentVersion\Run" Name="Forgetty server"
-                       Type="string" Value="&quot;[INSTALLFOLDER]forgetty.exe&quot; server start" KeyPath="yes" />
+                       Type="string" Value="&quot;[INSTALLFOLDER]forgetty-win.exe&quot; --start-server" KeyPath="yes" />
       </Component>
       <Component Id="UserPath" Guid="*">
         <Environment Id="UserPathEntry" Name="PATH" Action="set" Part="last" Value="[INSTALLFOLDER]" System="no" Permanent="no" />

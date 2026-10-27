@@ -16,6 +16,7 @@ mod console;
 mod element;
 mod encoder;
 mod lineedit;
+mod localserver;
 mod machines;
 mod menus;
 mod screenshot;
@@ -36,6 +37,10 @@ use config::{Backdrop, Config};
 use shell::AppShell;
 
 fn main() {
+    // The login Run value: start the local server without a window, then end.
+    if std::env::args().any(|a| a == "--start-server") {
+        std::process::exit(localserver::start_server_main());
+    }
     let start = Instant::now();
     let smoke = std::env::args().any(|a| a == "--smoke");
     if smoke {
@@ -82,6 +87,7 @@ fn main() {
         config::load()
     };
     let mut cfg = startup.config;
+    let local_server_on = cfg.local_server;
     let cfg_err = startup.error;
     let startup_warnings = startup.warnings;
     fit_backdrop(&mut cfg);
@@ -155,6 +161,11 @@ fn main() {
                             );
                         }
                         None => eprintln!("forgetty-win: no %APPDATA%, remote machines are off"),
+                    }
+                    // Tabs live in the local server when it can run; else this window's ConPTY.
+                    // The smoke starts it in a phase of its own.
+                    if !smoke {
+                        s.start_local_server(localserver::decide(local_server_on, false), None, cx);
                     }
                 });
                 shell

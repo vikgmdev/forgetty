@@ -21,7 +21,9 @@ warning, clear and reset, config hot reload (font, theme by name, bell, notifica
 profiles with arguments and directory, bad and deleted file, new-tab menu, theme list), zoom limits and chords,
 the config file watcher (burst, atomic rename, idle),
 the IME handler (preedit, commit, cancel, candidate window anchor at the cursor cell), a real Microsoft IME
-(Japanese) and Microsoft Pinyin driven by injected keys (preedit, conversion, commit, anchor), MSI install and uninstall.
+(Japanese) and Microsoft Pinyin driven by injected keys (preedit, conversion, commit, anchor), MSI install and uninstall,
+the local server (start, automatic pairing over loopback, This PC in the sidebar, key latency against the built-in terminal, kill and
+restart by the watchdog, the elevated rule, the `--start-server` exit code).
 
 CI cannot check: real GPU rendering, real fonts on your monitors, the IME candidate window on screen, sleep and resume,
 real wifi to tether changes, several monitors, Win-key shell behavior, SmartScreen. Those are below.
@@ -570,6 +572,24 @@ command = "wsl.exe -d Ubuntu --cd ~"
 - Profile icons (read and kept, not shown).
 
 ---
+
+## WP6: the local server (This PC)
+
+Needs the installed app (MSI) or `forgetty-win.exe` and `forgetty.exe` in one folder. Use a normal (not elevated) window.
+
+1. Run `forgetty server stop`. Start the app. [ ] After one or two seconds a tab opens and the sidebar shows **This PC** with `connected`.
+   [ ] There is no second machine called after your PC. [ ] No console window flashes.
+2. Type `echo one` and press Enter. Close the window with the close button (no question is asked). Start the app again.
+   [ ] The tab and the line `one` are still there (the server kept them). [ ] A program you left running (`ping -t 127.0.0.1`) is still running.
+3. Open Task Manager. [ ] There is one `forgetty.exe` and, after closing the window, it is still there.
+4. End `forgetty.exe` in Task Manager (End task). [ ] Within about 10 s the overlay "Reconnecting to This PC..." goes away and the tab works. [ ] The tab you had is back (or one new tab).
+5. Run `forgetty server stop` while the app is open, then `taskkill /IM forgetty.exe /F` if it is still there, and block it: rename `forgetty.exe` next to the app to `x.exe`.
+   [ ] After about a minute the built-in terminal opens in a new tab with a notice that the local server stopped. Rename it back and restart the app.
+6. Rename `forgetty.exe` to `x.exe` and start the app. [ ] A notice says forgetty.exe was not found and a tab opens at once. Rename it back.
+7. Start the app as administrator (right-click, Run as administrator). [ ] The notice says this window runs as administrator and uses the built-in terminal. [ ] Closing the window ends the tabs (a question is asked while a shell is open).
+8. Put `local_server = false` in `%APPDATA%\forgetty\config.toml` and restart. [ ] The built-in terminal is used with no notice. [ ] Settings, General, has "Keep terminals in the local server" off. Set it back to true.
+9. Sign out and in (or reboot). [ ] No console window shows at login. [ ] `forgetty server status` says running before you start the app.
+10. Feel: type fast in a tab of This PC and in a tab of the built-in terminal (`local_server = false`). [ ] You cannot tell them apart.
 
 ## Part B: a week of daily use
 
