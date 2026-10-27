@@ -321,7 +321,7 @@ fn map_event(inner: &Arc<Inner>, ev: ServerEvent) -> Vec<BackendEvent> {
         ServerEvent::PaneExited { .. }
         | ServerEvent::ClientConnected { .. }
         | ServerEvent::ClientDisconnected { .. }
-        // Prompt marks and tty mode (cap `shell_state`): the Windows shell does not use them yet.
+        // Shell integration (prompt marks) is for the pane header of a later client change.
         | ServerEvent::ShellState { .. }
         | ServerEvent::Unknown => return Vec::new(),
     }]
