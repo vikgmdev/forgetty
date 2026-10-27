@@ -43,6 +43,8 @@ pub struct LsPhase {
     ps_model: Vec<f64>,
     ps_probe: Option<(usize, usize, char, Instant)>,
     ps_log_mark: usize,
+    ps_back_switched: bool,
+    ps_back_restored: bool,
     ps_segs: Vec<[f64; 4]>,
     /// First key send and last echo of the UI key probes.
     ui_window: Option<(Instant, Instant)>,
@@ -286,7 +288,11 @@ impl ShellSmoke {
     /// starts the next shell with a fresh phase timer.
     fn ps_step(&mut self, shell: &mut AppShell, window: &mut Window, cx: &mut Context<AppShell>, server: bool) {
         let (name, argv) = self.ls.ps_shells[self.ls.ps_idx].clone();
-        let leg = if server { "server" } else { "in_process" };
+        let leg = match self.phase {
+            Phase::LsPsSrv => "server",
+            Phase::LsPsBack => "in_process_b",
+            _ => "in_process",
+        };
         match self.sub {
             0 => {
                 self.ls.ps_tabs_before = shell.layout.tab_count();
@@ -406,16 +412,34 @@ impl ShellSmoke {
                         let mine = lines.get(self.ls.ps_log_mark..).unwrap_or(&[]);
                         record(&format!("powershell_server_{name}_stage_us"), stages_json(mine));
                     }
-                    let key = format!("key_to_model_p50_ms_powershell_in_process_{name}");
-                    let Some(base) = recorded(&key) else { fail(&format!("powershell {name}: no in-process latency was measured")) };
-                    record(&format!("powershell_{name}_vs_in_process_ms"), json!({"in_process_p50": base, "server_p50": p50, "delta": p50 - base}));
-                    check(&format!("local_server_powershell_{name}_key_p50_within_2ms_of_in_process"), p50 - base <= 2.0);
+                    // The gate: what Forgetty adds per key. The shell's own time is the server's
+                    // "input to first pty read with the key"; the rest of the app's key to model is
+                    // the server's dispatch and frame, the link and the app.
+                    let stages = self.ls.cli.as_ref().and_then(|c| c.state_dir.as_deref()).map(|d| {
+                        let lines = key_echo_lines(d);
+                        stages_json(lines.get(self.ls.ps_log_mark..).unwrap_or(&[]))
+                    });
+                    let shell_ms = stages.as_ref().and_then(|s| s.get("to_first_pty_read")).and_then(|v| v.as_f64()).map(|us| us / 1000.0);
+                    let Some(shell_ms) = shell_ms else { fail(&format!("powershell {name}: the server logged no key echo stages (FORGETTY_TRACE_LATENCY)")) };
+                    record(
+                        &format!("powershell_{name}_forgetty_overhead_ms"),
+                        json!({"app_key_to_model_p50": p50, "server_input_to_first_pty_read_p50": shell_ms, "overhead": p50 - shell_ms}),
+                    );
+                    check(&format!("local_server_powershell_{name}_overhead_within_2ms"), p50 - shell_ms <= 2.0);
+                }
+                if leg == "in_process_b" {
+                    // Report only: the raw pair, in-process, server, in-process.
+                    let get = |l: &str| recorded(&format!("key_to_model_p50_ms_powershell_{l}_{name}"));
+                    let (a, s, b) = (get("in_process"), get("server"), get("in_process_b"));
+                    if let (Some(a), Some(s), Some(b)) = (a, s, b) {
+                        record(&format!("powershell_{name}_raw_pair_ms"), json!({"in_process_a": a, "server": s, "in_process_b": b, "delta_vs_mean_of_a_b": s - (a + b) / 2.0}));
+                    }
                 }
                 if let Some(tab) = self.ls.ps_tab.take() {
                     shell.close_tab(tab, cx);
                 }
                 self.ls.ps_idx += 1;
-                let again = if server { Phase::LsPsSrv } else { Phase::LsPsBase };
+                let again = self.phase;
                 self.goto(again);
             }
         }
@@ -434,9 +458,17 @@ impl ShellSmoke {
 
     pub(super) fn ls_step(&mut self, shell: &mut AppShell, window: &mut Window, cx: &mut Context<AppShell>, now_t: Instant) {
         match self.phase {
-            Phase::LsPsBase | Phase::LsPsSrv => {
+            Phase::LsPsBase | Phase::LsPsSrv | Phase::LsPsBack => {
                 let server = self.phase == Phase::LsPsSrv;
-                if !server && self.sub == 0 && self.ls.ps_idx == 0 && self.ls.ps_shells.is_empty() {
+                let back = self.phase == Phase::LsPsBack;
+                if back && !self.ls.ps_shells.is_empty() && !self.ls.ps_back_switched {
+                    // The third leg of the raw pair runs on the in-process machine again.
+                    let Some(inproc) = self.ls.inproc else { fail("local server: no in-process machine to go back to") };
+                    shell.switch_machine(inproc, cx);
+                    self.ls.ps_back_switched = true;
+                    return;
+                }
+                if self.phase == Phase::LsPsBase && self.sub == 0 && self.ls.ps_idx == 0 && self.ls.ps_shells.is_empty() {
                     if std::env::var_os("FORGETTY_SERVER_EXE").is_none() {
                         self.goto(Phase::LsStart);
                         return;
@@ -446,8 +478,19 @@ impl ShellSmoke {
                 }
                 if self.ls.ps_idx >= self.ls.ps_shells.len() {
                     // This leg is done: the next leg starts at shell 0.
+                    if back && self.ls.ps_back_switched && !self.ls.ps_back_restored {
+                        // Back on the server's machine for the rest of the phases.
+                        let Some(srv) = self.ls.server else { fail("local server: no server machine to return to") };
+                        shell.switch_machine(srv, cx);
+                        self.ls.ps_back_restored = true;
+                        return;
+                    }
                     self.ls.ps_idx = 0;
-                    self.goto(if server { Phase::LsDevices } else { Phase::LsStart });
+                    self.goto(match self.phase {
+                        Phase::LsPsBase => Phase::LsStart,
+                        Phase::LsPsSrv => Phase::LsPsBack,
+                        _ => Phase::LsDevices,
+                    });
                     return;
                 }
                 self.ps_step(shell, window, cx, server);

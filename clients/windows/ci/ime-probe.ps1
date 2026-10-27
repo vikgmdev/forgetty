@@ -43,11 +43,11 @@ function Try-Step($name, [scriptblock]$body, [int]$timeoutSec) {
 $r.steps = [ordered]@{}
 if ($r.install_language_cmdlet) {
   foreach ($lang in 'ja-JP', 'zh-CN') {
-    $r.steps["install_language_$lang"] = Try-Step "install $lang" ([scriptblock]::Create("Install-Language -Language $lang -ErrorAction Stop")) 900
+    $r.steps["install_language_$lang"] = Try-Step "install $lang" ([scriptblock]::Create("Install-Language -Language $lang -ErrorAction Stop")) 180
   }
 } else {
   foreach ($cap in 'Language.Basic~~~ja-JP~0.0.1.0', 'Language.Basic~~~zh-CN~0.0.1.0') {
-    $r.steps["capability_$cap"] = Try-Step "cap $cap" ([scriptblock]::Create("Add-WindowsCapability -Online -Name '$cap' -ErrorAction Stop")) 900
+    $r.steps["capability_$cap"] = Try-Step "cap $cap" ([scriptblock]::Create("Add-WindowsCapability -Online -Name '$cap' -ErrorAction Stop")) 180
   }
 }
 try { $r.installed_languages = @(Get-InstalledLanguage -ErrorAction Stop | ForEach-Object { $_.LanguageId }) } catch { $r.installed_languages_error = "$_" }

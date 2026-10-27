@@ -586,11 +586,13 @@ jobs:
   ime-probe:
     if: github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
-    timeout-minutes: 45
+    # A language pack install that hangs ended this job at 45 minutes and held the whole run.
+    timeout-minutes: 12
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - name: Try to install ja-JP and zh-CN input methods
+        timeout-minutes: 8
         shell: pwsh
         run: ./clients/windows/ci/ime-probe.ps1
       - name: Upload probe result

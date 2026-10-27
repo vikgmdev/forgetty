@@ -423,7 +423,12 @@ is) in its own `--state-dir`, pairs, times keys against the built-in pane, kills
 waits for the watchdog to bring it back, then revokes its own device and checks that the next
 start pairs again. The gate `local_server_key_p50_within_2ms_of_in_process` compares the
 median time from a key to its echo in the terminal model (stamped when the bytes are fed, no
-frame in it) on both paths; the frame-based number is a second check (one frame plus 2 ms).
+frame in it) on both paths for cmd.exe; the frame-based number is a second check (one frame plus 2 ms).
+For `pwsh` and Windows PowerShell the gate is `local_server_powershell_<name>_overhead_within_2ms`:
+the app's key-to-model median minus the server's median "input to first PTY read with the key"
+(`FORGETTY_TRACE_LATENCY`), so the shell's own time (bimodal, 9 or 14 ms) is not in it. The raw
+pairs (in-process, server, in-process again) are in the JSON as `powershell_<name>_raw_pair_ms`,
+report only.
 
 ## Command line, cursor, picture paste (WP6b)
 
