@@ -211,7 +211,7 @@ jobs:
       - name: Probe
         shell: pwsh
         run: |
-          cargo test --locked -p forgetty-server --test timer_probe -- --nocapture --test-threads=1 2>&1 | Tee-Object probe.log
+          cargo test --locked -p forgetty-server --test timer_probe -- --nocapture --test-threads=1 --include-ignored 2>&1 | Tee-Object probe.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - uses: actions/upload-artifact@v4

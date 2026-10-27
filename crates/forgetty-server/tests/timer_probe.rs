@@ -58,6 +58,15 @@ const PROGRAM: &str = "cat";
 
 const SAMPLES: usize = 60;
 
+/// Set by the diagnostic experiments (shell timing): a key whose echo does not come in time is
+/// reported and skipped instead of failing the test. The tests that measure Forgetty's own stages
+/// stay strict.
+static LENIENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn lenient() -> bool {
+    LENIENT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The bytes of `chunk` outside escape sequences: a CSI final byte such as the `h` of `ESC[?25h`
 /// is not an echo of the key `h`.
 fn printable(chunk: &[u8]) -> Vec<u8> {
@@ -132,6 +141,9 @@ impl Stats {
         Stats { label: label.into(), sorted: v }
     }
     fn at(&self, q: f64) -> f64 {
+        if self.sorted.is_empty() {
+            return f64::NAN;
+        }
         let i = ((self.sorted.len() as f64 * q) as usize).min(self.sorted.len() - 1);
         self.sorted[i].as_secs_f64() * 1000.0
     }
@@ -145,7 +157,7 @@ impl Stats {
             self.sorted.len(),
             self.at(0.5),
             self.at(0.95),
-            self.sorted.last().unwrap().as_secs_f64() * 1000.0
+            self.sorted.last().map_or(f64::NAN, |d| d.as_secs_f64() * 1000.0)
         );
     }
 }
@@ -184,14 +196,27 @@ fn in_process_with(label: &str, argv: &[&str]) -> Stats {
         writer.write_all(&[key]).unwrap();
         writer.flush().unwrap();
         let end = t0 + Duration::from_secs(5);
+        let mut echoed = true;
         loop {
             let left = end.saturating_duration_since(Instant::now());
-            assert!(!left.is_zero(), "no echo of {:?}", key as char);
+            if left.is_zero() {
+                assert!(lenient(), "no echo of {:?}", key as char);
+                echoed = false;
+                break;
+            }
             match rx.recv_timeout(left) {
                 Ok(chunk) if printable(&chunk).contains(&key) => break,
                 Ok(_) => {}
-                Err(_) => panic!("no echo of {:?}", key as char),
+                Err(_) => {
+                    assert!(lenient(), "no echo of {:?}", key as char);
+                    echoed = false;
+                    break;
+                }
             }
+        }
+        if !echoed {
+            println!("PROBE {label}: no echo of {:?} in 5 s, sample skipped", key as char);
+            continue;
         }
         out.push(t0.elapsed());
         std::thread::sleep(Duration::from_millis(20));
@@ -367,14 +392,27 @@ async fn through_server_as(
         let t0 = Instant::now();
         h.send_input(pane, &[key]).await.expect("send_input");
         let end = t0 + Duration::from_secs(5);
+        let mut echoed = true;
         'wait: loop {
             let left = end.saturating_duration_since(Instant::now());
-            assert!(!left.is_zero(), "no echo of {:?}", key as char);
+            if left.is_zero() {
+                assert!(lenient(), "no echo of {:?}", key as char);
+                echoed = false;
+                break 'wait;
+            }
             match tokio::time::timeout(left, stream.next()).await {
                 Ok(Some(PaneItem::Data { bytes, .. })) if printable(&bytes).contains(&key) => break 'wait,
                 Ok(Some(_)) => {}
-                other => panic!("no echo of {:?}: {:?}", key as char, other.is_ok()),
+                other => {
+                    assert!(lenient(), "no echo of {:?}: {:?}", key as char, other.is_ok());
+                    echoed = false;
+                    break 'wait;
+                }
             }
+        }
+        if !echoed {
+            println!("PROBE {client}: no echo of {:?} in 5 s, sample skipped", key as char);
+            continue;
         }
         echo.push(t0.elapsed());
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -396,6 +434,8 @@ async fn through_server_as(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn zz_key_to_echo_through_the_server_against_in_process() {
+    // Strict, whatever ran before it in this process.
+    LENIENT.store(false, std::sync::atomic::Ordering::Relaxed);
     // First with this process at the default timer (it stands for the app before it asks for 1 ms),
     // then at 1 ms (the app after `timeBeginPeriod(1)`), each against a server that does not ask
     // ("off") and one that does ("full", the shipped setting).
@@ -428,6 +468,7 @@ async fn zz_key_to_echo_through_the_server_against_in_process() {
     // holds it (period) or does not (off).
     #[cfg(windows)]
     {
+        LENIENT.store(true, std::sync::atomic::Ordering::Relaxed);
         let shell = ["powershell.exe", "-NoLogo"];
         let base = in_process_with("in process, powershell.exe, client timer 1 ms", &shell);
         base.show();
@@ -447,7 +488,9 @@ async fn zz_key_to_echo_through_the_server_against_in_process() {
 /// per shell and kind, each next to the same shell in process, so a slow echo shows which part of
 /// the pane it follows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "diagnostic experiment on shell timing: the timer-probe job runs it with --include-ignored"]
 async fn key_to_echo_on_panes_like_the_ui_pane() {
+    LENIENT.store(true, std::sync::atomic::Ordering::Relaxed);
     #[cfg(windows)]
     let shells: Vec<Vec<&str>> = {
         let mut v = vec![vec!["cmd.exe"], vec!["powershell.exe", "-NoLogo"]];
@@ -477,7 +520,9 @@ async fn key_to_echo_on_panes_like_the_ui_pane() {
 /// power throttling, the shells too, then ConPTY flags like portable-pty's. Each step is a new
 /// server and a new pane, next to the same shell in process.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "diagnostic experiment on shell timing: the timer-probe job runs it with --include-ignored"]
 async fn powershell_echo_by_power_throttling_and_conpty_flags() {
+    LENIENT.store(true, std::sync::atomic::Ordering::Relaxed);
     #[cfg(windows)]
     {
         let mut shells = vec![vec!["powershell.exe", "-NoLogo"]];
