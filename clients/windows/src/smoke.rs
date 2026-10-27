@@ -61,6 +61,9 @@ static RESULTS: Mutex<Option<Map<String, Value>>> = Mutex::new(None);
 static PHASE: Mutex<&'static str> = Mutex::new("window");
 /// Process id of the W3 test server, so a failure can take it down too.
 pub static SERVER_PID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// The local server of the local-server phases (`forgetty.exe`, its `--state-dir`): stopped at
+/// any exit, because it is detached and holds the CI shell's inherited handles.
+pub static LOCAL_SERVER: Mutex<Option<(std::path::PathBuf, std::path::PathBuf)>> = Mutex::new(None);
 static SCREEN_DUMP: Mutex<String> = Mutex::new(String::new());
 
 pub fn record_pub(key: &str, value: Value) {
@@ -119,6 +122,22 @@ pub fn hard_exit(code: i32) -> ! {
     }
     if let Some(d) = real::distro() {
         real::stop_server(&d);
+    }
+    #[cfg(windows)]
+    {
+        let ls = LOCAL_SERVER.lock().ok().and_then(|g| g.clone());
+        if let Some((exe, dir)) = ls {
+            use std::os::windows::process::CommandExt;
+            let mut c = std::process::Command::new(exe);
+            c.arg("--state-dir").arg(dir).args(["server", "stop"]).creation_flags(0x0800_0000);
+            if let Ok(mut child) = c.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn() {
+                let t0 = Instant::now();
+                while t0.elapsed() < Duration::from_secs(15) && matches!(child.try_wait(), Ok(None)) {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                let _ = child.kill();
+            }
+        }
     }
     #[cfg(windows)]
     unsafe {

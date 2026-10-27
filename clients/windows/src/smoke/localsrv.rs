@@ -57,6 +57,9 @@ impl ShellSmoke {
 
                 let state = std::env::temp_dir().join(format!("forgetty-smoke-server-state-{}", std::process::id()));
                 let _ = std::fs::remove_dir_all(&state);
+                if let Ok(mut g) = super::LOCAL_SERVER.lock() {
+                    *g = Some((exe.clone(), state.clone()));
+                }
                 self.ls.cli = Some(Cli { exe: exe.clone(), state_dir: Some(state) });
                 self.ls.inproc = Some(shell.machine.id);
                 self.ls.tabs_before = shell.layout.tab_count();
@@ -286,6 +289,9 @@ impl ShellSmoke {
                 shell.switch_machine(inproc, cx);
                 shell.drop_machine(id, cx);
                 let stop = cli.run(&["server", "stop"], Duration::from_secs(30));
+                if let Ok(mut g) = super::LOCAL_SERVER.lock() {
+                    *g = None;
+                }
                 check("local_server_stops", stop.as_ref().is_ok_and(|o| o.code == Some(0)));
                 check("local_server_machine_removed_in_process_back", shell.machines.len() == 1 && shell.machine.id == inproc);
                 if let Some(d) = cli.state_dir.as_ref() {

@@ -105,10 +105,14 @@ jobs:
         run: |
           Get-ChildItem *.exe, *.dll | Format-Table Name, Length
           # The release exe is GUI-subsystem: wait for it explicitly. It attaches to this console.
-          $p = Start-Process .\forgetty-win.exe -ArgumentList '--smoke' -Wait -PassThru -RedirectStandardOutput smoke.json -RedirectStandardError smoke.err
+          # Not -Wait: that also waits for the local server the smoke starts (a child of the app).
+          $p = Start-Process .\forgetty-win.exe -ArgumentList '--smoke' -PassThru -RedirectStandardOutput smoke.json -RedirectStandardError smoke.err
+          if (-not $p.WaitForExit(600000)) { Write-Host "smoke still running after 10 minutes, killing it"; $p.Kill() }
+          # A server the smoke left behind would keep the runner's handles.
+          Get-Process forgetty-test, forgetty -ErrorAction SilentlyContinue | Stop-Process -Force
           Get-Content smoke.json
           Get-Content smoke.err
-          $code = $p.ExitCode
+          $code = if ($p.HasExited) { $p.ExitCode } else { 1 }
           Write-Host "forgetty-win --smoke exit code: $code"
           exit $code
 
