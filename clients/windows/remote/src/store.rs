@@ -396,15 +396,19 @@ pub fn parse_offer(text: &str) -> Result<PairingOffer, String> {
 /// What `pair` dials and stores for `offer`: the pinned addresses (the payload's direct
 /// addresses plus `manual`, an address the user typed in or a test passes) and the address and
 /// options to dial them with.
-fn pair_plan(offer: &PairingOffer, manual: Option<SocketAddr>) -> Result<(forgetty_client::EndpointAddr, ClientOptions, Vec<SocketAddr>), ClientError> {
+///
+/// `local` (this PC's own server): never a relay, whatever the payload lists. The server sits on
+/// this machine, so the dial goes to the pinned loopback address only.
+fn pair_plan(offer: &PairingOffer, manual: Option<SocketAddr>, local: bool) -> Result<(forgetty_client::EndpointAddr, ClientOptions, Vec<SocketAddr>), ClientError> {
     let mut pinned = offer.direct.clone();
     if let Some(h) = manual {
         if !pinned.contains(&h) {
             pinned.insert(0, h);
         }
     }
-    let addr = server_addr_direct(&offer.qr.node_id, &offer.relays, &pinned)?;
-    let opts = ClientOptions { relays_disabled: offer.relays_disabled, pinned_addrs: pinned.clone(), ..Default::default() };
+    let relays: &[String] = if local { &[] } else { &offer.relays };
+    let addr = server_addr_direct(&offer.qr.node_id, relays, &pinned)?;
+    let opts = ClientOptions { relays_disabled: offer.relays_disabled || local, pinned_addrs: pinned.clone(), ..Default::default() };
     Ok((addr, opts, pinned))
 }
 
@@ -429,14 +433,14 @@ pub async fn pair_as(
     local: bool,
 ) -> Result<StoredMachine, ClientError> {
     let identity = store.identity().map_err(|e| ClientError::Setup(format!("identity: {e}")))?;
-    let (addr, opts, pinned) = pair_plan(offer, manual)?;
+    let (addr, opts, pinned) = pair_plan(offer, manual, local)?;
     pair_with_addr(addr, &offer.qr.secret, identity, device_name, ClientKind::Windows, &opts).await?;
     let m = StoredMachine {
         id: Uuid::new_v4(),
         name: offer.machine.clone(),
         node_id: offer.qr.node_id.clone(),
-        relays: offer.relays.clone(),
-        relays_disabled: offer.relays_disabled,
+        relays: if local { Vec::new() } else { offer.relays.clone() },
+        relays_disabled: offer.relays_disabled || local,
         pinned_addrs: pinned,
         local,
     };
@@ -632,6 +636,23 @@ mod tests {
     }
 
     #[test]
+    fn this_pcs_own_server_never_uses_a_relay() {
+        // A default server lists relays and no direct address; the app pins loopback itself.
+        let n = node();
+        let o = parse_offer(&offer_json(&n, "pc", "https://relay.example.org")).unwrap();
+        assert!(!o.relays.is_empty() && !o.relays_disabled);
+        let lo: SocketAddr = "127.0.0.1:47297".parse().unwrap();
+        let (addr, opts, pinned) = pair_plan(&o, Some(lo), true).unwrap();
+        assert_eq!(pinned, vec![lo]);
+        assert!(opts.relays_disabled);
+        assert_eq!(addr.relay_urls().count(), 0);
+        // Another machine keeps its relay.
+        let (addr, opts, _) = pair_plan(&o, Some(lo), false).unwrap();
+        assert!(!opts.relays_disabled);
+        assert_eq!(addr.relay_urls().count(), 1);
+    }
+
+    #[test]
     fn a_wireguard_offer_pins_its_direct_addresses_and_has_no_relay() {
         let n = node();
         let o = parse_offer(&wg_offer(&n)).unwrap();
@@ -640,7 +661,7 @@ mod tests {
         assert_eq!(o.direct, vec!["10.230.1.14:47297".parse::<SocketAddr>().unwrap(), "[fd00::1]:47297".parse().unwrap()]);
 
         let manual: SocketAddr = "10.230.1.99:47297".parse().unwrap();
-        let (addr, opts, pinned) = pair_plan(&o, Some(manual)).unwrap();
+        let (addr, opts, pinned) = pair_plan(&o, Some(manual), false).unwrap();
         assert_eq!(pinned[0], manual);
         assert_eq!(pinned.len(), 3);
         assert_eq!(opts.pinned_addrs, pinned);
@@ -648,7 +669,7 @@ mod tests {
         assert_eq!(addr.relay_urls().count(), 0);
         assert_eq!(addr.ip_addrs().count(), 3);
         // The same address twice is kept once.
-        assert_eq!(pair_plan(&o, Some(o.direct[0])).unwrap().2.len(), 2);
+        assert_eq!(pair_plan(&o, Some(o.direct[0]), false).unwrap().2.len(), 2);
 
         let m = StoredMachine {
             id: Uuid::new_v4(),

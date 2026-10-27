@@ -380,7 +380,9 @@ At start the app (a window that is not elevated, `local_server` not `false`):
 2. runs `forgetty.exe server start` with no console window (it does nothing when
    a server answers);
 3. pairs by itself: `forgetty pair --ttl 30` prints a payload, the app pairs over
-   loopback with the code of the pair dialog, and stores the machine with
+   loopback (`127.0.0.1:47297`, the server's default port, pinned by the app: the
+   server listens on every address and its payload names no direct one; this
+   machine never uses a relay) with the code of the pair dialog, and stores the machine with
    `local: true` in `machines.json`. An existing pairing is reused while the
    server's node id is the same;
 4. shows the machine as **This PC** in the sidebar, over `RemoteBackend`, and

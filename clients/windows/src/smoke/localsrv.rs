@@ -71,7 +71,8 @@ impl ShellSmoke {
             // ---- up, paired, shown as This PC ---------------------------------------------
             Phase::LsWait => {
                 if let LsState::Fallback(f) = &shell.lsrv.state {
-                    fail(&format!("local server: fell back to in-process: {f:?}"));
+                    let log = self.ls.cli.as_ref().and_then(|c| c.state_dir.as_deref()).map(server_log_tail).unwrap_or_default();
+                    fail(&format!("local server: fell back to in-process: {f:?}; server log: {log}"));
                 }
                 if self.phase_t0.elapsed() > Duration::from_secs(120) {
                     fail(&format!("local server: not up after 120 s ({:?})", shell.lsrv.state));
@@ -308,4 +309,27 @@ impl ShellSmoke {
             _ => {}
         }
     }
+}
+
+
+/// The last lines of the smoke server's `server.log` (under its state folder), one string.
+fn server_log_tail(state: &std::path::Path) -> String {
+    fn find(dir: &std::path::Path, depth: u32) -> Option<std::path::PathBuf> {
+        for e in std::fs::read_dir(dir).ok()?.filter_map(Result::ok) {
+            let p = e.path();
+            if p.is_file() && p.file_name().is_some_and(|n| n == "server.log") {
+                return Some(p);
+            }
+            if depth > 0 && p.is_dir() {
+                if let Some(f) = find(&p, depth - 1) {
+                    return Some(f);
+                }
+            }
+        }
+        None
+    }
+    let Some(log) = find(state, 5) else { return "no server.log".into() };
+    let text = std::fs::read_to_string(&log).unwrap_or_default();
+    let lines: Vec<&str> = text.lines().collect();
+    lines[lines.len().saturating_sub(40)..].join(" | ")
 }
