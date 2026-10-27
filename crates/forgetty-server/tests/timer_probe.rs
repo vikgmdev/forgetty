@@ -387,7 +387,7 @@ async fn through_server_as(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn key_to_echo_through_the_server_against_in_process() {
+async fn zz_key_to_echo_through_the_server_against_in_process() {
     // First with this process at the default timer (it stands for the app before it asks for 1 ms),
     // then at 1 ms (the app after `timeBeginPeriod(1)`), each against a server that does not ask
     // ("off") and one that does ("full", the shipped setting).
@@ -459,20 +459,25 @@ async fn powershell_echo_by_power_throttling_and_conpty_flags() {
         if Command::new("pwsh.exe").arg("-Version").output().is_ok() {
             shells.push(vec!["pwsh.exe", "-NoLogo"]);
         }
-        let steps: [(&str, &[(&str, &str)]); 5] = [
-            ("baseline", &[]),
-            ("1 server opted out", &[("FORGETTY_POWER_THROTTLING", "server")]),
-            ("2 server and shells opted out", &[("FORGETTY_POWER_THROTTLING", "shells")]),
-            ("3a conpty win32 input mode", &[("FORGETTY_CONPTY_FLAGS", "0x4")]),
-            ("3b conpty inherit cursor and win32 input", &[("FORGETTY_CONPTY_FLAGS", "0x5")]),
+        // The test process asks for no finer timer (the matrix test, which does, runs after this
+        // one), so the system timer is at its default unless another process on the machine asked.
+        println!("PROBE system timer period at the start of the steps: {:.2} ms", system_tick_ms());
+        let steps: [(&str, &str, &[(&str, &str)]); 7] = [
+            ("baseline", "off", &[]),
+            ("1 server opted out", "off", &[("FORGETTY_POWER_THROTTLING", "server")]),
+            ("2 server and shells opted out", "off", &[("FORGETTY_POWER_THROTTLING", "shells")]),
+            ("3a conpty win32 input mode", "off", &[("FORGETTY_CONPTY_FLAGS", "0x4")]),
+            ("3b conpty inherit cursor and win32 input", "off", &[("FORGETTY_CONPTY_FLAGS", "0x5")]),
+            ("4a server timeBeginPeriod(1)", "period", &[]),
+            ("4b server timeBeginPeriod(1) and throttling off", "full", &[]),
         ];
         for shell in &shells {
             let base = in_process_with(&format!("in process, {}", shell[0]), shell);
             base.show();
-            for (name, env) in steps {
+            for (name, timer, env) in steps {
                 *EXTRA_ENV.lock().unwrap() =
                     env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-                let (echo, _) = through_server_as("off", name, Pane::Fresh, shell).await;
+                let (echo, _) = through_server_as(timer, name, Pane::Fresh, shell).await;
                 echo.show();
                 println!(
                     "PROBE step {} {}: delta to in process {:+.2} ms (p50)",
