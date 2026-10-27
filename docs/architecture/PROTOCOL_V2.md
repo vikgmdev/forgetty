@@ -619,7 +619,7 @@ ShellState {
   `phase` as where the shell is, not as an event: `running` can be skipped, and a
   command that ended shows as `input` with the new `exit_code` (a `rev` that
   grew). When a connection lags and resyncs, the server sends the current state
-  of every pane again: the same `rev` can arrive twice. A client drops an event
+  of every pane again (and the newest `CwdChanged` of each pane): the same `rev` can arrive twice. A client drops an event
   whose `rev` is not higher than the one it holds.
 - `CwdChanged` follows the same rules: a pane sends a burst of 8, then one per
   10 ms, and the newest directory wins (a loop of OSC 7 makes a handful of

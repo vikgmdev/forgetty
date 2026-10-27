@@ -405,9 +405,17 @@ cannot add a socket to a running endpoint, so this closes the endpoint and
 binds a new one. Every open connection drops once and the clients reconnect;
 the device list, the pairing window and the panes are not touched. There is
 one rebind for the addresses that appeared in the same look. New pairing QR
-codes carry B. If the new bind fails, the server binds the old set again and
-logs an error (and does not try that address again). If B goes away later,
-nothing happens: iroh keeps the sockets it has. If none of the addresses is
+codes carry B (a QR asked for during the rebind waits for it, 3 s at most). The
+port is checked free on B first, with a few retries, and nothing is closed if it
+is not. If the new bind fails after the close, the server binds the old set
+again, logs an error and tries B again later (10 s, doubling up to 5 min,
+because each try drops the connections). If even the old set cannot be bound,
+the server never stays without an endpoint: it keeps trying in the background
+(1 s, 2 s, up to 10 s apart): the full set, then the old set, then each address
+alone, and logs which addresses are bound. If B goes away later, nothing
+happens: iroh keeps the sockets it has. Known leak: when closing the old
+endpoint takes more than 2 s, its connection tasks stay until the peers give
+up; this happens once per address that appears. If none of the addresses is
 there at start, the server waits as described above, and binds the ones that
 exist when the first appears.
 

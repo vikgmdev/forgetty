@@ -165,21 +165,37 @@ fn address_present(ip: std::net::IpAddr) -> bool {
 /// iroh cannot add a socket to a running endpoint, so the connections drop once
 /// and the clients reconnect. The key, node id and port stay.
 fn watch_missing_addresses(ep: Arc<SyncEndpoint>, all: Vec<std::net::IpAddr>) {
-    let mut missing: Vec<std::net::IpAddr> =
-        all.iter().copied().filter(|ip| !ep.bind_addrs().contains(ip)).collect();
+    let list = |v: &[std::net::IpAddr]| v.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ");
+    let missing_now = {
+        let (ep, all) = (Arc::clone(&ep), all.clone());
+        move || -> Vec<std::net::IpAddr> {
+            let have = ep.bind_addrs();
+            all.iter().copied().filter(|ip| !have.contains(ip)).collect()
+        }
+    };
+    let missing = missing_now();
     if missing.is_empty() {
         return;
     }
     for ip in &missing {
         warn!(
             "--bind {ip} is not on this machine yet; serving on {}; it is added when it appears",
-            ep.bind_addrs().iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ")
+            list(&ep.bind_addrs())
         );
     }
     tokio::spawn(async move {
+        // A failed rebind drops the connections: wait longer before the next
+        // one (10 s, doubling up to 5 min).
+        let mut cooldown = Duration::ZERO;
         let mut warned = false;
         loop {
-            tokio::time::sleep(BIND_WATCH_EVERY).await;
+            tokio::time::sleep(BIND_WATCH_EVERY.max(cooldown)).await;
+            // The addresses not bound now: those that never came, and those a
+            // failed rebind gave up on.
+            let missing = missing_now();
+            if missing.is_empty() {
+                return;
+            }
             let appeared: Vec<std::net::IpAddr> =
                 missing.iter().copied().filter(|ip| address_present(*ip)).collect();
             if appeared.is_empty() {
@@ -191,17 +207,14 @@ fn watch_missing_addresses(ep: Arc<SyncEndpoint>, all: Vec<std::net::IpAddr>) {
                 .copied()
                 .filter(|ip| current.contains(ip) || appeared.contains(ip))
                 .collect();
-            let names = appeared.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ");
+            let names = list(&appeared);
             match ep.rebind(set).await {
                 Ok(()) => {
                     info!(
                         "--bind {names} is there: iroh endpoint bound again on {} (connections reconnect once)",
-                        ep.bind_addrs().iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ")
+                        list(&ep.bind_addrs())
                     );
-                    missing.retain(|ip| !appeared.contains(ip));
-                    if missing.is_empty() {
-                        return;
-                    }
+                    cooldown = Duration::ZERO;
                     warned = false;
                 }
                 Err(f) if !f.dropped => {
@@ -212,14 +225,24 @@ fn watch_missing_addresses(ep: Arc<SyncEndpoint>, all: Vec<std::net::IpAddr>) {
                     }
                 }
                 Err(f) => {
-                    error!(
-                        "--bind {names} could not be added ({}); the endpoint serves on {} and does not try again",
-                        f.error,
-                        ep.bind_addrs().iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ")
-                    );
-                    missing.retain(|ip| !appeared.contains(ip));
-                    if missing.is_empty() {
-                        return;
+                    cooldown = if cooldown.is_zero() {
+                        Duration::from_secs(10)
+                    } else {
+                        (cooldown * 2).min(Duration::from_secs(300))
+                    };
+                    let bound = ep.bound_sockets();
+                    if bound.is_empty() {
+                        error!(
+                            "--bind {names} could not be added ({}); no endpoint is bound now, the server keeps trying to bind in the background",
+                            f.error
+                        );
+                    } else {
+                        error!(
+                            "--bind {names} could not be added ({}); bound now: {}; trying again in {} s",
+                            f.error,
+                            bound.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", "),
+                            cooldown.as_secs()
+                        );
                     }
                 }
             }

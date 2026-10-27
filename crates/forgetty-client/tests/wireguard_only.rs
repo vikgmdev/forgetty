@@ -292,6 +292,82 @@ async fn a_bind_address_that_is_not_there_does_not_end_the_server() {
     server.shutdown().await;
 }
 
+/// The rebind fails and the old set cannot be bound again either (a test hook
+/// refuses every bind that includes 127.0.0.1). The server must not stay
+/// without an endpoint: it keeps trying, binds what it can (127.0.0.2 alone),
+/// serves a client there, and binds the full set once the hook lets go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_rebind_and_fallback_is_retried_until_the_server_binds_again() {
+    if !real_only() {
+        return;
+    }
+    init_tracing();
+    let server = TestServer::start_real_hiding(
+        &["--bind", "127.0.0.1", "--bind", "127.0.0.2", "--no-relay"],
+        &["127.0.0.2"],
+        true,
+    )
+    .await;
+    let (first, _paired) = paired_client(&server, Duration::from_secs(5)).await;
+    assert!(first.state().is_connected());
+    let data = server.state_dir().unwrap().join("data/forgetty");
+    let sockets = |server: &TestServer| -> Vec<String> {
+        net(server)["bound_sockets"]
+            .as_array()
+            .map(|a| a.iter().map(|s| s.as_str().unwrap().to_string()).collect())
+            .unwrap_or_default()
+    };
+
+    std::fs::write(data.join("qa-fail-bind"), "127.0.0.1\n").unwrap();
+    server.show_addresses();
+    // The rebind and the fallback fail; the retry binds 127.0.0.2 alone.
+    wait_for("the server to bind 127.0.0.2 alone", Duration::from_secs(60), || {
+        let s = sockets(&server);
+        s.len() == 1 && s[0].starts_with("127.0.0.2:")
+    })
+    .await;
+    let log =
+        std::fs::read_to_string(server.state_dir().unwrap().parent().unwrap().join("server.log"))
+            .unwrap_or_default();
+    assert!(log.contains("retrying in the background"), "the fallback never failed:\n{log}");
+    let only = sockets(&server)[0].parse::<std::net::SocketAddr>().unwrap();
+
+    // A client that knows only that address pairs and connects.
+    let mut one = payload(&server);
+    one.direct = vec![only.to_string()];
+    let key = SecretKey::generate(&mut rand::rng());
+    let paired = pair(&one, key.clone(), "after-fallback", ClientKind::Cli)
+        .await
+        .unwrap_or_else(|e| panic!("pair through {only} failed: {e}"));
+    let mut opts = paired.options();
+    opts.dial_timeout = Duration::from_secs(5);
+    let info = ClientInfo::new(Uuid::new_v4(), ClientKind::Cli, "after-fallback", "0.0.0");
+    let addr = forgetty_client::server_addr(&one.node_id, &paired.relays).unwrap();
+    let second = tokio::time::timeout(
+        Duration::from_secs(10),
+        Client::connect_with(addr, key, info, opts),
+    )
+    .await
+    .expect("connect timed out")
+    .expect("connect failed");
+    assert!(second.state().is_connected());
+    second.request("get_layout", forgetty_client::proto::Value::Nil).await.expect("get_layout");
+
+    // The hook lets go: the watcher adds 127.0.0.1 again.
+    std::fs::write(data.join("qa-fail-bind"), "").unwrap();
+    wait_for("the server to bind both addresses", Duration::from_secs(90), || {
+        sockets(&server).len() == 2
+    })
+    .await;
+    wait_for("the first client to be connected again", Duration::from_secs(30), || {
+        first.state().is_connected()
+    })
+    .await;
+    second.close().await;
+    first.close().await;
+    server.shutdown().await;
+}
+
 /// Neither address is there at start: the server waits, then binds the ones
 /// that appeared (both here, in one go).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
