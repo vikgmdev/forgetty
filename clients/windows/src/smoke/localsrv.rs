@@ -528,6 +528,8 @@ impl ShellSmoke {
                         return;
                     }
                     self.ls.ps_shells = crate::reload::smoke_powershells();
+                    // Windows always ships powershell.exe: none found is a failure, not a skip.
+                    check("local_server_a_powershell_is_installed", !self.ls.ps_shells.is_empty());
                     record("ps_shells", json!(self.ls.ps_shells.iter().map(|(n, a)| json!({"name": n, "argv": a})).collect::<Vec<_>>()));
                 }
                 if self.ls.ps_idx >= self.ls.ps_shells.len() {
