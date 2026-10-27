@@ -423,6 +423,23 @@ async fn zz_key_to_echo_through_the_server_against_in_process() {
     for (what, p50, base) in &all {
         println!("PROBE delta to in process, {what}: {:+.2} ms (p50)", p50 - base);
     }
+    // The app's situation with PowerShell: this process asks for 1 ms (as the app does), the
+    // shell in process starts under that request, and the server is one that asks (default),
+    // holds it (period) or does not (off).
+    #[cfg(windows)]
+    {
+        let shell = ["powershell.exe", "-NoLogo"];
+        let base = in_process_with("in process, powershell.exe, client timer 1 ms", &shell);
+        base.show();
+        for timer in ["off", "default", "period"] {
+            let (echo, _) = through_server_as(timer, "client timer 1 ms", Pane::Fresh, &shell).await;
+            echo.show();
+            println!(
+                "PROBE app-like powershell.exe, client 1 ms, server {timer}: delta to in process {:+.2} ms (p50)",
+                echo.p50() - base.p50()
+            );
+        }
+    }
 }
 
 /// The UI pane differs from a fresh one: it was resized to the window and holds scrollback, and
