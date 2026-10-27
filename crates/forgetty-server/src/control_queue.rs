@@ -21,6 +21,9 @@ use tokio::sync::Notify;
 /// header, the deque slot and allocator slack).
 const ITEM_OVERHEAD: usize = 64;
 
+/// What a pending frame is replaced by: the kind of event and the pane.
+pub type KeyedSlot = (u8, uuid::Uuid);
+
 struct State {
     items: VecDeque<Vec<u8>>,
     /// When each item was queued (same order as `items`).
@@ -35,8 +38,8 @@ struct State {
     layout: Option<u64>,
     /// Push number of the pending keyed frame of each key (`ShellState`: the
     /// pane), and the key of each pending push number.
-    keyed: HashMap<uuid::Uuid, u64>,
-    keyed_by_push: HashMap<u64, uuid::Uuid>,
+    keyed: HashMap<KeyedSlot, u64>,
+    keyed_by_push: HashMap<u64, KeyedSlot>,
     /// Frames the writer finished writing.
     written: u64,
     /// Payload bytes of those frames.
@@ -126,7 +129,7 @@ impl ControlQueue {
 
     /// Queue a frame that is a whole state for `key`. A pending frame of the
     /// same key is replaced in place.
-    pub fn put_keyed(&self, key: uuid::Uuid, frame: Vec<u8>) {
+    pub fn put_keyed(&self, key: KeyedSlot, frame: Vec<u8>) {
         {
             let mut st = self.lock();
             let slot = st
@@ -341,7 +344,7 @@ mod tests {
     #[tokio::test]
     async fn a_pending_keyed_frame_is_replaced_in_place_per_key() {
         let q = ControlQueue::new();
-        let (a, b) = (uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2));
+        let (a, b) = ((0, uuid::Uuid::from_u128(1)), (0, uuid::Uuid::from_u128(2)));
         q.put_keyed(a, frame(1, 5));
         q.put_keyed(b, frame(2, 5));
         q.push(frame(3, 5));

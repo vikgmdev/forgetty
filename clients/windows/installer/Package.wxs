@@ -8,7 +8,7 @@
   - The install folder is added to the user PATH (HKCU). forgetty.exe there is the
     CLI and the per-user server (`forgetty server start|stop|status`, `forgetty ls`, ...).
     forgetty-win.exe is the app.
-  - An HKCU Run value starts the server at login: `forgetty-win.exe --start-server`, which runs
+  - An HKCU Run value starts the server at login: `forgetty-win.exe` with its start-server switch, which runs
     `forgetty.exe server start` with no window (forgetty.exe is a console program, and Run
     would flash a console window for it).
   - Before an uninstall or an upgrade the server is stopped (`forgetty.exe server stop`), so
@@ -37,8 +37,16 @@
     <CustomAction Id="StopServer" Directory="INSTALLFOLDER"
                   ExeCommand="&quot;[INSTALLFOLDER]forgetty.exe&quot; server stop"
                   Execute="immediate" Return="ignore" />
+    <!-- After an install or an upgrade the server runs again (an upgrade stopped it). The app's
+         The app is a GUI program, so its start-server switch shows no console window. It ends with 1 when the server
+         refuses to start (an elevated installer: the server does not run elevated). Then the Run
+         value starts it at the next login. -->
+    <CustomAction Id="StartServer" Directory="INSTALLFOLDER"
+                  ExeCommand="&quot;[INSTALLFOLDER]forgetty-win.exe&quot; --start-server"
+                  Execute="immediate" Return="ignore" />
     <InstallExecuteSequence>
       <Custom Action="StopServer" Before="InstallValidate" Condition="REMOVE=&quot;ALL&quot; OR WIX_UPGRADE_DETECTED" />
+      <Custom Action="StartServer" After="InstallFinalize" Condition="NOT (REMOVE=&quot;ALL&quot;)" />
     </InstallExecuteSequence>
 
     <Feature Id="Main" Title="Forgetty" Level="1">

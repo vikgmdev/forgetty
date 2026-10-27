@@ -101,6 +101,37 @@ impl PipeStream {
     /// [`connect`](Self::connect), judging the server against `own_level` (an integrity RID)
     /// instead of the level of this process. For tests: the level of a client above the server.
     pub fn connect_as_level(path: &Path, own_level: Option<u32>) -> io::Result<Self> {
+        Self::connect_with(path, own_level, true)
+    }
+
+    /// Connect to ask the server to stop, and nothing else. The owner of the pipe and the user
+    /// of the server process are checked as in [`connect`](Self::connect), but a server at a
+    /// LOWER integrity level than this process is accepted.
+    ///
+    /// Why: an elevated installer (msiexec) has to stop the server of the user, which never
+    /// runs elevated. The level rule exists so that a low-level process cannot stand in for the
+    /// server and receive what an elevated client sends. This stream only sends `shutdown`
+    /// and uses the ack, so there is nothing to receive in confidence and nothing to leak. The
+    /// caller must not use it for any other request.
+    pub fn connect_for_shutdown(path: &Path) -> io::Result<Self> {
+        Self::connect_with(path, None, false)
+    }
+
+    /// [`connect_for_shutdown`](Self::connect_for_shutdown) with the level of this process
+    /// replaced by `own_level`. For tests.
+    pub fn connect_for_shutdown_as_level(path: &Path, own_level: Option<u32>) -> io::Result<Self> {
+        Self::connect_with(path, own_level, false)
+    }
+
+    /// The id of the process that serves this pipe, as the system reports it.
+    pub fn server_pid(&self) -> io::Result<u32> {
+        let mut pid = 0u32;
+        // SAFETY: valid pipe handle and out pointer.
+        unsafe { GetNamedPipeServerProcessId(self.inner.handle, &mut pid) }.map_err(os_err)?;
+        Ok(pid)
+    }
+
+    fn connect_with(path: &Path, own_level: Option<u32>, enforce_level: bool) -> io::Result<Self> {
         let name = wide(path);
         let deadline = Instant::now() + BUSY_WAIT;
         let handle = loop {
@@ -141,13 +172,13 @@ impl PipeStream {
                 write_ms: AtomicU64::new(NONE),
             }),
         };
-        stream.check_server(own_level)?;
+        stream.check_server(own_level, enforce_level)?;
         Ok(stream)
     }
 
     /// The pipe must be owned by this user and the server must be a process of this user, at an
     /// integrity level at least as high as ours.
-    fn check_server(&self, own_level: Option<u32>) -> io::Result<()> {
+    fn check_server(&self, own_level: Option<u32>, enforce_level: bool) -> io::Result<()> {
         let refuse = |why: String| io::Error::new(io::ErrorKind::PermissionDenied, why);
         let me = acl::current_user_sid()?;
         let owner = acl::object_owner_sid(self.inner.handle)
@@ -166,6 +197,9 @@ impl PipeStream {
             .map_err(|e| refuse(format!("cannot tell who runs the server (pid {pid}): {e}")))?;
         if !acl::same_account(&me, &theirs) {
             return Err(refuse(format!("the pipe server (pid {pid}) runs as another user ({theirs})")));
+        }
+        if !enforce_level {
+            return Ok(());
         }
         levels_match(my_level, their_level)
             .map_err(|why| refuse(format!("the pipe server (pid {pid}) {why}")))
@@ -349,6 +383,15 @@ mod tests {
         assert!(err.to_string().contains("lower integrity"), "{err}");
         // A client below the server: accepted (the server only needs to be as high).
         assert!(PipeStream::connect_as_level(&name, Some(0x1000)).is_ok());
+        // The shutdown connection accepts the same lower server, as an elevated installer needs.
+        let mut stop = PipeStream::connect_for_shutdown_as_level(&name, Some(mine + 0x1000))
+            .expect("a shutdown call accepts a server below the client");
+        assert_eq!(stop.server_pid().unwrap(), std::process::id());
+        // It sends only `shutdown` and reads the ack. An unknown method is not sent here, but
+        // the stream itself must work for the one call.
+        stop.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"list_tabs\",\"id\":1}\n").unwrap();
+        stop.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        assert!(stop.read(&mut buf).unwrap() > 0);
         rt.shutdown_background();
     }
 }

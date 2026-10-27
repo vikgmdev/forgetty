@@ -311,16 +311,21 @@ jobs:
           name: forgetty-win
           path: payload
 
-      - name: Build the MSI
+      - name: Build the MSI (and a newer one for the upgrade test)
         shell: pwsh
         run: |
           dotnet tool install --global wix --version 4.0.5
           $env:PATH += ";$env:USERPROFILE\.dotnet\tools"
           $ver = (Select-String -Path clients/windows/Cargo.toml -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value
           Write-Host "version $ver"
-          New-Item -ItemType Directory -Force out | Out-Null
+          New-Item -ItemType Directory -Force out, out-new | Out-Null
           wix build -arch x64 -d Version=$ver -d Payload=payload clients/windows/installer/Package.wxs -o "out/forgetty-win-$ver-x64.msi"
-          Get-ChildItem out | Format-Table Name, Length
+          # The same files with a higher version: a major upgrade of the first one.
+          $v = [version]$ver
+          $newver = "$($v.Major).$($v.Minor).$($v.Build + 1)"
+          Write-Host "upgrade version $newver"
+          wix build -arch x64 -d Version=$newver -d Payload=payload clients/windows/installer/Package.wxs -o "out-new/forgetty-win-$newver-x64.msi"
+          Get-ChildItem out, out-new | Format-Table Name, Length
 
       - name: Turn on the Japanese and Chinese input methods for the smoke
         # Same as in build-and-smoke: the smoke switches to them like the language bar.
@@ -409,19 +414,56 @@ jobs:
           $extra = Get-ChildItem $dir | Where-Object { $_.Name -notin @("forgetty-win.exe", "forgetty.exe", "ghostty-vt.dll") }
           if ($extra) { throw "the smoke left files in the install folder: $($extra.Name -join ', ')" }
 
+      # An upgrade stops the server (its shells end, the layout is restored at the next start) and
+      # replaces the files. The runner is elevated and the server runs at medium integrity, so
+      # this is the case where the installer's `forgetty.exe server stop` must cross the levels.
+      - name: Upgrade with a running server
+        shell: pwsh
+        run: |
+          . clients/windows/ci/medium-server.ps1
+          $dir = Join-Path $env:LOCALAPPDATA "Programs\Forgetty"
+          $exe = Join-Path $dir "forgetty.exe"
+          $new = (Get-ChildItem out-new/*.msi | Select-Object -First 1).FullName
+          $newver = [IO.Path]::GetFileNameWithoutExtension($new) -replace '^forgetty-win-(.*)-x64$','$1'
+          $old = Start-MediumServer $exe
+          $p = Start-Process msiexec.exe -ArgumentList "/i `"$new`" /qn /l*v upgrade.log" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Get-Content upgrade.log -Tail 80; throw "upgrade failed: $($p.ExitCode)" }
+          if (-not (Wait-Gone $old)) { throw "the old server (pid $old) is still running after the upgrade" }
+          foreach ($pair in @(@("forgetty-win.exe", "forgetty-win.exe"), @("forgetty.exe", "forgetty.exe"), @("ghostty-vt.dll", "ghostty-vt.dll"))) {
+            $got = (Get-FileHash (Join-Path $dir $pair[0]) -Algorithm SHA256).Hash
+            $want = (Get-FileHash (Join-Path "payload" $pair[1]) -Algorithm SHA256).Hash
+            if ($got -ne $want) { throw "after the upgrade $($pair[0]) is not the tested build" }
+          }
+          $run = (Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run")."Forgetty server"
+          $want = "`"$dir\forgetty-win.exe`" --start-server"
+          if ($run -ne $want) { throw "after the upgrade the Run value is '$run', want '$want'" }
+          # The product version in the Uninstall list is the new one.
+          $found = foreach ($root in "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall", "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall") {
+            Get-ChildItem $root -ErrorAction SilentlyContinue | ForEach-Object { Get-ItemProperty $_.PSPath } | Where-Object { $_.DisplayName -eq "Forgetty" }
+          }
+          $found | ForEach-Object { Write-Host "installed product: $($_.DisplayName) $($_.DisplayVersion)" }
+          if ($found -and ($found | Where-Object { $_.DisplayVersion -ne $newver })) { throw "the product version is not $newver" }
+          Write-Host "upgraded to $newver; the old server (pid $old) was stopped"
+
       - name: Uninstall and check
         shell: pwsh
         run: |
-          $msi = (Get-ChildItem out/*.msi | Select-Object -First 1).FullName
+          . clients/windows/ci/medium-server.ps1
+          $msi = (Get-ChildItem out-new/*.msi | Select-Object -First 1).FullName
           $dir = Join-Path $env:LOCALAPPDATA "Programs\Forgetty"
+          $exe = Join-Path $dir "forgetty.exe"
           $lnk = Join-Path ([Environment]::GetFolderPath("Programs")) "Forgetty.lnk"
+          # A real server at medium integrity holds forgetty.exe and the DLL while we uninstall.
+          $srv = Start-MediumServer $exe
           $p = Start-Process msiexec.exe -ArgumentList "/x `"$msi`" /qn /l*v uninstall.log" -Wait -PassThru
+          # 3010 would mean a restart is needed because a file was in use.
           if ($p.ExitCode -ne 0) { Get-Content uninstall.log -Tail 60; throw "uninstall failed: $($p.ExitCode)" }
+          if (-not (Wait-Gone $srv)) { throw "the server (pid $srv) is still running after the uninstall" }
           if (Test-Path $dir) { throw "install folder left behind" }
           if (Test-Path $lnk) { throw "Start menu entry left behind" }
           if ((Get-ItemProperty "HKCU:\Environment").Path -like "*$dir*") { throw "PATH entry left behind" }
           if ((Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -ErrorAction SilentlyContinue)."Forgetty server") { throw "Run value left behind" }
-          Write-Host "install and uninstall are clean"
+          Write-Host "install, upgrade and uninstall are clean; the running server was stopped each time"
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -430,8 +472,10 @@ jobs:
           if-no-files-found: error
           path: |
             out/*.msi
+            out-new/*.msi
             out/installed-smoke.json
             install.log
+            upgrade.log
             uninstall.log
 
   # Can the runner install a Japanese or Chinese IME? Run by hand (workflow_dispatch). Result: it

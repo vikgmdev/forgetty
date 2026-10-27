@@ -1245,17 +1245,29 @@ fn peer_is_allowed(stream: &tokio::net::UnixStream, allowed_uid: Option<u32>) ->
 /// [`graceful_exit`] writes the file, so a late pane exit cannot save a
 /// smaller layout over the good one.
 pub fn save_layout(sm: &SessionManager, session_id: uuid::Uuid) {
-    if sm.is_shutting_down() {
-        return;
+    // The check and the snapshot are made under the save lock. A save that checked before the
+    // freeze and then waited for the lock would otherwise write its older state after the
+    // final one.
+    let saved = forgetty_workspace::save_session_for_with(session_id, || {
+        if sm.is_shutting_down() {
+            None
+        } else {
+            Some(sm.snapshot_to_workspace_state())
+        }
+    });
+    if let Err(e) = saved {
+        warn!("failed to save session layout: {e}");
     }
-    save_layout_final(sm, session_id);
 }
 
 /// Write the layout even in the shutdown state. Only a shutdown path calls this (the graceful
-/// exit, and the Windows logoff handler, which freezes the layout first and then saves).
+/// exit, and the Windows logoff handler, which freezes the layout first and then saves). The
+/// snapshot is made under the save lock, after any normal save that was already running.
 pub fn save_layout_final(sm: &SessionManager, session_id: uuid::Uuid) {
-    let state = sm.snapshot_to_workspace_state();
-    if let Err(e) = forgetty_workspace::save_session_for(session_id, &state) {
+    let saved = forgetty_workspace::save_session_for_with(session_id, || {
+        Some(sm.snapshot_to_workspace_state())
+    });
+    if let Err(e) = saved {
         warn!("failed to save session layout: {e}");
     }
 }

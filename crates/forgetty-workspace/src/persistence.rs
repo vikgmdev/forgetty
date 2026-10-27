@@ -56,6 +56,30 @@ pub fn save_session_for(session_id: uuid::Uuid, state: &WorkspaceState) -> io::R
     save_to_path(&session_path_for(session_id), state)
 }
 
+/// Like [`save_session_for`], but the state is made by `make_state` after the save lock is held.
+/// `make_state` returning `None` skips the save.
+///
+/// A state made before the lock can be older than the one a later caller saves first, and then
+/// it overwrites the newer file. Making it under the lock closes that: saves are in order, each
+/// with the state of its own turn. The shutdown path uses it so that a normal save cannot write
+/// over the final one (`make_state` there says `None` once the layout is frozen).
+/// `make_state` must not call a function that saves.
+pub fn save_session_for_with(
+    session_id: uuid::Uuid,
+    make_state: impl FnOnce() -> Option<WorkspaceState>,
+) -> io::Result<()> {
+    save_with_at(&session_path_for(session_id), make_state)
+}
+
+fn save_with_at(
+    path: &std::path::Path,
+    make_state: impl FnOnce() -> Option<WorkspaceState>,
+) -> io::Result<()> {
+    let _guard = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(state) = make_state() else { return Ok(()) };
+    write_locked(path, &state)
+}
+
 /// Load the workspace state from a UUID-named session file.
 ///
 /// Returns `Ok(None)` when the file does not exist. A corrupt file falls back to `.bak`.
@@ -138,6 +162,17 @@ fn save_to_path(path: &std::path::Path, state: &WorkspaceState) -> io::Result<()
     let json = serde_json::to_string_pretty(state)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let _guard = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    write_json_locked(path, &json)
+}
+
+/// [`save_to_path`] for a caller that holds `SAVE_LOCK`.
+fn write_locked(path: &std::path::Path, state: &WorkspaceState) -> io::Result<()> {
+    let json = serde_json::to_string_pretty(state)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    write_json_locked(path, &json)
+}
+
+fn write_json_locked(path: &std::path::Path, json: &str) -> io::Result<()> {
     if path.exists() {
         rotate_backup(path);
     }
@@ -1806,6 +1841,23 @@ mod p1qa_tests {
     use super::*;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    /// The state is made under the save lock, and `None` skips the save.
+    #[test]
+    fn save_with_makes_the_state_under_the_lock_and_none_skips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.json");
+        save_with_at(&path, || {
+            // The lock is held while the state is made: nobody else can save in between.
+            assert!(SAVE_LOCK.try_lock().is_err());
+            Some(named("first"))
+        })
+        .unwrap();
+        assert!(load_from_path(&path).unwrap().unwrap().workspaces[0].name == "first");
+        // Frozen: the closure says None and the file keeps the first state.
+        save_with_at(&path, || None).unwrap();
+        assert!(load_from_path(&path).unwrap().unwrap().workspaces[0].name == "first");
+    }
 
     fn named(name: &str) -> WorkspaceState {
         WorkspaceState {

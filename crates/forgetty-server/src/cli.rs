@@ -123,6 +123,14 @@ impl Info {
 impl Client {
     /// Connect without any version check.
     fn raw() -> Result<Self> {
+        Self::raw_for(false)
+    }
+
+    /// `shutdown_only`: Windows only. The connection is for the `shutdown` call alone and accepts
+    /// a server at a lower integrity level than this process (an elevated installer stopping
+    /// the server of the user). See `PipeStream::connect_for_shutdown`.
+    fn raw_for(shutdown_only: bool) -> Result<Self> {
+        let _ = shutdown_only;
         #[cfg(unix)]
         let path = default_socket_path();
         // The pipe name holds a secret kept in a file. No file means no server has started here.
@@ -152,7 +160,15 @@ impl Client {
                 return Err(CliError::Failed(format!("refusing to use the server socket: {why}")))
             }
         }
-        let stream = Stream::connect(&path).map_err(|e| {
+        #[cfg(windows)]
+        let connected = if shutdown_only {
+            Stream::connect_for_shutdown(&path)
+        } else {
+            Stream::connect(&path)
+        };
+        #[cfg(unix)]
+        let connected = Stream::connect(&path);
+        let stream = connected.map_err(|e| {
             // A pipe server of another user is not "not running": do not start over it.
             #[cfg(windows)]
             if e.kind() == std::io::ErrorKind::PermissionDenied {
@@ -605,15 +621,31 @@ fn process_alive(pid: u32) -> bool {
 }
 
 pub fn server_stop(if_idle: bool) -> Result<()> {
-    let (mut client, info) = Client::connect()?;
-    let pid = info.num("pid") as u32;
+    // Windows: the call is `shutdown` alone, on a connection that accepts a server below our
+    // integrity level (msiexec runs elevated, the server never does). The pid comes from the
+    // pipe, not from the server's own answer. No `server_info` is asked or trusted.
+    #[cfg(windows)]
+    let (mut client, pid) = {
+        let client = Client::raw_for(true)?;
+        let pid = client.writer.server_pid().map_err(|e| CliError::Failed(e.to_string()))?;
+        (client, pid)
+    };
+    #[cfg(unix)]
+    let (mut client, pid) = {
+        let (client, info) = Client::connect()?;
+        (client, info.num("pid") as u32)
+    };
     client.call("shutdown", json!({ "if_idle": if_idle }))?;
     drop(client);
 
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let alive = process_alive(pid);
-        if !alive && Client::raw().is_err() {
+        #[cfg(windows)]
+        let gone = Client::raw_for(true).is_err();
+        #[cfg(unix)]
+        let gone = Client::raw().is_err();
+        if !alive && gone {
             println!("server stopped");
             return Ok(());
         }
