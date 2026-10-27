@@ -36,6 +36,9 @@ pub struct PtyBridge {
     /// Input queue and writer thread. Writes go here, never to `pty`, so a
     /// program that does not read cannot hold a lock (see [`crate::pane_writer`]).
     pub writer: PaneWriterOwner,
+    /// The command the pane was started with: the explicit command, else the shell the config
+    /// names. Empty when the default shell was detected.
+    pub argv: Vec<String>,
 }
 
 impl PtyBridge {
@@ -106,7 +109,8 @@ impl PtyBridge {
             })
             .map_err(|e| format!("failed to spawn PTY reader thread: {e}"))?;
 
-        Ok(Self { pty, pty_rx: Some(rx), writer })
+        let argv = effective_command.unwrap_or_default();
+        Ok(Self { pty, pty_rx: Some(rx), writer, argv })
     }
 }
 

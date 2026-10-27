@@ -175,7 +175,7 @@ static METHODS: &[MethodSpec] = &[
         concat!(
             r#"{"tabs":[{"pane_id":""#,
             pane!(),
-            r#"","pid":4242,"rows":24,"cols":80,"cwd":"/home/vick","spawn_cwd":"/home/vick","title":"bash","remain_on_exit":false,"exited":false,"exit_code":null,"status":{"status":"idle","message":null,"kind":null,"progress":null,"app":null,"record_id":null},"last_notification":null,"label":"build"}]}"#
+            r#"","pid":4242,"rows":24,"cols":80,"cwd":"/home/vick","spawn_cwd":"/home/vick","title":"bash","remain_on_exit":false,"exited":false,"exit_code":null,"status":{"status":"idle","message":null,"kind":null,"progress":null,"app":null,"record_id":null},"last_notification":null,"label":"build","argv":[]}]}"#
         ),
         Some(|r, c| h::handle_list_tabs(r, &c.sm))
     ),
@@ -291,7 +291,7 @@ static METHODS: &[MethodSpec] = &[
         concat!(
             r#"{"pane_id":""#,
             pane!(),
-            r#"","rows":24,"cols":80,"title":"bash","cwd":"/home/vick","spawn_cwd":"/home/vick","pid":4242,"remain_on_exit":false,"exited":false,"exit_code":null,"status":{"status":"idle","message":null,"kind":null,"progress":null,"app":null,"record_id":null},"last_notification":null}"#
+            r#"","rows":24,"cols":80,"title":"bash","cwd":"/home/vick","spawn_cwd":"/home/vick","pid":4242,"remain_on_exit":false,"exited":false,"exit_code":null,"status":{"status":"idle","message":null,"kind":null,"progress":null,"app":null,"record_id":null},"last_notification":null,"argv":["pwsh.exe","-NoLogo"]}"#
         ),
         Some(|r, c| h::handle_get_pane_info(r, &c.sm))
     ),

@@ -134,6 +134,7 @@ pub(crate) fn handle_list_tabs(request: &Request, sm: &SessionManager) -> Respon
                     "status": status_json(&info),
                     "last_notification": notification_json(&info),
                     "label": info.label,
+                    "argv": info.argv,
                 })
             })
         })
@@ -1203,6 +1204,7 @@ pub(crate) fn handle_get_pane_info(request: &Request, sm: &SessionManager) -> Re
             "exit_code": info.exit_code,
             "status": status_json(&info),
             "last_notification": notification_json(&info),
+            "argv": info.argv,
             "size_owner": sm.size_owner(id).map(|o| serde_json::json!({
                 "client_id": o.client_id.to_string(),
                 "client_kind": o.client_kind,
@@ -2413,6 +2415,53 @@ mod tests {
             None,
         );
         assert_eq!(status.result.unwrap()["running"], true);
+    }
+
+    /// `argv` is the command the pane started with: the explicit command as given, and an
+    /// empty array for the default shell.
+    #[tokio::test]
+    async fn list_tabs_and_get_pane_info_carry_the_argv_of_the_pane() {
+        let sm = make_sm();
+        #[cfg(unix)]
+        let command = serde_json::json!(["sh", "-c", "sleep 30"]);
+        #[cfg(windows)]
+        let command = serde_json::json!(["cmd.exe", "/c", "ping -n 30 127.0.0.1"]);
+        let with = dispatch(
+            &req("new_tab", serde_json::json!({ "workspace_idx": 0, "command": command })),
+            Arc::clone(&sm),
+            None,
+            None,
+        );
+        let with = with.result.unwrap()["pane_id"].as_str().unwrap().to_string();
+        let plain = dispatch(
+            &req("new_tab", serde_json::json!({ "workspace_idx": 0 })),
+            Arc::clone(&sm),
+            None,
+            None,
+        );
+        let plain = plain.result.unwrap()["pane_id"].as_str().unwrap().to_string();
+        let tabs =
+            dispatch(&req("list_tabs", serde_json::Value::Null), Arc::clone(&sm), None, None);
+        let tabs = tabs.result.unwrap()["tabs"].clone();
+        let argv_of = |id: &str| {
+            tabs.as_array().unwrap().iter().find(|t| t["pane_id"] == id).unwrap()["argv"].clone()
+        };
+        assert_eq!(argv_of(&with), command);
+        assert_eq!(argv_of(&plain), serde_json::json!([]));
+        let one = dispatch(
+            &req("get_pane_info", serde_json::json!({ "pane_id": with })),
+            Arc::clone(&sm),
+            None,
+            None,
+        );
+        assert_eq!(one.result.unwrap()["argv"], command);
+        let one = dispatch(
+            &req("get_pane_info", serde_json::json!({ "pane_id": plain })),
+            sm,
+            None,
+            None,
+        );
+        assert_eq!(one.result.unwrap()["argv"], serde_json::json!([]));
     }
 
     #[tokio::test]

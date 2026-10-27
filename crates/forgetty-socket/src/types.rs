@@ -73,6 +73,8 @@ pub struct PaneEntry {
     pub last_notification: Option<LastNotification>,
     /// User label (`set_label`). Empty when none.
     pub label: String,
+    /// The command the pane was started with, as an array. Empty for the default shell.
+    pub argv: Vec<String>,
 }
 
 #[derive(JsonSchema, Serialize, Deserialize)]
@@ -352,6 +354,8 @@ pub struct PaneInfoResult {
     pub exit_code: Option<i32>,
     pub status: PaneStatus,
     pub last_notification: Option<LastNotification>,
+    /// The command the pane was started with, as an array. Empty for the default shell.
+    pub argv: Vec<String>,
     /// The client that owns the pane's size (AD-020), `null` when none does.
     pub size_owner: Option<SizeOwnerInfo>,
 }

@@ -98,6 +98,8 @@ pub struct PaneInfo {
     pub last_notification: Option<NotificationInfo>,
     /// User label (`set_label`), empty when none.
     pub label: String,
+    /// The command the pane was started with (empty for the default shell).
+    pub argv: Vec<String>,
 }
 
 /// Returned per-tab metadata from `SessionManager::duplicate_workspace` (FIX-007).

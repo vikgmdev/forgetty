@@ -300,6 +300,7 @@ None.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
+| `argv` | array of string | yes | The command the pane was started with, as an array. Empty for the default shell. |
 | `cols` | integer | yes |  |
 | `cwd` | string | yes | Working directory to show (OSC 7 hint, else the real directory). |
 | `exit_code` | integer or null | no |  |
@@ -329,7 +330,7 @@ None.
 
 ```json
 {"jsonrpc":"2.0","method":"list_tabs","params":{},"id":1}
-{"jsonrpc":"2.0","result":{"tabs":[{"pane_id":"6f1c2a40-5b7e-4d3a-9c21-8e0d4b7a1f35","pid":4242,"rows":24,"cols":80,"cwd":"/home/vick","spawn_cwd":"/home/vick","title":"bash","remain_on_exit":false,"exited":false,"exit_code":null,"status":{"status":"idle","message":null,"kind":null,"progress":null,"app":null,"record_id":null},"last_notification":null,"label":"build"}]},"id":1}
+{"jsonrpc":"2.0","result":{"tabs":[{"pane_id":"6f1c2a40-5b7e-4d3a-9c21-8e0d4b7a1f35","pid":4242,"rows":24,"cols":80,"cwd":"/home/vick","spawn_cwd":"/home/vick","title":"bash","remain_on_exit":false,"exited":false,"exit_code":null,"status":{"status":"idle","message":null,"kind":null,"progress":null,"app":null,"record_id":null},"last_notification":null,"label":"build","argv":[]}]},"id":1}
 ```
 
 ### `get_layout`
@@ -579,6 +580,7 @@ Kind: call. Protocol v2: yes.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
+| `argv` | array of string | yes | The command the pane was started with, as an array. Empty for the default shell. |
 | `cols` | integer | yes |  |
 | `cwd` | string | yes |  |
 | `exit_code` | integer or null | no |  |
@@ -624,7 +626,7 @@ Kind: call. Protocol v2: yes.
 
 ```json
 {"jsonrpc":"2.0","method":"get_pane_info","params":{"pane_id":"6f1c2a40-5b7e-4d3a-9c21-8e0d4b7a1f35"},"id":1}
-{"jsonrpc":"2.0","result":{"pane_id":"6f1c2a40-5b7e-4d3a-9c21-8e0d4b7a1f35","rows":24,"cols":80,"title":"bash","cwd":"/home/vick","spawn_cwd":"/home/vick","pid":4242,"remain_on_exit":false,"exited":false,"exit_code":null,"status":{"status":"idle","message":null,"kind":null,"progress":null,"app":null,"record_id":null},"last_notification":null},"id":1}
+{"jsonrpc":"2.0","result":{"pane_id":"6f1c2a40-5b7e-4d3a-9c21-8e0d4b7a1f35","rows":24,"cols":80,"title":"bash","cwd":"/home/vick","spawn_cwd":"/home/vick","pid":4242,"remain_on_exit":false,"exited":false,"exit_code":null,"status":{"status":"idle","message":null,"kind":null,"progress":null,"app":null,"record_id":null},"last_notification":null,"argv":["pwsh.exe","-NoLogo"]},"id":1}
 ```
 
 ### `resize_pane`

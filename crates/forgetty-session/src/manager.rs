@@ -2615,6 +2615,7 @@ impl SessionManager {
             exit_code: pane.exit_code,
             status: pane.osc.status.effective(),
             last_notification: pane.osc.last_notification.clone(),
+            argv: pane.pty_bridge.argv.clone(),
         })
     }
 
