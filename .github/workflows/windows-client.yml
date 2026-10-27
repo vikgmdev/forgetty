@@ -422,6 +422,8 @@ jobs:
       # replaces the files. The runner is elevated and the server runs at medium integrity, so
       # this is the case where the installer's `forgetty.exe server stop` must cross the levels.
       - name: Upgrade with a running server
+        # Independent of the app smoke above: a failed smoke must not hide the installer checks.
+        if: ${{ !cancelled() }}
         shell: pwsh
         run: |
           . clients/windows/ci/medium-server.ps1
@@ -450,6 +452,7 @@ jobs:
           Write-Host "upgraded to $newver; the old server (pid $old) was stopped"
 
       - name: Uninstall and check
+        if: ${{ !cancelled() }}
         shell: pwsh
         run: |
           . clients/windows/ci/medium-server.ps1
