@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use forgetty_shell_core::localserver::{self as ls, Fallback, Plan};
+use forgetty_shell_core::settings::Page;
 use forgetty_shell_core::{MachineKind, PaneId, Uuid};
 use gpui::{Context, Window};
 use serde_json::json;
@@ -178,7 +179,7 @@ impl ShellSmoke {
                             let base = recorded("key_to_frame_p50_ms").unwrap_or(f64::MAX);
                             record("local_server_vs_in_process_ms", json!({"in_process_p50": base, "server_p50": p50, "delta": p50 - base}));
                             check("local_server_key_p50_within_2ms_of_in_process", p50 <= base + 2.0);
-                            self.goto(Phase::LsKill);
+                            self.goto(Phase::LsDevices);
                         } else if self.lat_ms.len() % 20 == 0 {
                             self.ls.fed_before = view.read(cx).fed_bytes;
                             view.update(cx, |v, _| v.send_bytes(b"\r\n"));
@@ -189,6 +190,46 @@ impl ShellSmoke {
                             let ch = self.next_key_char();
                             self.probe = Some(Probe { row: r, col: c, ch, t0: Instant::now() });
                             view.update(cx, |v, _| v.send_bytes(ch.to_string().as_bytes()));
+                        }
+                    }
+                }
+            }
+            // ---- Settings, Devices: the list, and a QR code for another device ---------------------
+            Phase::LsDevices => {
+                let view = |shell: &AppShell| shell.settings.as_ref().map(|w| w.st.devices.view());
+                if self.phase_t0.elapsed() > Duration::from_secs(60) {
+                    fail("local server: the Devices page did not finish in 60 s");
+                }
+                match self.sub {
+                    0 => {
+                        shell.open_settings(Some(Page::Devices), cx);
+                        self.sub = 1;
+                    }
+                    1 => {
+                        let Some(v) = view(shell) else { return };
+                        if v.rows.is_empty() {
+                            return;
+                        }
+                        check("devices_page_lists_the_app_as_this_pc_local_app", v.rows.iter().any(|r| r.own && r.title.starts_with("This PC (local app)")));
+                        check("devices_page_own_device_has_no_revoke_armed", v.rows.iter().all(|r| !r.armed));
+                        shell.settings_press("dev-pair", window, cx);
+                        self.sub = 2;
+                    }
+                    2 => {
+                        let Some(v) = view(shell) else { return };
+                        if let Some(q) = v.qr {
+                            // A QR code of version 1 or more: 21 modules and a quiet zone.
+                            check("devices_page_pair_new_device_shows_a_qr", q.w >= 21 && q.h >= 21 && !q.runs.is_empty());
+                            shell.settings_press("dev-cancel", window, cx);
+                            self.sub = 3;
+                        }
+                    }
+                    _ => {
+                        let Some(w) = shell.settings.as_ref() else { return };
+                        if !w.st.devices.is_pairing() {
+                            check("devices_page_pairing_cancel_ends_it", view(shell).is_some_and(|v| v.qr.is_none() && v.message.is_some()));
+                            shell.close_settings(window, cx);
+                            self.goto(Phase::LsKill);
                         }
                     }
                 }

@@ -221,6 +221,10 @@ impl ShellSmoke {
                         && menu_has(shell, "Duplicate Tab", true)
                         && menu_has(shell, "Close Other Tabs", true),
                 );
+                check(
+                    "menu_tab_lists_the_gtk_rows_greyed",
+                    menu_has(shell, "Move to New Window", false) && menu_has(shell, "Export", false),
+                );
                 shell.handle_key(&key("down"), window, cx);
                 check("menu_down_selects_a_row", shell.menu.as_ref().is_some_and(|o| o.menu.selected.is_some()));
                 let handled = shell.handle_key(&key("escape"), window, cx);

@@ -28,6 +28,7 @@ mod remote;
 mod wp1;
 mod wp2;
 mod wp3;
+mod img;
 mod keymap;
 mod localsrv;
 mod settings;
@@ -179,10 +180,13 @@ enum Phase {
     Keymap,
     // The Settings window (WP4).
     Settings,
+    // F8: paste a picture.
+    ImgPaste,
     // The local server (WP6).
     LsStart,
     LsWait,
     LsKeys,
+    LsDevices,
     LsKill,
     LsDone,
     // W3: remote machines.
@@ -243,9 +247,11 @@ impl Phase {
             Phase::Wp3d => "wp3d-spawn-latency",
             Phase::Keymap => "keymap-presets",
             Phase::Settings => "settings-window",
+            Phase::ImgPaste => "f8-image-paste",
             Phase::LsStart => "ls-start",
             Phase::LsWait => "ls-wait-for-server",
             Phase::LsKeys => "ls-keystrokes",
+            Phase::LsDevices => "ls-devices-page",
             Phase::LsKill => "ls-kill-and-restart",
             Phase::LsDone => "ls-done",
             Phase::RSetup => "w3-start-server-and-pair",
@@ -1430,7 +1436,8 @@ impl ShellSmoke {
             Phase::Wp3d => self.wp3d(shell, window, cx),
             Phase::Keymap => self.keymap(shell, window, cx),
             Phase::Settings => self.settings(shell, window, cx),
-            Phase::LsStart | Phase::LsWait | Phase::LsKeys | Phase::LsKill | Phase::LsDone => self.ls_step(shell, window, cx, now_t),
+            Phase::ImgPaste => self.img_step(shell, window, cx, now_t),
+            Phase::LsStart | Phase::LsWait | Phase::LsKeys | Phase::LsDevices | Phase::LsKill | Phase::LsDone => self.ls_step(shell, window, cx, now_t),
             Phase::RSetup | Phase::RPair | Phase::REcho | Phase::RKeys | Phase::RKill | Phase::RRestart | Phase::RToast | Phase::RServer | Phase::W5View => {
                 self.w3_step(shell, window, cx, now_t)
             }
@@ -1563,6 +1570,22 @@ fn run_direct_checks() {
                 && d.paste_warn_size == 5120
                 && d.smart_copy
                 && bad.is_err(),
+        );
+    }
+
+    // H10: cursor_style is read, defaults to block, and decides the shape of a program that set none.
+    {
+        use forgetty_shell_core::config::CursorStyle;
+        use forgetty_shell_core::cursor::{shape, Shape};
+        let c = Config::from_toml("cursor_style = \"underline\"");
+        check(
+            "config_cursor_style",
+            Config::default().cursor_style == CursorStyle::Block
+                && c.as_ref().is_ok_and(|c| c.cursor_style == CursorStyle::Underline)
+                && Config::from_toml("cursor_style = \"fat\"").is_err()
+                && shape(1, CursorStyle::Underline, true) == Shape::Underline
+                && shape(0, CursorStyle::Underline, true) == Shape::Bar
+                && shape(1, CursorStyle::Underline, false) == Shape::Hollow,
         );
     }
 

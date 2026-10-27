@@ -465,7 +465,7 @@ impl ShellSmoke {
                 shell.close_settings(window, cx);
                 self.st_put("");
                 self.sub_t0 = Instant::now();
-                self.goto(super::Phase::LsStart);
+                self.goto(super::Phase::ImgPaste);
             }
             _ => {}
         }
