@@ -160,6 +160,40 @@ fn address_present(ip: std::net::IpAddr) -> bool {
     std::net::UdpSocket::bind((ip, 0)).is_ok()
 }
 
+/// Failed rebinds per address. A failed rebind drops the connections, so an
+/// address that fails [`RetryBook::MAX_FAILED`] times is given up until the
+/// server restarts, and each retry waits longer (10 s, then 20 s).
+#[derive(Default)]
+struct RetryBook {
+    failed: std::collections::HashMap<std::net::IpAddr, (u32, std::time::Instant)>,
+}
+
+impl RetryBook {
+    const MAX_FAILED: u32 = 3;
+
+    fn given_up(&self, ip: &std::net::IpAddr) -> bool {
+        self.failed.get(ip).is_some_and(|(n, _)| *n >= Self::MAX_FAILED)
+    }
+
+    /// May the address be tried now?
+    fn due(&self, ip: &std::net::IpAddr, now: std::time::Instant) -> bool {
+        self.failed.get(ip).is_none_or(|(_, next)| *next <= now)
+    }
+
+    /// A rebind with this address failed after it dropped the connections:
+    /// the failure count, and how long to wait.
+    fn failure(&mut self, ip: std::net::IpAddr, now: std::time::Instant) -> (u32, Duration) {
+        let n = self.failed.get(&ip).map_or(0, |(n, _)| *n) + 1;
+        let wait = Duration::from_secs(10 * u64::from(n));
+        self.failed.insert(ip, (n, now + wait));
+        (n, wait)
+    }
+
+    fn success(&mut self, ip: &std::net::IpAddr) {
+        self.failed.remove(ip);
+    }
+}
+
 /// Watch the `--bind` addresses that were missing at start. When one appears
 /// (several at once count as one), bind the endpoint again with the full set:
 /// iroh cannot add a socket to a running endpoint, so the connections drop once
@@ -184,20 +218,26 @@ fn watch_missing_addresses(ep: Arc<SyncEndpoint>, all: Vec<std::net::IpAddr>) {
         );
     }
     tokio::spawn(async move {
-        // A failed rebind drops the connections: wait longer before the next
-        // one (10 s, doubling up to 5 min).
-        let mut cooldown = Duration::ZERO;
+        let mut book = RetryBook::default();
         let mut warned = false;
         loop {
-            tokio::time::sleep(BIND_WATCH_EVERY.max(cooldown)).await;
+            tokio::time::sleep(BIND_WATCH_EVERY).await;
             // The addresses not bound now: those that never came, and those a
-            // failed rebind gave up on.
-            let missing = missing_now();
+            // failed rebind gave up on (not the ones given up for good).
+            let missing: Vec<std::net::IpAddr> = missing_now()
+                .into_iter()
+                .filter(|ip| !book.given_up(ip))
+                .collect();
             if missing.is_empty() {
                 return;
             }
-            let appeared: Vec<std::net::IpAddr> =
-                missing.iter().copied().filter(|ip| address_present(*ip)).collect();
+            let now = std::time::Instant::now();
+            let appeared: Vec<std::net::IpAddr> = missing
+                .iter()
+                .copied()
+                .filter(|ip| book.due(ip, now))
+                .filter(|ip| address_present(*ip))
+                .collect();
             if appeared.is_empty() {
                 continue;
             }
@@ -214,7 +254,9 @@ fn watch_missing_addresses(ep: Arc<SyncEndpoint>, all: Vec<std::net::IpAddr>) {
                         "--bind {names} is there: iroh endpoint bound again on {} (connections reconnect once)",
                         list(&ep.bind_addrs())
                     );
-                    cooldown = Duration::ZERO;
+                    for ip in &appeared {
+                        book.success(ip);
+                    }
                     warned = false;
                 }
                 Err(f) if !f.dropped => {
@@ -225,24 +267,29 @@ fn watch_missing_addresses(ep: Arc<SyncEndpoint>, all: Vec<std::net::IpAddr>) {
                     }
                 }
                 Err(f) => {
-                    cooldown = if cooldown.is_zero() {
-                        Duration::from_secs(10)
-                    } else {
-                        (cooldown * 2).min(Duration::from_secs(300))
-                    };
                     let bound = ep.bound_sockets();
-                    if bound.is_empty() {
-                        error!(
-                            "--bind {names} could not be added ({}); no endpoint is bound now, the server keeps trying to bind in the background",
-                            f.error
-                        );
+                    let bound_text = if bound.is_empty() {
+                        "no endpoint is bound now, the server keeps trying to bind in the background".to_string()
                     } else {
-                        error!(
-                            "--bind {names} could not be added ({}); bound now: {}; trying again in {} s",
-                            f.error,
-                            bound.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", "),
-                            cooldown.as_secs()
-                        );
+                        format!(
+                            "bound now: {}",
+                            bound.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ")
+                        )
+                    };
+                    for ip in &appeared {
+                        let (n, wait) = book.failure(*ip, std::time::Instant::now());
+                        if n >= RetryBook::MAX_FAILED {
+                            warn!(
+                                "--bind {ip} could not be added {n} times ({}); the server stops trying for it until it restarts; {bound_text}",
+                                f.error
+                            );
+                        } else {
+                            error!(
+                                "--bind {ip} could not be added ({}); {bound_text}; trying again in {} s",
+                                f.error,
+                                wait.as_secs()
+                            );
+                        }
                     }
                 }
             }
@@ -1210,6 +1257,26 @@ fn restore_subtree(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_address_that_keeps_failing_is_given_up_and_the_others_are_not_held_back() {
+        let (a, b): (std::net::IpAddr, std::net::IpAddr) =
+            ("10.0.0.1".parse().unwrap(), "10.0.0.2".parse().unwrap());
+        let t0 = std::time::Instant::now();
+        let mut book = RetryBook::default();
+        assert!(book.due(&a, t0) && !book.given_up(&a));
+        assert_eq!(book.failure(a, t0), (1, Duration::from_secs(10)));
+        assert!(!book.due(&a, t0 + Duration::from_secs(9)));
+        assert!(book.due(&a, t0 + Duration::from_secs(10)));
+        // Another address does not wait for a's cooldown.
+        assert!(book.due(&b, t0 + Duration::from_secs(1)));
+        assert_eq!(book.failure(a, t0).0, 2);
+        assert!(!book.given_up(&a));
+        assert_eq!(book.failure(a, t0).0, 3);
+        assert!(book.given_up(&a) && !book.given_up(&b));
+        book.success(&a);
+        assert!(!book.given_up(&a));
+    }
+
     use super::*;
 
     #[test]

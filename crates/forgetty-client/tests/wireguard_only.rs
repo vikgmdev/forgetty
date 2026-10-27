@@ -368,6 +368,43 @@ async fn a_failed_rebind_and_fallback_is_retried_until_the_server_binds_again() 
     server.shutdown().await;
 }
 
+/// While the server has no endpoint and retries in the background, a pairing
+/// payload does not wait for a rebind that is not going to end: it answers at
+/// once (with no direct address), and the server binds again when the hook lets
+/// go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pairing_payload_does_not_wait_while_the_server_retries_its_bind() {
+    if !real_only() {
+        return;
+    }
+    init_tracing();
+    let server = TestServer::start_real_hiding(
+        &["--bind", "127.0.0.1", "--bind", "127.0.0.2", "--no-relay"],
+        &["127.0.0.2"],
+        true,
+    )
+    .await;
+    let data = server.state_dir().unwrap().join("data/forgetty");
+    std::fs::write(data.join("qa-fail-bind"), "127.0.0.1\n127.0.0.2\n").unwrap();
+    server.show_addresses();
+    wait_for("the server to have no socket", Duration::from_secs(40), || {
+        net(&server)["bound_sockets"].as_array().is_some_and(|a| a.is_empty())
+    })
+    .await;
+    // Past the 4 s of the rebind itself, the background retry runs.
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    let t0 = Instant::now();
+    let qr = payload(&server);
+    assert!(t0.elapsed() < Duration::from_secs(2), "the payload waited {:?}", t0.elapsed());
+    assert!(qr.direct_addrs().is_empty(), "{:?}", qr.direct_addrs());
+    std::fs::write(data.join("qa-fail-bind"), "").unwrap();
+    wait_for("the server to bind again", Duration::from_secs(40), || {
+        net(&server)["bound_sockets"].as_array().is_some_and(|a| !a.is_empty())
+    })
+    .await;
+    server.shutdown().await;
+}
+
 /// Neither address is there at start: the server waits, then binds the ones
 /// that appeared (both here, in one go).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -274,6 +274,7 @@ impl SyncEndpointBuilder {
             rebind_lock: tokio::sync::Mutex::new(()),
             rebinding: AtomicBool::new(false),
             closed: AtomicBool::new(false),
+            recovering: AtomicBool::new(false),
             registry,
             pairing: Arc::new(Mutex::new(PairingState::new())),
             extra_alpns: Arc::new(self.extra_alpns),
@@ -459,6 +460,8 @@ pub struct SyncEndpoint {
     rebinding: AtomicBool,
     /// [`close`](Self::close) was called: no rebind any more.
     closed: AtomicBool,
+    /// A failed rebind left no endpoint and the background retry runs.
+    recovering: AtomicBool,
     registry: Arc<Mutex<DeviceRegistry>>,
     pairing: Arc<Mutex<PairingState>>,
     extra_alpns: Arc<HashMap<Vec<u8>, AlpnHandler>>,
@@ -616,6 +619,7 @@ impl SyncEndpoint {
                             one.bind_addrs = vec![*ip];
                             candidates.push(one);
                         }
+                        self.recovering.store(true, Ordering::SeqCst);
                         let me = Arc::clone(self);
                         tokio::spawn(async move { me.recover(candidates).await });
                     }
@@ -634,6 +638,7 @@ impl SyncEndpoint {
             tokio::time::sleep(wait).await;
             let _one = self.rebind_lock.lock().await;
             if self.closed.load(Ordering::SeqCst) {
+                self.recovering.store(false, Ordering::SeqCst);
                 self.rebinding.store(false, Ordering::SeqCst);
                 return;
             }
@@ -645,6 +650,7 @@ impl SyncEndpoint {
                     );
                     *self.endpoint.write().unwrap_or_else(|e| e.into_inner()) = Some(ep);
                     *self.cfg.lock().unwrap_or_else(|e| e.into_inner()) = cfg.clone();
+                    self.recovering.store(false, Ordering::SeqCst);
                     self.rebinding.store(false, Ordering::SeqCst);
                     return;
                 }
@@ -653,8 +659,13 @@ impl SyncEndpoint {
         }
     }
 
-    /// Wait (3 s at most) for a rebind in progress to end.
+    /// Wait (3 s at most) for a rebind in progress to end. During the
+    /// background retry after a failed rebind there is nothing to wait for:
+    /// the caller gets what is bound now.
     fn wait_for_rebind(&self) {
+        if self.recovering.load(Ordering::SeqCst) {
+            return;
+        }
         let t0 = std::time::Instant::now();
         while self.rebinding.load(Ordering::SeqCst) && t0.elapsed() < std::time::Duration::from_secs(3) {
             std::thread::sleep(std::time::Duration::from_millis(20));
