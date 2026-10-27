@@ -38,12 +38,23 @@ use crate::protocol::{methods, Request, Response};
 /// cannot accumulate).
 struct ConnGuard {
     counter: Arc<AtomicUsize>,
+    counted: bool,
 }
 
 impl ConnGuard {
+    /// A guard that is not counted yet: [`arm`](Self::arm) counts it. A connection whose peer
+    /// is not checked until it sends something (the Windows pipe) arms after that check, so a
+    /// refused client never shows up as attached.
     fn new(counter: Arc<AtomicUsize>) -> Self {
-        counter.fetch_add(1, Ordering::Relaxed);
-        Self { counter }
+        Self { counter, counted: false }
+    }
+
+    /// Count this connection. Once only.
+    fn arm(&mut self) {
+        if !self.counted {
+            self.counted = true;
+            self.counter.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -51,7 +62,9 @@ impl Drop for ConnGuard {
     fn drop(&mut self) {
         // `fetch_sub` with Relaxed: ordering is not required because the
         // counter is only ever read for a best-effort snapshot.
-        self.counter.fetch_sub(1, Ordering::Relaxed);
+        if self.counted {
+            self.counter.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -60,6 +73,9 @@ impl Drop for ConnGuard {
 #[cfg(unix)]
 mod transport {
     use super::*;
+
+    /// Is the peer known to be the right user when `accept` returns?
+    pub const PEER_CHECKED_AT_ACCEPT: bool = true;
 
     /// Who is served: a uid. `None` is the uid of this process.
     pub type Allowed = Option<u32>;
@@ -88,6 +104,21 @@ mod transport {
 #[cfg(windows)]
 mod transport {
     pub use crate::pipe::{Allowed, Listener};
+
+    /// The pipe client is checked after its first read, not at accept.
+    pub const PEER_CHECKED_AT_ACCEPT: bool = false;
+}
+
+/// A socket path as it goes into a log. A pipe name holds a secret, which stays out of logs.
+fn shown(path: &Path) -> String {
+    #[cfg(windows)]
+    {
+        format!("{:?}", crate::pipe::redact_pipe_name(&path.to_string_lossy()))
+    }
+    #[cfg(unix)]
+    {
+        format!("{path:?}")
+    }
 }
 
 /// The Forgetty JSON-RPC socket server.
@@ -216,7 +247,7 @@ impl SocketServer {
         F: Fn(Request) -> Response + Send + Sync + 'static,
     {
         let mut listener = transport::Listener::bind(&self.socket_path, self.allowed())?;
-        info!("Socket server listening on {:?}", self.socket_path);
+        info!("Socket server listening on {}", shown(&self.socket_path));
 
         let handler = Arc::new(handler);
 
@@ -274,7 +305,7 @@ impl SocketServer {
         sync_slot: SyncSlot,
     ) -> std::io::Result<()> {
         let mut listener = transport::Listener::bind(&self.socket_path, self.allowed())?;
-        info!("Socket server listening on {:?}", self.socket_path);
+        info!("Socket server listening on {}", shown(&self.socket_path));
 
         handlers::mark_started();
         let session_id = self.session_id;
@@ -294,7 +325,12 @@ impl SocketServer {
                     let counter = Arc::clone(&conn_counter);
                     let socket_path = socket_path.clone();
                     tokio::spawn(async move {
-                        let _guard = ConnGuard::new(Arc::clone(&counter));
+                        let mut guard = ConnGuard::new(Arc::clone(&counter));
+                        // A Unix peer is checked at accept: it counts from the start. A pipe
+                        // client is checked when its first bytes arrive: it counts from there.
+                        if transport::PEER_CHECKED_AT_ACCEPT {
+                            guard.arm();
+                        }
                         if let Err(e) = handle_streaming_connection(
                             stream,
                             sm,
@@ -302,6 +338,7 @@ impl SocketServer {
                             session_id,
                             counter,
                             socket_path,
+                            &mut guard,
                         )
                         .await
                         {
@@ -412,6 +449,7 @@ async fn handle_streaming_connection<S>(
     session_id: Option<uuid::Uuid>,
     conn_counter: Arc<AtomicUsize>,
     socket_path: PathBuf,
+    guard: &mut ConnGuard,
 ) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -435,6 +473,8 @@ where
             // Orderly EOF on the client read half.
             break;
         }
+        // Bytes came from the client, so on a pipe its user has been checked by now.
+        guard.arm();
         let line = line_buf.trim().to_string();
         if line.is_empty() {
             continue;

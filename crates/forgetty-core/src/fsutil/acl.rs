@@ -7,31 +7,33 @@
 use std::io;
 use std::path::Path;
 
-/// Write `bytes` to `path` so that only the current user can read the file at
-/// any time after it exists: write a temporary file, restrict it, flush it to disk, then
-/// rename it over `path` (the DACL travels with the file) and flush the rename too. A power
-/// cut leaves the old file or the new one, never an empty one.
+/// Write `bytes` to `path` so that only the current user can read the file at any time after it
+/// exists. The temporary file has a name no other call uses (pid, counter, clock), is created
+/// with the user-only descriptor in the create call, is flushed to disk, and is then renamed over
+/// `path` (the DACL travels with the file). The rename is flushed too. Two threads or processes
+/// writing the same target each use their own temporary file, so the target is always one
+/// complete write with the user-only descriptor. A power cut leaves the old file or the new one,
+/// never an empty one.
 pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = std::path::PathBuf::from(tmp);
-    // Fresh temporary every time: a stale one may carry another DACL.
-    let _ = std::fs::remove_file(&tmp);
+    let tmp = super::unique_tmp_path(path);
     let written = (|| {
-        use std::io::Write;
-        let mut f = std::fs::File::create(&tmp)?;
+        let mut f = super::create_private_new(&tmp)?;
         f.write_all(bytes)?;
         // The data must be on disk before the rename makes it the file.
         f.sync_all()
     })();
-    if let Err(e) = written.and_then(|()| restrict_to_user(&tmp)) {
+    if let Err(e) = written {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
-    replace_file(&tmp, path)?;
+    if let Err(e) = replace_file(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     match path.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => sync_dir(dir),
         _ => Ok(()),
@@ -86,7 +88,8 @@ pub fn is_user_only(path: &Path) -> io::Result<bool> {
 #[cfg(windows)]
 pub use win::{
     create_private_file, create_private_new, current_integrity_rid, current_user_sid, describe,
-    is_elevated, is_user_only, only_sid_sddl, pipe_client_identity, pipe_sddl, process_identity, process_user_sid,
+    is_elevated, is_user_only, object_owner_sid, only_sid_sddl, pipe_client_identity, pipe_sddl,
+    process_identity, process_user_sid,
     replace_file, restrict_dir_to_user, restrict_to_user, same_account, sync_dir, INTEGRITY_HIGH,
     INTEGRITY_MEDIUM,
 };
@@ -321,15 +324,47 @@ mod win {
         format!("D:P(A;;GA;;;{sid})")
     }
 
-    /// Like [`only_sid_sddl`], and for a process at high integrity also a mandatory label that
-    /// stops processes of a lower level from writing to, reading or executing the object (the
-    /// default label only stops writes). An elevated server must not be reachable from a normal
-    /// process of the same user: that would be a way around the UAC prompt.
-    pub fn pipe_sddl(sid: &str, high_integrity: bool) -> String {
-        if high_integrity {
-            format!("D:P(A;;GA;;;{sid})S:(ML;;NWNRNX;;;HI)")
-        } else {
-            only_sid_sddl(sid)
+    /// Like [`only_sid_sddl`], and `sid` is also the owner. Without it the owner is the default
+    /// owner of the creator's token, which is the Administrators group for an elevated process.
+    /// A client of the pipe reads the owner to be sure the pipe was made by this user
+    /// ([`object_owner_sid`]).
+    pub fn pipe_sddl(sid: &str) -> String {
+        format!("O:{sid}D:P(A;;GA;;;{sid})")
+    }
+
+    /// The owner SID of a kernel object that `handle` is open on (a pipe, for example), in
+    /// string form. The handle needs `READ_CONTROL`.
+    pub fn object_owner_sid(handle: HANDLE) -> io::Result<String> {
+        use windows::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
+        use windows::Win32::Security::OWNER_SECURITY_INFORMATION;
+        // SAFETY: out pointers are valid; the descriptor is freed after the SID is copied.
+        unsafe {
+            let mut owner = PSID::default();
+            let mut sd = PSECURITY_DESCRIPTOR::default();
+            let rc = GetSecurityInfo(
+                handle,
+                SE_KERNEL_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                Some(&mut owner),
+                None,
+                None,
+                None,
+                Some(&mut sd),
+            );
+            if rc != ERROR_SUCCESS {
+                return Err(io::Error::from_raw_os_error(rc.0 as i32));
+            }
+            let mut s = PWSTR::null();
+            let r = ConvertSidToStringSidW(owner, &mut s);
+            let out = match r {
+                Ok(()) => s.to_string().map_err(|e| io::Error::other(e.to_string())),
+                Err(e) => Err(err(e)),
+            };
+            if !s.is_null() {
+                let _ = LocalFree(Some(HLOCAL(s.0 as *mut c_void)));
+            }
+            let _ = LocalFree(Some(HLOCAL(sd.0)));
+            out
         }
     }
 
@@ -581,12 +616,11 @@ mod sid_tests {
     }
 
     #[test]
-    fn the_pipe_sddl_names_one_sid_and_labels_a_high_server() {
+    fn the_pipe_sddl_names_one_sid_as_owner_and_in_the_dacl() {
         assert_eq!(only_sid_sddl("S-1-5-21-1-2-3-1001"), "D:P(A;;GA;;;S-1-5-21-1-2-3-1001)");
-        assert_eq!(pipe_sddl("S-1-5-21-1-2-3-1001", false), only_sid_sddl("S-1-5-21-1-2-3-1001"));
         assert_eq!(
-            pipe_sddl("S-1-5-21-1-2-3-1001", true),
-            "D:P(A;;GA;;;S-1-5-21-1-2-3-1001)S:(ML;;NWNRNX;;;HI)"
+            pipe_sddl("S-1-5-21-1-2-3-1001"),
+            "O:S-1-5-21-1-2-3-1001D:P(A;;GA;;;S-1-5-21-1-2-3-1001)"
         );
     }
 
@@ -595,5 +629,53 @@ mod sid_tests {
         let rid = current_integrity_rid().unwrap();
         assert!(rid >= INTEGRITY_MEDIUM, "{rid:#x}");
         assert_eq!(is_elevated(), rid >= INTEGRITY_HIGH);
+    }
+}
+
+#[cfg(test)]
+mod write_private_tests {
+    use super::*;
+
+    /// Two threads write the same target in a loop. After every write the target holds one
+    /// complete payload and has the user-only descriptor.
+    #[test]
+    fn two_writers_on_one_target_keep_the_content_whole_and_the_descriptor_user_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("key.bin");
+        let payloads: [Vec<u8>; 2] = [vec![b'a'; 4096], vec![b'b'; 8192]];
+        let handles: Vec<_> = payloads
+            .iter()
+            .cloned()
+            .map(|payload| {
+                let target = target.clone();
+                let all = payloads.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..200 {
+                        write_private(&target, &payload).unwrap();
+                        // Windows may refuse a read for a moment while the other thread replaces
+                        // the file. Try again.
+                        let got = (0..100)
+                            .find_map(|_| {
+                                std::fs::read(&target).ok().or_else(|| {
+                                    std::thread::sleep(std::time::Duration::from_millis(5));
+                                    None
+                                })
+                            })
+                            .expect("read the target");
+                        assert!(all.contains(&got), "half-written content, {} bytes", got.len());
+                        assert!(
+                            is_user_only(&target).unwrap(),
+                            "descriptor: {:?}",
+                            describe(&target)
+                        );
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let left: Vec<_> = std::fs::read_dir(dir.path()).unwrap().flatten().collect();
+        assert_eq!(left.len(), 1, "no temporary file is left");
     }
 }

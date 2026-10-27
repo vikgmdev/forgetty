@@ -18,6 +18,8 @@ pub mod sockpath;
 #[path = "sockpath_windows.rs"]
 pub mod sockpath;
 #[cfg(windows)]
+pub mod endsession;
+#[cfg(windows)]
 pub mod pipe_client;
 
 pub mod control_queue;

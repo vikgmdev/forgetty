@@ -12,6 +12,9 @@ fn forgetty(state: &Path, args: &[&str]) -> Output {
         .arg("--state-dir")
         .arg(state)
         .args(args)
+        // The CI runner is an administrator, and the server refuses to run elevated. This
+        // variable lets the tests use it anyway. Real use never sets it.
+        .env("FORGETTY_TEST_ALLOW_ELEVATED", "1")
         .output()
         .expect("run forgetty")
 }
@@ -122,4 +125,28 @@ fn two_state_folders_have_two_pipes() {
     // The other folder sees no server.
     let other = forgetty(b.path(), &["server", "status"]);
     assert_eq!(other.status.code(), Some(4), "{}", text(&other));
+}
+
+/// An elevated process must not run the server: any normal program of the user could reach it
+/// and run commands as administrator, around the UAC prompt. The refusal is exit 78 with a
+/// message, before any state is made. On a runner that is not elevated there is nothing to test.
+#[test]
+fn an_elevated_server_refuses_to_run() {
+    if !forgetty_core::fsutil::acl::is_elevated() {
+        eprintln!("skipped: this process is not elevated");
+        return;
+    }
+    let state = tempfile::tempdir().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_forgetty"))
+        .arg("--state-dir")
+        .arg(state.path())
+        .args(["server", "run"])
+        .env_remove("FORGETTY_TEST_ALLOW_ELEVATED")
+        .output()
+        .expect("run forgetty");
+    assert_eq!(out.status.code(), Some(78), "{}", text(&out));
+    assert!(text(&out).contains("elevated"), "{}", text(&out));
+    // Nothing started: no server answers.
+    let status = forgetty(state.path(), &["server", "status"]);
+    assert_eq!(status.status.code(), Some(4), "{}", text(&status));
 }
