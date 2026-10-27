@@ -922,15 +922,19 @@ impl PtyProcess {
         None
     }
 
-    /// End the shell and everything it started.
+    /// Wait until the shell has ended, at most `ms` milliseconds. True when it ended.
+    ///
+    /// `kill` returns at once, and `TerminateProcess` finishes asynchronously: the exit code reads
+    /// as still active for a moment. This call blocks the thread, so async code runs it in
+    /// `spawn_blocking`.
+    pub fn wait_ended(&self, ms: u32) -> bool {
+        // SAFETY: valid process handle.
+        unsafe { WaitForSingleObject(self.process.raw(), ms) == WAIT_OBJECT_0 }
+    }
+
+    /// End the shell and everything it started. Does not wait: see [`Self::wait_ended`].
     pub fn kill(&mut self) -> Result<()> {
         self.kill_tree();
-        // `TerminateProcess` returns before the process has finished ending, and the exit code
-        // reads as still active for a moment. Wait (bounded) so `is_alive` is false on return.
-        // SAFETY: valid process handle.
-        unsafe {
-            WaitForSingleObject(self.process.raw(), 2000);
-        }
         Ok(())
     }
 
@@ -1185,6 +1189,7 @@ mod tests {
         let (mut p, _out, ping) = pane_with_grandchild();
         p.kill().unwrap();
         assert!(ended(&ping, 10), "the grandchild is gone after kill");
+        assert!(p.wait_ended(10_000), "the shell ended");
         assert!(!p.is_alive());
     }
 

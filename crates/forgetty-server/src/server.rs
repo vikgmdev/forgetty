@@ -258,13 +258,14 @@ fn acquire_instance_lock(server_id: uuid::Uuid) -> anyhow::Result<std::fs::File>
 }
 
 /// The server refuses to run elevated (see [`run`]). `FORGETTY_TEST_ALLOW_ELEVATED=1` lifts it for
-/// tests: the CI runner is an administrator. A user who sets it on a real server gives up the
-/// protection, so it is not documented for users.
+/// tests: the CI runner is an administrator. Only a debug build reads it: a release build, the
+/// one users run, has no way to lift the refusal.
 #[cfg(windows)]
 fn refuse_elevated() -> anyhow::Result<()> {
     if !forgetty_core::fsutil::acl::is_elevated() {
         return Ok(());
     }
+    #[cfg(debug_assertions)]
     if std::env::var_os("FORGETTY_TEST_ALLOW_ELEVATED").is_some_and(|v| v == "1") {
         warn!("running elevated because FORGETTY_TEST_ALLOW_ELEVATED=1 (tests only)");
         return Ok(());
@@ -741,8 +742,12 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
     {
         let sm = Arc::clone(&session_manager);
         if let Err(e) = forgetty_server::endsession::spawn(move || {
-            save_session_from_layout(&sm, session_id);
+            // Freeze first: from here the dying shells cannot change the layout, so the save
+            // below sees the layout as it is now. `save_layout` does nothing once frozen, so
+            // the save is the one that writes in the shutdown state.
             sm.begin_shutdown();
+            forgetty_socket::save_layout_final(&sm, session_id);
+            debug!(session_id = %session_id, "server: session layout saved at logoff");
         }) {
             warn!("cannot listen for logoff and shutdown: {e}");
         }
