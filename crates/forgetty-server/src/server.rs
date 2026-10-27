@@ -473,6 +473,9 @@ fn init_tracing() {
 pub async fn run(args: RunArgs) -> anyhow::Result<()> {
     init_tracing();
     forgetty_server::crash::install();
+    // Windows: without this every timer of the server rounds up to 15.6 ms.
+    #[cfg(windows)]
+    let _timer = forgetty_server::timerres::begin();
 
     // Windows: an elevated server would give any normal process of the same user a way to run
     // commands elevated, around the UAC prompt. So it does not start. An elevated app uses its

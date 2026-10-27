@@ -1276,6 +1276,7 @@ dependencies = [
  "clap",
  "criterion",
  "dirs",
+ "forgetty-client",
  "forgetty-config",
  "forgetty-core",
  "forgetty-proto",

@@ -182,6 +182,44 @@ jobs:
           $crates = $env:TEST_CRATES -split ' '
           cargo test --locked --no-fail-fast @crates
 
+  # Server-only latency probe: one key in over protocol v2, its echo out, for a server process
+  # at the default 15.6 ms timer ("off"), with timeBeginPeriod only ("period") and with the
+  # server's own setting ("full"), next to the same echo through a ConPTY in the test process.
+  # The numbers are in the log (lines starting with PROBE).
+  timer-probe:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout with LF line endings
+        shell: bash
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: server-crates
+
+      - name: Probe
+        shell: pwsh
+        run: |
+          cargo test --locked -p forgetty-server --test timer_probe -- --nocapture 2>&1 | Tee-Object probe.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: timer-probe
+          path: probe.log
+
   # The real Linux server, built here, for the WSL end-to-end test below.
   linux-server:
     runs-on: ubuntu-latest

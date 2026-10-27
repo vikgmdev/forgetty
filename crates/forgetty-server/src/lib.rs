@@ -21,6 +21,8 @@ pub mod sockpath;
 pub mod endsession;
 #[cfg(windows)]
 pub mod pipe_client;
+#[cfg(windows)]
+pub mod timerres;
 
 pub mod control_queue;
 #[cfg(not(windows))]
