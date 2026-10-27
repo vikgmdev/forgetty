@@ -30,6 +30,7 @@ pub struct LsPhase {
     pid: u64,
     t0: Option<Instant>,
     rtt_started: bool,
+    probe_started: bool,
     /// Per key: ms from the key to the writer task, to the client queue, to the output reaching the
     /// client, to the terminal model.
     segs: Vec<[f64; 4]>,
@@ -56,6 +57,90 @@ fn split_key(t0: Instant, model: Instant) -> Option<[f64; 4]> {
     let recv = log.iter().rev().find(|(k, t)| *k == "recv" && *t <= model && *t >= handed).map(|(_, t)| *t)?;
     let d = |a: Instant, b: Instant| ms(b.saturating_duration_since(a));
     Some([d(t0, popped), d(popped, handed), d(handed, recv), d(recv, model)])
+}
+
+/// Result of the in-app probe: key to echo medians, ms, and whether it has ended.
+static PROBE_MS: std::sync::Mutex<Vec<f64>> = std::sync::Mutex::new(Vec::new());
+static PROBE_ERR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static PROBE_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// What `timer_probe` of the server does, inside this process on the app's runtime: its own
+/// connection, its own pane, one byte every 20 ms with no UI in the loop, the clock from before
+/// `send_input` to the first `PaneItem::Data` with the key. If this is fast, the slow part is in
+/// the app's pane source or the UI; if it is slow, it is the link or this process.
+#[allow(clippy::too_many_arguments)]
+async fn probe_task(
+    server: forgetty_client::EndpointAddr,
+    identity: forgetty_client::SecretKey,
+    info: forgetty_client::ClientInfo,
+    opts: forgetty_client::ClientOptions,
+    backend: std::sync::Arc<dyn forgetty_shell_core::SessionBackend>,
+) -> Result<(), String> {
+    use forgetty_client::PaneItem;
+    let c = forgetty_client::Client::connect_with(server, identity, info, opts).await.map_err(|e| format!("connect: {e}"))?;
+    let reply = backend
+        .new_tab(forgetty_shell_core::NewTab { workspace_idx: 0, rows: 24, cols: 80, command: vec![crate::reload::smoke_cmd()], ..Default::default() })
+        .await
+        .map_err(|e| format!("new_tab: {e}"))?;
+    let pane = reply.pane_id.0;
+    let mut stream = c.attach_pane(pane).await.map_err(|e| format!("attach: {e}"))?;
+    // Let the prompt settle: read until 1.5 s of quiet.
+    while let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(1500), stream.next()).await {}
+    for i in 0..60usize {
+        let key = b'a' + (i % 26) as u8;
+        let t0 = Instant::now();
+        c.send_input(pane, &[key]).await.map_err(|e| format!("send: {e}"))?;
+        loop {
+            let left = Duration::from_secs(5).saturating_sub(t0.elapsed());
+            match tokio::time::timeout(left, stream.next()).await {
+                Ok(Some(PaneItem::Data { bytes, .. })) if bytes.contains(&key) => break,
+                Ok(Some(_)) => {}
+                _ => return Err(format!("no echo of {:?}", key as char)),
+            }
+        }
+        PROBE_MS.lock().unwrap().push(ms(t0.elapsed()));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let _ = backend.close_tab(reply.tab_id).await;
+    c.close().await;
+    Ok(())
+}
+
+/// Medians (microseconds) of the stage gaps the server logged for echoes (`FORGETTY_TRACE_LATENCY`).
+fn server_stages(state: &std::path::Path) -> serde_json::Value {
+    fn find(dir: &std::path::Path, depth: u32) -> Option<std::path::PathBuf> {
+        for e in std::fs::read_dir(dir).ok()?.filter_map(Result::ok) {
+            let p = e.path();
+            if p.is_file() && p.file_name().is_some_and(|n| n == "server.log") {
+                return Some(p);
+            }
+            if depth > 0 && p.is_dir() {
+                if let Some(f) = find(&p, depth - 1) {
+                    return Some(f);
+                }
+            }
+        }
+        None
+    }
+    let text = find(state, 5).and_then(|l| std::fs::read_to_string(l).ok()).unwrap_or_default();
+    let mut cols: Vec<Vec<i64>> = vec![Vec::new(); 5];
+    for line in text.lines().filter(|l| l.contains("key echo:")) {
+        let nums: Vec<i64> = line.split(|c: char| !(c.is_ascii_digit() || c == '-')).filter_map(|t| t.parse().ok()).collect();
+        if nums.len() == 5 {
+            for (c, n) in cols.iter_mut().zip(nums) {
+                c.push(n);
+            }
+        }
+    }
+    if cols[0].is_empty() {
+        return json!({"n": 0});
+    }
+    let med = |v: &mut Vec<i64>| {
+        v.sort();
+        v[v.len() / 2]
+    };
+    let m: Vec<i64> = cols.iter_mut().map(med).collect();
+    json!({"n": cols[0].len(), "input_to_pty_write": m[0], "to_first_pty_read": m[1], "to_pane_event": m[2], "to_frame_written": m[3], "total": m[4]})
 }
 
 fn recorded(key: &str) -> Option<f64> {
@@ -87,6 +172,9 @@ impl ShellSmoke {
                 if let Ok(mut g) = super::LOCAL_SERVER.lock() {
                     *g = Some((exe.clone(), state.clone()));
                 }
+                // The server logs the stages of an echo (read back after the key probes).
+                std::env::set_var("FORGETTY_TRACE_LATENCY", "1");
+                std::env::set_var("RUST_LOG", "latency=info");
                 self.ls.cli = Some(Cli { exe: exe.clone(), state_dir: Some(state) });
                 self.ls.inproc = Some(shell.machine.id);
                 self.ls.tabs_before = shell.layout.tab_count();
@@ -200,6 +288,41 @@ impl ShellSmoke {
                                 json!({"n": s.len(), "p50": p50_of(&v), "min": s.first(), "p95": s.get(s.len() * 95 / 100), "max": s.last()}),
                             );
                         }
+                        // The in-app probe (no UI in the loop), then the key probes below.
+                        if !self.ls.probe_started {
+                            self.ls.probe_started = true;
+                            let id = self.ls.server;
+                            let backend = id.and_then(|id| shell.machines.iter().find(|m| m.id == id).map(|m| m.backend.clone()));
+                            let parts = shell.remote.as_ref().and_then(|r| {
+                                let m = r.store.local_machine()?;
+                                let info = forgetty_client::ClientInfo::new(Uuid::new_v4(), forgetty_client::proto::ClientKind::Windows, "latency probe", env!("CARGO_PKG_VERSION"));
+                                Some((r.rt.clone(), forgetty_remote::store::machine_addr(&m).ok()?, r.store.identity().ok()?, info, forgetty_remote::store::machine_options(&r.addr_cache, &m)))
+                            });
+                            let (Some(backend), Some((rt, server, identity, info, opts))) = (backend, parts) else { fail("local server: no parts for the in-app probe") };
+                            rt.spawn(async move {
+                                if let Err(e) = probe_task(server, identity, info, opts, backend).await {
+                                    *PROBE_ERR.lock().unwrap() = Some(e);
+                                }
+                                PROBE_DONE.store(true, std::sync::atomic::Ordering::SeqCst);
+                            });
+                            self.sub_t0 = Instant::now();
+                            return;
+                        }
+                        if !PROBE_DONE.load(std::sync::atomic::Ordering::SeqCst) && self.sub_t0.elapsed() < Duration::from_secs(60) {
+                            return;
+                        }
+                        {
+                            let v = PROBE_MS.lock().unwrap().clone();
+                            let mut sorted = v.clone();
+                            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                            record(
+                                "local_server_in_app_probe_ms",
+                                json!({"n": sorted.len(), "p50": p50_of(&v), "p95": sorted.get(sorted.len() * 95 / 100), "max": sorted.last(), "error": PROBE_ERR.lock().unwrap().clone()}),
+                            );
+                            if let Some(d) = self.ls.cli.as_ref().and_then(|c| c.state_dir.as_deref()) {
+                                record("local_server_stage_us_after_in_app_probe", server_stages(d));
+                            }
+                        }
                         forgetty_remote::trace::enable(true);
                         self.ls.segs.clear();
                         self.ls.base_col = cc;
@@ -265,6 +388,9 @@ impl ShellSmoke {
                                         "total": p50_of(&tot),
                                     }),
                                 );
+                            }
+                            if let Some(d) = self.ls.cli.as_ref().and_then(|c| c.state_dir.as_deref()) {
+                                record("local_server_stage_us_all", server_stages(d));
                             }
                             // A number that was not measured fails the gate: no default.
                             let Some(base_model) = recorded("key_to_model_p50_ms") else { fail("local server: no in-process model latency was measured") };
