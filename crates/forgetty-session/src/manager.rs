@@ -3351,9 +3351,9 @@ mod tests {
         session.write_pty(id, b"echo hello_session_test\n").expect("write_pty should succeed");
 
         // Wait for the drain task to broadcast PtyOutput containing our string. The bound is
-        // wide: a PowerShell on a loaded Windows runner needs seconds to start and read the line.
+        // wide on Windows only: a PowerShell on a loaded Windows runner needs seconds to start and read the line.
         let mut got_hello = false;
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let deadline = std::time::Instant::now() + Duration::from_secs(if cfg!(windows) { 20 } else { 2 });
         while std::time::Instant::now() < deadline {
             match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
                 Ok(Ok(SessionEvent::PtyOutput { pane_id, data })) if pane_id == id => {

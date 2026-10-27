@@ -21,4 +21,5 @@ pub use session::{
     load_session, load_session_for, purge_old_trash, restore_from_trash, save_session,
     save_session_for, session_path, session_path_for, trash_session_for,
 };
+pub use persistence::save_session_for_with;
 pub use workspace::{PaneTreeState, TabState, Workspace, WorkspaceState};

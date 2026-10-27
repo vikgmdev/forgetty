@@ -287,7 +287,19 @@ fn command_line(program: &Path, args: &[String]) -> Result<Vec<u16>> {
 }
 
 /// The environment block of the child: this process's variables plus `extra`, which win.
-fn environment_block(extra: &[(String, String)]) -> Vec<u16> {
+///
+/// A name with `=` or NUL, an empty name, and a NUL in a value are refused: the block is a list of
+/// `NAME=value` strings ended by NUL, so such a variable would split into other variables or end
+/// the block early (a remote client can send extra environment through the server).
+fn environment_block(extra: &[(String, String)]) -> std::result::Result<Vec<u16>, String> {
+    for (k, v) in extra {
+        if k.is_empty() || k.contains('=') || k.contains('\0') {
+            return Err(format!("environment variable name {k:?} is not valid"));
+        }
+        if v.contains('\0') {
+            return Err(format!("the value of environment variable {k:?} holds a NUL"));
+        }
+    }
     // `extra` in order, a later entry replacing an earlier one with the same name.
     let mut merged: Vec<(&str, &str)> = Vec::new();
     for (k, v) in extra {
@@ -308,7 +320,7 @@ fn environment_block(extra: &[(String, String)]) -> Vec<u16> {
         block.push(0);
     }
     block.push(0);
-    block
+    Ok(block)
 }
 
 fn pathext() -> Vec<String> {
@@ -696,7 +708,7 @@ impl PtyProcess {
             ("TERM_PROGRAM_VERSION".into(), env!("CARGO_PKG_VERSION").into()),
         ];
         vars.extend(extra_env.iter().cloned());
-        let env = environment_block(&vars);
+        let env = environment_block(&vars).map_err(ForgettyError::Pty)?;
         // A folder that is not there: start in the home folder, as the Unix PTY does.
         let cwd: Option<Vec<u16>> = working_dir
             .filter(|d| d.is_dir())
@@ -1070,6 +1082,19 @@ mod tests {
         p.write(b"echo T=%TERM%;P=%TERM_PROGRAM%;V=%TERM_PROGRAM_VERSION%;C=%COLORTERM%\r\n").unwrap();
         let want = format!("T=xterm-256color;P=forgetty;V={};C=truecolor", env!("CARGO_PKG_VERSION"));
         out.until(20, |t| t.contains(&want));
+    }
+
+    #[test]
+    fn the_environment_block_refuses_names_and_values_that_would_split_it() {
+        let ok = |k: &str, v: &str| environment_block(&[(k.to_string(), v.to_string())]);
+        assert!(ok("GOOD_NAME", "a value with spaces and = signs").is_ok());
+        assert!(ok("", "x").is_err(), "empty name");
+        assert!(ok("A=B", "x").is_err(), "= in a name");
+        assert!(ok("A\0B", "x").is_err(), "NUL in a name");
+        assert!(ok("A", "x\0Y=z").is_err(), "NUL in a value");
+        // The refusal reaches the caller of spawn.
+        let bad = [("X=Y".to_string(), "1".to_string())];
+        assert!(PtyProcess::spawn_with_env(size(), None, Some(&cmd_exe()), false, &bad).is_err());
     }
 
     #[test]
