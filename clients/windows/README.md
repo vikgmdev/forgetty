@@ -177,6 +177,18 @@ is checked with the same parser the loader uses and written to a temporary file,
 the file is read again just before the rename and the write is dropped if it changed meanwhile. A file that does
 not load is never written by a row (the message points to the TOML editor), and the editor keeps one
 `config.toml.bak` when it overwrites. A network or non-`.toml` path is refused as for "Open configuration file".
+Each write goes to a temporary file of its own (`config.toml.<pid>.<n>.tmp`, an old leftover is swept), which
+gets the access rules of the current `config.toml` before any byte is written (`shell-core/src/fileperm.rs`:
+the DACL on Windows, protected or inherited as the file has it; the mode on Unix), is flushed with `sync_all`
+and renamed (retried for a second while a scanner holds the file). The `.bak` is created the same way, and a
+backup that cannot be written is logged and said in the status. One write runs at a time in the process.
+Inline tables (`keybindings = { new_tab = "ctrl+k" }`) take edits like normal tables. The TOML editor follows
+the file: when the file changes and the editor has no edits it shows the new text; with edits it keeps them,
+shows "The file changed on disk" with Reload and Keep (Ctrl+R and Alt+K), and a save is refused while the file
+differs from what the editor read, so nothing is overwritten by accident. Keybindings: Ctrl+Alt with a letter,
+digit or symbol is refused (AltGr), and an edit that would leave neither `open_settings` nor `command_palette`
+with a chord is refused (the palette lists "Settings..." whether or not it has a chord). The installed font
+names are read on a background thread; the Appearance page fills in when they arrive.
 All file work runs on the background executor. Entries the page changes: a theme goes to `theme`, a font to
 `[font]` when the file has that table (else `font_family`/`font_size`), shortcuts to `[keybindings]` (no entry
 when the chord is the default of the set).

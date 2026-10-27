@@ -1,7 +1,7 @@
 //! The Settings window in the `--smoke` gate, on the real shell and a real `config.toml`:
 //! rows, number entry, the keybinding editor (capture, conflict, reset), theme and font, a
 //! `[theme]` table, a file that does not load (no save from the pages, repair in the TOML
-//! editor), text the editor refuses, the shortcuts window (F1) and a render of every page.
+//! editor, which follows the file and never overwrites one that changed), text the editor refuses, the shortcuts window (F1) and a render of every page.
 //! Every change must come back through the live reload, and the comments and unknown keys of
 //! the file must still be there.
 
@@ -23,6 +23,7 @@ pub struct SettingsPhase {
     path: PathBuf,
     size0: f32,
     family0: String,
+    text0: String,
     pages: usize,
     page_t: Option<Instant>,
 }
@@ -218,7 +219,10 @@ impl ShellSmoke {
             }
             // ---- theme and font -----------------------------------------------------------------
             14 => {
-                until!(settle);
+                // The font names are read off the UI thread: the list fills in a moment after the
+                // window opened.
+                until!(settle && shell.font_names.is_some());
+                check("settings_fonts_listed_off_the_ui_thread", shell.font_names.as_ref().is_some_and(|f| !f.is_empty()) && shell.settings.as_ref().is_some_and(|w| !w.fonts.is_empty()));
                 let look = shell.settings_prepare().and_then(|v| match v.body {
                     Body::Look(l) => Some(l),
                     _ => None,
@@ -264,7 +268,8 @@ impl ShellSmoke {
                 self.st_next();
             }
             18 => {
-                until!(self.sub_t0.elapsed() > Duration::from_millis(700));
+                // The watcher has read the hand-made [theme] colors.
+                until!(shell.file_cfg.background == 0x101010);
                 shell.settings_look(Zone::Theme, None, cx);
                 self.st_send(shell, window, cx, &["enter"]);
                 self.st_next();
@@ -314,13 +319,72 @@ impl ShellSmoke {
                 until!(shell.file_cfg.bell_mode == BellMode::Both);
                 check("settings_toml_editor_repairs_the_file", self.st_file().contains("bell_mode = \"both\""));
                 check("settings_toml_editor_keeps_a_backup", self.settings.path.with_extension("toml.bak").exists());
+                // A row is toggled on the General page while the editor is loaded and clean.
+                self.settings.text0 = self.st_file();
+                shell.settings_page(Page::General, cx);
+                self.st_next();
+            }
+            25 => {
+                until!(settle);
+                self.st_send(shell, window, cx, &["down", "down", "down", "space"]);
+                self.st_next();
+            }
+            26 => {
+                let f = self.st_file();
+                until!(f != self.settings.text0 && f.contains("sidebar"));
+                until!(shell.settings.as_ref().is_some_and(|w| !w.st.busy));
+                shell.settings_page(Page::Advanced, cx);
+                // The clean editor follows the file: it shows the toggled key without a reload.
+                let follows = shell.settings_prepare().is_some_and(|v| matches!(v.body, Body::Toml(t) if t.loaded && !t.dirty && t.lines.iter().any(|l| l.1.contains("sidebar"))));
+                until!(follows);
+                check("settings_toml_editor_follows_the_file_when_it_has_no_edits", true);
+                // Save from the editor: the toggle stays.
+                self.st_send(shell, window, cx, &["ctrl+end", "enter"]);
+                self.st_type(shell, window, cx, "# edited");
+                self.st_send(shell, window, cx, &["ctrl+s"]);
+                self.st_next();
+            }
+            27 => {
+                let f = self.st_file();
+                until!(f.contains("# edited"));
+                until!(shell.settings.as_ref().is_some_and(|w| !w.st.busy));
+                check("settings_toml_editor_save_keeps_the_toggled_row", f.contains("sidebar") && f.contains("# edited"));
+                // An edit in the editor, and the file changes under it.
+                self.st_type(shell, window, cx, "x");
+                self.settings.text0 = format!("{}\n# external\n", f);
+                self.st_put(&self.settings.text0.clone());
+                self.st_next();
+            }
+            28 => {
+                let stale = shell.settings_prepare().is_some_and(|v| matches!(v.body, Body::Toml(t) if t.stale && t.dirty));
+                until!(stale);
+                check("settings_toml_editor_says_the_file_changed", true);
+                self.st_send(shell, window, cx, &["ctrl+s"]);
+                self.st_next();
+            }
+            29 => {
+                let msg = shell.settings_prepare().and_then(|v| match v.body {
+                    Body::Toml(t) if !shell.settings.as_ref().is_some_and(|w| w.st.busy) => t.message,
+                    _ => None,
+                });
+                until!(msg.as_ref().is_some_and(|m| m.contains("changed on disk")));
+                check("settings_toml_editor_never_overwrites_a_changed_file", self.st_file() == self.settings.text0);
+                // Keep: the next save replaces the file with the editor's text.
+                shell.settings_press("toml-keep", window, cx);
+                self.st_send(shell, window, cx, &["ctrl+s"]);
+                self.st_next();
+            }
+            30 => {
+                let f = self.st_file();
+                until!(f.contains("# editedx"));
+                check("settings_toml_editor_keep_then_save_writes_the_editor_text", !f.contains("# external"));
                 // Text that does not load is refused with the line.
                 self.st_send(shell, window, cx, &["enter"]);
                 self.st_type(shell, window, cx, "[[[");
                 self.st_send(shell, window, cx, &["ctrl+s"]);
                 self.st_next();
             }
-            25 => {
+            31 => {
                 let msg = shell.settings_prepare().and_then(|v| match v.body {
                     Body::Toml(t) if !shell.settings.as_ref().is_some_and(|w| w.st.busy) => t.message,
                     _ => None,
@@ -344,7 +408,7 @@ impl ShellSmoke {
                 self.st_next();
             }
             // ---- every page renders ---------------------------------------------------------------
-            26 => {
+            32 => {
                 let due = self.settings.page_t.is_none_or(|t| t.elapsed() > Duration::from_millis(150));
                 until!(due);
                 if self.settings.pages < Page::ALL.len() {
