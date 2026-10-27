@@ -39,8 +39,10 @@ impl ShellSmoke {
             }
             _ => {
                 let Some(s) = snap(shell, cx, p) else { return };
-                if let Some(row) = s.rows.iter().find(|r| r.contains("paste-") && r.contains(".png")) {
-                    record("image_paste_row", json!(row.trim()));
+                // The path is longer than a row can be: join the rows, the wrap adds no space.
+                let all: String = s.rows.iter().map(|r| r.trim_end()).collect();
+                if all.contains("paste-") && all.contains(".png") {
+                    record("image_paste_screen", json!(all));
                     let dir = forgetty_shell_core::imagepaste::cache_dir(std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from).as_deref());
                     let newest = dir.as_ref().and_then(|d| std::fs::read_dir(d).ok()).and_then(|rd| {
                         rd.filter_map(Result::ok)
@@ -56,7 +58,8 @@ impl ShellSmoke {
                     view.update(cx, |v, _| v.send_bytes(b"\x1b"));
                     self.goto(Phase::LsStart);
                 } else if self.sub_t0.elapsed() > Duration::from_secs(15) {
-                    fail("image paste: the path did not appear in the pane");
+                    let notice = view.read(cx).notice_text();
+                    fail(&format!("image paste: the path did not appear in the pane (notice {notice:?}, screen {all:?})"));
                 }
             }
         }
