@@ -11,7 +11,23 @@ __forgetty_ran=
 
 # The server's one-shot start line leaves PROMPT_COMMAND here.
 __forgetty_boot='. "$FORGETTY_SHELL_INTEGRATION_DIR/forgetty.bash"'
-if [[ ${PROMPT_COMMAND-} == *"$__forgetty_boot"* ]]; then
+if [[ $(declare -p PROMPT_COMMAND 2>/dev/null) == "declare -a"* ]]; then
+  # A startup file made it an array (`PROMPT_COMMAND+=(hook)`): the start line
+  # is one element. Take it out and keep the user's other elements.
+  for __forgetty_i in "${!PROMPT_COMMAND[@]}"; do
+    __forgetty_e=${PROMPT_COMMAND[__forgetty_i]}
+    if [[ $__forgetty_e == *"$__forgetty_boot"* ]]; then
+      __forgetty_e=${__forgetty_e/"$__forgetty_boot"/}
+      __forgetty_e=${__forgetty_e#"${__forgetty_e%%[![:space:];]*}"}
+      if [[ -z ${__forgetty_e//[[:space:];]/} ]]; then
+        unset "PROMPT_COMMAND[$__forgetty_i]"
+      else
+        PROMPT_COMMAND[__forgetty_i]=$__forgetty_e
+      fi
+    fi
+  done
+  unset __forgetty_i __forgetty_e
+elif [[ ${PROMPT_COMMAND-} == *"$__forgetty_boot"* ]]; then
   PROMPT_COMMAND=${PROMPT_COMMAND/"$__forgetty_boot"/}
   PROMPT_COMMAND=${PROMPT_COMMAND#"${PROMPT_COMMAND%%[![:space:];]*}"}
   [[ -z ${PROMPT_COMMAND//[[:space:];]/} ]] && unset PROMPT_COMMAND
