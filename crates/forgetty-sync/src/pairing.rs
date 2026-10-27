@@ -171,6 +171,20 @@ impl PairingState {
         Ok(id)
     }
 
+    /// Close the open window now, so its QR code stops working. With `Some(id)` only the
+    /// window with that id is closed, so a late cancel never ends a newer window. Returns
+    /// `true` when a window was closed. A window whose device is being saved is past
+    /// cancelling: the device is already accepted.
+    pub fn close(&mut self, id: Option<u64>) -> bool {
+        match &self.window {
+            Some(w) if id.is_none_or(|i| i == w.id) => {
+                self.window = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Remember which device used window `id`.
     pub fn record_paired(&mut self, id: u64, device_id: &str, name: &str) {
         if self.in_progress == Some(id) {
@@ -422,6 +436,41 @@ mod tests {
 
     fn open(state: &mut PairingState, now: Instant) -> OpenedWindow {
         state.open_with_secret(SECRET, Duration::from_secs(PAIRING_WINDOW_SECS), now)
+    }
+
+    #[test]
+    fn a_closed_window_refuses_its_secret_and_reads_as_expired() {
+        let mut st = PairingState::new();
+        let t0 = Instant::now();
+        let w = open(&mut st, t0);
+        assert!(st.close(None));
+        assert_eq!(st.verify(&w.secret, t0), Err(PairFailure::Expired));
+        assert_eq!(st.status(w.id, t0), PairStatus::Expired);
+        // Closing again finds nothing.
+        assert!(!st.close(None));
+    }
+
+    #[test]
+    fn close_with_an_id_ends_only_that_window() {
+        let mut st = PairingState::new();
+        let t0 = Instant::now();
+        let old = open(&mut st, t0);
+        let new = st.open_with_secret([5u8; SECRET_LEN], Duration::from_secs(60), t0);
+        // A late cancel for the replaced window leaves the new one alone.
+        assert!(!st.close(Some(old.id)));
+        assert_eq!(st.verify(&new.secret, t0), Ok(new.id));
+        let again = open(&mut st, t0);
+        assert!(st.close(Some(again.id)));
+    }
+
+    #[test]
+    fn a_device_being_saved_is_past_cancelling() {
+        let mut st = PairingState::new();
+        let t0 = Instant::now();
+        let w = open(&mut st, t0);
+        assert_eq!(st.verify(&w.secret, t0), Ok(w.id));
+        assert!(!st.close(None));
+        assert!(matches!(st.status(w.id, t0), PairStatus::Open { .. }));
     }
 
     #[test]

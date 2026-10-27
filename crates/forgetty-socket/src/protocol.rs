@@ -115,6 +115,9 @@ pub mod methods {
     /// Params: `{ "ttl_secs": u64 }` (optional). Result carries the QR
     /// payload (`v:2`, `node_id`, `machine`, `relay`, `secret`) and `window_id`.
     pub const PAIR_OPEN: &str = "pair_open";
+    /// Close the open pairing window now. Params: `{ "window_id": u64 }` (optional).
+    /// Result: `{ "ok": true, "closed": bool }`.
+    pub const PAIR_CLOSE: &str = "pair_close";
     /// AD-021: poll a pairing window. Params: `{ "window_id": u64 }`.
     /// Result: `{ "state": "open" | "paired" | "expired", ... }`.
     pub const PAIR_STATUS: &str = "pair_status";

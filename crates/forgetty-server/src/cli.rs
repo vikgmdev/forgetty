@@ -689,6 +689,17 @@ pub fn server_status(json_out: bool) -> Result<()> {
     println!("panes:    {}", info.num("panes"));
     println!("clients:  {}", info.num("clients"));
     println!("node id:  {}", info.0.get("node_id").and_then(Value::as_str).unwrap_or("none"));
+    match info.0.get("port").and_then(Value::as_u64) {
+        Some(port) => println!("port:     {port}"),
+        None => println!("port:     none"),
+    }
+    let addrs: Vec<&str> = info
+        .0
+        .get("addresses")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    println!("bound:    {}", if addrs.is_empty() { "none".to_string() } else { addrs.join(", ") });
     Ok(())
 }
 
@@ -908,6 +919,18 @@ pub fn revoke(target: &str) -> Result<()> {
 // ---------------------------------------------------------------------------
 // pairing
 // ---------------------------------------------------------------------------
+
+/// `forgetty pair --cancel`: end the open pairing window at once.
+pub fn pair_cancel() -> Result<()> {
+    let (mut client, _) = Client::connect()?;
+    let closed = client.call("pair_close", json!({}))?;
+    if closed.get("closed").and_then(Value::as_bool).unwrap_or(false) {
+        println!("pairing window closed");
+    } else {
+        println!("no pairing window was open");
+    }
+    Ok(())
+}
 
 pub fn pair(ttl: u64) -> Result<()> {
     let (mut client, _) = Client::connect()?;

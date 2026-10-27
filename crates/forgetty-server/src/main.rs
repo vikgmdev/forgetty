@@ -12,7 +12,7 @@
 //! forgetty run [--keep] [--wait] [--cwd DIR] -- CMD...
 //! forgetty wait -p PANE [--status done|waiting|...] [--timeout S]
 //! forgetty client ls [--json]
-//! forgetty pair | devices | revoke ID
+//! forgetty pair [--cancel] | devices | revoke ID
 //! forgetty label [-t tab|pane|workspace] TARGET LABEL
 //! forgetty api list [-q] [--json] [--markdown]
 //! forgetty api describe METHOD [--json]
@@ -185,6 +185,9 @@ enum Command {
         /// Window length in seconds (testing only).
         #[arg(long, default_value_t = 60, hide = true)]
         ttl: u64,
+        /// Close the open pairing window now, so its QR code stops working.
+        #[arg(long)]
+        cancel: bool,
     },
     /// List paired devices.
     Devices {
@@ -396,7 +399,8 @@ fn main() {
             }
             SkillCommand::Remove { agent, scope } => skill::remove(agent, scope),
         }),
-        Command::Pair { ttl } => cli::finish(cli::pair(ttl)),
+        Command::Pair { cancel: true, .. } => cli::finish(cli::pair_cancel()),
+        Command::Pair { ttl, .. } => cli::finish(cli::pair(ttl)),
         Command::Devices { json } => cli::finish(cli::devices(json)),
         Command::Revoke { id } => cli::finish(cli::revoke(&id)),
     };

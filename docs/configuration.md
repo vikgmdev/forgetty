@@ -164,6 +164,26 @@ QR carries them, and the apps keep them per paired machine. `forgetty server run
 relay_urls = ["https://relay.example.org"]
 ```
 
+### `relay`
+
+**Type:** String (`"none"` or `"default"`)
+**Default:** unset (Linux and macOS: relays as `relay_urls` says; Windows: no relay)
+
+`"none"` turns relays and n0 off. `"default"` uses iroh's default relays, which
+is how a Windows server opts back in. See `server.md`.
+
+### `bind_addrs`
+
+**Type:** List of IP addresses
+**Default:** empty (Linux and macOS: every address; Windows: `127.0.0.1` only)
+
+Addresses the server's iroh endpoint binds, on the fixed port.
+`forgetty server run --bind IP` replaces this list. See `server.md`.
+
+```toml
+bind_addrs = ["10.230.1.14"]
+```
+
 ## Custom theme format
 
 Create a `.toml` file in `~/.config/forgetty/themes/`:

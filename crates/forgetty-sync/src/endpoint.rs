@@ -819,6 +819,12 @@ impl SyncEndpoint {
         self.pairing.lock().unwrap_or_else(|e| e.into_inner()).open(ttl, Instant::now())
     }
 
+    /// Close the open pairing window now (see [`PairingState::close`]). Returns `true` when a
+    /// window was open and is now closed.
+    pub fn close_pairing(&self, id: Option<u64>) -> bool {
+        self.pairing.lock().unwrap_or_else(|e| e.into_inner()).close(id)
+    }
+
     /// Status of pairing window `id`.
     pub fn pairing_status(&self, id: u64) -> PairStatus {
         self.pairing.lock().unwrap_or_else(|e| e.into_inner()).status(id, Instant::now())

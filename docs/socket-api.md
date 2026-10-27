@@ -188,6 +188,7 @@ Every method takes `params` (an object, or absent when it has none) and returns
 | [`set_pinned`](#set_pinned) | call | yes | Compatibility no-op. |
 | [`get_pinned`](#get_pinned) | call | yes | Compatibility no-op. |
 | [`pair_open`](#pair_open) | call | no | Open a pairing window and get the QR payload. |
+| [`pair_close`](#pair_close) | call | no | Close the open pairing window now. |
 | [`pair_status`](#pair_status) | call | no | Poll a pairing window. |
 | [`get_pairing_info`](#get_pairing_info) | call | no | Get the QR code as a PNG. Opens a pairing window. |
 | [`list_devices`](#list_devices) | call | yes | List paired devices. |
@@ -1110,7 +1111,7 @@ Kind: call. Protocol v2: yes.
 
 Get the server version, protocol, pid, uptime and counts.
 
-Use it as a health check. `node_id` is the iroh id a paired device dials.
+Use it as a health check. `node_id` is the iroh id a paired device dials. `port` and `addresses` are what the iroh endpoint listens on.
 
 Kind: call. Protocol v2: yes.
 
@@ -1122,10 +1123,12 @@ None.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
+| `addresses` | array of string | yes | The local sockets of the iroh endpoint as `ip:port`, IPv6 as `[ip]:port`. Empty when the iroh endpoint is not running. |
 | `clients` | integer | yes | Attached clients. |
 | `node_id` | string or null | no | iroh node id. `null` when the iroh endpoint is not running. |
 | `panes` | integer | yes | Live panes. |
 | `pid` | integer | yes |  |
+| `port` | integer or null | no | The UDP port the iroh endpoint listens on (the real one, also when the fixed port was taken). `null` when the iroh endpoint is not running. |
 | `proto_major` | integer | yes |  |
 | `proto_minor` | integer | yes |  |
 | `proto_version` | string | yes | `major.minor`. |
@@ -1137,7 +1140,7 @@ None.
 
 ```json
 {"jsonrpc":"2.0","method":"server_info","params":{},"id":1}
-{"jsonrpc":"2.0","result":{"version":"0.1.0-beta","proto_major":2,"proto_minor":0,"proto_version":"2.0","server_id":"0d4a8e17-92c3-4b65-a1f8-3e7c5d9b2a64","pid":4100,"uptime_secs":3600,"panes":3,"clients":1,"node_id":"f3k2c7a9"},"id":1}
+{"jsonrpc":"2.0","result":{"version":"0.1.0-beta","proto_major":2,"proto_minor":0,"proto_version":"2.0","server_id":"0d4a8e17-92c3-4b65-a1f8-3e7c5d9b2a64","pid":4100,"uptime_secs":3600,"panes":3,"clients":1,"node_id":"f3k2c7a9","port":47297,"addresses":["127.0.0.1:47297"]},"id":1}
 ```
 
 ### `list_clients`
@@ -1262,6 +1265,34 @@ Kind: call. Protocol v2: no.
 ```json
 {"jsonrpc":"2.0","method":"pair_open","params":{"ttl_secs":60},"id":1}
 {"jsonrpc":"2.0","result":{"window_id":1,"ttl_secs":60,"payload":{"v":2,"node_id":"f3k2c7a9","machine":"devbox","relay":"https://relay.example.com","relays":["https://relay.example.com"],"secret":"MFRGGZDFMZTWQ2LK"}},"id":1}
+```
+
+### `pair_close`
+
+Close the open pairing window now.
+
+The QR code of the window stops working at once, and a later pair attempt with its secret is refused. With `window_id` only that window is closed, so a late cancel never ends a newer one. `closed` is `false` when no matching window was open (expired, paired or already closed). Closing is always a success.
+
+Kind: call. Protocol v2: no.
+
+**Params**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `window_id` | integer or null | no | Window to close. Left out: whichever window is open. |
+
+**Result**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `closed` | boolean | yes | A window was open and is now closed. |
+| `ok` | boolean | yes | Always `true`. |
+
+**Example**
+
+```json
+{"jsonrpc":"2.0","method":"pair_close","params":{"window_id":1},"id":1}
+{"jsonrpc":"2.0","result":{"ok":true,"closed":true},"id":1}
 ```
 
 ### `pair_status`

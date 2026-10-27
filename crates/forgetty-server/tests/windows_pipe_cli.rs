@@ -3,28 +3,43 @@
 //! of the user: `--state-dir` moves the data, the config and the pipe name.
 #![cfg(windows)]
 
+use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-fn forgetty(state: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_forgetty"))
-        .arg("--state-dir")
+/// The tests that start a server on the default port 47297 run one at a time. Every other test
+/// asks for port 0 (`FORGETTY_PORT=0`), so no two test servers race for the same UDP port.
+static DEFAULT_PORT: Mutex<()> = Mutex::new(());
+
+fn command(state: &Path, args: &[&str], default_port: bool) -> Command {
+    let mut c = Command::new(env!("CARGO_BIN_EXE_forgetty"));
+    c.arg("--state-dir")
         .arg(state)
         .args(args)
         // The CI runner is an administrator, and the server refuses to run elevated. This
         // variable lets the tests use it anyway. Real use never sets it.
-        .env("FORGETTY_TEST_ALLOW_ELEVATED", "1")
-        .output()
-        .expect("run forgetty")
+        .env("FORGETTY_TEST_ALLOW_ELEVATED", "1");
+    if default_port {
+        c.env_remove("FORGETTY_PORT");
+    } else {
+        c.env("FORGETTY_PORT", "0");
+    }
+    c
+}
+
+fn forgetty(state: &Path, args: &[&str]) -> Output {
+    command(state, args, false).output().expect("run forgetty")
+}
+
+/// Same, with the server's own default port (47297), as a user gets it.
+fn forgetty_default_port(state: &Path, args: &[&str]) -> Output {
+    command(state, args, true).output().expect("run forgetty")
 }
 
 fn text(o: &Output) -> String {
-    format!(
-        "{}{}",
-        String::from_utf8_lossy(&o.stdout),
-        String::from_utf8_lossy(&o.stderr)
-    )
+    format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))
 }
 
 /// Stops the server when the test ends, also when it fails half way.
@@ -38,9 +53,8 @@ impl Drop for Server {
         let stop = forgetty(self.state.path(), &["server", "stop"]);
         if !stop.status.success() {
             if let Some(pid) = self.pid {
-                let _ = Command::new("taskkill")
-                    .args(["/PID", &pid.to_string(), "/F", "/T"])
-                    .output();
+                let _ =
+                    Command::new("taskkill").args(["/PID", &pid.to_string(), "/F", "/T"]).output();
             }
         }
     }
@@ -107,6 +121,146 @@ fn the_cli_drives_a_detached_server_over_the_pipe() {
     assert!(stop.status.success(), "{}", text(&stop));
     let gone = forgetty(&state, &["server", "status"]);
     assert_eq!(gone.status.code(), Some(4), "{}", text(&gone));
+}
+
+fn status_json(state: &Path) -> serde_json::Value {
+    let out = forgetty(state, &["server", "status", "--json"]);
+    assert!(out.status.success(), "{}", text(&out));
+    serde_json::from_slice(&out.stdout).expect("status json")
+}
+
+/// The `status --json` contract the app reads: a `port` and the `addresses`, "ip:port" each.
+fn bound(info: &serde_json::Value) -> (u16, Vec<String>) {
+    let port = info["port"].as_u64().unwrap_or_else(|| panic!("no port in {info}")) as u16;
+    let addrs = info["addresses"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no addresses in {info}"))
+        .iter()
+        .map(|a| a.as_str().expect("address string").to_string())
+        .collect();
+    (port, addrs)
+}
+
+/// The rows of `netstat -ano -p <proto>` that belong to `pid`: (local, foreign, state).
+fn sockets_of(pid: u32, proto: &str) -> Vec<(String, String, String)> {
+    let out = Command::new("netstat").args(["-ano", "-p", proto]).output().expect("netstat");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            if f.first().map(|p| p.eq_ignore_ascii_case(proto)) != Some(true) {
+                return None;
+            }
+            if f.last().and_then(|p| p.parse::<u32>().ok()) != Some(pid) {
+                return None;
+            }
+            let state = if f.len() >= 5 { f[3].to_string() } else { String::new() };
+            Some((f.get(1)?.to_string(), f.get(2)?.to_string(), state))
+        })
+        .collect()
+}
+
+/// Runs `forgetty pair`, reads the payload line, and stops it again. The window stays open on
+/// the server until the caller closes it.
+fn pair_payload(state: &Path) -> serde_json::Value {
+    let mut child = command(state, &["pair"], false)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn forgetty pair");
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Some(json) = line.strip_prefix("payload: ") {
+                let _ = tx.send(json.to_string());
+                return;
+            }
+        }
+    });
+    let got = rx.recv_timeout(Duration::from_secs(30));
+    let _ = child.kill();
+    let _ = child.wait();
+    serde_json::from_str(&got.expect("forgetty pair printed no payload")).expect("payload json")
+}
+
+/// A default start is local only: loopback, no relay, port 47297. The sockets of the server
+/// process are the proof, not the settings it reports.
+#[test]
+fn a_default_start_listens_on_loopback_only_and_contacts_no_relay() {
+    let _one = DEFAULT_PORT.lock().unwrap_or_else(|e| e.into_inner());
+    let mut srv = Server { state: tempfile::tempdir().unwrap(), pid: None };
+    let state = srv.state.path().to_path_buf();
+    let start = forgetty_default_port(&state, &["server", "start"]);
+    assert!(start.status.success(), "{}", text(&start));
+
+    let info = status_json(&state);
+    let pid = info["pid"].as_u64().expect("pid") as u32;
+    srv.pid = Some(pid);
+    let (port, addresses) = bound(&info);
+    assert_eq!(port, 47297, "default port: {info}");
+    assert_eq!(addresses, vec!["127.0.0.1:47297".to_string()], "{info}");
+
+    // The real sockets: every UDP socket of the server is on 127.0.0.1, and the iroh one is there.
+    let udp = sockets_of(pid, "UDP");
+    assert!(udp.iter().any(|(l, _, _)| l == "127.0.0.1:47297"), "udp sockets: {udp:?}");
+    for (local, _, _) in &udp {
+        assert!(local.starts_with("127.0.0.1:"), "UDP socket not on loopback: {udp:?}");
+    }
+    // No TCP connection to anything outside the machine (a relay would be one).
+    for (local, foreign, state) in sockets_of(pid, "TCP") {
+        let loop_only = |a: &str| a.starts_with("127.0.0.1:") || a.starts_with("[::1]:");
+        assert!(
+            state == "LISTENING" && loop_only(&local) || loop_only(&foreign),
+            "TCP socket to the outside: {local} {foreign} {state}"
+        );
+    }
+
+    // The pairing payload: no relay, and the loopback address to dial.
+    let payload = pair_payload(&state);
+    assert_eq!(payload["relays_disabled"], true, "{payload}");
+    assert_eq!(payload["relay"], "", "{payload}");
+    assert_eq!(payload["direct"], serde_json::json!(["127.0.0.1:47297"]), "{payload}");
+
+    // `pair --cancel` closes that window; a second one finds none.
+    let cancel = forgetty(&state, &["pair", "--cancel"]);
+    assert!(cancel.status.success(), "{}", text(&cancel));
+    assert!(text(&cancel).contains("closed"), "{}", text(&cancel));
+    let again = forgetty(&state, &["pair", "--cancel"]);
+    assert!(text(&again).contains("no pairing window"), "{}", text(&again));
+}
+
+/// A second user of the same PC (their own state folder and pipe) finds 47297 taken. Their
+/// server still starts, on a free port that `status --json` reports, and still on loopback only.
+#[test]
+fn a_second_server_takes_a_free_port_when_the_default_is_taken() {
+    let _one = DEFAULT_PORT.lock().unwrap_or_else(|e| e.into_inner());
+    let mut first = Server { state: tempfile::tempdir().unwrap(), pid: None };
+    let mut second = Server { state: tempfile::tempdir().unwrap(), pid: None };
+
+    let start = forgetty_default_port(first.state.path(), &["server", "start"]);
+    assert!(start.status.success(), "{}", text(&start));
+    let a = status_json(first.state.path());
+    first.pid = a["pid"].as_u64().map(|p| p as u32);
+    assert_eq!(bound(&a).0, 47297, "{a}");
+
+    let start = forgetty_default_port(second.state.path(), &["server", "start"]);
+    assert!(start.status.success(), "{}", text(&start));
+    let b = status_json(second.state.path());
+    second.pid = b["pid"].as_u64().map(|p| p as u32);
+    let (port, addresses) = bound(&b);
+    assert_ne!(port, 47297, "the second server must not share the port: {b}");
+    assert_ne!(port, 0, "{b}");
+    assert_eq!(addresses, vec![format!("127.0.0.1:{port}")], "{b}");
+    let udp = sockets_of(second.pid.unwrap(), "UDP");
+    assert!(udp.iter().any(|(l, _, _)| *l == format!("127.0.0.1:{port}")), "udp sockets: {udp:?}");
+
+    // Its payload carries the port it really has.
+    let payload = pair_payload(second.state.path());
+    assert_eq!(payload["direct"], serde_json::json!([format!("127.0.0.1:{port}")]), "{payload}");
+
+    // The first one is untouched.
+    assert_eq!(bound(&status_json(first.state.path())).0, 47297);
 }
 
 #[test]

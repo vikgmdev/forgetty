@@ -451,6 +451,12 @@ pub struct ServerInfoResult {
     pub clients: u64,
     /// iroh node id. `null` when the iroh endpoint is not running.
     pub node_id: Option<String>,
+    /// The UDP port the iroh endpoint listens on (the real one, also when the fixed port was
+    /// taken). `null` when the iroh endpoint is not running.
+    pub port: Option<u16>,
+    /// The local sockets of the iroh endpoint as `ip:port`, IPv6 as `[ip]:port`. Empty when the
+    /// iroh endpoint is not running.
+    pub addresses: Vec<String>,
 }
 
 #[derive(JsonSchema, Serialize, Deserialize)]
@@ -544,6 +550,20 @@ pub struct PairOpenResult {
     pub window_id: u64,
     pub ttl_secs: u64,
     pub payload: PairPayload,
+}
+
+#[derive(JsonSchema, Serialize, Deserialize)]
+pub struct PairCloseParams {
+    /// Window to close. Left out: whichever window is open.
+    pub window_id: Option<u64>,
+}
+
+#[derive(JsonSchema, Serialize, Deserialize)]
+pub struct PairCloseResult {
+    /// Always `true`.
+    pub ok: bool,
+    /// A window was open and is now closed.
+    pub closed: bool,
 }
 
 #[derive(JsonSchema, Serialize, Deserialize)]
