@@ -36,7 +36,7 @@
                   ExeCommand="&quot;[INSTALLFOLDER]forgetty.exe&quot; server stop"
                   Execute="immediate" Return="ignore" />
     <InstallExecuteSequence>
-      <Custom Action="StopServer" Before="InstallValidate">REMOVE="ALL" OR WIX_UPGRADE_DETECTED</Custom>
+      <Custom Action="StopServer" Before="InstallValidate" Condition="REMOVE=&quot;ALL&quot; OR WIX_UPGRADE_DETECTED" />
     </InstallExecuteSequence>
 
     <Feature Id="Main" Title="Forgetty" Level="1">
