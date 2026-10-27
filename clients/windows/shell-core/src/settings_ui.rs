@@ -579,13 +579,13 @@ impl Settings {
             }
             "delete" if plain => {
                 if let Some(a) = cur {
-                    return Effect::Edits(shortcuts::plan_clear(ctx.cfg.keymap, a));
+                    return self.key_edits(shortcuts::plan_clear(ctx.cfg.keymap, a), ctx);
                 }
             }
-            "r" if k.ctrl && k.shift => return Effect::Edits(shortcuts::plan_reset_all(&ctx.cfg.keybindings)),
+            "r" if k.ctrl && k.shift => return self.key_edits(shortcuts::plan_reset_all(&ctx.cfg.keybindings), ctx),
             "r" if k.ctrl => {
                 if let Some(a) = cur {
-                    return Effect::Edits(shortcuts::plan_reset(a));
+                    return self.key_edits(shortcuts::plan_reset(a), ctx);
                 }
             }
             "backspace" if plain => {
@@ -612,6 +612,18 @@ impl Settings {
         Effect::None
     }
 
+    /// Edits to the keybindings, unless they would leave no way to Settings from the keyboard:
+    /// then nothing is written and the status says why.
+    fn key_edits(&mut self, edits: Vec<Edit>, ctx: &Ctx) -> Effect {
+        match shortcuts::keeps_settings_reachable(ctx.cfg.keymap, &ctx.cfg.keybindings, &edits) {
+            Ok(()) => Effect::Edits(edits),
+            Err(why) => {
+                self.status = Some(Status { ok: false, text: why.to_string() });
+                Effect::None
+            }
+        }
+    }
+
     fn capture_key(&mut self, k: &KeyIn, ctx: &Ctx) -> Effect {
         let Some(mut c) = self.capture.take() else { return Effect::None };
         let bare = !k.ctrl && !k.alt && !k.shift && !k.win;
@@ -619,7 +631,7 @@ impl Settings {
         if let Some((chord, _)) = c.conflict.clone() {
             if bare && k.key == "enter" {
                 return match shortcuts::plan_assign(ctx.cfg.keymap, &ctx.cfg.keybindings, c.action, &chord, c.mode, true) {
-                    Ok(edits) => Effect::Edits(edits),
+                    Ok(edits) => self.key_edits(edits, ctx),
                     Err(_) => Effect::None,
                 };
             }
@@ -640,6 +652,11 @@ impl Settings {
         match shortcuts::plan_assign(ctx.cfg.keymap, &ctx.cfg.keybindings, c.action, &chord, c.mode, false) {
             Ok(edits) => {
                 if edits.is_empty() {
+                    return Effect::None;
+                }
+                if let Err(why) = shortcuts::keeps_settings_reachable(ctx.cfg.keymap, &ctx.cfg.keybindings, &edits) {
+                    c.msg = Some(why.to_string());
+                    self.capture = Some(c);
                     return Effect::None;
                 }
                 Effect::Edits(edits)
@@ -1322,9 +1339,13 @@ mod tests {
         assert_eq!(s.key(&typed("a"), &c), Effect::None);
         let Body::Keys(kv) = s.view(&c).body else { panic!() };
         assert!(kv.capture.unwrap().1.contains("Ctrl"));
+        // Ctrl+Alt with a letter is AltGr: refused, the capture stays open.
+        assert_eq!(s.key(&ck("h", true, true, false), &c), Effect::None);
+        let Body::Keys(kv) = s.view(&c).body else { panic!() };
+        assert!(kv.capture.unwrap().1.contains("AltGr"));
         // A free chord.
-        let e = s.key(&ck("h", true, true, false), &c);
-        assert_eq!(e, Effect::Edits(vec![Edit::set("keybindings.toggle_sidebar", V::Str("ctrl+alt+h".into()))]));
+        let e = s.key(&ck("h", true, false, true), &c);
+        assert_eq!(e, Effect::Edits(vec![Edit::set("keybindings.toggle_sidebar", V::Str("ctrl+shift+h".into()))]));
         // A taken chord waits for Enter.
         s.key(&k("enter"), &c);
         assert_eq!(s.key(&ck("t", true, false, true), &c), Effect::None);
@@ -1343,6 +1364,38 @@ mod tests {
         s.key(&k("enter"), &c);
         assert_eq!(s.key(&k("escape"), &c), Effect::None);
         assert!(matches!(&s.view(&c).body, Body::Keys(x) if x.capture.is_none()));
+    }
+
+    #[test]
+    fn the_last_shortcut_to_settings_is_not_unbound() {
+        let h = H::new("[keybindings]\ncommand_palette = \"ctrl+shift+p\"\n");
+        let c = h.ctx();
+        let mut s = Settings::new(&c);
+        s.select_page(Page::Keybindings, &c);
+        for ch in "command palette".chars() {
+            if ch == ' ' {
+                s.key(&k("space"), &c);
+            } else {
+                s.key(&typed(&ch.to_string()), &c);
+            }
+        }
+        // The default set has a Settings chord: the palette may be unbound.
+        assert!(matches!(s.key(&k("delete"), &c), Effect::Edits(_)));
+        // With neither, the unbind is refused with a message.
+        let h = H::new("[keybindings]\nopen_settings = \"none\"\n");
+        let c = h.ctx();
+        let mut s = Settings::new(&c);
+        s.select_page(Page::Keybindings, &c);
+        for ch in "command palette".chars() {
+            if ch == ' ' {
+                s.key(&k("space"), &c);
+            } else {
+                s.key(&typed(&ch.to_string()), &c);
+            }
+        }
+        assert_eq!(s.key(&k("delete"), &c), Effect::None);
+        let st = s.status().unwrap();
+        assert!(!st.ok && st.text.contains("Settings"), "{st:?}");
     }
 
     #[test]

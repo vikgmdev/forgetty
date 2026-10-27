@@ -45,13 +45,18 @@ pub fn config_form(c: &Chord) -> String {
 }
 
 /// Is this chord one the Keybindings page accepts? A key that types text needs Ctrl, Alt or Win
-/// with it (else the binding would eat that character); the F keys stand alone.
+/// with it (else the binding would eat that character); the F keys stand alone. Ctrl+Alt with a
+/// letter, digit or symbol is how Windows reports AltGr, so it would take that character away
+/// from every keyboard that types it with AltGr: refused.
 pub fn capture_check(c: &Chord) -> Result<(), &'static str> {
     const MODS: &[&str] = &["shift", "control", "ctrl", "alt", "win", "super", "meta", "platform", "capslock", "function", "fn"];
     if c.key.is_empty() || MODS.contains(&c.key.as_str()) {
         return Err("Press a key together with the modifiers");
     }
     let is_f = c.key.len() >= 2 && c.key.starts_with('f') && c.key[1..].chars().all(|ch| ch.is_ascii_digit());
+    if c.ctrl && c.alt && c.key.chars().count() == 1 {
+        return Err("Ctrl+Alt with a letter or symbol is AltGr on many keyboards. Use Ctrl+Shift, or Ctrl+Alt with an arrow or F key");
+    }
     if is_f || c.ctrl || c.alt || c.win {
         Ok(())
     } else {
@@ -174,6 +179,38 @@ pub fn plan_assign(
     Ok(edits)
 }
 
+/// Would the keymap that `edits` make still reach Settings from the keyboard? It does while
+/// `open_settings` or `command_palette` (whose list has the Settings entry) has a chord. The last
+/// unbind of both is refused, so a user cannot lock themselves out of this window.
+pub fn keeps_settings_reachable(preset: KeymapPreset, overrides: &HashMap<String, Vec<String>>, edits: &[Edit]) -> Result<(), &'static str> {
+    let mut o = overrides.clone();
+    for e in edits {
+        match e {
+            Edit::Set(path, v) => {
+                if let Some(name) = path.strip_prefix("keybindings.") {
+                    let keys = match v {
+                        V::Str(s) => vec![s.clone()],
+                        V::List(l) => l.clone(),
+                        _ => continue,
+                    };
+                    o.insert(name.to_string(), keys);
+                }
+            }
+            Edit::Remove(path) => {
+                if let Some(name) = path.strip_prefix("keybindings.") {
+                    o.remove(name);
+                }
+            }
+        }
+    }
+    let km = Keymap::new(preset, &o);
+    if km.chords(Action::OpenSettings).is_empty() && km.chords(Action::CommandPalette).is_empty() {
+        Err("Not changed: Settings would have no shortcut. Keep a shortcut for Settings or for the command palette")
+    } else {
+        Ok(())
+    }
+}
+
 /// No chord for `a` (an entry `"none"`).
 pub fn plan_clear(preset: KeymapPreset, a: Action) -> Vec<Edit> {
     edits_for(preset, a, Vec::new())
@@ -271,6 +308,13 @@ mod tests {
     fn a_pressed_chord_needs_a_modifier_unless_it_is_an_f_key() {
         assert!(capture_check(&ch("ctrl+k")).is_ok());
         assert!(capture_check(&ch("alt+left")).is_ok());
+        // AltGr arrives as Ctrl+Alt: a character key with both is refused, other keys are fine.
+        for k in ["ctrl+alt+h", "ctrl+alt+2", "ctrl+alt+;", "ctrl+alt+shift+e"] {
+            assert!(capture_check(&ch(k)).unwrap_err().contains("AltGr"), "{k}");
+        }
+        for k in ["ctrl+alt+left", "ctrl+alt+f5", "ctrl+alt+tab", "ctrl+shift+h", "alt+h"] {
+            assert!(capture_check(&ch(k)).is_ok(), "{k}");
+        }
         assert!(capture_check(&Chord::new(false, false, false, false, "f5")).is_ok());
         assert!(capture_check(&Chord::new(false, false, false, false, "a")).is_err());
         assert!(capture_check(&Chord::new(false, false, true, false, "a")).is_err());
@@ -316,6 +360,30 @@ mod tests {
         assert_eq!(e[0], Edit::Set("keybindings.next_tab".into(), V::Str("ctrl+pagedown".into())));
         // A chord the action already has is no conflict.
         assert!(plan_assign(KeymapPreset::Gtk, &none(), Action::NewTab, &ch("ctrl+shift+t"), Mode::Add, false).is_ok());
+    }
+
+    #[test]
+    fn the_last_way_to_settings_cannot_be_unbound() {
+        let none = none();
+        let clear = |a| plan_clear(KeymapPreset::Windows, a);
+        // The windows set has no Settings chord of its own: the palette is the way.
+        assert!(keeps_settings_reachable(KeymapPreset::Windows, &none, &clear(Action::NewTab)).is_ok());
+        let e = keeps_settings_reachable(KeymapPreset::Windows, &none, &clear(Action::CommandPalette)).unwrap_err();
+        assert!(e.contains("Settings"), "{e}");
+        // With a Settings chord the palette may go, and then the Settings chord may not.
+        let mut o = none.clone();
+        o.insert("open_settings".into(), vec!["ctrl+shift+o".into()]);
+        assert!(keeps_settings_reachable(KeymapPreset::Windows, &o, &clear(Action::CommandPalette)).is_ok());
+        o.insert("command_palette".into(), vec!["none".into()]);
+        assert!(keeps_settings_reachable(KeymapPreset::Windows, &o, &clear(Action::OpenSettings)).is_err());
+        assert!(keeps_settings_reachable(KeymapPreset::Windows, &o, &plan_reset(Action::OpenSettings)).is_err());
+        // Putting one back is fine, and so is moving the Settings chord to another key.
+        assert!(keeps_settings_reachable(KeymapPreset::Windows, &o, &plan_reset(Action::CommandPalette)).is_ok());
+        let mv = plan_assign(KeymapPreset::Windows, &o, Action::OpenSettings, &ch("ctrl+shift+j"), Mode::Replace, false).unwrap();
+        assert!(keeps_settings_reachable(KeymapPreset::Windows, &o, &mv).is_ok());
+        // Taking the palette's chord for another action leaves the palette without one.
+        let take = plan_assign(KeymapPreset::Windows, &none, Action::NewTab, &ch("ctrl+shift+p"), Mode::Replace, true).unwrap();
+        assert!(keeps_settings_reachable(KeymapPreset::Windows, &none, &take).is_err());
     }
 
     #[test]

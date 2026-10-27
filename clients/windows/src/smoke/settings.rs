@@ -169,13 +169,18 @@ impl ShellSmoke {
                 self.st_send(shell, window, cx, &["enter"]);
                 let capturing = shell.settings_prepare().is_some_and(|v| matches!(v.body, Body::Keys(k) if k.capture.is_some()));
                 check("settings_keybinding_capture_opens", capturing);
+                // Ctrl+Alt with a letter is AltGr on many keyboards: refused with a message, the
+                // capture stays open and nothing is written.
                 self.st_send(shell, window, cx, &["ctrl+alt+h"]);
+                let refused = shell.settings_prepare().is_some_and(|v| matches!(v.body, Body::Keys(k) if k.capture.as_ref().is_some_and(|(_, m)| m.contains("AltGr"))));
+                check("settings_keybinding_refuses_altgr_chord", refused && !self.st_file().contains("ctrl+alt+h"));
+                self.st_send(shell, window, cx, &["ctrl+shift+h"]);
                 self.st_next();
             }
             10 => {
-                until!(shell.keymap.lookup(&chord("ctrl+alt+h")) == Some(Action::ToggleSidebar));
+                until!(shell.keymap.lookup(&chord("ctrl+shift+h")) == Some(Action::ToggleSidebar));
                 let f = self.st_file();
-                check("settings_keybinding_saved_and_live", f.contains("toggle_sidebar = \"ctrl+alt+h\""));
+                check("settings_keybinding_saved_and_live", f.contains("toggle_sidebar = \"ctrl+shift+h\""));
                 check("settings_keybinding_keeps_the_note_and_the_other_entry", f.contains("# keep this note") && f.contains("search = \"ctrl+alt+s\"") && f.contains("future_key = 1"));
                 check("settings_old_chord_is_free", shell.keymap.lookup(&chord("ctrl+alt+b")).is_none());
                 // A taken chord asks first.
