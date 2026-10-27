@@ -469,7 +469,8 @@ Limits:
   and turns the integration off.
 - A prompt theme that rebuilds `PS1` on every prompt (powerlevel10k, starship)
   keeps the marks: they are added after the theme runs. The first prompt of the
-  shell can lack them.
+  shell can lack them, and so can the first prompt after a hook is added later to
+  `PROMPT_COMMAND`.
 - A pane that writes marks in a loop gets its states merged (a burst of 8, then
   one per 10 ms per pane, and the newest pending one per client connection), so a
   client sees where the shell is, not every step. The same holds for the

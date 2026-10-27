@@ -662,5 +662,9 @@ Limits:
   keeps the marks: the script adds `A` and `B` from a hook that runs after the
   theme (last in `PROMPT_COMMAND` for bash, last in `precmd_functions` for zsh,
   put back at the end before every command). The very first prompt can still
-  lack its marks when the theme runs in the same start line; the next prompt has
-  them.
+  lack its marks when the theme runs in the same start line (also when it is an
+  element of an array `PROMPT_COMMAND`: bash runs the list it had at the start of
+  that prompt); the next prompt has them. A hook added later (`PROMPT_COMMAND+=`)
+  lands behind the integration's last hook: the first prompt after the change can
+  lack the marks, then the script moves its hook back to the end. bash older
+  than 5.1 runs element 0 of an array only: there the string form is used.

@@ -594,6 +594,9 @@ async fn bash_array_prompt_command_keeps_two_user_hooks() {
     seen.wait("the line editor tty mode", 0, |s| s.tty.is_some_and(|t| !t.canonical && !t.echo))
         .await;
     out.wait_for("[U2:3]").await;
+    // Prompt 1: the user's elements ran (behind the start line, so their
+    // output comes first on that prompt).
+    assert!(out.text().contains("[U1:2][U2:3]"), "prompt 1 skipped the user hooks:\n{}", out.text());
     for round in 0..2 {
         let from = seen.states.len();
         sm.write_pty(pane, b"true\n").unwrap();
@@ -619,5 +622,113 @@ async fn bash_array_prompt_command_keeps_two_user_hooks() {
     // The hooks ran on more than one prompt.
     assert!(text.matches("[U1:2]").count() >= 3, "user hooks did not run each prompt:\n{text}");
     assert!(!text.contains("command not found"), "output:\n{text}");
+    sm.close_pane(pane).unwrap();
+}
+
+/// A hook added after the start lands behind `__forgetty_last`; the next
+/// prompt moves the last hook back to the end, so the marks come after the
+/// hook (which rewrites PS1). `setup` runs in the pane as a command.
+async fn late_hook_keeps_marks(rc: Option<(&str, &str)>, setup: &str) {
+    let Some((sm, _env, pane)) = integrated_pane("bash", rc) else {
+        println!("SKIPPED: bash is not installed");
+        return;
+    };
+    let rx = sm.subscribe_meta();
+    let out = Output::start(&sm, pane);
+    let mut seen = Seen { rx, pane, states: Vec::new() };
+    seen.wait("the line editor tty mode", 0, |s| s.tty.is_some_and(|t| !t.canonical && !t.echo))
+        .await;
+    sm.write_pty(pane, format!("{setup}\n").as_bytes()).unwrap();
+    sm.write_pty(pane, b"echo SETUP-$((1+1))\n").unwrap();
+    out.wait_for("SETUP-2").await;
+    // The first prompt after the change already has its list: it may lack the
+    // marks. From the next one on they are back after the hook.
+    sm.write_pty(pane, b"true\n").unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    for round in 0..2 {
+        seen.drain();
+        let from = seen.states.len();
+        sm.write_pty(pane, b"true\n").unwrap();
+        let c = seen
+            .wait(&format!("late hook round {round}: command start"), from, |s| {
+                s.phase == Phase::Running
+            })
+            .await;
+        seen.wait(&format!("late hook round {round}: prompt marks after the hook"), c, |s| {
+            s.phase == Phase::Input
+        })
+        .await;
+    }
+    sm.write_pty(pane, b"echo OK-$((2+3))\n").unwrap();
+    out.wait_for("OK-5").await;
+    assert!(!out.text().contains("command not found"), "output:\n{}", out.text());
+    sm.close_pane(pane).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bash_hook_added_later_as_a_string_still_gets_the_marks_after_it() {
+    let _one = SERIAL.lock().await;
+    late_hook_keeps_marks(None, "__late() { PS1='late> '; }; PROMPT_COMMAND+=';__late'").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bash_hook_added_later_to_a_string_with_plus_array_still_gets_the_marks_after_it() {
+    let _one = SERIAL.lock().await;
+    late_hook_keeps_marks(None, "__late() { PS1='late> '; }; PROMPT_COMMAND+=(__late)").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bash_hook_added_later_to_an_array_still_gets_the_marks_after_it() {
+    let _one = SERIAL.lock().await;
+    let rc = "__u1() { :; }\nPROMPT_COMMAND+=(__u1)\n";
+    late_hook_keeps_marks(
+        Some((".bash_profile", rc)),
+        "__late() { PS1='late> '; }; PROMPT_COMMAND+=(__late)",
+    )
+    .await;
+}
+
+/// bash before 5.1 runs element 0 of an array PROMPT_COMMAND only: the string
+/// path is used (the elements behind 0 never ran there, and are dropped). (The version is forced; the bash of the test is newer.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bash_before_5_1_uses_the_string_path_for_an_array() {
+    let _one = SERIAL.lock().await;
+    let rc = "__u1() { printf '[U1:%d]' $((1+1)); }\nPROMPT_COMMAND+=(__u1)\n";
+    // SAFETY: serialized by SERIAL, no other test reads the variable.
+    unsafe { std::env::set_var("FORGETTY_BASH_VERSION_FOR_TEST", "5.0") };
+    let made = integrated_pane("bash", Some((".bash_profile", rc)));
+    let Some((sm, _env, pane)) = made else {
+        println!("SKIPPED: bash is not installed");
+        return;
+    };
+    let rx = sm.subscribe_meta();
+    let out = Output::start(&sm, pane);
+    let mut seen = Seen { rx, pane, states: Vec::new() };
+    seen.wait("the line editor tty mode", 0, |s| s.tty.is_some_and(|t| !t.canonical && !t.echo))
+        .await;
+    for round in 0..2 {
+        let from = seen.states.len();
+        sm.write_pty(pane, b"true\n").unwrap();
+        let c = seen
+            .wait(&format!("round {round}: command start"), from, |s| s.phase == Phase::Running)
+            .await;
+        seen.wait(&format!("round {round}: prompt again"), c, |s| s.phase == Phase::Input).await;
+    }
+    sm.write_pty(pane, b"declare -p PROMPT_COMMAND | tr -d '\\n'; echo STR-$((1+1))\n").unwrap();
+    out.wait_for("STR-2").await;
+    let text = out.text();
+    let declared = text
+        .lines()
+        .find(|l| l.contains("declare -- PROMPT_COMMAND") && !l.contains("declare -p"))
+        .unwrap_or("");
+    // The string path: a plain string with first and last (an array would be
+    // `declare -a`, with the hooks as elements).
+    assert!(
+        declared.contains("__forgetty_first;") && declared.contains("__forgetty_last"),
+        "wrong PROMPT_COMMAND: {declared:?}\n{text}"
+    );
+    assert!(!text.contains("command not found"), "output:\n{text}");
+    // SAFETY: as above.
+    unsafe { std::env::remove_var("FORGETTY_BASH_VERSION_FOR_TEST") };
     sm.close_pane(pane).unwrap();
 }

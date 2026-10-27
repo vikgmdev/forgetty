@@ -9,9 +9,20 @@
 __forgetty_si_loaded=1
 __forgetty_ran=
 
+# bash 5.1 and newer run every element of an array PROMPT_COMMAND; older bash
+# uses element 0 only, so there the string form is used. (The version can be
+# forced for a test with FORGETTY_BASH_VERSION_FOR_TEST.)
+__forgetty_arr=
+__forgetty_v=${FORGETTY_BASH_VERSION_FOR_TEST:-${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}}
+case $__forgetty_v in
+  [0-4].* | 5.0 | 5.0.*) ;;
+  *) __forgetty_arr=1 ;;
+esac
+unset __forgetty_v
+
 # The server's one-shot start line leaves PROMPT_COMMAND here.
 __forgetty_boot='. "$FORGETTY_SHELL_INTEGRATION_DIR/forgetty.bash"'
-if [[ $(declare -p PROMPT_COMMAND 2>/dev/null) == "declare -a"* ]]; then
+if [[ -n $__forgetty_arr && $(declare -p PROMPT_COMMAND 2>/dev/null) == "declare -a"* ]]; then
   # A startup file made it an array (`PROMPT_COMMAND+=(hook)`): the start line
   # is one element. Take it out and keep the user's other elements.
   for __forgetty_i in "${!PROMPT_COMMAND[@]}"; do
@@ -47,9 +58,46 @@ __forgetty_osc7() {
   printf '\e]7;file://%s%s\a' "${HOSTNAME}" "$out"
 }
 
+# A hook added after the start (`PROMPT_COMMAND+=(x)`, `+=";x"`) lands behind
+# __forgetty_last. Move it back to the end, so a theme hook that rewrites PS1 is
+# followed by the marks. This takes effect from the next prompt: the prompt that
+# is running now has its list already.
+__forgetty_relast() {
+  local nl=$'\n' e i
+  if [[ $(declare -p PROMPT_COMMAND 2>/dev/null) == "declare -a"* ]]; then
+    [[ -n $__forgetty_arr ]] || return 0
+    local idx=("${!PROMPT_COMMAND[@]}") out=() stripped=
+    for i in "${idx[@]}"; do
+      e=${PROMPT_COMMAND[i]}
+      if [[ $e == __forgetty_last ]]; then
+        continue
+      elif [[ $e == *"${nl}__forgetty_last" ]]; then
+        # the string form of an earlier start, turned into an array by a `+=(x)`
+        e=${e%"${nl}__forgetty_last"}
+        stripped=1
+      fi
+      out+=("$e")
+    done
+    # Already last: bare, and nothing else held it.
+    if (( ${#idx[@]} > 0 )) && [[ ${PROMPT_COMMAND[${idx[${#idx[@]}-1]}]} == __forgetty_last ]] \
+        && [[ -z $stripped ]] && (( ${#out[@]} == ${#idx[@]} - 1 )); then
+      return 0
+    fi
+    PROMPT_COMMAND=("${out[@]}" __forgetty_last)
+  else
+    [[ $PROMPT_COMMAND == *"${nl}__forgetty_last" ]] && return 0
+    [[ $PROMPT_COMMAND == *"${nl}__forgetty_last"* ]] || return 0
+    # A no-op in its place keeps the list valid whatever follows it (`;x`).
+    e=${PROMPT_COMMAND/"${nl}__forgetty_last"/"${nl}:"}
+    PROMPT_COMMAND="$e${nl}__forgetty_last"
+  fi
+  return 0
+}
+
 # First in PROMPT_COMMAND, so $? is still the status of the command.
 __forgetty_first() {
   local ret=$?
+  __forgetty_relast
   if [[ -n $__forgetty_ran ]]; then
     printf '\e]133;D;%s\a' "$ret"
     __forgetty_ran=
@@ -72,14 +120,14 @@ __forgetty_last() {
 # command runs. The expansion also records that a command ran.
 PS0='\e]133;C;${__forgetty_ran:=1}\a'"${PS0-}"
 
-if [[ $(declare -p PROMPT_COMMAND 2>/dev/null) == "declare -a"* ]]; then
+if [[ -n $__forgetty_arr && $(declare -p PROMPT_COMMAND 2>/dev/null) == "declare -a"* ]]; then
   PROMPT_COMMAND=(__forgetty_first "${PROMPT_COMMAND[@]}" __forgetty_last)
 else
   # A newline before the last hook keeps a trailing comment or & in the user's
   # command from swallowing it. It is built in a variable: $'\n' inside the
   # double quotes of a ${...:+...} is literal when `extquote` is off.
   __forgetty_nl=$'\n'
-  PROMPT_COMMAND="__forgetty_first;${PROMPT_COMMAND:+$PROMPT_COMMAND$__forgetty_nl}__forgetty_last"
+  PROMPT_COMMAND="__forgetty_first;${PROMPT_COMMAND-}${__forgetty_nl}__forgetty_last"
   unset __forgetty_nl
 fi
 
