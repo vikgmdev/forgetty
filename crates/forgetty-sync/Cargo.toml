@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Test hooks (never in a release build).
+qa-tools = []
+
 [dependencies]
 forgetty-core = { path = "../forgetty-core" }
 # iroh 0.97 (latest stable). The spec was written for 0.35; API diverged significantly.

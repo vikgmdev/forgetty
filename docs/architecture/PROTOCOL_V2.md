@@ -619,7 +619,7 @@ ShellState {
   `phase` as where the shell is, not as an event: `running` can be skipped, and a
   command that ended shows as `input` with the new `exit_code` (a `rev` that
   grew). When a connection lags and resyncs, the server sends the current state
-  of every pane again: the same `rev` can arrive twice. A client drops an event
+  of every pane again (and the newest `CwdChanged` of each pane): the same `rev` can arrive twice. A client drops an event
   whose `rev` is not higher than the one it holds.
 - `CwdChanged` follows the same rules: a pane sends a burst of 8, then one per
   10 ms, and the newest directory wins (a loop of OSC 7 makes a handful of
@@ -662,5 +662,12 @@ Limits:
   keeps the marks: the script adds `A` and `B` from a hook that runs after the
   theme (last in `PROMPT_COMMAND` for bash, last in `precmd_functions` for zsh,
   put back at the end before every command). The very first prompt can still
-  lack its marks when the theme runs in the same start line; the next prompt has
-  them.
+  lack its marks when the theme runs in the same start line (also when it is an
+  element of an array `PROMPT_COMMAND`: bash runs the list it had at the start of
+  that prompt); the next prompt has them. A hook added later (`PROMPT_COMMAND+=`)
+  lands behind the integration's last hook: the first prompt after the change can
+  lack the marks, then the script moves its hook back to the end. bash older
+  than 5.1 runs element 0 of an array only: there the string form is used. A hook added
+  in front of the integration's first hook is moved behind it the same way; in the
+  string form the prompt after the change sends its `D` mark without a code (the
+  status then belongs to the front hook), never a wrong one.

@@ -2047,19 +2047,33 @@ impl Session {
                         let seq = session.rpc.current_seq();
                         let event = ServerEvent::LayoutChanged { layout: session.rpc.layout_value() };
                         queue.put_layout(control_frame(&ControlMsg::Event { seq, event }));
-                        last_resync = Some(tokio::time::Instant::now());
                     }
-                    if session.has(cap::SHELL_STATE) {
-                        // States that were lost with the lagged events: the
-                        // whole state of each pane, replacing what is queued.
+                    {
+                        // What was lost with the lagged events: the newest
+                        // directory of each pane (every subscriber), and the
+                        // whole shell state (with the capability), replacing
+                        // what is queued.
                         let seq = session.rpc.current_seq();
                         let rpc = session.rpc.clone();
                         let states = tokio::task::spawn_blocking(move || rpc.sm.shell_states())
                             .await
                             .unwrap_or_default();
+                        let with_shell = session.has(cap::SHELL_STATE);
                         for (pane_id, state) in states {
-                            let event = shell_state_event(pane_id.0, &state);
-                            queue.put_keyed((KEY_SHELL_STATE, pane_id.0), control_frame(&ControlMsg::Event { seq, event }));
+                            if let Some(cwd) = state.cwd.clone() {
+                                let event = ServerEvent::CwdChanged { pane_id: pane_id.0, cwd };
+                                queue.put_keyed(
+                                    (KEY_CWD, pane_id.0),
+                                    control_frame(&ControlMsg::Event { seq, event }),
+                                );
+                            }
+                            if with_shell {
+                                let event = shell_state_event(pane_id.0, &state);
+                                queue.put_keyed(
+                                    (KEY_SHELL_STATE, pane_id.0),
+                                    control_frame(&ControlMsg::Event { seq, event }),
+                                );
+                            }
                         }
                         last_resync = Some(tokio::time::Instant::now());
                     }

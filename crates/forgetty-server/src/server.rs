@@ -160,28 +160,101 @@ fn address_present(ip: std::net::IpAddr) -> bool {
     std::net::UdpSocket::bind((ip, 0)).is_ok()
 }
 
+/// Failed rebinds per address. A failed rebind drops the connections, so an
+/// address that fails [`RetryBook::MAX_FAILED`] times is given up until the
+/// server restarts, and each retry waits longer (10 s, then 20 s).
+#[derive(Default)]
+struct RetryBook {
+    failed: std::collections::HashMap<std::net::IpAddr, (u32, std::time::Instant)>,
+}
+
+impl RetryBook {
+    const MAX_FAILED: u32 = 3;
+
+    fn given_up(&self, ip: &std::net::IpAddr) -> bool {
+        self.failed.get(ip).is_some_and(|(n, _)| *n >= Self::MAX_FAILED)
+    }
+
+    /// May the address be tried now?
+    fn due(&self, ip: &std::net::IpAddr, now: std::time::Instant) -> bool {
+        self.failed.get(ip).is_none_or(|(_, next)| *next <= now)
+    }
+
+    /// A rebind with this address failed after it dropped the connections:
+    /// the failure count, and how long to wait.
+    fn failure(&mut self, ip: std::net::IpAddr, now: std::time::Instant) -> (u32, Duration) {
+        let n = self.failed.get(&ip).map_or(0, |(n, _)| *n) + 1;
+        let wait = Duration::from_secs(10 * u64::from(n));
+        self.failed.insert(ip, (n, now + wait));
+        (n, wait)
+    }
+
+    fn success(&mut self, ip: &std::net::IpAddr) {
+        self.failed.remove(ip);
+    }
+}
+
+/// The addresses of `appeared` that a bind error names (`ip:port`, or
+/// `[ip]:port` for IPv6). Empty when the error names none of them: then the
+/// failure cannot be attributed.
+fn named_in_error(error: &str, appeared: &[std::net::IpAddr]) -> Vec<std::net::IpAddr> {
+    appeared
+        .iter()
+        .copied()
+        .filter(|ip| {
+            let needle = if ip.is_ipv4() { format!("{ip}:") } else { format!("[{ip}]:") };
+            error.match_indices(&needle).any(|(at, _)| {
+                // Not the tail of a longer address (110.0.0.2 for 10.0.0.2).
+                !error[..at].ends_with(|c: char| c.is_ascii_alphanumeric() || c == '.' || c == ':')
+            })
+        })
+        .collect()
+}
+
 /// Watch the `--bind` addresses that were missing at start. When one appears
 /// (several at once count as one), bind the endpoint again with the full set:
 /// iroh cannot add a socket to a running endpoint, so the connections drop once
 /// and the clients reconnect. The key, node id and port stay.
 fn watch_missing_addresses(ep: Arc<SyncEndpoint>, all: Vec<std::net::IpAddr>) {
-    let mut missing: Vec<std::net::IpAddr> =
-        all.iter().copied().filter(|ip| !ep.bind_addrs().contains(ip)).collect();
+    let list = |v: &[std::net::IpAddr]| v.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ");
+    let missing_now = {
+        let (ep, all) = (Arc::clone(&ep), all.clone());
+        move || -> Vec<std::net::IpAddr> {
+            let have = ep.bind_addrs();
+            all.iter().copied().filter(|ip| !have.contains(ip)).collect()
+        }
+    };
+    let missing = missing_now();
     if missing.is_empty() {
         return;
     }
     for ip in &missing {
         warn!(
             "--bind {ip} is not on this machine yet; serving on {}; it is added when it appears",
-            ep.bind_addrs().iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ")
+            list(&ep.bind_addrs())
         );
     }
     tokio::spawn(async move {
+        let mut book = RetryBook::default();
         let mut warned = false;
         loop {
             tokio::time::sleep(BIND_WATCH_EVERY).await;
-            let appeared: Vec<std::net::IpAddr> =
-                missing.iter().copied().filter(|ip| address_present(*ip)).collect();
+            // The addresses not bound now: those that never came, and those a
+            // failed rebind gave up on (not the ones given up for good).
+            let missing: Vec<std::net::IpAddr> = missing_now()
+                .into_iter()
+                .filter(|ip| !book.given_up(ip))
+                .collect();
+            if missing.is_empty() {
+                return;
+            }
+            let now = std::time::Instant::now();
+            let appeared: Vec<std::net::IpAddr> = missing
+                .iter()
+                .copied()
+                .filter(|ip| book.due(ip, now))
+                .filter(|ip| address_present(*ip))
+                .collect();
             if appeared.is_empty() {
                 continue;
             }
@@ -191,16 +264,15 @@ fn watch_missing_addresses(ep: Arc<SyncEndpoint>, all: Vec<std::net::IpAddr>) {
                 .copied()
                 .filter(|ip| current.contains(ip) || appeared.contains(ip))
                 .collect();
-            let names = appeared.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ");
+            let names = list(&appeared);
             match ep.rebind(set).await {
                 Ok(()) => {
                     info!(
                         "--bind {names} is there: iroh endpoint bound again on {} (connections reconnect once)",
-                        ep.bind_addrs().iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ")
+                        list(&ep.bind_addrs())
                     );
-                    missing.retain(|ip| !appeared.contains(ip));
-                    if missing.is_empty() {
-                        return;
+                    for ip in &appeared {
+                        book.success(ip);
                     }
                     warned = false;
                 }
@@ -212,14 +284,34 @@ fn watch_missing_addresses(ep: Arc<SyncEndpoint>, all: Vec<std::net::IpAddr>) {
                     }
                 }
                 Err(f) => {
-                    error!(
-                        "--bind {names} could not be added ({}); the endpoint serves on {} and does not try again",
-                        f.error,
-                        ep.bind_addrs().iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ")
-                    );
-                    missing.retain(|ip| !appeared.contains(ip));
-                    if missing.is_empty() {
-                        return;
+                    let bound = ep.bound_sockets();
+                    let bound_text = if bound.is_empty() {
+                        "no endpoint is bound now, the server keeps trying to bind in the background".to_string()
+                    } else {
+                        format!(
+                            "bound now: {}",
+                            bound.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ")
+                        )
+                    };
+                    // A strike for the address the error names; when it names
+                    // none of them, for all that were added.
+                    let text = f.error.to_string();
+                    let named = named_in_error(&text, &appeared);
+                    let blamed = if named.is_empty() { appeared.clone() } else { named };
+                    for ip in &blamed {
+                        let (n, wait) = book.failure(*ip, std::time::Instant::now());
+                        if n >= RetryBook::MAX_FAILED {
+                            warn!(
+                                "--bind {ip} could not be added {n} times ({}); the server stops trying for it until it restarts; {bound_text}",
+                                f.error
+                            );
+                        } else {
+                            error!(
+                                "--bind {ip} could not be added ({}); {bound_text}; trying again in {} s",
+                                f.error,
+                                wait.as_secs()
+                            );
+                        }
                     }
                 }
             }
@@ -1187,6 +1279,41 @@ fn restore_subtree(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_bind_error_is_attributed_to_the_address_it_names() {
+        let ips: Vec<std::net::IpAddr> =
+            ["10.0.0.2", "10.0.0.3", "fd00::2"].iter().map(|s| s.parse().unwrap()).collect();
+        let named = |e: &str| named_in_error(e, &ips);
+        assert_eq!(named("Failed to bind iroh endpoint: 10.0.0.3:47297: Address in use"), vec![ips[1]]);
+        assert_eq!(named("x: [fd00::2]:47297: nope"), vec![ips[2]]);
+        // Not the tail of a longer address.
+        assert!(named("110.0.0.2:5: nope").is_empty());
+        // Names none: cannot be attributed.
+        assert!(named("Failed to bind sockets: Address already in use (os error 98)").is_empty());
+        // Names an address that was bound before: not one of the new ones.
+        assert!(named("10.0.0.1:47297: nope").is_empty());
+    }
+
+    #[test]
+    fn an_address_that_keeps_failing_is_given_up_and_the_others_keep_their_retries() {
+        let (a, b): (std::net::IpAddr, std::net::IpAddr) =
+            ("10.0.0.1".parse().unwrap(), "10.0.0.2".parse().unwrap());
+        let t0 = std::time::Instant::now();
+        let mut book = RetryBook::default();
+        assert!(book.due(&a, t0) && !book.given_up(&a));
+        assert_eq!(book.failure(a, t0), (1, Duration::from_secs(10)));
+        assert!(!book.due(&a, t0 + Duration::from_secs(9)));
+        assert!(book.due(&a, t0 + Duration::from_secs(10)));
+        // Another address does not wait for a's cooldown.
+        assert!(book.due(&b, t0 + Duration::from_secs(1)));
+        assert_eq!(book.failure(a, t0).0, 2);
+        assert!(!book.given_up(&a));
+        assert_eq!(book.failure(a, t0).0, 3);
+        assert!(book.given_up(&a) && !book.given_up(&b));
+        book.success(&a);
+        assert!(!book.given_up(&a));
+    }
+
     use super::*;
 
     #[test]

@@ -26,7 +26,7 @@ path = "src/stream_test.rs"
 required-features = ["qa-tools"]
 
 [features]
-qa-tools = ["forgetty-socket/qa-tools"]
+qa-tools = ["forgetty-socket/qa-tools", "forgetty-sync/qa-tools"]
 
 [[bench]]
 # V2-013: in-process hot-path micro-bench (PTY -> broadcast subscriber).

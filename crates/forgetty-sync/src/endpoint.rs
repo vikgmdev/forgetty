@@ -257,7 +257,12 @@ impl SyncEndpointBuilder {
             bind_addrs: self.bind_addrs.clone(),
             bind_port: self.bind_port,
         };
+        let mut cfg = cfg;
         let endpoint = bind_endpoint(&cfg).await?;
+        if !cfg.bind_addrs.is_empty() {
+            // The port it really listens on: a rebind binds the same one.
+            cfg.bind_port = endpoint.bound_sockets().first().map(|s| s.port());
+        }
 
         let registry = Arc::new(Mutex::new(DeviceRegistry::load().map_err(SyncError::Registry)?));
         let (event_tx, _) = broadcast::channel(64);
@@ -269,6 +274,7 @@ impl SyncEndpointBuilder {
             rebind_lock: tokio::sync::Mutex::new(()),
             rebinding: AtomicBool::new(false),
             closed: AtomicBool::new(false),
+            recovering: AtomicBool::new(false),
             registry,
             pairing: Arc::new(Mutex::new(PairingState::new())),
             extra_alpns: Arc::new(self.extra_alpns),
@@ -300,6 +306,17 @@ struct BindConfig {
 
 /// Bind an iroh endpoint as `cfg` says.
 async fn bind_endpoint(cfg: &BindConfig) -> Result<Endpoint, SyncError> {
+    // Test hook (feature `qa-tools`): a bind of any set that contains an
+    // address listed in `<data dir>/qa-fail-bind` fails.
+    #[cfg(feature = "qa-tools")]
+    if let Ok(list) = std::fs::read_to_string(forgetty_core::platform::data_dir().join("qa-fail-bind")) {
+        let listed = |ip: &std::net::IpAddr| {
+            list.lines().any(|l| l.trim().parse::<std::net::IpAddr>().is_ok_and(|h| h == *ip))
+        };
+        if cfg.bind_addrs.iter().any(listed) {
+            return Err(SyncError::Bind("qa-fail-bind: the bind is refused".into()));
+        }
+    }
         // Several addresses on port 0 must share one port: find a port that is
         // free on every one of them first (the endpoint binds it right after).
         let bind_port = {
@@ -443,6 +460,8 @@ pub struct SyncEndpoint {
     rebinding: AtomicBool,
     /// [`close`](Self::close) was called: no rebind any more.
     closed: AtomicBool,
+    /// A failed rebind left no endpoint and the background retry runs.
+    recovering: AtomicBool,
     registry: Arc<Mutex<DeviceRegistry>>,
     pairing: Arc<Mutex<PairingState>>,
     extra_alpns: Arc<HashMap<Vec<u8>, AlpnHandler>>,
@@ -499,7 +518,7 @@ impl SyncEndpoint {
     /// leaves everything as it was (`dropped: false`). A failure after the
     /// close binds the old set again, so the endpoint serves on (`dropped:
     /// true`).
-    pub async fn rebind(&self, addrs: Vec<std::net::IpAddr>) -> Result<(), RebindFailed> {
+    pub async fn rebind(self: &Arc<Self>, addrs: Vec<std::net::IpAddr>) -> Result<(), RebindFailed> {
         let fail = |dropped: bool, error: SyncError| RebindFailed { dropped, error };
         let _one = self.rebind_lock.lock().await;
         if self.closed.load(Ordering::SeqCst) {
@@ -509,11 +528,32 @@ impl SyncEndpoint {
         if old_cfg.bind_addrs.is_empty() {
             return Err(fail(false, SyncError::Bind("the endpoint binds every address".into())));
         }
-        let Some(port) = self.bound_sockets().first().map(|s| s.port()) else {
-            return Err(fail(false, SyncError::Bind("the endpoint has no socket".into())));
+        if self.ep().is_none() {
+            return Err(fail(
+                false,
+                SyncError::Bind("the endpoint is being bound again in the background".into()),
+            ));
+        }
+        let Some(port) = old_cfg.bind_port.filter(|p| *p != 0) else {
+            return Err(fail(false, SyncError::Bind("the endpoint has no port".into())));
         };
+        // The port must be free on every new address. A short race with another
+        // process is retried: nothing is closed yet.
         for ip in addrs.iter().filter(|ip| !old_cfg.bind_addrs.contains(ip)) {
-            if let Err(e) = std::net::UdpSocket::bind((*ip, port)) {
+            let mut last = None;
+            for delay in [0u64, 100, 300, 700] {
+                if delay > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                }
+                match std::net::UdpSocket::bind((*ip, port)) {
+                    Ok(_) => {
+                        last = None;
+                        break;
+                    }
+                    Err(e) => last = Some(e),
+                }
+            }
+            if let Some(e) = last {
                 let msg = format!("{ip}:{port}: {e}");
                 return Err(fail(
                     false,
@@ -527,13 +567,11 @@ impl SyncEndpoint {
         }
         let mut new_cfg = old_cfg.clone();
         new_cfg.bind_addrs = addrs;
-        new_cfg.bind_port = Some(port);
-        let mut old_cfg = old_cfg;
-        old_cfg.bind_port = Some(port);
 
         self.rebinding.store(true, Ordering::SeqCst);
         // Take the old endpoint out and close it. The sockets are released when
-        // the last clone is gone.
+        // the last clone is gone. (A close that times out leaves its tasks
+        // behind until the peers give up; that happens once per address.)
         let old = self.endpoint.write().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(old) = old {
             if tokio::time::timeout(std::time::Duration::from_secs(2), old.close()).await.is_err() {
@@ -554,27 +592,84 @@ impl SyncEndpoint {
             }
             Err(last)
         };
-        let result = match bind_with_retry(new_cfg.clone()).await {
+        match bind_with_retry(new_cfg.clone()).await {
             Ok(ep) => {
                 *self.endpoint.write().unwrap_or_else(|e| e.into_inner()) = Some(ep);
                 *self.cfg.lock().unwrap_or_else(|e| e.into_inner()) = new_cfg;
+                self.rebinding.store(false, Ordering::SeqCst);
                 Ok(())
             }
             Err(error) => {
                 // Serve on with what was there.
-                match bind_with_retry(old_cfg).await {
+                match bind_with_retry(old_cfg.clone()).await {
                     Ok(ep) => {
                         *self.endpoint.write().unwrap_or_else(|e| e.into_inner()) = Some(ep);
+                        self.rebinding.store(false, Ordering::SeqCst);
                     }
                     Err(e) => {
-                        tracing::error!("totem-sync: rebind: the old addresses cannot be bound again: {e}");
+                        // Nothing is bound. Keep trying in the background: the
+                        // full set first, then the old set, then each address
+                        // alone. `rebinding` stays set until one binds.
+                        tracing::error!(
+                            "totem-sync: rebind: no address can be bound ({e}); retrying in the background"
+                        );
+                        let mut candidates = vec![new_cfg.clone(), old_cfg.clone()];
+                        for ip in &new_cfg.bind_addrs {
+                            let mut one = new_cfg.clone();
+                            one.bind_addrs = vec![*ip];
+                            candidates.push(one);
+                        }
+                        self.recovering.store(true, Ordering::SeqCst);
+                        let me = Arc::clone(self);
+                        tokio::spawn(async move { me.recover(candidates).await });
                     }
                 }
                 Err(fail(true, error))
             }
-        };
-        self.rebinding.store(false, Ordering::SeqCst);
-        result
+        }
+    }
+
+    /// Bind again after a failed rebind left no endpoint: try the candidate
+    /// sets in order, over and over (1 s, 2 s, ... up to 10 s apart), until one
+    /// binds or the endpoint is closed.
+    async fn recover(self: Arc<Self>, candidates: Vec<BindConfig>) {
+        let mut wait = std::time::Duration::from_secs(1);
+        loop {
+            tokio::time::sleep(wait).await;
+            let _one = self.rebind_lock.lock().await;
+            if self.closed.load(Ordering::SeqCst) {
+                self.recovering.store(false, Ordering::SeqCst);
+                self.rebinding.store(false, Ordering::SeqCst);
+                return;
+            }
+            for cfg in &candidates {
+                if let Ok(ep) = bind_endpoint(cfg).await {
+                    info!(
+                        "totem-sync: endpoint bound again on {}",
+                        cfg.bind_addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ")
+                    );
+                    *self.endpoint.write().unwrap_or_else(|e| e.into_inner()) = Some(ep);
+                    *self.cfg.lock().unwrap_or_else(|e| e.into_inner()) = cfg.clone();
+                    self.recovering.store(false, Ordering::SeqCst);
+                    self.rebinding.store(false, Ordering::SeqCst);
+                    return;
+                }
+            }
+            wait = (wait * 2).min(std::time::Duration::from_secs(10));
+        }
+    }
+
+    /// Wait (3 s at most) for a rebind in progress to end. During the
+    /// background retry after a failed rebind there is nothing to wait for:
+    /// the caller gets what is bound now.
+    fn wait_for_rebind(&self) {
+        if self.recovering.load(Ordering::SeqCst) {
+            return;
+        }
+        let t0 = std::time::Instant::now();
+        while self.rebinding.load(Ordering::SeqCst) && t0.elapsed() < std::time::Duration::from_secs(3) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 
     /// Start configuring a new `SyncEndpoint`.
@@ -616,6 +711,7 @@ impl SyncEndpoint {
     /// addresses to bind: those, with the port it really listens on. Empty
     /// when it listens on every address.
     pub fn direct_addrs(&self) -> Vec<std::net::SocketAddr> {
+        self.wait_for_rebind();
         let addrs = self.bind_addrs();
         if addrs.is_empty() {
             return Vec::new();
@@ -777,10 +873,12 @@ impl SyncEndpoint {
                 None => {
                     // A rebind closes the old endpoint on purpose: wait for
                     // the new one and go on.
-                    while self.rebinding.load(Ordering::SeqCst) {
+                    while self.rebinding.load(Ordering::SeqCst) && !self.closed.load(Ordering::SeqCst) {
                         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     }
-                    if self.ep().is_some_and(|e| !e.is_closed()) {
+                    if !self.closed.load(Ordering::SeqCst)
+                        && self.ep().is_some_and(|e| !e.is_closed())
+                    {
                         continue;
                     }
                     info!("totem-sync: endpoint closed, accept loop exiting");
