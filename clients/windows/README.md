@@ -302,8 +302,15 @@ the real server answers all of them.
 - installs to `%LOCALAPPDATA%\Programs\Forgetty`, needs no admin rights and
   shows no UAC prompt, writes nothing to Program Files or HKLM;
 - adds a Start menu entry "Forgetty";
-- puts the install folder on the user PATH (`HKCU\Environment`). `forgetty.exe`
-  there is reserved for the future Windows CLI and starts the app for now;
+- installs two programs: `forgetty-win.exe` is the app, `forgetty.exe` is the
+  CLI and the per-user server (`forgetty server start|stop|status`, `forgetty ls`,
+  ...). Both use the one `ghostty-vt.dll` in the folder;
+- puts the install folder on the user PATH (`HKCU\Environment`);
+- starts the server at login: the value `Forgetty server` under
+  `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` runs
+  `forgetty.exe server start`. The server does not run elevated;
+- stops the server before an uninstall or an upgrade (`forgetty.exe server
+  stop`), so the files are not in use. The server's data and saved layout stay;
 - uninstall removes all of it and keeps `%APPDATA%\forgetty` (paired machines,
   device key).
 

@@ -65,6 +65,18 @@ impl PtyProcess {
         command: Option<&[String]>,
         login_shell: bool,
     ) -> Result<Self> {
+        Self::spawn_with_env(size, working_dir, command, login_shell, &[])
+    }
+
+    /// [`spawn`](Self::spawn) with extra environment variables for the child
+    /// (set after the defaults, so they win). The shell integration uses this.
+    pub fn spawn_with_env(
+        size: PtySize,
+        working_dir: Option<&Path>,
+        command: Option<&[String]>,
+        login_shell: bool,
+        extra_env: &[(String, String)],
+    ) -> Result<Self> {
         let pty_system = native_pty_system();
 
         let pair = pty_system
@@ -113,6 +125,9 @@ impl PtyProcess {
         // Version derived from workspace Cargo.toml at compile time.
         // If forgetty-pty ever gets its own version, this will diverge from the binary version.
         cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
 
         if let Some(dir) = working_dir {
             cmd.cwd(dir);
@@ -272,6 +287,28 @@ impl PtyProcess {
         Some((termios.c_lflag & libc::ISIG != 0, termios.c_cc[libc::VINTR]))
     }
 
+    /// The terminal's line settings now: `(ICANON, ECHO)`, one `tcgetattr` on
+    /// the master. `None` if the master fd is unavailable or the call fails.
+    /// A shell line editor (zle, readline) and a full screen program run with
+    /// both off. A password read has `ICANON` on and `ECHO` off.
+    #[cfg(unix)]
+    pub fn tty_flags(&self) -> Option<(bool, bool)> {
+        use std::os::unix::io::RawFd;
+        let fd: RawFd = self.master.as_raw_fd()?;
+        let mut termios = unsafe { std::mem::zeroed::<libc::termios>() };
+        // SAFETY: `fd` is the open master fd and `termios` is a valid out pointer.
+        if unsafe { libc::tcgetattr(fd, &mut termios) } != 0 {
+            return None;
+        }
+        Some((termios.c_lflag & libc::ICANON != 0, termios.c_lflag & libc::ECHO != 0))
+    }
+
+    /// Non-Unix stub: there is no termios.
+    #[cfg(not(unix))]
+    pub fn tty_flags(&self) -> Option<(bool, bool)> {
+        None
+    }
+
     /// Non-Unix stub: VINTR is a POSIX termios concept.
     #[cfg(not(unix))]
     pub fn intr_setting(&self) -> Option<(bool, u8)> {
@@ -343,7 +380,7 @@ impl Drop for PtyProcess {
 /// Fallback chain (Android — Bionic libc, no `/etc/passwd`):
 ///   1. `$SHELL` environment variable (if set and the path exists)
 ///   2. `/system/bin/sh` (Android system shell)
-fn detect_shell() -> String {
+pub fn detect_shell() -> String {
     #[cfg(target_os = "android")]
     {
         // Android: Bionic libc does not provide a usable /etc/passwd.

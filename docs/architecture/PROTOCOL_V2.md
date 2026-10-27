@@ -71,7 +71,8 @@ know: an unknown `client_kind` is `unknown` (one entry of a `list_clients` must 
 make the list unreadable), and an unknown event inside `Event` is skipped but its
 `seq` counts. Initial capability names:
 `resume`, `layout_events`, `status_events`, `capture`, `size_policy_latest`,
-`snapshot_catchup`, `input_flags`, `size_owner`, `split_before`, `workspace_id`.
+`snapshot_catchup`, `input_flags`, `size_owner`, `split_before`, `workspace_id`,
+`shell_state` (section 14).
 
 Two additive capabilities for the request methods (both sides list them, as for the others):
 
@@ -160,6 +161,7 @@ New methods:
 `StatusChanged { pane_id, status, message }` (P4, cap `status_events`),
 `Notification { pane_id, title, body }` (OSC 9/99/777, cap `status_events`),
 `PaneExited { pane_id, exit_code }` (the pane stays listed only if `remain_on_exit`),
+`ShellState { pane_id, rev, phase, ... }` (P7.1, cap `shell_state`, section 14),
 `ClientConnected { client_id, client_kind, client_name, connected_at }`,
 `ClientDisconnected { client_id }`.
 
@@ -541,3 +543,114 @@ known gap, section 12).
 - `set_label { target: "workspace"|"tab"|"pane", id, label }`: emits
   `LayoutChanged`. Layout values carry `label` on tabs and a `pane_labels` map.
   Clients show the label when set, else the title.
+
+## 14. Shell state (P7.1, capability `shell_state`)
+
+The server tells a client where each pane's shell is in its prompt cycle, which
+directory the shell reports, and the line settings of the pane's terminal. It
+is additive: a client without the capability gets no `ShellState` event, and a
+server without it sends none. Nothing else changes.
+
+Sources, all standard: the prompt marks of OSC 133 (`A` prompt start, `B`
+command line start, `C` command start, `D` command end with an optional exit
+code), the working directory of OSC 7, and the termios of the pane's pty
+(`ICANON`, `ECHO`). The server scans the pane output for the two OSC numbers in
+the byte scanner it has already (AD-019). It does not parse more of the stream.
+The termios is not read per byte or per chunk: with every mark, once after output
+with a chain of checks (60 ms, 250 ms, 1 s and 3 s after the last output, a flood
+restarts it, a quiet pane has no timer), and on demand when a client subscribes.
+
+```
+ShellState {
+  pane_id,
+  rev: u64,                // grows with every change of this pane
+  phase: "unknown" | "prompt" | "input" | "running" | "done",
+  exit_code?: i32,         // of the last command that ended with a valid code
+  cwd?: string,            // OSC 7 directory, display only
+  canonical?: bool,        // termios ICANON, absent when not read yet
+  echo?: bool,             // termios ECHO, absent when not read yet
+  mark?: "A"|"B"|"C"|"D",  // the OSC 133 mark that caused this event
+  at_ms: u64,              // unix ms of the change, 0 in the state sent at subscribe
+}
+```
+
+- It is always the whole state, so a client keeps the event with the highest
+  `rev` of each pane and drops older ones.
+- `phase` is `unknown` while no mark was seen: the shell has no integration. Then
+  `cwd` may still be set (a shell can send OSC 7 alone) and the tty mode is read.
+  After `A` it is `prompt`, after `B` `input`, after `C` `running`, after `D`
+  `done`. A repeated `A` (a redraw of the prompt) is not an event.
+- The `cwd` is a hint from the program in the pane. A host other than this
+  machine is dropped. The server never uses it to start a pane, to save the
+  layout or to split: that stays the real directory of the shell process.
+- `canonical` and `echo` together say who edits the line:
+
+  | `canonical` | `echo` | Meaning |
+  |---|---|---|
+  | true | true | the kernel edits and echoes the line (`cat`, `read`) |
+  | true | false | a password-style read |
+  | false | true | one key at a time, echoed |
+  | false | false | the program edits: a shell line editor (zle, readline, fish), or a full screen program |
+
+  A client tells a shell prompt (`phase` `input`) from a full screen program
+  (`phase` `running`) by the phase. Without shell integration the phase is
+  `unknown` and the tty mode alone cannot tell them apart.
+- A mark event reads the termios at that moment, so `canonical` and `echo` in it
+  do not lag. The mode of a command that changes it later is reported by a
+  separate event (no `mark`), within 60 ms of its output. A change that no output
+  follows is seen by the checks of the next 3 s. A mode that lasts for less than
+  that time between two checks is not reported.
+- After the answer to `subscribe_events` the server sends one `ShellState` for
+  every pane that has a state (a mark seen, or a tty mode read). Other
+  subscribers see these too: they drop them by `rev`.
+- States are rate limited, so a pane that writes marks in a loop cannot lag a
+  subscriber. A pane sends a burst of 8 events at once (a fast command makes A,
+  B, C and D within a millisecond), then one per 10 ms. States over that merge:
+  the newest goes out when the next one is due. A connection also keeps only the
+  newest pending `ShellState` of each pane (as it does for the layout), so a
+  slow client gets the last state, not every step. Therefore a client reads the
+  `phase` as where the shell is, not as an event: `running` can be skipped, and a
+  command that ended shows as `input` with the new `exit_code` (a `rev` that
+  grew). When a connection lags and resyncs, the server sends the current state
+  of every pane again: the same `rev` can arrive twice. A client drops an event
+  whose `rev` is not higher than the one it holds.
+- Marks are not tied to a byte offset of the pane stream yet. A client that needs
+  command boundaries in the scrollback (command cards, P7.4) reads the marks from
+  the byte stream with its own parser, which is where they are.
+
+### Shell integration scripts
+
+The scripts that make a shell write the marks and the directory are in the
+server binary and written to `<data dir>/shell-integration` at start (the same
+directory the server keeps its other files in). Config key `shell_integration`
+(default `true`) turns them off for panes created after the server reads it. The
+server never edits the user's rc files. For a pane that runs the user's own
+shell (the config `shell` or `$SHELL`; never an explicit `-e` command) it sets:
+
+| Shell | How the script loads |
+|---|---|
+| zsh | `ZDOTDIR` points to a directory whose `.zshenv` gives `ZDOTDIR` back to the user's own (`FORGETTY_USER_ZDOTDIR`), runs the user's `.zshenv`, and loads the script at the first prompt |
+| bash | `PROMPT_COMMAND` starts the script at the first prompt and removes itself. A startup file that replaces `PROMPT_COMMAND` instead of adding to it turns the integration off for that shell |
+| fish | the data directory is put in front of `XDG_DATA_DIRS`, fish loads the script from `vendor_conf.d`, and the script takes the directory out of the variable again. fish 4 writes the marks itself: the script then reports the directory only |
+
+`FORGETTY_SHELL_INTEGRATION_DIR` is set in the environment of those panes. A user
+can also source `forgetty.zsh` or `forgetty.bash` by hand in a shell the server did
+not start.
+
+Limits:
+
+- zsh: only the shell the server starts has the integration. `exec zsh` and a
+  zsh started from it run without it (the script is not in the environment any
+  more, on purpose, see below). A system file `/etc/zsh/zshenv` that sets
+  `ZDOTDIR` takes the trampoline away and turns the integration off.
+- bash and zsh: the script takes `FORGETTY_SHELL_INTEGRATION_DIR` out of the
+  environment of the shell once loaded, and bash also unexports
+  `PROMPT_COMMAND`, so a nested bash, `su`, `script`, vim `:sh` or tmux started
+  from the pane does not run hooks that exist only in the first shell. Those
+  child shells run without the integration.
+- A prompt theme that rebuilds `PS1` on every prompt (powerlevel10k, starship)
+  keeps the marks: the script adds `A` and `B` from a hook that runs after the
+  theme (last in `PROMPT_COMMAND` for bash, last in `precmd_functions` for zsh,
+  put back at the end before every command). The very first prompt can still
+  lack its marks when the theme runs in the same start line; the next prompt has
+  them.

@@ -5,13 +5,17 @@
   - Scope="perUser": installs to %LOCALAPPDATA%\Programs\Forgetty with no admin
     rights and no UAC prompt. Nothing is written to Program Files or HKLM.
   - Start menu entry "Forgetty".
-  - The install folder is added to the user PATH (HKCU). forgetty.exe there is
-    reserved for the Windows CLI; for now it starts the same app.
+  - The install folder is added to the user PATH (HKCU). forgetty.exe there is the
+    CLI and the per-user server (`forgetty server start|stop|status`, `forgetty ls`, ...).
+    forgetty-win.exe is the app.
+  - An HKCU Run value starts the server at login: `forgetty.exe server start`.
+  - Before an uninstall or an upgrade the server is stopped (`forgetty.exe server stop`), so
+    the exe is not in use. Its saved layout and data stay.
   - Unsigned for now: Windows SmartScreen shows "Unknown publisher" (README).
   - Uninstall leaves %APPDATA%\forgetty (paired machines, device key) alone.
 
   Build: wix build -arch x64 -d Version=0.0.1 -d Payload=<dir> Package.wxs -o forgetty-win-0.0.1-x64.msi
-  <dir> holds forgetty-win.exe and ghostty-vt.dll.
+  <dir> holds forgetty-win.exe, forgetty.exe and ghostty-vt.dll (one DLL for both programs).
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
   <Package Name="Forgetty" Manufacturer="Forgetty" Version="$(Version)"
@@ -27,6 +31,13 @@
       </Directory>
     </StandardDirectory>
     <StandardDirectory Id="ProgramMenuFolder" />
+
+    <CustomAction Id="StopServer" Directory="INSTALLFOLDER"
+                  ExeCommand="&quot;[INSTALLFOLDER]forgetty.exe&quot; server stop"
+                  Execute="immediate" Return="ignore" />
+    <InstallExecuteSequence>
+      <Custom Action="StopServer" Before="InstallValidate">REMOVE="ALL" OR WIX_UPGRADE_DETECTED</Custom>
+    </InstallExecuteSequence>
 
     <Feature Id="Main" Title="Forgetty" Level="1">
       <ComponentGroupRef Id="AppFiles" />
@@ -44,8 +55,12 @@
         <RegistryValue Root="HKCU" Key="Software\Forgetty\Installer" Name="VtDll" Type="integer" Value="1" KeyPath="yes" />
       </Component>
       <Component Id="CliName" Guid="7DD9C4D4-D9BF-446C-B2AB-5EBEAEEDA997">
-        <File Id="CliExeFile" Name="forgetty.exe" Source="$(Payload)\forgetty-win.exe" />
+        <File Id="CliExeFile" Name="forgetty.exe" Source="$(Payload)\forgetty.exe" />
         <RegistryValue Root="HKCU" Key="Software\Forgetty\Installer" Name="CliName" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+      <Component Id="ServerAutostart" Guid="*">
+        <RegistryValue Root="HKCU" Key="Software\Microsoft\Windows\CurrentVersion\Run" Name="Forgetty server"
+                       Type="string" Value="&quot;[INSTALLFOLDER]forgetty.exe&quot; server start" KeyPath="yes" />
       </Component>
       <Component Id="UserPath" Guid="*">
         <Environment Id="UserPathEntry" Name="PATH" Action="set" Part="last" Value="[INSTALLFOLDER]" System="no" Permanent="no" />

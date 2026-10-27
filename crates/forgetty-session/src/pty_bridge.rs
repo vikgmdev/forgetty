@@ -46,12 +46,14 @@ impl PtyBridge {
     /// - `command` — explicit command + args (or `None` to use config/detected shell).
     /// - `shell` — config shell override (or `None` for auto-detect).
     /// - `login_shell` — whether to invoke the command as a login shell.
+    /// - `integration` — shell integration scripts to load into the user's shell.
     pub fn spawn(
         size: PtySize,
         working_dir: Option<&Path>,
         command: Option<&[String]>,
         shell: Option<&str>,
         login_shell: bool,
+        integration: Option<&crate::shell_integration::ShellIntegration>,
     ) -> Result<Self, String> {
         // Resolve effective command and login_shell semantics,
         // mirroring the logic in forgetty-gtk/src/pty_bridge.rs.
@@ -67,9 +69,23 @@ impl PtyBridge {
                 (None, login_shell)
             };
 
-        let mut pty =
-            PtyProcess::spawn(size, working_dir, effective_command.as_deref(), effective_login)
-                .map_err(|e| format!("spawn PTY: {e}"))?;
+        // P7.1: the scripts load only into the user's own shell, never into an
+        // explicit command.
+        let extra_env = match (integration, command) {
+            (Some(si), None) => {
+                let program = shell.map(str::to_string).unwrap_or_else(forgetty_pty::detect_shell);
+                si.env_for(&program, &|k| std::env::var(k).ok())
+            }
+            _ => Vec::new(),
+        };
+        let mut pty = PtyProcess::spawn_with_env(
+            size,
+            working_dir,
+            effective_command.as_deref(),
+            effective_login,
+            &extra_env,
+        )
+        .map_err(|e| format!("spawn PTY: {e}"))?;
 
         let reader = pty
             .take_reader()

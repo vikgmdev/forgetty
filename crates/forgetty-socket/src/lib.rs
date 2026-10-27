@@ -25,4 +25,6 @@ pub mod types;
 
 pub use handlers::dispatch;
 pub use protocol::{Request, Response};
-pub use server::{add_shutdown_hook, graceful_exit, save_layout, SocketServer, SyncSlot};
+pub use server::{
+    add_shutdown_hook, graceful_exit, save_layout, save_layout_final, SocketServer, SyncSlot,
+};

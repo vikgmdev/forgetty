@@ -1251,8 +1251,9 @@ pub fn save_layout(sm: &SessionManager, session_id: uuid::Uuid) {
     save_layout_final(sm, session_id);
 }
 
-/// Write the layout even in the shutdown state. Only the shutdown path calls this.
-fn save_layout_final(sm: &SessionManager, session_id: uuid::Uuid) {
+/// Write the layout even in the shutdown state. Only a shutdown path calls this (the graceful
+/// exit, and the Windows logoff handler, which freezes the layout first and then saves).
+pub fn save_layout_final(sm: &SessionManager, session_id: uuid::Uuid) {
     let state = sm.snapshot_to_workspace_state();
     if let Err(e) = forgetty_workspace::save_session_for(session_id, &state) {
         warn!("failed to save session layout: {e}");
