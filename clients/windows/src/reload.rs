@@ -189,6 +189,8 @@ impl AppShell {
         if let Some(t) = config::reload_notice(&ch, &warnings, asked) {
             self.notice_active(t, cx);
         }
+        // An open Settings window shows what the file says now.
+        self.settings_config_changed();
         cx.notify();
     }
 

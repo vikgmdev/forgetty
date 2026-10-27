@@ -169,6 +169,11 @@ pub struct AppShell {
     /// The open context menu and the question that waits for an answer.
     pub menu: Option<crate::menus::OpenMenu>,
     pub confirm: Option<crate::menus::Confirm>,
+    /// The Settings window and the shortcuts window (F1), when open.
+    pub settings: Option<Box<crate::settings::SettingsWin>>,
+    pub shortcuts: Option<crate::settings::ShortcutsWin>,
+    /// System font families, listed once.
+    pub font_names: Option<Vec<String>>,
     /// The user said yes to the quit question (the window may close).
     pub quit_ok: bool,
     /// Panes whose bell or notification the user has not looked at yet.
@@ -292,6 +297,9 @@ impl AppShell {
             drag: None,
             menu: None,
             confirm: None,
+            settings: None,
+            shortcuts: None,
+            font_names: None,
             quit_ok: false,
             attention: HashSet::new(),
             tab_colors: HashMap::new(),
@@ -1146,6 +1154,14 @@ impl AppShell {
                 }
             }
             Action::Quit => self.request_quit(cx),
+            Action::OpenSettings => self.open_settings(None, cx),
+            Action::ShowShortcuts => {
+                if self.shortcuts.is_some() {
+                    self.close_shortcuts(window, cx);
+                } else {
+                    self.open_shortcuts(cx);
+                }
+            }
             Action::PasteCtrlV => self.on_active_view(window, cx, |v, cx| {
                 v.key_paste(cx);
             }),
@@ -1158,7 +1174,7 @@ impl AppShell {
 
     /// Run `f` on the active pane's view and give it the keyboard focus (a command from the
     /// palette or a chord acts on the pane the user is working in).
-    fn on_active_view(
+    pub(crate) fn on_active_view(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1270,6 +1286,14 @@ impl AppShell {
         }
         if self.confirm.is_some() {
             self.confirm_key(ks, cx);
+            return true;
+        }
+        if self.shortcuts.is_some() {
+            self.shortcuts_key(ks, window, cx);
+            return true;
+        }
+        if self.settings.is_some() {
+            self.settings_key(ks, window, cx);
             return true;
         }
         if self.menu.is_some() {

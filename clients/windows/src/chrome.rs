@@ -349,6 +349,21 @@ impl AppShell {
                 .on_mouse_down(MouseButton::Left, cx.listener(|s, _e, _w, cx| s.open_pair(cx)))
                 .child("+ Pair machine..."),
         );
+        sb = sb.child(
+            div()
+                .id("sidebar-settings")
+                .mx(px(8.0))
+                .px(px(8.0))
+                .h(px(26.0))
+                .flex()
+                .items_center()
+                .rounded(px(5.0))
+                .cursor_pointer()
+                .text_color(hsla(th.accent))
+                .hover(move |s| s.bg(hover))
+                .on_mouse_down(MouseButton::Left, cx.listener(|s, _e, _w, cx| s.open_settings(None, cx)))
+                .child("Settings..."),
+        );
 
         // Workspaces.
         sb = sb.child(header("WORKSPACES"));
@@ -1047,6 +1062,7 @@ impl Render for AppShell {
         if self.take_sync_dirty() {
             self.sync(window, cx);
         }
+        let settings_view = self.settings_prepare();
         let th = self.theme;
         let entity = cx.entity();
         let mut body = div().flex().flex_row().flex_1().min_h_0().w_full();
@@ -1075,6 +1091,8 @@ impl Render for AppShell {
             .children(self.render_pair(cx))
             .children(self.render_clip_prompt(cx))
             .children(self.render_menu(cx))
+            .children(settings_view.map(|v| self.render_settings(v, cx)))
+            .children(self.render_shortcuts(cx))
             .children(self.render_confirm(cx))
             .child(
                 canvas(

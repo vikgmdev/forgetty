@@ -11,6 +11,7 @@ mod chrome;
 mod clipboard;
 mod config;
 mod reload;
+mod settings;
 mod console;
 mod element;
 mod encoder;
