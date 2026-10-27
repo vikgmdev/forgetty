@@ -90,8 +90,15 @@ fn printable(chunk: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Extra environment for the servers this test starts (one test at a time).
+static EXTRA_ENV: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+
 fn forgetty(state: &Path, timer: &str, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_forgetty"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_forgetty"));
+    for (k, v) in EXTRA_ENV.lock().unwrap().iter() {
+        command.env(k, v);
+    }
+    command
         .arg("--state-dir")
         .arg(state)
         .args(args)
@@ -99,7 +106,7 @@ fn forgetty(state: &Path, timer: &str, args: &[&str]) -> Output {
         .env("FORGETTY_PORT", "0")
         .env("FORGETTY_TIMER_RES", timer)
         .env("FORGETTY_TRACE_LATENCY", "1")
-        .env("RUST_LOG", "latency=info")
+        .env("RUST_LOG", "latency=info,forgetty_pty=info,forgetty_server=info")
         .output()
         .expect("run forgetty")
 }
@@ -331,14 +338,18 @@ async fn through_server_as(
         rtt.push(t0.elapsed());
     }
 
-    // Let the prompt arrive and settle: quiet for 1.5 s.
+    // Let the prompt arrive and settle: quiet for 1.5 s. A cursor position request (what
+    // `PSEUDOCONSOLE_INHERIT_CURSOR` makes the host send) is answered like the app's terminal does.
     let give_up = Instant::now() + Duration::from_secs(25);
     while Instant::now() < give_up {
-        if !matches!(
-            tokio::time::timeout(Duration::from_millis(1500), stream.next()).await,
-            Ok(Some(_))
-        ) {
-            break;
+        match tokio::time::timeout(Duration::from_millis(1500), stream.next()).await {
+            Ok(Some(PaneItem::Data { bytes, .. })) => {
+                if bytes.windows(4).any(|w| w == b"\x1b[6n") {
+                    h.send_input_flagged(pane, b"\x1b[1;1R", true).await.expect("cpr reply");
+                }
+            }
+            Ok(Some(_)) => {}
+            _ => break,
         }
     }
 
@@ -363,6 +374,10 @@ async fn through_server_as(
     h.close().await;
     show_stages(state.path(), &format!("{client}, server {timer}"));
     show_chunks(state.path(), &format!("{client}, server {timer}"));
+    let log = std::fs::read_to_string(state.path().join("data/forgetty/server.log")).unwrap_or_default();
+    for l in log.lines().filter(|l| l.contains("power throttling")).take(3) {
+        println!("PROBE power {client}: {}", l.trim());
+    }
     let stop = forgetty(state.path(), timer, &["server", "stop"]);
     assert!(stop.status.success(), "{}", text(&stop));
     (
@@ -429,6 +444,44 @@ async fn key_to_echo_on_panes_like_the_ui_pane() {
                 shell[0],
                 echo.p50() - base.p50()
             );
+        }
+    }
+}
+
+/// The gap PowerShell shows under the server, one change at a time: the server opted out of
+/// power throttling, the shells too, then ConPTY flags like portable-pty's. Each step is a new
+/// server and a new pane, next to the same shell in process.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn powershell_echo_by_power_throttling_and_conpty_flags() {
+    #[cfg(windows)]
+    {
+        let mut shells = vec![vec!["powershell.exe", "-NoLogo"]];
+        if Command::new("pwsh.exe").arg("-Version").output().is_ok() {
+            shells.push(vec!["pwsh.exe", "-NoLogo"]);
+        }
+        let steps: [(&str, &[(&str, &str)]); 5] = [
+            ("baseline", &[]),
+            ("1 server opted out", &[("FORGETTY_POWER_THROTTLING", "server")]),
+            ("2 server and shells opted out", &[("FORGETTY_POWER_THROTTLING", "shells")]),
+            ("3a conpty win32 input mode", &[("FORGETTY_CONPTY_FLAGS", "0x4")]),
+            ("3b conpty inherit cursor and win32 input", &[("FORGETTY_CONPTY_FLAGS", "0x5")]),
+        ];
+        for shell in &shells {
+            let base = in_process_with(&format!("in process, {}", shell[0]), shell);
+            base.show();
+            for (name, env) in steps {
+                *EXTRA_ENV.lock().unwrap() =
+                    env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+                let (echo, _) = through_server_as("off", name, Pane::Fresh, shell).await;
+                echo.show();
+                println!(
+                    "PROBE step {} {}: delta to in process {:+.2} ms (p50)",
+                    shell[0],
+                    name,
+                    echo.p50() - base.p50()
+                );
+            }
+            EXTRA_ENV.lock().unwrap().clear();
         }
     }
 }

@@ -40,6 +40,17 @@ impl Drop for Guard {
 
 /// Ask for a 1 ms timer for this process. Keep the guard for the life of the server.
 pub fn begin() -> Guard {
+    // Execution speed throttling (EcoQoS) for the server, on request (`FORGETTY_POWER_THROTTLING`
+    // = `server` or `shells`, see `forgetty_pty::PowerThrottling`).
+    if forgetty_pty::power_throttling_mode() != forgetty_pty::PowerThrottling::Off {
+        // SAFETY: the pseudo handle of this process.
+        match forgetty_pty::opt_out_of_power_throttling(unsafe { GetCurrentProcess() }) {
+            Ok((control, state)) => info!(
+                "server power throttling: ControlMask {control:#x}, StateMask {state:#x} read back"
+            ),
+            Err(e) => warn!("server power throttling opt-out failed: {e}"),
+        }
+    }
     let mode = std::env::var("FORGETTY_TIMER_RES").unwrap_or_default();
     if !matches!(mode.as_str(), "period" | "full" | "on") {
         info!("timer resolution: left at the system default (FORGETTY_TIMER_RES={mode:?})");

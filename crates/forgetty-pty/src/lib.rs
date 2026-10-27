@@ -16,7 +16,10 @@ pub use process::{PtyProcess, PtySize};
 #[cfg(not(windows))]
 pub use process::detect_shell;
 #[cfg(windows)]
-pub use process::{default_shell_argv, join_server_job, set_default_shell, set_default_shell_from_config};
+pub use process::{
+    default_shell_argv, join_server_job, opt_out_of_power_throttling, power_throttling_mode,
+    set_default_shell, set_default_shell_from_config, PowerThrottling,
+};
 
 /// The shell a new pane starts, as a program name. Windows has no `$SHELL`: it is the first
 /// element of [`default_shell_argv`] (the configured shell, then `pwsh.exe`, `powershell.exe`,
