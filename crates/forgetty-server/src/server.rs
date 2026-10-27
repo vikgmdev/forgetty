@@ -1295,7 +1295,7 @@ mod tests {
     }
 
     #[test]
-    fn an_address_that_keeps_failing_is_given_up_and_the_others_are_not_held_back() {
+    fn an_address_that_keeps_failing_is_given_up_and_the_others_keep_their_retries() {
         let (a, b): (std::net::IpAddr, std::net::IpAddr) =
             ("10.0.0.1".parse().unwrap(), "10.0.0.2".parse().unwrap());
         let t0 = std::time::Instant::now();
