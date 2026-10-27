@@ -43,6 +43,12 @@ pub struct LsPhase {
     ps_model: Vec<f64>,
     ps_probe: Option<(usize, usize, char, Instant)>,
     ps_log_mark: usize,
+    /// The server log while a server leg runs, the `key echo:` lines before the key in flight, and the
+    /// per key overhead (app key to model minus the server's input to first pty read), ms.
+    ps_log_path: Option<PathBuf>,
+    ps_pre: usize,
+    ps_over: Vec<f64>,
+    ps_server_read: Vec<f64>,
     ps_back_switched: bool,
     ps_back_restored: bool,
     ps_segs: Vec<[f64; 4]>,
@@ -235,6 +241,40 @@ fn server_stages(state: &std::path::Path) -> serde_json::Value {
     stages_json(&text.lines().filter(|l| l.contains("key echo:")).map(str::to_string).collect::<Vec<_>>())
 }
 
+/// The server's log file under its state folder.
+fn server_log_path(state: &std::path::Path) -> Option<PathBuf> {
+    fn find(dir: &std::path::Path, depth: u32) -> Option<PathBuf> {
+        for e in std::fs::read_dir(dir).ok()?.filter_map(Result::ok) {
+            let p = e.path();
+            if p.is_file() && p.file_name().is_some_and(|n| n == "server.log") {
+                return Some(p);
+            }
+            if depth > 0 && p.is_dir() {
+                if let Some(f) = find(&p, depth - 1) {
+                    return Some(f);
+                }
+            }
+        }
+        None
+    }
+    find(state, 5)
+}
+
+/// The `key echo:` lines of a server log file.
+fn key_echo_lines_at(path: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(path).unwrap_or_default().lines().filter(|l| l.contains("key echo:")).map(str::to_string).collect()
+}
+
+/// Input to first pty read of a `key echo:` line, in ms: the write gap plus the read gap.
+fn input_to_first_read_ms(line: &str) -> Option<f64> {
+    let nums: Vec<i64> = line.split(|c: char| !(c.is_ascii_digit() || c == '-')).filter_map(|t| t.parse().ok()).collect();
+    if nums.len() == 5 {
+        Some((nums[0] + nums[1]) as f64 / 1000.0)
+    } else {
+        None
+    }
+}
+
 /// The `key echo:` lines of the server log so far (to mark where a phase starts).
 fn key_echo_lines(state: &std::path::Path) -> Vec<String> {
     fn find(dir: &std::path::Path, depth: u32) -> Option<std::path::PathBuf> {
@@ -301,7 +341,11 @@ impl ShellSmoke {
                 self.ls.ps_model.clear();
                 self.ls.ps_probe = None;
                 self.ls.ps_segs.clear();
+                self.ls.ps_over.clear();
+                self.ls.ps_server_read.clear();
+                self.ls.ps_log_path = None;
                 if server {
+                    self.ls.ps_log_path = self.ls.cli.as_ref().and_then(|c| c.state_dir.as_deref()).and_then(server_log_path);
                     self.ls.ps_log_mark = self.ls.cli.as_ref().and_then(|c| c.state_dir.as_deref()).map(|d| key_echo_lines(d).len()).unwrap_or(0);
                     forgetty_remote::trace::enable(true);
                 }
@@ -378,7 +422,15 @@ impl ShellSmoke {
                     return;
                 }
                 self.ls.ps_probe = None;
-                self.ls.ps_model.push(model_ms(view.read(cx)));
+                let key_ms = model_ms(view.read(cx));
+                self.ls.ps_model.push(key_ms);
+                if let Some(path) = self.ls.ps_log_path.clone() {
+                    // This key's own `key echo:` line: the first one the server logged since the key was sent.
+                    if let Some(read) = key_echo_lines_at(&path).get(self.ls.ps_pre).and_then(|l| input_to_first_read_ms(l)) {
+                        self.ls.ps_over.push(key_ms - read);
+                        self.ls.ps_server_read.push(read);
+                    }
+                }
                 if server {
                     if let Some(model) = view.read(cx).probe_watch.as_ref().and_then(|w| w.model_at) {
                         if let Some(seg) = split_key(t0, model) {
@@ -413,20 +465,18 @@ impl ShellSmoke {
                         let mine = lines.get(self.ls.ps_log_mark..).unwrap_or(&[]);
                         record(&format!("powershell_server_{name}_stage_us"), stages_json(mine));
                     }
-                    // The gate: what Forgetty adds per key. The shell's own time is the server's
-                    // "input to first pty read with the key"; the rest of the app's key to model is
-                    // the server's dispatch and frame, the link and the app.
-                    let stages = self.ls.cli.as_ref().and_then(|c| c.state_dir.as_deref()).map(|d| {
-                        let lines = key_echo_lines(d);
-                        stages_json(lines.get(self.ls.ps_log_mark..).unwrap_or(&[]))
-                    });
-                    let shell_ms = stages.as_ref().and_then(|s| s.get("to_first_pty_read")).and_then(|v| v.as_f64()).map(|us| us / 1000.0);
-                    let Some(shell_ms) = shell_ms else { fail(&format!("powershell {name}: the server logged no key echo stages (FORGETTY_TRACE_LATENCY)")) };
+                    // The gate: what Forgetty adds per key. For each key, the app's key to model minus
+                    // the server's "input to first pty read with the key" of that same key (its own
+                    // `key echo:` line, in order). The shell's time is in both, so it drops out.
+                    let mut over = self.ls.ps_over.clone();
+                    over.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let med = over.get(over.len() / 2).copied().unwrap_or(f64::NAN);
                     record(
                         &format!("powershell_{name}_forgetty_overhead_ms"),
-                        json!({"app_key_to_model_p50": p50, "server_input_to_first_pty_read_p50": shell_ms, "overhead": p50 - shell_ms}),
+                        json!({"keys_paired": over.len(), "p50": med, "p95": over.get(over.len() * 95 / 100), "max": over.last(), "min": over.first(),
+                               "app_key_to_model_p50": p50, "server_input_to_first_pty_read_p50": p50_of(&self.ls.ps_server_read)}),
                     );
-                    check(&format!("local_server_powershell_{name}_overhead_within_2ms"), p50 - shell_ms <= 2.0);
+                    check(&format!("local_server_powershell_{name}_overhead_within_2ms"), over.len() >= 80 && med <= 2.0);
                 }
                 if leg == "in_process_b" {
                     // Report only: the raw pair, in-process, server, in-process.
@@ -448,6 +498,9 @@ impl ShellSmoke {
 
     fn ps_send(&mut self, view: &gpui::Entity<crate::view::TerminalView>, cx: &mut Context<AppShell>, row: usize, col: usize) {
         let ch = (b'a' + (self.ls.ps_model.len() % 26) as u8) as char;
+        if let Some(path) = &self.ls.ps_log_path {
+            self.ls.ps_pre = key_echo_lines_at(path).len();
+        }
         forgetty_remote::trace::clear();
         let t0 = Instant::now();
         self.ls.ps_probe = Some((row, col, ch, t0));
