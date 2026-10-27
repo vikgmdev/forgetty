@@ -22,6 +22,7 @@ public static class MediumLaunch {
   [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
   [DllImport("advapi32.dll", SetLastError = true)] static extern bool OpenProcessToken(IntPtr h, uint access, out IntPtr tok);
   [DllImport("advapi32.dll", SetLastError = true)] static extern bool CreateRestrictedToken(IntPtr t, uint flags, uint nd, IntPtr d, uint np, IntPtr p, uint nr, IntPtr r, out IntPtr nt);
+  [DllImport("advapi32.dll", SetLastError = true)] static extern bool DuplicateTokenEx(IntPtr t, uint access, IntPtr attrs, int level, int type, out IntPtr nt);
   [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern bool ConvertStringSidToSidW(string s, out IntPtr sid);
   [DllImport("advapi32.dll")] static extern uint GetLengthSid(IntPtr sid);
   [DllImport("advapi32.dll", SetLastError = true)] static extern bool SetTokenInformation(IntPtr t, int cls, ref SID_AND_ATTRIBUTES info, uint len);
@@ -32,17 +33,20 @@ public static class MediumLaunch {
   [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
 
   static void Check(bool ok, string what) {
-    if (!ok) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), what);
+    if (!ok) { int e = Marshal.GetLastWin32Error(); throw new System.ComponentModel.Win32Exception(e, what + " failed, error " + e); }
   }
 
   // Run `cmdLine` with a restricted token at medium integrity and wait up to `ms` for it to end.
   // Returns its exit code.
   public static int Run(string cmdLine, uint ms) {
-    IntPtr tok, rtok, sid;
+    IntPtr tok, rtok0, rtok, sid;
     // TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_QUERY
     Check(OpenProcessToken(GetCurrentProcess(), 0x1 | 0x2 | 0x8, out tok), "OpenProcessToken");
     // DISABLE_MAX_PRIVILEGE
-    Check(CreateRestrictedToken(tok, 0x1, 0, IntPtr.Zero, 0, IntPtr.Zero, 0, IntPtr.Zero, out rtok), "CreateRestrictedToken");
+    Check(CreateRestrictedToken(tok, 0x1, 0, IntPtr.Zero, 0, IntPtr.Zero, 0, IntPtr.Zero, out rtok0), "CreateRestrictedToken");
+    // A copy with full access to itself, so its integrity level can be lowered. MAXIMUM_ALLOWED,
+    // SecurityImpersonation, TokenPrimary.
+    Check(DuplicateTokenEx(rtok0, 0x02000000, IntPtr.Zero, 2, 1, out rtok), "DuplicateTokenEx");
     Check(ConvertStringSidToSidW("S-1-16-8192", out sid), "ConvertStringSidToSid");
     var label = new SID_AND_ATTRIBUTES { Sid = sid, Attributes = 0x20 }; // SE_GROUP_INTEGRITY
     // TokenIntegrityLevel = 25
@@ -55,7 +59,7 @@ public static class MediumLaunch {
     uint wait = WaitForSingleObject(pi.hProcess, ms);
     uint code = 0xFFFFFFFF;
     if (wait == 0) GetExitCodeProcess(pi.hProcess, out code);
-    CloseHandle(pi.hProcess); CloseHandle(rtok); CloseHandle(tok);
+    CloseHandle(pi.hProcess); CloseHandle(rtok); CloseHandle(rtok0); CloseHandle(tok);
     return unchecked((int)code);
   }
 }
