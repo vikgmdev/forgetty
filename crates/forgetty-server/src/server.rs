@@ -194,6 +194,23 @@ impl RetryBook {
     }
 }
 
+/// The addresses of `appeared` that a bind error names (`ip:port`, or
+/// `[ip]:port` for IPv6). Empty when the error names none of them: then the
+/// failure cannot be attributed.
+fn named_in_error(error: &str, appeared: &[std::net::IpAddr]) -> Vec<std::net::IpAddr> {
+    appeared
+        .iter()
+        .copied()
+        .filter(|ip| {
+            let needle = if ip.is_ipv4() { format!("{ip}:") } else { format!("[{ip}]:") };
+            error.match_indices(&needle).any(|(at, _)| {
+                // Not the tail of a longer address (110.0.0.2 for 10.0.0.2).
+                !error[..at].ends_with(|c: char| c.is_ascii_alphanumeric() || c == '.' || c == ':')
+            })
+        })
+        .collect()
+}
+
 /// Watch the `--bind` addresses that were missing at start. When one appears
 /// (several at once count as one), bind the endpoint again with the full set:
 /// iroh cannot add a socket to a running endpoint, so the connections drop once
@@ -276,7 +293,12 @@ fn watch_missing_addresses(ep: Arc<SyncEndpoint>, all: Vec<std::net::IpAddr>) {
                             bound.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ")
                         )
                     };
-                    for ip in &appeared {
+                    // A strike for the address the error names; when it names
+                    // none of them, for all that were added.
+                    let text = f.error.to_string();
+                    let named = named_in_error(&text, &appeared);
+                    let blamed = if named.is_empty() { appeared.clone() } else { named };
+                    for ip in &blamed {
                         let (n, wait) = book.failure(*ip, std::time::Instant::now());
                         if n >= RetryBook::MAX_FAILED {
                             warn!(
@@ -1257,6 +1279,21 @@ fn restore_subtree(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_bind_error_is_attributed_to_the_address_it_names() {
+        let ips: Vec<std::net::IpAddr> =
+            ["10.0.0.2", "10.0.0.3", "fd00::2"].iter().map(|s| s.parse().unwrap()).collect();
+        let named = |e: &str| named_in_error(e, &ips);
+        assert_eq!(named("Failed to bind iroh endpoint: 10.0.0.3:47297: Address in use"), vec![ips[1]]);
+        assert_eq!(named("x: [fd00::2]:47297: nope"), vec![ips[2]]);
+        // Not the tail of a longer address.
+        assert!(named("110.0.0.2:5: nope").is_empty());
+        // Names none: cannot be attributed.
+        assert!(named("Failed to bind sockets: Address already in use (os error 98)").is_empty());
+        // Names an address that was bound before: not one of the new ones.
+        assert!(named("10.0.0.1:47297: nope").is_empty());
+    }
+
     #[test]
     fn an_address_that_keeps_failing_is_given_up_and_the_others_are_not_held_back() {
         let (a, b): (std::net::IpAddr, std::net::IpAddr) =

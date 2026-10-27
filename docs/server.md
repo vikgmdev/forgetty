@@ -412,7 +412,8 @@ is not. If the new bind fails after the close, the server binds the old set
 again, logs an error and tries B again later (after 10 s, then 20 s; each try
 drops the connections, so after 3 failed tries the server gives B up until it
 restarts and logs a WARN once; the wait is per address, so another address that
-appears is not held back). If even the old set cannot be bound,
+appears is not held back; when the bind error names an address, only that one
+gets the strike, otherwise all that were added in that try). If even the old set cannot be bound,
 the server never stays without an endpoint: it keeps trying in the background
 (1 s, 2 s, up to 10 s apart): the full set, then the old set, then each address
 alone, and logs which addresses are bound. If B goes away later, nothing
