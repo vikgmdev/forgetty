@@ -38,7 +38,7 @@ use windows::Win32::System::Console::{
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
     SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::Threading::{
@@ -325,16 +325,94 @@ fn candidates(name: &str, exts: &[String]) -> Vec<String> {
     v
 }
 
+/// Why `program` may not be started, or `Ok` when its form is allowed. The server starts what a
+/// client sends, so only two forms are let through:
+///
+/// - a bare name (`pwsh`, `ssh.exe`), which is searched in PATH, and
+/// - an absolute path on a local drive (`C:\tools\x.exe`, `C:/tools/x.exe`).
+///
+/// Refused: a path with a folder part that is relative to the current folder (`.\x.exe`,
+/// `sub\x.exe`, `..\x.exe`), a path rooted without a drive (`\x.exe`), a drive-relative path
+/// (`C:x.exe`), a network path (`\\server\share\x.exe`), the device and extended forms
+/// (`\\?\C:\x.exe`, `\\.\pipe\x`, `\??\C:\x.exe`) and any colon besides the one after the
+/// drive letter (an NTFS stream, `x.exe:stream`).
+pub(crate) fn check_program_form(program: &str) -> std::result::Result<(), String> {
+    if program.contains('\0') {
+        return Err("the command holds a NUL character".into());
+    }
+    let b = program.as_bytes();
+    let sep = |c: u8| c == b'\\' || c == b'/';
+    if b.len() >= 2 && sep(b[0]) && sep(b[1]) {
+        return Err(format!(
+            "{program}: network, device and extended paths (\\\\server\\..., \\\\?\\..., \\\\.\\...) are not allowed"
+        ));
+    }
+    if program.starts_with("\\??\\") || program.starts_with("/??/") {
+        return Err(format!("{program}: NT object paths (\\??\\...) are not allowed"));
+    }
+    if !program.contains(['\\', '/', ':']) {
+        return Ok(());
+    }
+    // From here on the form has a folder part or a colon: only `X:\...` and `X:/...` pass.
+    if b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && sep(b[2]) {
+        if program[2..].contains(':') {
+            return Err(format!("{program}: a colon in the path (an NTFS stream?) is not allowed"));
+        }
+        return Ok(());
+    }
+    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        return Err(format!("{program}: a path relative to the current folder of a drive (C:x) is not allowed"));
+    }
+    if sep(b[0]) {
+        return Err(format!("{program}: a path without a drive letter is not allowed"));
+    }
+    if program.contains(':') {
+        return Err(format!("{program}: a colon in the command is not allowed"));
+    }
+    Err(format!(
+        "{program}: a relative path is not allowed; use a bare program name (searched in PATH) or a full path with a drive letter"
+    ))
+}
+
+/// Characters that `cmd.exe` reads as syntax in the arguments of a batch file, whatever the
+/// quoting: `& | < > ^ % ! " ( )` and line breaks.
+const CMD_META: &[char] = &['&', '|', '<', '>', '^', '%', '!', '"', '(', ')', '\r', '\n'];
+
+/// A `.bat` or `.cmd` file runs inside `cmd.exe`, which parses its arguments again, with its own
+/// rules that the argument quoting of `CreateProcess` does not cover. So such a target is only
+/// started when no argument holds a character `cmd.exe` treats as syntax.
+pub(crate) fn check_batch_args(program: &Path, args: &[String]) -> std::result::Result<(), String> {
+    let name = program
+        .file_name()
+        .map(|n| n.to_string_lossy().trim_end_matches(['.', ' ']).to_ascii_lowercase())
+        .unwrap_or_default();
+    if !(name.ends_with(".bat") || name.ends_with(".cmd")) {
+        return Ok(());
+    }
+    for a in args {
+        if let Some(c) = a.chars().find(|c| CMD_META.contains(c)) {
+            let shown = if c == '\r' || c == '\n' { "a line break".to_string() } else { format!("`{c}`") };
+            return Err(format!(
+                "{}: a batch file is started by cmd.exe, which reads {shown} in an argument as syntax; \
+                 remove it or start a program (an .exe) instead",
+                program.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The file `program` names. A bare name is searched in the PATH folders only (never in the
-/// current folder, where `CreateProcess` would look first), each with the PATHEXT endings. A name
-/// with a folder part is used as it is.
+/// current folder, where `CreateProcess` would look first), each with the PATHEXT endings. Other
+/// forms must pass [`check_program_form`].
 fn resolve_program(program: &str) -> Result<PathBuf> {
     let program = program.trim();
     if program.is_empty() {
         return Err(ForgettyError::Pty("the command is empty".into()));
     }
+    check_program_form(program).map_err(ForgettyError::Pty)?;
     let exts = pathext();
-    if program.contains(['\\', '/', ':']) {
+    if program.contains(['\\', '/']) {
         let p = Path::new(program);
         if p.is_file() {
             return Ok(p.to_path_buf());
@@ -472,7 +550,10 @@ fn new_kill_on_close_job() -> io::Result<OwnedHandle> {
             .map_err(|e| io::Error::from_raw_os_error(win32_code(&e)))?;
         let job = OwnedHandle(job);
         let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // BREAKAWAY_OK: a program may start a child outside the job on purpose (a launcher that
+        // wants its app to outlive the pane). Without the flag `CREATE_BREAKAWAY_FROM_JOB` fails.
+        info.BasicLimitInformation.LimitFlags =
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
         SetInformationJobObject(
             job.raw(),
             JobObjectExtendedLimitInformation,
@@ -586,6 +667,7 @@ impl PtyProcess {
             _ => default_shell_argv(),
         };
         let program = resolve_program(&argv[0])?;
+        check_batch_args(&program, &argv[1..]).map_err(ForgettyError::Pty)?;
         let mut cmdline = command_line(&program, &argv[1..])?;
         let env = environment_block(&[
             ("TERM", "xterm-256color".to_string()),
@@ -816,6 +898,12 @@ impl PtyProcess {
     /// End the shell and everything it started.
     pub fn kill(&mut self) -> Result<()> {
         self.kill_tree();
+        // `TerminateProcess` returns before the process has finished ending, and the exit code
+        // reads as still active for a moment. Wait (bounded) so `is_alive` is false on return.
+        // SAFETY: valid process handle.
+        unsafe {
+            WaitForSingleObject(self.process.raw(), 2000);
+        }
         Ok(())
     }
 
@@ -1150,6 +1238,63 @@ mod tests {
         };
         assert_eq!(line(&[]), r#""C:\Program Files\x.exe""#);
         assert_eq!(line(&["a b", "", r"c\d", r#"e"f"#, r"g h\"]), r#""C:\Program Files\x.exe" "a b" "" c\d e\"f "g h\\""#);
+    }
+
+    #[test]
+    fn program_forms_that_are_not_a_bare_name_or_a_drive_path_are_refused() {
+        for ok in ["pwsh", "ssh.exe", r"C:\tools\x.exe", "C:/tools/x.exe", r"d:\a b\c.exe"] {
+            assert!(check_program_form(ok).is_ok(), "{ok}");
+        }
+        let refused = [
+            r".\x.exe",
+            r"..\x.exe",
+            r"sub\x.exe",
+            "sub/x.exe",
+            "./x.exe",
+            r"\x.exe",
+            "/x.exe",
+            r"\\server\share\x.exe",
+            "//server/share/x.exe",
+            r"\\?\C:\x.exe",
+            r"\\.\pipe\x",
+            r"\??\C:\x.exe",
+            "C:x.exe",
+            "C:",
+            r"C:\x.exe:stream",
+            "x.exe:stream",
+            "a\0b.exe",
+        ];
+        for bad in refused {
+            assert!(check_program_form(bad).is_err(), "{bad:?} should be refused");
+            assert!(resolve_program(bad).is_err(), "{bad:?} should not resolve");
+        }
+        let err = check_program_form(r"\\server\share\x.exe").unwrap_err();
+        assert!(err.contains("network"), "{err}");
+    }
+
+    #[test]
+    fn a_spawn_with_a_refused_form_is_an_error() {
+        for bad in [r".\cmd.exe", r"\\?\C:\Windows\System32\cmd.exe", "C:cmd.exe"] {
+            let cmd = vec![bad.to_string()];
+            assert!(PtyProcess::spawn(size(), None, Some(&cmd), false).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_batch_file_with_cmd_syntax_in_an_argument_is_refused() {
+        let bat = Path::new(r"C:\x\run.bat");
+        let cmdf = Path::new(r"C:\x\RUN.CMD");
+        for c in ["&", "|", "<", ">", "^", "%", "!", "\"", "(", ")", "\n", "\r"] {
+            let args = vec![format!("a{c}b")];
+            let err = check_batch_args(bat, &args).unwrap_err();
+            assert!(err.contains("cmd.exe"), "{err}");
+            assert!(check_batch_args(cmdf, &args).is_err(), "{c:?}");
+        }
+        // Plain arguments pass, and an .exe takes anything.
+        assert!(check_batch_args(bat, &["one".into(), "two words".into(), "-x=1".into()]).is_ok());
+        assert!(check_batch_args(Path::new(r"C:\x\run.exe"), &["a&b".into()]).is_ok());
+        // A trailing dot or space does not hide the extension.
+        assert!(check_batch_args(Path::new(r"C:\x\run.bat."), &["a&b".into()]).is_err());
     }
 
     #[test]

@@ -3,17 +3,21 @@
 //! The same JSON-RPC lines and binary frames as the Unix socket, over a byte-mode duplex pipe.
 //! What keeps other users and other machines out:
 //!
-//! - The pipe is created with a protected DACL that holds one entry, the current user (the
-//!   kernel refuses everyone else at `CreateFile`), and with `PIPE_REJECT_REMOTE_CLIENTS`.
+//! - The pipe is created with the current user as owner and a protected DACL that holds one
+//!   entry, the current user (the kernel refuses everyone else at `CreateFile`), and with
+//!   `PIPE_REJECT_REMOTE_CLIENTS`. A client reads the owner of the pipe it opened and requires
+//!   it to be its own user.
 //! - The first instance is created with `FILE_FLAG_FIRST_PIPE_INSTANCE`, so a process that
 //!   already owns the name (a squatter) makes the bind fail instead of sharing the name. The
-//!   name also holds a secret that only this user can read (`forgetty-server` `sockpath`), so
-//!   another user cannot know it in advance.
-//! - A server that runs elevated labels the pipe with high integrity (`pipe_sddl`), so a normal
-//!   process of the same user cannot open it.
+//!   name also holds a secret that is new at every server start (`forgetty-server` `sockpath`):
+//!   it keeps another user from preparing a squat before the start. It is not a secret from
+//!   other users once the server runs (any user can list pipe names), so it is kept out of logs
+//!   and error messages here (see [`redact_pipe_name`]).
+//! - The server itself does not run elevated (it refuses to start), so there is no pipe that a
+//!   normal process of the same user must be kept away from.
 //! - After the first read from a client the server asks Windows for the client's user SID and
 //!   integrity level and drops the connection if the user is not the expected one or the level
-//!   is lower than the server's. This is the counterpart of
+//!   is lower than the server's. A connection counts as a client only after this check. This is the counterpart of
 //!   `SO_PEERCRED` on Unix, and it holds if someone widens the DACL by mistake.
 //!
 //! The client side (a blocking stream with timeouts and a check of the server's SID) is in
@@ -37,6 +41,18 @@ use windows::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
 use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+
+/// `name` with the secret cut out, for logs and errors (`\\.\pipe\forgetty-<SID>-<secret>`
+/// becomes `\\.\pipe\forgetty-<SID>-<redacted>`). The secret is the last dash-separated part
+/// when it is at least 32 hex digits.
+pub fn redact_pipe_name(name: &str) -> String {
+    match name.rsplit_once('-') {
+        Some((head, tail)) if tail.len() >= 32 && tail.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            format!("{head}-<redacted>")
+        }
+        _ => name.to_string(),
+    }
+}
 
 /// Pipe buffer size in each direction. Output frames are large; a bigger buffer means fewer
 /// round trips to the kernel.
@@ -105,8 +121,7 @@ impl Listener {
         let level = acl::current_integrity_rid()?;
         // The pipe is always restricted to this user. `allowed` only changes who the server
         // accepts after the connect (a test uses it to play a foreign user or a lower level).
-        // At high integrity the pipe also carries the label that keeps lower levels out.
-        let sd = Descriptor::from_sddl(&acl::pipe_sddl(&me, level >= acl::INTEGRITY_HIGH))?;
+        let sd = Descriptor::from_sddl(&acl::pipe_sddl(&me))?;
         let mut l = Self {
             name: path.to_string_lossy().into_owned(),
             sd,
@@ -118,7 +133,7 @@ impl Listener {
             if e.kind() == io::ErrorKind::PermissionDenied {
                 io::Error::new(
                     io::ErrorKind::AddrInUse,
-                    format!("the pipe {} is taken by another process", l.name),
+                    format!("the pipe {} is taken by another process", redact_pipe_name(&l.name)),
                 )
             } else {
                 e
@@ -126,7 +141,9 @@ impl Listener {
         })?);
         info!(
             "pipe {} created for {} (integrity {:#x} or higher)",
-            l.name, l.expected, l.min_integrity
+            redact_pipe_name(&l.name),
+            l.expected,
+            l.min_integrity
         );
         Ok(l)
     }
@@ -187,6 +204,11 @@ pub struct Connection {
 }
 
 impl Connection {
+    /// Has the client's user and integrity level been checked? True after the first bytes.
+    pub fn is_verified(&self) -> bool {
+        self.verified
+    }
+
     fn verify(&self) -> io::Result<()> {
         let handle = HANDLE(self.inner.as_raw_handle());
         let (sid, level) = acl::pipe_client_identity(handle).map_err(|e| {

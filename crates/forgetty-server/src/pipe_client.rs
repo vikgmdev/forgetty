@@ -2,12 +2,16 @@
 //! shaped like `std::os::unix::net::UnixStream` (`connect`, `try_clone`, `set_read_timeout`,
 //! `set_write_timeout`, `Read`, `Write`), so the CLI code is the same on both systems.
 //!
-//! Before the first byte is sent the client checks who runs the server on the other end of the
-//! pipe: the user SID of the server process must be the current user, and its integrity level
-//! must not be lower than the client's own. A process of another user that got the pipe name
-//! first cannot receive what the CLI sends, and neither can a normal process that made the
-//! `-elevated` pipe before the elevated server did (the counterpart of the server's check of its
-//! clients). The connection also asks Windows for the identification
+//! Before the first byte is sent the client checks who made and who runs the server on the other
+//! end of the pipe:
+//!
+//! - the owner of the pipe object (`GetSecurityInfo` on the handle) must be the current user;
+//! - the user SID of the server process (`GetNamedPipeServerProcessId`) must be the current user;
+//! - the integrity level of the server process must not be lower than the client's own, so a
+//!   normal process cannot stand in for a server when the client runs elevated.
+//!
+//! A process of another user that got the pipe name first cannot receive what the CLI sends (the
+//! counterpart of the server's check of its clients). The connection also asks Windows for the identification
 //! impersonation level only, so the server can read the client's identity but not act as it.
 
 use std::io::{self, Read, Write};
@@ -141,14 +145,19 @@ impl PipeStream {
         Ok(stream)
     }
 
-    /// The server on the other end must be a process of this user, at an integrity level at
-    /// least as high as ours.
+    /// The pipe must be owned by this user and the server must be a process of this user, at an
+    /// integrity level at least as high as ours.
     fn check_server(&self, own_level: Option<u32>) -> io::Result<()> {
+        let refuse = |why: String| io::Error::new(io::ErrorKind::PermissionDenied, why);
+        let me = acl::current_user_sid()?;
+        let owner = acl::object_owner_sid(self.inner.handle)
+            .map_err(|e| refuse(format!("cannot read who owns the pipe: {e}")))?;
+        if !acl::same_account(&me, &owner) {
+            return Err(refuse(format!("the pipe is owned by another user ({owner})")));
+        }
         let mut pid = 0u32;
         // SAFETY: valid pipe handle and out pointer.
         unsafe { GetNamedPipeServerProcessId(self.inner.handle, &mut pid) }.map_err(os_err)?;
-        let refuse = |why: String| io::Error::new(io::ErrorKind::PermissionDenied, why);
-        let me = acl::current_user_sid()?;
         let my_level = match own_level {
             Some(l) => l,
             None => acl::current_integrity_rid()?,
@@ -272,7 +281,9 @@ impl Write for &PipeStream {
 }
 
 /// A server may not run at a lower integrity level than its client: a normal process could
-/// otherwise stand in for an elevated server (it can read the pipe secret and make the pipe).
+/// otherwise stand in for the server of an elevated client (it can read the pipe secret and make
+/// the pipe). The server itself never runs elevated, so an elevated client has no server here:
+/// it uses its own in-process terminal.
 fn levels_match(client: u32, server: u32) -> Result<(), String> {
     if server >= client {
         Ok(())

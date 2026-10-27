@@ -90,6 +90,18 @@ pub fn finish_code(result: Result<i32>) -> i32 {
 // Socket client
 // ---------------------------------------------------------------------------
 
+/// A socket path as it goes into a message. A pipe name holds a secret, which stays out.
+fn shown_path(path: &std::path::Path) -> String {
+    #[cfg(windows)]
+    {
+        forgetty_server::sockpath::redact_pipe_name(&path.to_string_lossy())
+    }
+    #[cfg(unix)]
+    {
+        path.display().to_string()
+    }
+}
+
 struct Client {
     reader: BufReader<Stream>,
     writer: Stream,
@@ -113,10 +125,16 @@ impl Client {
     fn raw() -> Result<Self> {
         #[cfg(unix)]
         let path = default_socket_path();
-        // The pipe name holds a secret kept in a file; without it there is no way to connect.
+        // The pipe name holds a secret kept in a file. No file means no server has started here.
         #[cfg(windows)]
         let path = forgetty_server::sockpath::default_socket_path().map_err(|e| {
-            CliError::Failed(format!("cannot find the server pipe: {e}"))
+            if e.kind() == std::io::ErrorKind::NotFound {
+                CliError::Unreachable(
+                    "server not reachable. Start it with `forgetty server start`.".to_string(),
+                )
+            } else {
+                CliError::Failed(format!("cannot find the server pipe: {e}"))
+            }
         })?;
         // Never talk to a socket we cannot trust: a squatter could answer with
         // a fake server or read what we send. (On Windows `PipeStream::connect` checks the
@@ -127,7 +145,7 @@ impl Client {
             SocketCheck::Missing => {
                 return Err(CliError::Unreachable(format!(
                     "server not reachable at {}. Start it with `forgetty server start`.",
-                    path.display()
+                    shown_path(&path)
                 )))
             }
             SocketCheck::Unsafe(why) => {
@@ -142,7 +160,7 @@ impl Client {
             }
             CliError::Unreachable(format!(
                 "server not reachable at {} ({e}). Start it with `forgetty server start`.",
-                path.display()
+                shown_path(&path)
             ))
         })?;
         stream.set_read_timeout(Some(Duration::from_secs(15))).ok();

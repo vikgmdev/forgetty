@@ -1,5 +1,3 @@
-#![cfg(unix)]
-
 //! P-010: `subscribe_layout` forwards pane lifecycle events, and AD-019 pane
 //! metadata events (title, cwd, status).
 
@@ -10,24 +8,20 @@ use forgetty_pty::PtySize;
 use forgetty_session::SessionManager;
 use forgetty_socket::SocketServer;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
+
+mod common;
+use common::{connect, endpoint, Endpoint, Stream};
 
 async fn subscribe(
     sm: Arc<SessionManager>,
-) -> (tempfile::TempDir, BufReader<UnixStream>, tokio::task::JoinHandle<()>) {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("s.sock");
+) -> (Endpoint, BufReader<Stream>, tokio::task::JoinHandle<()>) {
+    let ep = endpoint();
+    let path = ep.path.clone();
     let server = SocketServer::new_with_path(path.clone()).unwrap();
     let task = tokio::spawn(async move {
         let _ = server.run_with_streaming(sm, None).await;
     });
-    for _ in 0..100 {
-        if path.exists() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    let mut stream = UnixStream::connect(&path).await.unwrap();
+    let mut stream = connect(&path).await;
     stream
         .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"subscribe_layout\",\"id\":1}\n")
         .await
@@ -36,11 +30,21 @@ async fn subscribe(
     let mut ack = String::new();
     reader.read_line(&mut ack).await.unwrap();
     assert!(ack.contains("\"ok\":true"), "ack was {ack}");
-    (dir, reader, task)
+    (ep, reader, task)
 }
 
 /// Read notifications until one has `method == want` (and `pane_id` if given).
-async fn expect(reader: &mut BufReader<UnixStream>, want: &str, pane: &str) -> serde_json::Value {
+async fn expect(reader: &mut BufReader<Stream>, want: &str, pane: &str) -> serde_json::Value {
+    expect_where(reader, want, pane, |_| true).await
+}
+
+/// Like [`expect`], and the notification must also pass `accept`.
+async fn expect_where(
+    reader: &mut BufReader<Stream>,
+    want: &str,
+    pane: &str,
+    accept: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     let mut seen = Vec::new();
     while tokio::time::Instant::now() < deadline {
@@ -48,7 +52,7 @@ async fn expect(reader: &mut BufReader<UnixStream>, want: &str, pane: &str) -> s
         match tokio::time::timeout(Duration::from_millis(500), reader.read_line(&mut line)).await {
             Ok(Ok(n)) if n > 0 => {
                 let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
-                if v["method"] == want && v["params"]["pane_id"] == pane {
+                if v["method"] == want && v["params"]["pane_id"] == pane && accept(&v) {
                     return v;
                 }
                 seen.push(v["method"].as_str().unwrap_or("?").to_string());
@@ -67,7 +71,10 @@ fn size() -> PtySize {
 async fn pane_exited_and_pane_closed_are_forwarded() {
     let sm = Arc::new(SessionManager::new());
     let (_dir, mut reader, task) = subscribe(Arc::clone(&sm)).await;
+    #[cfg(unix)]
     let cmd = Some(vec!["sh".into(), "-c".into(), "exit 4".into()]);
+    #[cfg(windows)]
+    let cmd = Some(vec!["cmd.exe".into(), "/c".into(), "exit 4".into()]);
     let (pane, _) = sm.create_tab(0, None, size(), cmd).unwrap();
     let pane = pane.to_string();
     let exited = expect(&mut reader, "pane_exited", &pane).await;
@@ -76,6 +83,30 @@ async fn pane_exited_and_pane_closed_are_forwarded() {
     task.abort();
 }
 
+/// ConPTY itself reports a title set by `OSC 2`, so this one runs on Windows too. The shell may
+/// set its own title first, so the test waits for the one it asked for.
+#[cfg(windows)]
+#[tokio::test]
+async fn title_events_are_forwarded() {
+    let sm = Arc::new(SessionManager::new());
+    let (_ep, mut reader, task) = subscribe(Arc::clone(&sm)).await;
+    let script = "[Console]::Out.Write([char]27 + ']2;evt-title' + [char]7); Start-Sleep 30";
+    let cmd = Some(vec![
+        "powershell.exe".into(),
+        "-NoProfile".into(),
+        "-Command".into(),
+        script.into(),
+    ]);
+    let (pane, _) = sm.create_tab(0, None, size(), cmd).unwrap();
+    let id = pane.to_string();
+    expect_where(&mut reader, "title_changed", &id, |v| v["params"]["title"] == "evt-title").await;
+    let _ = sm.close_pane(pane);
+    task.abort();
+}
+
+/// The cwd and status events come from `OSC 7` and `OSC 7501`. They are checked on Unix only:
+/// ConPTY does not promise to pass those sequences through.
+#[cfg(unix)]
 #[tokio::test]
 async fn title_cwd_and_status_events_are_forwarded() {
     let sm = Arc::new(SessionManager::new());

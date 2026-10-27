@@ -1,5 +1,3 @@
-#![cfg(unix)]
-
 //! Integration test for the V2-007 fix cycle 2 `is_attached` RPC.
 //!
 //! Covers the launcher's restore-path correctness question: "is any GUI
@@ -14,19 +12,17 @@ use forgetty_pty::PtySize;
 use forgetty_session::SessionManager;
 use forgetty_socket::SocketServer;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 
-fn rand_suffix() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().subsec_nanos();
-    format!("{nanos:x}")
-}
+mod common;
+use common::{connect, endpoint};
+
+const LIST_TABS: &[u8] = b"{\"jsonrpc\":\"2.0\",\"method\":\"list_tabs\",\"id\":1}\n";
 
 /// Send one `is_attached` request over an ephemeral connection, parse the
 /// response, and return the reported `attached` bool.
 async fn probe_is_attached(sock_path: &std::path::Path) -> bool {
-    let stream = UnixStream::connect(sock_path).await.expect("connect probe");
-    let (reader, mut writer) = stream.into_split();
+    let stream = connect(sock_path).await;
+    let (reader, mut writer) = tokio::io::split(stream);
     let mut lines = BufReader::new(reader).lines();
 
     writer
@@ -46,14 +42,8 @@ async fn probe_is_attached(sock_path: &std::path::Path) -> bool {
 
 #[tokio::test]
 async fn is_attached_false_when_probe_is_sole_client() {
-    let dir = std::env::temp_dir().join(format!(
-        "forgetty-isattached-{}-{}",
-        std::process::id(),
-        rand_suffix()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let sock_path = dir.join("test.sock");
-    let _ = std::fs::remove_file(&sock_path);
+    let ep = endpoint();
+    let sock_path = ep.path.clone();
 
     let sm = Arc::new(SessionManager::new());
     let server = SocketServer::new_with_path(sock_path.clone()).expect("server");
@@ -67,20 +57,12 @@ async fn is_attached_false_when_probe_is_sole_client() {
     let attached = probe_is_attached(&sock_path).await;
     assert!(!attached, "expected attached=false with single probe client");
 
-    let _ = std::fs::remove_file(&sock_path);
-    let _ = std::fs::remove_dir(&dir);
 }
 
 #[tokio::test]
 async fn is_attached_true_when_another_client_holds_socket() {
-    let dir = std::env::temp_dir().join(format!(
-        "forgetty-isattached-{}-{}",
-        std::process::id(),
-        rand_suffix()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let sock_path = dir.join("test.sock");
-    let _ = std::fs::remove_file(&sock_path);
+    let ep = endpoint();
+    let sock_path = ep.path.clone();
 
     let sm = Arc::new(SessionManager::new());
     let server = SocketServer::new_with_path(sock_path.clone()).expect("server");
@@ -90,8 +72,15 @@ async fn is_attached_true_when_another_client_holds_socket() {
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // First, hold a long-lived connection open (simulates the attached GUI).
-    let held = UnixStream::connect(&sock_path).await.expect("connect held");
+    // First, hold a long-lived connection open (simulates the attached GUI). The client makes one
+    // request first: on Windows the server counts a connection only after it has verified the
+    // client, which it does when it reads the first request.
+    let mut held = connect(&sock_path).await;
+    held.write_all(LIST_TABS).await.expect("send list_tabs");
+    let mut first = BufReader::new(&mut held).lines();
+    let line = first.next_line().await.expect("read response").expect("response line present");
+    assert!(line.contains("\"result\""), "{line}");
+    drop(first);
     // Give the server accept loop a chance to register the held connection
     // with its ConnGuard before we probe from a second connection.
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -108,8 +97,6 @@ async fn is_attached_true_when_another_client_holds_socket() {
     let attached_after = probe_is_attached(&sock_path).await;
     assert!(!attached_after, "expected attached=false after held connection dropped");
 
-    let _ = std::fs::remove_file(&sock_path);
-    let _ = std::fs::remove_dir(&dir);
 }
 
 /// V2-007 fix cycle 3 regression guard.
@@ -123,14 +110,8 @@ async fn is_attached_true_when_another_client_holds_socket() {
 /// (V2-007 AC-18).
 #[tokio::test]
 async fn is_attached_flips_false_after_idle_subscribe_output_client_disconnects() {
-    let dir = std::env::temp_dir().join(format!(
-        "forgetty-isattached-eof-{}-{}",
-        std::process::id(),
-        rand_suffix()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let sock_path = dir.join("test.sock");
-    let _ = std::fs::remove_file(&sock_path);
+    let ep = endpoint();
+    let sock_path = ep.path.clone();
 
     let sm = Arc::new(SessionManager::new());
     // Spawn a real PTY so subscribe_output validation passes. The pane is
@@ -149,8 +130,8 @@ async fn is_attached_flips_false_after_idle_subscribe_output_client_disconnects(
     // Connect, send subscribe_output, consume the ack, then drop the
     // connection while the pane is still idle.
     {
-        let stream = UnixStream::connect(&sock_path).await.expect("connect sub");
-        let (reader, mut writer) = stream.into_split();
+        let stream = connect(&sock_path).await;
+        let (reader, mut writer) = tokio::io::split(stream);
         let mut lines = BufReader::new(reader).lines();
         let req = format!(
             "{{\"jsonrpc\":\"2.0\",\"method\":\"subscribe_output\",\"params\":{{\"pane_id\":\"{pane_id}\"}},\"id\":1}}\n"
@@ -178,6 +159,4 @@ async fn is_attached_flips_false_after_idle_subscribe_output_client_disconnects(
 
     sm.close_pane(pane_id).ok();
     server_handle.abort();
-    let _ = std::fs::remove_file(&sock_path);
-    let _ = std::fs::remove_dir(&dir);
 }

@@ -257,6 +257,28 @@ fn acquire_instance_lock(server_id: uuid::Uuid) -> anyhow::Result<std::fs::File>
     }
 }
 
+/// The server refuses to run elevated (see [`run`]). `FORGETTY_TEST_ALLOW_ELEVATED=1` lifts it for
+/// tests: the CI runner is an administrator. A user who sets it on a real server gives up the
+/// protection, so it is not documented for users.
+#[cfg(windows)]
+fn refuse_elevated() -> anyhow::Result<()> {
+    if !forgetty_core::fsutil::acl::is_elevated() {
+        return Ok(());
+    }
+    if std::env::var_os("FORGETTY_TEST_ALLOW_ELEVATED").is_some_and(|v| v == "1") {
+        warn!("running elevated because FORGETTY_TEST_ALLOW_ELEVATED=1 (tests only)");
+        return Ok(());
+    }
+    Err(ConfigInvalid(
+        "the server does not run elevated: any normal program of yours could use it to run \
+         commands as administrator, around the UAC prompt. Start it from a normal (not \
+         elevated) shell. An elevated Forgetty window uses its own terminal and its panes end \
+         when the window closes."
+            .to_string(),
+    )
+    .into())
+}
+
 fn init_tracing() {
     let builder = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().unwrap()))
@@ -275,9 +297,17 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
     init_tracing();
     forgetty_server::crash::install();
 
+    // Windows: an elevated server would give any normal process of the same user a way to run
+    // commands elevated, around the UAC prompt. So it does not start. An elevated app uses its
+    // own in-process terminal instead. (A test in CI runs elevated and sets the variable.)
+    #[cfg(windows)]
+    refuse_elevated()?;
+
     // First-run state is created under the state-dir lock: the server id, the
     // instance lock and the identity key. Two servers that start at once
     // serialize here, the second finds the instance lock taken and exits.
+    #[cfg(windows)]
+    let mut pipe_path: Option<PathBuf> = None;
     let (session_id, secret_key, _instance_lock) = {
         let state_lock = lock_state_dir()?;
         // Stable server id: survives restarts, so the session file is found again.
@@ -287,6 +317,14 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
         };
         let instance_lock = acquire_instance_lock(session_id)?;
         let secret_key = load_or_generate()?;
+        // Windows: a new pipe secret at every start, under the lock and before the bind.
+        #[cfg(windows)]
+        if args.socket_path.is_none() {
+            pipe_path = Some(
+                sockpath::new_server_socket_path()
+                    .map_err(|e| anyhow::anyhow!("cannot make the pipe secret: {e}"))?,
+            );
+        }
         // Credential files written by an older build keep their old mode until here.
         forgetty_core::fsutil::fix_file_mode(&forgetty_sync::registry::registry_path())?;
         (session_id, secret_key, instance_lock)
@@ -668,8 +706,7 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
     #[cfg(windows)]
     let socket_path = match args.socket_path {
         Some(p) => p,
-        None => sockpath::default_socket_path()
-            .map_err(|e| anyhow::anyhow!("cannot set up the control pipe name: {e}"))?,
+        None => pipe_path.take().expect("the pipe name is made under the lock"),
     };
 
     // Bind the socket server (with session_id so shutdown_save can write the correct file).
@@ -679,7 +716,27 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
     // layout on disk always matches what the first client sees.
     save_session_from_layout(&session_manager, session_id);
 
+    // Windows: a logoff or shutdown kills the shells with the server. Save the layout and freeze
+    // it first, so the next start restores every pane.
+    #[cfg(windows)]
+    {
+        let sm = Arc::clone(&session_manager);
+        if let Err(e) = forgetty_server::endsession::spawn(move || {
+            save_session_from_layout(&sm, session_id);
+            sm.begin_shutdown();
+        }) {
+            warn!("cannot listen for logoff and shutdown: {e}");
+        }
+    }
+
+    #[cfg(unix)]
     info!("forgetty-server started, socket at {}", socket_path.display());
+    // The pipe name holds a secret, which stays out of the log.
+    #[cfg(windows)]
+    info!(
+        "forgetty-server started, pipe {}",
+        forgetty_server::sockpath::redact_pipe_name(&socket_path.to_string_lossy())
+    );
 
     // Per-pane drain tasks are spawned by the SessionManager automatically
     // when each pane is created (via spawn_drain_task inside create_pane /

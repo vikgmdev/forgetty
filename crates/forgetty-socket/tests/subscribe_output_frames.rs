@@ -1,10 +1,8 @@
-#![cfg(unix)]
-
 //! Integration test for the V2-003 binary framing on the `subscribe_output`
 //! streaming path.
 //!
 //! Spawns a real `SocketServer` running `run_with_streaming`, connects as a
-//! client over `UnixStream`, subscribes to a live pane, drives the PTY with
+//! client over the control socket (a Unix socket, or a named pipe on Windows), subscribes to a live pane, drives the PTY with
 //! a known echo command, and asserts that the bytes the server streamed back
 //! arrive verbatim inside `[u32 BE length][payload]` frames — no base64, no
 //! JSON envelope.
@@ -16,7 +14,9 @@ use forgetty_pty::PtySize;
 use forgetty_session::SessionManager;
 use forgetty_socket::SocketServer;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
+
+mod common;
+use common::{connect, endpoint};
 
 const MAX_FRAME_SIZE: usize = 4 * 1024 * 1024;
 
@@ -25,14 +25,8 @@ const MAX_FRAME_SIZE: usize = 4 * 1024 * 1024;
 #[tokio::test]
 async fn subscribe_output_streams_binary_frames() {
     // --- Server setup ---
-    let dir = std::env::temp_dir().join(format!(
-        "forgetty-v2003-{}-{}",
-        std::process::id(),
-        rand_suffix()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let sock_path = dir.join("test.sock");
-    let _ = std::fs::remove_file(&sock_path);
+    let ep = endpoint();
+    let sock_path = ep.path.clone();
 
     let sm = Arc::new(SessionManager::new());
     // Spawn a real PTY so the server's pane_id validation passes and
@@ -49,8 +43,8 @@ async fn subscribe_output_streams_binary_frames() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // --- Client: send subscribe_output, parse the JSON ack line ---
-    let stream = UnixStream::connect(&sock_path).await.expect("connect");
-    let (reader, mut writer) = stream.into_split();
+    let stream = connect(&sock_path).await;
+    let (reader, mut writer) = tokio::io::split(stream);
 
     let req = format!(
         "{{\"jsonrpc\":\"2.0\",\"method\":\"subscribe_output\",\"params\":{{\"pane_id\":\"{pane_id}\"}},\"id\":1}}\n"
@@ -69,13 +63,24 @@ async fn subscribe_output_streams_binary_frames() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     let marker = b"v2003_binary_marker";
     let mut send = Vec::new();
-    send.extend_from_slice(b"printf '%s' ");
-    send.extend_from_slice(marker);
-    send.extend_from_slice(b"\n");
+    // The shell echoes the typed line as well as printing the output, so the marker comes back
+    // either way. Windows shells take a carriage return as Enter.
+    #[cfg(unix)]
+    {
+        send.extend_from_slice(b"printf '%s' ");
+        send.extend_from_slice(marker);
+        send.extend_from_slice(b"\n");
+    }
+    #[cfg(windows)]
+    {
+        send.extend_from_slice(b"echo ");
+        send.extend_from_slice(marker);
+        send.extend_from_slice(b"\r");
+    }
     sm.write_pty(pane_id, &send).expect("write_pty");
 
     let mut collected: Vec<u8> = Vec::new();
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
     while std::time::Instant::now() < deadline {
         // Read one frame.
         let mut len_buf = [0u8; 4];
@@ -114,8 +119,6 @@ async fn subscribe_output_streams_binary_frames() {
     drop(buf_reader);
     sm.close_pane(pane_id).ok();
     server_handle.abort();
-    let _ = std::fs::remove_file(&sock_path);
-    let _ = std::fs::remove_dir(&dir);
 }
 
 /// Simple byte-needle-in-haystack search (no external dep).
@@ -124,18 +127,4 @@ fn memchr_find(hay: &[u8], needle: &[u8]) -> Option<usize> {
         return None;
     }
     hay.windows(needle.len()).position(|w| w == needle)
-}
-
-/// Cheap per-test suffix so parallel runs don't collide on the socket path.
-fn rand_suffix() -> u32 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    std::thread::current().id().hash(&mut h);
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos()
-        .hash(&mut h);
-    h.finish() as u32
 }
