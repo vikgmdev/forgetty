@@ -507,3 +507,34 @@ async fn a_pane_writing_marks_in_a_loop_gets_merged_states() {
     assert_eq!(now.phase, Phase::Input);
     sm.close_pane(pane).unwrap();
 }
+
+/// With `extquote` off, the user's last PROMPT_COMMAND command must not get a
+/// literal `$'\n'` glued to it, and the last hook must still run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bash_with_extquote_off_keeps_the_users_prompt_command_intact() {
+    let _one = SERIAL.lock().await;
+    let rc = "shopt -u extquote\n__mine() { :; }\n\
+              PROMPT_COMMAND=\"${PROMPT_COMMAND:+$PROMPT_COMMAND;}__mine\"\n";
+    let Some((sm, _env, pane)) = integrated_pane("bash", Some((".bash_profile", rc))) else {
+        println!("SKIPPED: bash is not installed");
+        return;
+    };
+    let rx = sm.subscribe_meta();
+    let out = Output::start(&sm, pane);
+    let mut seen = Seen { rx, pane, states: Vec::new() };
+    seen.wait("the line editor tty mode", 0, |s| s.tty.is_some_and(|t| !t.canonical && !t.echo))
+        .await;
+    // Second prompt: the hooks are in PROMPT_COMMAND now.
+    sm.write_pty(pane, b"true\n").unwrap();
+    sm.write_pty(pane, b"echo PC-$((1+1))-[${PROMPT_COMMAND//$'\\n'/NL}]\n").unwrap();
+    out.wait_for("PC-2-[").await;
+    let text = out.text();
+    let line = text.lines().find(|l| l.contains("PC-2-[") && !l.contains("$((1+1))")).unwrap_or("");
+    assert!(
+        line.contains("__mine") && line.contains("NL__forgetty_last"),
+        "PROMPT_COMMAND is not what it should be: {line:?}\n{text}"
+    );
+    assert!(!text.contains("$'\\n'__forgetty_last"), "a literal $'\\n' in PROMPT_COMMAND:\n{text}");
+    assert!(!text.contains("command not found"), "output:\n{text}");
+    sm.close_pane(pane).unwrap();
+}

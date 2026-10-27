@@ -60,8 +60,11 @@ if [[ $(declare -p PROMPT_COMMAND 2>/dev/null) == "declare -a"* ]]; then
   PROMPT_COMMAND=(__forgetty_first "${PROMPT_COMMAND[@]}" __forgetty_last)
 else
   # A newline before the last hook keeps a trailing comment or & in the user's
-  # command from swallowing it.
-  PROMPT_COMMAND="__forgetty_first;${PROMPT_COMMAND:+$PROMPT_COMMAND$'\n'}__forgetty_last"
+  # command from swallowing it. It is built in a variable: $'\n' inside the
+  # double quotes of a ${...:+...} is literal when `extquote` is off.
+  __forgetty_nl=$'\n'
+  PROMPT_COMMAND="__forgetty_first;${PROMPT_COMMAND:+$PROMPT_COMMAND$__forgetty_nl}__forgetty_last"
+  unset __forgetty_nl
 fi
 
 # Programs started from this shell (a nested bash, su, script, vim :sh, tmux)
