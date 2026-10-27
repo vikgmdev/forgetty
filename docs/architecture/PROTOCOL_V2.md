@@ -144,6 +144,13 @@ the subscription first and puts the answer in the queue after it, so an event
 with a `seq` above the `seq` of the answer can come ahead of the answer. A
 client takes events as they arrive and does not wait for the answer.
 
+A connection keeps one pending `LayoutChanged` and one pending `ShellState` per
+pane. A newer one replaces the pending one in place: the frame keeps the queue position of the old one and carries the
+newer `seq`. So `seq` on the wire can go backwards between events of different
+kinds. A client does not assume `seq` order across events. It uses `seq` of the
+`subscribe_events` answer to tell what it saw before the subscription, and the
+state `rev` (`ShellState`) or the layout content itself to tell newer from older.
+
 New methods:
 
 | Method | Params | Result |
