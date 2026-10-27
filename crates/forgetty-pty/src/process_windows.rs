@@ -898,6 +898,12 @@ impl PtyProcess {
     /// End the shell and everything it started.
     pub fn kill(&mut self) -> Result<()> {
         self.kill_tree();
+        // `TerminateProcess` returns before the process has finished ending, and the exit code
+        // reads as still active for a moment. Wait (bounded) so `is_alive` is false on return.
+        // SAFETY: valid process handle.
+        unsafe {
+            WaitForSingleObject(self.process.raw(), 2000);
+        }
         Ok(())
     }
 
