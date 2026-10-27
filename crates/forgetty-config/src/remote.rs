@@ -449,12 +449,17 @@ mod tests {
         let path = dir.path().join("config.toml");
         let saved =
             crate::parse_and_save_config_checked_at("relay = \"none\"\n", Some(&path)).unwrap();
-        assert_eq!(saved.warnings.len(), 1, "{:?}", saved.warnings);
-        assert!(
-            saved.warnings[0].contains("relay = none needs --bind or bind_addrs"),
-            "{:?}",
-            saved.warnings
-        );
+        if cfg!(windows) {
+            // There the server binds 127.0.0.1 when no address is set: nothing to warn about.
+            assert!(saved.warnings.is_empty(), "{:?}", saved.warnings);
+        } else {
+            assert_eq!(saved.warnings.len(), 1, "{:?}", saved.warnings);
+            assert!(
+                saved.warnings[0].contains("relay = none needs --bind or bind_addrs"),
+                "{:?}",
+                saved.warnings
+            );
+        }
         assert!(path.exists());
         // A bind list that is there is still checked, and a good one needs no warning.
         let bad = "relay = \"none\"\nbind_addrs = [\"0.0.0.0\"]\n";
