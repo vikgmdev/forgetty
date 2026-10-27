@@ -51,7 +51,9 @@ impl ShellSmoke {
 
     fn st_send(&mut self, shell: &mut AppShell, window: &mut Window, cx: &mut Context<AppShell>, chords: &[&str]) {
         for c in chords {
-            shell.handle_key(&key(c), window, cx);
+            // GPUI names the space bar "space" and types a blank with it.
+            let ks = if *c == "space" { typed(' ') } else { key(c) };
+            shell.handle_key(&ks, window, cx);
         }
     }
 
