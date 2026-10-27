@@ -105,20 +105,40 @@ impl Cli {
 
     /// `forgetty server start`: does nothing when a server answers.
     ///
-    /// The first run passes no handles to the process: the server it starts must not keep this
-    /// app's stdout or stderr (a file or pipe of whoever started the app) open for as long as it
-    /// lives. When it fails, it runs again with its output captured, to say why.
+    /// Every try passes no handles to the process: the server it starts must not keep a file or
+    /// pipe of this app (or of whoever started it) open for as long as it lives. So there are no
+    /// pipes to read an error from. When the second try fails too, the reason is read from the
+    /// server's log, which the command writes.
     pub fn start_server(&self) -> Result<(), Fallback> {
+        let timeout = || Fallback::Start("the server did not answer within 30 s".into());
         match self.run_clean(&["server", "start"], START_TIMEOUT) {
             Ok(Some(0)) => return Ok(()),
-            Ok(None) => return Err(Fallback::Start("the server did not answer within 30 s".into())),
+            Ok(None) => return Err(timeout()),
             _ => {}
         }
-        match self.run(&["server", "start"], START_TIMEOUT) {
-            Ok(o) if o.code == Some(0) => Ok(()),
-            Ok(o) if o.code.is_none() => Err(Fallback::Start("the server did not answer within 30 s".into())),
-            Ok(o) => Err(Fallback::Start(ls::cli_reason(&o.stdout, &o.stderr, o.code))),
+        // A start can lose a race with a server that is starting at the same moment.
+        std::thread::sleep(Duration::from_secs(1));
+        match self.run_clean(&["server", "start"], START_TIMEOUT) {
+            Ok(Some(0)) => Ok(()),
+            Ok(None) => Err(timeout()),
+            Ok(code) => Err(Fallback::Start(ls::cli_reason("", &self.server_log_tail(), code))),
             Err(e) => Err(Fallback::Start(format!("cannot run {}: {e}", self.exe.display()))),
+        }
+    }
+
+    /// The last lines of the server's log (the command writes why it could not start there).
+    fn server_log_tail(&self) -> String {
+        let log = match &self.state_dir {
+            None => Some(forgetty_core::platform::data_dir().join("server.log")),
+            Some(d) => find_file(d, "server.log", 5),
+        };
+        let text = log.and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
+        let all: Vec<&str> = text.lines().collect();
+        let lines = &all[all.len().saturating_sub(12)..];
+        // The server's own words ("forgetty server: ...") when it said any, else the last lines.
+        match lines.iter().rev().find(|l| l.contains("forgetty server: ")) {
+            Some(l) => l.to_string(),
+            None => lines[lines.len().saturating_sub(3)..].join("\n"),
         }
     }
 
@@ -200,13 +220,32 @@ impl Cli {
     }
 }
 
+/// The first file called `name` in `dir` or up to `depth` folders below it.
+fn find_file(dir: &Path, name: &str, depth: u32) -> Option<PathBuf> {
+    for e in std::fs::read_dir(dir).ok()?.flatten() {
+        let p = e.path();
+        if p.is_file() && p.file_name().is_some_and(|n| n == name) {
+            return Some(p);
+        }
+        if depth > 0 && p.is_dir() {
+            if let Some(f) = find_file(&p, name, depth - 1) {
+                return Some(f);
+            }
+        }
+    }
+    None
+}
+
 /// `forgetty-win.exe --start-server`: what the login Run value runs. GUI subsystem, no window.
 /// Returns the process exit code. `local_server = false` in the config means no server: 0.
 pub fn start_server_main() -> i32 {
-    if !crate::config::load().config.local_server {
+    let enabled = crate::config::load().config.local_server;
+    // Elevated: no server, whatever else is set (the server refuses to run elevated, and an
+    // elevated start must not hand a normal program a server that does).
+    if !ls::login_start_wanted(enabled, elevated(false)) {
         return 0;
     }
-    let exe = match find_server_exe() {
+    let exe = match find_server_exe(false) {
         Ok(Some(e)) => e,
         _ => return 2,
     };
@@ -216,14 +255,13 @@ pub fn start_server_main() -> i32 {
     }
 }
 
-/// Where the app looks for `forgetty.exe`: `FORGETTY_SERVER_EXE` (a developer's override: an
-/// absolute local path, else an error), else next to `forgetty-win.exe`. Never `PATH`.
-pub fn find_server_exe() -> Result<Option<PathBuf>, String> {
-    if let Some(p) = ls::override_exe(std::env::var_os("FORGETTY_SERVER_EXE").as_deref())? {
-        return Ok(Some(p));
-    }
+/// Where the app looks for `forgetty.exe`: next to `forgetty-win.exe`, never `PATH`. The
+/// developer override `FORGETTY_SERVER_EXE` (an absolute local path, else an error) is read only
+/// when `smoke` is set or in a debug build: a release run of the app ignores the variable.
+pub fn find_server_exe(smoke: bool) -> Result<Option<PathBuf>, String> {
+    let allow = smoke || cfg!(debug_assertions);
     let app_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf));
-    Ok(ls::find_exe(app_dir.as_deref(), ls::SERVER_EXE))
+    ls::server_exe(allow, std::env::var_os("FORGETTY_SERVER_EXE").as_deref(), app_dir.as_deref())
 }
 
 /// Is this window treated as elevated? In `--smoke`, `FORGETTY_TEST_ALLOW_ELEVATED=1` says the
@@ -236,7 +274,7 @@ pub fn elevated(smoke: bool) -> bool {
 }
 
 pub fn decide(enabled: bool, smoke: bool) -> Plan {
-    match find_server_exe() {
+    match find_server_exe(smoke) {
         Ok(exe) => ls::plan(enabled, elevated(smoke), exe),
         // A bad override is said, not skipped: the developer asked for that program.
         Err(why) if enabled && !elevated(smoke) => Plan::InProcess(Fallback::Start(why)),
@@ -263,8 +301,8 @@ pub fn bring_up(
         match ls::check_pairing(&m.node_id, &m.pinned_addrs, &status, devices.as_deref(), &own) {
             ls::PairingCheck::Keep => return Ok(m),
             ls::PairingCheck::NewAddress(a) => {
-                eprintln!("forgetty-win: local server: now at {a}");
-                m.pinned_addrs = vec![a];
+                eprintln!("forgetty-win: local server: now at {a:?}");
+                m.pinned_addrs = a;
                 m.relays_disabled = true;
                 m.relays.clear();
                 return store.add(m).map_err(|e| Fallback::Pair(format!("machines.json: {e}")));
@@ -320,8 +358,14 @@ fn pair_local(
             return Err(Fallback::Pair("the server's identity changed while pairing".into()));
         }
         let m = rt
-            .block_on(store::pair_as(store, &offer, device, Some(hint.unwrap_or_else(|| ls::loopback_addr(status.port_or_default()))), true))
+            .block_on(store::pair_as(store, &offer, device, Some(hint.unwrap_or_else(|| status.pins()[0])), true))
             .map_err(|e| Fallback::Pair(format!("{e} (dialed {:?}, relays off: {})", offer.direct, offer.relays_disabled)))?;
+        // The pins are what the server says it is bound to, not the payload's address list.
+        let mut m = m;
+        if hint.is_none() && m.pinned_addrs != status.pins() {
+            m.pinned_addrs = status.pins();
+            m = store.add(m).map_err(|e| Fallback::Pair(format!("machines.json: {e}")))?;
+        }
         // The command prints `paired:` and ends. Not seeing it is not an error: the pairing worked.
         let t1 = Instant::now();
         while t1.elapsed() < Duration::from_secs(10) {
@@ -709,10 +753,17 @@ fn pair_for_user(cli: &Cli, cancel: &std::sync::atomic::AtomicBool, tx: &async_c
     };
     let lines = line_channel(&mut child);
     let mut acc = String::new();
+    // The window this command opened, once it says so: a late cancel must not end a newer one.
+    let mut window: Option<u64> = None;
     let end = loop {
         if cancel.load(Ordering::SeqCst) {
             // `pair --cancel` ends the window at once, so the code stops working.
-            let closed = matches!(cli.run(&["pair", "--cancel"], Duration::from_secs(10)), Ok(o) if o.code == Some(0));
+            let id = window.map(|w| w.to_string());
+            let mut args = vec!["pair", "--cancel"];
+            if let Some(id) = &id {
+                args.extend(["--window-id", id]);
+            }
+            let closed = matches!(cli.run(&args, Duration::from_secs(10)), Ok(o) if o.code == Some(0));
             break Err(if closed {
                 "Cancelled. The code no longer works.".to_string()
             } else {
@@ -723,6 +774,7 @@ fn pair_for_user(cli: &Cli, cancel: &std::sync::atomic::AtomicBool, tx: &async_c
             Ok(l) => {
                 acc.push_str(&l);
                 acc.push('\n');
+                window = window.or_else(|| ls::pair_window_id(&l));
                 match ls::pair_line(&l) {
                     PairLine::Payload => {
                         let _ = tx.send_blocking(PairMsg::Output(acc.clone()));

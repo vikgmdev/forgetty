@@ -161,6 +161,9 @@ pub struct AppShell {
     pub meta: HashMap<PaneId, PaneMeta>,
     /// Active pane per tab (UI state; also reported to the backend).
     pub local_active: HashMap<Uuid, PaneId>,
+    /// The program a tab of this PC was started with (a profile or a command), by pane. A pane
+    /// that is not here runs the default shell.
+    pub pane_argv: HashMap<PaneId, Vec<String>>,
     pub zoomed: HashMap<Uuid, PaneId>,
     pub sidebar_open: bool,
     pub palette: Option<Palette>,
@@ -330,6 +333,7 @@ impl AppShell {
             attach_tries: HashMap::new(),
             meta: HashMap::new(),
             local_active: HashMap::new(),
+            pane_argv: HashMap::new(),
             zoomed: HashMap::new(),
             palette: None,
             rename: None,
@@ -484,6 +488,7 @@ impl AppShell {
                 BackendEvent::LayoutChanged(l) => layout = Some(l),
                 BackendEvent::PaneClosed { pane_id } => {
                     self.meta.remove(&pane_id);
+                    self.pane_argv.remove(&pane_id);
                     self.pending_notices.remove(&pane_id);
                 }
                 BackendEvent::TitleChanged { pane_id, title } => {
@@ -687,7 +692,11 @@ impl AppShell {
         let smoke_mode = self.smoke_mode;
         let view = cx.new(|cx| TerminalView::new(cfg, pane, src, rows, cols, smoke_mode, cx));
         let this_pc = self.is_this_pc();
-        view.update(cx, |v, _| v.image_paste = this_pc);
+        let target = self.paste_target(pane);
+        view.update(cx, |v, _| {
+            v.image_paste = this_pc;
+            v.paste_target = target;
+        });
         if let Some(o) = self.meta.get(&pane).and_then(|m| m.owner.as_ref()) {
             let label = o.label();
             view.update(cx, |v, cx| v.set_size_owner(Some(label), cx));
@@ -895,14 +904,36 @@ impl AppShell {
         self.new_tab_with(p.argv.clone(), p.start_dir.clone(), cx);
     }
 
+    /// What a pasted path is written for in this pane: the program it was started with, else the
+    /// default shell.
+    pub(crate) fn paste_target(&self, pane: PaneId) -> forgetty_shell_core::imagepaste::Target {
+        match self.pane_argv.get(&pane) {
+            Some(a) => forgetty_shell_core::imagepaste::target_of(a),
+            None => forgetty_shell_core::imagepaste::target_of(&crate::reload::default_shell(&self.cfg)),
+        }
+    }
+
+    /// The program of a pane is known (a profile): the view, when it exists, learns it.
+    pub(crate) fn set_pane_argv(&mut self, pane: PaneId, argv: Vec<String>, cx: &mut Context<Self>) {
+        self.pane_argv.insert(pane, argv);
+        let target = self.paste_target(pane);
+        if let Some(v) = self.views.get(&pane) {
+            v.update(cx, |v, _| v.paste_target = target);
+        }
+    }
+
     pub(crate) fn new_tab_with(&mut self, command: Vec<String>, cwd: Option<String>, cx: &mut Context<Self>) {
         let r = self.content_rect();
         let (rows, cols) = self.grid_for(r.w, r.h);
         // With no cwd the backend decides (it never trusts escape-code paths).
+        let argv = command.clone();
         let req = NewTab { workspace_idx: self.layout.active_workspace, rows, cols, command, cwd, ..Default::default() };
         let fut = self.backend.new_tab(req);
-        self.call(cx, fut, |s, reply, cx| {
+        self.call(cx, fut, move |s, reply, cx| {
             s.local_active.insert(reply.tab_id, reply.pane_id);
+            if !argv.is_empty() {
+                s.set_pane_argv(reply.pane_id, argv, cx);
+            }
             cx.notify();
         });
     }

@@ -51,6 +51,25 @@ pub fn override_exe(value: Option<&OsStr>) -> Result<Option<PathBuf>, String> {
     Ok(Some(p))
 }
 
+/// Does `forgetty-win.exe --start-server` (the login entry) start the server? Not when the
+/// config turns it off, and not when it runs elevated.
+pub fn login_start_wanted(enabled: bool, elevated: bool) -> bool {
+    enabled && !elevated
+}
+
+/// The program the app starts: with `allow_override`, `FORGETTY_SERVER_EXE` (see [`override_exe`]),
+/// else the one next to the app. The override is for `--smoke` and debug builds only: a release
+/// run of the app never reads the variable, so an environment of another program cannot choose
+/// which executable the login entry starts.
+pub fn server_exe(allow_override: bool, env: Option<&OsStr>, app_dir: Option<&Path>) -> Result<Option<PathBuf>, String> {
+    if allow_override {
+        if let Some(p) = override_exe(env)? {
+            return Ok(Some(p));
+        }
+    }
+    Ok(find_exe(app_dir, SERVER_EXE))
+}
+
 /// Does this process run elevated? An elevated window never uses the server: the server refuses
 /// to run elevated, and a normal program could otherwise use an elevated server to run commands
 /// as administrator around the UAC prompt. When it cannot be told, yes.
@@ -148,6 +167,8 @@ pub struct ServerStatus {
     pub pid: u64,
     /// The UDP port of the server's endpoint, when `status --json` says one.
     pub port: Option<u16>,
+    /// The sockets the server's endpoint is bound to (`addresses`), when `status --json` lists them.
+    pub addresses: Vec<std::net::SocketAddr>,
 }
 
 /// The server's default port, used while `status --json` names none.
@@ -157,6 +178,44 @@ impl ServerStatus {
     pub fn port_or_default(&self) -> u16 {
         self.port.unwrap_or(DEFAULT_PORT)
     }
+
+    /// The addresses the app pins for this PC's own server, from what the server says it is bound
+    /// to: its loopback entry when it has one (`127.0.0.1` before `::1`), else the port on loopback
+    /// when it is bound to every address, else this PC's own bound addresses (a server set to a LAN
+    /// address only). With no list, loopback and the port.
+    pub fn pins(&self) -> Vec<std::net::SocketAddr> {
+        use std::net::{IpAddr, Ipv4Addr};
+        let a = &self.addresses;
+        if let Some(l) = a.iter().find(|x| x.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST)).or_else(|| a.iter().find(|x| x.ip().is_loopback())) {
+            return vec![*l];
+        }
+        if let Some(u) = a.iter().find(|x| x.ip().is_unspecified()) {
+            return vec![loopback_addr(u.port())];
+        }
+        let mut own: Vec<std::net::SocketAddr> = Vec::new();
+        for x in a {
+            if !own.contains(x) && own.len() < 8 {
+                own.push(*x);
+            }
+        }
+        if own.is_empty() {
+            own.push(loopback_addr(self.port_or_default()));
+        }
+        own
+    }
+}
+
+/// The bound sockets a status document lists (`addresses`, else `direct_addrs`, else `addrs`).
+fn status_addresses(v: &serde_json::Value) -> Vec<std::net::SocketAddr> {
+    for key in ["addresses", "direct_addrs", "addrs"] {
+        let Some(list) = v.get(key).and_then(|l| l.as_array()) else { continue };
+        let addrs: Vec<std::net::SocketAddr> =
+            list.iter().filter_map(|a| a.as_str()?.trim().parse().ok()).filter(|a: &std::net::SocketAddr| a.port() != 0).collect();
+        if !addrs.is_empty() {
+            return addrs;
+        }
+    }
+    Vec::new()
 }
 
 /// The port in a status document: a `port` number, else the port of the first address of a list
@@ -185,7 +244,7 @@ pub fn parse_status(json: &str) -> Option<ServerStatus> {
     if node_id.is_empty() {
         return None;
     }
-    Some(ServerStatus { node_id, pid: v.get("pid").and_then(|p| p.as_u64()).unwrap_or(0), port: status_port(&v) })
+    Some(ServerStatus { node_id, pid: v.get("pid").and_then(|p| p.as_u64()).unwrap_or(0), port: status_port(&v), addresses: status_addresses(&v) })
 }
 
 /// A device paired with the server (`forgetty devices --json`).
@@ -239,6 +298,20 @@ pub enum PairLine {
     Paired { name: String, id: String },
     Expired,
     Other,
+}
+
+/// The window number a `forgetty pair` line names (`window_id: 3`, `window: 3`, `window id 3`),
+/// to close that window and no other one. `None` for any other line.
+pub fn pair_window_id(line: &str) -> Option<u64> {
+    let l = line.trim().to_ascii_lowercase();
+    let rest = l.strip_prefix("window")?;
+    let rest = rest.trim_start_matches(['_', ' ']);
+    let rest = rest.strip_prefix("id").unwrap_or(rest).trim_start_matches([':', '=', ' ']);
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() || digits.len() > 18 {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 pub fn pair_line(line: &str) -> PairLine {
@@ -389,8 +462,8 @@ pub fn loopback_addr(port: u16) -> std::net::SocketAddr {
 pub enum PairingCheck {
     /// The stored machine is right.
     Keep,
-    /// Same server, but it listens somewhere else now (another port): store this address.
-    NewAddress(std::net::SocketAddr),
+    /// Same server, but it listens somewhere else now (another port or address): store these.
+    NewAddress(Vec<std::net::SocketAddr>),
     /// The server will not know this app: drop the stored machine and pair again.
     Repair(&'static str),
 }
@@ -412,8 +485,13 @@ pub fn check_pairing(
             return PairingCheck::Repair("the server no longer lists this app (revoked or reset)");
         }
     }
-    let want = loopback_addr(status.port_or_default());
-    if stored_pins != [want] {
+    let want = status.pins();
+    let sorted = |v: &[std::net::SocketAddr]| {
+        let mut v = v.to_vec();
+        v.sort();
+        v
+    };
+    if sorted(stored_pins) != sorted(&want) {
         return PairingCheck::NewAddress(want);
     }
     PairingCheck::Keep
@@ -465,6 +543,33 @@ mod tests {
     }
 
     #[test]
+    fn the_override_is_read_only_when_allowed() {
+        let d = tempfile::tempdir().unwrap();
+        let app = d.path().join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        let other = d.path().join("other.exe");
+        std::fs::write(&other, b"x").unwrap();
+        let var = other.as_os_str();
+        // Allowed (smoke, debug build): the variable wins, a bad one is an error.
+        assert_eq!(server_exe(true, Some(var), Some(&app)), Ok(Some(other.clone())));
+        assert!(server_exe(true, Some(std::ffi::OsStr::new("rel.exe")), Some(&app)).is_err());
+        // Not allowed (a release run): the variable is ignored, even a bad one.
+        assert_eq!(server_exe(false, Some(var), Some(&app)), Ok(None));
+        assert_eq!(server_exe(false, Some(std::ffi::OsStr::new("rel.exe")), Some(&app)), Ok(None));
+        std::fs::write(app.join("forgetty.exe"), b"x").unwrap();
+        assert_eq!(server_exe(false, Some(var), Some(&app)), Ok(Some(app.join("forgetty.exe"))));
+        assert_eq!(server_exe(true, None, Some(&app)), Ok(Some(app.join("forgetty.exe"))));
+    }
+
+    #[test]
+    fn the_login_entry_does_not_start_a_server_when_elevated_or_off() {
+        assert!(login_start_wanted(true, false));
+        assert!(!login_start_wanted(true, true));
+        assert!(!login_start_wanted(false, false));
+        assert!(!login_start_wanted(false, true));
+    }
+
+    #[test]
     fn plan_order_is_disabled_then_elevated_then_exe() {
         let exe = Some(PathBuf::from("C:/x/forgetty.exe"));
         assert_eq!(plan(false, true, exe.clone()), Plan::InProcess(Fallback::Disabled));
@@ -504,7 +609,7 @@ mod tests {
     #[test]
     fn status_json() {
         let ok = r#"{"running":true,"pid":812,"node_id":"abc123","version":"0.1"}"#;
-        assert_eq!(parse_status(ok), Some(ServerStatus { node_id: "abc123".into(), pid: 812, port: None }));
+        assert_eq!(parse_status(ok), Some(ServerStatus { node_id: "abc123".into(), pid: 812, port: None, addresses: vec![] }));
         assert_eq!(parse_status(r#"{"running":false}"#), None);
         assert_eq!(parse_status(r#"{"running":true,"node_id":null}"#), None);
         assert_eq!(parse_status("not json"), None);
@@ -521,15 +626,15 @@ mod tests {
 
     #[test]
     fn the_stored_pairing_is_checked_at_every_start() {
-        let st = |node: &str, port: Option<u16>| ServerStatus { node_id: node.into(), pid: 1, port };
+        let st = |node: &str, port: Option<u16>| ServerStatus { node_id: node.into(), pid: 1, port, addresses: vec![] };
         let dev = |id: &str| Device { device_id: id.into(), name: String::new(), paired_at: None, last_seen: None };
         let pin = |p: u16| vec![loopback_addr(p)];
         // Same server, same address, listed: keep.
         assert_eq!(check_pairing("n", &pin(47297), &st("n", None), Some(&[dev("me")]), "me"), PairingCheck::Keep);
         // The server moved to another port: the stored address follows.
-        assert_eq!(check_pairing("n", &pin(47297), &st("n", Some(50000)), Some(&[dev("me")]), "me"), PairingCheck::NewAddress(loopback_addr(50000)));
+        assert_eq!(check_pairing("n", &pin(47297), &st("n", Some(50000)), Some(&[dev("me")]), "me"), PairingCheck::NewAddress(vec![loopback_addr(50000)]));
         // A pairing stored with another address list (or none) is brought to the one address.
-        assert_eq!(check_pairing("n", &[], &st("n", None), None, "me"), PairingCheck::NewAddress(loopback_addr(47297)));
+        assert_eq!(check_pairing("n", &[], &st("n", None), None, "me"), PairingCheck::NewAddress(vec![loopback_addr(47297)]));
         // A new server identity, or this app revoked: pair again.
         assert!(matches!(check_pairing("old", &pin(47297), &st("n", None), None, "me"), PairingCheck::Repair(_)));
         assert!(matches!(check_pairing("n", &pin(47297), &st("n", None), Some(&[dev("other")]), "me"), PairingCheck::Repair(_)));
@@ -538,6 +643,51 @@ mod tests {
         assert_eq!(check_pairing("n", &pin(47297), &st("n", None), None, "me"), PairingCheck::Keep);
         // Revoked wins over a changed port (the stored machine is dropped anyway).
         assert!(matches!(check_pairing("n", &pin(1), &st("n", Some(2)), Some(&[]), "me"), PairingCheck::Repair(_)));
+    }
+
+    #[test]
+    fn the_pins_come_from_the_addresses_the_server_is_bound_to() {
+        let a = |s: &str| -> std::net::SocketAddr { s.parse().unwrap() };
+        let st = |list: &[&str]| ServerStatus { node_id: "n".into(), pid: 1, port: None, addresses: list.iter().map(|s| a(s)).collect() };
+        // Its loopback entry, whatever else it is bound to.
+        assert_eq!(st(&["192.168.1.5:47300", "127.0.0.1:47300"]).pins(), vec![a("127.0.0.1:47300")]);
+        assert_eq!(st(&["[::1]:47300", "192.168.1.5:47300"]).pins(), vec![a("[::1]:47300")]);
+        assert_eq!(st(&["[::1]:47300", "127.0.0.1:47301"]).pins(), vec![a("127.0.0.1:47301")]);
+        // Bound to every address: loopback is in it.
+        assert_eq!(st(&["0.0.0.0:47300"]).pins(), vec![a("127.0.0.1:47300")]);
+        // Bound to a LAN address only (`bind_addrs = [..]`): this PC's own addresses stay as they are.
+        assert_eq!(st(&["192.168.1.5:47300"]).pins(), vec![a("192.168.1.5:47300")]);
+        assert_eq!(st(&["192.168.1.5:47300", "10.0.0.2:47300", "192.168.1.5:47300"]).pins(), vec![a("192.168.1.5:47300"), a("10.0.0.2:47300")]);
+        // No list: loopback and the port.
+        assert_eq!(st(&[]).pins(), vec![a("127.0.0.1:47297")]);
+        // The status document is read for them.
+        let p = parse_status(r#"{"running":true,"node_id":"n","port":47300,"addresses":["192.168.1.5:47300"]}"#).unwrap();
+        assert_eq!(p.addresses, vec![a("192.168.1.5:47300")]);
+        assert_eq!(p.pins(), vec![a("192.168.1.5:47300")]);
+    }
+
+    #[test]
+    fn a_server_bound_to_a_lan_address_keeps_that_pin() {
+        let a = |s: &str| -> std::net::SocketAddr { s.parse().unwrap() };
+        let lan = ServerStatus { node_id: "n".into(), pid: 1, port: Some(47300), addresses: vec![a("192.168.1.5:47300")] };
+        let dev = Device { device_id: "me".into(), name: String::new(), paired_at: None, last_seen: None };
+        // The stored pin is the LAN address: nothing to rewrite.
+        assert_eq!(check_pairing("n", &[a("192.168.1.5:47300")], &lan, Some(&[dev.clone()]), "me"), PairingCheck::Keep);
+        // A pin of loopback alone would not reach it: it is replaced by the bound address.
+        assert_eq!(check_pairing("n", &[a("127.0.0.1:47300")], &lan, Some(&[dev]), "me"), PairingCheck::NewAddress(vec![a("192.168.1.5:47300")]));
+    }
+
+    #[test]
+    fn the_window_number_is_read_from_a_pair_line() {
+        assert_eq!(pair_window_id("window_id: 3"), Some(3));
+        assert_eq!(pair_window_id("  Window: 12 "), Some(12));
+        assert_eq!(pair_window_id("window id=7"), Some(7));
+        assert_eq!(pair_window_id("window 9 is open"), Some(9));
+        assert_eq!(pair_window_id("windows are open"), None);
+        assert_eq!(pair_window_id("payload: {\"window_id\":4}"), None);
+        assert_eq!(pair_window_id("window_id: x"), None);
+        assert_eq!(pair_window_id("window_id: 99999999999999999999"), None);
+        assert_eq!(pair_window_id(""), None);
     }
 
     #[test]

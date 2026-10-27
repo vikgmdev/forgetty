@@ -378,16 +378,18 @@ At start the app (a window that is not elevated, `local_server` not `false`):
 
 1. looks for `forgetty.exe` next to `forgetty-win.exe` and nowhere else (not `PATH`, not the
    current folder). A developer can name another program with `FORGETTY_SERVER_EXE`: an absolute
-   path to a file on a local drive (a relative, UNC or device path is refused with a notice);
+   path to a file on a local drive (a relative, UNC or device path is refused with a notice).
+   Only `--smoke` and debug builds read the variable: a release run ignores it. The login
+   entry (`forgetty-win.exe --start-server`) starts nothing when it runs elevated;
 2. runs `forgetty.exe server start` with no console window and no inherited handle (the
    server must not keep this app's stdout open; it does nothing when a server answers);
 3. pairs by itself: `forgetty pair --ttl 30` prints a payload, the app pairs over
-   loopback (`127.0.0.1`, the port `server status --json` names or 47297 while it names none, pinned by the app: the
-   server listens on every address and its payload names no direct one; this
-   machine never uses a relay) with the code of the pair dialog, and stores the machine with
+   the address the server says it listens on (`addresses` of `server status --json`: its loopback entry;
+   a server bound to a LAN address only keeps that address; 47297 on loopback while the status names none;
+   this machine never uses a relay) with the code of the pair dialog, and stores the machine with
    `local: true` in `machines.json`. At every start the stored pairing is checked against
-   the server: the same node id, this app still in `forgetty devices`, and the stored address
-   equal to `127.0.0.1:<port>` of `status --json`. A new node id or a device list without this
+   the server: the same node id, this app still in `forgetty devices`, and the stored addresses
+   equal to those of `status --json`. A new node id or a device list without this
    app means pairing again (a revoked app pairs again at the next start); a new port updates
    the stored address;
 4. shows the machine as **This PC** in the sidebar, over `RemoteBackend`, and
@@ -444,8 +446,9 @@ forgetty-win.exe --help | --version
   underline keeps it.
 - Paste with a picture and no text on the clipboard saves
   `%LOCALAPPDATA%\forgetty\cache\clipboard\paste-<date>-<id>.png` (a folder and a file for
-  this user only) and pastes its path, quoted for the shell the pane runs when the path needs it
-  (read from the prompt line): cmd `"..."`, PowerShell `'...'`, a POSIX shell (WSL) `'/mnt/c/...'`.
+  this user only) and pastes its path, quoted for the program the pane was started with (its argv, never the prompt text) when the path needs it:
+  cmd `"..."`, PowerShell `'...'` (a quote doubled), WSL `'/mnt/c/...'`, Git Bash `'/c/...'`, Cygwin
+  `'/cygdrive/c/...'`, any other program `"..."` (refused, with a notice, when the path has `$`, a backtick, `%` or `!`).
   Tabs on this PC only.
 - Palette: "Retry the local server" after a fallback.
 - Settings, Devices: paired devices, Revoke, "Pair new device" (needs the local server).
