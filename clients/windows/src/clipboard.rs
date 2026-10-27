@@ -157,3 +157,43 @@ impl AppShell {
         self.set_clip_policy(id, policy, None, cx);
     }
 }
+
+/// Save a clipboard picture in the cache folder (`%LOCALAPPDATA%\forgetty\cache\clipboard`) and
+/// return the path. PNG is written as it is, a Windows bitmap (a screenshot) is converted to
+/// PNG, and other formats keep their own extension. Reads the clipboard bytes only: run it off
+/// the UI thread.
+pub fn save_image(img: &gpui::Image) -> Result<std::path::PathBuf, String> {
+    use forgetty_shell_core::imagepaste as ip;
+    use gpui::ImageFormat as F;
+    use std::io::Write as _;
+    if img.bytes.len() > ip::MAX_BYTES {
+        return Err("The picture on the clipboard is too large to save.".into());
+    }
+    let local = std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from);
+    let dir = ip::cache_dir(local.as_deref()).ok_or_else(|| "No %LOCALAPPDATA%: cannot save the picture".to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Cannot create {}: {e}", dir.display()))?;
+    let (ext, bytes): (&str, Vec<u8>) = match img.format {
+        F::Png => ("png", img.bytes.clone()),
+        F::Bmp => {
+            let rgba = ip::bmp_to_rgba(&img.bytes)?;
+            let mut out = Vec::new();
+            let mut enc = png::Encoder::new(&mut out, rgba.w, rgba.h);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            let mut wr = enc.write_header().map_err(|e| format!("png header: {e}"))?;
+            wr.write_image_data(&rgba.data).map_err(|e| format!("png data: {e}"))?;
+            drop(wr);
+            ("png", out)
+        }
+        F::Jpeg => ("jpg", img.bytes.clone()),
+        F::Gif => ("gif", img.bytes.clone()),
+        F::Webp => ("webp", img.bytes.clone()),
+        F::Svg => ("svg", img.bytes.clone()),
+        _ => ("img", img.bytes.clone()),
+    };
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let path = dir.join(ip::file_name(secs, &Uuid::new_v4().simple().to_string(), ext));
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&path).map_err(|e| format!("Cannot save {}: {e}", path.display()))?;
+    f.write_all(&bytes).map_err(|e| format!("Cannot save {}: {e}", path.display()))?;
+    Ok(path)
+}

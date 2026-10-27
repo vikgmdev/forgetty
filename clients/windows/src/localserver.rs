@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use forgetty_remote::store::{self, MachineStore, StoredMachine};
 use forgetty_shell_core::localserver::{self as ls, Fallback, PairLine, Plan};
 use forgetty_shell_core::{MachineKind, SessionBackend, Uuid};
+use forgetty_shell_core::devices::{Avail, DevEffect};
 use gpui::Context;
 
 use crate::shell::AppShell;
@@ -287,6 +288,8 @@ pub struct LocalSrv {
     pub last_try: Option<Instant>,
     pub restarting: bool,
     pub last_error: Option<String>,
+    /// Set to end the pairing command of the Devices page.
+    pub pair_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl LocalSrv {
@@ -385,6 +388,40 @@ impl AppShell {
         }
     }
 
+    /// The palette command "Quit and end all tabs on this PC": the counterpart of GTK's Close
+    /// Window Permanently. Asks first.
+    pub fn ask_end_session(&mut self, cx: &mut Context<Self>) {
+        if self.lsrv.machine != Some(self.machine.id) {
+            self.notice_active("Tabs of this window already end when it closes. Use Quit. (Switch to This PC to end the local server's tabs.)".into(), cx);
+            return;
+        }
+        let n = self.layout.workspaces.iter().map(|w| w.tabs.len()).sum::<usize>();
+        self.confirm = Some(crate::menus::Confirm {
+            text: format!("End all {n} tab(s) on this PC and quit? Programs running in them stop and the local server stops."),
+            act: crate::menus::ConfirmAct::EndSession,
+        });
+        cx.notify();
+    }
+
+    /// Close every tab, stop the server, quit. The server saves nothing to restore: no tab is left.
+    pub(crate) fn end_session_now(&mut self, cx: &mut Context<Self>) {
+        let (Some(cli), Some(r)) = (self.lsrv.cli.clone(), self.remote.as_ref()) else { return };
+        let rt = r.rt.clone();
+        // The watchdog must not start the server again.
+        self.lsrv.state = LsState::Off;
+        let tabs: Vec<Uuid> = self.layout.workspaces.iter().flat_map(|w| w.tabs.iter().map(|t| t.id)).collect();
+        let futs: Vec<_> = tabs.into_iter().map(|t| self.backend.close_tab(t)).collect();
+        self.quit_ok = true;
+        cx.spawn(async move |this, cx| {
+            for f in futs {
+                let _ = f.await;
+            }
+            let _ = rt.spawn_blocking(move || cli.run(&["server", "stop"], Duration::from_secs(30))).await;
+            let _ = this.update(cx, |_, cx| cx.quit());
+        })
+        .detach();
+    }
+
     /// The last tab of the server machine closed: end the app unless tabs are back within 1.5 s.
     pub(crate) fn quit_if_still_empty(&mut self, id: Uuid, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
@@ -472,5 +509,178 @@ impl AppShell {
                 self.drop_machine(id, cx);
             }
         }
+    }
+}
+
+// ---- the Devices page (M1) -------------------------------------------------------------
+
+enum PairMsg {
+    Output(String),
+    Done(Result<String, String>),
+}
+
+/// `forgetty pair --ttl N` for a device of the user: send the output up to the payload (the QR
+/// block) when it comes, then the result. Ends when `cancel` is set.
+fn pair_for_user(cli: &Cli, cancel: &std::sync::atomic::AtomicBool, tx: &async_channel::Sender<PairMsg>) {
+    use std::sync::atomic::Ordering;
+    let ttl = ls::USER_PAIR_TTL_SECS.to_string();
+    let mut child = match cli.command(&["pair", "--ttl", &ttl]).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = tx.send_blocking(PairMsg::Done(Err(format!("cannot run forgetty pair: {e}"))));
+            return;
+        }
+    };
+    let lines = line_channel(&mut child);
+    let mut acc = String::new();
+    let end = loop {
+        if cancel.load(Ordering::SeqCst) {
+            break Err("Cancelled. The code stays valid until it expires (2 minutes).".to_string());
+        }
+        match lines.recv_timeout(Duration::from_millis(200)) {
+            Ok(l) => {
+                acc.push_str(&l);
+                acc.push('\n');
+                match ls::pair_line(&l) {
+                    PairLine::Payload => {
+                        let _ = tx.send_blocking(PairMsg::Output(acc.clone()));
+                    }
+                    PairLine::Paired { name, .. } => break Ok(name),
+                    PairLine::Expired => break Err("The pairing window closed. No device paired.".to_string()),
+                    PairLine::Other => {}
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break Err("forgetty pair ended before a device paired.".to_string()),
+        }
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = tx.send_blocking(PairMsg::Done(end));
+}
+
+impl AppShell {
+    fn devices_avail(&self) -> Avail {
+        match &self.lsrv.state {
+            LsState::Up if self.lsrv.cli.is_some() => Avail::Yes,
+            LsState::Fallback(Fallback::Disabled) => Avail::No("The local server is turned off (local_server = false in the config).".into()),
+            LsState::Fallback(f) => Avail::No(f.notice().unwrap_or_default()),
+            LsState::Starting => Avail::No("The local server is starting.".into()),
+            _ => Avail::No("This window does not use the local server.".into()),
+        }
+    }
+
+    /// The Devices page asked for work.
+    pub(crate) fn devices_effect(&mut self, e: DevEffect, cx: &mut Context<Self>) {
+        let avail = self.devices_avail();
+        if let Some(w) = self.settings.as_mut() {
+            w.st.devices.set_avail(avail.clone());
+        }
+        if avail != Avail::Yes {
+            return;
+        }
+        match e {
+            DevEffect::Refresh => {
+                if let Some(w) = self.settings.as_mut() {
+                    w.st.devices.begin_refresh();
+                }
+                self.devices_refresh(cx);
+            }
+            DevEffect::Revoke(id) => self.devices_revoke(id, cx),
+            DevEffect::StartPair => self.devices_pair(cx),
+            DevEffect::CancelPair => {
+                if let Some(c) = self.lsrv.pair_cancel.take() {
+                    c.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            DevEffect::None | DevEffect::Close | DevEffect::CopyText(_) => {}
+        }
+    }
+
+    fn devices_refresh(&mut self, cx: &mut Context<Self>) {
+        let (Some(cli), Some(r)) = (self.lsrv.cli.clone(), self.remote.as_ref()) else { return };
+        let store = r.store.clone();
+        let task = r.rt.spawn_blocking(move || {
+            let res = match cli.run(&["devices", "--json"], Duration::from_secs(20)) {
+                Ok(o) if o.code == Some(0) => ls::parse_devices(&o.stdout),
+                Ok(o) => Err(ls::cli_reason(&o.stdout, &o.stderr, o.code)),
+                Err(e) => Err(e.to_string()),
+            };
+            (res, store.device_id().unwrap_or_default())
+        });
+        cx.spawn(async move |this, cx| {
+            let (res, own) = task.await.unwrap_or_else(|e| (Err(e.to_string()), String::new()));
+            let _ = this.update(cx, |s, cx| {
+                if let Some(w) = s.settings.as_mut() {
+                    w.st.devices.loaded(res, own);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn devices_revoke(&mut self, id: String, cx: &mut Context<Self>) {
+        let (Some(cli), Some(r)) = (self.lsrv.cli.clone(), self.remote.as_ref()) else { return };
+        let name = self
+            .settings
+            .as_ref()
+            .and_then(|w| w.st.devices.view().rows.into_iter().find(|row| id.starts_with(&row.short_id)).map(|row| row.title))
+            .unwrap_or_default();
+        let task = r.rt.spawn_blocking(move || match cli.run(&["revoke", &id], Duration::from_secs(20)) {
+            Ok(o) if o.code == Some(0) => Ok(()),
+            Ok(o) => Err(ls::cli_reason(&o.stdout, &o.stderr, o.code)),
+            Err(e) => Err(e.to_string()),
+        });
+        cx.spawn(async move |this, cx| {
+            let res = task.await.unwrap_or_else(|e| Err(e.to_string()));
+            let _ = this.update(cx, |s, cx| {
+                if let Some(w) = s.settings.as_mut() {
+                    w.st.devices.revoked(res.map(|_| name));
+                    w.st.devices.begin_refresh();
+                }
+                s.devices_refresh(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn devices_pair(&mut self, cx: &mut Context<Self>) {
+        let (Some(cli), Some(r)) = (self.lsrv.cli.clone(), self.remote.as_ref()) else { return };
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.lsrv.pair_cancel = Some(cancel.clone());
+        let (tx, rx) = async_channel::unbounded::<PairMsg>();
+        r.rt.spawn_blocking(move || pair_for_user(&cli, &cancel, &tx));
+        cx.spawn(async move |this, cx| {
+            while let Ok(m) = rx.recv().await {
+                let done = matches!(m, PairMsg::Done(_));
+                let alive = this
+                    .update(cx, |s, cx| {
+                        if let Some(w) = s.settings.as_mut() {
+                            match m {
+                                PairMsg::Output(t) => w.st.devices.pair_output(&t),
+                                PairMsg::Done(r) => {
+                                    let ok = r.is_ok();
+                                    w.st.devices.pair_finished(r);
+                                    if ok {
+                                        w.st.devices.begin_refresh();
+                                    }
+                                }
+                            }
+                        }
+                        if done {
+                            s.lsrv.pair_cancel = None;
+                            s.devices_refresh(cx);
+                        }
+                        cx.notify();
+                    })
+                    .is_ok();
+                if !alive || done {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 }

@@ -410,3 +410,28 @@ after `forgetty server stop`. `--smoke` runs the real `forgetty.exe` named by
 is) in its own `--state-dir`, pairs, times keys against the built-in pane
 (`local_server_key_p50_within_2ms_of_in_process`), kills the server and waits for
 the watchdog to bring it back.
+
+## Command line, cursor, picture paste (WP6b)
+
+```
+forgetty-win.exe [--working-directory DIR] [-e PROGRAM [ARGS...]] [--config-file FILE]
+forgetty-win.exe --help | --version
+```
+
+- `--working-directory DIR` and `-e PROGRAM ARGS...` set the first tab of this start
+  (`-e` takes the rest of the line; the program is found on `PATH` like a profile's).
+  With the local server the tab is added to the active workspace beside the tabs the
+  server kept. A folder that is not there, a program that is not found or an unknown
+  option is an error box (and text on the parent console) with exit code 2.
+- `--config-file FILE` reads, watches and saves FILE for this window instead of
+  `%APPDATA%\forgetty\config.toml` (the same as `FORGETTY_CONFIG`). The local server
+  keeps its own config.
+- `cursor_style = "block" | "bar" | "underline" | "block_hollow"` (Settings, Terminal,
+  Cursor): the shape for a program that sets none. A program that asks for a bar or an
+  underline keeps it.
+- Paste with a picture and no text on the clipboard saves
+  `%LOCALAPPDATA%\forgetty\cache\clipboard\paste-<date>-<id>.png` and pastes its path.
+  Tabs on this PC only.
+- Settings, Devices: paired devices, Revoke, "Pair new device" (needs the local server).
+  Palette: "Quit and end all tabs on this PC" stops the server.
+- `Ctrl+Alt+PageDown` / `Ctrl+Alt+PageUp`: next and previous workspace (`windows` keymap).

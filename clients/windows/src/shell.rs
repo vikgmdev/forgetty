@@ -231,6 +231,37 @@ pub struct AppShell {
     pub(crate) switch_to: Option<Uuid>,
     /// The local server: state, the machine it backs, the watchdog.
     pub lsrv: crate::localserver::LocalSrv,
+    /// `--working-directory` / `-e`: the first tab this start opens. Taken once.
+    pub launch: Option<Launch>,
+}
+
+/// What the command line asked the first tab to be.
+#[derive(Clone, Debug, Default)]
+pub struct Launch {
+    pub command: Vec<String>,
+    pub cwd: Option<String>,
+}
+
+impl Launch {
+    /// The folder must exist and the program must be found (PATH only, as a profile's), so a
+    /// typo is an error box at once and not a tab that closes by itself.
+    pub fn from_args(a: &forgetty_shell_core::cli::Args) -> Result<Option<Launch>, String> {
+        if !a.has_launch() {
+            return Ok(None);
+        }
+        if let Some(d) = &a.working_directory {
+            if !std::path::Path::new(d).is_dir() {
+                return Err(format!("--working-directory: {} is not a folder", forgetty_shell_core::notify::sanitize(d, 80)));
+            }
+        }
+        let mut command = a.command.clone();
+        if let Some(first) = command.first().cloned() {
+            let host = forgetty_shell_core::resolve::Host::real(None);
+            command[0] = forgetty_shell_core::resolve::resolve_program(&first, &host)
+                .map_err(|e| format!("-e: {}", forgetty_shell_core::notify::sanitize(&e, 160)))?;
+        }
+        Ok(Some(Launch { command, cwd: a.working_directory.clone() }))
+    }
 }
 
 pub fn basename(path: &str) -> String {
@@ -343,6 +374,7 @@ impl AppShell {
             pair_clip_seen: None,
             switch_to: None,
             lsrv: Default::default(),
+            launch: None,
         };
         let mut shell = shell;
         // The local machine is on screen first; its events feed the same
@@ -648,6 +680,8 @@ impl AppShell {
         let cfg = self.cfg.clone();
         let smoke_mode = self.smoke_mode;
         let view = cx.new(|cx| TerminalView::new(cfg, pane, src, rows, cols, smoke_mode, cx));
+        let this_pc = self.is_this_pc();
+        view.update(cx, |v, _| v.image_paste = this_pc);
         if let Some(o) = self.meta.get(&pane).and_then(|m| m.owner.as_ref()) {
             let label = o.label();
             view.update(cx, |v, cx| v.set_size_owner(Some(label), cx));
@@ -821,6 +855,11 @@ impl AppShell {
     /// A plain new tab: the default profile on this PC (as GTK: `default_profile`, else the first
     /// profile), else the shell. A remote machine always opens its own shell.
     pub fn new_tab(&mut self, cx: &mut Context<Self>) {
+        // The first tab of a start that had `--working-directory` or `-e`.
+        if let Some(l) = self.launch.take() {
+            self.new_tab_with(l.command, l.cwd, cx);
+            return;
+        }
         let profile = self.cfg.default_profile().cloned().filter(|_| self.is_this_pc());
         match profile {
             Some(p) => self.start_profile_tab(&p, cx),
@@ -1096,6 +1135,7 @@ impl AppShell {
                 }
             }
             Action::CheckUpdates => self.check_for_updates(cx),
+            Action::EndSession => self.ask_end_session(cx),
             Action::ClipboardWriteOff => self.set_active_clip_policy(forgetty_shell_core::osc52::Policy::Off, cx),
             Action::ClipboardWriteAsk => self.set_active_clip_policy(forgetty_shell_core::osc52::Policy::Ask, cx),
             Action::ClipboardWriteAllow => self.set_active_clip_policy(forgetty_shell_core::osc52::Policy::Allow, cx),

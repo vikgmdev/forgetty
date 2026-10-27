@@ -37,12 +37,49 @@ use config::{Backdrop, Config};
 use shell::AppShell;
 
 fn main() {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let args = match forgetty_shell_core::cli::parse(&argv) {
+        Ok(a) => a,
+        Err(e) => {
+            // A GUI-subsystem exe has no console of its own: print to the parent's, and show a box.
+            console::attach_parent();
+            eprintln!("forgetty-win: {e}");
+            console::error_box(&e);
+            std::process::exit(2);
+        }
+    };
+    if args.help || args.version {
+        console::attach_parent();
+        if args.help {
+            print!("{}", forgetty_shell_core::cli::USAGE);
+        } else {
+            println!("forgetty-win {}", env!("CARGO_PKG_VERSION"));
+        }
+        std::process::exit(0);
+    }
     // The login Run value: start the local server without a window, then end.
-    if std::env::args().any(|a| a == "--start-server") {
+    if args.start_server {
         std::process::exit(localserver::start_server_main());
     }
     let start = Instant::now();
-    let smoke = std::env::args().any(|a| a == "--smoke");
+    let smoke = args.smoke;
+    // `--config-file` is this window's config. The local server keeps its own.
+    if let (Some(f), false) = (&args.config_file, smoke) {
+        std::env::set_var("FORGETTY_CONFIG", f);
+    }
+    let launch = if smoke {
+        None
+    } else {
+        match shell::Launch::from_args(&args) {
+            Ok(l) => l,
+            Err(e) => {
+                console::attach_parent();
+                eprintln!("forgetty-win: {e}");
+                console::error_box(&e);
+                std::process::exit(2);
+            }
+        }
+    };
     if smoke {
         // The only mode that prints. A normal launch must not join the terminal's console.
         console::attach_parent();
@@ -141,6 +178,7 @@ fn main() {
                 window.on_window_should_close(cx, move |_w, cx| weak.update(cx, |s, cx| s.close_allowed(cx)).unwrap_or(true));
                 shell.update(cx, |s, cx| {
                     s.local = Some(local.clone());
+                    s.launch = launch;
                     s.startup_notice = reload::startup_notice(&startup_warnings);
                     s.start_config_watch(cx);
                     cx.observe_window_activation(window, |s, window, cx| s.on_window_activation(window, cx))

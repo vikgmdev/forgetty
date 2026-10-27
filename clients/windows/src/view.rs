@@ -200,6 +200,8 @@ pub struct TerminalView {
     pub ime_bounds_calls: u32,
     pub ime_bounds_last: Option<(usize, usize, f32, f32, f32, f32, f32, f32)>,
     pub pending_paste: Option<PendingPaste>,
+    /// A picture on the clipboard may be saved as a file and its path pasted (panes of this PC).
+    pub image_paste: bool,
     pub search: Option<SearchState>,
     /// The http(s) link under the pointer, and the cell and screen generation it was found for.
     pub hover_link: Option<Link>,
@@ -450,6 +452,7 @@ impl TerminalView {
             ime_bounds_calls: 0,
             ime_bounds_last: None,
             pending_paste: None,
+            image_paste: false,
             search: None,
             hover_link: None,
             hover_cell: None,
@@ -534,7 +537,7 @@ impl TerminalView {
         if ch.font {
             self.zoom_pt = None;
             self.remeasure(cx);
-        } else if ch.colors || ch.padding {
+        } else if ch.colors || ch.padding || ch.cursor {
             self.invalidate_rows();
             cx.notify();
         }
@@ -1569,9 +1572,43 @@ impl TerminalView {
     // ---- clipboard ----------------------------------------------------------
 
     pub fn paste(&mut self, cx: &mut Context<Self>) {
-        let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) else { return };
-        self.send_paste(&text);
-        cx.notify();
+        let item = cx.read_from_clipboard();
+        if let Some(text) = item.as_ref().and_then(|i| i.text()) {
+            self.send_paste(&text);
+            cx.notify();
+            return;
+        }
+        let img = item.as_ref().and_then(|i| {
+            i.entries().iter().find_map(|e| match e {
+                gpui::ClipboardEntry::Image(img) => Some(img.clone()),
+                _ => None,
+            })
+        });
+        if let Some(img) = img {
+            self.paste_image(img, cx);
+        }
+    }
+
+    /// F8: a picture and no text. Save it in the cache folder and paste the path. A path on this
+    /// PC means nothing to a remote machine, so only panes of this PC take it.
+    fn paste_image(&mut self, img: gpui::Image, cx: &mut Context<Self>) {
+        if !self.image_paste {
+            self.show_notice("Pasting a picture works in tabs on this PC only (the path would mean nothing there)".into(), cx);
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let saved = cx.background_executor().spawn(async move { crate::clipboard::save_image(&img) }).await;
+            let _ = this.update(cx, |v, cx| {
+                match saved {
+                    Ok(path) => {
+                        v.send_paste(&forgetty_shell_core::imagepaste::paste_text(&path));
+                    }
+                    Err(e) => v.show_notice(e, cx),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Sanitize and send, or park the paste for confirmation when it could run

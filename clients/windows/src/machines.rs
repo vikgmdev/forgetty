@@ -366,27 +366,47 @@ impl AppShell {
             return;
         }
         e.bootstrapped = true;
-        let empty = if id == self.machine.id {
-            self.layout.tab_count() == 0
+        // The tab `--working-directory` / `-e` asked for belongs to the local server's machine.
+        let launch = if self.lsrv.machine == Some(id) { self.launch.take() } else { None };
+        let (empty, active_ws) = if id == self.machine.id {
+            (self.layout.tab_count() == 0, self.layout.active_workspace)
         } else {
-            self.parked.get(&id).is_some_and(|p| p.layout.tab_count() == 0)
+            self.parked.get(&id).map(|p| (p.layout.tab_count() == 0, p.layout.active_workspace)).unwrap_or((false, 0))
         };
-        if empty {
-            let r = self.content_rect();
-            let (rows, cols) = self.grid_for(r.w, r.h);
-            let fut = self
-                .machines
-                .iter()
-                .find(|m| m.id == id)
-                .map(|m| m.backend.new_tab(NewTab { workspace_idx: 0, rows, cols, ..Default::default() }));
-            if let Some(fut) = fut {
-                cx.spawn(async move |_, _| {
-                    if let Err(e) = fut.await {
-                        eprintln!("forgetty-win: new_tab on empty machine: {e}");
+        let r = self.content_rect();
+        let (rows, cols) = self.grid_for(r.w, r.h);
+        let Some(backend) = self.machines.iter().find(|m| m.id == id).map(|m| m.backend.clone()) else { return };
+        if empty || launch.is_some() {
+            // No tab at all, or a command line that asks for one: open it (beside the tabs the
+            // server kept; GTK starts without them, the server's tabs outlive the window).
+            let l = launch.unwrap_or_default();
+            let fut = backend.new_tab(NewTab {
+                workspace_idx: if empty { 0 } else { active_ws },
+                rows,
+                cols,
+                command: l.command,
+                cwd: l.cwd,
+                ..Default::default()
+            });
+            cx.spawn(async move |_, _| {
+                if let Err(e) = fut.await {
+                    eprintln!("forgetty-win: first tab: {e}");
+                }
+            })
+            .detach();
+        } else if self.lsrv.machine == Some(id) && self.cfg.on_launch == forgetty_shell_core::config::OnLaunch::New {
+            // `on_launch = "new"`: the server keeps its workspaces, and this start opens a new
+            // one beside them and shows it (GTK opens a fresh window; there is one window here).
+            let fut = backend.create_workspace(None, rows, cols);
+            cx.spawn(async move |_, _| match fut.await {
+                Ok(reply) => {
+                    if let Err(e) = backend.set_active_workspace(reply.workspace_idx).await {
+                        eprintln!("forgetty-win: on_launch new, show it: {e}");
                     }
-                })
-                .detach();
-            }
+                }
+                Err(e) => eprintln!("forgetty-win: on_launch new: {e}"),
+            })
+            .detach();
         }
     }
 

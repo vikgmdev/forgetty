@@ -109,16 +109,12 @@ impl Element for TerminalElement {
                     point(bounds.origin.x + m.cell_w * c as f32, bounds.origin.y + m.line_h * r as f32),
                     size(m.cell_w * cells, m.line_h),
                 );
-                let shape = if !focused {
-                    CursorShape::Hollow
-                } else {
-                    // DECSCUSR: BAR=0, BLOCK=1, UNDERLINE=2, BLOCK_HOLLOW=3
-                    match v.term.cursor_visual_style() {
-                        0 => CursorShape::Bar,
-                        2 => CursorShape::Underline,
-                        3 => CursorShape::Hollow,
-                        _ => CursorShape::Block,
-                    }
+                // DECSCUSR from the program, else `cursor_style`.
+                let shape = match forgetty_shell_core::cursor::shape(v.term.cursor_visual_style(), v.cfg.cursor_style, focused) {
+                    forgetty_shell_core::cursor::Shape::Block => CursorShape::Block,
+                    forgetty_shell_core::cursor::Shape::Bar => CursorShape::Bar,
+                    forgetty_shell_core::cursor::Shape::Underline => CursorShape::Underline,
+                    forgetty_shell_core::cursor::Shape::Hollow => CursorShape::Hollow,
                 };
                 Some((b, shape))
             } else {

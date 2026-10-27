@@ -105,6 +105,10 @@ impl AppShell {
     }
 
     pub fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A pairing command that waits for a device ends with the window.
+        if let Some(c) = self.lsrv.pair_cancel.take() {
+            c.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         if self.settings.take().is_some() {
             // The keyboard goes back to the terminal.
             self.on_active_view(window, cx, |_, _| {});
@@ -173,8 +177,10 @@ impl AppShell {
 
     pub fn settings_page(&mut self, p: Page, cx: &mut Context<Self>) {
         let Some(e) = self.with_settings(|st, ctx| st.select_page(p, ctx)) else { return };
-        if e == Effect::LoadEditor {
-            self.settings_load_editor(cx);
+        match e {
+            Effect::LoadEditor => self.settings_load_editor(cx),
+            Effect::Devices(d) => self.devices_effect(d, cx),
+            _ => {}
         }
         cx.notify();
     }
@@ -225,6 +231,7 @@ impl AppShell {
                 }
             }
             Effect::CopyText(t) => cx.write_to_clipboard(ClipboardItem::new_string(t)),
+            Effect::Devices(e) => self.devices_effect(e, cx),
         }
     }
 
@@ -372,6 +379,7 @@ impl AppShell {
                 Page::Keybindings => ((h - 190.0) / 30.0).floor(),
                 Page::Appearance => ((h - 190.0) / 26.0).floor().min(14.0),
                 Page::Advanced => ((h - 190.0) / 19.0).floor(),
+                Page::Devices => ((h - 220.0) / 44.0).floor(),
                 Page::About => 6.0,
             };
             st.set_visible(n.max(3.0) as usize);
@@ -426,6 +434,7 @@ impl AppShell {
             Body::Look(l) => self.settings_look_page(l, cx),
             Body::Toml(t) => self.settings_toml(t, cx),
             Body::About(a) => self.settings_about(a, cx),
+            Body::Devices(d) => self.settings_devices(d, cx),
         };
         let main = div()
             .flex_1()
@@ -928,6 +937,98 @@ impl AppShell {
     pub fn settings_click_editor(&mut self, row: usize, cx: &mut Context<Self>) {
         self.with_settings(|st, _| st.click_editor(row, usize::MAX));
         cx.notify();
+    }
+
+    /// The Devices page: what is paired with the local server, Revoke, and a QR code to pair
+    /// another device.
+    fn settings_devices(&self, d: forgetty_shell_core::devices::DevicesView, cx: &mut Context<Self>) -> Div {
+        use forgetty_shell_core::devices::Avail;
+        let th = self.theme;
+        let mut col = div().flex_1().min_h_0().flex().flex_col().gap(px(8.0)).overflow_hidden();
+        if let Avail::No(why) = &d.avail {
+            return col
+                .child(div().text_color(hsla(th.dim)).child("Devices are managed by the local server (forgetty.exe) of this PC."))
+                .child(div().text_color(hsla(WARN)).child(SharedString::from(forgetty_shell_core::notify::notice_text(why))));
+        }
+        if let Some((ok, text)) = &d.message {
+            col = col.child(div().text_size(px(12.0)).text_color(hsla(if *ok { GOOD } else { BAD })).child(SharedString::from(text.clone())));
+        }
+        let pairing = d.qr.is_some();
+        let mut bar = div().flex().flex_row().gap(px(8.0)).flex_none();
+        if pairing {
+            bar = bar.child(self.sbtn(("dev-cancel", 0), "Cancel pairing (Esc)", false, cx, |s, w, cx| s.settings_press("dev-cancel", w, cx)));
+            if d.qr.as_ref().is_some_and(|q| q.can_copy) {
+                bar = bar.child(self.sbtn(("dev-copy", 0), "Copy payload (C)", false, cx, |s, w, cx| s.settings_press("dev-copy", w, cx)));
+            }
+        } else {
+            bar = bar
+                .child(self.sbtn(("dev-pair", 0), "Pair new device (P)", true, cx, |s, w, cx| s.settings_press("dev-pair", w, cx)))
+                .child(self.sbtn(("dev-refresh", 0), "Read again (F5)", false, cx, |s, w, cx| s.settings_press("dev-refresh", w, cx)))
+                .child(self.sbtn(("dev-revoke", 0), "Revoke (Delete)", false, cx, |s, w, cx| s.settings_press("dev-revoke", w, cx)));
+        }
+        col = col.child(bar);
+        if let Some(q) = d.qr {
+            // Black modules on white, whatever the theme: a scanner needs the contrast.
+            let cell = ((240 / q.w.max(1)) as f32).max(3.0);
+            let mut code = div().relative().flex_none().w(px(cell * q.w as f32)).h(px(cell * q.h as f32)).bg(hsla(0xffffff));
+            for (x, y, len) in q.runs {
+                code = code.child(div().absolute().left(px(cell * x as f32)).top(px(cell * y as f32)).w(px(cell * len as f32)).h(px(cell)).bg(hsla(0x000000)));
+            }
+            return col
+                .child(div().text_size(px(12.0)).text_color(hsla(th.dim)).child("Scan this code with the other device. It is open for 2 minutes and accepts one device."))
+                .child(code);
+        }
+        if d.loading && d.rows.is_empty() {
+            col = col.child(div().text_color(hsla(th.dim)).child("Reading the device list..."));
+        } else if d.rows.is_empty() {
+            col = col.child(div().text_color(hsla(th.dim)).child("No device is paired."));
+        }
+        for r in d.rows {
+            let idx = r.index;
+            let sub = format!("{}   paired {}   last seen {}", r.short_id, r.paired, r.last_seen);
+            let mut right = div().flex().flex_row().items_center().gap(px(6.0)).flex_none();
+            if r.armed {
+                right = right
+                    .child(div().text_color(hsla(WARN)).child("Revoke this device?"))
+                    .child(self.sbtn(("dev-confirm", idx), "Revoke", true, cx, move |s, w, cx| {
+                        s.settings_select(idx, cx);
+                        s.settings_press("dev-confirm", w, cx)
+                    }))
+                    .child(self.sbtn(("dev-cancel-row", idx), "Keep", false, cx, |s, w, cx| s.settings_press("dev-cancel", w, cx)));
+            } else if !r.own {
+                right = right.child(self.sbtn(("dev-revoke-row", idx), "Revoke", false, cx, move |s, w, cx| {
+                    s.settings_select(idx, cx);
+                    s.settings_press("dev-revoke", w, cx)
+                }));
+            }
+            col = col.child(
+                div()
+                    .id(("dev-row", idx))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(12.0))
+                    .px(px(12.0))
+                    .py(px(7.0))
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(if r.selected { hsla(th.accent) } else { alpha(th.border, 0.6) })
+                    .when(r.selected, |d| d.bg(alpha(th.accent, 0.08)))
+                    .on_mouse_down(MouseButton::Left, cx.listener(move |s, _e, _w, cx| s.settings_select(idx, cx)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .child(div().child(SharedString::from(r.title)))
+                            .child(div().text_size(px(11.5)).text_color(hsla(th.dim)).child(SharedString::from(sub))),
+                    )
+                    .child(right),
+            );
+        }
+        col
     }
 
     fn settings_about(&self, rows: Vec<(String, String)>, cx: &mut Context<Self>) -> Div {

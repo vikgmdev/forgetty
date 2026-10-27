@@ -23,7 +23,7 @@ the config file watcher (burst, atomic rename, idle),
 the IME handler (preedit, commit, cancel, candidate window anchor at the cursor cell), a real Microsoft IME
 (Japanese) and Microsoft Pinyin driven by injected keys (preedit, conversion, commit, anchor), MSI install and uninstall,
 the local server (start, automatic pairing over loopback, This PC in the sidebar, key latency against the built-in terminal, kill and
-restart by the watchdog, the elevated rule, the `--start-server` exit code).
+restart by the watchdog, the elevated rule, the `--start-server` exit code), the Devices page, picture paste into a local pane, `cursor_style` parsing and the cursor rule, the greyed rows of the tab menu.
 
 CI cannot check: real GPU rendering, real fonts on your monitors, the IME candidate window on screen, sleep and resume,
 real wifi to tether changes, several monitors, Win-key shell behavior, SmartScreen. Those are below.
@@ -590,6 +590,20 @@ Needs the installed app (MSI) or `forgetty-win.exe` and `forgetty.exe` in one fo
 8. Put `local_server = false` in `%APPDATA%\forgetty\config.toml` and restart. [ ] The built-in terminal is used with no notice. [ ] Settings, General, has "Keep terminals in the local server" off. Set it back to true.
 9. Sign out and in (or reboot). [ ] No console window shows at login. [ ] `forgetty server status` says running before you start the app.
 10. Feel: type fast in a tab of This PC and in a tab of the built-in terminal (`local_server = false`). [ ] You cannot tell them apart.
+
+## WP6b: devices, end session, command line, cursor, picture paste
+
+1. Settings (Ctrl+,), Devices (with the local server). [ ] The list shows "This PC (local app)" without Revoke. Press "Pair new device": [ ] a QR and a countdown show, Esc or "Cancel" stops it.
+   Pair a phone or `forgetty-win` on another PC with it: [ ] the device appears in the list. Revoke it (press twice): [ ] it disappears and cannot connect.
+2. Palette, "Quit and end all tabs on this PC". [ ] A question is asked. Yes: the window closes and `forgetty server status` says the server is not running. The next start opens one new tab.
+3. `on_launch = "new"` in Settings, General. Restart with tabs open. [ ] The old tabs are still in their workspace and a new workspace is shown. With `restore` the old tabs are shown.
+4. Command line: `forgetty-win.exe --working-directory C:\Windows -e cmd /k cd`. [ ] A tab opens in `C:\Windows` running cmd. `--working-directory C:\nope` shows an error box and exits.
+   `forgetty-win.exe --bogus` shows the error box. `forgetty-win.exe --help` from a console prints the usage. `--config-file D:\other.toml`: [ ] Settings changes are saved to that file.
+5. Cursor: Settings, Terminal, Cursor shape = Bar. [ ] The cursor of an open prompt turns into a bar at once in every tab. Run `printf '\033[4 q'`: [ ] the cursor becomes an underline (a program's own request wins); `printf '\033[0 q'` or a reset brings the setting back. Unfocused panes show an outline.
+6. Picture paste: take a screenshot (Win+Shift+S), press Ctrl+Shift+V in a tab of This PC. [ ] A path under `%LOCALAPPDATA%\forgetty\cache\clipboard` is typed and the file opens as a PNG.
+   In a tab of a remote machine: [ ] a notice says picture paste works on this PC only and nothing is typed.
+7. `Ctrl+Alt+PageDown` / `Ctrl+Alt+PageUp` with two workspaces. [ ] They switch the workspace.
+8. Right-click a tab. [ ] "Move to New Window" and "Export" are listed and grey.
 
 ## Part B: a week of daily use
 
