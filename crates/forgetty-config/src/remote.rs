@@ -212,7 +212,7 @@ pub fn validate_remote_settings_with(
         }
         (no_relay, relay_urls)
     };
-    let bind_addrs = if overrides.bind.is_empty() {
+    let mut bind_addrs = if overrides.bind.is_empty() {
         let mut addrs = parse_bind_addrs(&config.bind_addrs)?;
         if addrs.is_empty() && local_defaults {
             addrs.push(LOCAL_DEFAULT_BIND);
@@ -224,17 +224,6 @@ pub fn validate_remote_settings_with(
         }
         parse_bind_addrs(&overrides.bind)?
     };
-    // The local app reaches a local server on 127.0.0.1, so an opt-in list adds to it and never
-    // replaces it. A list with an unspecified address (0.0.0.0 or ::) already covers loopback,
-    // and a second socket on the same port would clash with it.
-    let mut bind_addrs = bind_addrs;
-    if local_defaults
-        && !bind_addrs.is_empty()
-        && !bind_addrs.contains(&LOCAL_DEFAULT_BIND)
-        && !bind_addrs.iter().any(IpAddr::is_unspecified)
-    {
-        bind_addrs.insert(0, LOCAL_DEFAULT_BIND);
-    }
     if no_relay {
         // Without relays the server is reached on its direct addresses only,
         // and a server that binds every address would put them all in the QR.
@@ -250,6 +239,18 @@ pub fn validate_remote_settings_with(
             ));
         }
         check_pairable_bind(&bind_addrs)?;
+    }
+    // After the checks above, which look at the list the user wrote: the added loopback must not
+    // make a list with no pairable address pass.
+    // The local app reaches a local server on 127.0.0.1, so an opt-in list adds to it and never
+    // replaces it. A list with an unspecified address (0.0.0.0 or ::) already covers loopback,
+    // and a second socket on the same port would clash with it.
+    if local_defaults
+        && !bind_addrs.is_empty()
+        && !bind_addrs.contains(&LOCAL_DEFAULT_BIND)
+        && !bind_addrs.iter().any(IpAddr::is_unspecified)
+    {
+        bind_addrs.insert(0, LOCAL_DEFAULT_BIND);
     }
     Ok(RemoteSettings { no_relay, relay_urls, bind_addrs, warnings })
 }

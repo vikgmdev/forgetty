@@ -66,6 +66,8 @@ fn forgetty(state: &Path, timer: &str, args: &[&str]) -> Output {
         .env("FORGETTY_TEST_ALLOW_ELEVATED", "1")
         .env("FORGETTY_PORT", "0")
         .env("FORGETTY_TIMER_RES", timer)
+        .env("FORGETTY_TRACE_LATENCY", "1")
+        .env("RUST_LOG", "latency=info")
         .output()
         .expect("run forgetty")
 }
@@ -146,6 +148,38 @@ fn in_process(label: &str) -> Stats {
     drop(writer);
     drop(pty);
     Stats::new(label, out)
+}
+
+/// The stage gaps the server logged for each echo (`FORGETTY_TRACE_LATENCY`, `latency_trace.rs`),
+/// as medians in microseconds.
+fn show_stages(state: &Path, label: &str) {
+    let log = state.join("data").join("forgetty").join("server.log");
+    let text = std::fs::read_to_string(&log).unwrap_or_default();
+    let mut cols: Vec<Vec<i64>> = vec![Vec::new(); 5];
+    for line in text.lines().filter(|l| l.contains("key echo:")) {
+        let nums: Vec<i64> = line
+            .split(|c: char| !(c.is_ascii_digit() || c == '-'))
+            .filter_map(|t| t.parse().ok())
+            .collect();
+        if nums.len() == 5 {
+            for (c, n) in cols.iter_mut().zip(nums) {
+                c.push(n);
+            }
+        }
+    }
+    if cols[0].is_empty() {
+        println!("PROBE stages {label}: no trace lines in {}", log.display());
+        return;
+    }
+    let med = |v: &mut Vec<i64>| {
+        v.sort();
+        v[v.len() / 2]
+    };
+    let m: Vec<i64> = cols.iter_mut().map(med).collect();
+    println!(
+        "PROBE stages {label} (n={}, median us): input->pty write {} | ->first pty read {} | ->pane event {} | ->frame written {} | total {}",
+        cols[0].len(), m[0], m[1], m[2], m[3], m[4]
+    );
 }
 
 /// A real server started with `timer` as `FORGETTY_TIMER_RES`; a key in over protocol v2, the
@@ -236,6 +270,7 @@ async fn through_server(timer: &str, client: &str) -> (Stats, Stats) {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     h.close().await;
+    show_stages(state.path(), &format!("{client}, server {timer}"));
     let stop = forgetty(state.path(), timer, &["server", "stop"]);
     assert!(stop.status.success(), "{}", text(&stop));
     (

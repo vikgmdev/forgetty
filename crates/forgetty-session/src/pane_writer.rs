@@ -391,6 +391,7 @@ impl PaneWriterOwner {
                     &|| s.touch(),
                 );
                 s.write_since_ms.store(IDLE, Ordering::SeqCst);
+                crate::latency_trace::written();
                 s.touch();
                 let failed = res.is_err();
                 let mut ended = Vec::new();

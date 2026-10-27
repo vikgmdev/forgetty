@@ -28,6 +28,7 @@ pub mod clients;
 pub mod drain_result;
 pub mod events;
 pub mod input_watch;
+pub mod latency_trace;
 pub mod layout;
 pub mod manager;
 pub mod osc;

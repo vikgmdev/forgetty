@@ -3067,10 +3067,15 @@ async fn write_live(
     catchup: bool,
 ) -> Result<(), StreamEnd> {
     if !catchup {
-        return write_output_frame(send, bytes).await.map_err(|_| StreamEnd::Gone);
+        let r = write_output_frame(send, bytes).await.map_err(|_| StreamEnd::Gone);
+        forgetty_session::latency_trace::sent();
+        return r;
     }
     match tokio::time::timeout(NO_PROGRESS, write_output_frame(send, bytes)).await {
-        Ok(Ok(())) => Ok(()),
+        Ok(Ok(())) => {
+            forgetty_session::latency_trace::sent();
+            Ok(())
+        }
         Ok(Err(_)) => Err(StreamEnd::Gone),
         Err(_) => {
             info!("rpc2: a live write made no progress for {NO_PROGRESS:?}, catching up");

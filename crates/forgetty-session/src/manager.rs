@@ -1972,6 +1972,7 @@ impl SessionManager {
     /// queue drops the bytes: the caller counts and logs it.
     pub fn queue_input(&self, id: PaneId, data: Vec<u8>) -> InputOutcome {
         let Some(w) = self.pane_writer(id) else { return InputOutcome::Gone };
+        crate::latency_trace::input();
         match w.try_queue(data) {
             Ok(()) => InputOutcome::Queued,
             Err(crate::pane_writer::QueueError::Full) => InputOutcome::Full,
@@ -2185,6 +2186,7 @@ impl SessionManager {
             pane_id: id,
             data: bytes::Bytes::copy_from_slice(bytes),
         });
+        crate::latency_trace::event();
         for ev in meta_events {
             let _ = inner.event_tx.send(ev);
         }
