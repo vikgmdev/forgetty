@@ -42,6 +42,8 @@ pub struct LsPhase {
     ps_base_col: usize,
     ps_model: Vec<f64>,
     ps_probe: Option<(usize, usize, char, Instant)>,
+    ps_log_mark: usize,
+    ps_segs: Vec<[f64; 4]>,
     /// First key send and last echo of the UI key probes.
     ui_window: Option<(Instant, Instant)>,
     /// Per UI key: ms until a second connection saw the pane's output with that key.
@@ -228,8 +230,33 @@ fn server_stages(state: &std::path::Path) -> serde_json::Value {
         None
     }
     let text = find(state, 5).and_then(|l| std::fs::read_to_string(l).ok()).unwrap_or_default();
+    stages_json(&text.lines().filter(|l| l.contains("key echo:")).map(str::to_string).collect::<Vec<_>>())
+}
+
+/// The `key echo:` lines of the server log so far (to mark where a phase starts).
+fn key_echo_lines(state: &std::path::Path) -> Vec<String> {
+    fn find(dir: &std::path::Path, depth: u32) -> Option<std::path::PathBuf> {
+        for e in std::fs::read_dir(dir).ok()?.filter_map(Result::ok) {
+            let p = e.path();
+            if p.is_file() && p.file_name().is_some_and(|n| n == "server.log") {
+                return Some(p);
+            }
+            if depth > 0 && p.is_dir() {
+                if let Some(f) = find(&p, depth - 1) {
+                    return Some(f);
+                }
+            }
+        }
+        None
+    }
+    let text = find(state, 5).and_then(|l| std::fs::read_to_string(l).ok()).unwrap_or_default();
+    text.lines().filter(|l| l.contains("key echo:")).map(str::to_string).collect()
+}
+
+/// Medians (microseconds) of the five stage numbers on `key echo:` lines.
+fn stages_json(lines: &[String]) -> serde_json::Value {
     let mut cols: Vec<Vec<i64>> = vec![Vec::new(); 5];
-    for line in text.lines().filter(|l| l.contains("key echo:")) {
+    for line in lines {
         let nums: Vec<i64> = line.split(|c: char| !(c.is_ascii_digit() || c == '-')).filter_map(|t| t.parse().ok()).collect();
         if nums.len() == 5 {
             for (c, n) in cols.iter_mut().zip(nums) {
@@ -266,6 +293,11 @@ impl ShellSmoke {
                 self.ls.ps_focused = false;
                 self.ls.ps_model.clear();
                 self.ls.ps_probe = None;
+                self.ls.ps_segs.clear();
+                if server {
+                    self.ls.ps_log_mark = self.ls.cli.as_ref().and_then(|c| c.state_dir.as_deref()).map(|d| key_echo_lines(d).len()).unwrap_or(0);
+                    forgetty_remote::trace::enable(true);
+                }
                 // The same start folder on both legs: the home folder.
                 shell.new_tab_with(argv, std::env::var("USERPROFILE").ok(), cx);
                 self.sub = 1;
@@ -340,6 +372,13 @@ impl ShellSmoke {
                 }
                 self.ls.ps_probe = None;
                 self.ls.ps_model.push(model_ms(view.read(cx)));
+                if server {
+                    if let Some(model) = view.read(cx).probe_watch.as_ref().and_then(|w| w.model_at) {
+                        if let Some(seg) = split_key(t0, model) {
+                            self.ls.ps_segs.push(seg);
+                        }
+                    }
+                }
                 if self.ls.ps_model.len() < PROBES {
                     if self.ls.ps_model.len() % 20 == 0 {
                         view.update(cx, |v, _| v.send_bytes(&[0x1b]));
@@ -354,6 +393,19 @@ impl ShellSmoke {
                 view.update(cx, |v, _| v.send_bytes(&[0x1b]));
                 let p50 = summarize_model(&self.ls.ps_model, &format!("_powershell_{leg}_{name}"));
                 if server {
+                    forgetty_remote::trace::enable(false);
+                    let col = |i: usize| self.ls.ps_segs.iter().map(|s| s[i]).collect::<Vec<_>>();
+                    let tot: Vec<f64> = self.ls.ps_segs.iter().map(|s| s.iter().sum()).collect();
+                    record(
+                        &format!("powershell_server_{name}_app_split_p50_ms"),
+                        json!({"n": self.ls.ps_segs.len(), "key_to_writer_task": p50_of(&col(0)), "writer_task_to_client_queue": p50_of(&col(1)),
+                               "queue_to_output_at_client": p50_of(&col(2)), "output_at_client_to_model": p50_of(&col(3)), "total": p50_of(&tot)}),
+                    );
+                    if let Some(d) = self.ls.cli.as_ref().and_then(|c| c.state_dir.as_deref()) {
+                        let lines = key_echo_lines(d);
+                        let mine = lines.get(self.ls.ps_log_mark..).unwrap_or(&[]);
+                        record(&format!("powershell_server_{name}_stage_us"), stages_json(mine));
+                    }
                     let key = format!("key_to_model_p50_ms_powershell_in_process_{name}");
                     let Some(base) = recorded(&key) else { fail(&format!("powershell {name}: no in-process latency was measured")) };
                     record(&format!("powershell_{name}_vs_in_process_ms"), json!({"in_process_p50": base, "server_p50": p50, "delta": p50 - base}));
@@ -371,6 +423,7 @@ impl ShellSmoke {
 
     fn ps_send(&mut self, view: &gpui::Entity<crate::view::TerminalView>, cx: &mut Context<AppShell>, row: usize, col: usize) {
         let ch = (b'a' + (self.ls.ps_model.len() % 26) as u8) as char;
+        forgetty_remote::trace::clear();
         let t0 = Instant::now();
         self.ls.ps_probe = Some((row, col, ch, t0));
         view.update(cx, |v, _| {
