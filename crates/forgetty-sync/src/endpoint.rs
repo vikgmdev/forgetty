@@ -19,7 +19,7 @@
 //! by ALPN into the registered handler map.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -113,6 +113,14 @@ fn bind_error(e: &(dyn std::error::Error + 'static)) -> SyncError {
     } else {
         SyncError::Bind(msg)
     }
+}
+
+/// A [`SyncEndpoint::rebind`] that did not happen.
+#[derive(Debug)]
+pub struct RebindFailed {
+    /// The old endpoint was closed already: its connections dropped.
+    pub dropped: bool,
+    pub error: SyncError,
 }
 
 /// What [`SyncEndpoint::revoke_device`] did.
@@ -239,18 +247,71 @@ impl SyncEndpointBuilder {
         alpn_list.push(FORGETTY_PAIRING_ALPN_V1.to_vec());
         alpn_list.extend(self.extra_alpns.keys().cloned());
 
+        let cfg = BindConfig {
+            secret_key: self.secret_key.clone(),
+            alpn_list,
+            relays_disabled: self.relays_disabled,
+            relay_urls: self.relay_urls.clone(),
+            n0_discovery: self.n0_discovery,
+            transport: self.transport.clone(),
+            bind_addrs: self.bind_addrs.clone(),
+            bind_port: self.bind_port,
+        };
+        let endpoint = bind_endpoint(&cfg).await?;
+
+        let registry = Arc::new(Mutex::new(DeviceRegistry::load().map_err(SyncError::Registry)?));
+        let (event_tx, _) = broadcast::channel(64);
+
+        Ok(SyncEndpoint {
+            node_id: endpoint.id(),
+            endpoint: std::sync::RwLock::new(Some(endpoint)),
+            cfg: Mutex::new(cfg),
+            rebind_lock: tokio::sync::Mutex::new(()),
+            rebinding: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
+            registry,
+            pairing: Arc::new(Mutex::new(PairingState::new())),
+            extra_alpns: Arc::new(self.extra_alpns),
+            relay_urls: self.relay_urls.iter().map(|u| u.to_string()).collect(),
+            n0_discovery: self.n0_discovery && !self.relays_disabled,
+            relays_disabled: self.relays_disabled,
+            live: crate::connections::LiveConnections::new(),
+            quic_open: Arc::new(AtomicUsize::new(0)),
+            handshake_failures: Arc::new(AtomicUsize::new(0)),
+            event_tx,
+        })
+    }
+}
+
+/// What it takes to bind the iroh endpoint again: kept by [`SyncEndpoint`] so
+/// [`SyncEndpoint::rebind`] can build the same endpoint (same key, same ALPNs,
+/// same port) with another set of addresses.
+#[derive(Clone)]
+struct BindConfig {
+    secret_key: SecretKey,
+    alpn_list: Vec<Vec<u8>>,
+    relays_disabled: bool,
+    relay_urls: Vec<iroh::RelayUrl>,
+    n0_discovery: bool,
+    transport: Option<iroh::endpoint::QuicTransportConfig>,
+    bind_addrs: Vec<std::net::IpAddr>,
+    bind_port: Option<u16>,
+}
+
+/// Bind an iroh endpoint as `cfg` says.
+async fn bind_endpoint(cfg: &BindConfig) -> Result<Endpoint, SyncError> {
         // Several addresses on port 0 must share one port: find a port that is
         // free on every one of them first (the endpoint binds it right after).
         let bind_port = {
-            let port = self.bind_port.unwrap_or(0);
-            if port == 0 && self.bind_addrs.len() > 1 {
-                common_free_port(&self.bind_addrs)
+            let port = cfg.bind_port.unwrap_or(0);
+            if port == 0 && cfg.bind_addrs.len() > 1 {
+                common_free_port(&cfg.bind_addrs)
             } else {
                 port
             }
         };
         let make = |dual: bool| -> Result<iroh::endpoint::Builder, SyncError> {
-            let mut builder = if self.relays_disabled {
+            let mut builder = if cfg.relays_disabled {
                 // Nothing of the N0 preset: no relays, no DNS publishing.
                 // The portmapper (UPnP, NAT-PMP, PCP) is on by default and
                 // asks the router: off too.
@@ -260,18 +321,18 @@ impl SyncEndpointBuilder {
             } else {
                 Endpoint::builder(presets::N0)
             }
-            .secret_key(self.secret_key.clone())
-            .alpns(alpn_list.clone());
-            if !self.relays_disabled && !self.relay_urls.is_empty() {
-                builder = builder.relay_mode(iroh::RelayMode::custom(self.relay_urls.clone()));
+            .secret_key(cfg.secret_key.clone())
+            .alpns(cfg.alpn_list.clone());
+            if !cfg.relays_disabled && !cfg.relay_urls.is_empty() {
+                builder = builder.relay_mode(iroh::RelayMode::custom(cfg.relay_urls.clone()));
             }
-            if !self.relays_disabled && !self.n0_discovery {
+            if !cfg.relays_disabled && !cfg.n0_discovery {
                 builder = builder.clear_address_lookup();
             }
-            if let Some(t) = &self.transport {
+            if let Some(t) = &cfg.transport {
                 builder = builder.transport_config(t.clone());
             }
-            if !self.bind_addrs.is_empty() {
+            if !cfg.bind_addrs.is_empty() {
                 builder = builder.clear_ip_transports();
                 // iroh 0.97 takes one default socket per IP family
                 // (`bind_addr`), and its duplicate check looks at the sockets
@@ -284,7 +345,7 @@ impl SyncEndpointBuilder {
                 // socket on the same port.
                 for v4 in [true, false] {
                     let family: Vec<&std::net::IpAddr> =
-                        self.bind_addrs.iter().filter(|ip| ip.is_ipv4() == v4).collect();
+                        cfg.bind_addrs.iter().filter(|ip| ip.is_ipv4() == v4).collect();
                     for (i, ip) in family.iter().enumerate() {
                         let sa = std::net::SocketAddr::new(**ip, bind_port);
                         let result = if i + 1 < family.len() {
@@ -300,7 +361,7 @@ impl SyncEndpointBuilder {
                         builder = result.map_err(|e| SyncError::Bind(format!("{sa}: {e}")))?;
                     }
                 }
-            } else if let Some(port) = self.bind_port {
+            } else if let Some(port) = cfg.bind_port {
                 builder = builder
                     .clear_ip_transports()
                     .bind_addr(format!("0.0.0.0:{port}").as_str())
@@ -315,13 +376,13 @@ impl SyncEndpointBuilder {
         };
         // IPv6 on the same port. A host without IPv6 binds IPv4 only. Addresses
         // the operator chose are bound as they are or not at all.
-        let chose_addrs = !self.bind_addrs.is_empty();
-        let endpoint = match make(self.bind_port.is_some())?.bind().await {
+        let chose_addrs = !cfg.bind_addrs.is_empty();
+        let endpoint = match make(cfg.bind_port.is_some())?.bind().await {
             Ok(ep) => ep,
-            Err(e) if self.bind_port.is_some() && !chose_addrs => {
+            Err(e) if cfg.bind_port.is_some() && !chose_addrs => {
                 warn!(
                     "totem-sync: dual-stack bind on port {:?} failed ({e}), using IPv4 only",
-                    self.bind_port
+                    cfg.bind_port
                 );
                 // The failed dual-stack attempt can still hold the IPv4 port for a moment
                 // (WSL1 releases it late), so the IPv4-only bind retries briefly.
@@ -347,24 +408,7 @@ impl SyncEndpointBuilder {
             Err(e) => return Err(bind_error(&e)),
         };
 
-        let registry = Arc::new(Mutex::new(DeviceRegistry::load().map_err(SyncError::Registry)?));
-        let (event_tx, _) = broadcast::channel(64);
-
-        Ok(SyncEndpoint {
-            endpoint,
-            registry,
-            pairing: Arc::new(Mutex::new(PairingState::new())),
-            extra_alpns: Arc::new(self.extra_alpns),
-            relay_urls: self.relay_urls.iter().map(|u| u.to_string()).collect(),
-            n0_discovery: self.n0_discovery && !self.relays_disabled,
-            relays_disabled: self.relays_disabled,
-            bind_addrs: self.bind_addrs.clone(),
-            live: crate::connections::LiveConnections::new(),
-            quic_open: Arc::new(AtomicUsize::new(0)),
-            handshake_failures: Arc::new(AtomicUsize::new(0)),
-            event_tx,
-        })
-    }
+        Ok(endpoint)
 }
 
 /// A UDP port that is free on every one of `addrs` (a few tries), or `0` when
@@ -386,7 +430,19 @@ fn common_free_port(addrs: &[std::net::IpAddr]) -> u16 {
 ///
 /// Construct via [`SyncEndpoint::builder`].
 pub struct SyncEndpoint {
-    endpoint: Endpoint,
+    /// The iroh endpoint. [`rebind`](Self::rebind) swaps it; everything else
+    /// takes a clone (cheap) through `ep()`.
+    endpoint: std::sync::RwLock<Option<Endpoint>>,
+    /// The node id (the key never changes, a rebind keeps it).
+    node_id: EndpointId,
+    /// How the endpoint was bound, with the addresses it has now.
+    cfg: Mutex<BindConfig>,
+    /// One rebind at a time.
+    rebind_lock: tokio::sync::Mutex<()>,
+    /// A rebind is between the close of the old endpoint and the new one.
+    rebinding: AtomicBool,
+    /// [`close`](Self::close) was called: no rebind any more.
+    closed: AtomicBool,
     registry: Arc<Mutex<DeviceRegistry>>,
     pairing: Arc<Mutex<PairingState>>,
     extra_alpns: Arc<HashMap<Vec<u8>, AlpnHandler>>,
@@ -403,8 +459,6 @@ pub struct SyncEndpoint {
     n0_discovery: bool,
     /// No relay and no n0 at all (see `SyncEndpointBuilder::relays_disabled`).
     relays_disabled: bool,
-    /// The addresses the endpoint was told to bind (empty: every address).
-    bind_addrs: Vec<std::net::IpAddr>,
     /// Broadcast channel for pairing/connection events. Receivers are vended to
     /// socket RPC handlers via `subscribe()`.
     pub event_tx: broadcast::Sender<SyncEvent>,
@@ -423,6 +477,106 @@ impl SyncEndpoint {
         self.handshake_failures.load(Ordering::SeqCst)
     }
 
+    /// The endpoint, or `None` during a rebind and after a failed one. A
+    /// clone keeps the sockets open: hold it only as long as needed.
+    fn ep(&self) -> Option<Endpoint> {
+        self.endpoint.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// The addresses the endpoint binds now (empty: every address).
+    pub fn bind_addrs(&self) -> Vec<std::net::IpAddr> {
+        self.cfg.lock().unwrap_or_else(|e| e.into_inner()).bind_addrs.clone()
+    }
+
+    /// Bind the same endpoint again (same key, same node id, same port, same
+    /// ALPNs) with another set of addresses: for an address that was not on
+    /// the machine at start and has come up. iroh 0.97 cannot add a socket to
+    /// a running endpoint, so the old endpoint is closed and a new one bound.
+    /// Every open connection drops once (the clients reconnect); the device
+    /// registry, the pairing window and the table of connections stay.
+    ///
+    /// The port is checked free on every new address first: a failure there
+    /// leaves everything as it was (`dropped: false`). A failure after the
+    /// close binds the old set again, so the endpoint serves on (`dropped:
+    /// true`).
+    pub async fn rebind(&self, addrs: Vec<std::net::IpAddr>) -> Result<(), RebindFailed> {
+        let fail = |dropped: bool, error: SyncError| RebindFailed { dropped, error };
+        let _one = self.rebind_lock.lock().await;
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(fail(false, SyncError::Bind("the endpoint is closed".into())));
+        }
+        let old_cfg = self.cfg.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if old_cfg.bind_addrs.is_empty() {
+            return Err(fail(false, SyncError::Bind("the endpoint binds every address".into())));
+        }
+        let Some(port) = self.bound_sockets().first().map(|s| s.port()) else {
+            return Err(fail(false, SyncError::Bind("the endpoint has no socket".into())));
+        };
+        for ip in addrs.iter().filter(|ip| !old_cfg.bind_addrs.contains(ip)) {
+            if let Err(e) = std::net::UdpSocket::bind((*ip, port)) {
+                let msg = format!("{ip}:{port}: {e}");
+                return Err(fail(
+                    false,
+                    if e.kind() == std::io::ErrorKind::AddrNotAvailable {
+                        SyncError::BindAddrNotAvailable(msg)
+                    } else {
+                        SyncError::Bind(msg)
+                    },
+                ));
+            }
+        }
+        let mut new_cfg = old_cfg.clone();
+        new_cfg.bind_addrs = addrs;
+        new_cfg.bind_port = Some(port);
+        let mut old_cfg = old_cfg;
+        old_cfg.bind_port = Some(port);
+
+        self.rebinding.store(true, Ordering::SeqCst);
+        // Take the old endpoint out and close it. The sockets are released when
+        // the last clone is gone.
+        let old = self.endpoint.write().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(old) = old {
+            if tokio::time::timeout(std::time::Duration::from_secs(2), old.close()).await.is_err() {
+                warn!("totem-sync: rebind: closing the old endpoint timed out after 2 s");
+            }
+        }
+        // The old sockets can stay a moment: bind again for a short while.
+        let bind_with_retry = |cfg: BindConfig| async move {
+            let mut last = SyncError::Bind(String::new());
+            for attempt in 0..8u32 {
+                if attempt > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+                match bind_endpoint(&cfg).await {
+                    Ok(ep) => return Ok(ep),
+                    Err(e) => last = e,
+                }
+            }
+            Err(last)
+        };
+        let result = match bind_with_retry(new_cfg.clone()).await {
+            Ok(ep) => {
+                *self.endpoint.write().unwrap_or_else(|e| e.into_inner()) = Some(ep);
+                *self.cfg.lock().unwrap_or_else(|e| e.into_inner()) = new_cfg;
+                Ok(())
+            }
+            Err(error) => {
+                // Serve on with what was there.
+                match bind_with_retry(old_cfg).await {
+                    Ok(ep) => {
+                        *self.endpoint.write().unwrap_or_else(|e| e.into_inner()) = Some(ep);
+                    }
+                    Err(e) => {
+                        tracing::error!("totem-sync: rebind: the old addresses cannot be bound again: {e}");
+                    }
+                }
+                Err(fail(true, error))
+            }
+        };
+        self.rebinding.store(false, Ordering::SeqCst);
+        result
+    }
+
     /// Start configuring a new `SyncEndpoint`.
     pub fn builder(secret_key: SecretKey) -> SyncEndpointBuilder {
         SyncEndpointBuilder {
@@ -439,7 +593,7 @@ impl SyncEndpoint {
 
     /// Returns the local `EndpointId` (iroh 0.97 equivalent of spec's `NodeId`).
     pub fn node_id(&self) -> EndpointId {
-        self.endpoint.id()
+        self.node_id
     }
 
     /// Relay URLs this endpoint was configured with, as written in the pairing
@@ -462,24 +616,32 @@ impl SyncEndpoint {
     /// addresses to bind: those, with the port it really listens on. Empty
     /// when it listens on every address.
     pub fn direct_addrs(&self) -> Vec<std::net::SocketAddr> {
-        if self.bind_addrs.is_empty() {
+        let addrs = self.bind_addrs();
+        if addrs.is_empty() {
             return Vec::new();
         }
-        self.endpoint
-            .bound_sockets()
+        self.bound_sockets()
             .into_iter()
-            .filter(|s| self.bind_addrs.contains(&s.ip()) && !s.ip().is_unspecified())
+            .filter(|s| addrs.contains(&s.ip()) && !s.ip().is_unspecified())
             .collect()
     }
 
     /// What the endpoint reaches out to besides its peers. All of it is
     /// empty or zero when relays are disabled.
     pub fn outside_services(&self) -> OutsideServices {
-        let m = self.endpoint.metrics();
+        let Some(ep) = self.ep() else {
+            return OutsideServices {
+                relay_urls: Vec::new(),
+                address_lookups: 0,
+                portmapper_activity: 0,
+                relay_activity: 0,
+            };
+        };
+        let m = ep.metrics();
         let s = &m.socket;
         OutsideServices {
-            relay_urls: self.endpoint.addr().relay_urls().map(ToString::to_string).collect(),
-            address_lookups: self.endpoint.address_lookup().map_or(0, |l| l.len()),
+            relay_urls: ep.addr().relay_urls().map(ToString::to_string).collect(),
+            address_lookups: ep.address_lookup().map_or(0, |l| l.len()),
             portmapper_activity: {
                 let p = &m.portmapper;
                 p.probes_started.get() + p.mapping_attempts.get() + p.local_port_updates.get()
@@ -508,7 +670,7 @@ impl SyncEndpoint {
 
     /// The local UDP sockets the endpoint listens on.
     pub fn bound_sockets(&self) -> Vec<std::net::SocketAddr> {
-        self.endpoint.bound_sockets()
+        self.ep().map(|e| e.bound_sockets()).unwrap_or_default()
     }
 
     /// The table of open connections.
@@ -574,10 +736,11 @@ impl SyncEndpoint {
     /// Bounded to 2 s: a peer that gave up mid-handshake leaves a half-open
     /// connection that would otherwise hold up shutdown.
     pub async fn close(&self) {
-        if tokio::time::timeout(std::time::Duration::from_secs(2), self.endpoint.close())
-            .await
-            .is_err()
-        {
+        self.closed.store(true, Ordering::SeqCst);
+        // A rebind in progress ends first.
+        let _one = self.rebind_lock.lock().await;
+        let Some(ep) = self.ep() else { return };
+        if tokio::time::timeout(std::time::Duration::from_secs(2), ep.close()).await.is_err() {
             tracing::warn!("iroh endpoint close timed out after 2 s");
         }
     }
@@ -598,9 +761,28 @@ impl SyncEndpoint {
     pub async fn accept_loop(self: Arc<Self>) {
         info!("totem-sync: accept loop started");
         loop {
-            let incoming = match self.endpoint.accept().await {
+            // No clone of the endpoint is kept while waiting for the next
+            // connection that is not the one `accept` borrows: a rebind needs
+            // the old sockets released.
+            let next = match self.ep() {
+                Some(ep) => {
+                    let n = ep.accept().await;
+                    drop(ep);
+                    n
+                }
+                None => None,
+            };
+            let incoming = match next {
                 Some(i) => i,
                 None => {
+                    // A rebind closes the old endpoint on purpose: wait for
+                    // the new one and go on.
+                    while self.rebinding.load(Ordering::SeqCst) {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    if self.ep().is_some_and(|e| !e.is_closed()) {
+                        continue;
+                    }
                     info!("totem-sync: endpoint closed, accept loop exiting");
                     break;
                 }
