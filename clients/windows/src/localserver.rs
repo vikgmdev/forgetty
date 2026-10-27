@@ -711,7 +711,13 @@ fn pair_for_user(cli: &Cli, cancel: &std::sync::atomic::AtomicBool, tx: &async_c
     let mut acc = String::new();
     let end = loop {
         if cancel.load(Ordering::SeqCst) {
-            break Err("Cancelled. The code stays valid until it expires (2 minutes).".to_string());
+            // `pair --cancel` ends the window at once, so the code stops working.
+            let closed = matches!(cli.run(&["pair", "--cancel"], Duration::from_secs(10)), Ok(o) if o.code == Some(0));
+            break Err(if closed {
+                "Cancelled. The code no longer works.".to_string()
+            } else {
+                "Cancelled. The code stays valid until it expires (2 minutes).".to_string()
+            });
         }
         match lines.recv_timeout(Duration::from_millis(200)) {
             Ok(l) => {
