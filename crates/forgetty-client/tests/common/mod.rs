@@ -591,6 +591,28 @@ impl TestServer {
         Self::start_real_on(0, extra, true).await
     }
 
+    /// A real server (`--bind` arguments in `extra`) for which the addresses in
+    /// `hidden` are "not on this machine": the server treats them as missing
+    /// until [`show_addresses`](Self::show_addresses) (qa-tools build).
+    pub async fn start_real_hiding(extra: &[&str], hidden: &[&str], need_net: bool) -> TestServer {
+        arm_watchdog();
+        assert!(is_real(), "start_real_hiding needs FORGETTY_REAL_SERVER");
+        let dir = Arc::new(tempfile::tempdir().expect("temp dir"));
+        let data = dir.path().join("state/data/forgetty");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("qa-hidden-addrs"), hidden.join("\n")).unwrap();
+        let extra: Vec<String> = extra.iter().map(ToString::to_string).collect();
+        let panes = if need_net { vec![vec![]] } else { Vec::new() };
+        let real = Real::start(dir, 0, &panes, None, false, None, None, &extra, need_net).await;
+        TestServer { inner: Inner::Real(Box::new(real)) }
+    }
+
+    /// Make the hidden addresses "appear" (see `start_real_hiding`).
+    pub fn show_addresses(&self) {
+        let dir = self.state_dir().expect("real server").join("data/forgetty");
+        std::fs::write(dir.join("qa-hidden-addrs"), "").unwrap();
+    }
+
     /// Like [`start_real_with_args`](Self::start_real_with_args) on `port`.
     /// With `need_net` false it returns as soon as the local socket answers,
     /// without waiting for the iroh endpoint (a server whose bind address is

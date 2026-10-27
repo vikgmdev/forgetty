@@ -23,7 +23,7 @@ pub mod registry;
 pub use forgetty_core::sanitize;
 
 pub use endpoint::{
-    AlpnHandler, OutsideServices, RevokeOutcome, SyncEndpoint, SyncEndpointBuilder, SyncError,
+    AlpnHandler, OutsideServices, RebindFailed, RevokeOutcome, SyncEndpoint, SyncEndpointBuilder, SyncError,
     SyncEvent,
     FORGETTY_PAIRING_ALPN, FORGETTY_PAIRING_ALPN_V1,
 };

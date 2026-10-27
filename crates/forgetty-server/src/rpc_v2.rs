@@ -1535,6 +1535,10 @@ fn shell_state_event(pane_id: Uuid, s: &forgetty_session::ShellSnapshot) -> Serv
     }
 }
 
+/// Kinds of event a connection keeps one pending frame of per pane.
+const KEY_SHELL_STATE: u8 = 0;
+const KEY_CWD: u8 = 1;
+
 fn pump_event(rpc: &RpcV2, ev: SessionEvent, layout_dirty: &mut bool) {
     match ev {
         SessionEvent::TitleChanged { pane_id, title } => {
@@ -2009,7 +2013,12 @@ impl Session {
                                 // not for this peer
                             } else if let ServerEvent::ShellState { pane_id, .. } = &event {
                                 // A whole state: one pending per pane.
-                                let key = *pane_id;
+                                let key = (KEY_SHELL_STATE, *pane_id);
+                                queue.put_keyed(key, control_frame(&ControlMsg::Event { seq, event }));
+                            } else if let ServerEvent::CwdChanged { pane_id, .. } = &event {
+                                // The directory is a whole value too: the
+                                // newest one per pane wins.
+                                let key = (KEY_CWD, *pane_id);
                                 queue.put_keyed(key, control_frame(&ControlMsg::Event { seq, event }));
                             } else if matches!(event, ServerEvent::LayoutChanged { .. }) {
                                 // A layout is a full snapshot: one pending
@@ -2038,19 +2047,33 @@ impl Session {
                         let seq = session.rpc.current_seq();
                         let event = ServerEvent::LayoutChanged { layout: session.rpc.layout_value() };
                         queue.put_layout(control_frame(&ControlMsg::Event { seq, event }));
-                        last_resync = Some(tokio::time::Instant::now());
                     }
-                    if session.has(cap::SHELL_STATE) {
-                        // States that were lost with the lagged events: the
-                        // whole state of each pane, replacing what is queued.
+                    {
+                        // What was lost with the lagged events: the newest
+                        // directory of each pane (every subscriber), and the
+                        // whole shell state (with the capability), replacing
+                        // what is queued.
                         let seq = session.rpc.current_seq();
                         let rpc = session.rpc.clone();
                         let states = tokio::task::spawn_blocking(move || rpc.sm.shell_states())
                             .await
                             .unwrap_or_default();
+                        let with_shell = session.has(cap::SHELL_STATE);
                         for (pane_id, state) in states {
-                            let event = shell_state_event(pane_id.0, &state);
-                            queue.put_keyed(pane_id.0, control_frame(&ControlMsg::Event { seq, event }));
+                            if let Some(cwd) = state.cwd.clone() {
+                                let event = ServerEvent::CwdChanged { pane_id: pane_id.0, cwd };
+                                queue.put_keyed(
+                                    (KEY_CWD, pane_id.0),
+                                    control_frame(&ControlMsg::Event { seq, event }),
+                                );
+                            }
+                            if with_shell {
+                                let event = shell_state_event(pane_id.0, &state);
+                                queue.put_keyed(
+                                    (KEY_SHELL_STATE, pane_id.0),
+                                    control_frame(&ControlMsg::Event { seq, event }),
+                                );
+                            }
                         }
                         last_resync = Some(tokio::time::Instant::now());
                     }

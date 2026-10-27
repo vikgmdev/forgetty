@@ -2156,8 +2156,9 @@ impl SessionManager {
         }
         let mut meta_events: Vec<SessionEvent> = Vec::new();
         let mut shell_flush: Option<std::time::Duration> = None;
+        let mut cwd_flush: Option<std::time::Duration> = None;
         if !found.is_empty() {
-            apply_osc_events(id, pane, found, &mut meta_events, &mut shell_flush);
+            apply_osc_events(id, pane, found, &mut meta_events, &mut shell_flush, &mut cwd_flush);
         }
         // P7.1: the tty mode is read a little after the output, never per
         // chunk and never per byte (see `shell::TTY_CHECK_DELAYS`): a chunk
@@ -2191,6 +2192,9 @@ impl SessionManager {
         }
         if let Some(after) = shell_flush {
             self.schedule_shell_flush(id, after);
+        }
+        if let Some(after) = cwd_flush {
+            self.schedule_cwd_flush(id, after);
         }
         Ok(DrainResult { pty_exited })
     }
@@ -2236,6 +2240,22 @@ impl SessionManager {
             if let Some(pane) = inner.panes.get_mut(&id) {
                 if let Some(state) = pane.osc.shell.take_held(std::time::Instant::now()) {
                     let _ = inner.event_tx.send(SessionEvent::ShellState { pane_id: id, state });
+                }
+            }
+        });
+    }
+
+    /// Send the newest held `CwdChanged` of a pane in `after`.
+    fn schedule_cwd_flush(&self, id: PaneId, after: std::time::Duration) {
+        let Ok(rt) = tokio::runtime::Handle::try_current() else { return };
+        let sm = self.clone();
+        rt.spawn(async move {
+            tokio::time::sleep(after).await;
+            let mut guard = sm.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let inner = &mut *guard;
+            if let Some(pane) = inner.panes.get_mut(&id) {
+                if let Some(cwd) = pane.osc.cwd_merge.take_held(std::time::Instant::now()) {
+                    let _ = inner.event_tx.send(SessionEvent::CwdChanged { pane_id: id, cwd });
                 }
             }
         });
@@ -3149,6 +3169,7 @@ fn apply_osc_events(
     found: Vec<OscEvent>,
     out: &mut Vec<SessionEvent>,
     flush: &mut Option<std::time::Duration>,
+    cwd_flush: &mut Option<std::time::Duration>,
 ) {
     for ev in found {
         match ev {
@@ -3168,7 +3189,7 @@ fn apply_osc_events(
                 if pane.osc.display_cwd.as_deref() != Some(path.as_str()) {
                     pane.osc.display_cwd = Some(path.clone());
                     let state = pane.osc.shell.cwd_changed(&path, now_ms());
-                    out.push(SessionEvent::CwdChanged { pane_id: id, cwd: path });
+                    offer_cwd_changed(id, pane, path, out, cwd_flush);
                     offer_shell_state(id, pane, state, out, flush);
                 }
             }
@@ -3224,6 +3245,29 @@ fn offer_shell_state(
     }
     match pane.osc.shell.offer(state, std::time::Instant::now()) {
         crate::shell::Offer::Send(state) => out.push(SessionEvent::ShellState { pane_id: id, state }),
+        crate::shell::Offer::Hold { flush_in } => {
+            if flush_in.is_some() {
+                *flush = flush_in;
+            }
+        }
+    }
+}
+
+/// Queue a `CwdChanged`, or keep it as the newest while the pane is over its
+/// rate (the same burst and gap as `ShellState`, see `shell::Merger`).
+fn offer_cwd_changed(
+    id: PaneId,
+    pane: &mut PaneState,
+    cwd: String,
+    out: &mut Vec<SessionEvent>,
+    flush: &mut Option<std::time::Duration>,
+) {
+    if tokio::runtime::Handle::try_current().is_err() {
+        out.push(SessionEvent::CwdChanged { pane_id: id, cwd });
+        return;
+    }
+    match pane.osc.cwd_merge.offer(cwd, std::time::Instant::now()) {
+        crate::shell::Offer::Send(cwd) => out.push(SessionEvent::CwdChanged { pane_id: id, cwd }),
         crate::shell::Offer::Hold { flush_in } => {
             if flush_in.is_some() {
                 *flush = flush_in;

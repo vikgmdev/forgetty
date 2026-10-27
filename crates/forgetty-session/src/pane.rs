@@ -26,6 +26,8 @@ pub struct PaneOsc {
     pub status: StatusTracker,
     /// Prompt marks, directory and tty mode of the shell (P7.1).
     pub shell: crate::shell::ShellTracker,
+    /// Rate limit of `CwdChanged` events (a loop of OSC 7).
+    pub cwd_merge: crate::shell::Merger<String>,
     /// Status last published, to emit `StatusChanged` only on a real change.
     pub published: StatusSnapshot,
     pub last_notification: Option<NotificationInfo>,

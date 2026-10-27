@@ -394,11 +394,44 @@ bind only when the error is "address not available". A busy port with the
 default bind still ends the process with a non-zero status, so the service
 manager restarts it.
 
+### Several `--bind` addresses, one of them late
+
+With `--bind A --bind B` and B not on the machine at start (a second tunnel that
+comes up later), the server binds A at once and serves on it. It logs a WARN
+once for B ("--bind B is not on this machine yet; ... it is added when it
+appears"). Every 5 s it looks for B. When B appears, the server binds the iroh
+endpoint again with the full set: same key, same node id, same port. iroh 0.97
+cannot add a socket to a running endpoint, so this closes the endpoint and
+binds a new one. Every open connection drops once and the clients reconnect;
+the device list, the pairing window and the panes are not touched. There is
+one rebind for the addresses that appeared in the same look. New pairing QR
+codes carry B (a QR asked for during the rebind waits for it, 3 s at most; during the
+background retry below it answers at once with what is bound). The
+port is checked free on B first, with a few retries, and nothing is closed if it
+is not. If the new bind fails after the close, the server binds the old set
+again, logs an error and tries B again later (after 10 s, then 20 s; each try
+drops the connections, so after 3 failed tries the server gives B up until it
+restarts and logs a WARN once; the wait is per address, so another address that
+appears is not held back; when the bind error names an address, only that one
+gets the strike, otherwise all that were added in that try). If even the old set cannot be bound,
+the server never stays without an endpoint: it keeps trying in the background
+(1 s, 2 s, up to 10 s apart): the full set, then the old set, then each address
+alone, and logs which addresses are bound. If B goes away later, nothing
+happens: iroh keeps the sockets it has. Known leak: when closing the old
+endpoint takes more than 2 s, its connection tasks stay until the peers give
+up; this happens once per address that appears. If none of the addresses is
+there at start, the server waits as described above, and binds the ones that
+exist when the first appears.
+
 A systemd user unit cannot be ordered after `wg-quick@wg0` (that is a system
 unit), so the unit has no `After=` for the tunnel. The retry covers it.
 
 ### Manual checks (need root, not in the test suite)
 
+- Second tunnel up after the server (`--bind` with two addresses, one missing):
+  the log shows `iroh endpoint bound again on ...` within 5 s of the address
+  appearing and clients are back within a few seconds. (The test suite hides an
+  address from the server with a test hook instead.)
 - Tunnel up after the server: stop the tunnel, start the server, then run
   `sudo wg-quick up wg0`. Within 10 s the log shows `iroh endpoint bound` and a
   client connects. (The test suite covers the same retry with a busy port,
@@ -440,7 +473,9 @@ Limits:
   and turns the integration off.
 - A prompt theme that rebuilds `PS1` on every prompt (powerlevel10k, starship)
   keeps the marks: they are added after the theme runs. The first prompt of the
-  shell can lack them.
+  shell can lack them, and so can the first prompt after a hook is added later to
+  `PROMPT_COMMAND`.
 - A pane that writes marks in a loop gets its states merged (a burst of 8, then
   one per 10 ms per pane, and the newest pending one per client connection), so a
-  client sees where the shell is, not every step.
+  client sees where the shell is, not every step. The same holds for the
+  directory (`CwdChanged`, OSC 7).
