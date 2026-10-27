@@ -384,6 +384,8 @@ jobs:
             $out = & $cli --state-dir $state server run 2>&1
             Write-Host "forgetty.exe server run (elevated): exit $LASTEXITCODE, $out"
             if ($LASTEXITCODE -ne 78) { throw "an elevated server run must exit 78, got $LASTEXITCODE" }
+            # The step must not end with the exit code of this check.
+            $global:LASTEXITCODE = 0
           }
           # Nothing the smoke did may stay in the install folder.
           $extra = Get-ChildItem $dir | Where-Object { $_.Name -notin @("forgetty-win.exe", "forgetty.exe", "ghostty-vt.dll") }
