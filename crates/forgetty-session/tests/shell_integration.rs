@@ -538,3 +538,40 @@ async fn bash_with_extquote_off_keeps_the_users_prompt_command_intact() {
     assert!(!text.contains("command not found"), "output:\n{text}");
     sm.close_pane(pane).unwrap();
 }
+
+/// A pane that writes OSC 7 in a loop: the `CwdChanged` events merge (the same
+/// burst and rate as `ShellState`) and the last directory is the true one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pane_writing_osc7_in_a_loop_gets_merged_cwd_events() {
+    let _one = SERIAL.lock().await;
+    let Some(shell) = find_shell("bash") else {
+        println!("SKIPPED: bash is not installed");
+        return;
+    };
+    let env = quiet_home();
+    set_env(env.home.path());
+    let sm = SessionManager::new();
+    let mut rx = sm.subscribe_meta();
+    let pane = spawn_pane(&sm, &shell, &env.work);
+    let out = Output::start(&sm, pane);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    sm.write_pty(
+        pane,
+        b"for ((i=0;i<5000;i++)); do printf '\\e]7;file://%s/tmp/c%d\\a' \"$HOSTNAME\" $i; done; echo FLOOD-$((1+1))\n",
+    )
+    .unwrap();
+    out.wait_for("FLOOD-2").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut cwds: Vec<String> = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        if let SessionEvent::CwdChanged { pane_id, cwd } = ev {
+            if pane_id == pane {
+                cwds.push(cwd);
+            }
+        }
+    }
+    println!("{} CwdChanged for 5000 directories", cwds.len());
+    assert!(cwds.len() < 300, "{} events for 5000 directories", cwds.len());
+    assert_eq!(cwds.last().map(String::as_str), Some("/tmp/c4999"), "{:?}", cwds.last());
+    sm.close_pane(pane).unwrap();
+}

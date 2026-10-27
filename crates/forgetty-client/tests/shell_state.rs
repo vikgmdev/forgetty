@@ -224,3 +224,45 @@ async fn a_flood_of_marks_ends_in_the_last_state_with_few_events() {
     h.close().await;
     server.shutdown().await;
 }
+
+/// The same for `CwdChanged` over v2: a flood of OSC 7 ends in the last
+/// directory with few events, for a client that reads late.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_flood_of_osc7_ends_in_the_last_directory_with_few_events() {
+    if !real_only() {
+        return;
+    }
+    let server = TestServer::start(TestServerConfig::default()).await;
+    let pane = server.add_pane();
+    let h = connect(&server, false).await;
+    let mut events = h.events().await.expect("events");
+    let mut flood = Vec::new();
+    for i in 0..5000 {
+        flood.extend_from_slice(format!("\x1b]7;file://localhost/tmp/c{i}\x07").as_bytes());
+    }
+    for chunk in flood.chunks(16 * 1024) {
+        h.send_input(pane, chunk).await.expect("send_input");
+    }
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let mut n = 0usize;
+    let ok = tokio::time::timeout(Duration::from_secs(20), async {
+        while let Some(item) = events.next().await {
+            if let EventItem::Server { event: ServerEvent::CwdChanged { pane_id, cwd }, .. } = item
+            {
+                if pane_id == pane {
+                    n += 1;
+                    if cwd == "/tmp/c4999" {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    })
+    .await;
+    assert_eq!(ok, Ok(true), "the last directory never came; {n} events");
+    println!("{n} CwdChanged events for 5000 directories");
+    assert!(n < 300, "{n} events for 5000 directories");
+    h.close().await;
+    server.shutdown().await;
+}

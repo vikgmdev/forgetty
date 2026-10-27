@@ -41,15 +41,77 @@ pub const EVENT_BURST: u32 = 8;
 /// The refill interval of the burst allowance.
 pub const MIN_EVENT_GAP: Duration = Duration::from_millis(10);
 
-/// What to do with a new state (see [`ShellTracker::offer`]).
+/// What to do with a new value (see [`Merger::offer`]).
 #[derive(Debug, PartialEq, Eq)]
-pub enum Offer {
+pub enum Offer<T = ShellSnapshot> {
     /// Send it now.
-    Send(ShellSnapshot),
-    /// Kept as the newest state. When `flush_in` is set, call
-    /// [`ShellTracker::take_held`] after that long; when `None`, a flush is
-    /// queued already.
+    Send(T),
+    /// Kept as the newest value. When `flush_in` is set, call
+    /// [`Merger::take_held`] after that long; when `None`, a flush is queued
+    /// already.
     Hold { flush_in: Option<Duration> },
+}
+
+/// The rate limit of a stream of events of one pane: a burst of
+/// [`EVENT_BURST`], then one per [`MIN_EVENT_GAP`]. Over that, the newest value
+/// is held and goes out when the next one is due (newest pending wins).
+#[derive(Debug)]
+pub struct Merger<T> {
+    /// Burst allowance left, and when it was last topped up.
+    tokens: u32,
+    refilled: Option<std::time::Instant>,
+    held: Option<T>,
+    flush_scheduled: bool,
+}
+
+impl<T> Default for Merger<T> {
+    fn default() -> Self {
+        Merger { tokens: 0, refilled: None, held: None, flush_scheduled: false }
+    }
+}
+
+impl<T> Merger<T> {
+    fn refill(&mut self, now: std::time::Instant) {
+        let Some(last) = self.refilled else {
+            self.refilled = Some(now);
+            self.tokens = EVENT_BURST;
+            return;
+        };
+        let gaps = (now.duration_since(last).as_millis() / MIN_EVENT_GAP.as_millis()) as u32;
+        if gaps > 0 {
+            self.tokens = (self.tokens + gaps).min(EVENT_BURST);
+            self.refilled = Some(last + MIN_EVENT_GAP * gaps);
+        }
+    }
+
+    /// A value changed. Decide whether it goes out now or waits, as the newest
+    /// one, for the next refill of the burst allowance.
+    pub fn offer(&mut self, value: T, now: std::time::Instant) -> Offer<T> {
+        self.refill(now);
+        if !self.flush_scheduled && self.tokens > 0 {
+            self.tokens -= 1;
+            self.held = None;
+            return Offer::Send(value);
+        }
+        self.held = Some(value);
+        if self.flush_scheduled {
+            return Offer::Hold { flush_in: None };
+        }
+        self.flush_scheduled = true;
+        let since = self.refilled.map_or(Duration::ZERO, |t| now.duration_since(t));
+        Offer::Hold {
+            flush_in: Some(MIN_EVENT_GAP.saturating_sub(since).max(Duration::from_millis(1))),
+        }
+    }
+
+    /// The flush asked for by [`Offer::Hold`]: the newest held value.
+    pub fn take_held(&mut self, now: std::time::Instant) -> Option<T> {
+        self.refill(now);
+        self.flush_scheduled = false;
+        let held = self.held.take()?;
+        self.tokens = self.tokens.saturating_sub(1);
+        Some(held)
+    }
 }
 
 /// Where the shell is in its prompt cycle.
@@ -127,11 +189,7 @@ pub struct ShellTracker {
     pub chain_epoch: u64,
     /// The first check of the current chain has not run yet.
     pub first_check_pending: bool,
-    /// Burst allowance left, and when it was last topped up.
-    tokens: u32,
-    refilled: Option<std::time::Instant>,
-    held: Option<ShellSnapshot>,
-    flush_scheduled: bool,
+    merge: Merger<ShellSnapshot>,
     /// Termios reads so far (for tests: it must stay far below the number of
     /// output chunks).
     pub tty_reads: u64,
@@ -151,46 +209,14 @@ impl ShellTracker {
         }
     }
 
-    fn refill(&mut self, now: std::time::Instant) {
-        let Some(last) = self.refilled else {
-            self.refilled = Some(now);
-            self.tokens = EVENT_BURST;
-            return;
-        };
-        let gaps = (now.duration_since(last).as_millis() / MIN_EVENT_GAP.as_millis()) as u32;
-        if gaps > 0 {
-            self.tokens = (self.tokens + gaps).min(EVENT_BURST);
-            self.refilled = Some(last + MIN_EVENT_GAP * gaps);
-        }
-    }
-
-    /// A state changed. Decide whether it goes out now or waits, as the newest
-    /// state, for the next refill of the burst allowance.
+    /// A state changed: send it now, or hold it as the newest (see [`Merger`]).
     pub fn offer(&mut self, snap: ShellSnapshot, now: std::time::Instant) -> Offer {
-        self.refill(now);
-        if !self.flush_scheduled && self.tokens > 0 {
-            self.tokens -= 1;
-            self.held = None;
-            return Offer::Send(snap);
-        }
-        self.held = Some(snap);
-        if self.flush_scheduled {
-            return Offer::Hold { flush_in: None };
-        }
-        self.flush_scheduled = true;
-        let since = self.refilled.map_or(Duration::ZERO, |t| now.duration_since(t));
-        Offer::Hold {
-            flush_in: Some(MIN_EVENT_GAP.saturating_sub(since).max(Duration::from_millis(1))),
-        }
+        self.merge.offer(snap, now)
     }
 
     /// The flush asked for by [`Offer::Hold`]: the newest held state.
     pub fn take_held(&mut self, now: std::time::Instant) -> Option<ShellSnapshot> {
-        self.refill(now);
-        self.flush_scheduled = false;
-        let held = self.held.take()?;
-        self.tokens = self.tokens.saturating_sub(1);
-        Some(held)
+        self.merge.take_held(now)
     }
 
     /// The state as it is now, without a change (the revision stays).

@@ -1535,6 +1535,10 @@ fn shell_state_event(pane_id: Uuid, s: &forgetty_session::ShellSnapshot) -> Serv
     }
 }
 
+/// Kinds of event a connection keeps one pending frame of per pane.
+const KEY_SHELL_STATE: u8 = 0;
+const KEY_CWD: u8 = 1;
+
 fn pump_event(rpc: &RpcV2, ev: SessionEvent, layout_dirty: &mut bool) {
     match ev {
         SessionEvent::TitleChanged { pane_id, title } => {
@@ -2009,7 +2013,12 @@ impl Session {
                                 // not for this peer
                             } else if let ServerEvent::ShellState { pane_id, .. } = &event {
                                 // A whole state: one pending per pane.
-                                let key = *pane_id;
+                                let key = (KEY_SHELL_STATE, *pane_id);
+                                queue.put_keyed(key, control_frame(&ControlMsg::Event { seq, event }));
+                            } else if let ServerEvent::CwdChanged { pane_id, .. } = &event {
+                                // The directory is a whole value too: the
+                                // newest one per pane wins.
+                                let key = (KEY_CWD, *pane_id);
                                 queue.put_keyed(key, control_frame(&ControlMsg::Event { seq, event }));
                             } else if matches!(event, ServerEvent::LayoutChanged { .. }) {
                                 // A layout is a full snapshot: one pending
@@ -2050,7 +2059,7 @@ impl Session {
                             .unwrap_or_default();
                         for (pane_id, state) in states {
                             let event = shell_state_event(pane_id.0, &state);
-                            queue.put_keyed(pane_id.0, control_frame(&ControlMsg::Event { seq, event }));
+                            queue.put_keyed((KEY_SHELL_STATE, pane_id.0), control_frame(&ControlMsg::Event { seq, event }));
                         }
                         last_resync = Some(tokio::time::Instant::now());
                     }

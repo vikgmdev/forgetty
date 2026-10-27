@@ -464,4 +464,5 @@ Limits:
   shell can lack them.
 - A pane that writes marks in a loop gets its states merged (a burst of 8, then
   one per 10 ms per pane, and the newest pending one per client connection), so a
-  client sees where the shell is, not every step.
+  client sees where the shell is, not every step. The same holds for the
+  directory (`CwdChanged`, OSC 7).
