@@ -7,6 +7,7 @@ pub mod acl;
 mod backend;
 mod convert;
 mod source;
+pub mod trace;
 pub mod store;
 
 pub use backend::{map_conn, map_err, RemoteBackend, RemoteParams};

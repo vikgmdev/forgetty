@@ -121,6 +121,7 @@ impl RemotePaneSource {
                         evs.push(PaneEvent::Output(out));
                     }
                     Some(PaneItem::Data { offset, bytes }) => {
+                        crate::trace::stamp("recv");
                         // Bytes from `replay_end` on are live: end the replay before them.
                         if replay_open && replay_end.is_some_and(|e| offset >= e) {
                             replay_open = false;
@@ -162,11 +163,15 @@ impl RemotePaneSource {
                     q.ready.notified().await;
                     continue;
                 };
+                crate::trace::stamp("popped");
                 // While disconnected the client buffers up to 64 KiB and sends the bytes in
                 // order after the connection resumes. It takes a buffer whole or refuses it.
-                if let Err(e) = c.send_input_flagged(pane, &buf, auto).await {
-                    q.dropped.fetch_add(buf.len() as u64, Ordering::Relaxed);
-                    eprintln!("forgetty-win: remote input dropped ({} bytes): {e}", buf.len());
+                match c.send_input_flagged(pane, &buf, auto).await {
+                    Ok(()) => crate::trace::stamp("handed"),
+                    Err(e) => {
+                        q.dropped.fetch_add(buf.len() as u64, Ordering::Relaxed);
+                        eprintln!("forgetty-win: remote input dropped ({} bytes): {e}", buf.len());
+                    }
                 }
             }
         });
@@ -202,6 +207,7 @@ impl PaneSource for RemotePaneSource {
 
     fn write_input(&self, bytes: &[u8]) {
         if !bytes.is_empty() {
+            crate::trace::stamp("queued");
             self.input.push(false, bytes);
         }
     }

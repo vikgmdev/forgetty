@@ -29,6 +29,33 @@ pub struct LsPhase {
     base_col: usize,
     pid: u64,
     t0: Option<Instant>,
+    rtt_started: bool,
+    /// Per key: ms from the key to the writer task, to the client queue, to the output reaching the
+    /// client, to the terminal model.
+    segs: Vec<[f64; 4]>,
+}
+
+/// Round trips of a small request to the server, in ms, and whether the loop has ended.
+static RTT_MS: std::sync::Mutex<Vec<f64>> = std::sync::Mutex::new(Vec::new());
+static RTT_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn p50_of(v: &[f64]) -> f64 {
+    let mut s = v.to_vec();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    s.get(s.len() / 2).copied().unwrap_or(f64::NAN)
+}
+
+/// The split of one key: stamps are the app's (`forgetty_remote::trace`), `model` is when the echo
+/// reached the terminal model. None when a stamp is missing.
+fn split_key(t0: Instant, model: Instant) -> Option<[f64; 4]> {
+    let log = forgetty_remote::trace::take();
+    let first = |kind: &str, after: Instant| log.iter().find(|(k, t)| *k == kind && *t >= after).map(|(_, t)| *t);
+    let queued = first("queued", t0)?;
+    let popped = first("popped", queued)?;
+    let handed = first("handed", popped)?;
+    let recv = log.iter().rev().find(|(k, t)| *k == "recv" && *t <= model && *t >= handed).map(|(_, t)| *t)?;
+    let d = |a: Instant, b: Instant| ms(b.saturating_duration_since(a));
+    Some([d(t0, popped), d(popped, handed), d(handed, recv), d(recv, model)])
 }
 
 fn recorded(key: &str) -> Option<f64> {
@@ -140,6 +167,41 @@ impl ShellSmoke {
                 let (cr, cc) = view.read(cx).term.cursor();
                 match self.sub {
                     0 => {
+                        if !self.ls.rtt_started {
+                            // The round trip of a small request, idle: the floor of the link and
+                            // the server's dispatch, to tell from the PTY and the output path.
+                            self.ls.rtt_started = true;
+                            let id = self.ls.server;
+                            let backend = id.and_then(|id| shell.machines.iter().find(|m| m.id == id).map(|m| m.backend.clone()));
+                            let rt = shell.remote.as_ref().map(|r| r.rt.clone());
+                            let (Some(backend), Some(rt)) = (backend, rt) else { fail("local server: no backend for the round trip probe") };
+                            rt.spawn(async move {
+                                for _ in 0..50 {
+                                    let t = Instant::now();
+                                    if backend.get_layout().await.is_ok() {
+                                        RTT_MS.lock().unwrap().push(ms(t.elapsed()));
+                                    }
+                                    tokio::time::sleep(Duration::from_millis(20)).await;
+                                }
+                                RTT_DONE.store(true, std::sync::atomic::Ordering::SeqCst);
+                            });
+                            self.sub_t0 = Instant::now();
+                            return;
+                        }
+                        if !RTT_DONE.load(std::sync::atomic::Ordering::SeqCst) && self.sub_t0.elapsed() < Duration::from_secs(20) {
+                            return;
+                        }
+                        {
+                            let v = RTT_MS.lock().unwrap().clone();
+                            let mut s = v.clone();
+                            s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                            record(
+                                "local_server_rpc_rtt_ms",
+                                json!({"n": s.len(), "p50": p50_of(&v), "min": s.first(), "p95": s.get(s.len() * 95 / 100), "max": s.last()}),
+                            );
+                        }
+                        forgetty_remote::trace::enable(true);
+                        self.ls.segs.clear();
                         self.ls.base_col = cc;
                         self.lat_ms.clear();
                         self.lat_model_ms.clear();
@@ -149,6 +211,7 @@ impl ShellSmoke {
                     1 | 3 => {
                         if cc == self.ls.base_col && self.sub_t0.elapsed() > Duration::from_millis(100) {
                             let ch = self.next_key_char();
+                            forgetty_remote::trace::clear();
                             let t0 = Instant::now();
                             self.probe = Some(Probe { row: cr, col: cc, ch, t0 });
                             view.update(cx, |v, _| {
@@ -177,11 +240,32 @@ impl ShellSmoke {
                         let p = self.probe.take().unwrap();
                         self.lat_ms.push(ms(now_t - p.t0));
                         self.lat_model_ms.push(model_ms(view.read(cx)));
+                        if let Some(model) = view.read(cx).probe_watch.as_ref().and_then(|w| w.model_at) {
+                            if let Some(seg) = split_key(p.t0, model) {
+                                self.ls.segs.push(seg);
+                            }
+                        }
                         self.max_reshaped_per_key = self.max_reshaped_per_key.max(reshaped);
                         if self.lat_ms.len() >= PROBES {
                             let (frame50, _) = summarize_keys(&self.lat_ms, self.max_reshaped_per_key, "_local_server");
                             let model50 = summarize_model(&self.lat_model_ms, "_local_server");
                             self.lat_model_ms.clear();
+                            forgetty_remote::trace::enable(false);
+                            {
+                                let col = |i: usize| self.ls.segs.iter().map(|s| s[i]).collect::<Vec<_>>();
+                                let tot: Vec<f64> = self.ls.segs.iter().map(|s| s.iter().sum()).collect();
+                                record(
+                                    "local_server_key_split_p50_ms",
+                                    json!({
+                                        "n": self.ls.segs.len(),
+                                        "key_to_writer_task": p50_of(&col(0)),
+                                        "writer_task_to_client_queue": p50_of(&col(1)),
+                                        "queue_to_output_at_client": p50_of(&col(2)),
+                                        "output_at_client_to_model": p50_of(&col(3)),
+                                        "total": p50_of(&tot),
+                                    }),
+                                );
+                            }
                             // A number that was not measured fails the gate: no default.
                             let Some(base_model) = recorded("key_to_model_p50_ms") else { fail("local server: no in-process model latency was measured") };
                             let Some(base_frame) = recorded("key_to_frame_p50_ms") else { fail("local server: no in-process frame latency was measured") };
@@ -208,6 +292,7 @@ impl ShellSmoke {
                         } else {
                             let (r, c) = view.read(cx).term.cursor();
                             let ch = self.next_key_char();
+                            forgetty_remote::trace::clear();
                             let t0 = Instant::now();
                             self.probe = Some(Probe { row: r, col: c, ch, t0 });
                             view.update(cx, |v, _| {
