@@ -31,6 +31,10 @@ pub struct LsPhase {
     t0: Option<Instant>,
     rtt_started: bool,
     probe_started: bool,
+    /// First key send and last echo of the UI key probes.
+    ui_window: Option<(Instant, Instant)>,
+    /// Per UI key: ms until a second connection saw the pane's output with that key.
+    c2_ms: Vec<f64>,
     /// Per key: ms from the key to the writer task, to the client queue, to the output reaching the
     /// client, to the terminal model.
     segs: Vec<[f64; 4]>,
@@ -100,6 +104,64 @@ async fn probe_task(
         }
         PROBE_MS.lock().unwrap().push(ms(t0.elapsed()));
         tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let _ = backend.close_tab(reply.tab_id).await;
+    c.close().await;
+    Ok(())
+}
+
+/// Output of the UI pane as a second connection saw it: when each `Data` item arrived.
+static C2_RECV: std::sync::Mutex<Vec<(Instant, Vec<u8>)>> = std::sync::Mutex::new(Vec::new());
+/// Keys of the concurrent probe: when each was sent and its echo time, ms.
+static CONC_MS: std::sync::Mutex<Vec<(Instant, f64)>> = std::sync::Mutex::new(Vec::new());
+static CONC_STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// While the key probes of the UI pane run: (1) a second connection attached to the same pane
+/// logs when its output arrives, (2) the same connection types into a pane of its own, one key
+/// every 25 ms, and times the echo. If (2) stays fast while the UI keys are slow, the slowness
+/// is on the UI connection or its pane source. If it is slow too, it is this process (CPU) or
+/// the server. (1) says whether another connection sees the UI pane's echo earlier.
+async fn concurrent_task(
+    server: forgetty_client::EndpointAddr,
+    identity: forgetty_client::SecretKey,
+    info: forgetty_client::ClientInfo,
+    opts: forgetty_client::ClientOptions,
+    backend: std::sync::Arc<dyn forgetty_shell_core::SessionBackend>,
+    ui_pane: Uuid,
+) -> Result<(), String> {
+    use forgetty_client::PaneItem;
+    let c = forgetty_client::Client::connect_with(server, identity, info, opts).await.map_err(|e| format!("connect: {e}"))?;
+    let mut ui = c.attach_pane(ui_pane).await.map_err(|e| format!("attach ui pane: {e}"))?;
+    tokio::spawn(async move {
+        while let Some(item) = ui.next().await {
+            if let PaneItem::Data { bytes, .. } = item {
+                C2_RECV.lock().unwrap().push((Instant::now(), bytes.to_vec()));
+            }
+        }
+    });
+    let reply = backend
+        .new_tab(forgetty_shell_core::NewTab { workspace_idx: 0, rows: 24, cols: 80, command: vec![crate::reload::smoke_cmd()], ..Default::default() })
+        .await
+        .map_err(|e| format!("new_tab: {e}"))?;
+    let pane = reply.pane_id.0;
+    let mut stream = c.attach_pane(pane).await.map_err(|e| format!("attach: {e}"))?;
+    while let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(1500), stream.next()).await {}
+    let mut i = 0usize;
+    while !CONC_STOP.load(std::sync::atomic::Ordering::SeqCst) && i < 600 {
+        let key = b'a' + (i % 26) as u8;
+        i += 1;
+        let t0 = Instant::now();
+        c.send_input(pane, &[key]).await.map_err(|e| format!("send: {e}"))?;
+        loop {
+            let left = Duration::from_secs(5).saturating_sub(t0.elapsed());
+            match tokio::time::timeout(left, stream.next()).await {
+                Ok(Some(PaneItem::Data { bytes, .. })) if bytes.contains(&key) => break,
+                Ok(Some(_)) => {}
+                _ => return Err(format!("no echo of {:?}", key as char)),
+            }
+        }
+        CONC_MS.lock().unwrap().push((t0, ms(t0.elapsed())));
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
     let _ = backend.close_tab(reply.tab_id).await;
     c.close().await;
@@ -323,6 +385,27 @@ impl ShellSmoke {
                                 record("local_server_stage_us_after_in_app_probe", server_stages(d));
                             }
                         }
+                        {
+                            let id = self.ls.server;
+                            let backend = id.and_then(|id| shell.machines.iter().find(|m| m.id == id).map(|m| m.backend.clone()));
+                            let parts = shell.remote.as_ref().and_then(|r| {
+                                let m = r.store.local_machine()?;
+                                let info = forgetty_client::ClientInfo::new(Uuid::new_v4(), forgetty_client::proto::ClientKind::Windows, "latency probe 2", env!("CARGO_PKG_VERSION"));
+                                Some((r.rt.clone(), forgetty_remote::store::machine_addr(&m).ok()?, r.store.identity().ok()?, info, forgetty_remote::store::machine_options(&r.addr_cache, &m)))
+                            });
+                            let ui_pane = self.ls.pane.map(|p| p.0);
+                            if let (Some(backend), Some((rt, server, identity, info, opts)), Some(ui_pane)) = (backend, parts, ui_pane) {
+                                C2_RECV.lock().unwrap().clear();
+                                CONC_MS.lock().unwrap().clear();
+                                CONC_STOP.store(false, std::sync::atomic::Ordering::SeqCst);
+                                rt.spawn(async move {
+                                    if let Err(e) = concurrent_task(server, identity, info, opts, backend, ui_pane).await {
+                                        eprintln!("forgetty-win: smoke concurrent probe: {e}");
+                                    }
+                                });
+                            }
+                        }
+                        self.ls.ui_window = None;
                         forgetty_remote::trace::enable(true);
                         self.ls.segs.clear();
                         self.ls.base_col = cc;
@@ -363,6 +446,17 @@ impl ShellSmoke {
                         let p = self.probe.take().unwrap();
                         self.lat_ms.push(ms(now_t - p.t0));
                         self.lat_model_ms.push(model_ms(view.read(cx)));
+                        {
+                            let now = Instant::now();
+                            self.ls.ui_window = Some(match self.ls.ui_window {
+                                Some((a, _)) => (a, now),
+                                None => (p.t0, now),
+                            });
+                            let seen = C2_RECV.lock().unwrap().iter().find(|(t, b)| *t >= p.t0 && b.contains(&(p.ch as u8))).map(|(t, _)| ms(t.saturating_duration_since(p.t0)));
+                            if let Some(v) = seen {
+                                self.ls.c2_ms.push(v);
+                            }
+                        }
                         if let Some(model) = view.read(cx).probe_watch.as_ref().and_then(|w| w.model_at) {
                             if let Some(seg) = split_key(p.t0, model) {
                                 self.ls.segs.push(seg);
@@ -374,6 +468,19 @@ impl ShellSmoke {
                             let model50 = summarize_model(&self.lat_model_ms, "_local_server");
                             self.lat_model_ms.clear();
                             forgetty_remote::trace::enable(false);
+                            CONC_STOP.store(true, std::sync::atomic::Ordering::SeqCst);
+                            {
+                                let all = CONC_MS.lock().unwrap().clone();
+                                let (during, outside): (Vec<(Instant, f64)>, Vec<(Instant, f64)>) =
+                                    all.into_iter().partition(|(t0, _)| self.ls.ui_window.is_some_and(|(a, b)| *t0 >= a && *t0 <= b));
+                                let v = |x: &[(Instant, f64)]| x.iter().map(|(_, m)| *m).collect::<Vec<f64>>();
+                                let (d, o) = (v(&during), v(&outside));
+                                record(
+                                    "local_server_probe_while_ui_keys_ms",
+                                    json!({"during_ui_keys": {"n": d.len(), "p50": p50_of(&d)}, "outside": {"n": o.len(), "p50": p50_of(&o)},
+                                           "second_connection_saw_ui_echo": {"n": self.ls.c2_ms.len(), "p50": p50_of(&self.ls.c2_ms)}}),
+                                );
+                            }
                             {
                                 let col = |i: usize| self.ls.segs.iter().map(|s| s[i]).collect::<Vec<_>>();
                                 let tot: Vec<f64> = self.ls.segs.iter().map(|s| s.iter().sum()).collect();
