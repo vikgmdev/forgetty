@@ -12,6 +12,7 @@ pub mod config;
 pub mod confwatch;
 pub mod conpty;
 pub mod copytext;
+pub mod fileperm;
 pub mod fingerprint;
 pub mod fuzzy;
 pub mod keys;

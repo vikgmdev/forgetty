@@ -190,7 +190,7 @@ impl AppShell {
             self.notice_active(t, cx);
         }
         // An open Settings window shows what the file says now.
-        self.settings_config_changed();
+        self.settings_config_changed(cx);
         cx.notify();
     }
 

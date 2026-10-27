@@ -31,8 +31,11 @@ pub enum Effect {
     Edits(Vec<Edit>),
     Theme(String),
     Font { family: Option<String>, size: Option<f32> },
-    /// The whole text of the TOML editor.
-    SaveText(String),
+    /// The whole text of the TOML editor, and the file text the editor was based on (the save is
+    /// refused when the file is something else by now).
+    SaveText { text: String, expect: String },
+    /// Read the file and give it to `editor_probe`: the file changed while the editor is loaded.
+    ProbeEditor,
     /// Read the file into the TOML editor.
     LoadEditor,
     OpenConfigFile,
@@ -94,6 +97,12 @@ pub struct Settings {
     look: Look,
     editor: TextArea,
     editor_loaded: bool,
+    /// The file text the editor started from (or was last saved as, or kept over).
+    expect: String,
+    /// The text of a save on its way.
+    sent: Option<String>,
+    /// The file on disk, when it changed while the editor had edits that are not saved.
+    stale: Option<String>,
     editor_msg: Option<String>,
     discard_armed: bool,
     pending: HashMap<&'static str, V>,
@@ -190,6 +199,8 @@ pub struct TomlView {
     pub message: Option<String>,
     pub dirty: bool,
     pub loaded: bool,
+    /// The file changed on disk while the editor has edits: offer Reload or Keep.
+    pub stale: bool,
     pub path: String,
 }
 
@@ -235,6 +246,9 @@ impl Settings {
             look: Look { zone: Zone::Theme, theme_filter: String::new(), theme_hi: 0, font_filter: String::new(), font_hi: 0, mono_only: true, size: ctx.cfg.font_size_pt },
             editor: TextArea::new(""),
             editor_loaded: false,
+            expect: String::new(),
+            sent: None,
+            stale: None,
             editor_msg: None,
             discard_armed: false,
             pending: HashMap::new(),
@@ -288,10 +302,44 @@ impl Settings {
     }
 
     /// The file changed (our own write or somebody else's): the values come from the file again.
-    pub fn config_changed(&mut self, ctx: &Ctx) {
+    pub fn config_changed(&mut self, ctx: &Ctx) -> Effect {
         self.pending.clear();
         self.look.size = ctx.cfg.font_size_pt;
         self.look_sync(ctx);
+        if self.editor_loaded {
+            Effect::ProbeEditor
+        } else {
+            Effect::None
+        }
+    }
+
+    /// The file's text after a change. The editor shows it when it has no edits of its own. With
+    /// edits, the editor keeps them and says the file changed (Reload or Keep).
+    pub fn editor_probe(&mut self, r: Result<String, String>) {
+        let Ok(disk) = r else { return };
+        // Our own save is on its way: its end sets the editor right.
+        if self.busy || !self.editor_loaded {
+            return;
+        }
+        if disk == self.expect {
+            self.stale = None;
+        } else if !self.editor.is_dirty() {
+            self.editor = TextArea::new(&disk);
+            self.expect = disk;
+            self.stale = None;
+            self.editor_msg = None;
+            self.discard_armed = false;
+        } else {
+            self.stale = Some(disk);
+        }
+    }
+
+    /// Keep the editor's text: the next save replaces what is on disk now.
+    pub fn editor_keep(&mut self) {
+        if let Some(d) = self.stale.take() {
+            self.expect = d;
+            self.editor_msg = None;
+        }
     }
 
     // ---- the Appearance page ----
@@ -728,7 +776,11 @@ impl Settings {
         self.discard_armed = false;
         if k.ctrl && !k.alt {
             match k.key {
-                "s" => return Effect::SaveText(self.editor.text()),
+                "s" => {
+                    let text = self.editor.text();
+                    self.sent = Some(text.clone());
+                    return Effect::SaveText { text, expect: self.expect.clone() };
+                }
                 "r" => return Effect::LoadEditor,
                 "v" => return Effect::PasteIntoEditor,
                 "c" if k.shift => return Effect::CopyText(self.editor.text()),
@@ -737,6 +789,10 @@ impl Settings {
         }
         if k.key == "v" && k.ctrl {
             return Effect::PasteIntoEditor;
+        }
+        if k.alt && !k.ctrl && !k.shift && k.key == "k" && self.stale.is_some() {
+            self.editor_keep();
+            return Effect::None;
         }
         let page = self.visible.max(3);
         if self.editor.key(k, page) == Out::Edited {
@@ -751,6 +807,8 @@ impl Settings {
         match r {
             Ok(text) => {
                 self.editor = TextArea::new(&text);
+                self.expect = text;
+                self.stale = None;
                 self.editor_loaded = true;
                 self.editor_msg = None;
                 self.discard_armed = false;
@@ -774,11 +832,16 @@ impl Settings {
                 self.status = Some(Status { ok: false, text: e });
             }
             (Wrote::Editor, Ok(warn)) => {
+                if let Some(t) = self.sent.take() {
+                    self.expect = t;
+                }
+                self.stale = None;
                 self.editor.mark_saved();
                 self.editor_msg = None;
                 self.status = Some(Status { ok: true, text: warn.first().map_or_else(|| "Saved".to_string(), |w| format!("Saved. {w}")) });
             }
             (Wrote::Editor, Err(e)) => {
+                self.sent = None;
                 if let Some(n) = error_line(&e) {
                     self.editor.go_to_line(n);
                     self.editor.ensure_visible(self.visible);
@@ -857,6 +920,11 @@ impl Settings {
             }
             "toml-save" => self.key(&KeyIn { key: "s", ctrl: true, ..Default::default() }, ctx),
             "toml-revert" => self.key(&KeyIn { key: "r", ctrl: true, ..Default::default() }, ctx),
+            "toml-reload" => Effect::LoadEditor,
+            "toml-keep" => {
+                self.editor_keep();
+                Effect::None
+            }
             "toml-paste" => Effect::PasteIntoEditor,
             "toml-copy" => Effect::CopyText(self.editor.text()),
             "about-open" => Effect::OpenConfigFile,
@@ -1075,6 +1143,7 @@ impl Settings {
             message: self.editor_msg.clone(),
             dirty: self.editor.is_dirty(),
             loaded: self.editor_loaded,
+            stale: self.stale.is_some(),
             path: String::new(),
         }
     }
@@ -1346,7 +1415,7 @@ mod tests {
         s.editor_loaded(Ok("a = 1\nb = 2\n".into()));
         s.key(&typed("x"), &c);
         let e = s.key(&ck("s", true, false, false), &c);
-        assert_eq!(e, Effect::SaveText("xa = 1\nb = 2\n".into()));
+        assert_eq!(e, Effect::SaveText { text: "xa = 1\nb = 2\n".into(), expect: "a = 1\nb = 2\n".into() });
         s.busy = true;
         s.saved(Wrote::Editor, Err("TOML parse error at line 2, column 3".into()));
         let Body::Toml(t) = s.view(&c).body else { panic!() };
@@ -1365,6 +1434,55 @@ mod tests {
         s.paste("p = 3\nq = 4");
         let Body::Toml(t) = s.view(&c).body else { panic!() };
         assert!(t.dirty);
+    }
+
+    #[test]
+    fn the_editor_follows_the_file_unless_it_has_edits_and_never_saves_over_a_changed_file() {
+        let h = H::new("");
+        let c = h.ctx();
+        let mut s = Settings::new(&c);
+        // Not loaded yet: a change needs no probe.
+        assert_eq!(s.config_changed(&c), Effect::None);
+        s.select_page(Page::Advanced, &c);
+        s.editor_loaded(Ok("a = 1\n".into()));
+        // No edits: the editor takes the new text.
+        assert_eq!(s.config_changed(&c), Effect::ProbeEditor);
+        s.editor_probe(Ok("a = 2\n".into()));
+        let Body::Toml(t) = s.view(&c).body else { panic!() };
+        assert_eq!(t.lines[0].1, "a = 2");
+        assert!(!t.stale && !t.dirty);
+        // The same text as before: nothing happens.
+        s.editor_probe(Ok("a = 2\n".into()));
+        // With edits: the edits stay and the banner shows.
+        s.key(&typed("x"), &c);
+        s.editor_probe(Ok("a = 3\n".into()));
+        let Body::Toml(t) = s.view(&c).body else { panic!() };
+        assert!(t.stale && t.dirty);
+        assert_eq!(t.lines[0].1, "xa = 2");
+        // The save still names the text it loaded, so the file is not overwritten.
+        let e = s.key(&ck("s", true, false, false), &c);
+        assert_eq!(e, Effect::SaveText { text: "xa = 2\n".into(), expect: "a = 2\n".into() });
+        s.busy = false;
+        // Keep: the save is based on the file as it is now.
+        assert_eq!(s.press("toml-keep", &c), Effect::None);
+        let Body::Toml(t) = s.view(&c).body else { panic!() };
+        assert!(!t.stale);
+        let e = s.key(&ck("s", true, false, false), &c);
+        assert_eq!(e, Effect::SaveText { text: "xa = 2\n".into(), expect: "a = 3\n".into() });
+        // A probe that arrives while our save is in flight is ignored.
+        s.busy = true;
+        s.editor_probe(Ok("a = 4\n".into()));
+        s.saved(Wrote::Editor, Ok(vec![]));
+        s.editor_probe(Ok("xa = 2\n".into()));
+        let Body::Toml(t) = s.view(&c).body else { panic!() };
+        assert!(!t.stale && !t.dirty);
+        // Reload takes the file whatever the editor holds.
+        s.key(&typed("y"), &c);
+        s.editor_probe(Ok("b = 1\n".into()));
+        assert_eq!(s.press("toml-reload", &c), Effect::LoadEditor);
+        s.editor_loaded(Ok("b = 1\n".into()));
+        let Body::Toml(t) = s.view(&c).body else { panic!() };
+        assert!(!t.stale && !t.dirty);
     }
 
     #[test]

@@ -21,6 +21,7 @@ fn alpha(hex: u32, a: f32) -> gpui::Hsla {
 
 const BAD: u32 = 0xff6b68;
 const GOOD: u32 = 0x6ccb5f;
+const WARN: u32 = 0xe5c07b;
 
 pub struct SettingsWin {
     pub st: Settings,
@@ -35,7 +36,7 @@ enum Job {
     Edits(Vec<settings_file::Edit>),
     Theme(String),
     Font(Option<String>, Option<f32>),
-    Text(String),
+    Text(String, String),
 }
 
 fn config_path_text() -> String {
@@ -105,8 +106,25 @@ impl AppShell {
     }
 
     /// The file was read again: the window shows what it says.
-    pub fn settings_config_changed(&mut self) {
-        self.with_settings(|st, ctx| st.config_changed(ctx));
+    pub fn settings_config_changed(&mut self, cx: &mut Context<Self>) {
+        if self.with_settings(|st, ctx| st.config_changed(ctx)) == Some(Effect::ProbeEditor) {
+            self.settings_probe_editor(cx);
+        }
+    }
+
+    /// Read the file on the background executor and let the editor follow it.
+    fn settings_probe_editor(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = crate::config::config_path() else { return };
+        cx.spawn(async move |this, cx| {
+            let r = cx.background_executor().spawn(async move { settings_file::read_for_editor(&path) }).await;
+            let _ = this.update(cx, |s, cx| {
+                if let Some(w) = s.settings.as_mut() {
+                    w.st.editor_probe(r);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     // ---- input ------------------------------------------------------------------------
@@ -171,7 +189,8 @@ impl AppShell {
                 self.settings_write(Job::Theme(name), cx);
             }
             Effect::Font { family, size } => self.settings_write(Job::Font(family, size), cx),
-            Effect::SaveText(t) => self.settings_write(Job::Text(t), cx),
+            Effect::SaveText { text, expect } => self.settings_write(Job::Text(text, expect), cx),
+            Effect::ProbeEditor => self.settings_probe_editor(cx),
             Effect::LoadEditor => self.settings_load_editor(cx),
             Effect::OpenConfigFile => self.open_config_file(cx),
             Effect::PasteIntoEditor => {
@@ -191,7 +210,7 @@ impl AppShell {
             self.notice_active("No configuration folder (APPDATA is not set)".into(), cx);
             return;
         };
-        let what = if matches!(job, Job::Text(_)) { Wrote::Editor } else { Wrote::Setting };
+        let what = if matches!(job, Job::Text(..)) { Wrote::Editor } else { Wrote::Setting };
         if let Some(w) = self.settings.as_mut() {
             w.st.busy = true;
         }
@@ -203,7 +222,7 @@ impl AppShell {
                         Job::Edits(e) => settings_file::save_edits(&path, &e),
                         Job::Theme(n) => settings_file::save_with(&path, |t| settings::theme_edits(t, &n)),
                         Job::Font(f, s) => settings_file::save_with(&path, |t| Ok(settings::font_edits(t, f.as_deref(), s))),
-                        Job::Text(t) => settings_file::save_text(&path, &t),
+                        Job::Text(t, expect) => settings_file::save_text(&path, &t, &expect),
                     }
                 })
                 .await;
@@ -852,7 +871,24 @@ impl AppShell {
                     .child(body),
             );
         }
-        let mut col = div().flex_1().min_h_0().flex().flex_col().gap(px(8.0)).overflow_hidden().child(bar).child(editor);
+        let mut col = div().flex_1().min_h_0().flex().flex_col().gap(px(8.0)).overflow_hidden().child(bar);
+        if t.stale {
+            col = col.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap(px(8.0))
+                    .items_center()
+                    .p(px(6.0))
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(alpha(WARN, 0.8))
+                    .child(div().flex_1().text_size(px(12.0)).child("The file changed on disk. Reload shows the new text and drops your edits. Keep holds your edits."))
+                    .child(self.sbtn(("toml-reload", 0), "Reload", false, cx, |s, w, cx| s.settings_press("toml-reload", w, cx)))
+                    .child(self.sbtn(("toml-keep", 0), "Keep", true, cx, |s, w, cx| s.settings_press("toml-keep", w, cx))),
+            );
+        }
+        col = col.child(editor);
         if let Some(m) = &t.message {
             if t.loaded {
                 col = col.child(div().text_size(px(12.0)).text_color(hsla(BAD)).child(SharedString::from(forgetty_shell_core::notify::notice_text(m))));

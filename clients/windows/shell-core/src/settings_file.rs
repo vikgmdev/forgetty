@@ -11,7 +11,7 @@
 
 use std::path::Path;
 
-use toml_edit::{Array, DocumentMut, Item, Table, Value};
+use toml_edit::{Array, DocumentMut, Item, Table, TableLike, Value};
 
 use crate::config::{open_refusal, Config};
 
@@ -67,7 +67,7 @@ fn split(path: &str) -> (Option<&str>, &str) {
 }
 
 /// Set `key` in `table`, keeping the comment around an existing value.
-fn put(table: &mut Table, key: &str, v: Value) {
+fn put(table: &mut dyn TableLike, key: &str, v: Value) {
     if let Some(old) = table.get_mut(key).and_then(Item::as_value_mut) {
         let decor = old.decor().clone();
         let mut v = v;
@@ -94,7 +94,8 @@ pub fn apply(text: &str, edits: &[Edit]) -> Result<String, String> {
                             doc.as_table_mut().insert(t, Item::Table(nt));
                         }
                         let item = doc.as_table_mut().get_mut(t).ok_or("table vanished")?;
-                        let table = item.as_table_mut().ok_or_else(|| format!("`{t}` in the file is not a table, so `{path}` cannot be set"))?;
+                        // A table written inline (`keybindings = { a = "x" }`) is a table too.
+                        let table = item.as_table_like_mut().ok_or_else(|| format!("`{t}` in the file is not a table, so `{path}` cannot be set"))?;
                         put(table, key, to_value(v));
                     }
                 }
@@ -106,7 +107,7 @@ pub fn apply(text: &str, edits: &[Edit]) -> Result<String, String> {
                         doc.as_table_mut().remove(key);
                     }
                     Some(t) => {
-                        let now_empty = match doc.as_table_mut().get_mut(t).and_then(Item::as_table_mut) {
+                        let now_empty = match doc.as_table_mut().get_mut(t).and_then(Item::as_table_like_mut) {
                             Some(table) => {
                                 table.remove(key);
                                 table.is_empty()
@@ -149,21 +150,89 @@ fn name_of(path: &Path) -> String {
     path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "the file".into())
 }
 
-/// Write `text` over `path` through a temporary file in the same folder. `expect` is what the
-/// caller read; when the file differs now, somebody else changed it and nothing is written.
+/// One write at a time in this process: two saves (a row and the editor, a second window) would
+/// otherwise read the same file and the second would drop the first one's change.
+static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn write_lock() -> std::sync::MutexGuard<'static, ()> {
+    WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A temporary file of ours that is older than this is left over from a crash.
+const STALE_TMP: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Remove the `config.toml.<pid>.<n>.tmp` files a crashed save left behind.
+fn sweep_stale(path: &Path) {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name().map(|n| n.to_string_lossy().into_owned())) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let f = e.file_name().to_string_lossy().into_owned();
+        if f.starts_with(&format!("{name}.")) && f.ends_with(".tmp") {
+            let old = e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age > STALE_TMP);
+            if old {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+}
+
+/// Create `dest` new with `bytes`. When `model` exists, `dest` gets its access rules before the
+/// first byte is written. The data is on disk when this returns.
+fn write_new_like(model: &Path, dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(dest)?;
+    let r = (|| {
+        if model.exists() {
+            crate::fileperm::copy_security(model, dest)?;
+        }
+        f.write_all(bytes)?;
+        f.sync_all()
+    })();
+    if r.is_err() {
+        drop(f);
+        let _ = std::fs::remove_file(dest);
+    }
+    r
+}
+
+/// Rename over the target. Windows refuses for a moment while a scanner or an indexer has the
+/// file open; that passes, so the call is repeated for about a second.
+fn rename_over(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut tries = 0;
+    loop {
+        match std::fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(e) if tries < 200 && (matches!(e.kind(), std::io::ErrorKind::PermissionDenied) || matches!(e.raw_os_error(), Some(5 | 32 | 33))) => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Write `text` over `path` through a temporary file in the same folder (a name that is ours alone:
+/// process id and a counter). `expect` is what the caller read; when the file differs now,
+/// somebody else changed it and nothing is written.
 fn write_atomic(path: &Path, text: &str, expect: Option<&str>) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("Not saved: {e}"))?;
     }
-    let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, text).map_err(|e| format!("Not saved: {e}"))?;
+    sweep_stale(path);
+    let n = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut tmp_name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    tmp_name.push(format!(".{}.{n}.tmp", std::process::id()));
+    let tmp = path.with_file_name(tmp_name);
+    let _ = std::fs::remove_file(&tmp);
+    write_new_like(path, &tmp, text.as_bytes()).map_err(|e| format!("Not saved: {e}"))?;
     if let Some(expect) = expect {
         if read_current(path).ok().as_deref() != Some(expect) {
             let _ = std::fs::remove_file(&tmp);
             return Err(format!("Not saved: {} changed while it was being saved. Try again.", name_of(path)));
         }
     }
-    std::fs::rename(&tmp, path).map_err(|e| {
+    rename_over(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         format!("Not saved: {e}")
     })
@@ -190,6 +259,7 @@ pub fn save_with(path: &Path, plan: impl FnOnce(&str) -> Result<Vec<Edit>, Strin
     if let Some(why) = open_refusal(path) {
         return Err(why);
     }
+    let _guard = write_lock();
     let cur = read_current(path)?;
     if !cur.trim().is_empty() {
         if let Err(e) = check(&cur) {
@@ -206,19 +276,29 @@ pub fn save_with(path: &Path, plan: impl FnOnce(&str) -> Result<Vec<Edit>, Strin
     Ok(Saved { text: new, warnings })
 }
 
-/// The TOML editor's save: `text` replaces the file when it loads. The old file is kept as
-/// `config.toml.bak` (one copy, the one before this save).
-pub fn save_text(path: &Path, text: &str) -> Result<Saved, String> {
+/// The TOML editor's save: `text` replaces the file when it loads and when the file is still
+/// what the editor read (`expect`): a file that changed on disk since is never overwritten.
+/// The old file is kept as `config.toml.bak` (one copy, the one before this save); a backup that
+/// cannot be written is said in the warnings, the save goes on.
+pub fn save_text(path: &Path, text: &str, expect: &str) -> Result<Saved, String> {
     if let Some(why) = open_refusal(path) {
         return Err(why);
     }
-    let warnings = check(text).map_err(|e| format!("Not saved: {e}"))?;
-    if let Ok(old) = std::fs::read_to_string(path) {
-        if old != text {
-            let _ = std::fs::write(path.with_extension("toml.bak"), old);
+    let mut warnings = check(text).map_err(|e| format!("Not saved: {e}"))?;
+    let _guard = write_lock();
+    let cur = read_current(path)?;
+    if cur != expect {
+        return Err(format!("Not saved: {} changed on disk after the editor read it. Choose Reload or Keep in the editor, then save again.", name_of(path)));
+    }
+    if cur != text && path.exists() {
+        let bak = path.with_extension("toml.bak");
+        let _ = std::fs::remove_file(&bak);
+        if let Err(e) = write_new_like(path, &bak, cur.as_bytes()) {
+            eprintln!("forgetty-win: backup {} not written: {e}", bak.display());
+            warnings.insert(0, format!("The backup {} was not written ({e})", bak.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()));
         }
     }
-    write_atomic(path, text, None)?;
+    write_atomic(path, text, Some(expect))?;
     Ok(Saved { text: text.to_string(), warnings })
 }
 
@@ -324,13 +404,70 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&p).unwrap(), s.text);
         std::fs::write(&p, "bell_mode = \n").unwrap();
         // Bad text: refused, file unchanged, no backup.
-        assert!(save_text(&p, "bell_mode = \"loud\"\n").is_err());
+        assert!(save_text(&p, "bell_mode = \"loud\"\n", "bell_mode = \n").is_err());
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "bell_mode = \n");
         // Good text repairs, and the old one is kept beside it.
-        save_text(&p, "bell_mode = \"audio\"\n").unwrap();
+        save_text(&p, "bell_mode = \"audio\"\n", "bell_mode = \n").unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "bell_mode = \"audio\"\n");
         assert_eq!(std::fs::read_to_string(p.with_extension("toml.bak")).unwrap(), "bell_mode = \n");
-        assert!(!p.with_extension("toml.tmp").exists());
+        let left: Vec<_> = std::fs::read_dir(d.path().join("sub")).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().ends_with(".tmp")).collect();
+        assert!(left.is_empty(), "temporary files left: {left:?}");
+    }
+
+    #[test]
+    fn the_editor_never_overwrites_a_file_that_changed_on_disk() {
+        let d = dir();
+        let p = d.path().join("config.toml");
+        std::fs::write(&p, "smart_copy = true\n").unwrap();
+        // The editor read "smart_copy = true", a row toggle then changed the file.
+        save_edits(&p, &[Edit::set("smart_copy", V::Bool(false))]).unwrap();
+        let e = save_text(&p, "bell_mode = \"audio\"\n", "smart_copy = true\n").unwrap_err();
+        assert!(e.contains("changed on disk"), "{e}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "smart_copy = false\n");
+        // With the text it read now, the save goes through.
+        save_text(&p, "bell_mode = \"audio\"\n", "smart_copy = false\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "bell_mode = \"audio\"\n");
+    }
+
+    #[test]
+    fn two_writers_in_a_row_both_land_and_a_stale_tmp_is_swept() {
+        let d = dir();
+        let p = d.path().join("config.toml");
+        let stale = d.path().join("config.toml.1.1.tmp");
+        std::fs::write(&stale, "junk").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options().write(true).open(&stale).unwrap().set_modified(old).unwrap();
+        let fresh = d.path().join("config.toml.2.2.tmp");
+        std::fs::write(&fresh, "other writer").unwrap();
+        let hs: Vec<_> = (0..6)
+            .map(|i| {
+                let p = p.clone();
+                std::thread::spawn(move || {
+                    let key = ["smart_copy", "copy_on_select", "cursor_blink"][i % 3];
+                    save_edits(&p, &[Edit::set(key, V::Bool(i % 2 == 0))]).unwrap();
+                })
+            })
+            .collect();
+        for h in hs {
+            h.join().unwrap();
+        }
+        let text = std::fs::read_to_string(&p).unwrap();
+        for k in ["smart_copy", "copy_on_select", "cursor_blink"] {
+            assert!(text.contains(k), "{k} lost: {text}");
+        }
+        assert!(!stale.exists());
+        assert!(fresh.exists(), "a recent tmp may belong to a running save");
+    }
+
+    #[test]
+    fn inline_tables_take_set_and_remove() {
+        let d = dir();
+        let p = d.path().join("config.toml");
+        std::fs::write(&p, "keybindings = { new_tab = \"ctrl+k\" }\n").unwrap();
+        let s = save_edits(&p, &[Edit::set("keybindings.close_tab", V::Str("ctrl+j".into()))]).unwrap();
+        assert!(s.text.contains("new_tab") && s.text.contains("close_tab"), "{}", s.text);
+        let s = save_edits(&p, &[Edit::remove("keybindings.new_tab")]).unwrap();
+        assert!(!s.text.contains("new_tab") && s.text.contains("close_tab"), "{}", s.text);
     }
 
     #[test]
@@ -339,7 +476,7 @@ mod tests {
         let p = d.path().join("config.txt");
         assert!(save_edits(&p, &[Edit::set("smart_copy", V::Bool(false))]).is_err());
         assert!(!p.exists());
-        assert!(save_text(&p, "a = 1\n").is_err());
+        assert!(save_text(&p, "a = 1\n", "").is_err());
         assert!(read_for_editor(&p).is_err());
     }
 }
