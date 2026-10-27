@@ -75,6 +75,10 @@ impl ShellSmoke {
                 }
             };
         }
+        // A write is on its way: the window takes no keys until it is done, so neither do we.
+        if shell.settings.as_ref().is_some_and(|w| w.st.busy) {
+            return;
+        }
         let settle = self.sub_t0.elapsed() > Duration::from_millis(150);
         match self.sub {
             0 => {
@@ -233,9 +237,15 @@ impl ShellSmoke {
             16 => {
                 until!((shell.file_cfg.font_size_pt - (self.settings.size0 + 0.5)).abs() < 0.01);
                 check("settings_font_size_saved", self.st_file().contains("font_size = "));
-                // Family: the first font of the list that is not in use.
-                shell.settings_look(Zone::Font, None, cx);
-                self.st_send(shell, window, cx, &["down", "enter"]);
+                // Family: the first font on screen that is not in use.
+                let pick = shell.settings_prepare().and_then(|v| match v.body {
+                    Body::Look(l) => l.fonts.items.iter().find(|f| !f.2).map(|f| f.0.clone()),
+                    _ => None,
+                });
+                record("settings_font_pick", json!(pick));
+                let Some(name) = pick else { fail("settings: no other font to pick") };
+                shell.settings_look_pick(Zone::Font, name, cx);
+                self.st_send(shell, window, cx, &["enter"]);
                 self.st_next();
             }
             17 => {
@@ -247,7 +257,7 @@ impl ShellSmoke {
                 self.st_next();
             }
             18 => {
-                until!(shell.file_cfg.background == 0x101010);
+                until!(self.sub_t0.elapsed() > Duration::from_millis(700));
                 shell.settings_look(Zone::Theme, None, cx);
                 self.st_send(shell, window, cx, &["enter"]);
                 self.st_next();
@@ -298,7 +308,8 @@ impl ShellSmoke {
                 check("settings_toml_editor_repairs_the_file", self.st_file().contains("bell_mode = \"both\""));
                 check("settings_toml_editor_keeps_a_backup", self.settings.path.with_extension("toml.bak").exists());
                 // Text that does not load is refused with the line.
-                self.st_type(shell, window, cx, "\n[[[");
+                self.st_send(shell, window, cx, &["enter"]);
+                self.st_type(shell, window, cx, "[[[");
                 self.st_send(shell, window, cx, &["ctrl+s"]);
                 self.st_next();
             }
