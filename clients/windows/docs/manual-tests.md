@@ -549,10 +549,19 @@ command = "wsl.exe -d Ubuntu --cd ~"
 - [ ] KM.8 Put `paste_ctrl_v = "none"` and `copy_or_interrupt = "none"` under `[keybindings]`: Ctrl+V and Ctrl+C reach the program in the GTK set (Ctrl+Shift+V and Ctrl+Shift+C still paste and copy). Alt+9 in a window with fewer than nine workspaces reaches the program (in `cat -v` it prints `^[9`).
 - [ ] KM.6 In the GTK set Ctrl+Shift+Q quits the app. Ctrl+Shift+N, Ctrl+1 and Ctrl+Shift+Z reach the program (they are not shortcuts there).
 
+### Settings window (WP4)
+
+- [ ] ST.1 Press Ctrl+. (or palette "Settings...", or the sidebar "Settings..." link): a full-window view with pages General, Appearance, Terminal, Keybindings, TOML editor, About. The title bar stays usable. Esc closes it and the keyboard is back in the terminal.
+- [ ] ST.2 General: change "Shortcut set" with Right or the arrows: the file gets `keymap = ...`, a notice says keys changed, comments in your file are still there. Delete returns the row to its default and removes the key from the file.
+- [ ] ST.3 Terminal: type a scrollback size (Enter on the row, digits, Enter) and see `scrollback_bytes` in the file in bytes. A value out of range stays in the box with a reason and the file does not change. Toggle "Smart copy" with Space.
+- [ ] ST.4 Keybindings: type "sidebar", Enter on the row, press Ctrl+Alt+H. The row shows the new chord and "changed", the shortcut works at once. Capture a chord that another action has (Ctrl+Shift+T): the window names that action and Enter moves the chord. Ctrl+R puts one row back, Ctrl+Shift+R every row. A plain letter is refused with a reason.
+- [ ] ST.5 Appearance: Up/Down in the theme list changes the preview. Enter writes the theme and the whole app changes color. Tab to the font list, pick a font, Enter. Tab to the size, Left/Right, Enter. With a `[theme]` table in the file the theme pick is refused with a reason and the file is untouched.
+- [ ] ST.6 Make the file invalid by hand (for example `bell_mode = ` alone on a line). Change any row: "does not load" and nothing is written. Open the TOML editor, repair the line, Ctrl+S: the app picks the file up and `config.toml.bak` has the broken one. Type `[[[` and Ctrl+S: refused with "Not saved" and the line number, the file is unchanged.
+- [ ] ST.7 Edit the file in Notepad while Settings is open: the rows show the new values after the save.
+- [ ] ST.8 F1 shows the shortcuts of the active set (and your own entries). Up/Down and the wheel scroll, Esc or F1 closes.
+
 ### Not done in WP3
 
-- A Settings window (not decided).
-- Theme preview swatches, a font picker.
 - `cursor_style` (GTK ignores it as well) and `on_launch` (Windows has no session restore).
 - Profile icons (read and kept, not shown).
 

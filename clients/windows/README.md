@@ -160,6 +160,27 @@ of `config.toml` (action name = value; `"none"` unbinds). Middle-click closes a 
 The smoke starts on the `windows` set (its early steps press those chords) and the `keymap` phase switches
 sets through the config file.
 
+### Settings window (WP4)
+
+Ctrl+. (GTK set), "Settings..." in the palette or the sidebar opens a full-window view; F1 opens the list of
+shortcuts. Pages: General (shell, shortcut set, backdrop, sidebar at start), Appearance (themes with a filter
+and a preview, font family, font size), Terminal (scrollback, bell, notifications, copy, right click, padding,
+paste warnings), Keybindings (every action: Change, Add, Unbind, Default, conflict check), TOML editor and
+About. Up/Down move, Left/Right/Space change, Enter types a value, Delete restores the default, Ctrl+Tab
+switches page, Esc closes. Everything is written to `config.toml` and applied by the same live reload as an
+edit by hand.
+
+How it writes (`shell-core/src/settings_file.rs`): the file text is edited with `toml_edit`, so comments, keys
+this client does not know, the order of keys and tables stay. `forgetty-config`'s own save functions re-serialize
+the whole file (they drop comments and the Windows-only tables), so they are not used for writing. The new text
+is checked with the same parser the loader uses and written to a temporary file, then renamed over the old one;
+the file is read again just before the rename and the write is dropped if it changed meanwhile. A file that does
+not load is never written by a row (the message points to the TOML editor), and the editor keeps one
+`config.toml.bak` when it overwrites. A network or non-`.toml` path is refused as for "Open configuration file".
+All file work runs on the background executor. Entries the page changes: a theme goes to `theme`, a font to
+`[font]` when the file has that table (else `font_family`/`font_size`), shortcuts to `[keybindings]` (no entry
+when the chord is the default of the set).
+
 W2 smoke checks (on top of the W1 list): `tabs_4`, `tab_nav`, `split_4_panes`, `zoom_toggle`,
 `echo_per_pane`, `echo_isolated`, `key_p50_4panes_le_1frame_plus_1_5ms`, `damage_only_4panes` (re-shaped rows in
 unfocused panes must stay 0), `divider_drag_ratios`, `divider_pty_follow`, `status_events`, `screenshot`
