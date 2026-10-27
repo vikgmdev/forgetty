@@ -444,11 +444,14 @@ jobs:
             $out = & $cli --state-dir $state server run 2>&1
             Write-Host "forgetty.exe server run (elevated): exit $LASTEXITCODE, $out"
             if ($LASTEXITCODE -ne 78) { throw "an elevated server run must exit 78, got $LASTEXITCODE" }
-            # The Run value runs this. It shows no window, finds forgetty.exe next to itself, and
-            # ends with 1 when the server will not start (here: elevated). 2 would be "no forgetty.exe".
+            # The Run value runs this. It shows no window and finds forgetty.exe next to itself.
+            # Elevated it starts nothing and ends with 0 (the server refuses to run elevated, and
+            # a start from an elevated window must not leave one for normal programs).
             $p = Start-Process (Join-Path $dir "forgetty-win.exe") -ArgumentList '--start-server' -Wait -PassThru
             Write-Host "forgetty-win.exe --start-server (elevated): exit $($p.ExitCode)"
-            if ($p.ExitCode -ne 1) { throw "--start-server must end with 1 when the server refuses to start, got $($p.ExitCode)" }
+            if ($p.ExitCode -ne 0) { throw "--start-server must end with 0 and start nothing when elevated, got $($p.ExitCode)" }
+            $started = Get-Process forgetty -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq (Join-Path $dir "forgetty.exe") }
+            if ($started) { throw "--start-server started a server although it runs elevated" }
             # The step must not end with the exit code of this check.
             $global:LASTEXITCODE = 0
           }

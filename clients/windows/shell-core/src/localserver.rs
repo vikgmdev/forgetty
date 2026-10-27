@@ -792,6 +792,10 @@ mod tests {
         let code = fake_code();
         let text = format!("Forgetty pairing\n{}payload: {{}}", render(&code, false));
         assert!(qr_from_ascii(&text).is_some());
+        // The line with the window number comes after the code, before the payload.
+        let text = format!("{}window_id: 3\npayload: {{}}", render(&code, false));
+        assert!(qr_from_ascii(&text).is_some());
+        assert_eq!(text.lines().find_map(pair_window_id), Some(3));
     }
 
     #[test]

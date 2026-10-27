@@ -137,8 +137,9 @@ pub fn quote_path(target: Target, path: &str) -> Result<String, String> {
     }
     match target {
         Target::Cmd => {
-            if p.contains('"') || p.contains('%') {
-                return Err("the path has a quote or a percent sign, which cmd cannot take in one word".into());
+            // `%` is expanded inside quotes, `!` when delayed expansion is on (`cmd /v:on`).
+            if p.contains('"') || p.contains('%') || p.contains('!') {
+                return Err("the path has a quote, a percent sign or an exclamation mark, which cmd cannot take in one word".into());
             }
             Ok(format!("\"{p}\""))
         }
@@ -320,6 +321,7 @@ mod tests {
         // cmd: `&` is inside the quotes; a percent sign cannot be quoted, so it is refused.
         assert_eq!(quote_path(Target::Cmd, r"C:\Users\a&b\p.png").unwrap(), r#""C:\Users\a&b\p.png""#);
         assert!(quote_path(Target::Cmd, r"C:\Users\%x%\p.png").is_err());
+        assert!(quote_path(Target::Cmd, r"C:\Users\a!b\p.png").is_err());
         // An unknown program: double quotes, unless a shell would act inside them.
         assert!(quote_path(Target::Unknown, r"C:\Users\a&b\p.png").is_ok());
         for bad in [r"C:\Users\$x\p.png", r"C:\Users\`x\p.png", r"C:\Users\%x%\p.png", r"C:\Users\a!b\p.png"] {
