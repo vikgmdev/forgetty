@@ -266,7 +266,8 @@ impl ShellSmoke {
                 self.ls.ps_focused = false;
                 self.ls.ps_model.clear();
                 self.ls.ps_probe = None;
-                shell.new_tab_with(argv, None, cx);
+                // The same start folder on both legs: the home folder.
+                shell.new_tab_with(argv, std::env::var("USERPROFILE").ok(), cx);
                 self.sub = 1;
                 self.sub_t0 = Instant::now();
             }
