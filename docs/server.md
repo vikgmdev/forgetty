@@ -100,6 +100,9 @@ stream) and the `qa_*` test methods are not reachable over v2.
   picks a free port, for tests). A second server on a taken port exits with a
   bind error. On Windows the default port falls back to a free one (see "Windows
   defaults" below), and a port given with `--port` or `FORGETTY_PORT` does not.
+  `FORGETTY_PORT` set to an empty value counts as not set, on every OS. A value
+  that is not a port (0 to 65535) is an error and the server exits with code 78;
+  before, Linux ignored such a value and used 47297.
 - Every pane has an absolute byte offset. The ring and the disk log know the
   offset of their first byte. The first offset is stored in
   `logs/<pane>.log.off`, so a client resumes at its offset after a server
@@ -176,6 +179,8 @@ forgetty server stop [--if-idle]    --if-idle refuses while a client is attached
 forgetty server status [--json]     pid, uptime, version, protocol, panes, clients, iroh node id
 forgetty ls [--json]
 forgetty new [--cwd DIR] [--keep] [-- CMD...]   prints the pane id; --keep = remain on exit
+                                    CMD is shown to every paired device (pane info `argv`) and
+                                    is in the process list: no secrets on this command line
 forgetty send -p PANE TEXT [--enter]
 forgetty send-key -p PANE KEY       enter tab esc ctrl+c up down left right
 forgetty close -p PANE              close a pane (also a kept, exited one)

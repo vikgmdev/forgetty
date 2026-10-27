@@ -39,6 +39,8 @@ impl Drop for Guard {
 
 /// Ask for a 1 ms timer for this process. Keep the guard for the life of the server.
 pub fn begin() -> Guard {
+    // The on-demand 1 ms request (it does nothing when `FORGETTY_TIMER_RES` is set).
+    forgetty_pty::timer_boost::init();
     // Execution speed throttling (EcoQoS) for the server, on request (`FORGETTY_POWER_THROTTLING`
     // = `server` or `shells`, see `forgetty_pty::PowerThrottling`).
     if forgetty_pty::power_throttling_mode() != forgetty_pty::PowerThrottling::Off {

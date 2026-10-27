@@ -117,12 +117,13 @@ impl std::fmt::Display for ConfigInvalid {
 
 impl std::error::Error for ConfigInvalid {}
 
-/// The port from `FORGETTY_PORT`: `None` when the variable is not set, an error when it is set
-/// to something that is not a port (0 to 65535). A typo must not start the server on the
+/// The port from `FORGETTY_PORT`: `None` when the variable is not set or empty (on every OS), an
+/// error when it is set to something that is not a port (0 to 65535). A typo must not start the server on the
 /// default port, where it would take the place of another one.
 pub fn port_from_env(value: Option<&str>) -> Result<Option<u16>, ConfigInvalid> {
     match value {
         None => Ok(None),
+        Some(v) if v.trim().is_empty() => Ok(None),
         Some(v) => v.trim().parse::<u16>().map(Some).map_err(|_| {
             ConfigInvalid(format!(
                 "FORGETTY_PORT={v:?} is not a port number (0 to 65535); unset it to use 47297"
@@ -1424,7 +1425,9 @@ mod tests {
         assert_eq!(port_from_env(None).unwrap(), None);
         assert_eq!(port_from_env(Some("0")).unwrap(), Some(0));
         assert_eq!(port_from_env(Some(" 47300 ")).unwrap(), Some(47300));
-        for bad in ["", "abc", "70000", "-1", "47297x"] {
+        assert_eq!(port_from_env(Some("")).unwrap(), None);
+        assert_eq!(port_from_env(Some("  ")).unwrap(), None);
+        for bad in ["abc", "70000", "-1", "47297x"] {
             let e = port_from_env(Some(bad)).unwrap_err().to_string();
             assert!(e.contains("FORGETTY_PORT") && e.contains("not a port"), "{bad}: {e}");
         }

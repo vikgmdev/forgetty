@@ -26,6 +26,9 @@ static KEY: AtomicU8 = AtomicU8::new(0);
 /// Chunks logged for the running trace.
 static CHUNKS: AtomicU8 = AtomicU8::new(0);
 
+/// A trace older than this without its echo is dropped (2 s).
+const STALE_US: u64 = 2_000_000;
+
 fn on() -> bool {
     *ON.get_or_init(|| std::env::var("FORGETTY_TRACE_LATENCY").is_ok_and(|v| v == "1"))
 }
@@ -38,7 +41,14 @@ fn now_us() -> u64 {
 
 /// Input bytes were queued for a pane. Starts a trace when none is running.
 pub fn input(bytes: &[u8]) {
-    if !on() || bytes.is_empty() || BUSY.swap(true, Ordering::AcqRel) {
+    if !on() || bytes.is_empty() {
+        return;
+    }
+    // A trace whose echo never came (no read held the key) ends after `STALE_US`, so the next
+    // input starts a new one.
+    let started = INPUT.load(Ordering::Acquire);
+    let stale = started != 0 && now_us().saturating_sub(started) > STALE_US;
+    if BUSY.swap(true, Ordering::AcqRel) && !stale {
         return;
     }
     KEY.store(bytes[0], Ordering::Relaxed);
@@ -71,7 +81,13 @@ pub fn pty_read(bytes: &[u8]) {
         return;
     }
     let key = KEY.load(Ordering::Relaxed);
-    let has_key = printable(bytes).contains(&key);
+    // A key that is a control byte (ESC, Enter, Ctrl+C) can only be found in the raw bytes. A
+    // printable key must not be matched inside an escape sequence.
+    let has_key = if key < 0x20 || key == 0x7f {
+        bytes.contains(&key)
+    } else {
+        printable(bytes).contains(&key)
+    };
     let at = now_us();
     if has_key {
         let _ = READ.compare_exchange(0, at, Ordering::AcqRel, Ordering::Relaxed);

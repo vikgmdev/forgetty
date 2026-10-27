@@ -157,10 +157,9 @@ fn in_process(label: &str) -> Stats {
 
 fn in_process_with(label: &str, argv: &[&str]) -> Stats {
     use std::io::{Read, Write};
-    // This process stands for a program that asks for no finer timer: the pty crate's own
-    // 1 ms request while a pane is in use stays off here (the servers started below have theirs).
-    std::env::set_var("FORGETTY_TIMER_RES", "off");
     let cmd: Vec<String> = argv.iter().map(|a| a.to_string()).collect();
+    // This process never calls `forgetty_pty::timer_boost::init`, so it stands for a program that
+    // asks for no finer timer. The servers started below do ask.
     let mut pty =
         forgetty_pty::PtyProcess::spawn(forgetty_pty::PtySize::default(), None, Some(&cmd), false)
             .expect("spawn pty");

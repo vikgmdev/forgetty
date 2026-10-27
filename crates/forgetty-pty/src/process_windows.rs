@@ -55,17 +55,47 @@ use windows::Win32::System::Threading::{
 /// terminal behind the pipe (libghostty-vt) does the reflow.
 const PSEUDOCONSOLE_RESIZE_QUIRK: u32 = 0x2;
 
-/// Extra `CreatePseudoConsole` flags for experiments (`FORGETTY_CONPTY_FLAGS`, decimal or `0x`
-/// hex, or-ed onto the default). `0x4` is `PSEUDOCONSOLE_WIN32_INPUT_MODE`, `0x1` is
-/// `PSEUDOCONSOLE_INHERIT_CURSOR` (portable-pty sets both). Unset: no extra flags.
-fn extra_conpty_flags() -> u32 {
-    let Ok(v) = std::env::var("FORGETTY_CONPTY_FLAGS") else { return 0 };
-    let v = v.trim();
-    match v.strip_prefix("0x") {
+/// The `CreatePseudoConsole` flags `FORGETTY_CONPTY_FLAGS` may add: `PSEUDOCONSOLE_INHERIT_CURSOR`
+/// (0x1), `PSEUDOCONSOLE_WIN32_INPUT_MODE` (0x4) and `PSEUDOCONSOLE_PASSTHROUGH_MODE` (0x8).
+const EXTRA_CONPTY_FLAGS_ALLOWED: u32 = 0x1 | 0x4 | 0x8;
+
+/// Parse the value of `FORGETTY_CONPTY_FLAGS` (decimal or `0x` hex). Bits that are not allowed
+/// are dropped and an invalid value gives none; both are returned with a warning text.
+fn parse_extra_conpty_flags(value: &str) -> (u32, Option<String>) {
+    let v = value.trim();
+    if v.is_empty() {
+        return (0, None);
+    }
+    let parsed = match v.strip_prefix("0x") {
         Some(h) => u32::from_str_radix(h, 16),
         None => v.parse(),
+    };
+    match parsed {
+        Err(_) => (0, Some(format!("FORGETTY_CONPTY_FLAGS={v:?} is not a number; ignored"))),
+        Ok(n) if n & !EXTRA_CONPTY_FLAGS_ALLOWED != 0 => (
+            n & EXTRA_CONPTY_FLAGS_ALLOWED,
+            Some(format!(
+                "FORGETTY_CONPTY_FLAGS={v:?}: only 0x1, 0x4 and 0x8 are allowed; using {:#x}",
+                n & EXTRA_CONPTY_FLAGS_ALLOWED
+            )),
+        ),
+        Ok(n) => (n, None),
     }
-    .unwrap_or(0)
+}
+
+/// Extra `CreatePseudoConsole` flags for experiments (`FORGETTY_CONPTY_FLAGS`, or-ed onto the
+/// default). `0x4` is `PSEUDOCONSOLE_WIN32_INPUT_MODE`, `0x1` is `PSEUDOCONSOLE_INHERIT_CURSOR`
+/// (portable-pty sets both). Unset: none. Read once.
+fn extra_conpty_flags() -> u32 {
+    static FLAGS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *FLAGS.get_or_init(|| {
+        let Ok(v) = std::env::var("FORGETTY_CONPTY_FLAGS") else { return 0 };
+        let (flags, warning) = parse_extra_conpty_flags(&v);
+        if let Some(w) = warning {
+            warn!("{w}");
+        }
+        flags
+    })
 }
 
 /// Where the power throttling (EcoQoS, "efficiency mode") opt-out applies
@@ -1056,6 +1086,24 @@ impl Drop for PtyProcess {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn extra_conpty_flags_are_masked_and_a_bad_value_is_refused() {
+        use super::parse_extra_conpty_flags as parse;
+        assert_eq!(parse(""), (0, None));
+        assert_eq!(parse("0x4"), (4, None));
+        assert_eq!(parse("5"), (5, None));
+        assert_eq!(parse(" 0x1 "), (1, None));
+        let (f, w) = parse("0x7");
+        assert_eq!(f, 5);
+        assert!(w.unwrap().contains("allowed"));
+        let (f, w) = parse("0x1f");
+        assert_eq!(f, 0xd);
+        assert!(w.is_some());
+        let (f, w) = parse("nope");
+        assert_eq!(f, 0);
+        assert!(w.unwrap().contains("not a number"));
+    }
+
     use super::*;
     use std::sync::mpsc;
     use std::time::Instant;
