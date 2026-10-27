@@ -64,6 +64,22 @@ const MARKS: &[u8] =
     b"\x1b]133;A\x07\x1b]133;B\x07\x1b]7;file://localhost/tmp/shell-state-test\x07\
 \x1b]133;C\x07\x1b]133;D;7\x07";
 
+/// The same marks one after the other, a pause between: a connection keeps
+/// only the newest pending state per pane, so marks that arrive within one
+/// write can merge. With a pause each one is its own event.
+async fn send_marks_apart(h: &ClientHandle, pane: Uuid) {
+    for part in [
+        &b"\x1b]133;A\x07"[..],
+        b"\x1b]133;B\x07",
+        b"\x1b]7;file://localhost/tmp/shell-state-test\x07",
+        b"\x1b]133;C\x07",
+        b"\x1b]133;D;7\x07",
+    ] {
+        h.send_input(pane, part).await.expect("send_input");
+        tokio::time::sleep(Duration::from_millis(120)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn marks_directory_and_tty_mode_reach_a_client_with_the_capability() {
     if !real_only() {
@@ -96,7 +112,7 @@ async fn marks_directory_and_tty_mode_reach_a_client_with_the_capability() {
     assert!(first.mark.is_none() && first.exit_code.is_none() && first.rev > 0, "{first:?}");
 
     // The marks come back as output of the pane.
-    h.send_input(pane, MARKS).await.expect("send_input");
+    send_marks_apart(&h, pane).await;
     let mut got: Vec<Shell> = Vec::new();
     let _ = tokio::time::timeout(Duration::from_secs(10), async {
         while let Some(item) = events.next().await {
@@ -156,5 +172,55 @@ async fn a_client_without_the_capability_gets_no_shell_state() {
     assert!(cwd_seen, "the OSC 7 in the test input made no CwdChanged");
     assert!(!shell_seen, "ShellState reached a client without the capability");
     old.close().await;
+    server.shutdown().await;
+}
+
+/// A pane that writes marks in a loop does not lag a subscriber: the states
+/// merge on the way, and the last one is the true one, even for a client that
+/// reads late.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_flood_of_marks_ends_in_the_last_state_with_few_events() {
+    if !real_only() {
+        return;
+    }
+    let server = TestServer::start(TestServerConfig::default()).await;
+    let pane = server.add_pane();
+    let h = connect(&server, true).await;
+    let mut events = h.events().await.expect("events");
+
+    // 20000 marks (A, B, C, D;1) in 5000 rounds, then a last D with code 42.
+    let round: &[u8] = b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;1\x07";
+    let mut flood = Vec::new();
+    for _ in 0..5000 {
+        flood.extend_from_slice(round);
+    }
+    for chunk in flood.chunks(16 * 1024) {
+        h.send_input(pane, chunk).await.expect("send_input");
+    }
+    h.send_input(pane, b"\x1b]133;D;42\x07").await.expect("send_input");
+
+    // The client does not read for a while, as a slow one would not.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let mut got: Vec<Shell> = Vec::new();
+    let end = tokio::time::timeout(Duration::from_secs(20), async {
+        while let Some(item) = events.next().await {
+            if let Some(s) = shell_state(Some(item), pane) {
+                let last = s.exit_code == Some(42);
+                got.push(s);
+                if last {
+                    return true;
+                }
+            }
+        }
+        false
+    })
+    .await;
+    assert_eq!(end, Ok(true), "the last state never came; {} states", got.len());
+    println!("{} ShellState events for 20001 marks", got.len());
+    assert!(got.len() < 1500, "{} events for 20001 marks", got.len());
+    let revs: Vec<u64> = got.iter().map(|s| s.rev).collect();
+    assert!(revs.windows(2).all(|w| w[0] <= w[1]), "revs never go back: {revs:?}");
+    h.close().await;
     server.shutdown().await;
 }

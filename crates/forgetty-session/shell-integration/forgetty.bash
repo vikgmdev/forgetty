@@ -17,6 +17,7 @@ if [[ ${PROMPT_COMMAND-} == *"$__forgetty_boot"* ]]; then
   [[ -z ${PROMPT_COMMAND//[[:space:];]/} ]] && unset PROMPT_COMMAND
 fi
 unset __forgetty_boot
+export -n PROMPT_COMMAND FORGETTY_SHELL_INTEGRATION_DIR
 
 __forgetty_osc7() {
   local LC_ALL=C i c out= hex
@@ -30,13 +31,21 @@ __forgetty_osc7() {
   printf '\e]7;file://%s%s\a' "${HOSTNAME}" "$out"
 }
 
-__forgetty_prompt() {
+# First in PROMPT_COMMAND, so $? is still the status of the command.
+__forgetty_first() {
   local ret=$?
   if [[ -n $__forgetty_ran ]]; then
     printf '\e]133;D;%s\a' "$ret"
     __forgetty_ran=
   fi
   __forgetty_osc7
+  return $ret
+}
+
+# Last in PROMPT_COMMAND, after a prompt theme (starship, powerline, ...) has
+# rebuilt PS1. A and B go into PS1, so a redraw of the prompt marks itself.
+__forgetty_last() {
+  local ret=$?
   if [[ $PS1 != *'133;A'* ]]; then
     PS1='\[\e]133;A\a\]'"$PS1"'\[\e]133;B\a\]'
   fi
@@ -47,11 +56,18 @@ __forgetty_prompt() {
 # command runs. The expansion also records that a command ran.
 PS0='\e]133;C;${__forgetty_ran:=1}\a'"${PS0-}"
 
-# First in PROMPT_COMMAND, so $? is still the status of the command.
 if [[ $(declare -p PROMPT_COMMAND 2>/dev/null) == "declare -a"* ]]; then
-  PROMPT_COMMAND=(__forgetty_prompt "${PROMPT_COMMAND[@]}")
+  PROMPT_COMMAND=(__forgetty_first "${PROMPT_COMMAND[@]}" __forgetty_last)
 else
-  PROMPT_COMMAND="__forgetty_prompt${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+  # A newline before the last hook keeps a trailing comment or & in the user's
+  # command from swallowing it.
+  PROMPT_COMMAND="__forgetty_first;${PROMPT_COMMAND:+$PROMPT_COMMAND$'\n'}__forgetty_last"
 fi
+
+# Programs started from this shell (a nested bash, su, script, vim :sh, tmux)
+# must not inherit the hooks: the functions exist only in this shell.
+export -n PROMPT_COMMAND FORGETTY_SHELL_INTEGRATION_DIR
+
 # This file runs from inside the first PROMPT_COMMAND: mark that prompt too.
-__forgetty_prompt
+__forgetty_first
+__forgetty_last

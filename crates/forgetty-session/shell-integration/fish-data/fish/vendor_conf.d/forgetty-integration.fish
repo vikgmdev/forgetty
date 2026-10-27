@@ -17,6 +17,8 @@ if status is-interactive; and not set -q __forgetty_si_loaded
             test "$d" = "$FORGETTY_SHELL_INTEGRATION_DIR/fish-data"; or set -a keep $d
         end
         set -gx XDG_DATA_DIRS (string join : -- $keep)
+        # Not for programs started from this shell.
+        set -gu FORGETTY_SHELL_INTEGRATION_DIR $FORGETTY_SHELL_INTEGRATION_DIR
     end
 
     function __forgetty_osc7 --on-variable PWD

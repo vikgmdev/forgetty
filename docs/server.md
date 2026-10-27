@@ -429,3 +429,18 @@ themselves. Your own startup files run as before. A bash startup file that
 replaces `PROMPT_COMMAND` instead of adding to it turns the integration off for
 that shell. A shell that was started before the server read the setting keeps
 running without it.
+
+Limits:
+
+- The integration is for the shell the server starts. `exec zsh`, a nested zsh
+  or bash, `su`, `script`, vim `:sh` and tmux started from the pane run without
+  it (the scripts take their variables out of the environment so those shells do
+  not run hooks that exist only in the first one).
+- A system `/etc/zsh/zshenv` that sets `ZDOTDIR` takes the zsh trampoline away
+  and turns the integration off.
+- A prompt theme that rebuilds `PS1` on every prompt (powerlevel10k, starship)
+  keeps the marks: they are added after the theme runs. The first prompt of the
+  shell can lack them.
+- A pane that writes marks in a loop gets its states merged (a burst of 8, then
+  one per 10 ms per pane, and the newest pending one per client connection), so a
+  client sees where the shell is, not every step.

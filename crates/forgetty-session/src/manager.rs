@@ -2155,8 +2155,9 @@ impl SessionManager {
             pane.osc.scanner.feed(bytes, &mut |e| found.push(e));
         }
         let mut meta_events: Vec<SessionEvent> = Vec::new();
+        let mut shell_flush: Option<std::time::Duration> = None;
         if !found.is_empty() {
-            apply_osc_events(id, pane, found, &mut meta_events);
+            apply_osc_events(id, pane, found, &mut meta_events, &mut shell_flush);
         }
         // P7.1: the tty mode is read a little after the output, never per
         // chunk and never per byte (see `shell::TTY_CHECK_DELAYS`): a chunk
@@ -2187,6 +2188,9 @@ impl SessionManager {
         drop(guard);
         if let Some(epoch) = tty_chain {
             self.schedule_tty_check(id, epoch);
+        }
+        if let Some(after) = shell_flush {
+            self.schedule_shell_flush(id, after);
         }
         Ok(DrainResult { pty_exited })
     }
@@ -2221,23 +2225,50 @@ impl SessionManager {
         inner.panes.get_mut(&id).map(f)
     }
 
+    /// Send the newest held `ShellState` of a pane in `after`.
+    fn schedule_shell_flush(&self, id: PaneId, after: std::time::Duration) {
+        let Ok(rt) = tokio::runtime::Handle::try_current() else { return };
+        let sm = self.clone();
+        rt.spawn(async move {
+            tokio::time::sleep(after).await;
+            let mut guard = sm.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let inner = &mut *guard;
+            if let Some(pane) = inner.panes.get_mut(&id) {
+                if let Some(state) = pane.osc.shell.take_held(std::time::Instant::now()) {
+                    let _ = inner.event_tx.send(SessionEvent::ShellState { pane_id: id, state });
+                }
+            }
+        });
+    }
+
     /// Read the termios of the pane now and broadcast a `ShellState` when the
     /// tty mode changed. Returns the state as it is after the read.
     fn read_tty_now(&self, id: PaneId) -> Option<crate::shell::ShellSnapshot> {
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let inner = &mut *guard;
-        let pane = inner.panes.get_mut(&id)?;
-        let flags = pane.pty_bridge.pty.tty_flags();
-        let cwd = pane.osc.display_cwd.clone();
-        let changed = pane.osc.shell.read_tty(flags, cwd.as_deref(), now_ms());
-        let now = pane.osc.shell.current(cwd.as_deref());
-        match changed {
-            Some(state) => {
-                let _ = inner.event_tx.send(SessionEvent::ShellState { pane_id: id, state: state.clone() });
-                Some(state)
+        let mut flush = None;
+        let result = {
+            let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let inner = &mut *guard;
+            let pane = inner.panes.get_mut(&id)?;
+            let flags = pane.pty_bridge.pty.tty_flags();
+            let cwd = pane.osc.display_cwd.clone();
+            let changed = pane.osc.shell.read_tty(flags, cwd.as_deref(), now_ms());
+            let now = pane.osc.shell.current(cwd.as_deref());
+            match changed {
+                Some(state) => {
+                    let mut out = Vec::new();
+                    offer_shell_state(id, pane, state.clone(), &mut out, &mut flush);
+                    for ev in out {
+                        let _ = inner.event_tx.send(ev);
+                    }
+                    state
+                }
+                None => now,
             }
-            None => Some(now),
+        };
+        if let Some(after) = flush {
+            self.schedule_shell_flush(id, after);
         }
+        Some(result)
     }
 
     /// The shell state of a pane, with a fresh read of its tty mode. A change
@@ -3106,6 +3137,7 @@ fn apply_osc_events(
     pane: &mut PaneState,
     found: Vec<OscEvent>,
     out: &mut Vec<SessionEvent>,
+    flush: &mut Option<std::time::Duration>,
 ) {
     for ev in found {
         match ev {
@@ -3126,7 +3158,7 @@ fn apply_osc_events(
                     pane.osc.display_cwd = Some(path.clone());
                     let state = pane.osc.shell.cwd_changed(&path, now_ms());
                     out.push(SessionEvent::CwdChanged { pane_id: id, cwd: path });
-                    out.push(SessionEvent::ShellState { pane_id: id, state });
+                    offer_shell_state(id, pane, state, out, flush);
                 }
             }
             OscEvent::Mark { kind, exit_code } => {
@@ -3135,7 +3167,7 @@ fn apply_osc_events(
                 if let Some(state) =
                     pane.osc.shell.mark(kind, exit_code, tty, cwd.as_deref(), now_ms())
                 {
-                    out.push(SessionEvent::ShellState { pane_id: id, state });
+                    offer_shell_state(id, pane, state, out, flush);
                 }
             }
             OscEvent::Status(report) => {
@@ -3159,6 +3191,31 @@ fn apply_osc_events(
                 pane.osc.last_notification =
                     Some(NotificationInfo { title: title.clone(), body: body.clone(), at_ms: now });
                 out.push(SessionEvent::Notification { pane_id: id, title, body });
+            }
+        }
+    }
+}
+
+/// Queue a `ShellState`, or keep it as the newest while the gap since the last
+/// one is not over (`shell::MIN_EVENT_GAP`). A held state is flushed by a timer
+/// the caller starts when `flush` is set. Without a runtime there is no timer,
+/// so the state goes out at once.
+fn offer_shell_state(
+    id: PaneId,
+    pane: &mut PaneState,
+    state: crate::shell::ShellSnapshot,
+    out: &mut Vec<SessionEvent>,
+    flush: &mut Option<std::time::Duration>,
+) {
+    if tokio::runtime::Handle::try_current().is_err() {
+        out.push(SessionEvent::ShellState { pane_id: id, state });
+        return;
+    }
+    match pane.osc.shell.offer(state, std::time::Instant::now()) {
+        crate::shell::Offer::Send(state) => out.push(SessionEvent::ShellState { pane_id: id, state }),
+        crate::shell::Offer::Hold { flush_in } => {
+            if flush_in.is_some() {
+                *flush = flush_in;
             }
         }
     }

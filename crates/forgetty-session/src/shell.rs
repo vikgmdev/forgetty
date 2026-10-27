@@ -31,6 +31,27 @@ pub const TTY_CHECK_DELAYS: [Duration; 4] = [
     Duration::from_millis(3000),
 ];
 
+/// A pane may send a burst of this many `ShellState` events at once (a fast
+/// command makes A, B, C and D within a millisecond), then one per
+/// [`MIN_EVENT_GAP`]. Over that the states merge: the newest goes out when the
+/// next one is due. A pane that writes prompt marks in a loop cannot lag the
+/// subscribers. (A client connection keeps only the newest pending state per
+/// pane too.)
+pub const EVENT_BURST: u32 = 8;
+/// The refill interval of the burst allowance.
+pub const MIN_EVENT_GAP: Duration = Duration::from_millis(10);
+
+/// What to do with a new state (see [`ShellTracker::offer`]).
+#[derive(Debug, PartialEq, Eq)]
+pub enum Offer {
+    /// Send it now.
+    Send(ShellSnapshot),
+    /// Kept as the newest state. When `flush_in` is set, call
+    /// [`ShellTracker::take_held`] after that long; when `None`, a flush is
+    /// queued already.
+    Hold { flush_in: Option<Duration> },
+}
+
 /// Where the shell is in its prompt cycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Phase {
@@ -106,6 +127,11 @@ pub struct ShellTracker {
     pub chain_epoch: u64,
     /// The first check of the current chain has not run yet.
     pub first_check_pending: bool,
+    /// Burst allowance left, and when it was last topped up.
+    tokens: u32,
+    refilled: Option<std::time::Instant>,
+    held: Option<ShellSnapshot>,
+    flush_scheduled: bool,
     /// Termios reads so far (for tests: it must stay far below the number of
     /// output chunks).
     pub tty_reads: u64,
@@ -123,6 +149,48 @@ impl ShellTracker {
             mark,
             at_ms,
         }
+    }
+
+    fn refill(&mut self, now: std::time::Instant) {
+        let Some(last) = self.refilled else {
+            self.refilled = Some(now);
+            self.tokens = EVENT_BURST;
+            return;
+        };
+        let gaps = (now.duration_since(last).as_millis() / MIN_EVENT_GAP.as_millis()) as u32;
+        if gaps > 0 {
+            self.tokens = (self.tokens + gaps).min(EVENT_BURST);
+            self.refilled = Some(last + MIN_EVENT_GAP * gaps);
+        }
+    }
+
+    /// A state changed. Decide whether it goes out now or waits, as the newest
+    /// state, for the next refill of the burst allowance.
+    pub fn offer(&mut self, snap: ShellSnapshot, now: std::time::Instant) -> Offer {
+        self.refill(now);
+        if !self.flush_scheduled && self.tokens > 0 {
+            self.tokens -= 1;
+            self.held = None;
+            return Offer::Send(snap);
+        }
+        self.held = Some(snap);
+        if self.flush_scheduled {
+            return Offer::Hold { flush_in: None };
+        }
+        self.flush_scheduled = true;
+        let since = self.refilled.map_or(Duration::ZERO, |t| now.duration_since(t));
+        Offer::Hold {
+            flush_in: Some(MIN_EVENT_GAP.saturating_sub(since).max(Duration::from_millis(1))),
+        }
+    }
+
+    /// The flush asked for by [`Offer::Hold`]: the newest held state.
+    pub fn take_held(&mut self, now: std::time::Instant) -> Option<ShellSnapshot> {
+        self.refill(now);
+        self.flush_scheduled = false;
+        let held = self.held.take()?;
+        self.tokens = self.tokens.saturating_sub(1);
+        Some(held)
     }
 
     /// The state as it is now, without a change (the revision stays).
@@ -266,6 +334,38 @@ mod tests {
         assert_eq!(t.output(), Some(2), "chain 1 had its first check: chain 2 starts");
         assert!(!t.first_check(1), "chain 1 is stale");
         assert!(t.first_check(2));
+    }
+
+    #[test]
+    fn a_burst_goes_out_then_states_merge_into_the_newest() {
+        let mut t = ShellTracker::default();
+        let t0 = std::time::Instant::now();
+        let ms = Duration::from_millis;
+        let kinds = [
+            MarkKind::PromptStart,
+            MarkKind::InputStart,
+            MarkKind::CommandStart,
+            MarkKind::CommandEnd,
+        ];
+        // A burst of EVENT_BURST states, all at once, goes out unchanged.
+        for i in 0..EVENT_BURST as usize {
+            let s = t.mark(kinds[i % 4], None, None, None, 0).unwrap();
+            assert_eq!(t.offer(s.clone(), t0), Offer::Send(s));
+        }
+        // The next ones merge; the first asks for a flush, the rest do not.
+        let s = t.mark(MarkKind::PromptStart, None, None, None, 0).unwrap();
+        let Offer::Hold { flush_in: Some(d) } = t.offer(s, t0 + ms(2)) else { panic!() };
+        assert_eq!(d, ms(8));
+        let s = t.mark(MarkKind::InputStart, None, None, None, 0).unwrap();
+        assert_eq!(t.offer(s, t0 + ms(3)), Offer::Hold { flush_in: None });
+        let newest = t.mark(MarkKind::CommandStart, None, None, None, 0).unwrap();
+        assert_eq!(t.offer(newest.clone(), t0 + ms(4)), Offer::Hold { flush_in: None });
+        // The flush sends the newest only.
+        assert_eq!(t.take_held(t0 + ms(10)), Some(newest));
+        assert_eq!(t.take_held(t0 + ms(11)), None);
+        // After a quiet time the burst allowance is back.
+        let e = t.mark(MarkKind::PromptStart, None, None, None, 0).unwrap();
+        assert_eq!(t.offer(e.clone(), t0 + ms(200)), Offer::Send(e));
     }
 
     #[test]

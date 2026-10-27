@@ -2007,6 +2007,10 @@ impl Session {
                         Ok((seq, event)) => {
                             if !session.event_allowed(&event) {
                                 // not for this peer
+                            } else if let ServerEvent::ShellState { pane_id, .. } = &event {
+                                // A whole state: one pending per pane.
+                                let key = *pane_id;
+                                queue.put_keyed(key, control_frame(&ControlMsg::Event { seq, event }));
                             } else if matches!(event, ServerEvent::LayoutChanged { .. }) {
                                 // A layout is a full snapshot: one pending
                                 // layout per connection, replaced in place.
@@ -2034,6 +2038,20 @@ impl Session {
                         let seq = session.rpc.current_seq();
                         let event = ServerEvent::LayoutChanged { layout: session.rpc.layout_value() };
                         queue.put_layout(control_frame(&ControlMsg::Event { seq, event }));
+                        last_resync = Some(tokio::time::Instant::now());
+                    }
+                    if session.has(cap::SHELL_STATE) {
+                        // States that were lost with the lagged events: the
+                        // whole state of each pane, replacing what is queued.
+                        let seq = session.rpc.current_seq();
+                        let rpc = session.rpc.clone();
+                        let states = tokio::task::spawn_blocking(move || rpc.sm.shell_states())
+                            .await
+                            .unwrap_or_default();
+                        for (pane_id, state) in states {
+                            let event = shell_state_event(pane_id.0, &state);
+                            queue.put_keyed(pane_id.0, control_frame(&ControlMsg::Event { seq, event }));
+                        }
                         last_resync = Some(tokio::time::Instant::now());
                     }
                 }

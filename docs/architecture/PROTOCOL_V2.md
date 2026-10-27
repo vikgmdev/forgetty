@@ -603,6 +603,17 @@ ShellState {
 - After the answer to `subscribe_events` the server sends one `ShellState` for
   every pane that has a state (a mark seen, or a tty mode read). Other
   subscribers see these too: they drop them by `rev`.
+- States are rate limited, so a pane that writes marks in a loop cannot lag a
+  subscriber. A pane sends a burst of 8 events at once (a fast command makes A,
+  B, C and D within a millisecond), then one per 10 ms. States over that merge:
+  the newest goes out when the next one is due. A connection also keeps only the
+  newest pending `ShellState` of each pane (as it does for the layout), so a
+  slow client gets the last state, not every step. Therefore a client reads the
+  `phase` as where the shell is, not as an event: `running` can be skipped, and a
+  command that ended shows as `input` with the new `exit_code` (a `rev` that
+  grew). When a connection lags and resyncs, the server sends the current state
+  of every pane again: the same `rev` can arrive twice. A client drops an event
+  whose `rev` is not higher than the one it holds.
 - Marks are not tied to a byte offset of the pane stream yet. A client that needs
   command boundaries in the scrollback (command cards, P7.4) reads the marks from
   the byte stream with its own parser, which is where they are.
@@ -625,3 +636,21 @@ shell (the config `shell` or `$SHELL`; never an explicit `-e` command) it sets:
 `FORGETTY_SHELL_INTEGRATION_DIR` is set in the environment of those panes. A user
 can also source `forgetty.zsh` or `forgetty.bash` by hand in a shell the server did
 not start.
+
+Limits:
+
+- zsh: only the shell the server starts has the integration. `exec zsh` and a
+  zsh started from it run without it (the script is not in the environment any
+  more, on purpose, see below). A system file `/etc/zsh/zshenv` that sets
+  `ZDOTDIR` takes the trampoline away and turns the integration off.
+- bash and zsh: the script takes `FORGETTY_SHELL_INTEGRATION_DIR` out of the
+  environment of the shell once loaded, and bash also unexports
+  `PROMPT_COMMAND`, so a nested bash, `su`, `script`, vim `:sh` or tmux started
+  from the pane does not run hooks that exist only in the first shell. Those
+  child shells run without the integration.
+- A prompt theme that rebuilds `PS1` on every prompt (powerlevel10k, starship)
+  keeps the marks: the script adds `A` and `B` from a hook that runs after the
+  theme (last in `PROMPT_COMMAND` for bash, last in `precmd_functions` for zsh,
+  put back at the end before every command). The very first prompt can still
+  lack its marks when the theme runs in the same start line; the next prompt has
+  them.

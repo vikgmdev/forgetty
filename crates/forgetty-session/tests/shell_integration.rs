@@ -134,9 +134,8 @@ async fn run_shell(name: &str) {
     let pane = spawn_pane(&sm, &shell, &env.work);
     let mut seen = Seen { rx, pane, states: Vec::new() };
 
-    // The first prompt: A, then B, with the directory.
+    // The first prompt (A and B), with the directory.
     let i = seen.wait("the first prompt (B)", 0, |s| s.phase == Phase::Input).await;
-    seen.wait("A before B", 0, |s| s.phase == Phase::Prompt).await;
     let cwd_ok = seen.states.iter().any(|s| s.cwd.as_deref() == env.work.to_str());
     assert!(cwd_ok, "{name}: no state carries the directory {:?}", env.work);
     // The line editor edits the line itself: the kernel does not echo.
@@ -144,23 +143,26 @@ async fn run_shell(name: &str) {
         .wait("the line editor tty mode", i, |s| s.tty.is_some_and(|t| !t.canonical && !t.echo))
         .await;
 
-    // A command that fails: C, then D with its exit code, then the next prompt.
+    // A command that fails: C, then the next prompt carries the exit code. The
+    // server merges states that come closer than 10 ms, so D, A and B may reach
+    // the client as one state: the phase is where the shell is, not an event.
     sm.write_pty(pane, b"sh -c 'exit 3'\n").unwrap();
     let c = seen.wait("command start (C)", tty, |s| s.phase == Phase::Running).await;
     let d = seen
-        .wait("command end (D) with code 3", c, |s| {
-            s.phase == Phase::Done && s.exit_code == Some(3)
+        .wait("the prompt again with exit code 3", c, |s| {
+            s.phase == Phase::Input && s.exit_code == Some(3)
         })
         .await;
-    let a2 = seen.wait("the next prompt (A)", d, |s| s.phase == Phase::Prompt).await;
-    let b2 = seen.wait("the next prompt ends (B)", a2, |s| s.phase == Phase::Input).await;
+    assert!(seen.states[d].rev > seen.states[c].rev);
 
     // A command that works: the code is 0.
     sm.write_pty(pane, b"true\n").unwrap();
-    seen.wait("exit code 0", b2, |s| s.phase == Phase::Done && s.exit_code == Some(0)).await;
-    let b3 = seen.wait("prompt again", b2, |s| s.phase == Phase::Input && s.rev > 0).await;
-    let b3 =
-        seen.states[b3..].iter().position(|s| s.phase == Phase::Input).map(|p| b3 + p).unwrap();
+    let c2 = seen.wait("command start again", d, |s| s.phase == Phase::Running).await;
+    let b3 = seen
+        .wait("the prompt again with exit code 0", c2, |s| {
+            s.phase == Phase::Input && s.exit_code == Some(0)
+        })
+        .await;
 
     // A password-style read: canonical, echo off, while the command runs.
     sm.write_pty(pane, b"sh -c 'stty -echo; read -r x; stty echo'\n").unwrap();
@@ -312,5 +314,196 @@ async fn tabs_and_splits_start_their_shell_with_the_integration() {
     let mut seen = Seen { rx, pane: child, states: Vec::new() };
     seen.wait("the split's first prompt", 0, |s| s.phase == Phase::Input).await;
     sm.close_pane(child).unwrap();
+    sm.close_pane(pane).unwrap();
+}
+
+/// All output bytes of one pane, collected in the background.
+struct Output {
+    buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+impl Output {
+    fn start(sm: &SessionManager, pane: PaneId) -> Output {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut rx = sm.subscribe_output();
+        let sink = buf.clone();
+        tokio::spawn(async move {
+            while let Ok(ev) = rx.recv().await {
+                if let SessionEvent::PtyOutput { pane_id, data } = ev {
+                    if pane_id == pane {
+                        sink.lock().unwrap().extend_from_slice(&data);
+                    }
+                }
+            }
+        });
+        Output { buf }
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.buf.lock().unwrap()).into_owned()
+    }
+
+    async fn wait_for(&self, needle: &str) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !self.text().contains(needle) {
+            assert!(Instant::now() < deadline, "no {needle:?} in the output:\n{}", self.text());
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+fn integrated_pane(name: &str, rc: Option<(&str, &str)>) -> Option<(SessionManager, Env, PaneId)> {
+    let shell = find_shell(name)?;
+    let env = quiet_home();
+    set_env(env.home.path());
+    if let Some((file, content)) = rc {
+        std::fs::write(env.home.path().join(file), content).unwrap();
+    }
+    let sm = SessionManager::new();
+    sm.set_shell_integration(Some(ShellIntegration::install(&env.home.path().join("si")).unwrap()));
+    let pane = spawn_pane(&sm, &shell, &env.work);
+    Some((sm, env, pane))
+}
+
+/// A shell started from an integrated shell (nested bash, su, script, vim
+/// :sh) must not inherit the hooks: no "command not found", a working prompt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bash_started_from_an_integrated_bash_runs_without_the_hooks() {
+    let _one = SERIAL.lock().await;
+    let Some((sm, _env, pane)) = integrated_pane("bash", None) else {
+        println!("SKIPPED: bash is not installed");
+        return;
+    };
+    let rx = sm.subscribe_meta();
+    let out = Output::start(&sm, pane);
+    let mut seen = Seen { rx, pane, states: Vec::new() };
+    let i = seen.wait("the first prompt", 0, |s| s.phase == Phase::Input).await;
+    sm.write_pty(
+        pane,
+        b"bash -i\necho NEST-$((20+1)) pc=[$PROMPT_COMMAND] dir=[$FORGETTY_SHELL_INTEGRATION_DIR]\nexit\n",
+    )
+    .unwrap();
+    out.wait_for("NEST-21 pc=[] dir=[]").await;
+    // The outer shell has its prompt back.
+    let r = seen.wait("the nested shell runs", i + 1, |s| s.phase == Phase::Running).await;
+    seen.wait("the outer prompt after the nested shell", r, |s| s.phase == Phase::Input).await;
+    sm.write_pty(pane, b"echo OUTER-$((5+5))\n").unwrap();
+    out.wait_for("OUTER-10").await;
+    let text = out.text();
+    assert!(!text.contains("command not found"), "output:\n{text}");
+    sm.close_pane(pane).unwrap();
+}
+
+/// The same for tmux started from a pane: the shell tmux starts runs clean.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tmux_started_from_an_integrated_bash_runs_without_the_hooks() {
+    let _one = SERIAL.lock().await;
+    if find_shell("tmux").is_none() {
+        println!("SKIPPED: tmux is not installed");
+        return;
+    }
+    let Some((sm, _env, pane)) = integrated_pane("bash", None) else {
+        println!("SKIPPED: bash is not installed");
+        return;
+    };
+    let rx = sm.subscribe_meta();
+    let out = Output::start(&sm, pane);
+    let mut seen = Seen { rx, pane, states: Vec::new() };
+    seen.wait("the first prompt", 0, |s| s.phase == Phase::Input).await;
+    let sock = format!("fgty-si-test-{}", std::process::id());
+    let cmd = format!(
+        "tmux -L {sock} -f /dev/null new-session -d -s t 'bash -i'; sleep 1; \
+         tmux -L {sock} send-keys -t t 'echo TMUX-$((3+4))' Enter; sleep 1; \
+         tmux -L {sock} capture-pane -p -t t; tmux -L {sock} kill-server; echo TMUX-$((1+1))END\n"
+    );
+    sm.write_pty(pane, cmd.as_bytes()).unwrap();
+    out.wait_for("TMUX-2END").await;
+    let text = out.text();
+    assert!(text.contains("TMUX-7"), "tmux's shell did not run the command:\n{text}");
+    assert!(!text.contains("command not found"), "output:\n{text}");
+    sm.close_pane(pane).unwrap();
+}
+
+/// After every command the prompt marks come back (B follows C), so the
+/// shell reaches the Input phase again.
+async fn prompt_marks_survive(sm: &SessionManager, pane: PaneId, name: &str) {
+    let rx = sm.subscribe_meta();
+    let mut seen = Seen { rx, pane, states: Vec::new() };
+    seen.wait("the line editor tty mode", 0, |s| s.tty.is_some_and(|t| !t.canonical && !t.echo))
+        .await;
+    for round in 0..3 {
+        let from = seen.states.len();
+        sm.write_pty(pane, b"true\n").unwrap();
+        let c = seen
+            .wait(&format!("{name} round {round}: command start"), from, |s| {
+                s.phase == Phase::Running
+            })
+            .await;
+        seen.wait(&format!("{name} round {round}: B after the theme"), c, |s| {
+            s.phase == Phase::Input && s.exit_code == Some(0)
+        })
+        .await;
+    }
+}
+
+/// A prompt theme that sets PS1 again on every prompt (starship, powerline)
+/// does not remove the marks: they are added after the theme ran.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bash_theme_that_rewrites_ps1_every_prompt_keeps_the_marks() {
+    let _one = SERIAL.lock().await;
+    let rc = "__theme() { PS1='themed> '; }\nPROMPT_COMMAND=\"${PROMPT_COMMAND:+$PROMPT_COMMAND;}__theme\"\n";
+    let Some((sm, _env, pane)) = integrated_pane("bash", Some((".bash_profile", rc))) else {
+        println!("SKIPPED: bash is not installed");
+        return;
+    };
+    prompt_marks_survive(&sm, pane, "bash").await;
+    sm.close_pane(pane).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn zsh_theme_that_rewrites_ps1_every_prompt_keeps_the_marks() {
+    let _one = SERIAL.lock().await;
+    let rc = "_theme() { PS1='themed> ' }\nprecmd_functions+=(_theme)\n";
+    let Some((sm, _env, pane)) = integrated_pane("zsh", Some((".zshrc", rc))) else {
+        println!("SKIPPED: zsh is not installed");
+        return;
+    };
+    prompt_marks_survive(&sm, pane, "zsh").await;
+    sm.close_pane(pane).unwrap();
+}
+
+/// A pane that writes prompt marks in a loop: the events stay few, and the
+/// last state is the true one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pane_writing_marks_in_a_loop_gets_merged_states() {
+    let _one = SERIAL.lock().await;
+    let Some((sm, _env, pane)) = integrated_pane("bash", None) else {
+        println!("SKIPPED: bash is not installed");
+        return;
+    };
+    let rx = sm.subscribe_meta();
+    let out = Output::start(&sm, pane);
+    let mut seen = Seen { rx, pane, states: Vec::new() };
+    seen.wait("the first prompt", 0, |s| s.phase == Phase::Input).await;
+    let from = seen.states.len();
+    // 20000 marks (A, B, C, D), then the prompt comes back.
+    sm.write_pty(
+        pane,
+        b"for ((i=0;i<5000;i++)); do printf '\\e]133;A\\a\\e]133;B\\a\\e]133;C\\a\\e]133;D;0\\a'; done; echo FLOOD-$((1+1))\n",
+    )
+    .unwrap();
+    out.wait_for("FLOOD-2").await;
+    // The shell comes back to a prompt: the last state says so.
+    seen.wait("the prompt after the loop", from, |s| s.phase == Phase::Input).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    seen.drain();
+    let n = seen.states.len() - from;
+    println!("{n} states for 20000 marks");
+    assert!(n < 1500, "{n} states for 20000 marks");
+    let last = seen.states.last().unwrap();
+    assert!(seen.states.windows(2).all(|w| w[0].rev < w[1].rev), "revisions go up");
+    let now = sm.shell_state(pane).unwrap();
+    assert_eq!(now.rev, last.rev, "the last event is the current state");
+    assert_eq!(now.phase, Phase::Input);
     sm.close_pane(pane).unwrap();
 }
