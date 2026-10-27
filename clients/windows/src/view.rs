@@ -214,6 +214,8 @@ pub struct TerminalView {
     pub pending_paste: Option<PendingPaste>,
     /// A picture on the clipboard may be saved as a file and its path pasted (panes of this PC).
     pub image_paste: bool,
+    /// The program the pane was started with, for quoting a pasted path (never the prompt text).
+    pub paste_target: forgetty_shell_core::imagepaste::Target,
     pub search: Option<SearchState>,
     /// The http(s) link under the pointer, and the cell and screen generation it was found for.
     pub hover_link: Option<Link>,
@@ -468,6 +470,7 @@ impl TerminalView {
             ime_bounds_last: None,
             pending_paste: None,
             image_paste: false,
+            paste_target: forgetty_shell_core::imagepaste::Target::Unknown,
             search: None,
             hover_link: None,
             hover_cell: None,
@@ -1622,11 +1625,13 @@ impl TerminalView {
             let _ = this.update(cx, |v, cx| {
                 match saved {
                     Ok(path) => {
-                        // Quoted for the shell the pane runs (read from the prompt line).
-                        let (r, _) = v.term.cursor();
-                        let line: String = v.term.screen().row(r).iter().filter(|c| !c.attrs.spacer).map(|c| c.grapheme.as_str()).collect();
-                        let shell = forgetty_shell_core::imagepaste::detect_shell(&line);
-                        v.send_paste(&forgetty_shell_core::imagepaste::paste_text(&path, shell));
+                        // Quoted and written for the program the pane was started with.
+                        match forgetty_shell_core::imagepaste::paste_text(&path, v.paste_target) {
+                            Ok(text) => {
+                                v.send_paste(&text);
+                            }
+                            Err(why) => v.show_notice(format!("Picture saved as {}, not pasted: {why}", path.display()), cx),
+                        }
                     }
                     Err(e) => v.show_notice(e, cx),
                 }

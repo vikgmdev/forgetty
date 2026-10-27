@@ -452,7 +452,7 @@ impl ShellSmoke {
             std::thread::spawn(move || crate::localserver::bring_up(&cli, &rt, &store, &device, None)).join().ok().and_then(Result::ok)
         };
         let Some(first) = store.local_machine() else { fail("local server: no stored machine to check") };
-        let want = ls::loopback_addr(cli.status().map(|s| s.port_or_default()).unwrap_or(47297));
+        let want = cli.status().map(|s| s.pins()).unwrap_or_else(|_| vec![ls::loopback_addr(47297)]);
 
         // 1. The stored address is wrong (the server was somewhere else): it follows the server,
         // and the pairing is kept (same machine id).
@@ -462,7 +462,7 @@ impl ShellSmoke {
         let kept = run(cli);
         check(
             "local_server_stored_address_follows_the_server",
-            kept.as_ref().is_some_and(|m| m.id == first.id && m.pinned_addrs == vec![want]) && store.local_machine().is_some_and(|m| m.pinned_addrs == vec![want]),
+            kept.as_ref().is_some_and(|m| m.id == first.id && m.pinned_addrs == want) && store.local_machine().is_some_and(|m| m.pinned_addrs == want),
         );
 
         // 2. The server forgets this app (revoked): the next start pairs again.
@@ -474,7 +474,7 @@ impl ShellSmoke {
         let listed = cli.devices().map(|d| d.iter().any(|x| ls::is_own_device(x, &own))).unwrap_or(false);
         check(
             "local_server_pairs_again_when_the_server_refuses_the_app",
-            again.as_ref().is_some_and(|m| m.id != first.id && m.pinned_addrs == vec![want]) && listed,
+            again.as_ref().is_some_and(|m| m.id != first.id && m.pinned_addrs == want) && listed,
         );
     }
 }
