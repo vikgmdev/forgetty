@@ -60,6 +60,8 @@ pub enum MenuCmd {
     WsDelete,
     /// A color of the tab or the workspace the menu belongs to. `None` clears it.
     Color(Option<u32>),
+    /// A row GTK has and this app does not: always greyed, never run.
+    Unavailable,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -73,6 +75,11 @@ pub enum Item {
 impl Item {
     fn cmd(cmd: MenuCmd, label: &str, enabled: bool) -> Item {
         Item::Cmd { cmd, label: label.to_string(), hint: String::new(), enabled }
+    }
+
+    /// A greyed row with the reason at its right edge.
+    fn unavailable(label: &str, why: &str) -> Item {
+        Item::Cmd { cmd: MenuCmd::Unavailable, label: label.to_string(), hint: why.to_string(), enabled: false }
     }
 
     /// The row can be chosen with the keyboard.
@@ -120,7 +127,7 @@ pub fn action_of(cmd: &MenuCmd) -> Option<Action> {
         MenuCmd::WsMoveUp => Action::MoveWorkspaceUp,
         MenuCmd::WsMoveDown => Action::MoveWorkspaceDown,
         MenuCmd::WsDelete => Action::DeleteWorkspace,
-        MenuCmd::Copy | MenuCmd::OpenLink(_) | MenuCmd::Color(_) => return None,
+        MenuCmd::Copy | MenuCmd::OpenLink(_) | MenuCmd::Color(_) | MenuCmd::Unavailable => return None,
     })
 }
 
@@ -212,8 +219,8 @@ pub struct TabMenuCtx {
     pub split_before: bool,
 }
 
-/// GTK's tab menu: color, rename, duplicate, split, move, find, then the three closes.
-/// ("Move to New Window" and the Export stub wait for the multi-window work.)
+/// GTK's tab menu: color, rename, duplicate, split, move, find, export, then the three closes.
+/// "Move to New Window" (one window here) and "Export" (a stub in GTK too) are greyed.
 pub fn tab_menu(c: &TabMenuCtx) -> Vec<Item> {
     let mut v = vec![
         Item::Swatches { current: c.color },
@@ -226,7 +233,9 @@ pub fn tab_menu(c: &TabMenuCtx) -> Vec<Item> {
         Item::Sep,
         Item::cmd(MenuCmd::TabMoveLeft, "Move Left", c.index > 0),
         Item::cmd(MenuCmd::TabMoveRight, "Move Right", c.index + 1 < c.count),
+        Item::unavailable("Move to New Window", "one window"),
         Item::cmd(MenuCmd::Find, "Find", true),
+        Item::unavailable("Export", "not yet"),
         Item::Sep,
         Item::cmd(MenuCmd::TabCloseRight, "Close Tabs to the Right", c.index + 1 < c.count),
         Item::cmd(MenuCmd::TabCloseOthers, "Close Other Tabs", c.count > 1),
@@ -467,6 +476,20 @@ mod tests {
         let last = c(2, 3);
         assert!(!enabled(&last, "Move Right") && !enabled(&last, "Close Tabs to the Right"));
         assert!(matches!(mid[0], Item::Swatches { current: None }));
+    }
+
+    #[test]
+    fn the_tab_menu_lists_the_two_rows_gtk_has_and_greys_them() {
+        let m = tab_menu(&TabMenuCtx { index: 1, count: 3, color: None, split_before: false });
+        for name in ["Move to New Window", "Export"] {
+            assert_eq!(enabled(&m, name), false, "{name} is greyed");
+            let it = m.iter().find(|i| matches!(i, Item::Cmd { label, .. } if label == name)).unwrap();
+            assert!(!it.selectable());
+            assert!(matches!(it, Item::Cmd { cmd: MenuCmd::Unavailable, hint, .. } if !hint.is_empty()));
+        }
+        let names = labels(&m);
+        let at = |n: &str| names.iter().position(|l| l == n).unwrap();
+        assert!(at("Move Right") < at("Move to New Window") && at("Find") < at("Export") && at("Export") < at("Close Tabs to the Right"));
     }
 
     #[test]

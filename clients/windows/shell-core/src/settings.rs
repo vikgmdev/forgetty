@@ -17,13 +17,15 @@ pub enum Page {
     Appearance,
     Terminal,
     Keybindings,
+    /// Devices paired with this PC's local server.
+    Devices,
     /// The TOML editor.
     Advanced,
     About,
 }
 
 impl Page {
-    pub const ALL: [Page; 6] = [Page::General, Page::Appearance, Page::Terminal, Page::Keybindings, Page::Advanced, Page::About];
+    pub const ALL: [Page; 7] = [Page::General, Page::Appearance, Page::Terminal, Page::Keybindings, Page::Devices, Page::Advanced, Page::About];
 
     pub fn title(self) -> &'static str {
         match self {
@@ -31,6 +33,7 @@ impl Page {
             Page::Appearance => "Appearance",
             Page::Terminal => "Terminal",
             Page::Keybindings => "Keybindings",
+            Page::Devices => "Devices",
             Page::Advanced => "TOML editor",
             Page::About => "About",
         }
@@ -185,6 +188,23 @@ pub const DEFS: &[Def] = &[
         get: |c| V::Int((c.scrollback_bytes as i64) / MIB),
         default: || V::Int(10),
         applies: "new panes",
+    },
+    Def {
+        id: "cursor_style",
+        path: "cursor_style",
+        page: Page::Terminal,
+        section: "Cursor",
+        label: "Cursor shape",
+        help: "The cursor of a program that does not ask for one. A program that asks for a bar or an underline keeps its own.",
+        kind: Kind::Choice(&[("block", "Block"), ("bar", "Bar"), ("underline", "Underline"), ("block_hollow", "Hollow block")]),
+        get: |c| s(match c.cursor_style {
+            forgetty_config::CursorStyle::Block => "block",
+            forgetty_config::CursorStyle::Bar => "bar",
+            forgetty_config::CursorStyle::Underline => "underline",
+            forgetty_config::CursorStyle::BlockHollow => "block_hollow",
+        }),
+        default: || V::Str("block".into()),
+        applies: "",
     },
     Def {
         id: "bell_mode",

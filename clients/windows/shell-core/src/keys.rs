@@ -16,6 +16,8 @@ pub enum Action {
     MoveTabRight,
     RenameTab,
     CheckUpdates,
+    /// Close every tab of this PC, stop the local server and quit.
+    EndSession,
     /// Per-machine policy for programs that set the clipboard (OSC 52, write only).
     ClipboardWriteOff,
     ClipboardWriteAsk,
@@ -178,6 +180,7 @@ pub const ACTIONS: &[ActionInfo] = &[
     info!(Action::MoveTabRight, "move_tab_right", "Move tab right", ["ctrl+shift+pagedown"]),
     differ!(Action::RenameTab, "rename_tab", "Rename tab", gtk [], windows ["ctrl+shift+r"]),
     info!(Action::CheckUpdates, "check_updates", "Check for updates", []),
+    info!(Action::EndSession, "end_session", "Quit and end all tabs on this PC", []),
     info!(Action::ClipboardWriteOff, "clipboard_write_off", "Clipboard writes from programs on this machine: off", []),
     info!(Action::ClipboardWriteAsk, "clipboard_write_ask", "Clipboard writes from programs on this machine: ask", []),
     info!(Action::ClipboardWriteAllow, "clipboard_write_allow", "Clipboard writes from programs on this machine: allow", []),
@@ -197,8 +200,8 @@ pub const ACTIONS: &[ActionInfo] = &[
     differ!(Action::ToggleSidebar, "toggle_sidebar", "Toggle sidebar", gtk ["ctrl+alt+b"], windows ["ctrl+shift+b"]),
     info!(Action::CommandPalette, "command_palette", "Command palette", ["ctrl+shift+p"]),
     differ!(Action::NewWorkspace, "new_workspace", "New workspace", gtk ["ctrl+alt+n"], windows ["ctrl+shift+n"]),
-    differ!(Action::NextWorkspace, "next_workspace", "Next workspace", gtk ["ctrl+alt+pagedown"], windows []),
-    differ!(Action::PrevWorkspace, "prev_workspace", "Previous workspace", gtk ["ctrl+alt+pageup"], windows []),
+    differ!(Action::NextWorkspace, "next_workspace", "Next workspace", gtk ["ctrl+alt+pagedown"], windows ["ctrl+alt+pagedown"]),
+    differ!(Action::PrevWorkspace, "prev_workspace", "Previous workspace", gtk ["ctrl+alt+pageup"], windows ["ctrl+alt+pageup"]),
     info!(Action::PairMachine, "pair_machine", "Pair machine...", []),
     info!(Action::NextMachine, "next_machine", "Next machine", []),
     info!(Action::PrevMachine, "prev_machine", "Previous machine", []),
@@ -609,6 +612,9 @@ mod tests {
         assert_eq!(c(true, false, false, "5"), Some(Action::GotoTab(5)));
         assert_eq!(c(true, false, true, "z"), Some(Action::ZoomPane));
         assert_eq!(c(true, false, true, "b"), Some(Action::ToggleSidebar));
+        // Next and previous workspace: the same chords as GTK (the pager keys are free in this set).
+        assert_eq!(c(true, true, false, "pagedown"), Some(Action::NextWorkspace));
+        assert_eq!(c(true, true, false, "pageup"), Some(Action::PrevWorkspace));
         assert_eq!(c(false, true, false, "left"), None);
         assert_eq!(c(false, true, false, "1"), None);
         assert!(km.chords(Action::Quit).is_empty());

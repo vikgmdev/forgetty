@@ -22,6 +22,7 @@
 //! sidebar = false               # start with the sidebar open
 //! local_server = true           # terminals live in the local forgetty.exe server (false: in this window)
 //! on_launch = "restore"         # restore | new: tabs the server kept, or one new workspace
+//! cursor_style = "block"       # block | bar | underline | block_hollow
 //! pane_padding_x = 6.0          # px between a pane border and its text (default 6)
 //! pane_padding_y = 4.0          # default 4
 //! bell_mode = "visual"          # visual | audio | both | none
@@ -48,8 +49,7 @@
 //! ```
 //! Action names: see `keys::ACTIONS`.
 //!
-//! Keys that GTK reads and a client does not use (`cursor_style`,
-//! `session_trash_days`, `byte_log_*`, `relay*`, `bind_addrs`) are accepted and ignored. A key
+//! Keys that GTK reads and a client does not use (`session_trash_days`, `byte_log_*`, `relay*`, `bind_addrs`) are accepted and ignored. A key
 //! nobody knows is a warning, with a suggestion when it is close to a known one.
 
 use std::collections::HashMap;
@@ -57,7 +57,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-pub use forgetty_config::NotificationMode;
+pub use forgetty_config::{CursorStyle, NotificationMode, OnLaunch};
 
 use crate::bell::BellMode;
 use crate::resolve::{resolve_dir, resolve_program, Host};
@@ -129,6 +129,9 @@ pub struct Config {
     pub local_server: bool,
     /// Start with the server's saved tabs (`restore`) or with one new workspace (`new`).
     pub on_launch: forgetty_config::OnLaunch,
+    /// The cursor a program that sets none gets (a program that asks for a bar or an underline
+    /// with DECSCUSR keeps its own).
+    pub cursor_style: CursorStyle,
     /// Space between a pane's border and its cell grid, in px.
     pub pane_padding_x: f32,
     pub pane_padding_y: f32,
@@ -181,6 +184,7 @@ impl Default for Config {
             sidebar_open: false,
             local_server: true,
             on_launch: forgetty_config::OnLaunch::Restore,
+            cursor_style: CursorStyle::Block,
             pane_padding_x: 6.0,
             pane_padding_y: 4.0,
             bell_mode: Default::default(),
@@ -504,6 +508,9 @@ impl Config {
         if table.contains_key("on_launch") {
             c.on_launch = shared.on_launch;
         }
+        if table.contains_key("cursor_style") {
+            c.cursor_style = shared.cursor_style;
+        }
         for (name, val, dst) in [
             ("pane_padding_x", f.pane_padding_x, &mut c.pane_padding_x),
             ("pane_padding_y", f.pane_padding_y, &mut c.pane_padding_y),
@@ -771,6 +778,8 @@ pub struct Changes {
     /// Foreground, background, cursor, selection, accent or the 16 colors.
     pub colors: bool,
     pub bell: bool,
+    /// cursor_style.
+    pub cursor: bool,
     pub notifications: bool,
     pub keybindings: bool,
     /// Profiles or the default profile.
@@ -792,6 +801,7 @@ impl Changes {
     pub fn any(&self) -> bool {
         self.font
             || self.colors
+            || self.cursor
             || self.bell
             || self.notifications
             || self.keybindings
@@ -810,6 +820,7 @@ impl Changes {
         for (on, name) in [
             (self.font, "font"),
             (self.colors, "colors"),
+            (self.cursor, "cursor"),
             (self.bell, "bell"),
             (self.notifications, "notifications"),
             (self.keybindings, "keys"),
@@ -838,6 +849,7 @@ pub fn diff(old: &Config, new: &Config) -> Changes {
             || old.selection != new.selection
             || old.accent != new.accent
             || old.ansi != new.ansi,
+        cursor: old.cursor_style != new.cursor_style,
         bell: old.bell_mode != new.bell_mode,
         notifications: old.notification_mode != new.notification_mode,
         keybindings: old.keybindings != new.keybindings || old.keymap != new.keymap,
@@ -1036,9 +1048,26 @@ session_trash_days = 3
         assert!(!c.paste_warn_newline);
         assert_eq!(c.scrollback_bytes, 5000 * 2048);
         assert_eq!(c.on_launch, forgetty_config::OnLaunch::New);
+        assert_eq!(c.cursor_style, CursorStyle::Bar);
         // [font] wins over font_family when both are there.
         let c = p("font_family = \"A\"\n[font]\nfamily = \"B\"\n").config;
         assert_eq!(c.font_family, "B");
+    }
+
+    #[test]
+    fn cursor_style_default_values_and_diff() {
+        assert_eq!(Config::default().cursor_style, CursorStyle::Block);
+        for (t, want) in [("block", CursorStyle::Block), ("Underline", CursorStyle::Underline), ("block_hollow", CursorStyle::BlockHollow)] {
+            let l = p(&format!("cursor_style = \"{t}\"\n"));
+            assert!(l.warnings.is_empty(), "{:?}", l.warnings);
+            assert_eq!(l.config.cursor_style, want);
+        }
+        assert!(Config::parse("cursor_style = \"fat\"").is_err());
+        let mut b = Config::default();
+        b.cursor_style = CursorStyle::Bar;
+        let ch = diff(&Config::default(), &b);
+        assert!(ch.cursor && ch.any() && ch.later.is_empty());
+        assert_eq!(ch.summary(), "cursor");
     }
 
     #[test]

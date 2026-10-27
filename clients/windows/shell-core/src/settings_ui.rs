@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 
 use crate::config::{Config, ThemeColors};
+use crate::devices::{DevEffect, DevicesState, DevicesView};
 use crate::keys::{Action, Chord};
 use crate::settings::{self, Def, Kind, Page};
 use crate::settings_file::{Edit, V};
@@ -41,6 +42,8 @@ pub enum Effect {
     OpenConfigFile,
     PasteIntoEditor,
     CopyText(String),
+    /// The Devices page asks for work (read the list, revoke, pair).
+    Devices(DevEffect),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -109,6 +112,8 @@ pub struct Settings {
     pending: HashMap<&'static str, V>,
     status: Option<Status>,
     pub busy: bool,
+    /// The Devices page.
+    pub devices: DevicesState,
 }
 
 // ---- the view -----------------------------------------------------------------------------
@@ -214,6 +219,7 @@ pub enum Body {
     Look(LookView),
     Toml(TomlView),
     About(Vec<(String, String)>),
+    Devices(DevicesView),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -258,6 +264,7 @@ impl Settings {
             pending: HashMap::new(),
             status: None,
             busy: false,
+            devices: DevicesState::default(),
         };
         s.look_sync(ctx);
         s
@@ -304,6 +311,10 @@ impl Settings {
             Page::Appearance => {
                 self.look_sync(ctx);
                 Effect::None
+            }
+            Page::Devices => {
+                self.devices.begin_refresh();
+                Effect::Devices(DevEffect::Refresh)
             }
             _ => Effect::None,
         }
@@ -410,6 +421,12 @@ impl Settings {
             Page::Keybindings => self.keys_key(k, ctx),
             Page::Appearance => self.look_key(k, ctx),
             Page::Advanced => self.toml_key(k, ctx),
+            Page::Devices => match self.devices.key(k) {
+                DevEffect::None => Effect::None,
+                DevEffect::Close => Effect::Close,
+                DevEffect::CopyText(t) => Effect::CopyText(t),
+                e => Effect::Devices(e),
+            },
             Page::About => match k.key {
                 "escape" => Effect::Close,
                 "enter" => Effect::OpenConfigFile,
@@ -911,6 +928,8 @@ impl Settings {
             }
         } else if self.page == Page::Keybindings && index < self.key_rows(ctx).len() {
             self.sel = index;
+        } else if self.page == Page::Devices {
+            self.devices.click_row(index);
         }
     }
 
@@ -980,6 +999,12 @@ impl Settings {
             "toml-copy" => Effect::CopyText(self.editor.text()),
             "about-open" => Effect::OpenConfigFile,
             "close" => Effect::Close,
+            n if n.starts_with("dev-") => match self.devices.press(n) {
+                DevEffect::None => Effect::None,
+                DevEffect::Close => Effect::Close,
+                DevEffect::CopyText(t) => Effect::CopyText(t),
+                e => Effect::Devices(e),
+            },
             _ => Effect::None,
         }
     }
@@ -1022,6 +1047,7 @@ impl Settings {
             Page::Keybindings => self.keys_view(ctx),
             Page::Appearance => Body::Look(self.look_view(ctx)),
             Page::Advanced => Body::Toml(self.toml_view()),
+            Page::Devices => Body::Devices(self.devices.view()),
             Page::About => Body::About(vec![
                 ("Version".into(), env!("CARGO_PKG_VERSION").to_string()),
                 ("Configuration file".into(), ctx.config_path.to_string()),
@@ -1044,6 +1070,7 @@ impl Settings {
             Page::Keybindings => "Type to search. Enter: change. Ctrl+Enter: add. Delete: unbind. Ctrl+R: default. Ctrl+Shift+R: all defaults. Esc: close.".into(),
             Page::Appearance => "Tab: list. Up/Down: preview. Enter: apply. Ctrl+M: all fonts. Left/Right: size. Esc: close.".into(),
             Page::Advanced => "Ctrl+S: save. Ctrl+R: read the file again. Ctrl+V: paste. Esc: close.".into(),
+            Page::Devices => self.devices.hint(),
             Page::About => "Enter: open the file in your editor. Ctrl+Tab: next page. Esc: close.".into(),
         }
     }
