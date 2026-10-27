@@ -321,6 +321,8 @@ fn map_event(inner: &Arc<Inner>, ev: ServerEvent) -> Vec<BackendEvent> {
         ServerEvent::PaneExited { .. }
         | ServerEvent::ClientConnected { .. }
         | ServerEvent::ClientDisconnected { .. }
+        // Shell integration (prompt marks) is for the pane header of a later client change.
+        | ServerEvent::ShellState { .. }
         | ServerEvent::Unknown => return Vec::new(),
     }]
 }
