@@ -180,14 +180,32 @@ pub fn plan_assign(
 }
 
 /// Would the keymap that `edits` make still reach Settings from the keyboard? It does while
-/// `open_settings` or `command_palette` (whose list has the Settings entry) has a chord. The last
-/// unbind of both is refused, so a user cannot lock themselves out of this window.
+/// `open_settings` or `command_palette` (whose list has the Settings entry) has a chord. The
+/// edits can change the shortcut set (`keymap`) as well as single entries. Only an edit that
+/// touches `keymap` or `[keybindings]` is judged, and only by what it leaves: a file that
+/// already has no way to Settings still takes unrelated rows and any edit that gives one back,
+/// and refuses just the edits that keep it unreachable.
 pub fn keeps_settings_reachable(preset: KeymapPreset, overrides: &HashMap<String, Vec<String>>, edits: &[Edit]) -> Result<(), &'static str> {
     let mut o = overrides.clone();
+    let mut preset = preset;
+    let mut touches = false;
     for e in edits {
         match e {
+            Edit::Set(path, v) if path == "keymap" => {
+                touches = true;
+                if let V::Str(s) = v {
+                    if let Some(p) = KeymapPreset::parse(s) {
+                        preset = p;
+                    }
+                }
+            }
+            Edit::Remove(path) if path == "keymap" => {
+                touches = true;
+                preset = KeymapPreset::default();
+            }
             Edit::Set(path, v) => {
                 if let Some(name) = path.strip_prefix("keybindings.") {
+                    touches = true;
                     let keys = match v {
                         V::Str(s) => vec![s.clone()],
                         V::List(l) => l.clone(),
@@ -198,10 +216,14 @@ pub fn keeps_settings_reachable(preset: KeymapPreset, overrides: &HashMap<String
             }
             Edit::Remove(path) => {
                 if let Some(name) = path.strip_prefix("keybindings.") {
+                    touches = true;
                     o.remove(name);
                 }
             }
         }
+    }
+    if !touches {
+        return Ok(());
     }
     let km = Keymap::new(preset, &o);
     if km.chords(Action::OpenSettings).is_empty() && km.chords(Action::CommandPalette).is_empty() {
@@ -384,6 +406,26 @@ mod tests {
         // Taking the palette's chord for another action leaves the palette without one.
         let take = plan_assign(KeymapPreset::Windows, &none, Action::NewTab, &ch("ctrl+shift+p"), Mode::Replace, true).unwrap();
         assert!(keeps_settings_reachable(KeymapPreset::Windows, &none, &take).is_err());
+    }
+
+    #[test]
+    fn the_shortcut_set_row_cannot_lock_settings_out_and_a_locked_file_takes_unrelated_edits() {
+        // gtk reaches Settings by its own chord; windows has none, so with the palette unbound the
+        // switch to windows would leave nothing.
+        let mut o = none();
+        o.insert("command_palette".into(), vec!["none".into()]);
+        let to_windows = [Edit::Set("keymap".into(), V::Str("windows".into()))];
+        assert!(keeps_settings_reachable(KeymapPreset::Gtk, &o, &to_windows).is_err());
+        assert!(keeps_settings_reachable(KeymapPreset::Gtk, &none(), &to_windows).is_ok());
+        // Back to the default set (the key leaves the file) is judged as gtk.
+        assert!(keeps_settings_reachable(KeymapPreset::Windows, &o, &[Edit::Remove("keymap".into())]).is_ok());
+        // Already locked out (windows, palette unbound): rows that do not touch the keys pass,
+        // an edit that gives a way back passes, one that keeps it locked is refused.
+        assert!(keeps_settings_reachable(KeymapPreset::Windows, &o, &[Edit::Set("smart_copy".into(), V::Bool(false))]).is_ok());
+        assert!(keeps_settings_reachable(KeymapPreset::Windows, &o, &[]).is_ok());
+        assert!(keeps_settings_reachable(KeymapPreset::Windows, &o, &plan_reset(Action::CommandPalette)).is_ok());
+        assert!(keeps_settings_reachable(KeymapPreset::Windows, &o, &[Edit::Set("keymap".into(), V::Str("gtk".into()))]).is_ok());
+        assert!(keeps_settings_reachable(KeymapPreset::Windows, &o, &plan_clear(KeymapPreset::Windows, Action::NewTab)).is_err());
     }
 
     #[test]

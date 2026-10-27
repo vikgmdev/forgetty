@@ -259,8 +259,12 @@ impl AppShell {
         let ok = result.is_ok();
         let r = result.map(|s| s.warnings);
         if self.settings.is_some() {
+            let mut probe = false;
             if let Some(w) = self.settings.as_mut() {
-                w.st.saved(what, r);
+                probe = w.st.saved(what, r) == Effect::ProbeEditor;
+            }
+            if probe {
+                self.settings_probe_editor(cx);
             }
         } else if let Err(e) = r {
             self.notice_active(e, cx);

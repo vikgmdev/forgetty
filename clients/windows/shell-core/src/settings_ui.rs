@@ -446,9 +446,16 @@ impl Settings {
         Effect::None
     }
 
-    fn change(&mut self, d: &'static Def, v: V) -> Effect {
-        self.pending.insert(d.id, v.clone());
-        Effect::Edits(d.edits(&v))
+    fn change(&mut self, d: &'static Def, v: V, ctx: &Ctx) -> Effect {
+        let edits = d.edits(&v);
+        // The shortcut set row can take away the only way to Settings (the windows set has no
+        // Settings chord of its own).
+        if let Err(why) = shortcuts::keeps_settings_reachable(ctx.cfg.keymap, &ctx.cfg.keybindings, &edits) {
+            self.status = Some(Status { ok: false, text: why.to_string() });
+            return Effect::None;
+        }
+        self.pending.insert(d.id, v);
+        Effect::Edits(edits)
     }
 
     fn row_action(&mut self, d: &'static Def, k: &KeyIn, ctx: &Ctx) -> Effect {
@@ -456,12 +463,17 @@ impl Settings {
         match (k.key, &d.kind) {
             ("delete", _) | ("backspace", Kind::Choice(_) | Kind::Toggle) => {
                 // Back to the default: the key leaves the file.
+                let edits = vec![Edit::remove(d.path)];
+                if let Err(why) = shortcuts::keeps_settings_reachable(ctx.cfg.keymap, &ctx.cfg.keybindings, &edits) {
+                    self.status = Some(Status { ok: false, text: why.to_string() });
+                    return Effect::None;
+                }
                 self.pending.insert(d.id, (d.default)());
-                Effect::Edits(vec![Edit::remove(d.path)])
+                Effect::Edits(edits)
             }
-            ("left", _) => d.step(&cur, -1).map_or(Effect::None, |v| self.change(d, v)),
-            ("right", _) => d.step(&cur, 1).map_or(Effect::None, |v| self.change(d, v)),
-            ("space" | "enter", Kind::Toggle | Kind::Choice(_)) => d.step(&cur, 1).map_or(Effect::None, |v| self.change(d, v)),
+            ("left", _) => d.step(&cur, -1).map_or(Effect::None, |v| self.change(d, v, ctx)),
+            ("right", _) => d.step(&cur, 1).map_or(Effect::None, |v| self.change(d, v, ctx)),
+            ("space" | "enter", Kind::Toggle | Kind::Choice(_)) => d.step(&cur, 1).map_or(Effect::None, |v| self.change(d, v, ctx)),
             ("enter" | "space", Kind::Int { .. } | Kind::Float { .. } | Kind::Text { .. }) => {
                 self.start_entry(d, &cur);
                 Effect::None
@@ -491,7 +503,7 @@ impl Settings {
         self.entry = Some(Entry { id: d.id, ta, error: None });
     }
 
-    fn entry_key(&mut self, k: &KeyIn, _ctx: &Ctx) -> Effect {
+    fn entry_key(&mut self, k: &KeyIn, ctx: &Ctx) -> Effect {
         let Some(mut e) = self.entry.take() else { return Effect::None };
         let Some(d) = settings::def(e.id) else { return Effect::None };
         match k.key {
@@ -499,7 +511,7 @@ impl Settings {
             "enter" => {
                 let text = e.ta.text();
                 match d.parse_text(&text) {
-                    Ok(v) => return self.change(d, v),
+                    Ok(v) => return self.change(d, v, ctx),
                     Err(msg) => e.error = Some(msg),
                 }
             }
@@ -853,7 +865,7 @@ impl Settings {
     }
 
     /// A write finished.
-    pub fn saved(&mut self, what: Wrote, r: Result<Vec<String>, String>) {
+    pub fn saved(&mut self, what: Wrote, r: Result<Vec<String>, String>) -> Effect {
         self.busy = false;
         match (what, r) {
             (Wrote::Setting, Ok(warn)) => {
@@ -878,9 +890,16 @@ impl Settings {
                     self.editor.go_to_line(n);
                     self.editor.ensure_visible(self.visible);
                 }
+                // The file is not what the editor read: read it now, so the Reload/Keep bar shows
+                // whether or not the file watcher has noticed the change yet.
+                let changed = e.contains(crate::settings_file::CHANGED_ON_DISK);
                 self.editor_msg = Some(e);
+                if changed {
+                    return Effect::ProbeEditor;
+                }
             }
         }
+        Effect::None
     }
 
     /// A click on a row of a rows page, or on a control inside it.
@@ -1415,6 +1434,24 @@ mod tests {
     }
 
     #[test]
+    fn the_shortcut_set_row_refuses_the_switch_that_leaves_no_way_to_settings() {
+        let h = H::new("[keybindings]\ncommand_palette = \"none\"\n");
+        let c = h.ctx();
+        let mut s = Settings::new(&c);
+        assert_eq!(s.page, Page::General);
+        s.key(&k("down"), &c);
+        // gtk -> windows: the windows set has no Settings chord and the palette has none either.
+        assert_eq!(s.key(&k("right"), &c), Effect::None);
+        let st = s.status().unwrap();
+        assert!(!st.ok && st.text.contains("Settings"), "{st:?}");
+        // The row still shows the file's value.
+        // A row that has nothing to do with keys is fine.
+        s.key(&k("down"), &c);
+        s.key(&k("down"), &c);
+        assert!(matches!(s.key(&k("space"), &c), Effect::Edits(_)));
+    }
+
+    #[test]
     fn unbind_reset_and_reset_all_on_the_keybindings_page() {
         let h = H::new("[keybindings]\nnew_tab = \"ctrl+k\"\n");
         let c = h.ctx();
@@ -1538,6 +1575,26 @@ mod tests {
         assert!(!t.stale);
         let e = s.key(&ck("s", true, false, false), &c);
         assert_eq!(e, Effect::SaveText { text: "xa = 2\n".into(), expect: "a = 3\n".into() });
+        // A save the file refuses (it changed and no watcher event came yet) asks for a probe, and
+        // the probe shows the bar.
+        s.editor_probe(Ok("a = 3\n".into()));
+        s.key(&typed("z"), &c);
+        let e = s.key(&ck("s", true, false, false), &c);
+        assert!(matches!(e, Effect::SaveText { .. }));
+        s.busy = true;
+        s.editor_probe(Ok("a = 9\n".into()));
+        let refused = "Not saved: config.toml changed on disk after the editor read it.".to_string();
+        assert_eq!(s.saved(Wrote::Editor, Err(refused)), Effect::ProbeEditor);
+        s.editor_probe(Ok("a = 9\n".into()));
+        let Body::Toml(t) = s.view(&c).body else { panic!() };
+        assert!(t.stale && t.dirty);
+        // Other failures ask for nothing.
+        s.busy = true;
+        assert_eq!(s.saved(Wrote::Editor, Err("Not saved: TOML parse error".into())), Effect::None);
+        s.editor_keep();
+        s.editor_probe(Ok("a = 9\n".into()));
+        let _ = s.key(&ck("s", true, false, false), &c);
+        s.busy = false;
         // A probe that arrives while our save is in flight is ignored.
         s.busy = true;
         s.editor_probe(Ok("a = 4\n".into()));
