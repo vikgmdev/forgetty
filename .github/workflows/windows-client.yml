@@ -448,7 +448,8 @@ jobs:
             Get-ChildItem $root -ErrorAction SilentlyContinue | ForEach-Object { Get-ItemProperty $_.PSPath } | Where-Object { $_.DisplayName -eq "Forgetty" }
           }
           $found | ForEach-Object { Write-Host "installed product: $($_.DisplayName) $($_.DisplayVersion)" }
-          if ($found -and ($found | Where-Object { $_.DisplayVersion -ne $newver })) { throw "the product version is not $newver" }
+          if (-not $found) { throw "no installed product Forgetty in the Uninstall list" }
+          if ($found | Where-Object { $_.DisplayVersion -ne $newver }) { throw "the product version is not $newver" }
           Write-Host "upgraded to $newver; the old server (pid $old) was stopped"
 
       - name: Uninstall and check
