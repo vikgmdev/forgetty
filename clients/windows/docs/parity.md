@@ -48,7 +48,7 @@ Verdict: local shells on Windows do not survive closing the app. Everything the 
 | A10 | New Window (spawns another process with a fresh session id; `app.rs:1642-1657`) | MISSING | Single window, `main.rs:104-130`. | M | ARCH (second window must share or split the backend) |
 | A11 | Tab tear-off to a new window (drag out of tab bar, `app.rs:1229-1245`, `app.rs:7688-7740`) and "Move to New Window" (`app.rs:7416`) | MISSING | Single window. | M | depends on A10 |
 | A12 | Clean shutdown on SIGTERM/SIGHUP/SIGINT (`app.rs:2351-2385`) | MISSING | No equivalent handling (CTRL_CLOSE not handled). | S | LINUX-ONLY |
-| A13 | Command line: `--working-directory`, `-e`, `--class`, `--no-restore`, `--session-id`, `--restore-all`, `--config-file` (`src/cli.rs:1-60`) | MISSING | Only `--smoke` (`main.rs:34`). `forgetty.exe` on PATH is reserved for a future CLI (`README.md` Install). Env: `FORGETTY_CONFIG`, `FORGETTY_SHELL`. | M | ARCH (one `forgetty` CLI for Windows is a product call) |
+| A13 | Command line: `--working-directory`, `-e`, `--class`, `--no-restore`, `--session-id`, `--restore-all`, `--config-file` (`src/cli.rs:1-60`) | MISSING | Only `--smoke` (`main.rs:34`). `forgetty.exe` on PATH is now the server CLI (`forgetty server ...`, WP5), not the app (`README.md` Install). Env: `FORGETTY_CONFIG`, `FORGETTY_SHELL`. | M | ARCH (one `forgetty` CLI for Windows is a product call) |
 | A14 | Window size and position restore | N/A (GTK lacks it) | GTK: `window_width/height` fields exist but are always `None` (`forgetty-workspace/src/workspace.rs:23`, `forgetty-session/src/manager.rs:2579`). Windows: fixed centered size (`main.rs:104-112`). Listed in section 11, not counted as a gap. | - | - |
 
 ## 3. Tabs
