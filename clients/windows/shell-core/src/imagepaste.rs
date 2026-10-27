@@ -40,9 +40,66 @@ pub fn file_name(epoch_secs: u64, id8: &str, ext: &str) -> String {
     format!("paste-{}-{id}.{ext}", timestamp(epoch_secs))
 }
 
-/// What is pasted into the pane: the path and a space, as GTK does.
-pub fn paste_text(path: &Path) -> String {
-    format!("{} ", path.to_string_lossy())
+/// The shell a pane runs, as far as quoting a path is concerned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Shell {
+    Cmd,
+    PowerShell,
+    /// bash, zsh and the like (a WSL tab): a Windows path is turned into `/mnt/<drive>/...`.
+    Posix,
+    Unknown,
+}
+
+/// The shell behind a pane, from the text of the line the cursor is on (the prompt): `PS C:\x>`
+/// is PowerShell, `C:\x>` is cmd, a line that ends with `$`, `#` or `%` is a POSIX shell. A
+/// program that is not a shell at a prompt is `Unknown`.
+pub fn detect_shell(prompt_line: &str) -> Shell {
+    let t = prompt_line.trim_end();
+    if t.starts_with("PS ") && t.ends_with('>') {
+        return Shell::PowerShell;
+    }
+    let b = t.as_bytes();
+    if t.ends_with('>') && b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'>') {
+        return Shell::Cmd;
+    }
+    if t.ends_with('$') || t.ends_with('#') || t.ends_with('%') {
+        return Shell::Posix;
+    }
+    Shell::Unknown
+}
+
+/// `C:\Users\a` as `/mnt/c/Users/a`. Any other path is only turned to forward slashes.
+pub fn wsl_path(p: &str) -> String {
+    let b = p.as_bytes();
+    if b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/') {
+        format!("/mnt/{}/{}", (b[0] as char).to_ascii_lowercase(), p[3..].replace('\\', "/"))
+    } else {
+        p.replace('\\', "/")
+    }
+}
+
+fn plain(p: &str) -> bool {
+    !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '\\' | '/' | '-' | '+' | ','))
+}
+
+/// `path` as one word for `shell`. A path of plain characters stays as it is. Otherwise: cmd gets
+/// double quotes (a Windows path holds none), PowerShell single quotes (`$` and the backtick mean
+/// nothing there; a quote is doubled), a POSIX shell single quotes (a quote is `'\''`).
+pub fn quote_path(shell: Shell, path: &str) -> String {
+    let p = if shell == Shell::Posix { wsl_path(path) } else { path.to_string() };
+    if plain(&p) {
+        return p;
+    }
+    match shell {
+        Shell::Cmd | Shell::Unknown => format!("\"{}\"", p.replace('"', "")),
+        Shell::PowerShell => format!("'{}'", p.replace('\'', "''")),
+        Shell::Posix => format!("'{}'", p.replace('\'', "'\\''")),
+    }
+}
+
+/// What is pasted into the pane: the quoted path and a space (GTK pastes the path and a space).
+pub fn paste_text(path: &Path, shell: Shell) -> String {
+    format!("{} ", quote_path(shell, &path.to_string_lossy()))
 }
 
 #[derive(Debug)]
@@ -131,7 +188,52 @@ mod tests {
         let d = cache_dir(Some(Path::new("C:/Users/v/AppData/Local"))).unwrap();
         assert!(d.ends_with("forgetty/cache/clipboard"));
         assert!(cache_dir(None).is_none());
-        assert_eq!(paste_text(Path::new("C:/a b/p.png")), "C:/a b/p.png ");
+    }
+
+    #[test]
+    fn the_shell_is_read_from_the_prompt_line() {
+        assert_eq!(detect_shell("C:\\Users\\a>"), Shell::Cmd);
+        assert_eq!(detect_shell("C:\\>   "), Shell::Cmd);
+        assert_eq!(detect_shell("PS C:\\Users\\a> "), Shell::PowerShell);
+        assert_eq!(detect_shell("vick@box:~/src$"), Shell::Posix);
+        assert_eq!(detect_shell("root@box:/# "), Shell::Posix);
+        assert_eq!(detect_shell("some program output"), Shell::Unknown);
+        assert_eq!(detect_shell(""), Shell::Unknown);
+    }
+
+    #[test]
+    fn a_plain_path_stays_as_it_is() {
+        let p = r"C:\Users\a\AppData\Local\forgetty\cache\clipboard\paste-1.png";
+        for sh in [Shell::Cmd, Shell::PowerShell, Shell::Unknown] {
+            assert_eq!(quote_path(sh, p), p);
+        }
+        assert_eq!(paste_text(Path::new("C:/a/p.png"), Shell::Cmd), "C:/a/p.png ");
+    }
+
+    #[test]
+    fn a_path_with_a_space_is_quoted_for_each_shell() {
+        let p = r"C:\Users\Ana Maria\AppData\Local\forgetty\cache\clipboard\paste-1.png";
+        assert_eq!(quote_path(Shell::Cmd, p), format!("\"{p}\""));
+        assert_eq!(quote_path(Shell::Unknown, p), format!("\"{p}\""));
+        assert_eq!(quote_path(Shell::PowerShell, p), format!("'{p}'"));
+        assert_eq!(
+            quote_path(Shell::Posix, p),
+            "'/mnt/c/Users/Ana Maria/AppData/Local/forgetty/cache/clipboard/paste-1.png'"
+        );
+        assert_eq!(paste_text(Path::new(p), Shell::PowerShell), format!("'{p}' "));
+    }
+
+    #[test]
+    fn quotes_and_dollars_in_a_path_cannot_break_out() {
+        // A user name can hold an apostrophe, a dollar sign or an ampersand.
+        assert_eq!(quote_path(Shell::PowerShell, r"C:\Users\O'Neil\p.png"), r"'C:\Users\O''Neil\p.png'");
+        assert_eq!(quote_path(Shell::PowerShell, r"C:\Users\$x\p.png"), r"'C:\Users\$x\p.png'");
+        assert_eq!(quote_path(Shell::Posix, r"C:\Users\O'Neil\p.png"), r"'/mnt/c/Users/O'\''Neil/p.png'");
+        assert_eq!(quote_path(Shell::Posix, r"C:\Users\a;rm\p.png"), "'/mnt/c/Users/a;rm/p.png'");
+        assert_eq!(quote_path(Shell::Cmd, r"C:\Users\a&b\p.png"), r#""C:\Users\a&b\p.png""#);
+        // WSL: a plain path is converted and not quoted.
+        assert_eq!(quote_path(Shell::Posix, r"C:\Users\a\p.png"), "/mnt/c/Users/a/p.png");
+        assert_eq!(wsl_path(r"D:\x y\z"), "/mnt/d/x y/z");
     }
 
     fn bmp(w: i32, h: i32, bpp: u16, comp: u32, pixels: &[u8]) -> Vec<u8> {

@@ -311,6 +311,10 @@ pub struct ShellSmoke {
     first_frame_seen: bool,
     probe: Option<Probe>,
     lat_ms: Vec<f64>,
+    /// Key to the echo in the terminal model, not to a frame (see `ProbeWatch`).
+    lat_model_ms: Vec<f64>,
+    img_dir: Option<std::path::PathBuf>,
+    img_prev_local: Option<std::ffi::OsString>,
     base_col: usize,
     max_reshaped_per_key: usize,
     others_reshaped: usize,
@@ -412,6 +416,9 @@ impl ShellSmoke {
             first_frame_seen: false,
             probe: None,
             lat_ms: Vec::new(),
+            lat_model_ms: Vec::new(),
+            img_dir: None,
+            img_prev_local: None,
             base_col: 0,
             max_reshaped_per_key: 0,
             others_reshaped: 0,
@@ -636,9 +643,12 @@ impl ShellSmoke {
                 if done {
                     let p = self.probe.take().unwrap();
                     self.lat_ms.push(ms(now - p.t0));
+                    self.lat_model_ms.push(model_ms(v));
                     self.max_reshaped_per_key = self.max_reshaped_per_key.max(v.rows_reshaped_last);
                     if self.lat_ms.len() >= KEYSTROKES {
                         let (p50, reshaped) = summarize_keys(&self.lat_ms, self.max_reshaped_per_key, "");
+                        summarize_model(&self.lat_model_ms, "");
+                        self.lat_model_ms.clear();
                         check("key_p50_le_1frame_plus_1_5ms", self.key_gate(p50, ""));
                         check("damage_only_redraw", reshaped <= 3);
                         self.lat_ms.clear();
@@ -898,9 +908,31 @@ impl ShellSmoke {
 
     fn start_probe(&mut self, v: &mut TerminalView, row: usize, col: usize) {
         let ch = (b'a' + (self.lat_ms.len() % 26) as u8) as char;
-        self.probe = Some(Probe { row, col, ch, t0: Instant::now() });
+        let t0 = Instant::now();
+        self.probe = Some(Probe { row, col, ch, t0 });
+        v.probe_watch = Some(crate::view::ProbeWatch { row, col, ch, t0, model_at: None });
         v.send_bytes(ch.to_string().as_bytes());
     }
+}
+
+/// Milliseconds from the key to the echo in the terminal model (`view.probe_watch`). The view
+/// stamps it when it feeds the bytes, so it has no frame in it. A missing stamp fails the run.
+fn model_ms(v: &TerminalView) -> f64 {
+    match v.probe_watch.as_ref().and_then(|w| w.model_at.map(|m| m.saturating_duration_since(w.t0))) {
+        Some(d) => d.as_secs_f64() * 1000.0,
+        None => fail("key probe: the view did not stamp the echo"),
+    }
+}
+
+/// Record the model-level latency under `suffix` and return the median.
+fn summarize_model(lat: &[f64], suffix: &str) -> f64 {
+    let mut s = lat.to_vec();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let p50 = s[s.len() / 2];
+    record(&format!("key_to_model_p50_ms{suffix}"), json!((p50 * 1000.0).round() / 1000.0));
+    record(&format!("key_to_model_p95_ms{suffix}"), json!((s[(s.len() * 95) / 100] * 1000.0).round() / 1000.0));
+    record(&format!("key_to_model_max_ms{suffix}"), json!((s.last().unwrap() * 1000.0).round() / 1000.0));
+    p50
 }
 
 /// Record latency stats under `suffix` and return (p50, max reshaped rows).

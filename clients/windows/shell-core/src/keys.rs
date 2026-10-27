@@ -18,6 +18,7 @@ pub enum Action {
     CheckUpdates,
     /// Close every tab of this PC, stop the local server and quit.
     EndSession,
+    RetryLocalServer,
     /// Per-machine policy for programs that set the clipboard (OSC 52, write only).
     ClipboardWriteOff,
     ClipboardWriteAsk,
@@ -181,6 +182,7 @@ pub const ACTIONS: &[ActionInfo] = &[
     differ!(Action::RenameTab, "rename_tab", "Rename tab", gtk [], windows ["ctrl+shift+r"]),
     info!(Action::CheckUpdates, "check_updates", "Check for updates", []),
     info!(Action::EndSession, "end_session", "Quit and end all tabs on this PC", []),
+    info!(Action::RetryLocalServer, "retry_local_server", "Retry the local server", []),
     info!(Action::ClipboardWriteOff, "clipboard_write_off", "Clipboard writes from programs on this machine: off", []),
     info!(Action::ClipboardWriteAsk, "clipboard_write_ask", "Clipboard writes from programs on this machine: ask", []),
     info!(Action::ClipboardWriteAllow, "clipboard_write_allow", "Clipboard writes from programs on this machine: allow", []),

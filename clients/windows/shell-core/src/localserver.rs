@@ -23,31 +23,32 @@ pub const AUTO_PAIR_TTL_SECS: u32 = 30;
 /// Seconds of a pairing window shown to the user ("Pair new device").
 pub const USER_PAIR_TTL_SECS: u32 = 120;
 
-/// Where `forgetty.exe` can be, best first: next to the app, then each directory of `PATH`. A
-/// relative `PATH` entry (empty, `.`) is skipped: it would mean "wherever the app was started".
-pub fn exe_candidates(app_dir: Option<&Path>, path_var: Option<&OsStr>, name: &str) -> Vec<PathBuf> {
-    let mut out: Vec<PathBuf> = Vec::new();
-    let mut push = |p: PathBuf| {
-        if !out.contains(&p) {
-            out.push(p);
-        }
-    };
-    if let Some(d) = app_dir {
-        push(d.join(name));
-    }
-    if let Some(v) = path_var {
-        for dir in std::env::split_paths(v) {
-            if dir.is_absolute() {
-                push(dir.join(name));
-            }
-        }
-    }
-    out
+/// `forgetty.exe` next to the app, and nowhere else: a program found through `PATH` or the
+/// current folder could be put there by another program, and the app hands it the user's
+/// terminals. A folder with that name is not the program.
+pub fn find_exe(app_dir: Option<&Path>, name: &str) -> Option<PathBuf> {
+    let p = app_dir?.join(name);
+    p.is_file().then_some(p)
 }
 
-/// The first candidate that is a file.
-pub fn find_exe(app_dir: Option<&Path>, path_var: Option<&OsStr>, name: &str) -> Option<PathBuf> {
-    exe_candidates(app_dir, path_var, name).into_iter().find(|p| p.is_file())
+/// `FORGETTY_SERVER_EXE`, for a developer: an absolute path to a file on a local drive. A
+/// relative path, a UNC share (`\\srv\x`) and a device path (`\\?\`, `\\.\`, `\??\`) are
+/// refused with the reason. `Ok(None)`: the variable is not set (or is empty).
+pub fn override_exe(value: Option<&OsStr>) -> Result<Option<PathBuf>, String> {
+    let Some(v) = value.filter(|v| !v.is_empty()) else { return Ok(None) };
+    let shown = sanitize(&v.to_string_lossy(), 60);
+    let text = v.to_string_lossy();
+    if !crate::osc::is_safe_local_path(&text) {
+        return Err(format!("FORGETTY_SERVER_EXE {shown} is a network or device path"));
+    }
+    let p = PathBuf::from(v);
+    if !p.is_absolute() {
+        return Err(format!("FORGETTY_SERVER_EXE {shown} is not an absolute path"));
+    }
+    if !p.is_file() {
+        return Err(format!("FORGETTY_SERVER_EXE {shown} is not a file"));
+    }
+    Ok(Some(p))
 }
 
 /// Does this process run elevated? An elevated window never uses the server: the server refuses
@@ -81,16 +82,17 @@ impl Fallback {
     /// The notice shown on the first pane. `None` for a choice the user made.
     pub fn notice(&self) -> Option<String> {
         let tail = "Using the built-in terminal: its tabs end when this window closes.";
+        let retry = " Retry: command palette, \"Retry the local server\".";
         let why = |w: &str| sanitize(w, 100);
         Some(match self {
             Fallback::Disabled => return None,
             Fallback::Elevated => {
                 "This window runs as administrator, so it uses the built-in terminal: its tabs end when the window closes.".to_string()
             }
-            Fallback::NotFound => format!("The local server (forgetty.exe) was not found next to the app or on PATH. {tail}"),
-            Fallback::Start(w) => format!("The local server did not start ({}). {tail}", why(w)),
-            Fallback::Pair(w) => format!("Cannot connect to the local server ({}). {tail}", why(w)),
-            Fallback::Stopped(w) => format!("The local server stopped and did not start again ({}). {tail}", why(w)),
+            Fallback::NotFound => format!("The local server (forgetty.exe) was not found next to the app. {tail}"),
+            Fallback::Start(w) => format!("The local server did not start ({}). {tail}{retry}", why(w)),
+            Fallback::Pair(w) => format!("Cannot connect to the local server ({}). {tail}{retry}", why(w)),
+            Fallback::Stopped(w) => format!("The local server stopped and did not start again ({}). {tail}{retry}", why(w)),
         })
     }
 }
@@ -366,39 +368,100 @@ pub fn watch(down: Duration, tries: u32, since_try: Option<Duration>) -> Watch {
 
 /// Restarts the supervisor makes before it gives up.
 pub const MAX_RESTARTS: u32 = 3;
+/// A server that goes down again and again is not restarted for ever: this many restarts within
+/// [`RESTART_WINDOW`] end it (the built-in terminal, a notice, and "Retry the local server").
+pub const MAX_RESTARTS_IN_WINDOW: usize = 5;
+pub const RESTART_WINDOW: Duration = Duration::from_secs(600);
+
+/// `ages`: how long ago each restart was made. True when one more would be the sixth in ten
+/// minutes.
+pub fn too_many_restarts(ages: &[Duration]) -> bool {
+    ages.iter().filter(|a| **a < RESTART_WINDOW).count() >= MAX_RESTARTS_IN_WINDOW
+}
+
+/// Where the app dials its own server: loopback and `port`.
+pub fn loopback_addr(port: u16) -> std::net::SocketAddr {
+    std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port)
+}
+
+/// What to do with the pairing the app has stored, at every start.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PairingCheck {
+    /// The stored machine is right.
+    Keep,
+    /// Same server, but it listens somewhere else now (another port): store this address.
+    NewAddress(std::net::SocketAddr),
+    /// The server will not know this app: drop the stored machine and pair again.
+    Repair(&'static str),
+}
+
+/// `devices` is the server's list of paired devices, `None` when it could not be read (then the
+/// stored pairing is trusted: a failed read is no proof of a revoked device).
+pub fn check_pairing(
+    stored_node: &str,
+    stored_pins: &[std::net::SocketAddr],
+    status: &ServerStatus,
+    devices: Option<&[Device]>,
+    own_id: &str,
+) -> PairingCheck {
+    if stored_node != status.node_id {
+        return PairingCheck::Repair("the server's identity changed");
+    }
+    if let Some(list) = devices {
+        if !own_id.is_empty() && !list.iter().any(|d| is_own_device(d, own_id)) {
+            return PairingCheck::Repair("the server no longer lists this app (revoked or reset)");
+        }
+    }
+    let want = loopback_addr(status.port_or_default());
+    if stored_pins != [want] {
+        return PairingCheck::NewAddress(want);
+    }
+    PairingCheck::Keep
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn candidates_prefer_the_app_folder_and_skip_relative_path_entries() {
-        let path = std::env::join_paths([PathBuf::from("/opt/a"), PathBuf::from(""), PathBuf::from("."), PathBuf::from("rel"), PathBuf::from("/opt/b")]).unwrap();
-        let c = exe_candidates(Some(Path::new("/app")), Some(&path), "forgetty.exe");
-        assert_eq!(
-            c,
-            vec![PathBuf::from("/app/forgetty.exe"), PathBuf::from("/opt/a/forgetty.exe"), PathBuf::from("/opt/b/forgetty.exe")]
-        );
-        assert!(exe_candidates(None, None, "x").is_empty());
-    }
-
-    #[test]
-    fn find_exe_takes_the_first_file() {
+    fn the_exe_is_next_to_the_app_and_nowhere_else() {
         let d = tempfile::tempdir().unwrap();
         let app = d.path().join("app");
         let other = d.path().join("other");
         std::fs::create_dir_all(&app).unwrap();
         std::fs::create_dir_all(&other).unwrap();
-        let path = std::env::join_paths([&other]).unwrap();
-        assert_eq!(find_exe(Some(&app), Some(&path), "forgetty.exe"), None);
+        // Another folder (a PATH entry, the current folder) does not count.
         std::fs::write(other.join("forgetty.exe"), b"x").unwrap();
-        assert_eq!(find_exe(Some(&app), Some(&path), "forgetty.exe"), Some(other.join("forgetty.exe")));
+        assert_eq!(find_exe(Some(&app), "forgetty.exe"), None);
         std::fs::write(app.join("forgetty.exe"), b"x").unwrap();
-        assert_eq!(find_exe(Some(&app), Some(&path), "forgetty.exe"), Some(app.join("forgetty.exe")));
+        assert_eq!(find_exe(Some(&app), "forgetty.exe"), Some(app.join("forgetty.exe")));
+        assert_eq!(find_exe(None, "forgetty.exe"), None);
         // A folder with the name is not the program.
         let d2 = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(d2.path().join("forgetty.exe")).unwrap();
-        assert_eq!(find_exe(Some(d2.path()), None, "forgetty.exe"), None);
+        assert_eq!(find_exe(Some(d2.path()), "forgetty.exe"), None);
+    }
+
+    #[test]
+    fn the_developer_override_takes_an_absolute_local_file_only() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("forgetty-test.exe");
+        std::fs::write(&f, b"x").unwrap();
+        let os = |s: &str| std::ffi::OsString::from(s);
+        assert_eq!(override_exe(None), Ok(None));
+        assert_eq!(override_exe(Some(&os(""))), Ok(None));
+        assert_eq!(override_exe(Some(f.as_os_str())), Ok(Some(f.clone())));
+        for bad in ["forgetty.exe", "./forgetty.exe", "..\\x\\forgetty.exe", "\\\\srv\\share\\forgetty.exe", "//srv/share/forgetty.exe", "\\\\?\\C:\\forgetty.exe", "\\\\.\\pipe\\x", "\\??\\UNC\\srv\\x"] {
+            let e = override_exe(Some(&os(bad))).unwrap_err();
+            assert!(e.starts_with("FORGETTY_SERVER_EXE"), "{bad}: {e}");
+        }
+        // Absolute, local, but not there (or a folder).
+        let missing = d.path().join("nothing.exe");
+        assert!(override_exe(Some(missing.as_os_str())).unwrap_err().contains("not a file"));
+        assert!(override_exe(Some(d.path().as_os_str())).unwrap_err().contains("not a file"));
+        // The reason never carries control characters.
+        let e = override_exe(Some(&os("rel\u{1b}[31m"))).unwrap_err();
+        assert!(!e.contains('\u{1b}'), "{e:?}");
     }
 
     #[test]
@@ -423,7 +486,7 @@ mod tests {
             let n = f.notice().unwrap();
             assert!(!n.contains('\n') && !n.contains('\u{202e}'), "{n}");
             assert!(n.contains("built-in terminal"), "{n}");
-            assert!(n.chars().count() < 260, "{n}");
+            assert!(n.chars().count() < 330, "{n}");
         }
     }
 
@@ -454,6 +517,38 @@ mod tests {
         assert_eq!(with(r#""direct_addrs":["[::1]:47400"]"#).port, Some(47400));
         assert_eq!(with(r#""addresses":["junk"]"#).port, None);
         assert_eq!(parse_status(r#"{"running":true,"node_id":" "}"#), None);
+    }
+
+    #[test]
+    fn the_stored_pairing_is_checked_at_every_start() {
+        let st = |node: &str, port: Option<u16>| ServerStatus { node_id: node.into(), pid: 1, port };
+        let dev = |id: &str| Device { device_id: id.into(), name: String::new(), paired_at: None, last_seen: None };
+        let pin = |p: u16| vec![loopback_addr(p)];
+        // Same server, same address, listed: keep.
+        assert_eq!(check_pairing("n", &pin(47297), &st("n", None), Some(&[dev("me")]), "me"), PairingCheck::Keep);
+        // The server moved to another port: the stored address follows.
+        assert_eq!(check_pairing("n", &pin(47297), &st("n", Some(50000)), Some(&[dev("me")]), "me"), PairingCheck::NewAddress(loopback_addr(50000)));
+        // A pairing stored with another address list (or none) is brought to the one address.
+        assert_eq!(check_pairing("n", &[], &st("n", None), None, "me"), PairingCheck::NewAddress(loopback_addr(47297)));
+        // A new server identity, or this app revoked: pair again.
+        assert!(matches!(check_pairing("old", &pin(47297), &st("n", None), None, "me"), PairingCheck::Repair(_)));
+        assert!(matches!(check_pairing("n", &pin(47297), &st("n", None), Some(&[dev("other")]), "me"), PairingCheck::Repair(_)));
+        assert!(matches!(check_pairing("n", &pin(47297), &st("n", None), Some(&[]), "me"), PairingCheck::Repair(_)));
+        // A list that could not be read proves nothing.
+        assert_eq!(check_pairing("n", &pin(47297), &st("n", None), None, "me"), PairingCheck::Keep);
+        // Revoked wins over a changed port (the stored machine is dropped anyway).
+        assert!(matches!(check_pairing("n", &pin(1), &st("n", Some(2)), Some(&[]), "me"), PairingCheck::Repair(_)));
+    }
+
+    #[test]
+    fn restarts_are_capped_in_a_window() {
+        let m = |s: u64| Duration::from_secs(s * 60);
+        assert!(!too_many_restarts(&[]));
+        assert!(!too_many_restarts(&[m(1), m(2), m(3), m(4)]));
+        assert!(too_many_restarts(&[m(1), m(2), m(3), m(4), m(5)]));
+        // Restarts older than ten minutes do not count.
+        assert!(!too_many_restarts(&[m(1), m(2), m(3), m(4), m(11)]));
+        assert!(too_many_restarts(&[m(1), m(2), m(3), m(4), m(9), m(30)]));
     }
 
     #[test]

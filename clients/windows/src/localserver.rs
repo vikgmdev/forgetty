@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use forgetty_remote::store::{self, MachineStore, StoredMachine};
 use forgetty_shell_core::localserver::{self as ls, Fallback, PairLine, Plan};
-use forgetty_shell_core::{MachineKind, SessionBackend, Uuid};
+use forgetty_shell_core::{ConnState, MachineKind, SessionBackend, Uuid};
 use forgetty_shell_core::devices::{Avail, DevEffect};
 use gpui::Context;
 
@@ -104,12 +104,88 @@ impl Cli {
     }
 
     /// `forgetty server start`: does nothing when a server answers.
+    ///
+    /// The first run passes no handles to the process: the server it starts must not keep this
+    /// app's stdout or stderr (a file or pipe of whoever started the app) open for as long as it
+    /// lives. When it fails, it runs again with its output captured, to say why.
     pub fn start_server(&self) -> Result<(), Fallback> {
+        match self.run_clean(&["server", "start"], START_TIMEOUT) {
+            Ok(Some(0)) => return Ok(()),
+            Ok(None) => return Err(Fallback::Start("the server did not answer within 30 s".into())),
+            _ => {}
+        }
         match self.run(&["server", "start"], START_TIMEOUT) {
             Ok(o) if o.code == Some(0) => Ok(()),
             Ok(o) if o.code.is_none() => Err(Fallback::Start("the server did not answer within 30 s".into())),
             Ok(o) => Err(Fallback::Start(ls::cli_reason(&o.stdout, &o.stderr, o.code))),
             Err(e) => Err(Fallback::Start(format!("cannot run {}: {e}", self.exe.display()))),
+        }
+    }
+
+    /// Run with no inherited handle (`bInheritHandles` false, no standard handles) and no
+    /// window. `Some(code)` when it ended, `None` when it was killed after `timeout`.
+    #[cfg(windows)]
+    fn run_clean(&self, args: &[&str], timeout: Duration) -> std::io::Result<Option<i32>> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::core::{PCWSTR, PWSTR};
+        use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+        use windows::Win32::System::Threading::{
+            CreateProcessW, GetExitCodeProcess, TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW,
+            PROCESS_INFORMATION, STARTUPINFOW,
+        };
+        let mut argv: Vec<String> = Vec::new();
+        if let Some(d) = &self.state_dir {
+            argv.push("--state-dir".into());
+            argv.push(d.to_string_lossy().into_owned());
+        }
+        argv.extend(args.iter().map(|a| (*a).to_string()));
+        let line = forgetty_shell_core::argv::command_line(&self.exe.to_string_lossy(), &argv);
+        let mut cmdline: Vec<u16> = std::ffi::OsStr::new(&line).encode_wide().chain(std::iter::once(0)).collect();
+        let app: Vec<u16> = self.exe.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let si = STARTUPINFOW { cb: std::mem::size_of::<STARTUPINFOW>() as u32, ..Default::default() };
+        let mut pi = PROCESS_INFORMATION::default();
+        // SAFETY: the strings are NUL-terminated and outlive the call, `si` and `pi` are valid.
+        // The handles of the new process are closed here.
+        unsafe {
+            CreateProcessW(
+                PCWSTR(app.as_ptr()),
+                Some(PWSTR(cmdline.as_mut_ptr())),
+                None,
+                None,
+                false,
+                CREATE_NO_WINDOW,
+                None,
+                PCWSTR::null(),
+                &si,
+                &mut pi,
+            )
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+            let _ = CloseHandle(pi.hThread);
+            let ms = timeout.as_millis().min(u128::from(u32::MAX - 1)) as u32;
+            let code = if WaitForSingleObject(pi.hProcess, ms) == WAIT_OBJECT_0 {
+                let mut c = 0u32;
+                let _ = GetExitCodeProcess(pi.hProcess, &mut c);
+                Some(c as i32)
+            } else {
+                let _ = TerminateProcess(pi.hProcess, 1);
+                None
+            };
+            let _ = CloseHandle(pi.hProcess);
+            Ok(code)
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn run_clean(&self, args: &[&str], timeout: Duration) -> std::io::Result<Option<i32>> {
+        self.run(args, timeout).map(|o| o.code)
+    }
+
+    /// `forgetty devices --json`.
+    pub fn devices(&self) -> Result<Vec<ls::Device>, String> {
+        match self.run(&["devices", "--json"], Duration::from_secs(20)) {
+            Ok(o) if o.code == Some(0) => ls::parse_devices(&o.stdout),
+            Ok(o) => Err(ls::cli_reason(&o.stdout, &o.stderr, o.code)),
+            Err(e) => Err(e.to_string()),
         }
     }
 
@@ -125,11 +201,14 @@ impl Cli {
 }
 
 /// `forgetty-win.exe --start-server`: what the login Run value runs. GUI subsystem, no window.
-/// Returns the process exit code.
+/// Returns the process exit code. `local_server = false` in the config means no server: 0.
 pub fn start_server_main() -> i32 {
-    let app_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf));
-    let Some(exe) = ls::find_exe(app_dir.as_deref(), std::env::var_os("PATH").as_deref(), ls::SERVER_EXE) else {
-        return 2;
+    if !crate::config::load().config.local_server {
+        return 0;
+    }
+    let exe = match find_server_exe() {
+        Ok(Some(e)) => e,
+        _ => return 2,
     };
     match (Cli { exe, state_dir: None }).start_server() {
         Ok(()) => 0,
@@ -137,15 +216,14 @@ pub fn start_server_main() -> i32 {
     }
 }
 
-/// Where the app looks for `forgetty.exe`. `FORGETTY_SERVER_EXE` is read in `--smoke` only.
-pub fn find_server_exe(smoke: bool) -> Option<PathBuf> {
-    if smoke {
-        if let Some(p) = std::env::var_os("FORGETTY_SERVER_EXE").map(PathBuf::from).filter(|p| p.is_file()) {
-            return Some(p);
-        }
+/// Where the app looks for `forgetty.exe`: `FORGETTY_SERVER_EXE` (a developer's override: an
+/// absolute local path, else an error), else next to `forgetty-win.exe`. Never `PATH`.
+pub fn find_server_exe() -> Result<Option<PathBuf>, String> {
+    if let Some(p) = ls::override_exe(std::env::var_os("FORGETTY_SERVER_EXE").as_deref())? {
+        return Ok(Some(p));
     }
     let app_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf));
-    ls::find_exe(app_dir.as_deref(), std::env::var_os("PATH").as_deref(), ls::SERVER_EXE)
+    Ok(ls::find_exe(app_dir.as_deref(), ls::SERVER_EXE))
 }
 
 /// Is this window treated as elevated? In `--smoke`, `FORGETTY_TEST_ALLOW_ELEVATED=1` says the
@@ -158,11 +236,18 @@ pub fn elevated(smoke: bool) -> bool {
 }
 
 pub fn decide(enabled: bool, smoke: bool) -> Plan {
-    ls::plan(enabled, elevated(smoke), find_server_exe(smoke))
+    match find_server_exe() {
+        Ok(exe) => ls::plan(enabled, elevated(smoke), exe),
+        // A bad override is said, not skipped: the developer asked for that program.
+        Err(why) if enabled && !elevated(smoke) => Plan::InProcess(Fallback::Start(why)),
+        Err(_) => ls::plan(enabled, elevated(smoke), None),
+    }
 }
 
 /// Start the server if needed and make sure this app is paired with it. Blocking: run it on a
-/// worker thread. The returned machine is stored with `local` set.
+/// worker thread. The returned machine is stored with `local` set. At every start the stored
+/// pairing is checked against what the server says now (`ls::check_pairing`): a new identity or
+/// a device list without this app means pair again, a new port means the stored address follows.
 pub fn bring_up(
     cli: &Cli,
     rt: &tokio::runtime::Handle,
@@ -172,20 +257,25 @@ pub fn bring_up(
 ) -> Result<StoredMachine, Fallback> {
     cli.start_server()?;
     let status = cli.status()?;
-    if let Some(m) = store.local_machine() {
-        if m.node_id == status.node_id {
-            return Ok(m);
+    if let Some(mut m) = store.local_machine() {
+        let own = store.device_id().unwrap_or_default();
+        let devices = cli.devices().ok();
+        match ls::check_pairing(&m.node_id, &m.pinned_addrs, &status, devices.as_deref(), &own) {
+            ls::PairingCheck::Keep => return Ok(m),
+            ls::PairingCheck::NewAddress(a) => {
+                eprintln!("forgetty-win: local server: now at {a}");
+                m.pinned_addrs = vec![a];
+                m.relays_disabled = true;
+                m.relays.clear();
+                return store.add(m).map_err(|e| Fallback::Pair(format!("machines.json: {e}")));
+            }
+            ls::PairingCheck::Repair(why) => {
+                eprintln!("forgetty-win: local server: pairing again: {why}");
+                let _ = store.remove(m.id);
+            }
         }
-        // The server's identity changed (its state was removed): the old pairing is dead.
-        let _ = store.remove(m.id);
     }
     pair_local(cli, rt, store, device, hint, &status)
-}
-
-/// Where the local server listens: loopback and the port `status --json` names (the server's
-/// default port while it names none). The app pins this address and uses no relay for this machine.
-fn loopback(port: u16) -> SocketAddr {
-    SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port)
 }
 
 /// `forgetty pair --ttl N` opens a pairing window and prints the payload; the app pairs over
@@ -230,7 +320,7 @@ fn pair_local(
             return Err(Fallback::Pair("the server's identity changed while pairing".into()));
         }
         let m = rt
-            .block_on(store::pair_as(store, &offer, device, Some(hint.unwrap_or_else(|| loopback(status.port_or_default()))), true))
+            .block_on(store::pair_as(store, &offer, device, Some(hint.unwrap_or_else(|| ls::loopback_addr(status.port_or_default()))), true))
             .map_err(|e| Fallback::Pair(format!("{e} (dialed {:?}, relays off: {})", offer.direct, offer.relays_disabled)))?;
         // The command prints `paired:` and ends. Not seeing it is not an error: the pairing worked.
         let t1 = Instant::now();
@@ -294,6 +384,11 @@ pub struct LocalSrv {
     pub last_try: Option<Instant>,
     pub restarting: bool,
     pub last_error: Option<String>,
+    /// When each restart of this session was made (a server that keeps going down is given up).
+    pub restarts: Vec<Instant>,
+    /// "Retry the local server" is running: the built-in tabs stay on screen.
+    pub retry: bool,
+    pub watchdog_on: bool,
     /// Set to end the pairing command of the Devices page.
     pub pair_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
@@ -331,6 +426,49 @@ impl AppShell {
         }
     }
 
+    /// The palette command "Retry the local server": after a fallback, try the server again with
+    /// a fresh restart count. The built-in tabs stay on screen; the server shows as This PC.
+    pub fn retry_local_server(&mut self, cx: &mut Context<Self>) {
+        match self.lsrv.state {
+            LsState::Up => {
+                self.notice_active("The local server is running".into(), cx);
+                return;
+            }
+            LsState::Starting => {
+                self.notice_active("The local server is starting".into(), cx);
+                return;
+            }
+            _ => {}
+        }
+        if self.remote.is_none() {
+            self.notice_active("The local server needs %APPDATA% (machines are off)".into(), cx);
+            return;
+        }
+        let exe = match decide(self.cfg.local_server, self.smoke_mode) {
+            Plan::Server(exe) => exe,
+            Plan::InProcess(f) => {
+                let t = f.notice().unwrap_or_else(|| "The local server is turned off (local_server = false in the config)".into());
+                self.notice_active(t, cx);
+                return;
+            }
+        };
+        let state_dir = self.lsrv.cli.as_ref().and_then(|c| c.state_dir.clone());
+        self.lsrv.cli = Some(Cli { exe, state_dir });
+        self.lsrv.restarts.clear();
+        self.lsrv.tries = 0;
+        self.lsrv.down_since = None;
+        self.lsrv.last_try = None;
+        self.lsrv.last_error = None;
+        self.lsrv.retry = true;
+        self.lsrv.keep_inproc = true;
+        self.lsrv.state = LsState::Starting;
+        self.notice_active("Starting the local server...".into(), cx);
+        self.run_bring_up(cx);
+        if !self.lsrv.watchdog_on {
+            self.start_watchdog(cx);
+        }
+    }
+
     fn run_bring_up(&mut self, cx: &mut Context<Self>) {
         let (Some(cli), Some(r)) = (self.lsrv.cli.clone(), self.remote.as_ref()) else { return };
         let (rt, store, device, hint) = (r.rt.clone(), r.store.clone(), r.device_name.clone(), self.pair_hint);
@@ -346,10 +484,23 @@ impl AppShell {
     fn bring_up_done(&mut self, res: Result<StoredMachine, Fallback>, cx: &mut Context<Self>) {
         match res {
             Ok(mut m) => {
+                let retry = std::mem::take(&mut self.lsrv.retry);
                 self.lsrv.state = LsState::Up;
                 self.lsrv.machine = Some(m.id);
                 m.name = ls::THIS_PC.into();
-                self.connect_stored(m, true, cx);
+                // After a retry the user is working in the built-in terminal: do not move them.
+                self.connect_stored(m, !retry, cx);
+                if retry {
+                    self.notice_active("The local server is back. Switch to This PC in the sidebar to use it.".into(), cx);
+                }
+            }
+            Err(f) if self.lsrv.retry => {
+                self.lsrv.retry = false;
+                eprintln!("forgetty-win: local server: {f:?}");
+                if let Some(n) = f.notice() {
+                    self.notice_active(n, cx);
+                }
+                self.lsrv.state = LsState::Fallback(f);
             }
             Err(f) => self.server_fallback(f, true, cx),
         }
@@ -456,6 +607,7 @@ impl AppShell {
     // ---- watchdog ------------------------------------------------------------------
 
     fn start_watchdog(&mut self, cx: &mut Context<Self>) {
+        self.lsrv.watchdog_on = true;
         cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(Duration::from_secs(1)).await;
             if this.update(cx, |s, cx| s.watch_tick(cx)).is_err() {
@@ -468,6 +620,15 @@ impl AppShell {
     fn watch_tick(&mut self, cx: &mut Context<Self>) {
         let Some(id) = self.lsrv.machine.filter(|_| self.lsrv.state == LsState::Up) else { return };
         let Some(conn) = self.machines.iter().find(|m| m.id == id).map(|m| m.conn.clone()) else { return };
+        // The link stopped for good (the server does not accept this app: revoked or reset):
+        // restarting the server cannot help. Retry pairs again.
+        if let ConnState::Failed(why) = &conn {
+            let why = why.clone();
+            self.lsrv.machine = None;
+            self.server_fallback(Fallback::Pair(why), true, cx);
+            self.drop_machine(id, cx);
+            return;
+        }
         if conn.is_connected() {
             self.lsrv.down_since = None;
             self.lsrv.tries = 0;
@@ -484,6 +645,15 @@ impl AppShell {
         match ls::watch(down, self.lsrv.tries, since) {
             ls::Watch::Wait => {}
             ls::Watch::Restart => {
+                let ages: Vec<Duration> = self.lsrv.restarts.iter().map(|t| now - *t).collect();
+                if ls::too_many_restarts(&ages) {
+                    self.lsrv.machine = None;
+                    self.server_fallback(Fallback::Stopped("it went down 5 times in 10 minutes".into()), true, cx);
+                    self.drop_machine(id, cx);
+                    return;
+                }
+                self.lsrv.restarts.retain(|t| now - *t < ls::RESTART_WINDOW);
+                self.lsrv.restarts.push(now);
                 self.lsrv.tries += 1;
                 self.lsrv.last_try = Some(now);
                 self.lsrv.restarting = true;
@@ -541,7 +711,13 @@ fn pair_for_user(cli: &Cli, cancel: &std::sync::atomic::AtomicBool, tx: &async_c
     let mut acc = String::new();
     let end = loop {
         if cancel.load(Ordering::SeqCst) {
-            break Err("Cancelled. The code stays valid until it expires (2 minutes).".to_string());
+            // `pair --cancel` ends the window at once, so the code stops working.
+            let closed = matches!(cli.run(&["pair", "--cancel"], Duration::from_secs(10)), Ok(o) if o.code == Some(0));
+            break Err(if closed {
+                "Cancelled. The code no longer works.".to_string()
+            } else {
+                "Cancelled. The code stays valid until it expires (2 minutes).".to_string()
+            });
         }
         match lines.recv_timeout(Duration::from_millis(200)) {
             Ok(l) => {

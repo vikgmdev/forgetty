@@ -376,15 +376,20 @@ as a real key), below the Win32 key event hop.
 Tabs live in `forgetty.exe`, the per-user server, so they outlive the window.
 At start the app (a window that is not elevated, `local_server` not `false`):
 
-1. looks for `forgetty.exe` next to `forgetty-win.exe`, then on `PATH`;
-2. runs `forgetty.exe server start` with no console window (it does nothing when
-   a server answers);
+1. looks for `forgetty.exe` next to `forgetty-win.exe` and nowhere else (not `PATH`, not the
+   current folder). A developer can name another program with `FORGETTY_SERVER_EXE`: an absolute
+   path to a file on a local drive (a relative, UNC or device path is refused with a notice);
+2. runs `forgetty.exe server start` with no console window and no inherited handle (the
+   server must not keep this app's stdout open; it does nothing when a server answers);
 3. pairs by itself: `forgetty pair --ttl 30` prints a payload, the app pairs over
    loopback (`127.0.0.1`, the port `server status --json` names or 47297 while it names none, pinned by the app: the
    server listens on every address and its payload names no direct one; this
    machine never uses a relay) with the code of the pair dialog, and stores the machine with
-   `local: true` in `machines.json`. An existing pairing is reused while the
-   server's node id is the same;
+   `local: true` in `machines.json`. At every start the stored pairing is checked against
+   the server: the same node id, this app still in `forgetty devices`, and the stored address
+   equal to `127.0.0.1:<port>` of `status --json`. A new node id or a device list without this
+   app means pairing again (a revoked app pairs again at the next start); a new port updates
+   the stored address;
 4. shows the machine as **This PC** in the sidebar, over `RemoteBackend`, and
    drops the built-in terminal from the list.
 
@@ -398,8 +403,11 @@ server off without a notice.
 A watchdog looks once a second. When the link to the server is down for 3 s it
 runs `forgetty server start` again (at 0, 5 and 15 s after that) and, when the
 link is still down 25 s after the third try, the built-in terminal comes back
-with a notice. The server machine is not shown for a server that was replaced
-(new node id): the next start pairs again.
+with a notice. A server that goes down 5 times in 10 minutes is given up the same way, and so
+is a link the server refuses for good (this app was removed from its devices). The palette
+command **Retry the local server** tries again with a fresh count; the built-in tabs stay on
+screen and the server shows as This PC in the sidebar. `forgetty-win.exe --start-server`
+(the login Run value) does nothing when the config has `local_server = false`.
 
 Closing the last tab ends the app, as for the built-in terminal, after 1.5 s
 (a server that restarts can report an empty layout before it restores its tabs).
@@ -409,9 +417,11 @@ Differences from the built-in terminal: the `shell` setting and profiles are
 read by the server for new tabs (same `config.toml`); a changed `shell` applies
 after `forgetty server stop`. `--smoke` runs the real `forgetty.exe` named by
 `FORGETTY_SERVER_EXE` (a build that allows an elevated run, which the CI runner
-is) in its own `--state-dir`, pairs, times keys against the built-in pane
-(`local_server_key_p50_within_2ms_of_in_process`), kills the server and waits for
-the watchdog to bring it back.
+is) in its own `--state-dir`, pairs, times keys against the built-in pane, kills the server and
+waits for the watchdog to bring it back, then revokes its own device and checks that the next
+start pairs again. The gate `local_server_key_p50_within_2ms_of_in_process` compares the
+median time from a key to its echo in the terminal model (stamped when the bytes are fed, no
+frame in it) on both paths; the frame-based number is a second check (one frame plus 2 ms).
 
 ## Command line, cursor, picture paste (WP6b)
 
@@ -420,7 +430,8 @@ forgetty-win.exe [--working-directory DIR] [-e PROGRAM [ARGS...]] [--config-file
 forgetty-win.exe --help | --version
 ```
 
-- `--working-directory DIR` and `-e PROGRAM ARGS...` set the first tab of this start
+- `--working-directory DIR` (a relative folder is made absolute against the app's folder) and
+  `-e PROGRAM ARGS...` set the first tab of this start
   (`-e` takes the rest of the line; the program is found on `PATH` like a profile's).
   With the local server the tab is added to the active workspace beside the tabs the
   server kept. A folder that is not there, a program that is not found or an unknown
@@ -432,8 +443,11 @@ forgetty-win.exe --help | --version
   Cursor): the shape for a program that sets none. A program that asks for a bar or an
   underline keeps it.
 - Paste with a picture and no text on the clipboard saves
-  `%LOCALAPPDATA%\forgetty\cache\clipboard\paste-<date>-<id>.png` and pastes its path.
+  `%LOCALAPPDATA%\forgetty\cache\clipboard\paste-<date>-<id>.png` (a folder and a file for
+  this user only) and pastes its path, quoted for the shell the pane runs when the path needs it
+  (read from the prompt line): cmd `"..."`, PowerShell `'...'`, a POSIX shell (WSL) `'/mnt/c/...'`.
   Tabs on this PC only.
+- Palette: "Retry the local server" after a fallback.
 - Settings, Devices: paired devices, Revoke, "Pair new device" (needs the local server).
   Palette: "Quit and end all tabs on this PC" stops the server.
 - `Ctrl+Alt+PageDown` / `Ctrl+Alt+PageUp`: next and previous workspace (`windows` keymap).

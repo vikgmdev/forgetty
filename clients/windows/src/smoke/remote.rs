@@ -544,6 +544,7 @@ impl ShellSmoke {
                                 size == Some((v.rows as u16, v.cols as u16)),
                             );
                             self.w3.resets_before = v.resets;
+                            check("image_paste_refused_on_a_real_remote_pane", self.img_remote_refusal(&view, cx));
                             self.goto(Phase::RKill);
                         } else if self.lat_ms.len() % 20 == 0 {
                             self.w3.fed_before = view.read(cx).fed_bytes;

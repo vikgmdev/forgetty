@@ -249,10 +249,16 @@ impl Launch {
         if !a.has_launch() {
             return Ok(None);
         }
+        // A relative folder is made absolute against this process's folder here: the server's own
+        // current folder is somewhere else.
+        let mut cwd = None;
         if let Some(d) = &a.working_directory {
-            if !std::path::Path::new(d).is_dir() {
-                return Err(format!("--working-directory: {} is not a folder", forgetty_shell_core::notify::sanitize(d, 80)));
+            let shown = forgetty_shell_core::notify::sanitize(d, 80);
+            let abs = std::path::absolute(d).map_err(|e| format!("--working-directory: {shown}: {e}"))?;
+            if !abs.is_dir() {
+                return Err(format!("--working-directory: {shown} is not a folder"));
             }
+            cwd = Some(abs.to_string_lossy().into_owned());
         }
         let mut command = a.command.clone();
         if let Some(first) = command.first().cloned() {
@@ -260,7 +266,7 @@ impl Launch {
             command[0] = forgetty_shell_core::resolve::resolve_program(&first, &host)
                 .map_err(|e| format!("-e: {}", forgetty_shell_core::notify::sanitize(&e, 160)))?;
         }
-        Ok(Some(Launch { command, cwd: a.working_directory.clone() }))
+        Ok(Some(Launch { command, cwd }))
     }
 }
 
@@ -1136,6 +1142,7 @@ impl AppShell {
             }
             Action::CheckUpdates => self.check_for_updates(cx),
             Action::EndSession => self.ask_end_session(cx),
+            Action::RetryLocalServer => self.retry_local_server(cx),
             Action::ClipboardWriteOff => self.set_active_clip_policy(forgetty_shell_core::osc52::Policy::Off, cx),
             Action::ClipboardWriteAsk => self.set_active_clip_policy(forgetty_shell_core::osc52::Policy::Ask, cx),
             Action::ClipboardWriteAllow => self.set_active_clip_policy(forgetty_shell_core::osc52::Policy::Allow, cx),

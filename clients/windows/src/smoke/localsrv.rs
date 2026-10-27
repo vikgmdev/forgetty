@@ -13,7 +13,7 @@ use forgetty_shell_core::{MachineKind, PaneId, Uuid};
 use gpui::{Context, Window};
 use serde_json::json;
 
-use super::{check, fail, ms, record, snap, summarize_keys, Phase, Probe, ShellSmoke, RESULTS};
+use super::{check, fail, model_ms, ms, record, snap, summarize_keys, summarize_model, Phase, Probe, ShellSmoke, RESULTS};
 use crate::localserver::{Cli, LsState};
 use crate::shell::AppShell;
 
@@ -142,14 +142,19 @@ impl ShellSmoke {
                     0 => {
                         self.ls.base_col = cc;
                         self.lat_ms.clear();
+                        self.lat_model_ms.clear();
                         self.max_reshaped_per_key = 0;
                         self.sub = 1;
                     }
                     1 | 3 => {
                         if cc == self.ls.base_col && self.sub_t0.elapsed() > Duration::from_millis(100) {
                             let ch = self.next_key_char();
-                            self.probe = Some(Probe { row: cr, col: cc, ch, t0: Instant::now() });
-                            view.update(cx, |v, _| v.send_bytes(ch.to_string().as_bytes()));
+                            let t0 = Instant::now();
+                            self.probe = Some(Probe { row: cr, col: cc, ch, t0 });
+                            view.update(cx, |v, _| {
+                                v.probe_watch = Some(crate::view::ProbeWatch { row: cr, col: cc, ch, t0, model_at: None });
+                                v.send_bytes(ch.to_string().as_bytes())
+                            });
                             self.sub = 4;
                         } else if self.sub_t0.elapsed() > Duration::from_secs(5) {
                             fail("local server key probe: the prompt line did not come back");
@@ -171,12 +176,29 @@ impl ShellSmoke {
                         }
                         let p = self.probe.take().unwrap();
                         self.lat_ms.push(ms(now_t - p.t0));
+                        self.lat_model_ms.push(model_ms(view.read(cx)));
                         self.max_reshaped_per_key = self.max_reshaped_per_key.max(reshaped);
                         if self.lat_ms.len() >= PROBES {
-                            let (p50, _) = summarize_keys(&self.lat_ms, self.max_reshaped_per_key, "_local_server");
-                            let base = recorded("key_to_frame_p50_ms").unwrap_or(f64::MAX);
-                            record("local_server_vs_in_process_ms", json!({"in_process_p50": base, "server_p50": p50, "delta": p50 - base}));
-                            check("local_server_key_p50_within_2ms_of_in_process", p50 <= base + 2.0);
+                            let (frame50, _) = summarize_keys(&self.lat_ms, self.max_reshaped_per_key, "_local_server");
+                            let model50 = summarize_model(&self.lat_model_ms, "_local_server");
+                            self.lat_model_ms.clear();
+                            // A number that was not measured fails the gate: no default.
+                            let Some(base_model) = recorded("key_to_model_p50_ms") else { fail("local server: no in-process model latency was measured") };
+                            let Some(base_frame) = recorded("key_to_frame_p50_ms") else { fail("local server: no in-process frame latency was measured") };
+                            record(
+                                "local_server_vs_in_process_ms",
+                                json!({
+                                    "model": {"in_process_p50": base_model, "server_p50": model50, "delta": model50 - base_model},
+                                    "frame": {"in_process_p50": base_frame, "server_p50": frame50, "delta": frame50 - base_frame},
+                                }),
+                            );
+                            // The gate: the median of the echo reaching the terminal model, which has no
+                            // frame in it, within 2 ms of the built-in terminal.
+                            check("local_server_key_p50_within_2ms_of_in_process", model50 - base_model <= 2.0);
+                            // The second check: as the user sees it, a frame is the resolution, so one
+                            // frame plus the 2 ms.
+                            let frame = self.frame_ms();
+                            check("local_server_key_frame_p50_within_one_frame_of_in_process", frame50 - base_frame <= frame + 2.0);
                             view.update(cx, |v, _| v.send_bytes(&[0x1b]));
                             self.goto(Phase::LsDevices);
                         } else if self.lat_ms.len() % 20 == 0 {
@@ -186,8 +208,12 @@ impl ShellSmoke {
                         } else {
                             let (r, c) = view.read(cx).term.cursor();
                             let ch = self.next_key_char();
-                            self.probe = Some(Probe { row: r, col: c, ch, t0: Instant::now() });
-                            view.update(cx, |v, _| v.send_bytes(ch.to_string().as_bytes()));
+                            let t0 = Instant::now();
+                            self.probe = Some(Probe { row: r, col: c, ch, t0 });
+                            view.update(cx, |v, _| {
+                                v.probe_watch = Some(crate::view::ProbeWatch { row: r, col: c, ch, t0, model_at: None });
+                                v.send_bytes(ch.to_string().as_bytes())
+                            });
                         }
                     }
                 }
@@ -283,6 +309,7 @@ impl ShellSmoke {
                 shell.lsrv.machine = None;
                 shell.switch_machine(inproc, cx);
                 shell.drop_machine(id, cx);
+                self.ls_pairing_checks(shell, &cli);
                 let stop = cli.run(&["server", "stop"], Duration::from_secs(30));
                 if let Ok(mut g) = super::LOCAL_SERVER.lock() {
                     *g = None;
@@ -326,4 +353,43 @@ fn server_log_tail(state: &std::path::Path) -> String {
     let text = std::fs::read_to_string(&log).unwrap_or_default();
     let lines: Vec<&str> = text.lines().collect();
     lines[lines.len().saturating_sub(40)..].join(" | ")
+}
+
+impl ShellSmoke {
+    /// The stored pairing is checked at every start: a changed port moves the stored address, and
+    /// a device list without this app means pairing again. Both run `bring_up`, as a start does.
+    fn ls_pairing_checks(&mut self, shell: &mut AppShell, cli: &Cli) {
+        let Some(r) = shell.remote.as_ref() else { return };
+        let (rt, store, device) = (r.rt.clone(), r.store.clone(), r.device_name.clone());
+        let own = store.device_id().unwrap_or_default();
+        let run = |cli: &Cli| {
+            let (cli, rt, store, device) = (cli.clone(), rt.clone(), store.clone(), device.clone());
+            std::thread::spawn(move || crate::localserver::bring_up(&cli, &rt, &store, &device, None)).join().ok().and_then(Result::ok)
+        };
+        let Some(first) = store.local_machine() else { fail("local server: no stored machine to check") };
+        let want = ls::loopback_addr(cli.status().map(|s| s.port_or_default()).unwrap_or(47297));
+
+        // 1. The stored address is wrong (the server was somewhere else): it follows the server,
+        // and the pairing is kept (same machine id).
+        let mut moved = first.clone();
+        moved.pinned_addrs = vec![ls::loopback_addr(1)];
+        let _ = store.add(moved);
+        let kept = run(cli);
+        check(
+            "local_server_stored_address_follows_the_server",
+            kept.as_ref().is_some_and(|m| m.id == first.id && m.pinned_addrs == vec![want]) && store.local_machine().is_some_and(|m| m.pinned_addrs == vec![want]),
+        );
+
+        // 2. The server forgets this app (revoked): the next start pairs again.
+        let revoked = cli.run(&["revoke", &own], Duration::from_secs(20));
+        record("local_server_revoke_own", json!(revoked.as_ref().map(|o| o.code).map_err(|e| e.to_string())));
+        let listed = cli.devices().map(|d| d.iter().any(|x| ls::is_own_device(x, &own))).unwrap_or(true);
+        check("local_server_revoked_app_is_gone_from_the_list", !listed);
+        let again = run(cli);
+        let listed = cli.devices().map(|d| d.iter().any(|x| ls::is_own_device(x, &own))).unwrap_or(false);
+        check(
+            "local_server_pairs_again_when_the_server_refuses_the_app",
+            again.as_ref().is_some_and(|m| m.id != first.id && m.pinned_addrs == vec![want]) && listed,
+        );
+    }
 }

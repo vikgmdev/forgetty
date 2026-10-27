@@ -19,7 +19,7 @@ pub fn category(a: Action) -> &'static str {
         RenameWorkspace | NewWorkspace | NextWorkspace | PrevWorkspace | GotoWorkspace(_) | DuplicateWorkspace | DeleteWorkspace | MoveWorkspaceUp | MoveWorkspaceDown | ToggleSidebar => "Workspaces",
         PairMachine | NextMachine | PrevMachine => "Machines",
         Profile(_) => "Profiles",
-        CommandPalette | OpenConfig | ReloadConfig | ChooseTheme | Quit | CheckUpdates | EndSession | OpenSettings | ShowShortcuts => "Application",
+        CommandPalette | OpenConfig | ReloadConfig | ChooseTheme | Quit | CheckUpdates | EndSession | RetryLocalServer | OpenSettings | ShowShortcuts => "Application",
     }
 }
 
