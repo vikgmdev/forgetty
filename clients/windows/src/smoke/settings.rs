@@ -126,7 +126,7 @@ impl ShellSmoke {
             // ---- a toggle and its default --------------------------------------------------------
             5 => {
                 until!(settle);
-                self.st_send(shell, window, cx, &["down", "down", "down", "space"]);
+                self.st_send(shell, window, cx, &["down", "down", "down", "down", "space"]);
                 self.st_next();
             }
             6 => {
@@ -139,7 +139,7 @@ impl ShellSmoke {
                 until!(shell.file_cfg.smart_copy);
                 check("settings_delete_removes_the_key_for_the_default", !self.st_file().contains("smart_copy"));
                 // The number entry: scrollback, 10 MiB to 5 MiB.
-                self.st_send(shell, window, cx, &["up", "up", "up", "enter", "backspace", "backspace"]);
+                self.st_send(shell, window, cx, &["up", "up", "up", "up", "enter", "backspace", "backspace"]);
                 self.st_type(shell, window, cx, "5");
                 self.st_send(shell, window, cx, &["enter"]);
                 self.st_next();
