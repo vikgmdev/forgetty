@@ -5029,6 +5029,26 @@ mod tests {
         let session = SessionManager::new();
         let size = test_size();
 
+        // The shell may print while the test runs (the focus-mode request of a Windows console).
+        // Only layout events count here.
+        async fn next_event(
+            rx: &mut tokio::sync::broadcast::Receiver<SessionEvent>,
+            wait: Duration,
+        ) -> std::result::Result<
+            std::result::Result<SessionEvent, tokio::sync::broadcast::error::RecvError>,
+            tokio::time::error::Elapsed,
+        > {
+            let end = tokio::time::Instant::now() + wait;
+            loop {
+                let left = end.saturating_duration_since(tokio::time::Instant::now());
+                match tokio::time::timeout(left, rx.recv()).await? {
+                    Ok(SessionEvent::PtyOutput { .. }) => continue,
+                    other => return Ok(other),
+                }
+            }
+        }
+
+
         let (pane1, tab_id) = session.create_tab(0, None, size, None).expect("create_tab");
         let pane2 = session.split_pane(pane1, "horizontal", size, None).expect("split_pane");
 
@@ -5045,7 +5065,7 @@ mod tests {
         );
 
         // Pull the event from the broadcast.
-        let evt = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+        let evt = next_event(&mut rx, Duration::from_millis(200))
             .await
             .expect("event recv timeout")
             .expect("event recv error");
@@ -5063,12 +5083,12 @@ mod tests {
 
         // Idempotence: setting the same value emits NO event.
         session.set_active_pane(0, tab_id, Some(pane2)).expect("idempotent");
-        let next = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await;
+        let next = next_event(&mut rx, Duration::from_millis(50)).await;
         assert!(next.is_err(), "idempotent set must NOT emit ActivePaneChanged (got {next:?})");
 
         // A real change still fires.
         session.set_active_pane(0, tab_id, Some(pane1)).expect("set back to pane1");
-        let evt = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+        let evt = next_event(&mut rx, Duration::from_millis(200))
             .await
             .expect("event recv timeout")
             .expect("event recv error");
@@ -5079,7 +5099,7 @@ mod tests {
 
         // Setting to None also fires (different value).
         session.set_active_pane(0, tab_id, None).expect("clear");
-        let evt = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+        let evt = next_event(&mut rx, Duration::from_millis(200))
             .await
             .expect("event recv timeout")
             .expect("event recv error");
@@ -5481,6 +5501,8 @@ mod tests {
         assert_eq!(code, Some(Some(7)));
     }
 
+    // Needs /tmp, `printf` and `sh`.
+    #[cfg(unix)]
     #[tokio::test]
     async fn osc7_cannot_choose_the_spawn_directory() {
         let tmp = std::fs::canonicalize("/tmp").unwrap();

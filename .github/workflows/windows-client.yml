@@ -117,15 +117,20 @@ jobs:
 
   # WP0 to WP3 of docs/architecture/WINDOWS_SERVER.md: the server crates on Windows.
   # CHECK_CRATES must compile (tests and benches too). TEST_CRATES must pass their tests. Both
-  # sets grow with each work package. The last steps look at the crates that are not in the
-  # sets yet and never fail the job: their output is the to-do list.
+  # sets grow with each work package. Every server crate is in both sets now.
+  # sets yet.
   server-crates:
     runs-on: windows-latest
     timeout-minutes: 60
     env:
       CHECK_CRATES: "-p forgetty-core -p forgetty-config -p forgetty-workspace -p forgetty-sync -p forgetty-pty -p forgetty-session -p forgetty-socket -p forgetty-server"
-      TEST_CRATES: "-p forgetty-core -p forgetty-config -p forgetty-workspace -p forgetty-sync -p forgetty-pty -p forgetty-socket"
+      TEST_CRATES: "-p forgetty-core -p forgetty-config -p forgetty-workspace -p forgetty-sync -p forgetty-pty -p forgetty-session -p forgetty-socket -p forgetty-server"
     steps:
+      # Tests compare generated docs and `include_str!` text with the checked-in files: LF only.
+      - name: Checkout with LF line endings
+        shell: bash
+        run: git config --global core.autocrlf false
+
       - uses: actions/checkout@v4
         with:
           submodules: true
@@ -151,12 +156,6 @@ jobs:
         run: |
           $crates = $env:TEST_CRATES -split ' '
           cargo test --locked --no-fail-fast @crates
-
-      - name: Tests of crates that are compiled but not gated yet (does not gate)
-        if: ${{ !cancelled() }}
-        continue-on-error: true
-        shell: pwsh
-        run: cargo test --locked --no-fail-fast -p forgetty-session -p forgetty-server
 
   # The real Linux server, built here, for the WSL end-to-end test below.
   linux-server:

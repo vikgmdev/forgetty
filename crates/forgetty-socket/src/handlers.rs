@@ -2591,6 +2591,8 @@ mod tests {
         assert_eq!(ids, vec![left, pane, plain, right]);
     }
 
+    // Needs /tmp.
+    #[cfg(unix)]
     #[tokio::test]
     async fn osc7_hint_does_not_choose_the_split_directory() {
         let tmp = std::fs::canonicalize("/tmp").unwrap();
