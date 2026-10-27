@@ -118,7 +118,6 @@ jobs:
   # WP0 to WP3 of docs/architecture/WINDOWS_SERVER.md: the server crates on Windows.
   # CHECK_CRATES must compile (tests and benches too). TEST_CRATES must pass their tests. Both
   # sets grow with each work package. Every server crate is in both sets now.
-  # sets yet.
   server-crates:
     runs-on: windows-latest
     timeout-minutes: 60
