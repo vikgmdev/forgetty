@@ -696,3 +696,41 @@ fn every_configuration_error_exits_78() {
         assert!(err.contains(needle), "args {args:?}: wanted {needle:?} in: {err}");
     }
 }
+
+/// `pair_close` ends the open window: the QR a user cancelled stops working at once. A close for
+/// an older window id leaves a newer window alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_closed_pairing_window_refuses_the_pair_attempt() {
+    if !real_only() {
+        return;
+    }
+    init_tracing();
+    let server = TestServer::start_real_with_args(&ARGS).await;
+
+    // Open, cancel, then scan: refused.
+    let opened = server.socket_call("pair_open", serde_json::json!({})).expect("pair_open");
+    let id = opened["window_id"].as_u64().unwrap();
+    let qr: QrPayload = serde_json::from_value(opened["payload"].clone()).unwrap();
+    let closed =
+        server.socket_call("pair_close", serde_json::json!({ "window_id": id })).expect("close");
+    assert_eq!(closed["closed"], true, "{closed}");
+    let st = server.socket_call("pair_status", serde_json::json!({ "window_id": id })).unwrap();
+    assert_eq!(st["state"], "expired", "{st}");
+    let err = pair(&qr, SecretKey::generate(&mut rand::rng()), "late", ClientKind::Cli)
+        .await
+        .expect_err("pair after close must fail");
+    assert!(err.to_string().contains("expired"), "{err}");
+
+    // A second close finds no window, and is still a success.
+    let again = server.socket_call("pair_close", serde_json::json!({})).expect("close again");
+    assert_eq!(again["ok"], true);
+    assert_eq!(again["closed"], false, "{again}");
+
+    // A late cancel of the old window does not end a newer one.
+    let newer = payload(&server);
+    let late = server.socket_call("pair_close", serde_json::json!({ "window_id": id })).unwrap();
+    assert_eq!(late["closed"], false, "{late}");
+    pair(&newer, SecretKey::generate(&mut rand::rng()), "ok", ClientKind::Cli)
+        .await
+        .expect("the newer window still pairs");
+}

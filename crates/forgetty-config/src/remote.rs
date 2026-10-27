@@ -55,6 +55,12 @@ pub fn is_relay_none(value: &str) -> bool {
     value.trim().eq_ignore_ascii_case("none")
 }
 
+/// Is `value` the relay setting that asks for iroh's default relays? Trimmed, any case. Same as
+/// leaving `relay` out on Linux. On Windows, where the default is no relay, this turns them on.
+pub fn is_relay_default(value: &str) -> bool {
+    value.trim().eq_ignore_ascii_case("default")
+}
+
 /// One relay URL (trimmed): http or https, with a host.
 pub fn parse_relay_url(value: &str) -> Result<Url, ConfigError> {
     let parsed = Url::parse(value.trim())
@@ -112,8 +118,10 @@ pub fn relays_disabled(
     match relay_setting.map(str::trim) {
         None | Some("") => Ok(no_relay_flag),
         Some(v) if is_relay_none(v) => Ok(true),
+        Some(v) if is_relay_default(v) => Ok(false),
         Some(v) => Err(ConfigError(format!(
-            "invalid relay setting {v:?}: the only value is \"none\" (use relay_urls for relays)"
+            "invalid relay setting {v:?}: the values are \"none\" and \"default\" (use relay_urls \
+             for own relays)"
         ))),
     }
 }
@@ -151,6 +159,25 @@ pub fn validate_remote_settings(
     config: &crate::Config,
     overrides: &RemoteOverrides,
 ) -> Result<RemoteSettings, ConfigError> {
+    validate_remote_settings_with(config, overrides, cfg!(windows))
+}
+
+/// The address a server with `local_defaults` binds when nothing says otherwise.
+pub const LOCAL_DEFAULT_BIND: IpAddr = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+
+/// [`validate_remote_settings`], with the platform defaults chosen by the caller.
+///
+/// `local_defaults` (Windows): a server nobody configured is reachable from this machine only.
+/// With no `--no-relay`, `relay`, `--relay-url` or `relay_urls` it uses no relay and publishes
+/// nothing to n0, and with no `--bind` or `bind_addrs` it binds `127.0.0.1` only. A user who
+/// wants other devices to reach it sets `bind_addrs` (an explicit opt-in), and relays come back
+/// with `relay_urls` or `relay = "default"`. Without `local_defaults` (Linux) the defaults are
+/// iroh's relays and every address.
+pub fn validate_remote_settings_with(
+    config: &crate::Config,
+    overrides: &RemoteOverrides,
+    local_defaults: bool,
+) -> Result<RemoteSettings, ConfigError> {
     let mut warnings = Vec::new();
     let file_relay = config.relay.as_deref().map(str::trim).filter(|v| !v.is_empty());
     let (no_relay, relay_urls) = if overrides.no_relay {
@@ -170,7 +197,11 @@ pub fn validate_remote_settings(
         (false, parse_relay_urls(&overrides.relay_urls)?)
     } else {
         let relay_urls = parse_relay_urls(&config.relay_urls)?;
-        let no_relay = relays_disabled(false, config.relay.as_deref())?;
+        let mut no_relay = relays_disabled(false, config.relay.as_deref())?;
+        // Nothing asked for relays: a local-only server uses none.
+        if local_defaults && file_relay.is_none() && relay_urls.is_empty() {
+            no_relay = true;
+        }
         if no_relay && !relay_urls.is_empty() {
             return Err(ConfigError(
                 "relays are switched off (relay = \"none\") but relay URLs are set \
@@ -181,7 +212,11 @@ pub fn validate_remote_settings(
         (no_relay, relay_urls)
     };
     let bind_addrs = if overrides.bind.is_empty() {
-        parse_bind_addrs(&config.bind_addrs)?
+        let mut addrs = parse_bind_addrs(&config.bind_addrs)?;
+        if addrs.is_empty() && local_defaults {
+            addrs.push(LOCAL_DEFAULT_BIND);
+        }
+        addrs
     } else {
         if !config.bind_addrs.is_empty() {
             warnings.push("config bind_addrs ignored: --bind given".to_string());
@@ -211,6 +246,61 @@ pub fn validate_remote_settings(
 mod tests {
     use super::*;
     use crate::Config;
+
+    /// The Linux defaults, on every platform: these tests describe the rules without the
+    /// local-only defaults.
+    fn linux(config: &Config, o: &RemoteOverrides) -> Result<RemoteSettings, ConfigError> {
+        validate_remote_settings_with(config, o, false)
+    }
+
+    fn local(config: &Config, o: &RemoteOverrides) -> Result<RemoteSettings, ConfigError> {
+        validate_remote_settings_with(config, o, true)
+    }
+
+    #[test]
+    fn local_defaults_bind_loopback_only_with_no_relay() {
+        let s = local(&Config::default(), &RemoteOverrides::default()).unwrap();
+        assert!(s.no_relay);
+        assert!(s.relay_urls.is_empty());
+        assert_eq!(s.bind_addrs, vec![LOCAL_DEFAULT_BIND]);
+        // Linux keeps iroh's relays and every address.
+        let s =
+            validate_remote_settings_with(&Config::default(), &RemoteOverrides::default(), false)
+                .unwrap();
+        assert!(!s.no_relay && s.bind_addrs.is_empty());
+    }
+
+    #[test]
+    fn local_defaults_give_way_to_explicit_settings() {
+        // Other addresses are an opt-in; relays stay off unless asked for.
+        let c = Config { bind_addrs: vec!["10.230.1.14".into()], ..Config::default() };
+        let s = local(&c, &RemoteOverrides::default()).unwrap();
+        assert_eq!(s.bind_addrs, vec!["10.230.1.14".parse::<IpAddr>().unwrap()]);
+        assert!(s.no_relay);
+        // The command line wins over the file.
+        let o = RemoteOverrides { bind: vec!["10.9.9.9".into()], ..Default::default() };
+        assert_eq!(local(&c, &o).unwrap().bind_addrs, vec!["10.9.9.9".parse::<IpAddr>().unwrap()]);
+        // Own relays, or the default relays on request.
+        let c =
+            Config { relay_urls: vec!["https://relay.example.org".into()], ..Config::default() };
+        let s = local(&c, &RemoteOverrides::default()).unwrap();
+        assert!(!s.no_relay);
+        assert_eq!(s.bind_addrs, vec![LOCAL_DEFAULT_BIND]);
+        let c = Config { relay: Some("default".into()), ..Config::default() };
+        assert!(!local(&c, &RemoteOverrides::default()).unwrap().no_relay);
+        let o = RemoteOverrides {
+            relay_urls: vec!["https://relay.example.org".into()],
+            ..Default::default()
+        };
+        assert!(!local(&Config::default(), &o).unwrap().no_relay);
+    }
+
+    #[test]
+    fn relay_default_is_accepted_and_a_typo_still_is_not() {
+        assert!(!relays_disabled(false, Some("default")).unwrap());
+        assert!(!relays_disabled(false, Some(" Default ")).unwrap());
+        assert!(relays_disabled(false, Some("nope")).is_err());
+    }
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
@@ -278,7 +368,7 @@ mod tests {
     #[test]
     fn the_command_line_replaces_the_file_lists() {
         let c = config("bind_addrs = [\"10.0.0.1\"]\nrelay_urls = [\"https://a.example.org\"]\n");
-        let s = validate_remote_settings(&c, &RemoteOverrides::default()).unwrap();
+        let s = linux(&c, &RemoteOverrides::default()).unwrap();
         assert_eq!(s.bind_addrs, vec![ip("10.0.0.1")]);
         assert_eq!(s.relay_urls.len(), 1);
         let over = RemoteOverrides {
@@ -286,7 +376,7 @@ mod tests {
             relay_urls: vec!["https://b.example.org".into()],
             ..Default::default()
         };
-        let s = validate_remote_settings(&c, &over).unwrap();
+        let s = linux(&c, &over).unwrap();
         assert_eq!(s.bind_addrs, vec![ip("10.0.0.2")]);
         assert_eq!(s.relay_urls[0].as_str(), "https://b.example.org/");
         assert!(!s.no_relay);
@@ -307,7 +397,7 @@ mod tests {
             "relay = \"nne\"\n",
             "relay = \"none\"\nrelay_urls = [\"https://r.example.org\"]\n",
         ] {
-            let s = validate_remote_settings(&config(file), &flag(true, &[], &["10.0.0.1"]))
+            let s = linux(&config(file), &flag(true, &[], &["10.0.0.1"]))
                 .unwrap_or_else(|e| panic!("{file:?}: {e}"));
             assert!(s.no_relay && s.relay_urls.is_empty(), "{file:?}");
             assert_eq!(
@@ -317,39 +407,26 @@ mod tests {
             );
         }
         // relay = "none" alone in the file is the same as the flag: no warning.
-        let s = validate_remote_settings(
-            &config("relay = \"none\"\n"),
-            &flag(true, &[], &["10.0.0.1"]),
-        )
-        .unwrap();
+        let s = linux(&config("relay = \"none\"\n"), &flag(true, &[], &["10.0.0.1"])).unwrap();
         assert!(s.warnings.is_empty());
         // --relay-url: the file's relay = "none" is ignored.
-        let s = validate_remote_settings(
-            &config("relay = \"none\"\n"),
-            &flag(false, &["https://r.example.org"], &[]),
-        )
-        .unwrap();
+        let s = linux(&config("relay = \"none\"\n"), &flag(false, &["https://r.example.org"], &[]))
+            .unwrap();
         assert!(!s.no_relay && s.relay_urls.len() == 1);
         assert_eq!(
             s.warnings,
             vec!["config relay settings ignored: --relay-url given".to_string()]
         );
         // --bind: the file's bind_addrs is ignored, even a bad one.
-        let s = validate_remote_settings(
-            &config("bind_addrs = [\"not an ip\"]\n"),
-            &flag(false, &[], &["10.0.0.2"]),
-        )
-        .unwrap();
+        let s = linux(&config("bind_addrs = [\"not an ip\"]\n"), &flag(false, &[], &["10.0.0.2"]))
+            .unwrap();
         assert_eq!(s.bind_addrs, vec![ip("10.0.0.2")]);
         assert_eq!(s.warnings, vec!["config bind_addrs ignored: --bind given".to_string()]);
         // A conflict inside one source is still an error.
-        let e = validate_remote_settings(
-            &config(""),
-            &flag(true, &["https://r.example.org"], &["10.0.0.1"]),
-        )
-        .unwrap_err();
+        let e =
+            linux(&config(""), &flag(true, &["https://r.example.org"], &["10.0.0.1"])).unwrap_err();
         assert!(e.to_string().contains("relay URLs are set"), "{e}");
-        let e = validate_remote_settings(
+        let e = linux(
             &config("relay = \"none\"\nrelay_urls = [\"https://r.example.org\"]\n"),
             &flag(false, &[], &["10.0.0.1"]),
         )
@@ -360,10 +437,10 @@ mod tests {
     #[test]
     fn no_relay_needs_a_bind_address() {
         let c = config("relay = \"none\"\n");
-        let e = validate_remote_settings(&c, &RemoteOverrides::default()).unwrap_err();
+        let e = linux(&c, &RemoteOverrides::default()).unwrap_err();
         assert!(e.to_string().contains("no bind address is set"), "{e}");
         let over = RemoteOverrides { bind: vec!["10.0.0.2".into()], ..Default::default() };
-        assert!(validate_remote_settings(&c, &over).unwrap().no_relay);
+        assert!(linux(&c, &over).unwrap().no_relay);
     }
 
     #[test]
@@ -387,7 +464,7 @@ mod tests {
         assert!(saved.warnings.is_empty());
         // The server itself still refuses it with no --bind.
         let c = config("relay = \"none\"\n");
-        assert!(validate_remote_settings(&c, &RemoteOverrides::default()).is_err());
+        assert!(linux(&c, &RemoteOverrides::default()).is_err());
     }
 
     /// The cases of `every_configuration_error_exits_78` in forgetty-client

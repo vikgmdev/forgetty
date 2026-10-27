@@ -98,7 +98,8 @@ stream) and the `qa_*` test methods are not reachable over v2.
 
 - The UDP port is fixed: `forgetty server run --port N`, default 47297 (`0`
   picks a free port, for tests). A second server on a taken port exits with a
-  bind error.
+  bind error. On Windows the default port falls back to a free one (see "Windows
+  defaults" below), and a port given with `--port` or `FORGETTY_PORT` does not.
 - Every pane has an absolute byte offset. The ring and the disk log know the
   offset of their first byte. The first offset is stored in
   `logs/<pane>.log.off`, so a client resumes at its offset after a server
@@ -297,6 +298,22 @@ or set `relay_urls = ["https://relay.example.org"]` in
 `~/.config/forgetty/config.toml`. The pairing QR then carries the relay and the
 apps use it. How to run `iroh-relay` as a user service, with HTTPS and the
 firewall ports: `relay.md`.
+
+## Windows defaults
+
+On Windows the server is local only unless you opt in. With no `bind_addrs` and no
+`--bind` it binds `127.0.0.1` only. With no `relay`, `relay_urls`, `--no-relay`
+or `--relay-url` it uses no relay and never contacts n0. The pairing payload
+carries `relays_disabled` and the direct address `127.0.0.1:<port>`. The port is
+47297. When another program or another Windows user on the same PC has it, the
+server picks a free port and logs a warning. `forgetty server status --json`
+reports the real one as `port` and `addresses`. Opt-ins in `config.toml`:
+`bind_addrs = ["10.230.1.14"]` for other addresses, `relay = "default"` for
+iroh's default relays, `relay_urls` for your own. Linux and macOS defaults are
+unchanged.
+
+`forgetty pair --cancel` (the `pair_close` call) closes the open pairing window
+at once, so its QR code stops working.
 
 ## WireGuard-only server
 

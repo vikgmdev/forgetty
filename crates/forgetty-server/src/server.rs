@@ -563,7 +563,12 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
         info!("bind: {}", bind_addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", "));
     }
     if no_relay && loopback_only(&bind_addrs) {
-        warn!("bound to loopback only: no remote device can pair");
+        if cfg!(windows) {
+            // The default there: this machine only. Other devices need `bind_addrs`.
+            info!("bound to loopback only (the default on Windows): set bind_addrs to let other devices pair");
+        } else {
+            warn!("bound to loopback only: no remote device can pair");
+        }
     }
 
     info!("session_id: {session_id}");
@@ -1035,10 +1040,10 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
     // specific behaviour out of the transport crate.
     let sm_for_alpn = Arc::clone(&session_manager);
     let rpc_v2 = RpcV2::new(Arc::clone(&session_manager), session_id);
-    let port = args
-        .port
-        .or_else(|| std::env::var("FORGETTY_PORT").ok().and_then(|v| v.parse().ok()))
-        .unwrap_or(DEFAULT_PORT);
+    let chosen_port =
+        args.port.or_else(|| std::env::var("FORGETTY_PORT").ok().and_then(|v| v.parse().ok()));
+    let port_is_default = chosen_port.is_none();
+    let port = chosen_port.unwrap_or(DEFAULT_PORT);
     info!("n0 discovery: {}", if n0_discovery { "on" } else { "off" });
     if no_relay {
         info!("relays: none (the server never contacts a relay or n0)");
@@ -1065,7 +1070,7 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
     let all_bind_addrs = bind_addrs.clone();
     let make_endpoint = {
         let (rpc_v2, relay_urls) = (Arc::clone(&rpc_v2), relay_urls);
-        move |bind_addrs: Vec<std::net::IpAddr>| {
+        move |port: u16, bind_addrs: Vec<std::net::IpAddr>| {
             let sm_for_alpn = Arc::clone(&sm_for_alpn);
             SyncEndpoint::builder(secret_key.clone())
                 .bind_port(port)
@@ -1125,7 +1130,19 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
         }
     };
     let first = match usable() {
-        Ok(set) => make_endpoint(set).await,
+        Ok(set) => {
+            let first = make_endpoint(port, set.clone()).await;
+            // Windows: the fixed port is the default, and another program may hold it. Then the
+            // server takes a free port rather than not starting. `server status` and the pair
+            // payload carry the port it really has. A port the user chose is never replaced.
+            match first {
+                Err(forgetty_sync::SyncError::Bind(why)) if cfg!(windows) && port_is_default => {
+                    warn!("iroh endpoint: port {port} is not available ({why}); using a free port");
+                    make_endpoint(0, set).await
+                }
+                other => other,
+            }
+        }
         Err(e) => Err(e),
     };
     match first {
@@ -1146,7 +1163,7 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
                 loop {
                     tokio::time::sleep(wait).await;
                     let attempt = match usable() {
-                        Ok(set) => make_endpoint(set).await,
+                        Ok(set) => make_endpoint(port, set).await,
                         Err(e) => Err(e),
                     };
                     match attempt {

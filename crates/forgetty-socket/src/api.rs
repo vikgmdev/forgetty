@@ -527,14 +527,14 @@ static METHODS: &[MethodSpec] = &[
         Call,
         true,
         "Get the server version, protocol, pid, uptime and counts.",
-        "Use it as a health check. `node_id` is the iroh id a paired device dials.",
+        "Use it as a health check. `node_id` is the iroh id a paired device dials. `port` and `addresses` are what the iroh endpoint listens on.",
         t::NoParams,
         t::ServerInfoResult,
         EMPTY,
         concat!(
             r#"{"version":"0.1.0-beta","proto_major":2,"proto_minor":0,"proto_version":"2.0","server_id":""#,
             ws!(),
-            r#"","pid":4100,"uptime_secs":3600,"panes":3,"clients":1,"node_id":"f3k2c7a9"}"#
+            r#"","pid":4100,"uptime_secs":3600,"panes":3,"clients":1,"node_id":"f3k2c7a9","port":47297,"addresses":["127.0.0.1:47297"]}"#
         ),
         Some(|r, c| h::handle_server_info(r, &c.sm, c.sync.as_deref(), c.session_id))
     ),
@@ -587,6 +587,21 @@ static METHODS: &[MethodSpec] = &[
         r#"{"ttl_secs":60}"#,
         r#"{"window_id":1,"ttl_secs":60,"payload":{"v":2,"node_id":"f3k2c7a9","machine":"devbox","relay":"https://relay.example.com","relays":["https://relay.example.com"],"secret":"MFRGGZDFMZTWQ2LK"}}"#,
         Some(|r, c| h::handle_pair_open(r, c.sync.as_deref()))
+    ),
+    spec!(
+        "pair_close",
+        Call,
+        false,
+        "Close the open pairing window now.",
+        "The QR code of the window stops working at once, and a later pair attempt with its \
+         secret is refused. With `window_id` only that window is closed, so a late cancel never \
+         ends a newer one. `closed` is `false` when no matching window was open (expired, \
+         paired or already closed). Closing is always a success.",
+        t::PairCloseParams,
+        t::PairCloseResult,
+        r#"{"window_id":1}"#,
+        r#"{"ok":true,"closed":true}"#,
+        Some(|r, c| h::handle_pair_close(r, c.sync.as_deref()))
     ),
     spec!(
         "pair_status",

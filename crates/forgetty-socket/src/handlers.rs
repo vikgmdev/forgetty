@@ -879,6 +879,7 @@ pub(crate) fn handle_server_info(
     session_id: Option<Uuid>,
 ) -> Response {
     let uptime = STARTED.get_or_init(std::time::Instant::now).elapsed().as_secs();
+    let sockets = se.map(SyncEndpoint::bound_sockets).unwrap_or_default();
     Response::success(
         request.id.clone(),
         serde_json::json!({
@@ -892,6 +893,8 @@ pub(crate) fn handle_server_info(
             "panes": sm.list_panes().len(),
             "clients": sm.clients().count(),
             "node_id": se.map(|e| e.node_id().to_string()),
+            "port": sockets.first().map(|s| s.port()),
+            "addresses": sockets.iter().map(ToString::to_string).collect::<Vec<_>>(),
         }),
     )
 }
@@ -1437,6 +1440,25 @@ pub(crate) fn handle_pair_open(request: &Request, se: Option<&SyncEndpoint>) -> 
             "payload": payload,
         }),
     )
+}
+
+pub(crate) fn handle_pair_close(request: &Request, se: Option<&SyncEndpoint>) -> Response {
+    let Some(se) = se else { return sync_unavailable(request) };
+    let id = match request.params.get("window_id") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => match v.as_u64() {
+            Some(id) => Some(id),
+            None => {
+                return Response::error(
+                    request.id.clone(),
+                    protocol::INVALID_PARAMS,
+                    "window_id must be a non-negative integer".to_string(),
+                )
+            }
+        },
+    };
+    let closed = se.close_pairing(id);
+    Response::success(request.id.clone(), serde_json::json!({ "ok": true, "closed": closed }))
 }
 
 pub(crate) fn handle_pair_status(request: &Request, se: Option<&SyncEndpoint>) -> Response {
@@ -2339,6 +2361,8 @@ mod tests {
         assert_eq!(v["panes"], 0);
         assert_eq!(v["clients"], 1);
         assert!(v["node_id"].is_null());
+        assert!(v["port"].is_null());
+        assert_eq!(v["addresses"], serde_json::json!([]));
     }
 
     #[test]
@@ -2355,7 +2379,9 @@ mod tests {
     #[test]
     fn pair_methods_need_the_sync_endpoint() {
         let sm = make_sm();
-        let resp = dispatch(&req("pair_open", serde_json::Value::Null), sm, None, None);
+        let resp = dispatch(&req("pair_open", serde_json::Value::Null), sm.clone(), None, None);
+        assert!(resp.error.is_some());
+        let resp = dispatch(&req("pair_close", serde_json::Value::Null), make_sm(), None, None);
         assert!(resp.error.is_some());
     }
 

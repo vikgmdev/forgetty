@@ -175,12 +175,14 @@ pub struct Config {
     /// `"none"`: the iroh endpoint uses no relay and publishes nothing to n0
     /// (a server reached over WireGuard only). Anything else, or unset: relays
     /// as `relay_urls` says. `--no-relay` on the command line has the same
-    /// effect.
+    /// effect. On Windows the server uses no relay unless this file sets
+    /// `relay_urls` or `relay = "default"` (iroh's default relays).
     pub relay: Option<String>,
 
     /// IP addresses the iroh endpoint binds, for example `["10.230.1.14"]`, on
-    /// the fixed port. Empty (default) binds every address. `--bind` on the
-    /// command line replaces this list.
+    /// the fixed port. Empty (default) binds every address on Linux and
+    /// macOS, and only 127.0.0.1 on Windows. `--bind` on the command line
+    /// replaces this list.
     pub bind_addrs: Vec<String>,
 
     /// Load the shell integration scripts into zsh, bash and fish when the
