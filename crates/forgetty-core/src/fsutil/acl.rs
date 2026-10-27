@@ -86,7 +86,7 @@ pub fn is_user_only(path: &Path) -> io::Result<bool> {
 #[cfg(windows)]
 pub use win::{
     create_private_file, create_private_new, current_integrity_rid, current_user_sid, describe,
-    is_elevated, is_user_only, only_sid_sddl, pipe_client_identity, pipe_sddl, process_user_sid,
+    is_elevated, is_user_only, only_sid_sddl, pipe_client_identity, pipe_sddl, process_identity, process_user_sid,
     replace_file, restrict_dir_to_user, restrict_to_user, same_account, sync_dir, INTEGRITY_HIGH,
     INTEGRITY_MEDIUM,
 };
@@ -206,23 +206,6 @@ mod win {
         }
     }
 
-    /// The user SID of the process `pid`. Fails (access denied) for a process of another user and
-    /// for an elevated process when this one is not elevated.
-    pub fn process_user_sid(pid: u32) -> io::Result<String> {
-        use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
-        // SAFETY: handles are closed on every path.
-        unsafe {
-            let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).map_err(err)?;
-            let mut token = HANDLE::default();
-            let opened = OpenProcessToken(process, TOKEN_QUERY, &mut token).map_err(err);
-            let _ = CloseHandle(process);
-            opened?;
-            let result = token_user_sid(token);
-            let _ = CloseHandle(token);
-            result
-        }
-    }
-
     /// Mandatory integrity levels (the RID of the label SID).
     pub const INTEGRITY_MEDIUM: u32 = 0x2000;
     pub const INTEGRITY_HIGH: u32 = 0x3000;
@@ -269,6 +252,28 @@ mod win {
     /// the stricter rules are the safe answer.
     pub fn is_elevated() -> bool {
         current_integrity_rid().map(|r| r >= INTEGRITY_HIGH).unwrap_or(true)
+    }
+
+    /// The user SID and the integrity level of the process `pid`. Fails (access denied) for a
+    /// process of another user and for an elevated process when this one is not elevated.
+    pub fn process_identity(pid: u32) -> io::Result<(String, u32)> {
+        use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+        // SAFETY: handles are closed on every path.
+        unsafe {
+            let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).map_err(err)?;
+            let mut token = HANDLE::default();
+            let opened = OpenProcessToken(process, TOKEN_QUERY, &mut token).map_err(err);
+            let _ = CloseHandle(process);
+            opened?;
+            let result = token_user_sid(token).and_then(|sid| Ok((sid, token_integrity_rid(token)?)));
+            let _ = CloseHandle(token);
+            result
+        }
+    }
+
+    /// The user SID of the process `pid` (see [`process_identity`]).
+    pub fn process_user_sid(pid: u32) -> io::Result<String> {
+        process_identity(pid).map(|(sid, _)| sid)
     }
 
     /// The user SID and the integrity level of the client on the other end of a named pipe, read

@@ -3,9 +3,11 @@
 //! `set_write_timeout`, `Read`, `Write`), so the CLI code is the same on both systems.
 //!
 //! Before the first byte is sent the client checks who runs the server on the other end of the
-//! pipe: the user SID of the server process must be the current user. A process of another user
-//! that got the pipe name first cannot receive what the CLI sends (the counterpart of the
-//! server's check of its clients). The connection also asks Windows for the identification
+//! pipe: the user SID of the server process must be the current user, and its integrity level
+//! must not be lower than the client's own. A process of another user that got the pipe name
+//! first cannot receive what the CLI sends, and neither can a normal process that made the
+//! `-elevated` pipe before the elevated server did (the counterpart of the server's check of its
+//! clients). The connection also asks Windows for the identification
 //! impersonation level only, so the server can read the client's identity but not act as it.
 
 use std::io::{self, Read, Write};
@@ -89,6 +91,12 @@ impl PipeStream {
     ///
     /// `NotFound` when no server has created the pipe.
     pub fn connect(path: &Path) -> io::Result<Self> {
+        Self::connect_as_level(path, None)
+    }
+
+    /// [`connect`](Self::connect), judging the server against `own_level` (an integrity RID)
+    /// instead of the level of this process. For tests: the level of a client above the server.
+    pub fn connect_as_level(path: &Path, own_level: Option<u32>) -> io::Result<Self> {
         let name = wide(path);
         let deadline = Instant::now() + BUSY_WAIT;
         let handle = loop {
@@ -129,24 +137,29 @@ impl PipeStream {
                 write_ms: AtomicU64::new(NONE),
             }),
         };
-        stream.check_server()?;
+        stream.check_server(own_level)?;
         Ok(stream)
     }
 
-    /// The server on the other end must be a process of this user.
-    fn check_server(&self) -> io::Result<()> {
+    /// The server on the other end must be a process of this user, at an integrity level at
+    /// least as high as ours.
+    fn check_server(&self, own_level: Option<u32>) -> io::Result<()> {
         let mut pid = 0u32;
         // SAFETY: valid pipe handle and out pointer.
         unsafe { GetNamedPipeServerProcessId(self.inner.handle, &mut pid) }.map_err(os_err)?;
         let refuse = |why: String| io::Error::new(io::ErrorKind::PermissionDenied, why);
         let me = acl::current_user_sid()?;
-        let theirs = acl::process_user_sid(pid)
+        let my_level = match own_level {
+            Some(l) => l,
+            None => acl::current_integrity_rid()?,
+        };
+        let (theirs, their_level) = acl::process_identity(pid)
             .map_err(|e| refuse(format!("cannot tell who runs the server (pid {pid}): {e}")))?;
-        if acl::same_account(&me, &theirs) {
-            Ok(())
-        } else {
-            Err(refuse(format!("the pipe server (pid {pid}) runs as another user ({theirs})")))
+        if !acl::same_account(&me, &theirs) {
+            return Err(refuse(format!("the pipe server (pid {pid}) runs as another user ({theirs})")));
         }
+        levels_match(my_level, their_level)
+            .map_err(|why| refuse(format!("the pipe server (pid {pid}) {why}")))
     }
 
     pub fn try_clone(&self) -> io::Result<Self> {
@@ -255,5 +268,76 @@ impl Write for &PipeStream {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+/// A server may not run at a lower integrity level than its client: a normal process could
+/// otherwise stand in for an elevated server (it can read the pipe secret and make the pipe).
+fn levels_match(client: u32, server: u32) -> Result<(), String> {
+    if server >= client {
+        Ok(())
+    } else {
+        Err(format!(
+            "runs at a lower integrity level ({server:#x}) than this client ({client:#x}); \
+             start the server from this shell, or use a normal shell"
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use forgetty_socket::SocketServer;
+    use std::sync::Arc;
+
+    #[test]
+    fn a_server_below_the_client_is_refused_and_an_equal_or_higher_one_is_not() {
+        assert!(levels_match(0x2000, 0x2000).is_ok());
+        assert!(levels_match(0x2000, 0x3000).is_ok());
+        assert!(levels_match(0x3000, 0x3000).is_ok());
+        let err = levels_match(0x3000, 0x2000).unwrap_err();
+        assert!(err.contains("lower integrity"), "{err}");
+    }
+
+    /// A real pipe server in this process, and a blocking client against it.
+    #[test]
+    fn connect_checks_the_server_level_in_both_directions() {
+        let name = std::path::PathBuf::from(format!(r"\\.\pipe\forgetty-test-{}", uuid::Uuid::new_v4()));
+        let n = name.clone();
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let server = SocketServer::new_with_path(n).unwrap();
+        let sm = Arc::new(forgetty_session::SessionManager::new());
+        rt.spawn(async move {
+            let _ = server.run_with_streaming(sm, None).await;
+        });
+        let mine = acl::current_integrity_rid().unwrap();
+        // Wait until the pipe exists.
+        let mut ok = None;
+        for _ in 0..200 {
+            match PipeStream::connect(&name) {
+                Ok(s) => {
+                    ok = Some(s);
+                    break;
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    std::thread::sleep(Duration::from_millis(25))
+                }
+                Err(e) => panic!("connect: {e}"),
+            }
+        }
+        // Same level: accepted, and the stream works.
+        let mut s = ok.expect("the server came up");
+        s.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"list_tabs\",\"id\":1}\n").unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut buf = [0u8; 4096];
+        let n = s.read(&mut buf).unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).contains("result"));
+        // A client one level above the server: refused before any byte is sent.
+        let err = PipeStream::connect_as_level(&name, Some(mine + 0x1000)).err().expect("refused");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+        assert!(err.to_string().contains("lower integrity"), "{err}");
+        // A client below the server: accepted (the server only needs to be as high).
+        assert!(PipeStream::connect_as_level(&name, Some(0x1000)).is_ok());
+        rt.shutdown_background();
     }
 }
