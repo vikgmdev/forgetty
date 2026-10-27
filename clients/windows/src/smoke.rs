@@ -29,6 +29,7 @@ mod wp1;
 mod wp2;
 mod wp3;
 mod keymap;
+mod settings;
 mod wp3d;
 
 pub const KEYSTROKES: usize = 100;
@@ -175,6 +176,8 @@ enum Phase {
     Wp3d,
     // Keymap presets.
     Keymap,
+    // The Settings window (WP4).
+    Settings,
     // W3: remote machines.
     RSetup,
     RPair,
@@ -232,6 +235,7 @@ impl Phase {
             Phase::Wp3 => "wp3-config-reload-zoom-profiles",
             Phase::Wp3d => "wp3d-spawn-latency",
             Phase::Keymap => "keymap-presets",
+            Phase::Settings => "settings-window",
             Phase::RSetup => "w3-start-server-and-pair",
             Phase::RPair => "w3-wait-for-panes",
             Phase::REcho => "w3-remote-echo",
@@ -307,6 +311,7 @@ pub struct ShellSmoke {
     wp3: wp3::Wp3,
     wp3d: wp3d::Wp3d,
     keymap: keymap::KeymapPhase,
+    settings: settings::SettingsPhase,
     real: real::Real,
 }
 
@@ -404,6 +409,7 @@ impl ShellSmoke {
             wp3: wp3::Wp3::default(),
             wp3d: wp3d::Wp3d::default(),
             keymap: keymap::KeymapPhase::default(),
+            settings: settings::SettingsPhase::default(),
             real: real::Real::new(real_distro),
         }
     }
@@ -1409,6 +1415,7 @@ impl ShellSmoke {
             Phase::Wp3 => self.wp3(shell, window, cx),
             Phase::Wp3d => self.wp3d(shell, window, cx),
             Phase::Keymap => self.keymap(shell, window, cx),
+            Phase::Settings => self.settings(shell, window, cx),
             Phase::RSetup | Phase::RPair | Phase::REcho | Phase::RKeys | Phase::RKill | Phase::RRestart | Phase::RToast | Phase::RServer | Phase::W5View => {
                 self.w3_step(shell, window, cx, now_t)
             }

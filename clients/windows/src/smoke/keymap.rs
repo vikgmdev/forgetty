@@ -184,7 +184,7 @@ impl ShellSmoke {
                 until!(shell.layout.workspaces.len() == self.keymap.ws0);
                 check("keymap_workspace_removed", true);
                 self.keymap_put("");
-                self.goto(super::Phase::RSetup);
+                self.goto(super::Phase::Settings);
             }
             _ => {}
         }
