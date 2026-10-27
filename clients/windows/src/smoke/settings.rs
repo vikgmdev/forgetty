@@ -428,7 +428,7 @@ impl ShellSmoke {
             33 => {
                 // gtk reaches Settings by Ctrl+. ; the windows set has no Settings chord, so with
                 // the palette unbound the switch would lock the user out.
-                self.st_put("keymap = \"gtk\"\ncommand_palette = \"none\"\n");
+                self.st_put("keymap = \"gtk\"\n\n[keybindings]\ncommand_palette = \"none\"\n");
                 self.st_next();
             }
             34 => {
