@@ -180,6 +180,11 @@ is how a Windows server opts back in. See `server.md`.
 Addresses the server's iroh endpoint binds, on the fixed port.
 `forgetty server run --bind IP` replaces this list. See `server.md`.
 
+On Windows the server always binds `127.0.0.1` as well, so the local app keeps its
+path: the list adds to it and never replaces it (a list that has `127.0.0.1` is used
+as written, and so is one with `0.0.0.0` or `::`, which cover loopback already).
+`forgetty server status --json` shows every bound address in `addresses`.
+
 ```toml
 bind_addrs = ["10.230.1.14"]
 ```

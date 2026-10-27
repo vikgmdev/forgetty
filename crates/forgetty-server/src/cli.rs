@@ -920,14 +920,42 @@ pub fn revoke(target: &str) -> Result<()> {
 // pairing
 // ---------------------------------------------------------------------------
 
-/// `forgetty pair --cancel`: end the open pairing window at once.
-pub fn pair_cancel() -> Result<()> {
+/// Where `forgetty pair` notes the window it opened, so `pair --cancel` without an id can close
+/// that one and no other. Contents: `<server pid> <window id>`.
+fn pair_note_path() -> std::path::PathBuf {
+    forgetty_core::platform::data_dir().join("pair-window")
+}
+
+/// `forgetty pair --cancel [--window-id N]`: end a pairing window at once. Without an id only
+/// the window the last `forgetty pair` of the running server opened, never one that another
+/// program (the app's own pairing) opened.
+pub fn pair_cancel(window_id: Option<u64>) -> Result<()> {
     let (mut client, _) = Client::connect()?;
-    let closed = client.call("pair_close", json!({}))?;
+    let id = match window_id {
+        Some(id) => id,
+        None => {
+            let note = pair_note_path();
+            let noted = std::fs::read_to_string(&note).ok().and_then(|t| {
+                let mut it = t.split_whitespace();
+                Some((it.next()?.parse::<u64>().ok()?, it.next()?.parse::<u64>().ok()?))
+            });
+            let _ = std::fs::remove_file(&note);
+            let info = client.call("server_info", json!({}))?;
+            let pid = info.get("pid").and_then(Value::as_u64);
+            match noted {
+                Some((noted_pid, id)) if Some(noted_pid) == pid => id,
+                _ => {
+                    println!("no pairing window of this command is open (use --window-id N)");
+                    return Ok(());
+                }
+            }
+        }
+    };
+    let closed = client.call("pair_close", json!({ "window_id": id }))?;
     if closed.get("closed").and_then(Value::as_bool).unwrap_or(false) {
-        println!("pairing window closed");
+        println!("pairing window {id} closed");
     } else {
-        println!("no pairing window was open");
+        println!("pairing window {id} was not open");
     }
     Ok(())
 }
@@ -945,7 +973,17 @@ pub fn pair(ttl: u64) -> Result<()> {
     let ascii = forgetty_sync::qr::qr_to_ascii(&payload)
         .map_err(|e| CliError::Failed(format!("QR render failed: {e}")))?;
 
+    // Note the window, so `pair --cancel` can close this one and no other.
+    let server_pid = client
+        .call("server_info", json!({}))
+        .ok()
+        .and_then(|i| i.get("pid").and_then(Value::as_u64));
+    if let Some(pid) = server_pid {
+        let _ = std::fs::write(pair_note_path(), format!("{pid} {window_id}"));
+    }
+
     println!("{ascii}");
+    println!("window_id: {window_id}");
     println!("payload: {payload_value}");
     println!(
         "Scan the QR code in the Forgetty app. The window is open for {} s and accepts one device.",

@@ -117,6 +117,20 @@ impl std::fmt::Display for ConfigInvalid {
 
 impl std::error::Error for ConfigInvalid {}
 
+/// The port from `FORGETTY_PORT`: `None` when the variable is not set, an error when it is set
+/// to something that is not a port (0 to 65535). A typo must not start the server on the
+/// default port, where it would take the place of another one.
+pub fn port_from_env(value: Option<&str>) -> Result<Option<u16>, ConfigInvalid> {
+    match value {
+        None => Ok(None),
+        Some(v) => v.trim().parse::<u16>().map(Some).map_err(|_| {
+            ConfigInvalid(format!(
+                "FORGETTY_PORT={v:?} is not a port number (0 to 65535); unset it to use 47297"
+            ))
+        }),
+    }
+}
+
 /// Do all the addresses stay on this machine? Then no remote device can pair.
 /// Allowed (the tests bind `127.0.0.1`), but worth a warning at startup.
 pub fn loopback_only(addrs: &[std::net::IpAddr]) -> bool {
@@ -554,6 +568,11 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
     for w in &remote.warnings {
         warn!("{w}");
     }
+    // `--port`, else `FORGETTY_PORT`. A value that is not a port is an error, never the default.
+    let chosen_port = match args.port {
+        Some(p) => Some(p),
+        None => port_from_env(std::env::var("FORGETTY_PORT").ok().as_deref())?,
+    };
     let no_relay = remote.no_relay;
     let relay_urls: Vec<iroh::RelayUrl> =
         remote.relay_urls.into_iter().map(iroh::RelayUrl::from).collect();
@@ -1043,8 +1062,6 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
     // specific behaviour out of the transport crate.
     let sm_for_alpn = Arc::clone(&session_manager);
     let rpc_v2 = RpcV2::new(Arc::clone(&session_manager), session_id);
-    let chosen_port =
-        args.port.or_else(|| std::env::var("FORGETTY_PORT").ok().and_then(|v| v.parse().ok()));
     let port_is_default = chosen_port.is_none();
     let port = chosen_port.unwrap_or(DEFAULT_PORT);
     info!("n0 discovery: {}", if n0_discovery { "on" } else { "off" });
@@ -1401,6 +1418,18 @@ fn restore_subtree(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn forgetty_port_is_a_port_or_an_error() {
+        use super::port_from_env;
+        assert_eq!(port_from_env(None).unwrap(), None);
+        assert_eq!(port_from_env(Some("0")).unwrap(), Some(0));
+        assert_eq!(port_from_env(Some(" 47300 ")).unwrap(), Some(47300));
+        for bad in ["", "abc", "70000", "-1", "47297x"] {
+            let e = port_from_env(Some(bad)).unwrap_err().to_string();
+            assert!(e.contains("FORGETTY_PORT") && e.contains("not a port"), "{bad}: {e}");
+        }
+    }
+
     #[test]
     fn a_bind_error_is_attributed_to_the_address_it_names() {
         let ips: Vec<std::net::IpAddr> =

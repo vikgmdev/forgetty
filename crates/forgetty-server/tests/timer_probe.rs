@@ -21,6 +21,37 @@ extern "system" {
 }
 
 #[cfg(windows)]
+#[link(name = "ntdll")]
+extern "system" {
+    fn NtQueryTimerResolution(min: *mut u32, max: *mut u32, current: *mut u32) -> i32;
+}
+
+/// The system timer period now, in ms. Any process that asked for a finer timer changes it for
+/// the machine, so this says how clean a "default timer" measurement is.
+fn system_tick_ms() -> f64 {
+    #[cfg(windows)]
+    {
+        let (mut min, mut max, mut cur) = (0u32, 0u32, 0u32);
+        // SAFETY: three valid out pointers.
+        unsafe { NtQueryTimerResolution(&mut min, &mut max, &mut cur) };
+        f64::from(cur) / 10_000.0
+    }
+    #[cfg(not(windows))]
+    {
+        0.0
+    }
+}
+
+/// Ask for a 1 ms timer in this (the client) process, as the app does.
+fn client_timer_1ms() {
+    #[cfg(windows)]
+    // SAFETY: plain winmm call.
+    unsafe {
+        timeBeginPeriod(1);
+    }
+}
+
+#[cfg(windows)]
 const PROGRAM: &str = "cmd.exe";
 #[cfg(not(windows))]
 const PROGRAM: &str = "cat";
@@ -62,7 +93,7 @@ impl Stats {
     }
     fn show(&self) {
         println!(
-            "PROBE {:<34} n={} p50={:.2} ms p95={:.2} ms max={:.2} ms",
+            "PROBE {:<52} n={} p50={:.2} ms p95={:.2} ms max={:.2} ms",
             self.label,
             self.sorted.len(),
             self.at(0.5),
@@ -73,7 +104,7 @@ impl Stats {
 }
 
 /// The same echo without a server: a pty of this process, a key written, the echo read.
-fn in_process() -> Stats {
+fn in_process(label: &str) -> Stats {
     use std::io::{Read, Write};
     let cmd = vec![PROGRAM.to_string()];
     let mut pty =
@@ -114,12 +145,12 @@ fn in_process() -> Stats {
     }
     drop(writer);
     drop(pty);
-    Stats::new("in process (pty, no server)", out)
+    Stats::new(label, out)
 }
 
 /// A real server started with `timer` as `FORGETTY_TIMER_RES`; a key in over protocol v2, the
 /// echo out.
-async fn through_server(timer: &str) -> (Stats, Stats) {
+async fn through_server(timer: &str, client: &str) -> (Stats, Stats) {
     let state = tempfile::tempdir().unwrap();
     // Windows servers are loopback only with no relay by default. Elsewhere the config says so.
     #[cfg(not(windows))]
@@ -208,28 +239,38 @@ async fn through_server(timer: &str) -> (Stats, Stats) {
     let stop = forgetty(state.path(), timer, &["server", "stop"]);
     assert!(stop.status.success(), "{}", text(&stop));
     (
-        Stats::new(&format!("server, timer {timer}: key to echo"), echo),
-        Stats::new(&format!("server, timer {timer}: get_layout"), rtt),
+        Stats::new(&format!("{client}, server {timer}: key to echo"), echo),
+        Stats::new(&format!("{client}, server {timer}: get_layout"), rtt),
     )
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn key_to_echo_through_the_server_against_in_process() {
-    // The app asks for a 1 ms timer in its own process. So does the probe, which stands in for it.
-    #[cfg(windows)]
-    unsafe {
-        timeBeginPeriod(1);
-    }
-    let base = in_process();
-    base.show();
+    // First with this process at the default timer (it stands for the app before it asks for 1 ms),
+    // then at 1 ms (the app after `timeBeginPeriod(1)`), each against a server that does not ask
+    // ("off") and one that does ("full", the shipped setting).
+    println!("PROBE system timer period at the start: {:.2} ms", system_tick_ms());
     let mut all = Vec::new();
-    for timer in ["off", "period", "full"] {
-        let (echo, rtt) = through_server(timer).await;
+    let base_default = in_process("in process, client timer default");
+    base_default.show();
+    for timer in ["off", "full"] {
+        let (echo, rtt) = through_server(timer, "client timer default").await;
         echo.show();
         rtt.show();
-        all.push((timer, echo.p50()));
+        println!("PROBE system timer period now: {:.2} ms", system_tick_ms());
+        all.push((format!("client default, server {timer}"), echo.p50(), base_default.p50()));
     }
-    for (timer, p50) in &all {
-        println!("PROBE delta to in process, timer {timer}: {:+.2} ms (p50)", p50 - base.p50());
+    client_timer_1ms();
+    println!("PROBE client now asks for 1 ms; system timer period: {:.2} ms", system_tick_ms());
+    let base_fine = in_process("in process, client timer 1 ms");
+    base_fine.show();
+    for timer in ["off", "period", "full"] {
+        let (echo, rtt) = through_server(timer, "client timer 1 ms").await;
+        echo.show();
+        rtt.show();
+        all.push((format!("client 1 ms, server {timer}"), echo.p50(), base_fine.p50()));
+    }
+    for (what, p50, base) in &all {
+        println!("PROBE delta to in process, {what}: {:+.2} ms (p50)", p50 - base);
     }
 }

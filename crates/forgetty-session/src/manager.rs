@@ -2163,7 +2163,9 @@ impl SessionManager {
         // P7.1: the tty mode is read a little after the output, never per
         // chunk and never per byte (see `shell::TTY_CHECK_DELAYS`): a chunk
         // starts a chain of checks only when no first check is waiting.
-        let tty_chain = if scanning { pane.osc.shell.output() } else { None };
+        // Windows has no tty mode to read (`tty_flags` is `None`): no chain, no timers.
+        let tty_chain =
+            if scanning && cfg!(not(windows)) { pane.osc.shell.output() } else { None };
 
         // V2-007 AC-13: ring write BEFORE broadcast, both under the same
         // `inner` mutex guard. This is the ordering invariant that makes

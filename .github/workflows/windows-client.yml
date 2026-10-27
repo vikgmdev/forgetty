@@ -511,6 +511,55 @@ jobs:
           if ((Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -ErrorAction SilentlyContinue)."Forgetty server") { throw "Run value left behind" }
           Write-Host "install, upgrade and uninstall are clean; the running server was stopped each time"
 
+      # The StartServer custom action (after InstallFinalize) starts the user's server when the
+      # installer itself is not elevated. The runner is elevated, so the steps above never see
+      # it: this one runs the installer at medium integrity, as a user's own installer does.
+      # After msiexec ends, a server must be running, answer on its pipe (asked at medium too),
+      # and not be a child that ends with the installer.
+      - name: Install at medium integrity starts the server
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          . clients/windows/ci/medium-server.ps1
+          $msi = (Get-ChildItem out-new/*.msi | Select-Object -First 1).FullName
+          $dir = Join-Path $env:LOCALAPPDATA "Programs\Forgetty"
+          $exe = Join-Path $dir "forgetty.exe"
+          if (Test-Path $dir) { throw "the install folder is still there before the test" }
+          if (Get-ServerPid $exe) { throw "a server is running before the test" }
+          $code = [MediumLaunch]::Run("msiexec.exe /i `"$msi`" /qn /l*v `"$PWD\medium-install.log`"", 300000)
+          Write-Host "medium install: exit $code"
+          if ($code -ne 0) { Get-Content medium-install.log -Tail 80; throw "install at medium integrity failed: $code" }
+          # msiexec has ended. The custom action ran forgetty-win.exe --start-server, which starts
+          # the server detached and returns.
+          $srv = $null
+          $deadline = (Get-Date).AddSeconds(60)
+          while ((Get-Date) -lt $deadline -and -not $srv) { Start-Sleep -Milliseconds 500; $srv = Get-ServerPid $exe }
+          if (-not $srv) { Get-Content medium-install.log -Tail 80; throw "no server after the install" }
+          # Not a child that dies with the installer: its parent is not an msiexec, and it is
+          # still there some seconds after msiexec ended.
+          $parent = (Get-CimInstance Win32_Process -Filter "ProcessId = $srv").ParentProcessId
+          $pp = Get-Process -Id $parent -ErrorAction SilentlyContinue
+          Write-Host "server pid $srv, parent pid $parent ($($pp.ProcessName))"
+          if ($pp -and $pp.ProcessName -eq 'msiexec') { throw "the server is a child of msiexec" }
+          Start-Sleep -Seconds 8
+          if (-not (Get-Process -Id $srv -ErrorAction SilentlyContinue)) { throw "the server (pid $srv) ended with the installer" }
+          # Reachable through its pipe, asked as the user would (medium).
+          $out = Join-Path $env:RUNNER_TEMP "medium-status.json"
+          Remove-Item $out -ErrorAction SilentlyContinue
+          $st = [MediumLaunch]::Run("cmd.exe /d /s /c `"`"$exe`" server status --json > `"$out`" 2>&1`"", 60000)
+          $json = Get-Content $out -Raw
+          Write-Host "medium 'server status --json': exit $st $json"
+          if ($st -ne 0) { throw "the server does not answer on its pipe (exit $st)" }
+          $info = $json | ConvertFrom-Json
+          if ($info.pid -ne $srv) { throw "the server that answers (pid $($info.pid)) is not the one started (pid $srv)" }
+          if (-not $info.port -or -not $info.addresses) { throw "status has no port and addresses: $json" }
+          # Clean up as the user: stop the server, uninstall.
+          [void][MediumLaunch]::Run("`"$exe`" server stop", 60000)
+          if (-not (Wait-Gone $srv)) { throw "the server (pid $srv) did not stop" }
+          $code = [MediumLaunch]::Run("msiexec.exe /x `"$msi`" /qn /l*v `"$PWD\medium-uninstall.log`"", 300000)
+          if ($code -ne 0) { Get-Content medium-uninstall.log -Tail 60; throw "uninstall at medium integrity failed: $code" }
+          Write-Host "the install started a server (pid $srv) that outlived msiexec and answered on its pipe"
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -523,6 +572,8 @@ jobs:
             install.log
             upgrade.log
             uninstall.log
+            medium-install.log
+            medium-uninstall.log
 
   # Can the runner install a Japanese or Chinese IME? Run by hand (workflow_dispatch). Result: it
   # already has Microsoft IME (ja) and Pinyin (zh) and the language packs, so the smoke drives them

@@ -309,11 +309,14 @@ carries `relays_disabled` and the direct address `127.0.0.1:<port>`. The port is
 server picks a free port and logs a warning. `forgetty server status --json`
 reports the real one as `port` and `addresses`. Opt-ins in `config.toml`:
 `bind_addrs = ["10.230.1.14"]` for other addresses, `relay = "default"` for
-iroh's default relays, `relay_urls` for your own. Linux and macOS defaults are
+iroh's default relays, `relay_urls` for your own. `bind_addrs` (or `--bind`) adds to
+`127.0.0.1`: the server always keeps it on Windows, so the local app keeps its path
+(`status --json` shows all addresses in `addresses`). Linux and macOS defaults are
 unchanged.
 
-`forgetty pair --cancel` (the `pair_close` call) closes the open pairing window
-at once, so its QR code stops working.
+`forgetty pair` prints `window_id: N`. `forgetty pair --cancel --window-id N` (the
+`pair_close` call) closes that window at once, so its QR code stops working. Without
+`--window-id` it closes only the window the last `forgetty pair` of this server opened.
 
 ## WireGuard-only server
 

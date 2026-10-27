@@ -185,9 +185,14 @@ enum Command {
         /// Window length in seconds (testing only).
         #[arg(long, default_value_t = 60, hide = true)]
         ttl: u64,
-        /// Close the open pairing window now, so its QR code stops working.
+        /// Close a pairing window now, so its QR code stops working. With `--window-id` that
+        /// window. Without it, the window the last `forgetty pair` of this server opened
+        /// (never a window another program opened, such as the app's own).
         #[arg(long)]
         cancel: bool,
+        /// The window to close with `--cancel` (printed as `window_id:` by `forgetty pair`).
+        #[arg(long, requires = "cancel")]
+        window_id: Option<u64>,
     },
     /// List paired devices.
     Devices {
@@ -399,7 +404,7 @@ fn main() {
             }
             SkillCommand::Remove { agent, scope } => skill::remove(agent, scope),
         }),
-        Command::Pair { cancel: true, .. } => cli::finish(cli::pair_cancel()),
+        Command::Pair { cancel: true, window_id, .. } => cli::finish(cli::pair_cancel(window_id)),
         Command::Pair { ttl, .. } => cli::finish(cli::pair(ttl)),
         Command::Devices { json } => cli::finish(cli::devices(json)),
         Command::Revoke { id } => cli::finish(cli::revoke(&id)),

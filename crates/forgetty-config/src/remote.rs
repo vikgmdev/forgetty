@@ -170,7 +170,8 @@ pub const LOCAL_DEFAULT_BIND: IpAddr = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
 /// `local_defaults` (Windows): a server nobody configured is reachable from this machine only.
 /// With no `--no-relay`, `relay`, `--relay-url` or `relay_urls` it uses no relay and publishes
 /// nothing to n0, and with no `--bind` or `bind_addrs` it binds `127.0.0.1` only. A user who
-/// wants other devices to reach it sets `bind_addrs` (an explicit opt-in), and relays come back
+/// wants other devices to reach it sets `bind_addrs` (an explicit opt-in, which adds to
+/// `127.0.0.1` and never replaces it), and relays come back
 /// with `relay_urls` or `relay = "default"`. Without `local_defaults` (Linux) the defaults are
 /// iroh's relays and every address.
 pub fn validate_remote_settings_with(
@@ -223,6 +224,17 @@ pub fn validate_remote_settings_with(
         }
         parse_bind_addrs(&overrides.bind)?
     };
+    // The local app reaches a local server on 127.0.0.1, so an opt-in list adds to it and never
+    // replaces it. A list with an unspecified address (0.0.0.0 or ::) already covers loopback,
+    // and a second socket on the same port would clash with it.
+    let mut bind_addrs = bind_addrs;
+    if local_defaults
+        && !bind_addrs.is_empty()
+        && !bind_addrs.contains(&LOCAL_DEFAULT_BIND)
+        && !bind_addrs.iter().any(IpAddr::is_unspecified)
+    {
+        bind_addrs.insert(0, LOCAL_DEFAULT_BIND);
+    }
     if no_relay {
         // Without relays the server is reached on its direct addresses only,
         // and a server that binds every address would put them all in the QR.
@@ -275,11 +287,30 @@ mod tests {
         // Other addresses are an opt-in; relays stay off unless asked for.
         let c = Config { bind_addrs: vec!["10.230.1.14".into()], ..Config::default() };
         let s = local(&c, &RemoteOverrides::default()).unwrap();
-        assert_eq!(s.bind_addrs, vec!["10.230.1.14".parse::<IpAddr>().unwrap()]);
+        // The local app keeps its loopback path: the list adds to 127.0.0.1.
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert_eq!(s.bind_addrs, vec![LOCAL_DEFAULT_BIND, ip("10.230.1.14")]);
         assert!(s.no_relay);
-        // The command line wins over the file.
+        // The command line wins over the file, and gets 127.0.0.1 too.
         let o = RemoteOverrides { bind: vec!["10.9.9.9".into()], ..Default::default() };
-        assert_eq!(local(&c, &o).unwrap().bind_addrs, vec!["10.9.9.9".parse::<IpAddr>().unwrap()]);
+        assert_eq!(local(&c, &o).unwrap().bind_addrs, vec![LOCAL_DEFAULT_BIND, ip("10.9.9.9")]);
+        // A list that has 127.0.0.1 is left as it is, and so is one with an unspecified address.
+        let c2 = Config {
+            bind_addrs: vec!["10.230.1.14".into(), "127.0.0.1".into()],
+            ..Config::default()
+        };
+        assert_eq!(
+            local(&c2, &RemoteOverrides::default()).unwrap().bind_addrs,
+            vec![ip("10.230.1.14"), LOCAL_DEFAULT_BIND]
+        );
+        let o = RemoteOverrides { bind: vec!["0.0.0.0".into()], ..Default::default() };
+        let relays = Config { relay: Some("default".into()), ..Config::default() };
+        assert_eq!(local(&relays, &o).unwrap().bind_addrs, vec![ip("0.0.0.0")]);
+        // Linux: the list is the list.
+        assert_eq!(
+            linux(&c, &RemoteOverrides::default()).unwrap().bind_addrs,
+            vec![ip("10.230.1.14")]
+        );
         // Own relays, or the default relays on request.
         let c =
             Config { relay_urls: vec!["https://relay.example.org".into()], ..Config::default() };

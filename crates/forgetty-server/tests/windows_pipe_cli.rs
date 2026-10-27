@@ -163,6 +163,11 @@ fn sockets_of(pid: u32, proto: &str) -> Vec<(String, String, String)> {
 /// Runs `forgetty pair`, reads the payload line, and stops it again. The window stays open on
 /// the server until the caller closes it.
 fn pair_payload(state: &Path) -> serde_json::Value {
+    pair_window(state).1
+}
+
+/// [`pair_payload`] with the `window_id` the command prints.
+fn pair_window(state: &Path) -> (u64, serde_json::Value) {
     let mut child = command(state, &["pair"], false)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -171,9 +176,13 @@ fn pair_payload(state: &Path) -> serde_json::Value {
     let stdout = child.stdout.take().unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
+        let mut id = None;
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Some(n) = line.strip_prefix("window_id: ") {
+                id = n.trim().parse::<u64>().ok();
+            }
             if let Some(json) = line.strip_prefix("payload: ") {
-                let _ = tx.send(json.to_string());
+                let _ = tx.send((id, json.to_string()));
                 return;
             }
         }
@@ -181,7 +190,8 @@ fn pair_payload(state: &Path) -> serde_json::Value {
     let got = rx.recv_timeout(Duration::from_secs(30));
     let _ = child.kill();
     let _ = child.wait();
-    serde_json::from_str(&got.expect("forgetty pair printed no payload")).expect("payload json")
+    let (id, json) = got.expect("forgetty pair printed no payload");
+    (id.expect("forgetty pair printed no window_id"), serde_json::from_str(&json).expect("payload json"))
 }
 
 /// A default start is local only: loopback, no relay, port 47297. The sockets of the server
@@ -222,12 +232,65 @@ fn a_default_start_listens_on_loopback_only_and_contacts_no_relay() {
     assert_eq!(payload["relay"], "", "{payload}");
     assert_eq!(payload["direct"], serde_json::json!(["127.0.0.1:47297"]), "{payload}");
 
-    // `pair --cancel` closes that window; a second one finds none.
-    let cancel = forgetty(&state, &["pair", "--cancel"]);
+    // `pair --cancel --window-id N` closes that window (the one the command printed).
+    let (wid, _) = pair_window(&state);
+    let cancel = forgetty(&state, &["pair", "--cancel", "--window-id", &wid.to_string()]);
     assert!(cancel.status.success(), "{}", text(&cancel));
     assert!(text(&cancel).contains("closed"), "{}", text(&cancel));
+    let again = forgetty(&state, &["pair", "--cancel", "--window-id", &wid.to_string()]);
+    assert!(text(&again).contains("was not open"), "{}", text(&again));
+
+    // Without an id it closes the window the last `forgetty pair` opened, once.
+    let _ = pair_window(&state);
+    let cancel = forgetty(&state, &["pair", "--cancel"]);
+    assert!(cancel.status.success() && text(&cancel).contains("closed"), "{}", text(&cancel));
     let again = forgetty(&state, &["pair", "--cancel"]);
-    assert!(text(&again).contains("no pairing window"), "{}", text(&again));
+    assert!(text(&again).contains("no pairing window of this command"), "{}", text(&again));
+}
+
+/// `bind_addrs` adds to 127.0.0.1 on Windows, it does not replace it: the local app keeps its
+/// path. 127.0.0.2 stands for "another address" (it is on this machine and needs no network).
+#[test]
+fn bind_addrs_add_to_loopback_and_never_replace_it() {
+    let mut srv = Server { state: tempfile::tempdir().unwrap(), pid: None };
+    let dir = srv.state.path().join("config").join("forgetty");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("config.toml"), "bind_addrs = [\"127.0.0.2\"]\n").unwrap();
+    let start = forgetty(srv.state.path(), &["server", "start"]);
+    assert!(start.status.success(), "{}", text(&start));
+    let info = status_json(srv.state.path());
+    let pid = info["pid"].as_u64().expect("pid") as u32;
+    srv.pid = Some(pid);
+    let (port, mut addresses) = bound(&info);
+    addresses.sort();
+    assert_eq!(
+        addresses,
+        vec![format!("127.0.0.1:{port}"), format!("127.0.0.2:{port}")],
+        "{info}"
+    );
+    let udp = sockets_of(pid, "UDP");
+    for want in &addresses {
+        assert!(udp.iter().any(|(l, _, _)| l == want), "no socket on {want}: {udp:?}");
+    }
+    // The payload lists both, so the local app finds its address.
+    let direct = pair_payload(srv.state.path())["direct"].clone();
+    let mut direct: Vec<String> = serde_json::from_value(direct).unwrap();
+    direct.sort();
+    assert_eq!(direct, addresses);
+}
+
+/// A `FORGETTY_PORT` that is not a port is an error, not the default port.
+#[test]
+fn a_bad_forgetty_port_is_an_error_and_starts_nothing() {
+    let state = tempfile::tempdir().unwrap();
+    let out = command(state.path(), &["server", "start"], false)
+        .env("FORGETTY_PORT", "not-a-port")
+        .output()
+        .expect("run forgetty");
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("FORGETTY_PORT"), "{}", text(&out));
+    let none = forgetty(state.path(), &["server", "status"]);
+    assert_eq!(none.status.code(), Some(4), "{}", text(&none));
 }
 
 /// A second user of the same PC (their own state folder and pipe) finds 47297 taken. Their
