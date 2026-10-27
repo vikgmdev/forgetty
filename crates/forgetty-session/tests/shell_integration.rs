@@ -507,3 +507,117 @@ async fn a_pane_writing_marks_in_a_loop_gets_merged_states() {
     assert_eq!(now.phase, Phase::Input);
     sm.close_pane(pane).unwrap();
 }
+
+/// With `extquote` off, the user's last PROMPT_COMMAND command must not get a
+/// literal `$'\n'` glued to it, and the last hook must still run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bash_with_extquote_off_keeps_the_users_prompt_command_intact() {
+    let _one = SERIAL.lock().await;
+    let rc = "shopt -u extquote\n__mine() { :; }\n\
+              PROMPT_COMMAND=\"${PROMPT_COMMAND:+$PROMPT_COMMAND;}__mine\"\n";
+    let Some((sm, _env, pane)) = integrated_pane("bash", Some((".bash_profile", rc))) else {
+        println!("SKIPPED: bash is not installed");
+        return;
+    };
+    let rx = sm.subscribe_meta();
+    let out = Output::start(&sm, pane);
+    let mut seen = Seen { rx, pane, states: Vec::new() };
+    seen.wait("the line editor tty mode", 0, |s| s.tty.is_some_and(|t| !t.canonical && !t.echo))
+        .await;
+    // Second prompt: the hooks are in PROMPT_COMMAND now.
+    sm.write_pty(pane, b"true\n").unwrap();
+    sm.write_pty(pane, b"echo PC-$((1+1))-[${PROMPT_COMMAND//$'\\n'/NL}]\n").unwrap();
+    out.wait_for("PC-2-[").await;
+    let text = out.text();
+    let line = text.lines().find(|l| l.contains("PC-2-[") && !l.contains("$((1+1))")).unwrap_or("");
+    assert!(
+        line.contains("__mine") && line.contains("NL__forgetty_last"),
+        "PROMPT_COMMAND is not what it should be: {line:?}\n{text}"
+    );
+    assert!(!text.contains("$'\\n'__forgetty_last"), "a literal $'\\n' in PROMPT_COMMAND:\n{text}");
+    assert!(!text.contains("command not found"), "output:\n{text}");
+    sm.close_pane(pane).unwrap();
+}
+
+/// A pane that writes OSC 7 in a loop: the `CwdChanged` events merge (the same
+/// burst and rate as `ShellState`) and the last directory is the true one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pane_writing_osc7_in_a_loop_gets_merged_cwd_events() {
+    let _one = SERIAL.lock().await;
+    let Some(shell) = find_shell("bash") else {
+        println!("SKIPPED: bash is not installed");
+        return;
+    };
+    let env = quiet_home();
+    set_env(env.home.path());
+    let sm = SessionManager::new();
+    let mut rx = sm.subscribe_meta();
+    let pane = spawn_pane(&sm, &shell, &env.work);
+    let out = Output::start(&sm, pane);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    sm.write_pty(
+        pane,
+        b"for ((i=0;i<5000;i++)); do printf '\\e]7;file://%s/tmp/c%d\\a' \"$HOSTNAME\" $i; done; echo FLOOD-$((1+1))\n",
+    )
+    .unwrap();
+    out.wait_for("FLOOD-2").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut cwds: Vec<String> = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        if let SessionEvent::CwdChanged { pane_id, cwd } = ev {
+            if pane_id == pane {
+                cwds.push(cwd);
+            }
+        }
+    }
+    println!("{} CwdChanged for 5000 directories", cwds.len());
+    assert!(cwds.len() < 300, "{} events for 5000 directories", cwds.len());
+    assert_eq!(cwds.last().map(String::as_str), Some("/tmp/c4999"), "{:?}", cwds.last());
+    sm.close_pane(pane).unwrap();
+}
+
+/// A startup file that turns PROMPT_COMMAND into an array with its own hooks:
+/// the user's elements stay, in order, between the first and the last hook, and
+/// they run on the first prompt and on the next ones.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bash_array_prompt_command_keeps_two_user_hooks() {
+    let _one = SERIAL.lock().await;
+    let rc = "__u1() { printf '[U1:%d]' $((1+1)); }\n__u2() { printf '[U2:%d]' $((1+2)); }\n\
+              PROMPT_COMMAND+=(__u1 __u2)\n";
+    let Some((sm, _env, pane)) = integrated_pane("bash", Some((".bash_profile", rc))) else {
+        println!("SKIPPED: bash is not installed");
+        return;
+    };
+    let rx = sm.subscribe_meta();
+    let out = Output::start(&sm, pane);
+    let mut seen = Seen { rx, pane, states: Vec::new() };
+    seen.wait("the line editor tty mode", 0, |s| s.tty.is_some_and(|t| !t.canonical && !t.echo))
+        .await;
+    out.wait_for("[U2:3]").await;
+    for round in 0..2 {
+        let from = seen.states.len();
+        sm.write_pty(pane, b"true\n").unwrap();
+        let c = seen
+            .wait(&format!("round {round}: command start"), from, |s| s.phase == Phase::Running)
+            .await;
+        seen.wait(&format!("round {round}: prompt again"), c, |s| s.phase == Phase::Input).await;
+    }
+    sm.write_pty(pane, b"declare -p PROMPT_COMMAND | tr -d '\\n'; echo ARRAY-$((1+1))\n").unwrap();
+    out.wait_for("ARRAY-2").await;
+    let text = out.text();
+    let declared = text
+        .lines()
+        .find(|l| l.contains("declare -a PROMPT_COMMAND") && !l.contains("declare -p"))
+        .unwrap_or("");
+    let at = |needle: &str| declared.find(needle).unwrap_or(usize::MAX);
+    assert!(
+        at("__forgetty_first") < at("__u1")
+            && at("__u1") < at("__u2")
+            && at("__u2") < at("__forgetty_last"),
+        "wrong PROMPT_COMMAND: {declared:?}\n{text}"
+    );
+    // The hooks ran on more than one prompt.
+    assert!(text.matches("[U1:2]").count() >= 3, "user hooks did not run each prompt:\n{text}");
+    assert!(!text.contains("command not found"), "output:\n{text}");
+    sm.close_pane(pane).unwrap();
+}

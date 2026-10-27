@@ -292,6 +292,128 @@ async fn a_bind_address_that_is_not_there_does_not_end_the_server() {
     server.shutdown().await;
 }
 
+/// Neither address is there at start: the server waits, then binds the ones
+/// that appeared (both here, in one go).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn with_no_bind_address_there_the_server_waits_and_binds_when_they_appear() {
+    if !real_only() {
+        return;
+    }
+    let server = TestServer::start_real_hiding(
+        &["--bind", "127.0.0.1", "--bind", "127.0.0.2", "--no-relay"],
+        &["127.0.0.1", "127.0.0.2"],
+        false,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(server.qa_state()["udp_port"].is_null(), "bound with no address there");
+    server.show_addresses();
+    wait_for("the endpoint to come up", Duration::from_secs(25), || {
+        !server.qa_state()["udp_port"].is_null()
+    })
+    .await;
+    let n = net(&server);
+    assert_eq!(n["bound_sockets"].as_array().unwrap().len(), 2, "{n}");
+    let (h, _paired) = paired_client(&server, Duration::from_secs(5)).await;
+    assert!(h.state().is_connected());
+    h.close().await;
+    server.shutdown().await;
+}
+
+/// `--bind A --bind B` with B not on the machine at start: the server serves on
+/// A at once. When B appears the endpoint is bound again with both: the same
+/// node id and port, a client pins B and connects, and the client that was on A
+/// reconnects. (127.0.0.2 is hidden from the server by a test hook, so no root
+/// is needed.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bind_address_that_comes_up_later_is_added_without_a_restart() {
+    if !real_only() {
+        return;
+    }
+    init_tracing();
+    let server = TestServer::start_real_hiding(
+        &["--bind", "127.0.0.1", "--bind", "127.0.0.2", "--no-relay"],
+        &["127.0.0.2"],
+        true,
+    )
+    .await;
+    let before: Vec<std::net::SocketAddr> = net(&server)["bound_sockets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.as_str().unwrap().parse().unwrap())
+        .collect();
+    assert_eq!(before.len(), 1, "only the existing address is bound: {before:?}");
+    assert_eq!(before[0].ip().to_string(), "127.0.0.1");
+    let log = std::fs::read_to_string(server.state_dir().unwrap().parent().unwrap().join("server.log"))
+        .unwrap_or_default();
+    assert!(log.contains("--bind 127.0.0.2 is not on this machine yet"), "no WARN:\n{log}");
+    let node_id = server.node_id();
+
+    // A client on the first address.
+    let (first, _paired) = paired_client(&server, Duration::from_secs(5)).await;
+    assert!(first.state().is_connected());
+    first.request("get_layout", forgetty_client::proto::Value::Nil).await.expect("get_layout");
+    let pane = server.add_pane();
+    assert!(!pane.is_nil());
+
+    // The second address appears.
+    server.show_addresses();
+    wait_for("the endpoint to bind both addresses", Duration::from_secs(30), || {
+        net(&server)["bound_sockets"].as_array().is_some_and(|a| a.len() == 2)
+    })
+    .await;
+    let mut after: Vec<std::net::SocketAddr> = net(&server)["bound_sockets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.as_str().unwrap().parse().unwrap())
+        .collect();
+    after.sort();
+    assert_eq!(after[0].port(), before[0].port(), "the port stays: {after:?}");
+    assert_eq!(after[1].port(), before[0].port(), "the port stays: {after:?}");
+    assert_eq!(after[1].ip().to_string(), "127.0.0.2");
+    assert_eq!(server.node_id(), node_id);
+    assert_eq!(payload(&server).node_id, node_id.to_string());
+
+    // The client that was connected comes back by itself, with its pane.
+    wait_for("the first client to be connected again", Duration::from_secs(30), || {
+        first.state().is_connected()
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    first
+        .request("get_layout", forgetty_client::proto::Value::Nil)
+        .await
+        .expect("get_layout after the rebind");
+
+    // A client that knows only the new address pairs and connects through it.
+    let mut one = payload(&server);
+    one.direct = vec![after[1].to_string()];
+    let key = SecretKey::generate(&mut rand::rng());
+    let paired = pair(&one, key.clone(), "late-bind", ClientKind::Cli)
+        .await
+        .unwrap_or_else(|e| panic!("pair through {} failed: {e}", after[1]));
+    assert_eq!(paired.pinned_addrs, vec![after[1]]);
+    let mut opts = paired.options();
+    opts.dial_timeout = Duration::from_secs(5);
+    let info = ClientInfo::new(Uuid::new_v4(), ClientKind::Cli, "late-bind", "0.0.0");
+    let addr = forgetty_client::server_addr(&one.node_id, &paired.relays).unwrap();
+    let second = tokio::time::timeout(
+        Duration::from_secs(10),
+        Client::connect_with(addr, key, info, opts),
+    )
+    .await
+    .expect("connect through the new address timed out")
+    .expect("connect through the new address failed");
+    assert!(second.state().is_connected());
+    second.request("get_layout", forgetty_client::proto::Value::Nil).await.expect("get_layout");
+    second.close().await;
+    first.close().await;
+    server.shutdown().await;
+}
+
+
 /// The address appears later (here: the port is held by another socket at
 /// first). The server retries in the background and comes up by itself, and a
 /// client can pair with it. A real tunnel address needs root to add, so the

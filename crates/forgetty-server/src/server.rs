@@ -143,6 +143,90 @@ const BIND_RETRY_MIN: Duration = Duration::from_secs(1);
 const BIND_RETRY_MAX: Duration = Duration::from_secs(10);
 const BIND_WARN_EVERY: Duration = Duration::from_secs(60);
 
+/// How often the server looks for a `--bind` address that was not there at
+/// start.
+const BIND_WATCH_EVERY: Duration = Duration::from_secs(5);
+
+/// Is `ip` an address of this machine? A UDP socket can be bound to it. (With
+/// the `qa-tools` feature, an address listed in `<state dir>/qa-hidden-addrs`
+/// counts as missing: tests make an address "appear" by emptying the file.)
+fn address_present(ip: std::net::IpAddr) -> bool {
+    #[cfg(feature = "qa-tools")]
+    if let Ok(list) = std::fs::read_to_string(forgetty_core::platform::data_dir().join("qa-hidden-addrs")) {
+        if list.lines().any(|l| l.trim().parse::<std::net::IpAddr>().is_ok_and(|h| h == ip)) {
+            return false;
+        }
+    }
+    std::net::UdpSocket::bind((ip, 0)).is_ok()
+}
+
+/// Watch the `--bind` addresses that were missing at start. When one appears
+/// (several at once count as one), bind the endpoint again with the full set:
+/// iroh cannot add a socket to a running endpoint, so the connections drop once
+/// and the clients reconnect. The key, node id and port stay.
+fn watch_missing_addresses(ep: Arc<SyncEndpoint>, all: Vec<std::net::IpAddr>) {
+    let mut missing: Vec<std::net::IpAddr> =
+        all.iter().copied().filter(|ip| !ep.bind_addrs().contains(ip)).collect();
+    if missing.is_empty() {
+        return;
+    }
+    for ip in &missing {
+        warn!(
+            "--bind {ip} is not on this machine yet; serving on {}; it is added when it appears",
+            ep.bind_addrs().iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ")
+        );
+    }
+    tokio::spawn(async move {
+        let mut warned = false;
+        loop {
+            tokio::time::sleep(BIND_WATCH_EVERY).await;
+            let appeared: Vec<std::net::IpAddr> =
+                missing.iter().copied().filter(|ip| address_present(*ip)).collect();
+            if appeared.is_empty() {
+                continue;
+            }
+            let current = ep.bind_addrs();
+            let set: Vec<std::net::IpAddr> = all
+                .iter()
+                .copied()
+                .filter(|ip| current.contains(ip) || appeared.contains(ip))
+                .collect();
+            let names = appeared.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ");
+            match ep.rebind(set).await {
+                Ok(()) => {
+                    info!(
+                        "--bind {names} is there: iroh endpoint bound again on {} (connections reconnect once)",
+                        ep.bind_addrs().iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ")
+                    );
+                    missing.retain(|ip| !appeared.contains(ip));
+                    if missing.is_empty() {
+                        return;
+                    }
+                    warned = false;
+                }
+                Err(f) if !f.dropped => {
+                    // Nothing changed: try again at the next look.
+                    if !warned {
+                        warn!("--bind {names} is there but cannot be added yet ({}); trying again", f.error);
+                        warned = true;
+                    }
+                }
+                Err(f) => {
+                    error!(
+                        "--bind {names} could not be added ({}); the endpoint serves on {} and does not try again",
+                        f.error,
+                        ep.bind_addrs().iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ")
+                    );
+                    missing.retain(|ip| !appeared.contains(ip));
+                    if missing.is_empty() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+}
+
 /// Does a failed iroh bind wait for the address, or end the process? The
 /// operator chose the addresses (`--bind`): wait, the tunnel may come up. With
 /// the default bind only "address not available" (`io::ErrorKind::
@@ -813,16 +897,17 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
     } else {
         "the bind address".to_string()
     };
+    let all_bind_addrs = bind_addrs.clone();
     let make_endpoint = {
-        let (rpc_v2, relay_urls, bind_addrs) = (Arc::clone(&rpc_v2), relay_urls, bind_addrs);
-        move || {
+        let (rpc_v2, relay_urls) = (Arc::clone(&rpc_v2), relay_urls);
+        move |bind_addrs: Vec<std::net::IpAddr>| {
             let sm_for_alpn = Arc::clone(&sm_for_alpn);
             SyncEndpoint::builder(secret_key.clone())
                 .bind_port(port)
                 .relay_urls(relay_urls.clone())
                 .n0_discovery(n0_discovery)
                 .relays_disabled(no_relay)
-                .bind_addrs(bind_addrs.clone())
+                .bind_addrs(bind_addrs)
                 .transport_config(quic_config())
                 .register_alpn(forgetty_proto::ALPN_RPC, rpc_v2.alpn_handler())
                 .register_alpn(
@@ -839,7 +924,7 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
     };
     let bring_up = {
         let (rpc_v2, slot) = (Arc::clone(&rpc_v2), Arc::clone(&sync_slot));
-        move |ep: SyncEndpoint| {
+        move |ep: SyncEndpoint| -> Arc<SyncEndpoint> {
             info!(
                 "iroh endpoint bound, node_id={}, udp={:?}, alpns=[forgetty/rpc/2, forgetty/pair/2, forgetty/pair/1 (refuses), forgetty/stream/1]",
                 ep.node_id(),
@@ -849,13 +934,40 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
             rpc_v2.set_sync(Arc::clone(&ep));
             let _ = slot.set(Arc::clone(&ep));
             // Spawn iroh accept loop.
+            let for_loop = Arc::clone(&ep);
             tokio::spawn(async move {
-                ep.accept_loop().await;
+                for_loop.accept_loop().await;
             });
+            ep
         }
     };
-    match make_endpoint().await {
-        Ok(ep) => bring_up(ep),
+    // Bind the `--bind` addresses that exist. The rest are watched for.
+    let usable = {
+        let all = all_bind_addrs.clone();
+        move || -> Result<Vec<std::net::IpAddr>, forgetty_sync::SyncError> {
+            if all.is_empty() {
+                return Ok(Vec::new());
+            }
+            let there: Vec<std::net::IpAddr> =
+                all.iter().copied().filter(|ip| address_present(*ip)).collect();
+            if there.is_empty() {
+                Err(forgetty_sync::SyncError::BindAddrNotAvailable(
+                    "none of the --bind addresses is on this machine".into(),
+                ))
+            } else {
+                Ok(there)
+            }
+        }
+    };
+    let first = match usable() {
+        Ok(set) => make_endpoint(set).await,
+        Err(e) => Err(e),
+    };
+    match first {
+        Ok(ep) => {
+            let ep = bring_up(ep);
+            watch_missing_addresses(ep, all_bind_addrs.clone());
+        }
         Err(e) if bind_is_retryable(chose_addrs, &e) => {
             // Not fatal: the process keeps the panes and the local socket and
             // tries again until the address is there.
@@ -868,9 +980,14 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
                 let mut last_warn = std::time::Instant::now();
                 loop {
                     tokio::time::sleep(wait).await;
-                    match make_endpoint().await {
+                    let attempt = match usable() {
+                        Ok(set) => make_endpoint(set).await,
+                        Err(e) => Err(e),
+                    };
+                    match attempt {
                         Ok(ep) => {
-                            bring_up(ep);
+                            let ep = bring_up(ep);
+                            watch_missing_addresses(ep, all_bind_addrs.clone());
                             return;
                         }
                         Err(e) if bind_is_retryable(chose_addrs, &e) => {

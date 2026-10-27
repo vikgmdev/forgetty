@@ -394,11 +394,32 @@ bind only when the error is "address not available". A busy port with the
 default bind still ends the process with a non-zero status, so the service
 manager restarts it.
 
+### Several `--bind` addresses, one of them late
+
+With `--bind A --bind B` and B not on the machine at start (a second tunnel that
+comes up later), the server binds A at once and serves on it. It logs a WARN
+once for B ("--bind B is not on this machine yet; ... it is added when it
+appears"). Every 5 s it looks for B. When B appears, the server binds the iroh
+endpoint again with the full set: same key, same node id, same port. iroh 0.97
+cannot add a socket to a running endpoint, so this closes the endpoint and
+binds a new one. Every open connection drops once and the clients reconnect;
+the device list, the pairing window and the panes are not touched. There is
+one rebind for the addresses that appeared in the same look. New pairing QR
+codes carry B. If the new bind fails, the server binds the old set again and
+logs an error (and does not try that address again). If B goes away later,
+nothing happens: iroh keeps the sockets it has. If none of the addresses is
+there at start, the server waits as described above, and binds the ones that
+exist when the first appears.
+
 A systemd user unit cannot be ordered after `wg-quick@wg0` (that is a system
 unit), so the unit has no `After=` for the tunnel. The retry covers it.
 
 ### Manual checks (need root, not in the test suite)
 
+- Second tunnel up after the server (`--bind` with two addresses, one missing):
+  the log shows `iroh endpoint bound again on ...` within 5 s of the address
+  appearing and clients are back within a few seconds. (The test suite hides an
+  address from the server with a test hook instead.)
 - Tunnel up after the server: stop the tunnel, start the server, then run
   `sudo wg-quick up wg0`. Within 10 s the log shows `iroh endpoint bound` and a
   client connects. (The test suite covers the same retry with a busy port,
@@ -443,4 +464,5 @@ Limits:
   shell can lack them.
 - A pane that writes marks in a loop gets its states merged (a burst of 8, then
   one per 10 ms per pane, and the newest pending one per client connection), so a
-  client sees where the shell is, not every step.
+  client sees where the shell is, not every step. The same holds for the
+  directory (`CwdChanged`, OSC 7).

@@ -144,6 +144,13 @@ the subscription first and puts the answer in the queue after it, so an event
 with a `seq` above the `seq` of the answer can come ahead of the answer. A
 client takes events as they arrive and does not wait for the answer.
 
+A connection keeps one pending `LayoutChanged`, and one pending `ShellState` and
+one pending `CwdChanged` per pane. A newer one replaces the pending one in place: the frame keeps the queue position of the old one and carries the
+newer `seq`. So `seq` on the wire can go backwards between events of different
+kinds. A client does not assume `seq` order across events. It uses `seq` of the
+`subscribe_events` answer to tell what it saw before the subscription, and the
+state `rev` (`ShellState`) or the layout content itself to tell newer from older.
+
 New methods:
 
 | Method | Params | Result |
@@ -614,6 +621,9 @@ ShellState {
   grew). When a connection lags and resyncs, the server sends the current state
   of every pane again: the same `rev` can arrive twice. A client drops an event
   whose `rev` is not higher than the one it holds.
+- `CwdChanged` follows the same rules: a pane sends a burst of 8, then one per
+  10 ms, and the newest directory wins (a loop of OSC 7 makes a handful of
+  events). A connection keeps only the newest pending `CwdChanged` per pane.
 - Marks are not tied to a byte offset of the pane stream yet. A client that needs
   command boundaries in the scrollback (command cards, P7.4) reads the marks from
   the byte stream with its own parser, which is where they are.
