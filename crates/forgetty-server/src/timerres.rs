@@ -1,15 +1,14 @@
-//! Timer resolution of the server process on Windows. Off by default.
+//! Timer resolution of the server process on Windows: the explicit settings.
 //!
-//! A process that never asks for a finer timer gets the default tick of 15.6 ms. The app asks for
-//! 1 ms (`timeBeginPeriod(1)`). The server does not, because measuring showed no gain on the key
-//! to output path (`tests/timer_probe.rs`, CI job `timer-probe`: the server adds about 0.35 ms
-//! with or without it) and a 1 ms tick for as long as the server runs costs power. The code stays
-//! as an opt-in for the next time a timer matters.
+//! By default the server asks for a 1 ms timer only while a pane is in use
+//! (`forgetty_pty::timer_boost`). A shell such as PowerShell waits on a timer, and its key echo
+//! takes 14 to 16 ms at the default 15.6 ms tick and 9.4 ms at 1 ms (`tests/timer_probe.rs`, CI
+//! job `timer-probe`). A tick of 1 ms for as long as the server runs costs power.
 //!
-//! `FORGETTY_TIMER_RES`: unset or `off` does nothing. `period` calls `timeBeginPeriod(1)` only.
-//! `full` (or `on`) does that and also opts the process out of power throttling, because a
-//! process without a window can be classified as background work, and then the system ignores
-//! its timer request.
+//! `FORGETTY_TIMER_RES`: unset leaves it to `timer_boost`. `off` turns that off too. `period`
+//! calls `timeBeginPeriod(1)` once for the life of the server. `full` (or `on`) does that and also
+//! opts the process out of power throttling, because a process without a window can be classified
+//! as background work, and then the system ignores its timer request.
 
 use tracing::{info, warn};
 use windows::Win32::System::Threading::{
