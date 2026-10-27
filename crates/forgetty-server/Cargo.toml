@@ -38,6 +38,8 @@ harness = false
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 bytes = "1"
 tempfile = "3"
+# The timer probe (`tests/timer_probe.rs`) talks protocol v2 to a real server.
+forgetty-client = { path = "../forgetty-client" }
 
 [dependencies]
 forgetty-core = { path = "../forgetty-core" }
