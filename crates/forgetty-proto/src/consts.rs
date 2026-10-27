@@ -117,6 +117,9 @@ pub mod cap {
     /// `delete_workspace`, `duplicate_workspace`, `move_workspace` and `set_workspace_color`
     /// take workspace ids (`workspace_id`, `source_workspace_id`, `from_id`, `to_id`).
     pub const WORKSPACE_ID: &str = "workspace_id";
+    /// `ShellState` events: prompt marks (OSC 133), the shell's directory
+    /// (OSC 7) and the tty mode of a pane (P7.1).
+    pub const SHELL_STATE: &str = "shell_state";
 }
 
 /// Method names that are new in v2 (section 4).

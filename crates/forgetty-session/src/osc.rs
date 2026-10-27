@@ -9,7 +9,8 @@
 //! | 0, 2 | window title |
 //! | 7 | working directory (`file://host/path`) |
 //! | 9, 99, 777 | desktop notifications |
-//! | 133 `;A` | shell prompt start |
+//! | 133 `;A` | shell prompt start (also as [`OscEvent::PromptStart`]) |
+//! | 133 `;A`, `;B`, `;C`, `;D[;code]` | prompt marks, as [`OscEvent::Mark`] |
 //! | 7501 | Program Status Protocol |
 //!
 //! The scanner keeps its state across chunk boundaries, so a sequence split at
@@ -98,6 +99,61 @@ pub enum OscEvent {
     Notification { title: Option<String>, body: String },
     /// OSC 133 `A`: a new shell prompt begins.
     PromptStart,
+    /// OSC 133 `A`, `B`, `C` or `D`: a shell prompt mark. For `D` the exit
+    /// code of the command, when the shell sent a valid one.
+    Mark { kind: MarkKind, exit_code: Option<i32> },
+}
+
+/// The four OSC 133 marks (semantic prompts).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkKind {
+    /// `A`: the prompt starts.
+    PromptStart,
+    /// `B`: the prompt ends, the command line starts.
+    InputStart,
+    /// `C`: the command line is done, the command starts.
+    CommandStart,
+    /// `D`: the command ended.
+    CommandEnd,
+}
+
+impl MarkKind {
+    /// The letter on the wire.
+    pub fn letter(self) -> char {
+        match self {
+            MarkKind::PromptStart => 'A',
+            MarkKind::InputStart => 'B',
+            MarkKind::CommandStart => 'C',
+            MarkKind::CommandEnd => 'D',
+        }
+    }
+}
+
+/// Parse the body of an OSC 133: `A`, `B`, `C` or `D`, each alone or followed
+/// by `;` and options. `D` may carry the exit code as its first option.
+fn parse_mark(body: &[u8]) -> Option<(MarkKind, Option<i32>)> {
+    let kind = match body.first()? {
+        b'A' => MarkKind::PromptStart,
+        b'B' => MarkKind::InputStart,
+        b'C' => MarkKind::CommandStart,
+        b'D' => MarkKind::CommandEnd,
+        _ => return None,
+    };
+    if body.len() > 1 && body[1] != b';' {
+        return None;
+    }
+    let exit_code = (kind == MarkKind::CommandEnd && body.len() > 2)
+        .then(|| {
+            let field = body[2..].split(|&b| b == b';').next().unwrap_or(&[]);
+            // Digits with an optional minus, at most 11 bytes: an `aid=...`
+            // option or garbage is not a code.
+            let ok = !field.is_empty()
+                && field.len() <= 11
+                && field.iter().enumerate().all(|(i, &b)| b.is_ascii_digit() || (i == 0 && b == b'-'));
+            ok.then(|| std::str::from_utf8(field).ok()?.parse::<i32>().ok()).flatten()
+        })
+        .flatten();
+    Some((kind, exit_code))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -412,8 +468,11 @@ impl OscScanner {
                 }
             }
             Kind::Prompt => {
-                if body.first() == Some(&b'A') && (body.len() == 1 || body[1] == b';') {
-                    sink(OscEvent::PromptStart);
+                if let Some((kind, exit_code)) = parse_mark(&body) {
+                    if kind == MarkKind::PromptStart {
+                        sink(OscEvent::PromptStart);
+                    }
+                    sink(OscEvent::Mark { kind, exit_code });
                 }
             }
         }
@@ -870,13 +929,42 @@ mod tests {
         }
     }
 
+    fn mark(kind: MarkKind, exit_code: Option<i32>) -> OscEvent {
+        OscEvent::Mark { kind, exit_code }
+    }
+
     #[test]
     fn prompt_start_osc133() {
-        assert_eq!(assert_split_invariant(b"\x1b]133;A\x07"), vec![OscEvent::PromptStart]);
-        assert_eq!(assert_split_invariant(b"\x1b]133;A;k=i\x1b\\"), vec![OscEvent::PromptStart]);
-        assert!(scan(b"\x1b]133;B\x07").is_empty());
-        assert!(scan(b"\x1b]133;D;0\x07").is_empty());
+        let a = vec![OscEvent::PromptStart, mark(MarkKind::PromptStart, None)];
+        assert_eq!(assert_split_invariant(b"\x1b]133;A\x07"), a);
+        assert_eq!(assert_split_invariant(b"\x1b]133;A;k=i\x1b\\"), a);
         assert!(scan(b"\x1b]133;AB\x07").is_empty());
+        assert!(scan(b"\x1b]133;E\x07").is_empty());
+    }
+
+    #[test]
+    fn prompt_marks_b_c_d_with_exit_code() {
+        assert_eq!(assert_split_invariant(b"\x1b]133;B\x07"), vec![mark(MarkKind::InputStart, None)]);
+        assert_eq!(
+            assert_split_invariant(b"\x1b]133;C;cmdline=ls\x07"),
+            vec![mark(MarkKind::CommandStart, None)]
+        );
+        assert_eq!(assert_split_invariant(b"\x1b]133;D\x07"), vec![mark(MarkKind::CommandEnd, None)]);
+        assert_eq!(
+            assert_split_invariant(b"\x1b]133;D;0\x07"),
+            vec![mark(MarkKind::CommandEnd, Some(0))]
+        );
+        assert_eq!(
+            assert_split_invariant(b"\x1b]133;D;130;aid=7\x1b\\"),
+            vec![mark(MarkKind::CommandEnd, Some(130))]
+        );
+        assert_eq!(scan(b"\x1b]133;D;-1\x07"), vec![mark(MarkKind::CommandEnd, Some(-1))]);
+        // Not a code: an option, text, an overflow. The mark still counts.
+        for junk in [&b"\x1b]133;D;aid=7\x07"[..], b"\x1b]133;D;x1\x07", b"\x1b]133;D;99999999999\x07"] {
+            assert_eq!(scan(junk), vec![mark(MarkKind::CommandEnd, None)], "{junk:?}");
+        }
+        // Only D has a code.
+        assert_eq!(scan(b"\x1b]133;C;5\x07"), vec![mark(MarkKind::CommandStart, None)]);
     }
 
     #[test]
@@ -1184,6 +1272,7 @@ mod tests {
                 OscEvent::Cwd { host: String::new(), path: "/x".into() },
                 OscEvent::Notification { title: None, body: "note".into() },
                 OscEvent::PromptStart,
+                mark(MarkKind::PromptStart, None),
             ]
         );
     }

@@ -183,6 +183,13 @@ pub struct Config {
     /// command line replaces this list.
     pub bind_addrs: Vec<String>,
 
+    /// Load the shell integration scripts into zsh, bash and fish when the
+    /// server starts a pane (P7.1): OSC 133 prompt marks and OSC 7 directory,
+    /// so clients know prompt, command and exit code. Default `true`. It acts
+    /// on panes created after the server reads this; the user's rc files are
+    /// never edited.
+    pub shell_integration: bool,
+
     /// Top-level keys this version does not know, kept as they were so a save
     /// (`save_config`, the settings editor) does not delete them. The loader
     /// warns about each of them and refuses one that looks like a typo of
@@ -232,7 +239,7 @@ impl Serialize for Config {
             len += 1;
         }
 
-        let mut map = serializer.serialize_map(Some(len + self.extra.len() + 3))?;
+        let mut map = serializer.serialize_map(Some(len + self.extra.len() + 4))?;
 
         map.serialize_entry("font_family", &self.font_family)?;
         map.serialize_entry("font_size", &self.font_size)?;
@@ -289,6 +296,9 @@ impl Serialize for Config {
         }
         if !self.bind_addrs.is_empty() {
             map.serialize_entry("bind_addrs", &self.bind_addrs)?;
+        }
+        if !self.shell_integration {
+            map.serialize_entry("shell_integration", &false)?;
         }
 
         // Keys of a newer version (or a typo): kept, last.
@@ -377,6 +387,9 @@ impl<'de> Deserialize<'de> for Config {
             #[serde(default)]
             bind_addrs: Vec<String>,
 
+            #[serde(default = "default_shell_integration")]
+            shell_integration: bool,
+
             /// Every key above does not claim.
             #[serde(flatten)]
             extra: toml::Table,
@@ -458,10 +471,15 @@ impl<'de> Deserialize<'de> for Config {
             relay_urls: raw.relay_urls,
             relay: raw.relay,
             bind_addrs: raw.bind_addrs,
+            shell_integration: raw.shell_integration,
             extra: raw.extra,
             source: None,
         })
     }
+}
+
+fn default_shell_integration() -> bool {
+    true
 }
 
 fn default_font_family() -> String {
@@ -519,6 +537,18 @@ mod relay_urls_tests {
         assert_eq!(c.relay.as_deref(), Some("none"));
         let again: Config = toml::from_str(&toml::to_string(&c).unwrap()).unwrap();
         assert_eq!((again.relay, again.bind_addrs), (c.relay, c.bind_addrs));
+    }
+
+    #[test]
+    fn shell_integration_is_on_by_default_and_only_written_when_off() {
+        let c: Config = toml::from_str("").unwrap();
+        assert!(c.shell_integration);
+        assert!(!toml::to_string(&c).unwrap().contains("shell_integration"));
+        let off: Config = toml::from_str("shell_integration = false\n").unwrap();
+        assert!(!off.shell_integration);
+        let again: Config = toml::from_str(&toml::to_string(&off).unwrap()).unwrap();
+        assert!(!again.shell_integration);
+        assert!(off.extra.is_empty(), "the key is known, not an extra");
     }
 
     #[test]

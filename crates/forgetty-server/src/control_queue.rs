@@ -5,11 +5,13 @@
 //! upstream, because the connection stops reading requests while the queue is
 //! over its byte budget and caps the requests in flight. A `LayoutChanged` is a
 //! full snapshot, so a connection holds at most one: a newer one replaces the
-//! pending one in its place.
+//! pending one in its place. A `ShellState` is a whole state too: a connection
+//! holds at most one per pane, so a pane that writes prompt marks in a loop
+//! cannot grow the queue or make a client read old states.
 //!
 //! Nothing here polls. Waiters use `Notify` with the arm-then-check pattern.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
@@ -31,6 +33,10 @@ struct State {
     pushed: u64,
     /// Push number of the pending `LayoutChanged`, if any.
     layout: Option<u64>,
+    /// Push number of the pending keyed frame of each key (`ShellState`: the
+    /// pane), and the key of each pending push number.
+    keyed: HashMap<uuid::Uuid, u64>,
+    keyed_by_push: HashMap<u64, uuid::Uuid>,
     /// Frames the writer finished writing.
     written: u64,
     /// Payload bytes of those frames.
@@ -64,6 +70,8 @@ impl ControlQueue {
                 popped: 0,
                 pushed: 0,
                 layout: None,
+                keyed: HashMap::new(),
+                keyed_by_push: HashMap::new(),
                 written: 0,
                 written_bytes: 0,
                 reserved: 0,
@@ -116,6 +124,37 @@ impl ControlQueue {
         self.changed.notify_waiters();
     }
 
+    /// Queue a frame that is a whole state for `key`. A pending frame of the
+    /// same key is replaced in place.
+    pub fn put_keyed(&self, key: uuid::Uuid, frame: Vec<u8>) {
+        {
+            let mut st = self.lock();
+            let slot = st
+                .keyed
+                .get(&key)
+                .and_then(|n| n.checked_sub(st.popped))
+                .and_then(|i| usize::try_from(i).ok())
+                .filter(|i| *i < st.items.len());
+            match slot {
+                Some(i) => {
+                    let old = std::mem::replace(&mut st.items[i], frame);
+                    let new_len = st.items[i].len();
+                    st.bytes = st.bytes - old.len() + new_len;
+                }
+                None => {
+                    st.bytes += frame.len() + ITEM_OVERHEAD;
+                    st.items.push_back(frame);
+                    st.stamps.push_back(std::time::Instant::now());
+                    let n = st.pushed;
+                    st.keyed.insert(key, n);
+                    st.keyed_by_push.insert(n, key);
+                    st.pushed += 1;
+                }
+            }
+        }
+        self.changed.notify_waiters();
+    }
+
     /// Take the next frame, waiting for one. `None` once the queue is closed.
     pub async fn pop(&self) -> Option<Vec<u8>> {
         self.pop_timed().await.map(|(frame, _)| frame)
@@ -134,6 +173,10 @@ impl ControlQueue {
                     st.bytes -= frame.len() + ITEM_OVERHEAD;
                     if st.layout.is_some_and(|n| n == st.popped) {
                         st.layout = None;
+                    }
+                    let popped = st.popped;
+                    if let Some(key) = st.keyed_by_push.remove(&popped) {
+                        st.keyed.remove(&key);
                     }
                     st.popped += 1;
                     drop(st);
@@ -293,6 +336,31 @@ mod tests {
         // The slot is free again once the layout left the queue.
         q.put_layout(frame(13, 10));
         assert_eq!(q.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_pending_keyed_frame_is_replaced_in_place_per_key() {
+        let q = ControlQueue::new();
+        let (a, b) = (uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2));
+        q.put_keyed(a, frame(1, 5));
+        q.put_keyed(b, frame(2, 5));
+        q.push(frame(3, 5));
+        for i in 0..1000u32 {
+            q.put_keyed(a, frame(10 + (i % 100) as u8, 20));
+        }
+        q.put_keyed(b, frame(99, 7));
+        assert_eq!(q.len(), 3, "one slot per key, however many states arrive");
+        assert_eq!(q.bytes(), 20 + 7 + 5 + 3 * ITEM_OVERHEAD);
+        let first = q.pop().await.unwrap();
+        assert_eq!(first.len(), 20, "the newest state of a, in a's place");
+        assert_eq!(q.pop().await.unwrap()[0], 99);
+        assert_eq!(q.pop().await.unwrap()[0], 3);
+        // The slots are free again once the frames left the queue.
+        q.put_keyed(a, frame(4, 10));
+        q.put_keyed(a, frame(5, 10));
+        assert_eq!(q.len(), 1);
+        assert_eq!(q.pop().await.unwrap()[0], 5);
+        assert_eq!(q.bytes(), 0);
     }
 
     #[tokio::test]

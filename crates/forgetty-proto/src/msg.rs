@@ -218,6 +218,7 @@ const KNOWN_EVENTS: &[&str] = &[
     "StatusChanged",
     "Notification",
     "PaneExited",
+    "ShellState",
     "ClientConnected",
     "ClientDisconnected",
     "InputDropped",
@@ -366,6 +367,42 @@ pub enum ServerEvent {
         pane_id: Uuid,
         /// Exit code, `None` when unknown.
         exit_code: Option<i32>,
+    },
+    /// The shell state of a pane (cap `shell_state`): prompt marks (OSC 133),
+    /// the directory the shell reports (OSC 7, display only) and the tty mode.
+    /// Always the whole state. Sent when a mark, the directory or the tty mode
+    /// changes, and once per pane that has a state after `subscribe_events`.
+    ShellState {
+        /// Pane id.
+        #[serde(with = "uuid_str")]
+        pane_id: Uuid,
+        /// Grows with every change of this pane. Keep the highest seen and
+        /// ignore an older state.
+        rev: u64,
+        /// `unknown` (no mark seen: no shell integration), `prompt` (after
+        /// `A`), `input` (after `B`), `running` (after `C`) or `done` (after
+        /// `D`).
+        phase: String,
+        /// Exit code of the last command that ended with a valid code.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
+        /// Directory the shell reported, absent before the first report.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        /// Termios `ICANON` of the pty, absent when it was not read.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        canonical: Option<bool>,
+        /// Termios `ECHO` of the pty, absent when it was not read.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        echo: Option<bool>,
+        /// The OSC 133 letter (`A` to `D`) that caused this state, absent for
+        /// a change of the directory or the tty mode.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mark: Option<String>,
+        /// Unix time in milliseconds of the change, `0` for the state sent
+        /// after `subscribe_events`.
+        #[serde(default)]
+        at_ms: u64,
     },
     /// Input this client sent to a pane was dropped because the pane did not
     /// read it (AD-024). Sent once the pane's queue is empty again, to the

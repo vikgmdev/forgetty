@@ -24,6 +24,8 @@ pub struct NotificationInfo {
 pub struct PaneOsc {
     pub scanner: OscScanner,
     pub status: StatusTracker,
+    /// Prompt marks, directory and tty mode of the shell (P7.1).
+    pub shell: crate::shell::ShellTracker,
     /// Status last published, to emit `StatusChanged` only on a real change.
     pub published: StatusSnapshot,
     pub last_notification: Option<NotificationInfo>,

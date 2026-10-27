@@ -8,4 +8,4 @@ pub mod multiplexer;
 pub mod process;
 
 pub use multiplexer::{PtyId, PtyMultiplexer};
-pub use process::{PtyProcess, PtySize};
+pub use process::{detect_shell, PtyProcess, PtySize};
