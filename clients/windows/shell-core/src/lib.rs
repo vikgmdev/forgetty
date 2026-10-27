@@ -19,6 +19,7 @@ pub mod keys;
 pub mod layout;
 pub mod links;
 pub mod local;
+pub mod localserver;
 pub mod menu;
 pub mod notify;
 pub mod update;
