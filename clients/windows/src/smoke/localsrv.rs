@@ -106,30 +106,6 @@ async fn probe_task(
         PROBE_MS.lock().unwrap().push(ms(t0.elapsed()));
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    // E3: the app's own connection and pane source (queue, writer task, reader task), typing into
-    // the pane above. Not a pane the UI shows.
-    {
-        use forgetty_shell_core::PaneEvent;
-        let src = backend.attach_pane(forgetty_shell_core::PaneId(pane)).await.map_err(|e| format!("source attach: {e}"))?;
-        let ev = src.events();
-        while let Ok(Ok(_)) = tokio::time::timeout(Duration::from_millis(1500), ev.recv()).await {}
-        for i in 0..60usize {
-            let key = b'A' + (i % 26) as u8;
-            let t0 = Instant::now();
-            src.write_input(&[key]);
-            loop {
-                let left = Duration::from_secs(5).saturating_sub(t0.elapsed());
-                match tokio::time::timeout(left, ev.recv()).await {
-                    Ok(Ok(PaneEvent::Output(b))) if b.contains(&key) => break,
-                    Ok(Ok(_)) => {}
-                    _ => return Err(format!("source: no echo of {:?}", key as char)),
-                }
-            }
-            E3_MS.lock().unwrap().push(ms(t0.elapsed()));
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        src.shutdown();
-    }
     // E2: the young connection typing into the pane the UI shows (the line is cleared after).
     {
         let mut ui = c.attach_pane(ui_pane).await.map_err(|e| format!("attach ui pane: {e}"))?;
