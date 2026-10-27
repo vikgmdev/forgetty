@@ -324,10 +324,18 @@ impl ShellSmoke {
                     }
                     return;
                 }
-                let Some(p) = shell.active_pane() else { return };
+                // The pane of the tab just opened (the last one), not whatever pane is active: the
+                // first tab of the server runs the default shell, which may be PowerShell.
+                let Some(p) = shell.layout.active_workspace().and_then(|w| w.tabs.last().map(|t| t.pane_tree.first_leaf())) else { return };
+                if shell.active_pane() != Some(p) {
+                    shell.focus_pane(p, window, cx);
+                    return;
+                }
                 let Some(s) = snap(shell, cx, p) else { return };
-                if s.rows.iter().any(|r| r.trim_end().ends_with('>')) {
-                    check("local_server_tab_runs_cmd", true);
+                if let Some(row) = s.rows.iter().find(|r| r.trim_end().ends_with('>')) {
+                    record("local_server_tab_prompt", json!(row.trim_end()));
+                    // cmd.exe: its prompt is `C:\...>`, PowerShell's starts with `PS `.
+                    check("local_server_tab_runs_cmd", !row.trim_start().starts_with("PS "));
                     self.ls.pane = Some(p);
                     shell.focus_pane(p, window, cx);
                     self.goto(Phase::LsKeys);
