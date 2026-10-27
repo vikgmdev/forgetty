@@ -378,13 +378,30 @@ impl ShellSmoke {
                 let f = self.st_file();
                 until!(f.contains("# editedx"));
                 check("settings_toml_editor_keep_then_save_writes_the_editor_text", !f.contains("# external"));
+                until!(shell.settings.as_ref().is_some_and(|w| !w.st.busy));
+                // The file changes and the save follows at once: the save is refused, and the bar
+                // is there without waiting for the file watcher.
+                self.st_type(shell, window, cx, "y");
+                self.settings.text0 = format!("{f}\n# race\n");
+                self.st_put(&self.settings.text0.clone());
+                self.st_send(shell, window, cx, &["ctrl+s"]);
+                self.st_next();
+            }
+            31 => {
+                let t = shell.settings_prepare().and_then(|v| match v.body {
+                    Body::Toml(t) if !shell.settings.as_ref().is_some_and(|w| w.st.busy) => Some(t),
+                    _ => None,
+                });
+                until!(t.as_ref().is_some_and(|t| t.stale && t.message.as_deref().is_some_and(|m| m.contains("changed on disk"))));
+                check("settings_toml_editor_refused_save_offers_keep", self.st_file() == self.settings.text0);
+                shell.settings_press("toml-keep", window, cx);
                 // Text that does not load is refused with the line.
                 self.st_send(shell, window, cx, &["enter"]);
                 self.st_type(shell, window, cx, "[[[");
                 self.st_send(shell, window, cx, &["ctrl+s"]);
                 self.st_next();
             }
-            31 => {
+            32 => {
                 let msg = shell.settings_prepare().and_then(|v| match v.body {
                     Body::Toml(t) if !shell.settings.as_ref().is_some_and(|w| w.st.busy) => t.message,
                     _ => None,
@@ -407,8 +424,34 @@ impl ShellSmoke {
                 self.settings.page_t = Some(Instant::now());
                 self.st_next();
             }
+            // ---- the shortcut set row cannot take away the way to Settings ------------------------
+            33 => {
+                // gtk reaches Settings by Ctrl+. ; the windows set has no Settings chord, so with
+                // the palette unbound the switch would lock the user out.
+                self.st_put("keymap = \"gtk\"\ncommand_palette = \"none\"\n");
+                self.st_next();
+            }
+            34 => {
+                until!(shell.file_cfg.keymap == KeymapPreset::Gtk && shell.keymap.chords(Action::CommandPalette).is_empty());
+                shell.settings_page(Page::General, cx);
+                self.st_next();
+            }
+            35 => {
+                until!(settle);
+                self.st_send(shell, window, cx, &["down", "right"]);
+                self.st_next();
+            }
+            36 => {
+                let s = shell.settings.as_ref().and_then(|w| w.st.status().cloned());
+                until!(s.is_some());
+                let s = s.unwrap();
+                record("settings_keymap_lockout_status", json!(s.text));
+                check("settings_keymap_row_refuses_a_switch_with_no_way_to_settings", !s.ok && s.text.contains("Settings") && shell.file_cfg.keymap == KeymapPreset::Gtk && self.st_file().contains("keymap = \"gtk\""));
+                self.st_put("");
+                self.st_next();
+            }
             // ---- every page renders ---------------------------------------------------------------
-            32 => {
+            37 => {
                 let due = self.settings.page_t.is_none_or(|t| t.elapsed() > Duration::from_millis(150));
                 until!(due);
                 if self.settings.pages < Page::ALL.len() {
