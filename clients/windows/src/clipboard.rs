@@ -165,13 +165,13 @@ impl AppShell {
 pub fn save_image(img: &gpui::Image) -> Result<std::path::PathBuf, String> {
     use forgetty_shell_core::imagepaste as ip;
     use gpui::ImageFormat as F;
-    use std::io::Write as _;
     if img.bytes.len() > ip::MAX_BYTES {
         return Err("The picture on the clipboard is too large to save.".into());
     }
     let local = std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from);
     let dir = ip::cache_dir(local.as_deref()).ok_or_else(|| "No %LOCALAPPDATA%: cannot save the picture".to_string())?;
-    std::fs::create_dir_all(&dir).map_err(|e| format!("Cannot create {}: {e}", dir.display()))?;
+    // The folder and the file are for this user only, like the identity key.
+    forgetty_core::fsutil::ensure_private_dir(&dir).map_err(|e| format!("Cannot create {}: {e}", dir.display()))?;
     let (ext, bytes): (&str, Vec<u8>) = match img.format {
         F::Png => ("png", img.bytes.clone()),
         F::Bmp => {
@@ -193,7 +193,6 @@ pub fn save_image(img: &gpui::Image) -> Result<std::path::PathBuf, String> {
     };
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let path = dir.join(ip::file_name(secs, &Uuid::new_v4().simple().to_string(), ext));
-    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&path).map_err(|e| format!("Cannot save {}: {e}", path.display()))?;
-    f.write_all(&bytes).map_err(|e| format!("Cannot save {}: {e}", path.display()))?;
+    forgetty_core::fsutil::acl::write_private(&path, &bytes).map_err(|e| format!("Cannot save {}: {e}", path.display()))?;
     Ok(path)
 }

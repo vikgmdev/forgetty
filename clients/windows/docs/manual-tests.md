@@ -585,8 +585,11 @@ Needs the installed app (MSI) or `forgetty-win.exe` and `forgetty.exe` in one fo
 4. End `forgetty.exe` in Task Manager (End task). [ ] Within about 10 s the overlay "Reconnecting to This PC..." goes away and the tab works. [ ] The tab you had is back (or one new tab).
 5. Run `forgetty server stop` while the app is open, then `taskkill /IM forgetty.exe /F` if it is still there, and block it: rename `forgetty.exe` next to the app to `x.exe`.
    [ ] After about a minute the built-in terminal opens in a new tab with a notice that the local server stopped. Rename it back and restart the app.
-6. Rename `forgetty.exe` to `x.exe` and start the app. [ ] A notice says forgetty.exe was not found and a tab opens at once. Rename it back.
-7. Start the app as administrator (right-click, Run as administrator). [ ] The notice says this window runs as administrator and uses the built-in terminal. [ ] Closing the window ends the tabs (a question is asked while a shell is open).
+6. Rename `forgetty.exe` to `x.exe` and start the app. [ ] A notice says forgetty.exe was not found next to the app and a tab opens at once, even when another `forgetty.exe` is on PATH. Rename it back.
+7. Run `forgetty revoke <the app's device id>` (id from `forgetty devices`), then start the app again. [ ] It pairs again by itself and This PC works. With the app open, revoke it: [ ] the built-in terminal takes over with a notice, and the palette entry "Retry the local server" brings This PC back.
+   End `forgetty.exe` five times within ten minutes (restart it by hand each time is not needed, the app does): [ ] after the fifth the built-in terminal takes over with a notice, "Retry the local server" starts it again.
+   Set `local_server = false` and run `forgetty-win.exe --start-server` from Run (Win+R): [ ] no server starts.
+7a. Start the app as administrator (right-click, Run as administrator). [ ] The notice says this window runs as administrator and uses the built-in terminal. [ ] Closing the window ends the tabs (a question is asked while a shell is open).
 8. Put `local_server = false` in `%APPDATA%\forgetty\config.toml` and restart. [ ] The built-in terminal is used with no notice. [ ] Settings, General, has "Keep terminals in the local server" off. Set it back to true.
 9. Sign out and in (or reboot). [ ] No console window shows at login. [ ] `forgetty server status` says running before you start the app.
 10. Feel: type fast in a tab of This PC and in a tab of the built-in terminal (`local_server = false`). [ ] You cannot tell them apart.
@@ -600,7 +603,7 @@ Needs the installed app (MSI) or `forgetty-win.exe` and `forgetty.exe` in one fo
 4. Command line: `forgetty-win.exe --working-directory C:\Windows -e cmd /k cd`. [ ] A tab opens in `C:\Windows` running cmd. `--working-directory C:\nope` shows an error box and exits.
    `forgetty-win.exe --bogus` shows the error box. `forgetty-win.exe --help` from a console prints the usage. `--config-file D:\other.toml`: [ ] Settings changes are saved to that file.
 5. Cursor: Settings, Terminal, Cursor shape = Bar. [ ] The cursor of an open prompt turns into a bar at once in every tab. Run `printf '\033[4 q'`: [ ] the cursor becomes an underline (a program's own request wins); `printf '\033[0 q'` or a reset brings the setting back. Unfocused panes show an outline.
-6. Picture paste: take a screenshot (Win+Shift+S), press Ctrl+Shift+V in a tab of This PC. [ ] A path under `%LOCALAPPDATA%\forgetty\cache\clipboard` is typed and the file opens as a PNG.
+6. Picture paste: take a screenshot (Win+Shift+S), press Ctrl+Shift+V in a tab of This PC. [ ] A path under `%LOCALAPPDATA%\forgetty\cache\clipboard` is typed and the file opens as a PNG. With a user name that has a space the path is in quotes in cmd (`"..."`), in PowerShell (`'...'`), and in a WSL tab it is `'/mnt/c/...'`. [ ] Properties, Security of the file lists only you.
    In a tab of a remote machine: [ ] a notice says picture paste works on this PC only and nothing is typed.
 7. `Ctrl+Alt+PageDown` / `Ctrl+Alt+PageUp` with two workspaces. [ ] They switch the workspace.
 8. Right-click a tab. [ ] "Move to New Window" and "Export" are listed and grey.

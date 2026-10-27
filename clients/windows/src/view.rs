@@ -146,6 +146,18 @@ pub struct ClipboardSeen {
     pub replayed: u32,
 }
 
+/// A key the smoke sent and what it waits for: `ch` at (`row`, `col`). `model_at` is when the
+/// output bytes that held it had been fed to the terminal model.
+#[derive(Clone, Debug)]
+pub struct ProbeWatch {
+    pub row: usize,
+    pub col: usize,
+    pub ch: char,
+    pub t0: Instant,
+    pub model_at: Option<Instant>,
+}
+
+
 pub struct TerminalView {
     pub osc52: forgetty_shell_core::osc52::Scanner,
     pub clip_seen: ClipboardSeen,
@@ -254,6 +266,9 @@ pub struct TerminalView {
     drop_notice_until: Option<Instant>,
     pub resets: u64,
     pub fed_bytes: u64,
+    /// The smoke times a key to the moment its echo is in the terminal model, below the
+    /// resolution of a frame.
+    pub probe_watch: Option<ProbeWatch>,
     pub feed_time: Duration,
     pub max_feed: Duration,
 }
@@ -488,6 +503,7 @@ impl TerminalView {
             drop_notice_until: None,
             resets: 0,
             fed_bytes: 0,
+            probe_watch: None,
             feed_time: Duration::ZERO,
             max_feed: Duration::ZERO,
         }
@@ -596,6 +612,11 @@ impl TerminalView {
                 cx.emit(ViewEvent::Clipboard(req));
             }
             self.fed_bytes += bytes.len() as u64;
+            if let Some(w) = self.probe_watch.as_mut() {
+                if w.model_at.is_none() && self.term.screen().cell(w.row, w.col).grapheme.starts_with(w.ch) {
+                    w.model_at = Some(Instant::now());
+                }
+            }
             if let Some(st) = self.search.as_mut() {
                 st.stale = true;
             }
@@ -1601,7 +1622,11 @@ impl TerminalView {
             let _ = this.update(cx, |v, cx| {
                 match saved {
                     Ok(path) => {
-                        v.send_paste(&forgetty_shell_core::imagepaste::paste_text(&path));
+                        // Quoted for the shell the pane runs (read from the prompt line).
+                        let (r, _) = v.term.cursor();
+                        let line: String = v.term.screen().row(r).iter().filter(|c| !c.attrs.spacer).map(|c| c.grapheme.as_str()).collect();
+                        let shell = forgetty_shell_core::imagepaste::detect_shell(&line);
+                        v.send_paste(&forgetty_shell_core::imagepaste::paste_text(&path, shell));
                     }
                     Err(e) => v.show_notice(e, cx),
                 }

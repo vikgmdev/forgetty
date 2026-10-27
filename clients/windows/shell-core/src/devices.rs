@@ -249,7 +249,7 @@ impl DevicesState {
         let Some(d) = self.selected().cloned() else { return DevEffect::None };
         if is_own_device(&d, &self.own_id) {
             self.armed = None;
-            self.msg = Some((false, "This is the app itself. It pairs with the server again by itself.".into()));
+            self.msg = Some((false, "This is the app itself. It pairs with the server again at the next start if it is removed.".into()));
             return DevEffect::None;
         }
         if self.armed.as_deref() == Some(d.device_id.as_str()) {

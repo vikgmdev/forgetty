@@ -55,6 +55,44 @@ pub fn split(s: &str) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
+/// One argument as `CommandLineToArgvW` reads it back: quoted when it holds white space or a
+/// quote (or is empty), with the backslashes before a quote doubled.
+pub fn quote_windows_arg(a: &str) -> String {
+    if !a.is_empty() && !a.contains([' ', '\t', '\n', '\x0b', '"']) {
+        return a.to_string();
+    }
+    let mut out = String::from('"');
+    let mut backslashes = 0usize;
+    for c in a.chars() {
+        match c {
+            '\\' => backslashes += 1,
+            '"' => {
+                out.push_str(&"\\".repeat(backslashes * 2 + 1));
+                out.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                out.push_str(&"\\".repeat(backslashes));
+                out.push(c);
+                backslashes = 0;
+            }
+        }
+    }
+    out.push_str(&"\\".repeat(backslashes * 2));
+    out.push('"');
+    out
+}
+
+/// The command line of `CreateProcessW` for `program` and `args`.
+pub fn command_line(program: &str, args: &[String]) -> String {
+    let mut line = quote_windows_arg(program);
+    for a in args {
+        line.push(' ');
+        line.push_str(&quote_windows_arg(a));
+    }
+    line
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,5 +128,20 @@ mod tests {
     fn a_quote_left_open_is_an_error() {
         assert!(split(r#"pwsh "C:\Program Files"#).is_err());
         assert!(split("echo 'oops").is_err());
+    }
+
+    #[test]
+    fn windows_command_lines_round_trip_the_quoting_rules() {
+        assert_eq!(quote_windows_arg("plain"), "plain");
+        assert_eq!(quote_windows_arg(""), "\"\"");
+        assert_eq!(quote_windows_arg("a b"), "\"a b\"");
+        assert_eq!(quote_windows_arg("say \"hi\""), "\"say \\\"hi\\\"\"");
+        // Backslashes before a closing quote are doubled; elsewhere they stay.
+        assert_eq!(quote_windows_arg("C:\\a b\\"), "\"C:\\a b\\\\\"");
+        assert_eq!(quote_windows_arg("C:\\x\\y"), "C:\\x\\y");
+        assert_eq!(
+            command_line("C:\\Program Files\\forgetty.exe", &["--state-dir".into(), "D:\\s p".into(), "server".into()]),
+            "\"C:\\Program Files\\forgetty.exe\" --state-dir \"D:\\s p\" server"
+        );
     }
 }
