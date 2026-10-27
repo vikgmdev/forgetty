@@ -58,6 +58,38 @@ const PROGRAM: &str = "cat";
 
 const SAMPLES: usize = 60;
 
+/// The bytes of `chunk` outside escape sequences: a CSI final byte such as the `h` of `ESC[?25h`
+/// is not an echo of the key `h`.
+fn printable(chunk: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(chunk.len());
+    let mut i = 0;
+    while i < chunk.len() {
+        if chunk[i] == 0x1b && i + 1 < chunk.len() {
+            match chunk[i + 1] {
+                b'[' => {
+                    i += 2;
+                    while i < chunk.len() && !(0x40..=0x7e).contains(&chunk[i]) {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                b']' => {
+                    i += 2;
+                    while i < chunk.len() && chunk[i] != 0x07 && chunk[i] != 0x1b {
+                        i += 1;
+                    }
+                    i += if i < chunk.len() && chunk[i] == 0x1b { 2 } else { 1 };
+                }
+                _ => i += 2,
+            }
+        } else {
+            out.push(chunk[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
 fn forgetty(state: &Path, timer: &str, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_forgetty"))
         .arg("--state-dir")
@@ -107,8 +139,12 @@ impl Stats {
 
 /// The same echo without a server: a pty of this process, a key written, the echo read.
 fn in_process(label: &str) -> Stats {
+    in_process_with(label, &[PROGRAM])
+}
+
+fn in_process_with(label: &str, argv: &[&str]) -> Stats {
     use std::io::{Read, Write};
-    let cmd = vec![PROGRAM.to_string()];
+    let cmd: Vec<String> = argv.iter().map(|a| a.to_string()).collect();
     let mut pty =
         forgetty_pty::PtyProcess::spawn(forgetty_pty::PtySize::default(), None, Some(&cmd), false)
             .expect("spawn pty");
@@ -123,9 +159,9 @@ fn in_process(label: &str) -> Stats {
             }
         }
     });
-    // Let the prompt settle.
-    std::thread::sleep(Duration::from_millis(1500));
-    while rx.try_recv().is_ok() {}
+    // Let the prompt settle: quiet for 1.5 s (a PowerShell takes a few seconds to start).
+    let give_up = Instant::now() + Duration::from_secs(25);
+    while Instant::now() < give_up && rx.recv_timeout(Duration::from_millis(1500)).is_ok() {}
     let mut out = Vec::new();
     for i in 0..SAMPLES {
         let key = b'a' + (i % 26) as u8;
@@ -137,7 +173,7 @@ fn in_process(label: &str) -> Stats {
             let left = end.saturating_duration_since(Instant::now());
             assert!(!left.is_zero(), "no echo of {:?}", key as char);
             match rx.recv_timeout(left) {
-                Ok(chunk) if chunk.contains(&key) => break,
+                Ok(chunk) if printable(&chunk).contains(&key) => break,
                 Ok(_) => {}
                 Err(_) => panic!("no echo of {:?}", key as char),
             }
@@ -182,9 +218,43 @@ fn show_stages(state: &Path, label: &str) {
     );
 }
 
+/// The first ConPTY read chunks after an input, as the server saw them: how long after the
+/// input, whether the key byte is in the chunk, and its first bytes. Says whether the character
+/// comes in the first read or in a later one.
+fn show_chunks(state: &Path, label: &str) {
+    let log = state.join("data").join("forgetty").join("server.log");
+    let text = std::fs::read_to_string(&log).unwrap_or_default();
+    let lines: Vec<&str> = text.lines().filter(|l| l.contains(" us after the input")).collect();
+    let late = lines.iter().filter(|l| l.contains("key byte not in it")).count();
+    println!("PROBE chunks {label}: {} chunk lines, {} without the key byte", lines.len(), late);
+    for l in lines.iter().rev().take(10).rev() {
+        println!("PROBE chunk {label}: {}", l.split("latency:").last().unwrap_or(l).trim());
+    }
+}
+
 /// A real server started with `timer` as `FORGETTY_TIMER_RES`; a key in over protocol v2, the
 /// echo out.
 async fn through_server(timer: &str, client: &str) -> (Stats, Stats) {
+    through_server_as(timer, client, Pane::Fresh, &[PROGRAM]).await
+}
+
+/// What the pane went through before the keys: `Fresh` is a new 80x24 pane, `Resized` is the
+/// size the app's window gives it (200x50) by a `resize` after attach, `Scrolled` is that plus
+/// 3000 lines of scrollback.
+#[derive(Clone, Copy, Debug)]
+enum Pane {
+    Fresh,
+    Resized,
+    Scrolled,
+}
+
+async fn through_server_as(
+    timer: &str,
+    client: &str,
+    kind: Pane,
+    argv: &[&str],
+) -> (Stats, Stats) {
+    let client = &format!("{client}, {} {kind:?} pane", argv[0]);
     let state = tempfile::tempdir().unwrap();
     // Windows servers are loopback only with no relay by default. Elsewhere the config says so.
     #[cfg(not(windows))]
@@ -198,7 +268,9 @@ async fn through_server(timer: &str, client: &str) -> (Stats, Stats) {
     assert!(start.status.success(), "{}", text(&start));
 
     // The pane, and the pairing payload an app would scan.
-    let new = forgetty(state.path(), timer, &["new", "--", PROGRAM]);
+    let mut new_args = vec!["new", "--"];
+    new_args.extend_from_slice(argv);
+    let new = forgetty(state.path(), timer, &new_args);
     assert!(new.status.success(), "{}", text(&new));
     let pane = Uuid::parse_str(String::from_utf8_lossy(&new.stdout).trim()).expect("pane id");
     let qr: QrPayload = {
@@ -236,6 +308,20 @@ async fn through_server(timer: &str, client: &str) -> (Stats, Stats) {
     .expect("connect timed out")
     .expect("connect");
     let mut stream = h.attach_pane(pane).await.expect("attach");
+    if !matches!(kind, Pane::Fresh) {
+        h.resize(pane, 50, 200).await.expect("resize");
+    }
+    if matches!(kind, Pane::Scrolled) {
+        #[cfg(windows)]
+        let fill: &[u8] = b"for /l %i in (1,1,3000) do @echo line %i\r";
+        #[cfg(not(windows))]
+        let fill: &[u8] = b"seq 1 3000\n";
+        h.send_input(pane, fill).await.expect("fill");
+        // Until the output has been quiet for a second.
+        while let Ok(Some(_)) =
+            tokio::time::timeout(Duration::from_millis(1000), stream.next()).await
+        {}
+    }
 
     // Idle round trip of a plain request, for scale.
     let mut rtt = Vec::new();
@@ -245,10 +331,15 @@ async fn through_server(timer: &str, client: &str) -> (Stats, Stats) {
         rtt.push(t0.elapsed());
     }
 
-    // Let the prompt arrive and settle.
-    let settle = Instant::now() + Duration::from_millis(2000);
-    while Instant::now() < settle {
-        let _ = tokio::time::timeout(Duration::from_millis(100), stream.next()).await;
+    // Let the prompt arrive and settle: quiet for 1.5 s.
+    let give_up = Instant::now() + Duration::from_secs(25);
+    while Instant::now() < give_up {
+        if !matches!(
+            tokio::time::timeout(Duration::from_millis(1500), stream.next()).await,
+            Ok(Some(_))
+        ) {
+            break;
+        }
     }
 
     let mut echo = Vec::new();
@@ -261,7 +352,7 @@ async fn through_server(timer: &str, client: &str) -> (Stats, Stats) {
             let left = end.saturating_duration_since(Instant::now());
             assert!(!left.is_zero(), "no echo of {:?}", key as char);
             match tokio::time::timeout(left, stream.next()).await {
-                Ok(Some(PaneItem::Data { bytes, .. })) if bytes.contains(&key) => break 'wait,
+                Ok(Some(PaneItem::Data { bytes, .. })) if printable(&bytes).contains(&key) => break 'wait,
                 Ok(Some(_)) => {}
                 other => panic!("no echo of {:?}: {:?}", key as char, other.is_ok()),
             }
@@ -271,6 +362,7 @@ async fn through_server(timer: &str, client: &str) -> (Stats, Stats) {
     }
     h.close().await;
     show_stages(state.path(), &format!("{client}, server {timer}"));
+    show_chunks(state.path(), &format!("{client}, server {timer}"));
     let stop = forgetty(state.path(), timer, &["server", "stop"]);
     assert!(stop.status.success(), "{}", text(&stop));
     (
@@ -307,5 +399,36 @@ async fn key_to_echo_through_the_server_against_in_process() {
     }
     for (what, p50, base) in &all {
         println!("PROBE delta to in process, {what}: {:+.2} ms (p50)", p50 - base);
+    }
+}
+
+/// The UI pane differs from a fresh one: it was resized to the window and holds scrollback, and
+/// it runs the default shell (PowerShell, with PSReadLine, when the machine has one). One server
+/// per shell and kind, each next to the same shell in process, so a slow echo shows which part of
+/// the pane it follows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn key_to_echo_on_panes_like_the_ui_pane() {
+    #[cfg(windows)]
+    let shells: Vec<Vec<&str>> = {
+        let mut v = vec![vec!["cmd.exe"], vec!["powershell.exe", "-NoLogo"]];
+        if Command::new("pwsh.exe").arg("-Version").output().is_ok() {
+            v.push(vec!["pwsh.exe", "-NoLogo"]);
+        }
+        v
+    };
+    #[cfg(not(windows))]
+    let shells: Vec<Vec<&str>> = vec![vec![PROGRAM]];
+    for shell in &shells {
+        let base = in_process_with(&format!("in process, {}", shell[0]), shell);
+        base.show();
+        for kind in [Pane::Fresh, Pane::Resized, Pane::Scrolled] {
+            let (echo, _) = through_server_as("off", "ui-like", kind, shell).await;
+            echo.show();
+            println!(
+                "PROBE ui-like {} {kind:?}: delta to in process {:+.2} ms (p50)",
+                shell[0],
+                echo.p50() - base.p50()
+            );
+        }
     }
 }

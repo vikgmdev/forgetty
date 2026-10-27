@@ -1972,7 +1972,7 @@ impl SessionManager {
     /// queue drops the bytes: the caller counts and logs it.
     pub fn queue_input(&self, id: PaneId, data: Vec<u8>) -> InputOutcome {
         let Some(w) = self.pane_writer(id) else { return InputOutcome::Gone };
-        crate::latency_trace::input();
+        crate::latency_trace::input(&data);
         match w.try_queue(data) {
             Ok(()) => InputOutcome::Queued,
             Err(crate::pane_writer::QueueError::Full) => InputOutcome::Full,
@@ -1989,6 +1989,7 @@ impl SessionManager {
         on_end: crate::pane_writer::OnEnd,
     ) -> InputOutcome {
         let Some(w) = self.pane_writer(id) else { return InputOutcome::Gone };
+        crate::latency_trace::input(&data);
         match w.try_queue_tracked(data, on_end) {
             Ok(()) => InputOutcome::Queued,
             Err(crate::pane_writer::QueueError::Full) => InputOutcome::Full,

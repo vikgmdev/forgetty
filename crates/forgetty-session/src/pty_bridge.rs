@@ -124,7 +124,7 @@ fn pty_reader_thread(mut reader: Box<dyn IoRead + Send>, tx: Sender<Vec<u8>>) {
                 break;
             }
             Ok(n) => {
-                crate::latency_trace::pty_read();
+                crate::latency_trace::pty_read(&buf[..n]);
                 if tx.blocking_send(buf[..n].to_vec()).is_err() {
                     debug!("session PTY reader: channel closed, stopping");
                     break;
