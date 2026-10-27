@@ -100,7 +100,9 @@ fn forgetty(state: &Path, timer: &str, args: &[&str]) -> Output {
     }
     // "default" leaves the variable unset: the server's own setting (the 1 ms tick while panes
     // are in use).
-    if timer != "default" {
+    if timer == "default" {
+        command.env_remove("FORGETTY_TIMER_RES");
+    } else {
         command.env("FORGETTY_TIMER_RES", timer);
     }
     command
