@@ -31,6 +31,17 @@ pub struct LsPhase {
     t0: Option<Instant>,
     rtt_started: bool,
     probe_started: bool,
+    tab_focused: bool,
+    /// The PowerShell pair: shells (name, argv), the one under test, and its tab and probes.
+    ps_shells: Vec<(String, Vec<String>)>,
+    ps_idx: usize,
+    ps_tabs_before: usize,
+    ps_focused: bool,
+    ps_tab: Option<Uuid>,
+    ps_pane: Option<PaneId>,
+    ps_base_col: usize,
+    ps_model: Vec<f64>,
+    ps_probe: Option<(usize, usize, char, Instant)>,
     /// First key send and last echo of the UI key probes.
     ui_window: Option<(Instant, Instant)>,
     /// Per UI key: ms until a second connection saw the pane's output with that key.
@@ -242,8 +253,152 @@ fn recorded(key: &str) -> Option<f64> {
 }
 
 impl ShellSmoke {
+    /// One PowerShell, one leg: open a tab with it (in the app's own terminal, or through the
+    /// server), wait for the prompt, time `PROBES` keys to the terminal model. Through the server it
+    /// is gated against the same shell in-process. The tab closes after. `goto` of the same phase
+    /// starts the next shell with a fresh phase timer.
+    fn ps_step(&mut self, shell: &mut AppShell, window: &mut Window, cx: &mut Context<AppShell>, server: bool) {
+        let (name, argv) = self.ls.ps_shells[self.ls.ps_idx].clone();
+        let leg = if server { "server" } else { "in_process" };
+        match self.sub {
+            0 => {
+                self.ls.ps_tabs_before = shell.layout.tab_count();
+                self.ls.ps_focused = false;
+                self.ls.ps_model.clear();
+                self.ls.ps_probe = None;
+                // The same start folder on both legs: the home folder.
+                shell.new_tab_with(argv, std::env::var("USERPROFILE").ok(), cx);
+                self.sub = 1;
+                self.sub_t0 = Instant::now();
+            }
+            1 => {
+                if shell.layout.tab_count() <= self.ls.ps_tabs_before {
+                    if self.sub_t0.elapsed() > Duration::from_secs(20) {
+                        fail(&format!("powershell {leg} {name}: the new tab did not appear"));
+                    }
+                    return;
+                }
+                let Some((tab, p)) = shell.layout.active_workspace().and_then(|w| w.tabs.last().map(|t| (t.id, t.pane_tree.first_leaf()))) else { return };
+                if shell.active_pane() != Some(p) {
+                    if !self.ls.ps_focused {
+                        self.ls.ps_focused = true;
+                        shell.focus_tab(tab, cx);
+                    }
+                    if self.sub_t0.elapsed() > Duration::from_secs(30) {
+                        fail(&format!("powershell {leg} {name}: the new tab never became active"));
+                    }
+                    return;
+                }
+                let Some(s) = snap(shell, cx, p) else { return };
+                if let Some(row) = s.rows.iter().find(|r| r.trim_end().ends_with('>')) {
+                    record(&format!("powershell_{leg}_{name}_prompt"), json!(row.trim_end()));
+                    self.ls.ps_tab = Some(tab);
+                    self.ls.ps_pane = Some(p);
+                    shell.focus_pane(p, window, cx);
+                    self.sub = 2;
+                    self.sub_t0 = Instant::now();
+                } else if self.sub_t0.elapsed() > Duration::from_secs(40) {
+                    record(&format!("powershell_{leg}_{name}_screen"), json!(s.rows));
+                    fail(&format!("powershell {leg} {name}: no prompt in 40 s"));
+                }
+            }
+            2 => {
+                // PSReadLine loads a moment after the prompt shows.
+                let Some(p) = self.ls.ps_pane else { return };
+                if shell.active_pane() != Some(p) {
+                    shell.focus_pane(p, window, cx);
+                    return;
+                }
+                if self.sub_t0.elapsed() < Duration::from_millis(1500) {
+                    return;
+                }
+                let Some(view) = shell.views.get(&p).cloned() else { return };
+                self.ls.ps_base_col = view.read(cx).term.cursor().1;
+                self.sub = 3;
+                self.sub_t0 = Instant::now();
+            }
+            3 | 5 => {
+                let Some(p) = self.ls.ps_pane else { return };
+                let Some(view) = shell.views.get(&p).cloned() else { return };
+                let (cr, cc) = view.read(cx).term.cursor();
+                if cc == self.ls.ps_base_col && self.sub_t0.elapsed() > Duration::from_millis(100) {
+                    self.ps_send(&view, cx, cr, cc);
+                    self.sub = 4;
+                } else if self.sub_t0.elapsed() > Duration::from_secs(5) {
+                    fail(&format!("powershell {leg} {name}: the prompt line did not come back"));
+                }
+            }
+            _ => {
+                let Some(p) = self.ls.ps_pane else { return };
+                let Some(view) = shell.views.get(&p).cloned() else { return };
+                let Some((row, col, ch, t0)) = self.ls.ps_probe else { fail("powershell probe state lost") };
+                if t0.elapsed() > Duration::from_millis(3000) {
+                    fail(&format!("powershell {leg} {name}: echo did not arrive"));
+                }
+                if !view.read(cx).term.screen().cell(row, col).grapheme.starts_with(ch) {
+                    return;
+                }
+                self.ls.ps_probe = None;
+                self.ls.ps_model.push(model_ms(view.read(cx)));
+                if self.ls.ps_model.len() < PROBES {
+                    if self.ls.ps_model.len() % 20 == 0 {
+                        view.update(cx, |v, _| v.send_bytes(&[0x1b]));
+                        self.sub = 5;
+                        self.sub_t0 = Instant::now();
+                    } else {
+                        let (r, c) = view.read(cx).term.cursor();
+                        self.ps_send(&view, cx, r, c);
+                    }
+                    return;
+                }
+                view.update(cx, |v, _| v.send_bytes(&[0x1b]));
+                let p50 = summarize_model(&self.ls.ps_model, &format!("_powershell_{leg}_{name}"));
+                if server {
+                    let key = format!("key_to_model_p50_ms_powershell_in_process_{name}");
+                    let Some(base) = recorded(&key) else { fail(&format!("powershell {name}: no in-process latency was measured")) };
+                    record(&format!("powershell_{name}_vs_in_process_ms"), json!({"in_process_p50": base, "server_p50": p50, "delta": p50 - base}));
+                    check(&format!("local_server_powershell_{name}_key_p50_within_2ms_of_in_process"), p50 - base <= 2.0);
+                }
+                if let Some(tab) = self.ls.ps_tab.take() {
+                    shell.close_tab(tab, cx);
+                }
+                self.ls.ps_idx += 1;
+                let again = if server { Phase::LsPsSrv } else { Phase::LsPsBase };
+                self.goto(again);
+            }
+        }
+    }
+
+    fn ps_send(&mut self, view: &gpui::Entity<crate::view::TerminalView>, cx: &mut Context<AppShell>, row: usize, col: usize) {
+        let ch = (b'a' + (self.ls.ps_model.len() % 26) as u8) as char;
+        let t0 = Instant::now();
+        self.ls.ps_probe = Some((row, col, ch, t0));
+        view.update(cx, |v, _| {
+            v.probe_watch = Some(crate::view::ProbeWatch { row, col, ch, t0, model_at: None });
+            v.send_bytes(ch.to_string().as_bytes())
+        });
+    }
+
     pub(super) fn ls_step(&mut self, shell: &mut AppShell, window: &mut Window, cx: &mut Context<AppShell>, now_t: Instant) {
         match self.phase {
+            Phase::LsPsBase | Phase::LsPsSrv => {
+                let server = self.phase == Phase::LsPsSrv;
+                if !server && self.sub == 0 && self.ls.ps_idx == 0 && self.ls.ps_shells.is_empty() {
+                    if std::env::var_os("FORGETTY_SERVER_EXE").is_none() {
+                        self.goto(Phase::LsStart);
+                        return;
+                    }
+                    self.ls.ps_shells = crate::reload::smoke_powershells();
+                    record("ps_shells", json!(self.ls.ps_shells.iter().map(|(n, a)| json!({"name": n, "argv": a})).collect::<Vec<_>>()));
+                }
+                if self.ls.ps_idx >= self.ls.ps_shells.len() {
+                    // This leg is done: the next leg starts at shell 0.
+                    self.ls.ps_idx = 0;
+                    self.goto(if server { Phase::LsDevices } else { Phase::LsStart });
+                    return;
+                }
+                self.ps_step(shell, window, cx, server);
+            }
             Phase::LsStart => {
                 let Some(exe) = std::env::var_os("FORGETTY_SERVER_EXE").map(PathBuf::from) else {
                     record("local_server", json!("skipped: FORGETTY_SERVER_EXE is not set"));
@@ -326,9 +481,15 @@ impl ShellSmoke {
                 }
                 // The pane of the tab just opened (the last one), not whatever pane is active: the
                 // first tab of the server runs the default shell, which may be PowerShell.
-                let Some(p) = shell.layout.active_workspace().and_then(|w| w.tabs.last().map(|t| t.pane_tree.first_leaf())) else { return };
+                let Some((tab, p)) = shell.layout.active_workspace().and_then(|w| w.tabs.last().map(|t| (t.id, t.pane_tree.first_leaf()))) else { return };
                 if shell.active_pane() != Some(p) {
-                    shell.focus_pane(p, window, cx);
+                    if !self.ls.tab_focused {
+                        self.ls.tab_focused = true;
+                        shell.focus_tab(tab, cx);
+                    }
+                    if self.sub_t0.elapsed() > Duration::from_secs(30) {
+                        fail(&format!("local server: the new tab never became active (active pane {:?}, new pane {:?})", shell.active_pane(), p));
+                    }
                     return;
                 }
                 let Some(s) = snap(shell, cx, p) else { return };
@@ -561,7 +722,7 @@ impl ShellSmoke {
                             let frame = self.frame_ms();
                             check("local_server_key_frame_p50_within_one_frame_of_in_process", frame50 - base_frame <= frame + 2.0);
                             view.update(cx, |v, _| v.send_bytes(&[0x1b]));
-                            self.goto(Phase::LsDevices);
+                            self.goto(Phase::LsPsSrv);
                         } else if self.lat_ms.len() % 20 == 0 {
                             view.update(cx, |v, _| v.send_bytes(&[0x1b]));
                             self.sub = 3;

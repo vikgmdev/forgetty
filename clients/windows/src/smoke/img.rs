@@ -108,7 +108,7 @@ impl ShellSmoke {
                         // The pane is a plain cmd again; clear the line the path was typed on.
                         shell.set_pane_argv(p, vec![crate::reload::smoke_cmd()], cx);
                         view.update(cx, |v, _| v.send_bytes(b"\x1b"));
-                        self.goto(Phase::LsStart);
+                        self.goto(Phase::LsPsBase);
                     }
                 } else if self.sub_t0.elapsed() > Duration::from_secs(15) {
                     let notice = view.read(cx).notice_text();
