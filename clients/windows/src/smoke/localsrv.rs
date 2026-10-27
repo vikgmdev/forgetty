@@ -79,6 +79,7 @@ async fn probe_task(
     info: forgetty_client::ClientInfo,
     opts: forgetty_client::ClientOptions,
     backend: std::sync::Arc<dyn forgetty_shell_core::SessionBackend>,
+    ui_pane: Uuid,
 ) -> Result<(), String> {
     use forgetty_client::PaneItem;
     let c = forgetty_client::Client::connect_with(server, identity, info, opts).await.map_err(|e| format!("connect: {e}"))?;
@@ -105,22 +106,69 @@ async fn probe_task(
         PROBE_MS.lock().unwrap().push(ms(t0.elapsed()));
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    // E3: the app's own connection and pane source (queue, writer task, reader task), typing into
+    // the pane above. Not a pane the UI shows.
+    {
+        use forgetty_shell_core::PaneEvent;
+        let src = backend.attach_pane(forgetty_shell_core::PaneId(pane)).await.map_err(|e| format!("source attach: {e}"))?;
+        let ev = src.events();
+        while let Ok(Ok(_)) = tokio::time::timeout(Duration::from_millis(1500), ev.recv()).await {}
+        for i in 0..60usize {
+            let key = b'A' + (i % 26) as u8;
+            let t0 = Instant::now();
+            src.write_input(&[key]);
+            loop {
+                let left = Duration::from_secs(5).saturating_sub(t0.elapsed());
+                match tokio::time::timeout(left, ev.recv()).await {
+                    Ok(Ok(PaneEvent::Output(b))) if b.contains(&key) => break,
+                    Ok(Ok(_)) => {}
+                    _ => return Err(format!("source: no echo of {:?}", key as char)),
+                }
+            }
+            E3_MS.lock().unwrap().push(ms(t0.elapsed()));
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        src.shutdown();
+    }
+    // E2: the young connection typing into the pane the UI shows (the line is cleared after).
+    {
+        let mut ui = c.attach_pane(ui_pane).await.map_err(|e| format!("attach ui pane: {e}"))?;
+        while let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(1500), ui.next()).await {}
+        for i in 0..60usize {
+            let key = b'a' + (i % 26) as u8;
+            let t0 = Instant::now();
+            c.send_input(ui_pane, &[key]).await.map_err(|e| format!("send: {e}"))?;
+            loop {
+                let left = Duration::from_secs(5).saturating_sub(t0.elapsed());
+                match tokio::time::timeout(left, ui.next()).await {
+                    Ok(Some(PaneItem::Data { bytes, .. })) if bytes.contains(&key) => break,
+                    Ok(Some(_)) => {}
+                    _ => return Err(format!("ui pane: no echo of {:?}", key as char)),
+                }
+            }
+            E2_MS.lock().unwrap().push(ms(t0.elapsed()));
+            if i % 10 == 9 {
+                let _ = c.send_input(ui_pane, &[0x1b]).await;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let _ = c.send_input(ui_pane, &[0x1b]).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
     let _ = backend.close_tab(reply.tab_id).await;
     c.close().await;
     Ok(())
 }
 
+static E2_MS: std::sync::Mutex<Vec<f64>> = std::sync::Mutex::new(Vec::new());
+static E3_MS: std::sync::Mutex<Vec<f64>> = std::sync::Mutex::new(Vec::new());
+
 /// Output of the UI pane as a second connection saw it: when each `Data` item arrived.
 static C2_RECV: std::sync::Mutex<Vec<(Instant, Vec<u8>)>> = std::sync::Mutex::new(Vec::new());
-/// Keys of the concurrent probe: when each was sent and its echo time, ms.
-static CONC_MS: std::sync::Mutex<Vec<(Instant, f64)>> = std::sync::Mutex::new(Vec::new());
 static CONC_STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// While the key probes of the UI pane run: (1) a second connection attached to the same pane
-/// logs when its output arrives, (2) the same connection types into a pane of its own, one key
-/// every 25 ms, and times the echo. If (2) stays fast while the UI keys are slow, the slowness
-/// is on the UI connection or its pane source. If it is slow too, it is this process (CPU) or
-/// the server. (1) says whether another connection sees the UI pane's echo earlier.
+/// While the key probes of the UI pane run, a second connection attached to the same pane logs
+/// when its output arrives: does another connection see the UI pane's echo earlier?
 async fn concurrent_task(
     server: forgetty_client::EndpointAddr,
     identity: forgetty_client::SecretKey,
@@ -139,31 +187,12 @@ async fn concurrent_task(
             }
         }
     });
-    let reply = backend
-        .new_tab(forgetty_shell_core::NewTab { workspace_idx: 0, rows: 24, cols: 80, command: vec![crate::reload::smoke_cmd()], ..Default::default() })
-        .await
-        .map_err(|e| format!("new_tab: {e}"))?;
-    let pane = reply.pane_id.0;
-    let mut stream = c.attach_pane(pane).await.map_err(|e| format!("attach: {e}"))?;
-    while let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(1500), stream.next()).await {}
-    let mut i = 0usize;
-    while !CONC_STOP.load(std::sync::atomic::Ordering::SeqCst) && i < 600 {
-        let key = b'a' + (i % 26) as u8;
-        i += 1;
-        let t0 = Instant::now();
-        c.send_input(pane, &[key]).await.map_err(|e| format!("send: {e}"))?;
-        loop {
-            let left = Duration::from_secs(5).saturating_sub(t0.elapsed());
-            match tokio::time::timeout(left, stream.next()).await {
-                Ok(Some(PaneItem::Data { bytes, .. })) if bytes.contains(&key) => break,
-                Ok(Some(_)) => {}
-                _ => return Err(format!("no echo of {:?}", key as char)),
-            }
-        }
-        CONC_MS.lock().unwrap().push((t0, ms(t0.elapsed())));
-        tokio::time::sleep(Duration::from_millis(25)).await;
+    // The own-pane loop of this task answered already (see `local_server_probe_variants_ms`): only
+    // the listener on the UI pane stays, until the key probes end.
+    while !CONC_STOP.load(std::sync::atomic::Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let _ = backend.close_tab(reply.tab_id).await;
+    let _ = backend;
     c.close().await;
     Ok(())
 }
@@ -360,9 +389,10 @@ impl ShellSmoke {
                                 let info = forgetty_client::ClientInfo::new(Uuid::new_v4(), forgetty_client::proto::ClientKind::Windows, "latency probe", env!("CARGO_PKG_VERSION"));
                                 Some((r.rt.clone(), forgetty_remote::store::machine_addr(&m).ok()?, r.store.identity().ok()?, info, forgetty_remote::store::machine_options(&r.addr_cache, &m)))
                             });
-                            let (Some(backend), Some((rt, server, identity, info, opts))) = (backend, parts) else { fail("local server: no parts for the in-app probe") };
+                            let ui_pane = self.ls.pane.map(|p| p.0);
+                            let (Some(backend), Some((rt, server, identity, info, opts)), Some(ui_pane)) = (backend, parts, ui_pane) else { fail("local server: no parts for the in-app probe") };
                             rt.spawn(async move {
-                                if let Err(e) = probe_task(server, identity, info, opts, backend).await {
+                                if let Err(e) = probe_task(server, identity, info, opts, backend, ui_pane).await {
                                     *PROBE_ERR.lock().unwrap() = Some(e);
                                 }
                                 PROBE_DONE.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -381,6 +411,13 @@ impl ShellSmoke {
                                 "local_server_in_app_probe_ms",
                                 json!({"n": sorted.len(), "p50": p50_of(&v), "p95": sorted.get(sorted.len() * 95 / 100), "max": sorted.last(), "error": PROBE_ERR.lock().unwrap().clone()}),
                             );
+                            let (e2, e3) = (E2_MS.lock().unwrap().clone(), E3_MS.lock().unwrap().clone());
+                            record(
+                                "local_server_probe_variants_ms",
+                                json!({"own_pane_own_connection": p50_of(&v),
+                                       "app_connection_and_pane_source_own_pane": {"n": e3.len(), "p50": p50_of(&e3)},
+                                       "own_connection_into_ui_pane": {"n": e2.len(), "p50": p50_of(&e2)}}),
+                            );
                             if let Some(d) = self.ls.cli.as_ref().and_then(|c| c.state_dir.as_deref()) {
                                 record("local_server_stage_us_after_in_app_probe", server_stages(d));
                             }
@@ -396,7 +433,6 @@ impl ShellSmoke {
                             let ui_pane = self.ls.pane.map(|p| p.0);
                             if let (Some(backend), Some((rt, server, identity, info, opts)), Some(ui_pane)) = (backend, parts, ui_pane) {
                                 C2_RECV.lock().unwrap().clear();
-                                CONC_MS.lock().unwrap().clear();
                                 CONC_STOP.store(false, std::sync::atomic::Ordering::SeqCst);
                                 rt.spawn(async move {
                                     if let Err(e) = concurrent_task(server, identity, info, opts, backend, ui_pane).await {
@@ -469,18 +505,10 @@ impl ShellSmoke {
                             self.lat_model_ms.clear();
                             forgetty_remote::trace::enable(false);
                             CONC_STOP.store(true, std::sync::atomic::Ordering::SeqCst);
-                            {
-                                let all = CONC_MS.lock().unwrap().clone();
-                                let (during, outside): (Vec<(Instant, f64)>, Vec<(Instant, f64)>) =
-                                    all.into_iter().partition(|(t0, _)| self.ls.ui_window.is_some_and(|(a, b)| *t0 >= a && *t0 <= b));
-                                let v = |x: &[(Instant, f64)]| x.iter().map(|(_, m)| *m).collect::<Vec<f64>>();
-                                let (d, o) = (v(&during), v(&outside));
-                                record(
-                                    "local_server_probe_while_ui_keys_ms",
-                                    json!({"during_ui_keys": {"n": d.len(), "p50": p50_of(&d)}, "outside": {"n": o.len(), "p50": p50_of(&o)},
-                                           "second_connection_saw_ui_echo": {"n": self.ls.c2_ms.len(), "p50": p50_of(&self.ls.c2_ms)}}),
-                                );
-                            }
+                            record(
+                                "local_server_second_connection_saw_ui_echo_ms",
+                                json!({"n": self.ls.c2_ms.len(), "p50": p50_of(&self.ls.c2_ms)}),
+                            );
                             {
                                 let col = |i: usize| self.ls.segs.iter().map(|s| s[i]).collect::<Vec<_>>();
                                 let tot: Vec<f64> = self.ls.segs.iter().map(|s| s.iter().sum()).collect();
