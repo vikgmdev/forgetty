@@ -85,9 +85,10 @@ pub fn is_user_only(path: &Path) -> io::Result<bool> {
 
 #[cfg(windows)]
 pub use win::{
-    create_private_file, create_private_new, current_user_sid, describe, is_user_only, only_sid_sddl,
-    pipe_client_sid, process_user_sid, replace_file, restrict_dir_to_user, restrict_to_user,
-    same_account, sync_dir,
+    create_private_file, create_private_new, current_integrity_rid, current_user_sid, describe,
+    is_elevated, is_user_only, only_sid_sddl, pipe_client_identity, pipe_sddl, process_user_sid,
+    replace_file, restrict_dir_to_user, restrict_to_user, same_account, sync_dir, INTEGRITY_HIGH,
+    INTEGRITY_MEDIUM,
 };
 
 /// Like [`restrict_to_user`] for a folder. On Unix the mode is 0700.
@@ -222,11 +223,59 @@ mod win {
         }
     }
 
-    /// The user SID of the client on the other end of a named pipe, read by impersonating the
-    /// client for a moment on this thread. Works for an elevated client, which `process_user_sid`
-    /// cannot see. Windows allows it only after the server read from the pipe once
-    /// (`ERROR_CANNOT_IMPERSONATE` before), so call it after the first read.
-    pub fn pipe_client_sid(pipe: HANDLE) -> io::Result<String> {
+    /// Mandatory integrity levels (the RID of the label SID).
+    pub const INTEGRITY_MEDIUM: u32 = 0x2000;
+    pub const INTEGRITY_HIGH: u32 = 0x3000;
+
+    /// The integrity level (RID of the mandatory label) of an access token.
+    fn token_integrity_rid(token: HANDLE) -> io::Result<u32> {
+        use windows::Win32::Security::{
+            GetSidSubAuthority, GetSidSubAuthorityCount, TokenIntegrityLevel, TOKEN_MANDATORY_LABEL,
+        };
+        // SAFETY: buffers are sized by the API; the SID pointers stay inside `buf`.
+        unsafe {
+            let mut len = 0u32;
+            let _ = GetTokenInformation(token, TokenIntegrityLevel, None, 0, &mut len);
+            if len == 0 {
+                return Err(io::Error::other("GetTokenInformation returned no size"));
+            }
+            let mut buf = vec![0u8; len as usize];
+            GetTokenInformation(token, TokenIntegrityLevel, Some(buf.as_mut_ptr() as *mut c_void), len, &mut len)
+                .map_err(err)?;
+            let label = &*(buf.as_ptr() as *const TOKEN_MANDATORY_LABEL);
+            let sid = label.Label.Sid;
+            let count = *GetSidSubAuthorityCount(sid);
+            if count == 0 {
+                return Err(io::Error::other("integrity label without a sub authority"));
+            }
+            Ok(*GetSidSubAuthority(sid, u32::from(count) - 1))
+        }
+    }
+
+    /// The integrity level of this process: 0x2000 medium (a normal process), 0x3000 high (an
+    /// elevated one), 0x4000 system.
+    pub fn current_integrity_rid() -> io::Result<u32> {
+        // SAFETY: the pseudo handle of this process is valid; the token is closed after use.
+        unsafe {
+            let mut token = HANDLE::default();
+            OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).map_err(err)?;
+            let result = token_integrity_rid(token);
+            let _ = CloseHandle(token);
+            result
+        }
+    }
+
+    /// Does this process run elevated (high integrity or above)? When it cannot be told, yes:
+    /// the stricter rules are the safe answer.
+    pub fn is_elevated() -> bool {
+        current_integrity_rid().map(|r| r >= INTEGRITY_HIGH).unwrap_or(true)
+    }
+
+    /// The user SID and the integrity level of the client on the other end of a named pipe, read
+    /// by impersonating the client for a moment on this thread. Works for an elevated client,
+    /// which a process-id lookup cannot. Windows allows it only after the server read from the
+    /// pipe once (`ERROR_CANNOT_IMPERSONATE` before), so call it after the first read.
+    pub fn pipe_client_identity(pipe: HANDLE) -> io::Result<(String, u32)> {
         use windows::Win32::Security::RevertToSelf;
         use windows::Win32::System::Pipes::ImpersonateNamedPipeClient;
         use windows::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
@@ -251,7 +300,7 @@ mod win {
             // `true`: open with the identity of the process, so the check does not depend on
             // what the client's token allows.
             OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, true, &mut token).map_err(err)?;
-            let result = token_user_sid(token);
+            let result = token_user_sid(token).and_then(|sid| Ok((sid, token_integrity_rid(token)?)));
             let _ = CloseHandle(token);
             result
         }
@@ -265,6 +314,18 @@ mod win {
     /// An SDDL string for a pipe or other kernel object that only `sid` may use.
     pub fn only_sid_sddl(sid: &str) -> String {
         format!("D:P(A;;GA;;;{sid})")
+    }
+
+    /// Like [`only_sid_sddl`], and for a process at high integrity also a mandatory label that
+    /// stops processes of a lower level from writing to, reading or executing the object (the
+    /// default label only stops writes). An elevated server must not be reachable from a normal
+    /// process of the same user: that would be a way around the UAC prompt.
+    pub fn pipe_sddl(sid: &str, high_integrity: bool) -> String {
+        if high_integrity {
+            format!("D:P(A;;GA;;;{sid})S:(ML;;NWNRNX;;;HI)")
+        } else {
+            only_sid_sddl(sid)
+        }
     }
 
     /// Create `path` new with `bytes`, readable by the current user only from the first moment
@@ -515,7 +576,19 @@ mod sid_tests {
     }
 
     #[test]
-    fn the_pipe_sddl_names_one_sid() {
+    fn the_pipe_sddl_names_one_sid_and_labels_a_high_server() {
         assert_eq!(only_sid_sddl("S-1-5-21-1-2-3-1001"), "D:P(A;;GA;;;S-1-5-21-1-2-3-1001)");
+        assert_eq!(pipe_sddl("S-1-5-21-1-2-3-1001", false), only_sid_sddl("S-1-5-21-1-2-3-1001"));
+        assert_eq!(
+            pipe_sddl("S-1-5-21-1-2-3-1001", true),
+            "D:P(A;;GA;;;S-1-5-21-1-2-3-1001)S:(ML;;NWNRNX;;;HI)"
+        );
+    }
+
+    #[test]
+    fn this_process_has_an_integrity_level() {
+        let rid = current_integrity_rid().unwrap();
+        assert!(rid >= INTEGRITY_MEDIUM, "{rid:#x}");
+        assert_eq!(is_elevated(), rid >= INTEGRITY_HIGH);
     }
 }

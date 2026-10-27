@@ -101,9 +101,9 @@ pub struct SocketServer {
     /// Tests set another uid to simulate a foreign user.
     #[cfg(unix)]
     allowed_uid: Option<u32>,
-    /// Only clients with this user SID are served. `None` means this process's user.
+    /// Who is served: the user SID and the lowest integrity level of a client.
     #[cfg(windows)]
-    allowed_sid: Option<String>,
+    allowed: crate::pipe::Allowed,
 }
 
 impl SocketServer {
@@ -142,7 +142,7 @@ impl SocketServer {
             #[cfg(unix)]
             allowed_uid: None,
             #[cfg(windows)]
-            allowed_sid: None,
+            allowed: Default::default(),
         })
     }
 
@@ -172,7 +172,17 @@ impl SocketServer {
     /// exercised without a second account.
     #[cfg(windows)]
     pub fn restrict_to_sid(mut self, sid: impl Into<String>) -> Self {
-        self.allowed_sid = Some(sid.into());
+        self.allowed.sid = Some(sid.into());
+        self
+    }
+
+    /// Serve only clients at this integrity level or higher (RID: 0x2000 medium, 0x3000 high,
+    /// 0x4000 system) instead of the level of this process.
+    ///
+    /// For tests: a client at the level of this process plays a client of a lower level.
+    #[cfg(windows)]
+    pub fn require_integrity(mut self, rid: u32) -> Self {
+        self.allowed.min_integrity = Some(rid);
         self
     }
 
@@ -183,7 +193,7 @@ impl SocketServer {
         }
         #[cfg(windows)]
         {
-            self.allowed_sid.clone()
+            self.allowed.clone()
         }
     }
 

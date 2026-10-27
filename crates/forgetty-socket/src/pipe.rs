@@ -6,9 +6,14 @@
 //! - The pipe is created with a protected DACL that holds one entry, the current user (the
 //!   kernel refuses everyone else at `CreateFile`), and with `PIPE_REJECT_REMOTE_CLIENTS`.
 //! - The first instance is created with `FILE_FLAG_FIRST_PIPE_INSTANCE`, so a process that
-//!   already owns the name (a squatter) makes the bind fail instead of sharing the name.
+//!   already owns the name (a squatter) makes the bind fail instead of sharing the name. The
+//!   name also holds a secret that only this user can read (`forgetty-server` `sockpath`), so
+//!   another user cannot know it in advance.
+//! - A server that runs elevated labels the pipe with high integrity (`pipe_sddl`), so a normal
+//!   process of the same user cannot open it.
 //! - After the first read from a client the server asks Windows for the client's user SID and
-//!   drops the connection if it is not the expected one. This is the counterpart of
+//!   integrity level and drops the connection if the user is not the expected one or the level
+//!   is lower than the server's. This is the counterpart of
 //!   `SO_PEERCRED` on Unix, and it holds if someone widens the DACL by mistake.
 //!
 //! The client side (a blocking stream with timeouts and a check of the server's SID) is in
@@ -37,8 +42,15 @@ use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 /// round trips to the kernel.
 const PIPE_BUFFER: u32 = 64 * 1024;
 
-/// The user the server serves: `None` is the user this process runs as.
-pub type Allowed = Option<String>;
+/// Who the server serves.
+#[derive(Clone, Debug, Default)]
+pub struct Allowed {
+    /// The user SID. `None` is the user this process runs as.
+    pub sid: Option<String>,
+    /// The lowest integrity level of a client. `None` is the level of this process. Tests raise
+    /// it to play a client of a lower level.
+    pub min_integrity: Option<u32>,
+}
 
 /// A security descriptor made from SDDL, freed on drop.
 struct Descriptor(PSECURITY_DESCRIPTOR);
@@ -81,6 +93,8 @@ pub struct Listener {
     next: Option<NamedPipeServer>,
     /// The SID a client must have.
     expected: String,
+    /// The integrity level a client must have at least.
+    min_integrity: u32,
 }
 
 impl Listener {
@@ -88,14 +102,17 @@ impl Listener {
     /// name exists already.
     pub fn bind(path: &Path, allowed: Allowed) -> io::Result<Self> {
         let me = acl::current_user_sid()?;
+        let level = acl::current_integrity_rid()?;
         // The pipe is always restricted to this user. `allowed` only changes who the server
-        // accepts after the connect (a test uses it to play a foreign user).
-        let sd = Descriptor::from_sddl(&acl::only_sid_sddl(&me))?;
+        // accepts after the connect (a test uses it to play a foreign user or a lower level).
+        // At high integrity the pipe also carries the label that keeps lower levels out.
+        let sd = Descriptor::from_sddl(&acl::pipe_sddl(&me, level >= acl::INTEGRITY_HIGH))?;
         let mut l = Self {
             name: path.to_string_lossy().into_owned(),
             sd,
             next: None,
-            expected: allowed.unwrap_or(me),
+            expected: allowed.sid.unwrap_or(me),
+            min_integrity: allowed.min_integrity.unwrap_or(level),
         };
         l.next = Some(l.create(true).map_err(|e| {
             if e.kind() == io::ErrorKind::PermissionDenied {
@@ -107,7 +124,10 @@ impl Listener {
                 e
             }
         })?);
-        info!("pipe {} created for {}", l.name, l.expected);
+        info!(
+            "pipe {} created for {} (integrity {:#x} or higher)",
+            l.name, l.expected, l.min_integrity
+        );
         Ok(l)
     }
 
@@ -148,7 +168,12 @@ impl Listener {
         }
         // At once, so the next client finds a free instance.
         self.next = self.create(false).map_err(|e| warn!("pipe: cannot create the next instance: {e}")).ok();
-        Ok(Some(Connection { inner: server, verified: false, expected: self.expected.clone() }))
+        Ok(Some(Connection {
+            inner: server,
+            verified: false,
+            expected: self.expected.clone(),
+            min_integrity: self.min_integrity,
+        }))
     }
 }
 
@@ -158,24 +183,34 @@ pub struct Connection {
     inner: NamedPipeServer,
     verified: bool,
     expected: String,
+    min_integrity: u32,
 }
 
 impl Connection {
     fn verify(&self) -> io::Result<()> {
         let handle = HANDLE(self.inner.as_raw_handle());
-        let sid = acl::pipe_client_sid(handle).map_err(|e| {
+        let (sid, level) = acl::pipe_client_identity(handle).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!("pipe: cannot read the client's user: {e}"),
             )
         })?;
-        if acl::same_account(&sid, &self.expected) {
-            debug!("pipe: client {sid} accepted");
-            Ok(())
-        } else {
+        if !acl::same_account(&sid, &self.expected) {
             warn!("pipe: refused a client of user {sid} (only {} is served)", self.expected);
-            Err(io::Error::new(io::ErrorKind::PermissionDenied, "client is another user"))
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "client is another user"));
         }
+        if level < self.min_integrity {
+            warn!(
+                "pipe: refused a client at integrity {level:#x} (the server needs {:#x})",
+                self.min_integrity
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "client runs at a lower integrity level than the server",
+            ));
+        }
+        debug!("pipe: client {sid} accepted at integrity {level:#x}");
+        Ok(())
     }
 }
 

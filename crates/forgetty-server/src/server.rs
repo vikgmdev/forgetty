@@ -663,7 +663,14 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
         );
     }
 
+    #[cfg(unix)]
     let socket_path = args.socket_path.unwrap_or_else(sockpath::default_socket_path);
+    #[cfg(windows)]
+    let socket_path = match args.socket_path {
+        Some(p) => p,
+        None => sockpath::default_socket_path()
+            .map_err(|e| anyhow::anyhow!("cannot set up the control pipe name: {e}"))?,
+    };
 
     // Bind the socket server (with session_id so shutdown_save can write the correct file).
     let socket_server = SocketServer::new_with_session(socket_path.clone(), session_id)?;

@@ -35,9 +35,20 @@ fn start(
     name: &std::path::Path,
     foreign: Option<&str>,
 ) -> tokio::task::JoinHandle<std::io::Result<()>> {
+    start_with(name, foreign, None)
+}
+
+fn start_with(
+    name: &std::path::Path,
+    foreign: Option<&str>,
+    min_integrity: Option<u32>,
+) -> tokio::task::JoinHandle<std::io::Result<()>> {
     let mut server = SocketServer::new_with_path(name.to_path_buf()).unwrap();
     if let Some(sid) = foreign {
         server = server.restrict_to_sid(sid);
+    }
+    if let Some(rid) = min_integrity {
+        server = server.require_integrity(rid);
     }
     let sm = Arc::new(SessionManager::new());
     tokio::spawn(async move { server.run_with_streaming(sm, None).await })
@@ -114,4 +125,37 @@ async fn a_second_server_cannot_take_the_name() {
     let err = result.expect_err("the name is taken");
     assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse, "{err}");
     first.abort();
+}
+
+#[tokio::test]
+async fn a_client_at_a_lower_integrity_level_gets_no_service() {
+    // The client is this process. A server that needs the level above ours plays the elevated
+    // server and this client the normal process.
+    let mine = acl::current_integrity_rid().unwrap();
+    let name = pipe_name();
+    let task = start_with(&name, None, Some(mine + 0x1000));
+    let mut c = connect(&name).await;
+    let _ = c.write_all(LIST_TABS).await;
+    let mut buf = vec![0u8; 4096];
+    let got = tokio::time::timeout(Duration::from_secs(10), c.read(&mut buf))
+        .await
+        .expect("the server closes the connection of a lower level");
+    match got {
+        Ok(0) | Err(_) => {}
+        Ok(n) => panic!("a lower level got an answer: {}", String::from_utf8_lossy(&buf[..n])),
+    }
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_client_at_the_servers_level_is_served() {
+    let mine = acl::current_integrity_rid().unwrap();
+    let name = pipe_name();
+    let task = start_with(&name, None, Some(mine));
+    let mut c = connect(&name).await;
+    c.write_all(LIST_TABS).await.unwrap();
+    let mut buf = vec![0u8; 4096];
+    let n = c.read(&mut buf).await.unwrap();
+    assert!(String::from_utf8_lossy(&buf[..n]).contains("\"result\""));
+    task.abort();
 }

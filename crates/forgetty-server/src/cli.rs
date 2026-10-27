@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 use forgetty_server::pipe_client::PipeStream;
 #[cfg(unix)]
 use forgetty_server::sockpath::{self, SocketCheck};
+#[cfg(unix)]
 use forgetty_server::sockpath::default_socket_path;
 
 /// The connection to the server.
@@ -110,7 +111,13 @@ impl Info {
 impl Client {
     /// Connect without any version check.
     fn raw() -> Result<Self> {
+        #[cfg(unix)]
         let path = default_socket_path();
+        // The pipe name holds a secret kept in a file; without it there is no way to connect.
+        #[cfg(windows)]
+        let path = forgetty_server::sockpath::default_socket_path().map_err(|e| {
+            CliError::Failed(format!("cannot find the server pipe: {e}"))
+        })?;
         // Never talk to a socket we cannot trust: a squatter could answer with
         // a fake server or read what we send. (On Windows `PipeStream::connect` checks the
         // user of the server process instead.)
@@ -502,6 +509,12 @@ fn spawn_detached(cmd: &mut std::process::Command) -> Result<std::process::Child
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
     let base = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW;
+    // `CreateProcess` hands every inheritable handle of this process to the child. Our own
+    // stdout may be a pipe that a caller reads until it closes (a script, a test, an editor):
+    // if the server kept it, that caller would wait for the server to exit. So the standard
+    // handles are not inheritable while the server starts. The log file the server writes to
+    // is passed explicitly by `cmd`, and std makes its own inheritable copy of it.
+    let _guard = StdHandlesPrivate::new();
     match cmd.creation_flags(base | CREATE_BREAKAWAY_FROM_JOB).spawn() {
         Ok(child) => Ok(child),
         // The job of the caller does not allow a breakaway: start without it. The server is
@@ -511,6 +524,53 @@ fn spawn_detached(cmd: &mut std::process::Command) -> Result<std::process::Child
             .spawn()
             .map_err(|e| CliError::Failed(format!("spawn server: {e}"))),
         Err(e) => Err(CliError::Failed(format!("spawn server: {e}"))),
+    }
+}
+
+/// Makes the standard handles of this process non-inheritable until dropped.
+#[cfg(windows)]
+struct StdHandlesPrivate(Vec<(windows::Win32::Foundation::HANDLE, u32)>);
+
+#[cfg(windows)]
+impl StdHandlesPrivate {
+    fn new() -> Self {
+        use windows::Win32::Foundation::{
+            GetHandleInformation, SetHandleInformation, HANDLE_FLAGS, HANDLE_FLAG_INHERIT,
+        };
+        use windows::Win32::System::Console::{
+            GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+        };
+        let mut saved = Vec::new();
+        for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            // SAFETY: plain calls on the handles the system gave this process.
+            unsafe {
+                let Ok(h) = GetStdHandle(which) else { continue };
+                if h.is_invalid() {
+                    continue;
+                }
+                let mut flags = 0u32;
+                if GetHandleInformation(h, &mut flags).is_err() || flags & HANDLE_FLAG_INHERIT.0 == 0 {
+                    continue;
+                }
+                if SetHandleInformation(h, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0)).is_ok() {
+                    saved.push((h, flags));
+                }
+            }
+        }
+        Self(saved)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for StdHandlesPrivate {
+    fn drop(&mut self) {
+        use windows::Win32::Foundation::{SetHandleInformation, HANDLE_FLAGS, HANDLE_FLAG_INHERIT};
+        for (h, flags) in &self.0 {
+            // SAFETY: the handles were valid when saved and this process still owns them.
+            unsafe {
+                let _ = SetHandleInformation(*h, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(*flags));
+            }
+        }
     }
 }
 
