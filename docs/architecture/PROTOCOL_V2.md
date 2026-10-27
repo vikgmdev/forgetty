@@ -667,4 +667,7 @@ Limits:
   that prompt); the next prompt has them. A hook added later (`PROMPT_COMMAND+=`)
   lands behind the integration's last hook: the first prompt after the change can
   lack the marks, then the script moves its hook back to the end. bash older
-  than 5.1 runs element 0 of an array only: there the string form is used.
+  than 5.1 runs element 0 of an array only: there the string form is used. A hook added
+  in front of the integration's first hook is moved behind it the same way; in the
+  string form the prompt after the change sends its `D` mark without a code (the
+  status then belongs to the front hook), never a wrong one.

@@ -732,3 +732,96 @@ async fn bash_before_5_1_uses_the_string_path_for_an_array() {
     unsafe { std::env::remove_var("FORGETTY_BASH_VERSION_FOR_TEST") };
     sm.close_pane(pane).unwrap();
 }
+
+/// A hook added in front after the start pushes `__forgetty_first` back. In the
+/// string form the prompt that follows cannot know the command's status (the
+/// front hook's status is what `$?` holds), so its D mark has no code: never a
+/// wrong one.
+/// The order is put right, and the next command's code is the true one.
+async fn front_hook_does_not_leak_its_status(setup: &str, array: bool) {
+    let Some((sm, _env, pane)) = integrated_pane("bash", None) else {
+        println!("SKIPPED: bash is not installed");
+        return;
+    };
+    let rx = sm.subscribe_meta();
+    let out = Output::start(&sm, pane);
+    let mut seen = Seen { rx, pane, states: Vec::new() };
+    seen.wait("the line editor tty mode", 0, |s| s.tty.is_some_and(|t| !t.canonical && !t.echo))
+        .await;
+    // The setup command adds the front hook; the prompt after it is the
+    // displaced one: the front hook returns 1, the command's own status is 0.
+    seen.drain();
+    let from = seen.states.len();
+    sm.write_pty(pane, format!("{setup}\n").as_bytes()).unwrap();
+    let c = seen.wait("displaced round: command start", from, |s| s.phase == Phase::Running).await;
+    seen.wait("displaced round: prompt again", c, |s| s.phase == Phase::Input).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    seen.drain();
+    assert!(
+        seen.states[from..].iter().all(|s| s.exit_code != Some(1)),
+        "the front hook's status leaked into a D mark: {:?}",
+        seen.states[from..].iter().map(|s| s.exit_code).collect::<Vec<_>>()
+    );
+    if array {
+        // bash gives each element of an array the command's status: the D mark
+        // of the displaced prompt has the true code.
+        assert!(
+            seen.states[from..].iter().any(|s| s.exit_code == Some(0)),
+            "{:?}",
+            seen.states[from..].iter().map(|s| s.exit_code).collect::<Vec<_>>()
+        );
+    }
+    // Put right: the next command reports its own code.
+    let from = seen.states.len();
+    sm.write_pty(pane, b"sh -c 'exit 3'\n").unwrap();
+    let c = seen.wait("next round: command start", from, |s| s.phase == Phase::Running).await;
+    seen.wait("next round: the true exit code", c, |s| {
+        s.phase == Phase::Input && s.exit_code == Some(3)
+    })
+    .await;
+    assert!(!out.text().contains("command not found"), "output:\n{}", out.text());
+    sm.close_pane(pane).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bash_hook_added_in_front_as_a_string_does_not_leak_its_status() {
+    let _one = SERIAL.lock().await;
+    front_hook_does_not_leak_its_status("__front() { return 1; }; PROMPT_COMMAND=\"__front;$PROMPT_COMMAND\"", false)
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bash_hook_added_in_front_as_an_array_does_not_leak_its_status() {
+    let _one = SERIAL.lock().await;
+    front_hook_does_not_leak_its_status(
+        "__front() { return 1; }; PROMPT_COMMAND=(__front \"${PROMPT_COMMAND[@]}\")",
+        true,
+    )
+    .await;
+}
+
+/// The hooks run on every prompt: no `$(...)`, no pipe, no external command in
+/// them (a fork per prompt shows in a slow shell).
+#[test]
+fn the_bash_prompt_hooks_start_no_process() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("shell-integration/forgetty.bash");
+    let script = std::fs::read_to_string(path).unwrap();
+    let from = script.find("__forgetty_osc7() {").unwrap();
+    let to = script.find("# C is written by the shell itself").unwrap();
+    let hooks = &script[from..to];
+    for (n, line) in hooks.lines().enumerate() {
+        let code = line.split('#').next().unwrap_or("");
+        assert!(!code.contains("$(") && !code.contains('`'), "hook line {n} forks: {line}");
+        assert!(!code.contains(" | ") && !code.contains("<("), "hook line {n} pipes: {line}");
+        for cmd in [
+            "sed", "awk", "cat", "tr", "cut", "grep", "date", "hostname", "head", "tail", "env",
+            "basename", "dirname", "sleep", "stty", "tput", "perl", "python",
+        ] {
+            assert!(
+                !code.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
+                    .any(|w| w == cmd),
+                "hook line {n} runs {cmd}: {line}"
+            );
+        }
+    }
+}
