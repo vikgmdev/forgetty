@@ -45,6 +45,9 @@ pub struct MachineEntry {
     pub backend: Arc<dyn SessionBackend>,
     /// The first layout arrived (an empty remote machine then gets one tab).
     pub bootstrapped: bool,
+    /// The address cache was written once with this machine connected. The first Connected seen
+    /// saves it, whether the machine was already connected when it was added or not.
+    pub addr_saved: bool,
 }
 
 impl MachineEntry {
@@ -57,6 +60,7 @@ impl MachineEntry {
             conn: backend.connection(),
             backend,
             bootstrapped: false,
+            addr_saved: false,
         }
     }
 }
@@ -260,6 +264,12 @@ impl AppShell {
             return;
         }
         self.machines.push(MachineEntry::new(backend.clone()));
+        if let Some(e) = self.machines.last_mut() {
+            if e.conn.is_connected() && e.kind == MachineKind::Remote {
+                e.addr_saved = true;
+                self.save_addr_cache();
+            }
+        }
         self.parked.insert(info.id, MachineSlot::new(backend.clone()));
         Self::spawn_event_pump(backend.clone(), cx);
         self.fetch_layout(info.id, cx);
@@ -373,7 +383,17 @@ impl AppShell {
         if let Some(e) = self.machines.iter_mut().find(|m| m.id == id) {
             e.conn = st.clone();
         }
-        if st.is_connected() && !was_connected && self.machines.iter().any(|m| m.id == id && m.kind == MachineKind::Remote) {
+        let remote = self.machines.iter().any(|m| m.id == id && m.kind == MachineKind::Remote);
+        // A machine added while already connected never has a "was not connected" step: its
+        // first Connected still writes the address cache.
+        let first = st.is_connected() && remote && self.machines.iter().any(|m| m.id == id && !m.addr_saved);
+        if first {
+            if let Some(e) = self.machines.iter_mut().find(|m| m.id == id) {
+                e.addr_saved = true;
+            }
+            self.save_addr_cache();
+        }
+        if st.is_connected() && !was_connected && remote {
             // A new connection has no size on record at the server (a restarted server
             // restores its panes at the default size, and a resumed stream has no reset):
             // send each pane's grid again so the PTY follows this client (AD-020).
@@ -384,7 +404,9 @@ impl AppShell {
             });
             // Events may have been missed while the link was down.
             self.fetch_layout(id, cx);
-            self.save_addr_cache();
+            if !first {
+                self.save_addr_cache();
+            }
         }
         cx.notify();
     }
