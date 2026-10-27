@@ -202,9 +202,11 @@ enum Phase {
     // F8: paste a picture.
     ImgPaste,
     // The local server (WP6).
+    LsPsBase,
     LsStart,
     LsWait,
     LsKeys,
+    LsPsSrv,
     LsDevices,
     LsKill,
     LsDone,
@@ -267,6 +269,8 @@ impl Phase {
             Phase::Keymap => "keymap-presets",
             Phase::Settings => "settings-window",
             Phase::ImgPaste => "f8-image-paste",
+            Phase::LsPsBase => "ls-powershell-in-process",
+            Phase::LsPsSrv => "ls-powershell-through-server",
             Phase::LsStart => "ls-start",
             Phase::LsWait => "ls-wait-for-server",
             Phase::LsKeys => "ls-keystrokes",
@@ -1488,7 +1492,7 @@ impl ShellSmoke {
             Phase::Keymap => self.keymap(shell, window, cx),
             Phase::Settings => self.settings(shell, window, cx),
             Phase::ImgPaste => self.img_step(shell, window, cx, now_t),
-            Phase::LsStart | Phase::LsWait | Phase::LsKeys | Phase::LsDevices | Phase::LsKill | Phase::LsDone => self.ls_step(shell, window, cx, now_t),
+            Phase::LsPsBase | Phase::LsPsSrv | Phase::LsStart | Phase::LsWait | Phase::LsKeys | Phase::LsDevices | Phase::LsKill | Phase::LsDone => self.ls_step(shell, window, cx, now_t),
             Phase::RSetup | Phase::RPair | Phase::REcho | Phase::RKeys | Phase::RKill | Phase::RRestart | Phase::RToast | Phase::RServer | Phase::W5View => {
                 self.w3_step(shell, window, cx, now_t)
             }

@@ -52,6 +52,15 @@ fn fallback_shell() -> &'static Vec<String> {
     })
 }
 
+/// The PowerShells on this PC the smoke times keys in: `pwsh.exe`, `powershell.exe` (name, argv).
+pub fn smoke_powershells() -> Vec<(String, Vec<String>)> {
+    let host = Host::real(None);
+    ["pwsh.exe", "powershell.exe"]
+        .iter()
+        .filter_map(|n| forgetty_shell_core::resolve::resolve_program(n, &host).ok().map(|path| (n.trim_end_matches(".exe").to_string(), vec![path, "-NoLogo".to_string()])))
+        .collect()
+}
+
 /// `cmd.exe` as the smoke starts it: the PATH lookup every configured program gets.
 pub fn smoke_cmd() -> String {
     forgetty_shell_core::resolve::resolve_program("cmd.exe", &Host::real(None)).unwrap_or_else(|_| fallback_shell()[0].clone())
