@@ -315,7 +315,11 @@ relay = "none"
 ```
 
 - `--bind IP` (repeatable) binds the iroh endpoint to these addresses only, on
-  the fixed `--port`. Without it the server binds every address.
+  the fixed `--port`. Without it the server binds every address. Several
+  addresses, also of one IP family (`--bind 10.230.1.14 --bind 10.240.1.112`),
+  each get their own socket on the same port, and the pairing payload lists
+  every one as a direct address. With `--port 0` the server picks one free
+  port for all of them.
 - `--no-relay` (or `relay = "none"`) turns relays off. The server never
   contacts a relay or n0: no relay connection, no address publishing, no
   discovery. It also switches off iroh's port mapping (UPnP, NAT-PMP, PCP), so
@@ -404,3 +408,39 @@ unit), so the unit has no `After=` for the tunnel. The retry covers it.
   client is back within 5 s. The server's socket is bound to the address, so
   check in the log that it keeps answering after the interface returns. If it
   does not, restart the server and report it.
+
+## Shell integration
+
+For zsh, bash and fish the server can make the shell write the standard prompt
+marks (OSC 133: prompt start, command line start, command start, command end with
+the exit code) and the working directory (OSC 7). Clients get them, with the tty
+mode of the pane, as `ShellState` events (`PROTOCOL_V2.md`, section 14).
+
+It is on by default for panes the server creates after it reads `config.toml`:
+
+```toml
+shell_integration = false   # turn it off
+```
+
+The server never edits your rc files. It writes its scripts to
+`<data dir>/shell-integration` at start, and sets `ZDOTDIR` (zsh), `PROMPT_COMMAND`
+(bash) or `XDG_DATA_DIRS` (fish) for the shell it starts, so the scripts load by
+themselves. Your own startup files run as before. A bash startup file that
+replaces `PROMPT_COMMAND` instead of adding to it turns the integration off for
+that shell. A shell that was started before the server read the setting keeps
+running without it.
+
+Limits:
+
+- The integration is for the shell the server starts. `exec zsh`, a nested zsh
+  or bash, `su`, `script`, vim `:sh` and tmux started from the pane run without
+  it (the scripts take their variables out of the environment so those shells do
+  not run hooks that exist only in the first one).
+- A system `/etc/zsh/zshenv` that sets `ZDOTDIR` takes the zsh trampoline away
+  and turns the integration off.
+- A prompt theme that rebuilds `PS1` on every prompt (powerlevel10k, starship)
+  keeps the marks: they are added after the theme runs. The first prompt of the
+  shell can lack them.
+- A pane that writes marks in a loop gets its states merged (a burst of 8, then
+  one per 10 ms per pane, and the newest pending one per client connection), so a
+  client sees where the shell is, not every step.

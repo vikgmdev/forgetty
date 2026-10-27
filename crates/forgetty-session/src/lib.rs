@@ -34,6 +34,8 @@ pub mod osc;
 pub mod pane;
 pub mod pane_writer;
 pub mod pty_bridge;
+pub mod shell;
+pub mod shell_integration;
 pub mod sizes;
 pub mod snapshot;
 pub mod status;
@@ -53,6 +55,8 @@ pub use manager::{
 pub use pane::{DuplicatedTab, NotificationInfo, PaneInfo, PaneOsc, PaneState};
 pub use pane_writer::{OnEnd, PaneWriter, QueueError, WriterStats, INPUT_QUEUE_BYTES};
 pub use pty_bridge::PtyBridge;
+pub use shell::{Phase, ShellSnapshot, ShellTracker, TtyMode};
+pub use shell_integration::{Shell, ShellIntegration};
 pub use sizes::{SizeGovernor, SizeOwner};
 pub use status::{PaneStatus, StatusSnapshot};
 pub use vt_gate::{vt_gate, VtGate, VtPermit, MAX_VT_BUILDS};

@@ -13,5 +13,15 @@ pub mod process;
 
 pub use multiplexer::{PtyId, PtyMultiplexer};
 pub use process::{PtyProcess, PtySize};
+#[cfg(not(windows))]
+pub use process::detect_shell;
 #[cfg(windows)]
 pub use process::{default_shell_argv, join_server_job, set_default_shell, set_default_shell_from_config};
+
+/// The shell a new pane starts, as a program name. Windows has no `$SHELL`: it is the first
+/// element of [`default_shell_argv`] (the configured shell, then `pwsh.exe`, `powershell.exe`,
+/// `%COMSPEC%`), and `cmd.exe` when that list is empty.
+#[cfg(windows)]
+pub fn detect_shell() -> String {
+    default_shell_argv().into_iter().next().unwrap_or_else(|| "cmd.exe".to_string())
+}

@@ -397,6 +397,25 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
     // V2-007: thread byte-log config values from TOML into SessionManager.
     session_manager.set_byte_log_config(config.byte_log_ring_kb, config.byte_log_max_mb);
 
+    // P7.1: shell integration for the shells new panes start. The scripts are
+    // part of this binary; they are written to the data dir so the shells can
+    // read them. A failure is a warning: panes then start without them.
+    if cfg!(windows) {
+        // The scripts are for bash, zsh and fish. Windows panes run pwsh or cmd.
+        info!("shell integration: off (not available on Windows)");
+    } else if config.shell_integration {
+        let dir = forgetty_core::platform::data_dir().join("shell-integration");
+        match forgetty_session::ShellIntegration::install(&dir) {
+            Ok(si) => {
+                info!("shell integration: on ({})", si.dir().display());
+                session_manager.set_shell_integration(Some(si));
+            }
+            Err(e) => warn!("shell integration: cannot write {}: {e}", dir.display()),
+        }
+    } else {
+        info!("shell integration: off (shell_integration = false)");
+    }
+
     // Cold-start restore: reload the UUID-named session file into the live SessionLayout.
     //
     // This runs synchronously before the socket server starts accepting connections

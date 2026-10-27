@@ -287,12 +287,18 @@ fn command_line(program: &Path, args: &[String]) -> Result<Vec<u16>> {
 }
 
 /// The environment block of the child: this process's variables plus `extra`, which win.
-fn environment_block(extra: &[(&str, String)]) -> Vec<u16> {
+fn environment_block(extra: &[(String, String)]) -> Vec<u16> {
+    // `extra` in order, a later entry replacing an earlier one with the same name.
+    let mut merged: Vec<(&str, &str)> = Vec::new();
+    for (k, v) in extra {
+        merged.retain(|(have, _)| !have.eq_ignore_ascii_case(k));
+        merged.push((k, v));
+    }
     let mut vars: Vec<(OsString, OsString)> = std::env::vars_os().collect();
-    for (k, _) in extra {
+    for (k, _) in &merged {
         vars.retain(|(have, _)| !have.to_string_lossy().eq_ignore_ascii_case(k));
     }
-    vars.extend(extra.iter().map(|(k, v)| (OsString::from(k), OsString::from(v))));
+    vars.extend(merged.iter().map(|(k, v)| (OsString::from(k), OsString::from(v))));
     vars.sort_by_key(|(k, _)| k.to_string_lossy().to_uppercase());
     let mut block = Vec::new();
     for (k, v) in vars {
@@ -661,6 +667,19 @@ impl PtyProcess {
         command: Option<&[String]>,
         login_shell: bool,
     ) -> Result<Self> {
+        Self::spawn_with_env(size, working_dir, command, login_shell, &[])
+    }
+
+    /// [`spawn`](Self::spawn) with extra environment variables for the child. They are merged
+    /// into the environment block after the defaults, so they win (names compare without regard
+    /// to case, as Windows does).
+    pub fn spawn_with_env(
+        size: PtySize,
+        working_dir: Option<&Path>,
+        command: Option<&[String]>,
+        login_shell: bool,
+        extra_env: &[(String, String)],
+    ) -> Result<Self> {
         let _ = login_shell;
         let argv: Vec<String> = match command {
             Some(c) if !c.is_empty() => c.to_vec(),
@@ -669,13 +688,15 @@ impl PtyProcess {
         let program = resolve_program(&argv[0])?;
         check_batch_args(&program, &argv[1..]).map_err(ForgettyError::Pty)?;
         let mut cmdline = command_line(&program, &argv[1..])?;
-        let env = environment_block(&[
-            ("TERM", "xterm-256color".to_string()),
-            ("COLORTERM", "truecolor".to_string()),
-            ("TERM_PROGRAM", "forgetty".to_string()),
+        let mut vars: Vec<(String, String)> = vec![
+            ("TERM".into(), "xterm-256color".into()),
+            ("COLORTERM".into(), "truecolor".into()),
+            ("TERM_PROGRAM".into(), "forgetty".into()),
             // Version derived from the workspace Cargo.toml at compile time.
-            ("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION").to_string()),
-        ]);
+            ("TERM_PROGRAM_VERSION".into(), env!("CARGO_PKG_VERSION").into()),
+        ];
+        vars.extend(extra_env.iter().cloned());
+        let env = environment_block(&vars);
         // A folder that is not there: start in the home folder, as the Unix PTY does.
         let cwd: Option<Vec<u16>> = working_dir
             .filter(|d| d.is_dir())
@@ -895,6 +916,12 @@ impl PtyProcess {
     /// Throw away unread input. There is no call for it on a pseudo console. Best effort: none.
     pub fn flush_pending_input(&self) {}
 
+    /// The terminal's line settings. Windows has no termios, so there is nothing to read: the
+    /// session code treats `None` as "unknown".
+    pub fn tty_flags(&self) -> Option<(bool, bool)> {
+        None
+    }
+
     /// End the shell and everything it started.
     pub fn kill(&mut self) -> Result<()> {
         self.kill_tree();
@@ -1039,6 +1066,21 @@ mod tests {
         p.write(b"echo T=%TERM%;P=%TERM_PROGRAM%;V=%TERM_PROGRAM_VERSION%;C=%COLORTERM%\r\n").unwrap();
         let want = format!("T=xterm-256color;P=forgetty;V={};C=truecolor", env!("CARGO_PKG_VERSION"));
         out.until(20, |t| t.contains(&want));
+    }
+
+    #[test]
+    fn extra_env_reaches_the_child_and_wins_over_the_defaults() {
+        let extra = [
+            ("FORGETTY_TEST_EXTRA".to_string(), "seen-by-pane".to_string()),
+            // The names are not case sensitive: this replaces the default TERM_PROGRAM.
+            ("term_program".to_string(), "other".to_string()),
+        ];
+        let mut p = PtyProcess::spawn_with_env(size(), None, Some(&cmd_exe()), false, &extra)
+            .expect("spawn");
+        let mut out = Output::start(&mut p);
+        p.write(b"echo X=%FORGETTY_TEST_EXTRA%;P=%TERM_PROGRAM%\r\n").unwrap();
+        out.until(20, |t| t.contains("X=seen-by-pane;P=other"));
+        assert_eq!(p.tty_flags(), None);
     }
 
     #[test]

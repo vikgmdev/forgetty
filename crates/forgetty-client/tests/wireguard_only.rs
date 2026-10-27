@@ -102,6 +102,68 @@ async fn the_server_binds_only_its_address_and_reaches_nobody_outside() {
     server.shutdown().await;
 }
 
+/// Several `--bind` addresses of one family: one socket each on the same port,
+/// every one in the pairing payload, and a client that knows only one of them
+/// pairs and connects through it. 127.0.0.1 and 127.0.0.2 are both loopback.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_bind_addresses_of_one_family_each_pair_and_connect() {
+    if !real_only() {
+        return;
+    }
+    init_tracing();
+    let server = TestServer::start_real_with_args(&[
+        "--bind", "127.0.0.1", "--bind", "127.0.0.2", "--no-relay",
+    ])
+    .await;
+    let n = net(&server);
+    let mut sockets: Vec<std::net::SocketAddr> = n["bound_sockets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.as_str().unwrap().parse().unwrap())
+        .collect();
+    sockets.sort();
+    assert_eq!(sockets.len(), 2, "one socket per address: {n}");
+    assert_eq!(sockets[0].ip().to_string(), "127.0.0.1", "{sockets:?}");
+    assert_eq!(sockets[1].ip().to_string(), "127.0.0.2", "{sockets:?}");
+    assert_eq!(sockets[0].port(), sockets[1].port(), "the same port: {sockets:?}");
+
+    let qr = payload(&server);
+    assert!(qr.relays_disabled);
+    let mut direct = qr.direct_addrs();
+    direct.sort();
+    assert_eq!(direct, sockets, "every bound address is a direct address");
+
+    for only in &sockets {
+        // A fresh pairing window each time (the secret is single use), with
+        // only one of the direct addresses in it.
+        let mut one = payload(&server);
+        one.direct = vec![only.to_string()];
+        let key = SecretKey::generate(&mut rand::rng());
+        let paired = pair(&one, key.clone(), "multi-bind", ClientKind::Cli)
+            .await
+            .unwrap_or_else(|e| panic!("pair through {only} failed: {e}"));
+        assert_eq!(paired.pinned_addrs, vec![*only]);
+        let mut opts = paired.options();
+        opts.dial_timeout = Duration::from_secs(5);
+        let info = ClientInfo::new(Uuid::new_v4(), ClientKind::Cli, "multi-bind", "0.0.0");
+        let addr = forgetty_client::server_addr(&qr.node_id, &paired.relays).unwrap();
+        let h = tokio::time::timeout(
+            Duration::from_secs(10),
+            Client::connect_with(addr, key, info, opts),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("connect through {only} timed out"))
+        .unwrap_or_else(|e| panic!("connect through {only} failed: {e}"));
+        assert!(h.state().is_connected());
+        h.request("get_layout", forgetty_client::proto::Value::Nil)
+            .await
+            .unwrap_or_else(|e| panic!("get_layout through {only}: {e}"));
+        h.close().await;
+    }
+    server.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_frozen_server_is_unreachable_direct_only_and_the_client_comes_back() {
     if !real_only() {
