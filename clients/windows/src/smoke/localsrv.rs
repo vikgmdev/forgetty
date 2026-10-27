@@ -26,7 +26,7 @@ pub struct LsPhase {
     inproc: Option<Uuid>,
     pane: Option<PaneId>,
     tabs_before: usize,
-    fed_before: u64,
+    base_col: usize,
     pid: u64,
     t0: Option<Instant>,
 }
@@ -135,30 +135,24 @@ impl ShellSmoke {
                     return;
                 }
                 let Some(view) = shell.views.get(&p0).cloned() else { return };
+                // cmd.exe: probes go at the cursor of the prompt line, as for the in-process pane.
+                // Escape clears the typed line (every 20 keys, so the line never wraps).
+                let (cr, cc) = view.read(cx).term.cursor();
                 match self.sub {
-                    0 | 2 => {
-                        self.ls.fed_before = view.read(cx).fed_bytes;
-                        view.update(cx, |v, _| v.send_bytes(b"\r\n"));
-                        self.sub += 1;
-                        self.sub_t0 = Instant::now();
+                    0 => {
+                        self.ls.base_col = cc;
+                        self.lat_ms.clear();
+                        self.max_reshaped_per_key = 0;
+                        self.sub = 1;
                     }
                     1 | 3 => {
-                        let (cc, fed) = {
-                            let v = view.read(cx);
-                            (v.term.cursor().1, v.fed_bytes)
-                        };
-                        if cc == 0 && fed > self.ls.fed_before && self.sub_t0.elapsed() > Duration::from_millis(100) {
-                            if self.sub == 1 {
-                                self.lat_ms.clear();
-                                self.max_reshaped_per_key = 0;
-                            }
-                            let (r, c) = view.read(cx).term.cursor();
+                        if cc == self.ls.base_col && self.sub_t0.elapsed() > Duration::from_millis(100) {
                             let ch = self.next_key_char();
-                            self.probe = Some(Probe { row: r, col: c, ch, t0: Instant::now() });
+                            self.probe = Some(Probe { row: cr, col: cc, ch, t0: Instant::now() });
                             view.update(cx, |v, _| v.send_bytes(ch.to_string().as_bytes()));
                             self.sub = 4;
                         } else if self.sub_t0.elapsed() > Duration::from_secs(5) {
-                            fail("local server key probe: fresh line did not arrive");
+                            fail("local server key probe: the prompt line did not come back");
                         }
                     }
                     _ => {
@@ -183,10 +177,10 @@ impl ShellSmoke {
                             let base = recorded("key_to_frame_p50_ms").unwrap_or(f64::MAX);
                             record("local_server_vs_in_process_ms", json!({"in_process_p50": base, "server_p50": p50, "delta": p50 - base}));
                             check("local_server_key_p50_within_2ms_of_in_process", p50 <= base + 2.0);
+                            view.update(cx, |v, _| v.send_bytes(&[0x1b]));
                             self.goto(Phase::LsDevices);
                         } else if self.lat_ms.len() % 20 == 0 {
-                            self.ls.fed_before = view.read(cx).fed_bytes;
-                            view.update(cx, |v, _| v.send_bytes(b"\r\n"));
+                            view.update(cx, |v, _| v.send_bytes(&[0x1b]));
                             self.sub = 3;
                             self.sub_t0 = Instant::now();
                         } else {
